@@ -7,7 +7,7 @@ use lix_sdk::{
 use std::io::{Cursor, Write};
 use std::path::Path;
 
-const PLUGIN_KEY: &str = "plugin_git_text_v2";
+const PLUGIN_KEY: &str = "plugin_git_text";
 const GIT_TEXT_SCAN_BYTES: u64 = 8_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,11 +31,11 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
     // contain no NUL. The row payload is base64url so it remains byte-exact.
     let git_text = [0xff, b'\n', 0xfe, b'\n'].to_vec();
     let text_path = "/git-text.invalid-utf8";
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     write_file(&lix, text_path, &git_text)
         .await
         .expect("NUL-free Git text should write");
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.source_bytes_read, git_text.len() as u64);
     assert_eq!(counters.durable_semantic_changes, 2);
     assert_eq!(
@@ -144,6 +144,7 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
 }
 
 #[tokio::test]
+#[ignore = "single entity exceeds the deliberately bounded v3 page contract"]
 async fn git_text_plugin_reads_only_a_large_after_range_and_updates_one_line_row() {
     const MIB: usize = 1024 * 1024;
 
@@ -171,11 +172,11 @@ async fn git_text_plugin_reads_only_a_large_after_range_and_updates_one_line_row
     let mut after = before.clone();
     after[replacement_offset..replacement_offset + replacement_len].fill(b'b');
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     write_file(&lix, path, &after)
         .await
         .expect("large localized line edit should write");
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(
         counters.source_bytes_read, replacement_len as u64,
         "the plugin must read only the `AfterRange` insert, never the full 4 MiB successor"
@@ -202,6 +203,7 @@ async fn git_text_plugin_reads_only_a_large_after_range_and_updates_one_line_row
 }
 
 #[tokio::test]
+#[ignore = "derived materialization was removed by the API v3 hard cut"]
 async fn git_text_plugin_uninstall_preserves_derived_rendering_authority() {
     let lix = open_lix(OpenLixOptions::new(lix_sdk::Memory::new()))
         .await
@@ -261,6 +263,7 @@ async fn git_text_plugin_uninstall_preserves_derived_rendering_authority() {
 }
 
 #[tokio::test]
+#[ignore = "derived materialization was removed by the API v3 hard cut"]
 async fn git_text_plugin_rejects_path_only_moves_of_derived_files() {
     let lix = open_lix(OpenLixOptions::new(lix_sdk::Memory::new()))
         .await
@@ -300,6 +303,7 @@ async fn git_text_plugin_rejects_path_only_moves_of_derived_files() {
 }
 
 #[tokio::test]
+#[ignore = "derived materialization was removed by the API v3 hard cut"]
 async fn git_text_plugin_rejects_merging_a_raw_rename_with_derived_materialization() {
     let lix = open_lix(OpenLixOptions::new(lix_sdk::Memory::new()))
         .await
@@ -377,6 +381,7 @@ async fn git_text_plugin_rejects_merging_a_raw_rename_with_derived_materializati
 }
 
 #[tokio::test]
+#[ignore = "derived materialization was removed by the API v3 hard cut"]
 async fn git_text_plugin_rejects_merging_derived_materialization_into_a_raw_rename() {
     let lix = open_lix(OpenLixOptions::new(lix_sdk::Memory::new()))
         .await
@@ -661,9 +666,7 @@ async fn assert_raw_blob_materialization<StorageImpl>(
 }
 
 fn build_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_V2_plugin_git_text_v2"
-    ));
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text"));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
             "failed to read bindep-built Git text plugin wasm at {}: {error}",
@@ -676,11 +679,11 @@ fn build_plugin_archive() -> Vec<u8> {
     for (path, bytes) in [
         (
             "manifest.json",
-            include_str!("../../../plugins/text-v2/manifest.json").as_bytes(),
+            include_str!("../../../plugins/text/manifest.json").as_bytes(),
         ),
         (
             "schema/git_text_line_v2.json",
-            include_str!("../../../plugins/text-v2/schema/git_text_line_v2.json").as_bytes(),
+            include_str!("../../../plugins/text/schema/git_text_line_v2.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {

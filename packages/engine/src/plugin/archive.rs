@@ -236,7 +236,7 @@ fn load_plugin_archive(
         })?;
         validate_lix_schema_definition(&schema_json)?;
         let schema_key = schema_key_from_definition(&schema_json)?.schema_key;
-        validate_v2_number_free_schema(&schema_json, &schema_key)?;
+        validate_number_free_schema(&schema_json, &schema_key)?;
         if !seen_schema_keys.insert(schema_key.clone()) {
             return Err(invalid_plugin(format!(
                 "Plugin archive declares duplicate schema '{schema_key}'"
@@ -284,18 +284,18 @@ fn schema_has_uuid_v7_primary_key_default(schema: &JsonValue) -> bool {
         })
 }
 
-/// Production v2 snapshots currently use a durable JSON representation that
+/// Production component snapshots currently use a durable JSON representation that
 /// cannot preserve arbitrary-precision JSON numbers. Reject any schema path
 /// that can admit a numeric node before installing the plugin.
-fn validate_v2_number_free_schema(schema: &JsonValue, schema_key: &str) -> Result<(), LixError> {
+fn validate_number_free_schema(schema: &JsonValue, schema_key: &str) -> Result<(), LixError> {
     if schema_may_accept_number(schema, schema, &mut BTreeSet::new())? {
         return Err(v2_numeric_schema_error(schema_key));
     }
     let mut visited_refs = BTreeSet::new();
-    validate_v2_number_free_child_positions(schema, schema, schema_key, &mut visited_refs)
+    validate_number_free_child_positions(schema, schema, schema_key, &mut visited_refs)
 }
 
-fn validate_v2_number_free_child_positions(
+fn validate_number_free_child_positions(
     schema: &JsonValue,
     root: &JsonValue,
     schema_key: &str,
@@ -327,7 +327,7 @@ fn validate_v2_number_free_child_positions(
     for keyword in ["properties", "patternProperties", "dependentSchemas"] {
         if let Some(children) = object.get(keyword).and_then(JsonValue::as_object) {
             for child in children.values() {
-                validate_v2_number_free_value_schema(child, root, schema_key, visited_refs)?;
+                validate_number_free_value_schema(child, root, schema_key, visited_refs)?;
             }
         }
     }
@@ -339,37 +339,37 @@ fn validate_v2_number_free_child_positions(
         "unevaluatedItems",
     ] {
         if let Some(child) = object.get(keyword) {
-            validate_v2_number_free_value_schema(child, root, schema_key, visited_refs)?;
+            validate_number_free_value_schema(child, root, schema_key, visited_refs)?;
         }
     }
     if let Some(children) = object.get("prefixItems").and_then(JsonValue::as_array) {
         for child in children {
-            validate_v2_number_free_value_schema(child, root, schema_key, visited_refs)?;
+            validate_number_free_value_schema(child, root, schema_key, visited_refs)?;
         }
     }
 
     for keyword in ["allOf", "anyOf", "oneOf"] {
         if let Some(branches) = object.get(keyword).and_then(JsonValue::as_array) {
             for branch in branches {
-                validate_v2_number_free_child_positions(branch, root, schema_key, visited_refs)?;
+                validate_number_free_child_positions(branch, root, schema_key, visited_refs)?;
             }
         }
     }
     for keyword in ["not", "if", "then", "else"] {
         if let Some(branch) = object.get(keyword) {
-            validate_v2_number_free_child_positions(branch, root, schema_key, visited_refs)?;
+            validate_number_free_child_positions(branch, root, schema_key, visited_refs)?;
         }
     }
     if let Some(reference) = object.get("$ref").and_then(JsonValue::as_str)
         && visited_refs.insert(reference.to_string())
     {
         let target = resolve_local_schema_ref(root, reference)?;
-        validate_v2_number_free_child_positions(target, root, schema_key, visited_refs)?;
+        validate_number_free_child_positions(target, root, schema_key, visited_refs)?;
     }
     Ok(())
 }
 
-fn validate_v2_number_free_value_schema(
+fn validate_number_free_value_schema(
     schema: &JsonValue,
     root: &JsonValue,
     schema_key: &str,
@@ -378,7 +378,7 @@ fn validate_v2_number_free_value_schema(
     if schema_may_accept_number(schema, root, &mut BTreeSet::new())? {
         return Err(v2_numeric_schema_error(schema_key));
     }
-    validate_v2_number_free_child_positions(schema, root, schema_key, visited_refs)
+    validate_number_free_child_positions(schema, root, schema_key, visited_refs)
 }
 
 fn schema_may_accept_number(
@@ -500,7 +500,7 @@ fn resolve_local_schema_ref<'a>(
         LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
             format!(
-                "wasm-component-v2 schemas require resolvable local JSON Pointer references; unsupported or missing '$ref': '{reference}'"
+                "wasm-component schemas require resolvable local JSON Pointer references; unsupported or missing '$ref': '{reference}'"
             ),
         )
     })
@@ -510,7 +510,7 @@ fn v2_numeric_schema_error(schema_key: &str) -> LixError {
     LixError::new(
         LixError::CODE_SCHEMA_DEFINITION,
         format!(
-            "wasm-component-v2 schema '{schema_key}' admits reachable JSON number or integer values"
+            "wasm-component schema '{schema_key}' admits reachable JSON number or integer values"
         ),
     )
     .with_hint(
@@ -1114,8 +1114,8 @@ mod tests {
 
     const MANIFEST: &[u8] = br#"{
         "key":"plugin_test",
-        "runtime":"wasm-component-v2",
-        "api_version":"2.1.0",
+        "runtime":"wasm-component",
+        "api_version":"3.0.0",
         "materialization":"blob",
         "match":{"path_glob":"*.test"},
         "entry":"plugin.wasm",
@@ -1134,8 +1134,8 @@ mod tests {
     fn v2_archive_with_schema(schema: &JsonValue) -> Vec<u8> {
         let manifest = br#"{
             "key":"plugin_test",
-            "runtime":"wasm-component-v2",
-            "api_version":"2.1.0",
+            "runtime":"wasm-component",
+            "api_version":"3.0.0",
             "materialization":"blob",
             "match":{"path_glob":"*.test"},
             "entry":"plugin.wasm",
@@ -1258,7 +1258,7 @@ mod tests {
         ] {
             let error =
                 parse_plugin_archive_for_install(&v2_archive_with_schema(&v2_schema(payload)))
-                    .expect_err("v2 numeric snapshots must be rejected at install");
+                    .expect_err("component numeric snapshots must be rejected at install");
             assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
             assert!(
                 error.message.contains("JSON number or integer"),
@@ -1813,8 +1813,8 @@ mod benchmark_probe {
     fn benchmark_archive(wasm_bytes: usize) -> Vec<u8> {
         let manifest = br#"{
             "key":"plugin_bench",
-            "runtime":"wasm-component-v2",
-            "api_version":"2.1.0",
+            "runtime":"wasm-component",
+            "api_version":"3.0.0",
             "materialization":"blob",
             "match":{"path_glob":"*.bench"},
             "entry":"plugin.wasm",

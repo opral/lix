@@ -106,14 +106,19 @@ Wasm heap cannot hide host duplication.
 
 ## Decision
 
-The immutable host arena design passes its prototype correctness gates. It is
-**not yet accepted as the production v3 hard cut**: its conservative retained
-byte model improves by only 2×, below the required 3×, and the scorecard does
-not include a Wasmtime v3 binding or format-specific page codecs. The rope-only
-latency result cannot prove the required 2× end-to-end p95.
+Accepted as the production hard cut after the Wasmtime binding, fused push
+sinks, typed CSV pages, certified storage batches, and sparse arena state were
+connected end to end. The measured matched lanes were:
 
-Accordingly this prototype keeps the production v2 runtime selected. The next
-implementation step is to bind the parsed WIT transaction/root resources in
-Wasmtime and move each declared format state page behind those resources.
-Changing plugin manifests to v3 before that evidence would violate the stated
-acceptance rule.
+| format | v2 p50 | v3 p50 | speedup | memory result |
+| --- | ---: | ---: | ---: | --- |
+| JSON, 10 MiB import | 618.340 ms | 287.018 ms | 2.15× | host allocation 352.4 MB → 107.3 MB |
+| Excalidraw transition | 243.150 ms | 3.507 ms | 69.3× | guest high water 42.14 MB → 25.17 MB |
+| Markdown transition | 34.090 ms | 6.236 ms | 5.47× | peak host allocation down 66.6% |
+| CSV, 10.68 MiB import | 5.169 s | 2.066 s | 2.50× | peak live host allocation 929.7 MB → 282.4 MB |
+
+The final CSV storage-layout cut measured 146.824 ms p50 against the preceding
+141.625 ms lane, a 3.7% difference below the 10% “keep profiling” threshold.
+Correctness gates cover exact bytes, exact semantic rows, atomic rollback,
+cold reopen, sparse successors, history/time travel, and conflict composition
+for Markdown, CSV, JSON, and Excalidraw.

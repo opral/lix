@@ -13,7 +13,9 @@ use async_trait::async_trait;
 use lix_engine::LixError;
 use lix_engine::wasm::{WasmLimits, WasmRuntime};
 use lru::LruCache;
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::Component;
+#[cfg(test)]
+use wasmtime::component::Linker;
 use wasmtime::{
     Cache, CacheConfig, Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder,
 };
@@ -21,10 +23,8 @@ use wasmtime_wasi::{
     ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2::add_to_linker_sync,
 };
 
-#[path = "default_wasm_runtime_v2.rs"]
-mod v2_runtime;
-#[path = "default_wasm_runtime_v3_prototype.rs"]
-mod v3_prototype_runtime;
+#[path = "default_wasm_runtime_component.rs"]
+mod component_runtime;
 
 const COMPILED_COMPONENT_CACHE_CAPACITY: usize = 16;
 const MAX_PLUGIN_INSTANCES: usize = 64;
@@ -390,20 +390,12 @@ impl WasiView for WasiHostState {
 
 #[async_trait]
 impl WasmRuntime for WasmtimePluginRuntime {
-    async fn compile_component_v2(
+    async fn compile_component(
         &self,
         bytes: Vec<u8>,
         limits: WasmLimits,
-    ) -> Result<Arc<dyn lix_engine::wasm::v2::WasmComponentV2Factory>, LixError> {
-        v2_runtime::compile_component(self, bytes, limits).await
-    }
-
-    async fn compile_component_v3_prototype(
-        &self,
-        bytes: Vec<u8>,
-        limits: WasmLimits,
-    ) -> Result<Arc<dyn lix_engine::wasm::v2::WasmComponentV2Factory>, LixError> {
-        v3_prototype_runtime::compile_component(self, bytes, limits).await
+    ) -> Result<Arc<dyn lix_engine::wasm::WasmComponentFactory>, LixError> {
+        component_runtime::compile_component(self, bytes, limits).await
     }
 }
 

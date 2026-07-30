@@ -180,8 +180,8 @@ mod tests {
     #[test]
     fn bundled_csv_and_markdown_content_type_manifests_install() {
         let cases = [
-            ("plugin_csv_v2", "*.{csv,tsv}"),
-            ("plugin_markdown_incremental_v2", "*.{md,markdown}"),
+            ("plugin_csv", "*.{csv,tsv}"),
+            ("plugin_markdown", "*.{md,markdown}"),
         ];
 
         for (plugin_key, path_glob) in cases {
@@ -252,8 +252,8 @@ mod tests {
         let manifest = format!(
             r#"{{
                 "key":"{plugin_key}",
-                "runtime":"wasm-component-v2",
-                "api_version":"2.1.0",
+                "runtime":"wasm-component",
+                "api_version":"3.0.0",
                 "materialization":"blob",
                 "match":{{"path_glob":"{path_glob}"{content_type}}},
                 "entry":"plugin.wasm",

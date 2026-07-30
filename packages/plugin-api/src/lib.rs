@@ -252,6 +252,18 @@ impl Sink<'_> {
         self.max_batch_bytes
     }
 
+    pub fn put_state(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.inner
+            .put_state(key, value)
+            .map_err(|error| host_error("host rejected state page", error))
+    }
+
+    pub fn delete_state(&mut self, key: &[u8]) -> Result<()> {
+        self.inner
+            .delete_state(key)
+            .map_err(|error| host_error("host rejected state deletion", error))
+    }
+
     pub fn emit_changes(&mut self, record_count: u32, payload: Vec<u8>) -> Result<()> {
         self.validate_page(record_count, payload.len(), "change")?;
         self.inner

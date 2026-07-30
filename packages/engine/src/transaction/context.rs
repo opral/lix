@@ -66,9 +66,9 @@ use crate::plugin::{
     PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
     PluginActorStore, PluginActorStorePermit, PluginArchiveInstallPlan, PluginContentType,
     PluginFileOwner, PluginMaterialization, PluginObservation, PluginRegistry, PluginRegistryEntry,
-    PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition,
+    PluginRegistryEntryInput, PluginRuntimeHost, SchemaAllowlist, ValidatedConflictTransition,
     ValidatedFileTransition, ValidatedSameLengthOutputSplice, VecEntityChangeSource,
-    VecEntityConflictSource, VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
+    VecEntityConflictSource, VecEntitySource, build_file_update_splices, canonicalize_snapshot,
     drain_conflict_transition_resolutions, drain_entity_transition_edits,
     drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
     host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
@@ -167,7 +167,7 @@ use crate::transaction::validation::{
     validate_certified_tracked_insert_identities, validate_prepared_writes,
 };
 use crate::wasm::{
-    WasmChangeEffect, WasmComponentV2Actor, WasmComponentV2Factory, WasmConflictUpdate,
+    WasmChangeEffect, WasmComponentActor, WasmComponentFactory, WasmConflictUpdate,
     WasmDocumentHandle, WasmEntityChange, WasmEntityConflict, WasmEntityKey, WasmEntityUpdate,
     WasmFileDescriptor, WasmFileUpdate, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges,
     WasmOpenEntitiesInput, WasmOpenFileInput, WasmPluginSelection, WasmTransitionLimits,
@@ -184,13 +184,13 @@ pub(crate) struct TransactionCommitOutcome {
 /// The semantic root fences actor state. Blob-backed plugins retain a CAS
 /// reference; derived plugins retain only the exact rendered byte fingerprint.
 #[derive(Debug, Clone)]
-struct VisibleV2Materialization {
+struct VisibleMaterialization {
     semantic_root: String,
-    bytes: VisibleV2MaterializationBytes,
+    bytes: VisibleMaterializationBytes,
 }
 
 #[derive(Debug, Clone)]
-enum VisibleV2MaterializationBytes {
+enum VisibleMaterializationBytes {
     Blob {
         hash: BlobHash,
     },
@@ -202,11 +202,11 @@ enum VisibleV2MaterializationBytes {
 }
 
 #[cfg(test)]
-fn decode_visible_v2_materialization(
+fn decode_visible_materialization(
     row: &MaterializedLiveStateRow,
     file_id: &str,
-) -> Result<VisibleV2Materialization, LixError> {
-    decode_visible_v2_materialization_parts(
+) -> Result<VisibleMaterialization, LixError> {
+    decode_visible_materialization_parts(
         row.schema_key.as_str(),
         row.change_id,
         row.snapshot_content.as_deref(),
@@ -214,11 +214,11 @@ fn decode_visible_v2_materialization(
     )
 }
 
-fn decode_visible_v2_materialization_ref(
+fn decode_visible_materialization_ref(
     row: MaterializedLiveStateRowRef<'_>,
     file_id: &str,
-) -> Result<VisibleV2Materialization, LixError> {
-    decode_visible_v2_materialization_parts(
+) -> Result<VisibleMaterialization, LixError> {
+    decode_visible_materialization_parts(
         row.schema_key(),
         row.change_id(),
         row.snapshot_content().map(|content| content.as_str()),
@@ -226,23 +226,23 @@ fn decode_visible_v2_materialization_ref(
     )
 }
 
-fn decode_visible_v2_materialization_parts(
+fn decode_visible_materialization_parts(
     schema_key: &str,
     change_id: Option<ChangeId>,
     snapshot_content: Option<&str>,
     file_id: &str,
-) -> Result<VisibleV2Materialization, LixError> {
+) -> Result<VisibleMaterialization, LixError> {
     let semantic_root = change_id.map(|root| root.to_string()).ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            format!("v2 materialization root for file '{file_id}' is missing change_id"),
+            format!("component materialization root for file '{file_id}' is missing change_id"),
         )
     })?;
     let snapshot = snapshot_content.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INVALID_PLUGIN,
             format!(
-                "owned v2 plugin file '{file_id}' materialization is missing its durable proof"
+                "owned component plugin file '{file_id}' materialization is missing its durable proof"
             ),
         )
     })?;
@@ -253,7 +253,7 @@ fn decode_visible_v2_materialization_parts(
                     LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
                         format!(
-                            "owned v2 plugin file '{file_id}' has an invalid blob reference: {error}"
+                            "owned component plugin file '{file_id}' has an invalid blob reference: {error}"
                         ),
                     )
                 })?;
@@ -261,11 +261,11 @@ fn decode_visible_v2_materialization_parts(
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     format!(
-                        "owned v2 plugin file '{file_id}' materialization identity does not match its file scope"
+                        "owned component plugin file '{file_id}' materialization identity does not match its file scope"
                     ),
                 ));
             }
-            VisibleV2MaterializationBytes::Blob {
+            VisibleMaterializationBytes::Blob {
                 hash: BlobHash::from_hex(&snapshot.blob_hash)?,
             }
         }
@@ -274,7 +274,7 @@ fn decode_visible_v2_materialization_parts(
                 LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     format!(
-                        "owned v2 plugin file '{file_id}' has an invalid derived materialization: {error}"
+                        "owned component plugin file '{file_id}' has an invalid derived materialization: {error}"
                     ),
                 )
             })?;
@@ -282,7 +282,7 @@ fn decode_visible_v2_materialization_parts(
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     format!(
-                        "owned v2 plugin file '{file_id}' materialization identity does not match its file scope"
+                        "owned component plugin file '{file_id}' materialization identity does not match its file scope"
                     ),
                 ));
             }
@@ -290,11 +290,11 @@ fn decode_visible_v2_materialization_parts(
                 LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
                     format!(
-                        "owned v2 plugin file '{file_id}' has an invalid derived SHA-256 proof"
+                        "owned component plugin file '{file_id}' has an invalid derived SHA-256 proof"
                     ),
                 )
             })?;
-            VisibleV2MaterializationBytes::Derived {
+            VisibleMaterializationBytes::Derived {
                 path: snapshot.path,
                 sha256,
                 size_bytes: snapshot.size_bytes,
@@ -304,12 +304,12 @@ fn decode_visible_v2_materialization_parts(
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
                 format!(
-                    "owned v2 plugin file '{file_id}' materialization uses unsupported schema '{schema_key}'"
+                    "owned component plugin file '{file_id}' materialization uses unsupported schema '{schema_key}'"
                 ),
             ));
         }
     };
-    Ok(VisibleV2Materialization {
+    Ok(VisibleMaterialization {
         semantic_root,
         bytes,
     })
@@ -1146,7 +1146,7 @@ where
         preflight_derived_path_stability(&base, &staged, &prospective, &prospective.rows).await
     }
 
-    /// Runs the stateless conflict resolver for one pinned v2 plugin
+    /// Runs the stateless conflict resolver for one pinned component plugin
     /// generation. Unlike normal file mutation this creates no persistent
     /// document actor: a merge may need to resolve one row from a large file,
     /// and the resulting rows are rendered once by the ordinary staged-write
@@ -1156,7 +1156,7 @@ where
     /// roots, not the mutable current registry. This keeps `b` selection
     /// and plugin code selection deterministic across merge direction and
     /// retries.
-    pub(crate) async fn resolve_v2_plugin_conflicts(
+    pub(crate) async fn resolve_plugin_conflicts(
         &mut self,
         plugin: &PluginRegistryEntry,
         descriptor: WasmFileDescriptor,
@@ -1169,7 +1169,7 @@ where
         let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
         let factory = match self
             .plugin_host
-            .cached_plugin_v2_factory(plugin.key(), wasm_hash)?
+            .cached_plugin_factory(plugin.key(), wasm_hash)?
         {
             Some(factory) => factory,
             None => {
@@ -1196,7 +1196,7 @@ where
                     })?;
                 let installed = plugin.to_installed_plugin(wasm)?;
                 self.plugin_host
-                    .load_or_compile_v2_factory(&installed)
+                    .load_or_compile_factory(&installed)
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
                         "lix.perf.plugin_conflict_factory_compile"
@@ -1254,7 +1254,7 @@ where
         };
         store.actor_mut().retire().await?;
         self.plugin_host
-            .record_v2_transition_counters(validated.counters);
+            .record_transition_counters(validated.counters);
         Ok(validated)
     }
 
@@ -1272,10 +1272,10 @@ where
         overlay_scan_batch(&base, &staged, request).await
     }
 
-    async fn visible_v2_materialization(
+    async fn visible_materialization(
         &mut self,
         key: &PluginFileWriteKey,
-    ) -> Result<Option<VisibleV2Materialization>, LixError> {
+    ) -> Result<Option<VisibleMaterialization>, LixError> {
         let rows = self
             .scan_visible_live_state_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
@@ -1297,22 +1297,22 @@ where
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "v2 materialization lookup returned duplicate rows for file '{}'",
+                    "component materialization lookup returned duplicate rows for file '{}'",
                     key.file_id
                 ),
             ));
         }
         rows.get(0)
-            .map(|row| decode_visible_v2_materialization_ref(row, &key.file_id))
+            .map(|row| decode_visible_materialization_ref(row, &key.file_id))
             .transpose()
     }
 
-    async fn cold_open_v2_semantic_actor(
+    async fn cold_open_semantic_actor(
         &mut self,
         actor_key: &PluginActorKey,
         plugin: &PluginRegistryEntry,
         descriptor: WasmFileDescriptor,
-        factory: Arc<dyn WasmComponentV2Factory>,
+        factory: Arc<dyn WasmComponentFactory>,
         current_publications: &mut Vec<PendingPluginActorPublication>,
     ) -> Result<PluginObservation, LixError> {
         let cache = self.plugin_host.actor_cache();
@@ -1354,28 +1354,28 @@ where
             return Err(LixError::new(
                 LixError::CODE_PLUGIN_OBSERVATION_STALE,
                 format!(
-                    "owned v2 plugin file '{}' must have exactly one visible materialization; found {}",
+                    "owned component plugin file '{}' must have exactly one visible materialization; found {}",
                     actor_key.file_id,
                     blob_rows.len()
                 ),
             ));
         }
         let materialization =
-            decode_visible_v2_materialization_ref(blob_rows.row(0), &actor_key.file_id)?;
+            decode_visible_materialization_ref(blob_rows.row(0), &actor_key.file_id)?;
         if !matches!(
             (plugin.materialization(), &materialization.bytes),
             (
                 PluginMaterialization::Blob,
-                &VisibleV2MaterializationBytes::Blob { .. }
+                &VisibleMaterializationBytes::Blob { .. }
             ) | (
                 PluginMaterialization::Derived,
-                &VisibleV2MaterializationBytes::Derived { .. }
+                &VisibleMaterializationBytes::Derived { .. }
             )
         ) {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
                 format!(
-                    "owned v2 plugin file '{}' materialization does not match plugin '{}' contract",
+                    "owned component plugin file '{}' materialization does not match plugin '{}' contract",
                     actor_key.file_id,
                     plugin.key()
                 ),
@@ -1430,14 +1430,14 @@ where
         let entity_ordinals =
             v2_host_entity_ordinals_from_live_batch(&rows, &file_key, plugin.schema_keys())?;
         let entity_count = entity_ordinals.len();
-        if let VisibleV2MaterializationBytes::Derived { path, .. } = &materialization.bytes
+        if let VisibleMaterializationBytes::Derived { path, .. } = &materialization.bytes
             && descriptor.path.as_deref() != Some(path.as_str())
         {
             let _ = actor.retire().await;
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
                 format!(
-                    "owned v2 plugin file '{}' derived materialization was rendered at '{}' but now resolves to '{}'",
+                    "owned component plugin file '{}' derived materialization was rendered at '{}' but now resolves to '{}'",
                     actor_key.file_id,
                     path,
                     descriptor.path.as_deref().unwrap_or_default(),
@@ -1446,7 +1446,7 @@ where
         }
         let materialization_bytes = materialization.bytes.clone();
         let validated = match materialization_bytes {
-            VisibleV2MaterializationBytes::Blob { hash } => {
+            VisibleMaterializationBytes::Blob { hash } => {
                 let base_blob_reader = self.binary_cas.reader(read);
                 let materialized_bytes: crate::Blob = load_transaction_blob_bytes(
                     &base_blob_reader,
@@ -1462,7 +1462,7 @@ where
                     LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
                         format!(
-                            "owned v2 plugin file '{}' references missing materialized blob '{}'",
+                            "owned component plugin file '{}' references missing materialized blob '{}'",
                             actor_key.file_id,
                             hash.to_hex()
                         ),
@@ -1506,7 +1506,7 @@ where
                     }
                 }
             }
-            VisibleV2MaterializationBytes::Derived {
+            VisibleMaterializationBytes::Derived {
                 sha256, size_bytes, ..
             } => {
                 let source = LiveBatchEntitySource::new(rows, entity_ordinals, limits)?;
@@ -1551,7 +1551,7 @@ where
                     return Err(LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
                         format!(
-                            "owned v2 plugin file '{}' derived materialization does not reproduce its durable proof",
+                            "owned component plugin file '{}' derived materialization does not reproduce its durable proof",
                             actor_key.file_id
                         ),
                     ));
@@ -1561,8 +1561,8 @@ where
         };
         let materialized_bytes = validated.bytes.clone();
         let materialized_bytes_sha256 = match materialization.bytes {
-            VisibleV2MaterializationBytes::Blob { .. } => validated.bytes_sha256,
-            VisibleV2MaterializationBytes::Derived { .. } => {
+            VisibleMaterializationBytes::Blob { .. } => validated.bytes_sha256,
+            VisibleMaterializationBytes::Derived { .. } => {
                 Some(FileBytesSha256::compute(&materialized_bytes))
             }
         };
@@ -1571,7 +1571,7 @@ where
             u64::try_from(entity_count).unwrap_or(u64::MAX);
         counters.full_document_reparses = 1;
         counters.full_renderer_invocations = u64::from(!cold_open_hydrates_without_render);
-        self.plugin_host.record_v2_transition_counters(counters);
+        self.plugin_host.record_transition_counters(counters);
         cache
             .install_cold_if_absent(
                 cold_install,
@@ -1591,13 +1591,13 @@ where
     /// The durable semantic root must still exactly match the root delivered
     /// with the observation. A concurrent committed transition therefore
     /// remains stale and cannot be mistaken for benign working-set eviction.
-    async fn lease_or_reopen_observed_v2_actor(
+    async fn lease_or_reopen_observed_actor(
         &mut self,
         observation: &PluginObservation,
         actor_key: &PluginActorKey,
         plugin: &PluginRegistryEntry,
         descriptor: WasmFileDescriptor,
-        factory: Arc<dyn WasmComponentV2Factory>,
+        factory: Arc<dyn WasmComponentFactory>,
         current_publications: &mut Vec<PendingPluginActorPublication>,
     ) -> Result<PluginActorLease, LixError> {
         let cache = self.plugin_host.actor_cache();
@@ -1610,8 +1610,7 @@ where
                     untracked: false,
                     file_id: actor_key.file_id.clone(),
                 };
-                let Some(visible_materialization) =
-                    self.visible_v2_materialization(&file_key).await?
+                let Some(visible_materialization) = self.visible_materialization(&file_key).await?
                 else {
                     return Err(error);
                 };
@@ -1623,13 +1622,7 @@ where
         }
 
         let reopened = self
-            .cold_open_v2_semantic_actor(
-                actor_key,
-                plugin,
-                descriptor,
-                factory,
-                current_publications,
-            )
+            .cold_open_semantic_actor(actor_key, plugin, descriptor, factory, current_publications)
             .await?;
         cache.lease_for_transition(&reopened).await
     }
@@ -1652,7 +1645,7 @@ where
     /// currently accepted durable entity. The exact-row lookup keeps this
     /// proportional to the sparse format-only output instead of hydrating the
     /// complete file graph.
-    async fn suppress_v2_format_only_noops(
+    async fn suppress_format_only_noops(
         &mut self,
         plugin: &PluginRegistryEntry,
         changes: WasmHostEntityChanges,
@@ -1701,7 +1694,7 @@ where
             .map(|(_, key)| key.clone())
             .collect();
         Ok((
-            suppress_v2_format_only_noops_against_batch(changes, &format_only_keys, &current)?,
+            suppress_format_only_noops_against_batch(changes, &format_only_keys, &current)?,
             observed_existing,
         ))
     }
@@ -1748,7 +1741,7 @@ where
                     entity_pk: EntityPk::uuid_from_canonical(id).map_err(|error| {
                         LixError::new(
                             LixError::CODE_INVALID_PLUGIN,
-                            format!("v2 plugin emitted invalid entity_pk: {error}"),
+                            format!("component plugin emitted invalid entity_pk: {error}"),
                         )
                     })?,
                     file_id: Some(file_key.file_id.clone()),
@@ -1788,17 +1781,17 @@ where
         Ok(rows)
     }
 
-    async fn preflight_v2_create(
+    async fn preflight_create(
         &mut self,
         bound: BoundCreateContext,
         file_key: &PluginFileWriteKey,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        self.preflight_v2_creates(&[(bound, file_key.clone())])
+        self.preflight_creates(&[(bound, file_key.clone())])
             .await
             .map(|mut rows| rows.pop().expect("one preflight produces one result"))
     }
 
-    async fn preflight_v2_creates(
+    async fn preflight_creates(
         &mut self,
         requests: &[(BoundCreateContext, PluginFileWriteKey)],
     ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
@@ -1876,7 +1869,7 @@ where
         file_key: &PluginFileWriteKey,
         target: PluginMaterialization,
     ) -> Result<RawWriteBatch, LixError> {
-        let Some(visible) = self.visible_v2_materialization(file_key).await? else {
+        let Some(visible) = self.visible_materialization(file_key).await? else {
             return Ok(RawWriteBatch::new());
         };
         let context = FilesystemRowContext {
@@ -1888,10 +1881,10 @@ where
         };
         let mut rows = RawWriteBatch::with_capacity(1);
         match (target, visible.bytes) {
-            (PluginMaterialization::Derived, VisibleV2MaterializationBytes::Blob { .. }) => {
+            (PluginMaterialization::Derived, VisibleMaterializationBytes::Blob { .. }) => {
                 append_blob_ref_tombstone_row(&mut rows, file_key.file_id.clone(), context);
             }
-            (PluginMaterialization::Blob, VisibleV2MaterializationBytes::Derived { .. }) => {
+            (PluginMaterialization::Blob, VisibleMaterializationBytes::Derived { .. }) => {
                 append_derived_file_ref_tombstone_row(&mut rows, file_key.file_id.clone(), context);
             }
             _ => {}
@@ -1955,7 +1948,7 @@ where
                                 LixError::new(
                                     LixError::CODE_INTERNAL_ERROR,
                                     format!(
-                                        "v2 semantic materialization payload for file '{}' is missing",
+                                        "component semantic materialization payload for file '{}' is missing",
                                         file_key.file_id
                                     ),
                                 )
@@ -2061,7 +2054,7 @@ where
                                 LixError::new(
                                     LixError::CODE_INTERNAL_ERROR,
                                     format!(
-                                        "v2 materialization payload for file '{}' is missing",
+                                        "component materialization payload for file '{}' is missing",
                                         file_key.file_id
                                     ),
                                 )
@@ -2620,7 +2613,7 @@ where
         }
         if !generation_upgrades.is_empty() {
             let base_blob_reader = self.binary_cas.reader(read.clone());
-            preflight_owned_v2_generation_upgrades(
+            preflight_owned_generation_upgrades(
                 &self.plugin_host,
                 &base,
                 &staged,
@@ -2852,7 +2845,7 @@ where
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     format!(
-                        "one write batch cannot mutate both bytes and semantic entities for v2 plugin file '{file_id}'"
+                        "one write batch cannot mutate both bytes and semantic entities for component plugin file '{file_id}'"
                     ),
                 )
                 .with_hint("submit either the byte mutation or the resolved entity mutations"));
@@ -2861,7 +2854,7 @@ where
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     format!(
-                        "one write batch cannot delete v2 plugin file '{file_id}' and mutate its semantic entities"
+                        "one write batch cannot delete component plugin file '{file_id}' and mutate its semantic entities"
                     ),
                 ));
             }
@@ -2869,7 +2862,7 @@ where
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "durable v2 plugin owner for file '{file_id}' is missing its incarnation"
+                        "durable component plugin owner for file '{file_id}' is missing its incarnation"
                     ),
                 )
             })?;
@@ -2887,7 +2880,7 @@ where
             group.2.push(row_index);
         }
 
-        let mut semantic_groups = BTreeMap::<PluginFileWriteKey, PluginV2SemanticWriteGroup>::new();
+        let mut semantic_groups = BTreeMap::<PluginFileWriteKey, PluginSemanticWriteGroup>::new();
         if !unresolved_semantic_groups.is_empty() {
             let request = FilesystemPathIndexRequest::new(
                 unresolved_semantic_groups
@@ -2913,7 +2906,7 @@ where
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         format!(
-                            "owned v2 plugin file '{}' must resolve to exactly one tracked path; found {}",
+                            "owned component plugin file '{}' must resolve to exactly one tracked path; found {}",
                             file_key.file_id,
                             entries.len()
                         ),
@@ -2926,7 +2919,7 @@ where
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         format!(
-                            "owned v2 plugin '{}' no longer matches file path '{}'",
+                            "owned component plugin '{}' no longer matches file path '{}'",
                             plugin.key(),
                             entry.path
                         ),
@@ -2934,7 +2927,7 @@ where
                 }
                 semantic_groups.insert(
                     file_key,
-                    PluginV2SemanticWriteGroup {
+                    PluginSemanticWriteGroup {
                         plugin,
                         path: entry.path.clone(),
                         filename: entry.name.clone(),
@@ -2971,7 +2964,7 @@ where
                 .get(&write.branch_id)
                 .expect("active plugin branch should have a registry");
 
-            // A warm v2 actor already carries an exact, generation-bound
+            // A warm component actor already carries an exact, generation-bound
             // selection. Reuse it only while every matcher-relevant identity
             // is unchanged. UTF-8 and Git-text constraints have separate
             // bounded trusted-splice proofs; all inconclusive, binary, blind,
@@ -3036,7 +3029,7 @@ where
             }
             let selected = selected_plugins.get(key);
             let semantic = semantic_groups.get(key).map(|group| &group.plugin);
-            // A same-owner v2 write is authorized by an exact document
+            // A same-owner component write is authorized by an exact document
             // observation and must not hydrate the complete durable graph.
             // Lifecycle removal/reselection still needs the old rows so it
             // can tombstone every schema owned by the previous plugin.
@@ -3184,24 +3177,22 @@ where
         // Resolve warm factories by their fixed content hash before asking the
         // CAS for bytes. The factory can then instantiate one isolated actor
         // per file without recompiling the component.
-        let mut component_v2_factories =
-            BTreeMap::<PluginBranchEntryKey, Arc<dyn WasmComponentV2Factory>>::new();
-        let mut cold_v2_entries = BTreeMap::<PluginBranchEntryKey, PluginRegistryEntry>::new();
+        let mut component_factories =
+            BTreeMap::<PluginBranchEntryKey, Arc<dyn WasmComponentFactory>>::new();
+        let mut cold_entries = BTreeMap::<PluginBranchEntryKey, PluginRegistryEntry>::new();
         for (key, entry) in selected_entries {
             let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
-            let cached_factory = self
-                .plugin_host
-                .cached_plugin_v2_factory(entry.key(), hash)?;
+            let cached_factory = self.plugin_host.cached_plugin_factory(entry.key(), hash)?;
             if let Some(factory) = cached_factory {
-                component_v2_factories.insert(key, factory);
+                component_factories.insert(key, factory);
             } else {
-                cold_v2_entries.insert(key, entry);
+                cold_entries.insert(key, entry);
             }
         }
 
         let mut wasm_by_hash = current_install_wasm;
         let mut missing_hashes = Vec::<BlobHash>::new();
-        for entry in cold_v2_entries.values() {
+        for entry in cold_entries.values() {
             let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
             if !wasm_by_hash.contains_key(&hash) && !missing_hashes.contains(&hash) {
                 missing_hashes.push(hash);
@@ -3229,7 +3220,7 @@ where
                 wasm_by_hash.insert(hash, bytes);
             }
         }
-        for (key, entry) in cold_v2_entries {
+        for (key, entry) in cold_entries {
             let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
             let wasm = wasm_by_hash.get(&hash).cloned().ok_or_else(|| {
                 LixError::new(
@@ -3243,13 +3234,13 @@ where
             let plugin = entry.to_installed_plugin(wasm)?;
             let factory = self
                 .plugin_host
-                .load_or_compile_v2_factory(&plugin)
+                .load_or_compile_factory(&plugin)
                 .instrument(tracing::debug_span!(
                     target: "lix_perf",
                     "lix.perf.plugin_factory_compile"
                 ))
                 .await?;
-            component_v2_factories.insert(key, factory);
+            component_factories.insert(key, factory);
         }
 
         let mut reconciled_file_keys = BTreeSet::<PluginFileWriteKey>::new();
@@ -3291,9 +3282,9 @@ where
                     branch_id: write.branch_id.clone(),
                     plugin_key: selected.key().to_string(),
                 };
-                let factory = component_v2_factories
+                let factory = component_factories
                     .get(&installed_key)
-                    .expect("selected v2 plugin should have a compiled factory")
+                    .expect("selected component plugin should have a compiled factory")
                     .clone();
                 let desired_owner =
                     PluginFileOwner::from_registry_entry(write.file_id.clone(), &selected)?;
@@ -3329,7 +3320,7 @@ where
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         format!(
-                            "one transaction cannot transition v2 plugin file '{}' more than once",
+                            "one transaction cannot transition component plugin file '{}' more than once",
                             write.file_id
                         ),
                     )
@@ -3337,7 +3328,7 @@ where
                 }
 
                 let descriptor = v2_file_descriptor(write, &selected);
-                let schemas = V2SchemaAllowlist::from_catalog(
+                let schemas = SchemaAllowlist::from_catalog(
                     selected.schema_keys(),
                     Arc::clone(&self.sql_schema_snapshot),
                 )?;
@@ -3372,7 +3363,7 @@ where
                 .iter()
                 .map(|prepared| (prepared.create_context, prepared.file_key.clone()))
                 .collect::<Vec<_>>();
-            let existing_rows = match self.preflight_v2_creates(&preflight_requests).await {
+            let existing_rows = match self.preflight_creates(&preflight_requests).await {
                 Ok(existing_rows) => existing_rows,
                 Err(error) => {
                     discard_plugin_actor_publications(std::mem::take(
@@ -3458,11 +3449,7 @@ where
                             "lix.perf.plugin_open_file_drain"
                         ))
                         .await?;
-                        crate::plugin::certify_dense_v2_fresh_file(
-                            &mut validated,
-                            creates,
-                            &schemas,
-                        )?;
+                        crate::plugin::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
                         Ok((actor, validated))
                     });
                     PendingFreshPluginOpen {
@@ -3543,7 +3530,7 @@ where
                 counters.durable_semantic_changes = u64::try_from(changes.entity_change_count())
                     .unwrap_or(u64::MAX)
                     .saturating_add(certified_row_count);
-                self.plugin_host.record_v2_transition_counters(counters);
+                self.plugin_host.record_transition_counters(counters);
 
                 rows.push(pending.owner_row);
                 rows.append(create_rows);
@@ -3555,7 +3542,7 @@ where
                     file_id: None,
                     metadata: None,
                 };
-                append_plugin_change_rows_from_v2(
+                append_plugin_change_rows(
                     rows,
                     &pending.selected,
                     changes,
@@ -3667,9 +3654,9 @@ where
                 branch_id: write.branch_id.clone(),
                 plugin_key: selected.key().to_string(),
             };
-            let factory = component_v2_factories
+            let factory = component_factories
                 .get(&installed_key)
-                .expect("selected v2 plugin should have a compiled factory")
+                .expect("selected component plugin should have a compiled factory")
                 .clone();
             let same_plugin_owner = owner.is_some_and(|owner| owner.plugin_key() == selected.key());
             let session_key = SessionFileViewKey::new(&write.branch_id, &write.file_id);
@@ -3690,7 +3677,7 @@ where
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!(
-                            "durable v2 plugin owner for file '{}' is missing its incarnation",
+                            "durable component plugin owner for file '{}' is missing its incarnation",
                             write.file_id
                         ),
                     )
@@ -3722,7 +3709,7 @@ where
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     format!(
-                        "one transaction cannot transition v2 plugin file '{}' more than once",
+                        "one transaction cannot transition component plugin file '{}' more than once",
                         write.file_id
                     ),
                 )
@@ -3730,7 +3717,7 @@ where
             }
             let descriptor = v2_file_descriptor(write, selected);
             let limits = WasmTransitionLimits::default();
-            let schemas = V2SchemaAllowlist::from_catalog(
+            let schemas = SchemaAllowlist::from_catalog(
                 selected.schema_keys(),
                 Arc::clone(&self.sql_schema_snapshot),
             )?;
@@ -3740,7 +3727,7 @@ where
             let create_context = BoundCreateContext::bind(mutation_identity, &actor_key)?;
             let creates = create_context.creates();
             let existing_create_reservation =
-                match self.preflight_v2_create(create_context, &file_key).await {
+                match self.preflight_create(create_context, &file_key).await {
                     Ok(existing) => existing,
                     Err(error) => {
                         discard_plugin_actor_publications(std::mem::take(
@@ -3760,13 +3747,13 @@ where
                     selected,
                     current_owner_change_id
                         .as_deref()
-                        .expect("same-owner v2 file should have an owner incarnation"),
+                        .expect("same-owner component file should have an owner incarnation"),
                 );
                 let observation = match acknowledged_view {
                     Some(view) => match view.observation {
                         Some(observation) => observation,
                         None => {
-                            self.cold_open_v2_semantic_actor(
+                            self.cold_open_semantic_actor(
                                 &actor_key,
                                 selected,
                                 descriptor.clone(),
@@ -3785,12 +3772,12 @@ where
                     {
                         return Err(LixError::new(
                             LixError::CODE_PLUGIN_OBSERVATION_STALE,
-                            "the acknowledged v2 file identity no longer matches this write",
+                            "the acknowledged component file identity no longer matches this write",
                         )
                         .with_hint("read the exact file bytes again before retrying the edit"));
                     }
                     None => {
-                        self.cold_open_v2_semantic_actor(
+                        self.cold_open_semantic_actor(
                             &actor_key,
                             selected,
                             descriptor.clone(),
@@ -3803,7 +3790,7 @@ where
                 if !v2_actor_key_is_descriptor_successor(observation.key(), &actor_key) {
                     return Err(LixError::new(
                         LixError::CODE_PLUGIN_OBSERVATION_STALE,
-                        "the acknowledged v2 file identity no longer matches this write",
+                        "the acknowledged component file identity no longer matches this write",
                     )
                     .with_hint("read the exact file bytes again before retrying the edit"));
                 }
@@ -3814,7 +3801,7 @@ where
                 // Then read the root again: a second local session may have
                 // committed while this request waited for the actor.
                 let mut lease = self
-                    .lease_or_reopen_observed_v2_actor(
+                    .lease_or_reopen_observed_actor(
                         &observation,
                         &actor_key,
                         selected,
@@ -3824,12 +3811,12 @@ where
                     )
                     .await?;
                 let visible_materialization = self
-                    .visible_v2_materialization(&file_key)
+                    .visible_materialization(&file_key)
                     .await?
                     .ok_or_else(|| {
                         LixError::new(
                             LixError::CODE_PLUGIN_OBSERVATION_STALE,
-                            "the acknowledged v2 file no longer has a visible materialization root",
+                            "the acknowledged component file no longer has a visible materialization root",
                         )
                         .with_hint("read the exact file bytes again before retrying the edit")
                     })?;
@@ -3913,7 +3900,7 @@ where
                 let detection_document = detected_transition.document;
                 let mut counters = detected_transition.counters;
                 let (mut changes, observed_existing_authorities) = match self
-                    .suppress_v2_format_only_noops(selected, detected_transition.changes, &file_key)
+                    .suppress_format_only_noops(selected, detected_transition.changes, &file_key)
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
                         "lix.perf.plugin_suppress_noops"
@@ -3963,9 +3950,9 @@ where
                         // exact merge result; rendering the same sparse change
                         // onto the same base would only repeat guest work.
                         verified_same_length_blob_splice = match visible_materialization.bytes {
-                            VisibleV2MaterializationBytes::Blob { hash } => same_length_blob_splice
+                            VisibleMaterializationBytes::Blob { hash } => same_length_blob_splice
                                 .map(|(offset, length)| (hash, offset, length)),
-                            VisibleV2MaterializationBytes::Derived { .. } => None,
+                            VisibleMaterializationBytes::Derived { .. } => None,
                         };
                         (
                             detection_document,
@@ -4047,7 +4034,7 @@ where
                 counters.durable_semantic_changes = u64::try_from(changes.entity_change_count())
                     .unwrap_or(u64::MAX)
                     .saturating_add(certified_row_count);
-                self.plugin_host.record_v2_transition_counters(counters);
+                self.plugin_host.record_transition_counters(counters);
                 lease.complete_guest_call(
                     successor_document,
                     materialized_bytes.clone(),
@@ -4104,7 +4091,7 @@ where
                     "lix.perf.plugin_open_file_drain"
                 ))
                 .await?;
-                crate::plugin::certify_dense_v2_fresh_file(&mut validated, creates, &schemas)?;
+                crate::plugin::certify_dense_fresh_file(&mut validated, creates, &schemas)?;
                 let certified_row_count = validated
                     .certified_batches
                     .iter()
@@ -4135,7 +4122,7 @@ where
                 counters.durable_semantic_changes = u64::try_from(changes.entity_change_count())
                     .unwrap_or(u64::MAX)
                     .saturating_add(certified_row_count);
-                self.plugin_host.record_v2_transition_counters(counters);
+                self.plugin_host.record_transition_counters(counters);
                 (
                     changes,
                     PendingPluginActorPublication::New {
@@ -4157,7 +4144,7 @@ where
                 "lix.perf.plugin_change_rows"
             )
             .in_scope(|| {
-                append_plugin_change_rows_from_v2(rows, selected, changes, &write.file_id, &context)
+                append_plugin_change_rows(rows, selected, changes, &write.file_id, &context)
             });
             if let Err(error) = change_rows {
                 publication.discard().await;
@@ -4219,7 +4206,7 @@ where
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     format!(
-                        "one write batch cannot transition v2 plugin file '{}' more than once",
+                        "one write batch cannot transition component plugin file '{}' more than once",
                         file_key.file_id
                     ),
                 ));
@@ -4228,9 +4215,9 @@ where
                 branch_id: file_key.branch_id.clone(),
                 plugin_key: group.plugin.key().to_string(),
             };
-            let factory = component_v2_factories
+            let factory = component_factories
                 .get(&installed_key)
-                .expect("semantic v2 plugin should have a compiled factory")
+                .expect("semantic component plugin should have a compiled factory")
                 .clone();
             let descriptor = WasmFileDescriptor {
                 path: Some(group.path.clone()),
@@ -4277,7 +4264,7 @@ where
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     format!(
-                        "normalized semantic rows escaped v2 plugin file '{}' ownership",
+                        "normalized semantic rows escaped component plugin file '{}' ownership",
                         file_key.file_id
                     ),
                 ));
@@ -4287,7 +4274,7 @@ where
             if changes.entity_change_count() == 0 {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
-                    "v2 semantic write batch must contain at least one entity change",
+                    "component semantic write batch must contain at least one entity change",
                 ));
             }
             let view = PendingPluginActorView {
@@ -4324,7 +4311,7 @@ where
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
                         format!(
-                            "semantic entity writes cannot follow a byte or identity transition for v2 plugin file '{}' in the same transaction",
+                            "semantic entity writes cannot follow a byte or identity transition for component plugin file '{}' in the same transaction",
                             file_key.file_id
                         ),
                     )
@@ -4333,13 +4320,13 @@ where
                 None => {
                     let cache = self.plugin_host.actor_cache();
                     let visible_materialization = self
-                        .visible_v2_materialization(&file_key)
+                        .visible_materialization(&file_key)
                         .await?
                         .ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_PLUGIN_OBSERVATION_STALE,
                                 format!(
-                                    "owned v2 plugin file '{}' has no visible materialization root",
+                                    "owned component plugin file '{}' has no visible materialization root",
                                     file_key.file_id
                                 ),
                             )
@@ -4355,7 +4342,7 @@ where
                         PluginActorColdOpen::Ready(observation) => observation,
                         PluginActorColdOpen::Build(cold_install) => {
                             drop(cold_install);
-                            self.cold_open_v2_semantic_actor(
+                            self.cold_open_semantic_actor(
                                 &actor_key,
                                 &group.plugin,
                                 descriptor.clone(),
@@ -4373,7 +4360,7 @@ where
                         return Err(LixError::new(
                             LixError::CODE_PLUGIN_OBSERVATION_STALE,
                             format!(
-                                "v2 semantic write actor identity no longer matches file '{}'",
+                                "component semantic write actor identity no longer matches file '{}'",
                                 file_key.file_id
                             ),
                         ));
@@ -4391,7 +4378,7 @@ where
                     )
                 }
             };
-            let visible_materialization = match self.visible_v2_materialization(&file_key).await {
+            let visible_materialization = match self.visible_materialization(&file_key).await {
                 Ok(Some(materialization)) => materialization,
                 Ok(None) => {
                     let publication = PendingPluginActorPublication::Existing {
@@ -4407,7 +4394,7 @@ where
                     return Err(LixError::new(
                         LixError::CODE_PLUGIN_OBSERVATION_STALE,
                         format!(
-                            "owned v2 plugin file '{}' lost its materialization root",
+                            "owned component plugin file '{}' lost its materialization root",
                             file_key.file_id
                         ),
                     ));
@@ -4427,7 +4414,7 @@ where
                 }
             };
             let materialization_version = self.functions.call_uuid_v7().to_string();
-            let transition = render_v2_semantic_changes_with_lease(
+            let transition = render_semantic_changes_with_lease(
                 lease,
                 successor_key,
                 publication_view,
@@ -4458,11 +4445,10 @@ where
                         return Err(error);
                     }
                 };
-            self.plugin_host.record_v2_transition_counters(counters);
+            self.plugin_host.record_transition_counters(counters);
             match group.plugin.materialization() {
                 PluginMaterialization::Blob => {
-                    let VisibleV2MaterializationBytes::Blob { hash } =
-                        visible_materialization.bytes
+                    let VisibleMaterializationBytes::Blob { hash } = visible_materialization.bytes
                     else {
                         publication.discard().await;
                         discard_plugin_actor_publications(std::mem::take(
@@ -4472,7 +4458,7 @@ where
                         return Err(LixError::new(
                             LixError::CODE_INVALID_PLUGIN,
                             format!(
-                                "owned v2 plugin file '{}' blob contract has no visible CAS materialization",
+                                "owned component plugin file '{}' blob contract has no visible CAS materialization",
                                 file_key.file_id
                             ),
                         ));
@@ -6442,7 +6428,7 @@ fn v2_create_context(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::wasm:
         .creates()
 }
 
-fn suppress_v2_format_only_noops_against_batch(
+fn suppress_format_only_noops_against_batch(
     changes: WasmHostEntityChanges,
     keys: &[WasmEntityKey],
     accepted: &MaterializedLiveStateExactBatch,
@@ -6478,7 +6464,7 @@ fn suppress_v2_format_only_noops_against_batch(
                     WasmHostBytes::Inline(_) | WasmHostBytes::Source(_) => {
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
-                            "validated v2 guest changes must own parsed canonical snapshots",
+                            "validated component guest changes must own parsed canonical snapshots",
                         ));
                     }
                 };
@@ -6491,7 +6477,7 @@ fn suppress_v2_format_only_noops_against_batch(
                     // a different key order or equivalent escape spelling;
                     // canonicalize that base exactly once only on mismatch.
                     candidate.as_bytes()
-                        == canonicalize_v2_snapshot(base_snapshot.as_bytes())?.as_slice()
+                        == canonicalize_snapshot(base_snapshot.as_bytes())?.as_slice()
                 }
             }
             WasmEntityChange::Create { .. }
@@ -6505,7 +6491,7 @@ fn suppress_v2_format_only_noops_against_batch(
     Ok(WasmHostEntityChanges { changes: effective })
 }
 
-fn append_plugin_change_rows_from_v2(
+fn append_plugin_change_rows(
     rows: &mut RawWriteBatch,
     plugin: &PluginRegistryEntry,
     changes: WasmHostEntityChanges,
@@ -6542,7 +6528,7 @@ fn append_plugin_change_rows_from_v2(
                     WasmHostBytes::Inline(_) | WasmHostBytes::Source(_) => {
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
-                            "validated v2 guest changes must own parsed canonical snapshots",
+                            "validated component guest changes must own parsed canonical snapshots",
                         ));
                     }
                 };
@@ -6608,7 +6594,7 @@ fn plugin_entity_pk(
     result.map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PLUGIN,
-            format!("v2 plugin emitted invalid entity_pk: {error}"),
+            format!("component plugin emitted invalid entity_pk: {error}"),
         )
     })
 }
@@ -6643,7 +6629,7 @@ fn v2_host_entities_from_live_batch_ordinals(
         if pair[0].key == pair[1].key {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "durable v2 entity hydration returned duplicate keys",
+                "durable component entity hydration returned duplicate keys",
             ));
         }
     }
@@ -6690,7 +6676,7 @@ fn v2_host_entity_ordinals_from_live_batch(
         if left.schema_key() == right.schema_key() && left.entity_pk() == right.entity_pk() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "durable v2 entity hydration returned duplicate keys",
+                "durable component entity hydration returned duplicate keys",
             ));
         }
     }
@@ -6707,7 +6693,7 @@ fn v2_host_changes_from_prepared_rows(
             if row.global || row.untracked || row.file_id.is_none() {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    "v2 semantic rendering requires tracked, branch-local, file-scoped rows",
+                    "component semantic rendering requires tracked, branch-local, file-scoped rows",
                 ));
             }
             let key = WasmEntityKey::from_owned_parts(
@@ -6740,7 +6726,7 @@ fn v2_host_changes_from_prepared_rows(
         if pair[0].entity_key() == pair[1].entity_key() {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
-                "one v2 semantic write batch cannot contain the same entity key more than once",
+                "one component semantic write batch cannot contain the same entity key more than once",
             ));
         }
     }
@@ -7134,9 +7120,9 @@ struct PreparedFreshPluginOpen {
     submitted_bytes: crate::Blob,
     create_context: BoundCreateContext,
     existing_create_reservation: Option<MaterializedLiveStateRow>,
-    factory: Arc<dyn WasmComponentV2Factory>,
+    factory: Arc<dyn WasmComponentFactory>,
     descriptor: WasmFileDescriptor,
-    schemas: V2SchemaAllowlist,
+    schemas: SchemaAllowlist,
     cold_limits: WasmTransitionLimits,
 }
 
@@ -7154,7 +7140,7 @@ struct PendingFreshPluginOpen {
     store_permit: PluginActorStorePermit,
     task: Option<
         tokio::task::JoinHandle<
-            Result<(Box<dyn WasmComponentV2Actor>, ValidatedFileTransition), LixError>,
+            Result<(Box<dyn WasmComponentActor>, ValidatedFileTransition), LixError>,
         >,
     >,
 }
@@ -7374,7 +7360,7 @@ fn semantic_rendered_file_data(
     rendered_file
 }
 
-async fn render_v2_semantic_changes_with_lease(
+async fn render_semantic_changes_with_lease(
     mut lease: PluginActorLease,
     successor_key: PluginActorKey,
     view: PendingPluginActorView,
@@ -7416,7 +7402,7 @@ async fn render_v2_semantic_changes_with_lease(
     if call.semantic_root() != visible_root {
         let error = LixError::new(
             LixError::CODE_PLUGIN_OBSERVATION_STALE,
-            "v2 semantic write base no longer matches visible semantic state",
+            "component semantic write base no longer matches visible semantic state",
         );
         let error = lease.handle_pending_guest_call_error(call, error);
         return Err((error, publication(lease)));
@@ -7752,8 +7738,8 @@ async fn preflight_derived_file_path_moves(
         let Some(proof) = proofs.row(slot) else {
             continue;
         };
-        let VisibleV2MaterializationBytes::Derived { .. } =
-            decode_visible_v2_materialization_ref(proof, file_id)?.bytes
+        let VisibleMaterializationBytes::Derived { .. } =
+            decode_visible_materialization_ref(proof, file_id)?.bytes
         else {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
@@ -7808,8 +7794,8 @@ async fn preflight_derived_directory_path_moves(
                     "derived materialization proof is missing its file identity",
                 )
             })?;
-        let VisibleV2MaterializationBytes::Derived { .. } =
-            decode_visible_v2_materialization_ref(row, &file_id)?.bytes
+        let VisibleMaterializationBytes::Derived { .. } =
+            decode_visible_materialization_ref(row, &file_id)?.bytes
         else {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
@@ -8111,7 +8097,7 @@ fn prospective_exact_identity_cmp(
 /// currently owned file. The replacement factory is deliberately used only
 /// as a disposable verifier: accepted actors are cold-opened later under the
 /// new generation key, after the registry row commits.
-async fn preflight_owned_v2_generation_upgrades(
+async fn preflight_owned_generation_upgrades(
     host: &PluginRuntimeHost,
     base: &dyn crate::live_state::LiveStateReader,
     staged: &impl StagedLiveStateRows,
@@ -8274,7 +8260,7 @@ async fn preflight_owned_v2_generation_upgrades(
         }
         upgrade
             .previous
-            .validate_owned_v2_upgrade_contract(&upgrade.replacement)?;
+            .validate_owned_upgrade_contract(&upgrade.replacement)?;
         if upgrade.previous.materialization() == PluginMaterialization::Derived {
             return Err(plugin_upgrade_error(
                 upgrade,
@@ -8480,7 +8466,7 @@ async fn preflight_owned_v2_generation_upgrades(
                             owner.file_id(),
                             LixError::new(
                                 LixError::CODE_INVALID_PLUGIN,
-                                "owned v2 file is missing its materialized blob reference",
+                                "owned component file is missing its materialized blob reference",
                             ),
                         )
                     })
@@ -8508,7 +8494,7 @@ async fn preflight_owned_v2_generation_upgrades(
             )
         })?;
         let installed = upgrade.replacement.to_installed_plugin(wasm)?;
-        let factory = host.load_or_compile_v2_factory(&installed).await?;
+        let factory = host.load_or_compile_factory(&installed).await?;
         let limits = WasmTransitionLimits::default();
 
         for (owner, expected) in owners.iter().zip(materialized_bytes) {
@@ -8519,7 +8505,7 @@ async fn preflight_owned_v2_generation_upgrades(
                         owner.file_id(),
                         LixError::new(
                             LixError::CODE_INVALID_PLUGIN,
-                            "owned v2 file references a missing materialized blob",
+                            "owned component file references a missing materialized blob",
                         ),
                     )
                 })?
@@ -8543,7 +8529,7 @@ async fn preflight_owned_v2_generation_upgrades(
                     LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
                         format!(
-                            "owned v2 file must resolve to exactly one tracked descriptor, found {}",
+                            "owned component file must resolve to exactly one tracked descriptor, found {}",
                             matches.len()
                         ),
                     ),
@@ -8564,7 +8550,7 @@ async fn preflight_owned_v2_generation_upgrades(
                 .await
                 .map_err(|error| plugin_upgrade_error(upgrade, owner.file_id(), error))?;
             let mut store = PluginActorStore::new(actor, store_permit);
-            let verified = preflight_rendered_v2_file(
+            let verified = preflight_rendered_file(
                 store.actor_mut(),
                 WasmFileDescriptor {
                     path: Some(entry.path.clone()),
@@ -8588,26 +8574,34 @@ async fn preflight_owned_v2_generation_upgrades(
     Ok(())
 }
 
-async fn preflight_rendered_v2_file(
-    actor: &mut dyn WasmComponentV2Actor,
+async fn preflight_rendered_file(
+    actor: &mut dyn WasmComponentActor,
     descriptor: WasmFileDescriptor,
     entities: Vec<WasmHostEntity>,
     expected: crate::Blob,
     limits: WasmTransitionLimits,
 ) -> Result<(), LixError> {
     let source = VecEntitySource::new(entities, limits)?;
+    let accepted = Arc::new(ArcByteSource::new(expected.clone()));
     let transition = actor
         .open_entities(
             limits,
             WasmOpenEntitiesInput {
                 descriptor,
                 entities: Box::new(source),
-                accepted: None,
+                accepted: Some(accepted),
             },
         )
         .await?;
-    let validated =
-        drain_entity_transition_edits(actor, transition, &[], Some(expected), None, limits).await?;
+    let validated = drain_entity_transition_edits(
+        actor,
+        transition,
+        expected.as_ref(),
+        Some(expected.clone()),
+        None,
+        limits,
+    )
+    .await?;
     actor.drop_document(validated.document).await
 }
 
@@ -8670,7 +8664,7 @@ struct PluginStateBatchRow {
 }
 
 #[derive(Debug)]
-struct PluginV2SemanticWriteGroup {
+struct PluginSemanticWriteGroup {
     plugin: PluginRegistryEntry,
     path: String,
     filename: String,
@@ -8689,7 +8683,7 @@ fn plugin_owner_needs_write(current: Option<&PluginFileOwner>, desired: &PluginF
 }
 
 fn retain_large_import_actor(plugin: &PluginRegistryEntry) -> bool {
-    // v2 retains its guest document as before. Arena v3 retains only the
+    // component retains its guest document as before. Arena v3 retains only the
     // host-owned immutable root after import, so its large-file actor is also
     // the intended warm-successor cache entry.
     debug_assert!(!plugin.api_version().is_empty());
@@ -9134,16 +9128,16 @@ mod tests {
             branch_id: "main".into(),
         };
 
-        let visible = decode_visible_v2_materialization(
+        let visible = decode_visible_materialization(
             &row("01920000-0000-7000-8000-0000000000a2"),
             "01920000-0000-7000-8000-0000000000a2",
         )
         .expect("matching materialization should decode");
         assert!(matches!(
             visible.bytes,
-            VisibleV2MaterializationBytes::Blob { hash } if hash == blob_hash
+            VisibleMaterializationBytes::Blob { hash } if hash == blob_hash
         ));
-        let error = decode_visible_v2_materialization(
+        let error = decode_visible_materialization(
             &row("other-file"),
             "01920000-0000-7000-8000-0000000000a2",
         )
@@ -9280,7 +9274,7 @@ mod tests {
         );
 
         let effective =
-            suppress_v2_format_only_noops_against_batch(changes, &accepted_keys, &accepted)
+            suppress_format_only_noops_against_batch(changes, &accepted_keys, &accepted)
                 .expect("number-free normalized snapshots should compare");
         assert_eq!(effective.changes.len(), 3);
         assert_eq!(effective.changes[0].entity_key(), Some(&key("changed")));
@@ -9367,6 +9361,7 @@ mod tests {
         behavior: UpgradePreflightBehavior,
         emitted: bool,
         discarded: bool,
+        accepted_len: u64,
     }
 
     impl UpgradePreflightActor {
@@ -9375,6 +9370,7 @@ mod tests {
                 behavior: UpgradePreflightBehavior::Render(bytes.to_vec()),
                 emitted: false,
                 discarded: false,
+                accepted_len: 0,
             }
         }
 
@@ -9383,6 +9379,7 @@ mod tests {
                 behavior: UpgradePreflightBehavior::Trap,
                 emitted: false,
                 discarded: false,
+                accepted_len: 0,
             }
         }
     }
@@ -9395,7 +9392,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl WasmComponentV2Actor for UpgradePreflightActor {
+    impl WasmComponentActor for UpgradePreflightActor {
         async fn fork_document(
             &mut self,
             document: WasmDocumentHandle,
@@ -9414,8 +9411,9 @@ mod tests {
         async fn open_entities(
             &mut self,
             _limits: WasmTransitionLimits,
-            _input: WasmOpenEntitiesInput,
+            input: WasmOpenEntitiesInput,
         ) -> Result<crate::wasm::WasmEntityTransition, LixError> {
+            self.accepted_len = input.accepted.as_ref().map_or(0, |accepted| accepted.len());
             match &self.behavior {
                 UpgradePreflightBehavior::Render(_) => Ok(crate::wasm::WasmEntityTransition {
                     transition: crate::wasm::WasmTransitionHandle(1),
@@ -9473,7 +9471,7 @@ mod tests {
             Ok(Some(crate::wasm::WasmEditPage {
                 edits: vec![crate::wasm::WasmOutputSplice {
                     offset: 0,
-                    delete_len: 0,
+                    delete_len: self.accepted_len,
                     insert: crate::wasm::WasmGuestBytes::Inline(bytes.clone().into()),
                 }],
                 outputs: None,
@@ -9525,17 +9523,17 @@ mod tests {
             path: Some("/owned.csv".to_string()),
             media_type: Some("text/csv".to_string()),
             plugin: WasmPluginSelection {
-                plugin_key: "plugin_csv_v2".to_string(),
+                plugin_key: "plugin_csv".to_string(),
                 generation: "replacement".to_string(),
             },
         }
     }
 
     #[tokio::test]
-    async fn owned_v2_upgrade_preflight_accepts_only_byte_stable_renderer() {
+    async fn owned_component_upgrade_preflight_accepts_only_byte_stable_renderer() {
         let expected: crate::Blob = b"first,one\n".as_slice().into();
         let mut compatible = UpgradePreflightActor::rendering(expected.as_ref());
-        preflight_rendered_v2_file(
+        preflight_rendered_file(
             &mut compatible,
             upgrade_preflight_descriptor(),
             Vec::new(),
@@ -9546,7 +9544,7 @@ mod tests {
         .expect("byte-stable replacement should pass preflight");
 
         let mut output_changing = UpgradePreflightActor::rendering(b"changed\n");
-        let error = preflight_rendered_v2_file(
+        let error = preflight_rendered_file(
             &mut output_changing,
             upgrade_preflight_descriptor(),
             Vec::new(),
@@ -9562,7 +9560,7 @@ mod tests {
         );
 
         let mut trapping = UpgradePreflightActor::trapping();
-        let error = preflight_rendered_v2_file(
+        let error = preflight_rendered_file(
             &mut trapping,
             upgrade_preflight_descriptor(),
             Vec::new(),
@@ -9577,17 +9575,17 @@ mod tests {
     fn upgrade_test_entry(hash_byte: char) -> PluginRegistryEntry {
         let hash = std::iter::repeat_n(hash_byte, 64).collect::<String>();
         PluginRegistryEntry::new(PluginRegistryEntryInput {
-            key: "plugin_csv_v2".to_string(),
-            runtime: crate::plugin::PluginRuntime::WasmComponentV2,
-            api_version: "2.1.0".to_string(),
+            key: "plugin_csv".to_string(),
+            runtime: crate::plugin::PluginRuntime::WasmComponent,
+            api_version: "3.0.0".to_string(),
             path_glob: "*.csv".to_string(),
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
             create_schema_keys: vec!["csv_row".to_string()],
-            manifest_json: r#"{"api_version":"2.1.0","entry":"plugin.wasm","key":"plugin_csv_v2","match":{"content_type":"text","path_glob":"*.csv"},"materialization":"blob","runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}"#.to_string(),
-            archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv_v2"),
-            archive_path: "/.lix/plugins/plugin_csv_v2.lixplugin".to_string(),
+            manifest_json: r#"{"api_version":"3.0.0","entry":"plugin.wasm","key":"plugin_csv","match":{"content_type":"text","path_glob":"*.csv"},"materialization":"blob","runtime":"wasm-component","schemas":["schema/csv_row.json"]}"#.to_string(),
+            archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv"),
+            archive_path: "/.lix/plugins/plugin_csv.lixplugin".to_string(),
             archive_blob_hash: hash.clone(),
             wasm_blob_hash: hash,
         })
@@ -9595,7 +9593,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_v2_upgrade_rejects_schema_definition_change_before_authority_swap() {
+    fn owned_component_upgrade_rejects_schema_definition_change_before_authority_swap() {
         let previous = upgrade_test_entry('a');
         let upgrade = PluginGenerationUpgrade {
             branch_id: "main".to_string(),
@@ -10644,7 +10642,7 @@ mod tests {
             file_id: "01920000-0000-7000-8000-0000000000a2".to_string(),
             path: "/data.csv".to_string(),
             owner_change_id: "incarnation-a".to_string(),
-            plugin_key: "plugin_csv_v2".to_string(),
+            plugin_key: "plugin_csv".to_string(),
             plugin_generation: "generation-a".to_string(),
         };
         assert_eq!(v2_create_context(seed, &key), v2_create_context(seed, &key));

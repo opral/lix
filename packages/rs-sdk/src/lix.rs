@@ -1,6 +1,6 @@
 use lix_engine::telemetry::TelemetrySink;
 use lix_engine::wasm::WasmRuntime;
-use lix_engine::wasm::v2::WasmTransitionCounters;
+use lix_engine::wasm::WasmTransitionCounters;
 use lix_engine::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, EngineOptions,
     ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
@@ -103,8 +103,8 @@ where
 }
 
 /// Opens a workspace with explicit per-Store memory and live-Store limits for
-/// Component API v2 plugins.
-pub async fn open_lix_with_storage_and_plugin_v2_resource_limits<StorageImpl>(
+/// Component plugins.
+pub async fn open_lix_with_storage_and_plugin_resource_limits<StorageImpl>(
     storage: StorageImpl,
     max_memory_bytes: u64,
     max_live_stores: usize,
@@ -438,17 +438,17 @@ where
         self.session.close().await
     }
 
-    /// Returns engine-local v2 transition counters for profiling and
+    /// Returns engine-local transition counters for profiling and
     /// production invariant monitoring.
     #[doc(hidden)]
-    pub fn plugin_v2_transition_counters(&self) -> WasmTransitionCounters {
-        self.engine.plugin_v2_transition_counters()
+    pub fn plugin_transition_counters(&self) -> WasmTransitionCounters {
+        self.engine.plugin_transition_counters()
     }
 
-    /// Starts a new engine-local v2 transition measurement window.
+    /// Starts a new engine-local transition measurement window.
     #[doc(hidden)]
-    pub fn reset_plugin_v2_transition_counters(&self) {
-        self.engine.reset_plugin_v2_transition_counters();
+    pub fn reset_plugin_transition_counters(&self) {
+        self.engine.reset_plugin_transition_counters();
     }
 }
 
@@ -498,7 +498,7 @@ pub(crate) async fn open_or_initialize_engine<StorageImpl>(
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
-    plugin_v2_resource_limits: Option<(u64, usize)>,
+    plugin_resource_limits: Option<(u64, usize)>,
 ) -> Result<Engine<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -507,14 +507,14 @@ where
         storage.clone(),
         wasm_runtime.clone(),
         telemetry.clone(),
-        plugin_v2_resource_limits,
+        plugin_resource_limits,
     )
     .await
     {
         Ok(engine) => Ok(engine),
         Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
             Engine::initialize(storage.clone()).await?;
-            new_engine(storage, wasm_runtime, telemetry, plugin_v2_resource_limits).await
+            new_engine(storage, wasm_runtime, telemetry, plugin_resource_limits).await
         }
         Err(error) => Err(error),
     }
@@ -524,7 +524,7 @@ async fn new_engine<StorageImpl>(
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
-    plugin_v2_resource_limits: Option<(u64, usize)>,
+    plugin_resource_limits: Option<(u64, usize)>,
 ) -> Result<Engine<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -541,8 +541,8 @@ where
     if let Some(telemetry) = telemetry {
         options = options.with_telemetry(telemetry);
     }
-    if let Some((max_memory_bytes, max_live_stores)) = plugin_v2_resource_limits {
-        options = options.with_plugin_v2_resource_limits(max_memory_bytes, max_live_stores);
+    if let Some((max_memory_bytes, max_live_stores)) = plugin_resource_limits {
+        options = options.with_plugin_resource_limits(max_memory_bytes, max_live_stores);
     }
     Engine::new_with_options(storage, options).await
 }

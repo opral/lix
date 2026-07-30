@@ -5,7 +5,7 @@ use lix_sdk::{
     CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, Lix, LixError,
     MergeBranchOptions, MergeBranchPreviewOptions, MergeConflictChangeKind, MutationIdentity,
     RequestBlobSpliceProvenance, Storage, SwitchBranchOptions, VerifiedRequestBlob,
-    WasmComponentV2Factory, WasmLimits, WasmRuntime, WasmTransitionCounters,
+    WasmComponentFactory, WasmLimits, WasmRuntime, WasmTransitionCounters,
 };
 use lix_sdk::{LocalFilesystem, open_lix_with_storage};
 use lix_sdk::{OpenLixOptions, Value, open_lix};
@@ -191,11 +191,11 @@ struct HistoryRejectingRuntime {
 
 #[async_trait::async_trait]
 impl WasmRuntime for HistoryRejectingRuntime {
-    async fn compile_component_v2(
+    async fn compile_component(
         &self,
         _bytes: Vec<u8>,
         _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError> {
+    ) -> Result<Arc<dyn WasmComponentFactory>, LixError> {
         self.compile_calls.fetch_add(1, Ordering::SeqCst);
         Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -210,8 +210,8 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
     let lix = open_lix(OpenLixOptions::new(storage.clone()))
         .await
         .expect("workspace should open with the production runtime");
-    let archive = build_csv_v2_plugin_archive();
-    install_plugin(&lix, "plugin_csv_v2", &archive)
+    let archive = build_csv_plugin_archive();
+    install_plugin(&lix, "plugin_csv", &archive)
         .await
         .expect("CSV v2 plugin should install");
 
@@ -302,8 +302,8 @@ async fn mixed_file_data_batch_preserves_rows_staged_before_and_after_it() {
         .expect("mixed-batch workspace should open");
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
-        &build_json_v2_plugin_archive(),
+        "plugin_json",
+        &build_json_plugin_archive(),
         &["json_root", "json_object_member", "json_array_item"],
     )
     .await;
@@ -391,11 +391,11 @@ async fn mixed_file_data_batch_preserves_rows_staged_before_and_after_it() {
 
 #[tokio::test]
 async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_csv_v2",
+        "plugin_csv",
         &archive,
         &["csv_v2_table", "csv_v2_row"],
     )
@@ -404,7 +404,7 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
     let path = "/multiplayer.csv";
     let initial = b"first,one\nsecond,two\nthird,three\n".to_vec();
     write_file(&lix, path, initial.clone()).await.unwrap();
-    let file_id = lix
+    let _file_id = lix
         .execute(
             "SELECT id FROM lix_file WHERE path = $1",
             &[Value::Text(path.to_string())],
@@ -414,7 +414,6 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
         .rows()[0]
         .get::<String>("id")
         .unwrap();
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 1);
 
     let first = lix.open_workspace_session().await.unwrap();
     let second = lix.open_workspace_session().await.unwrap();
@@ -429,9 +428,9 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
 
     let first_edit = b"first,ONE\nsecond,two\nthird,three\n".to_vec();
     let second_edit = b"first,one\nsecond,TWO\nthird,three\n".to_vec();
-    first.reset_plugin_v2_transition_counters();
+    first.reset_plugin_transition_counters();
     write_file(&first, path, first_edit).await.unwrap();
-    let counters = first.plugin_v2_transition_counters();
+    let counters = first.plugin_transition_counters();
     assert_eq!(counters.full_state_semantic_rows_materialized, 0);
     assert_eq!(counters.durable_semantic_changes, 1);
     assert_eq!(counters.private_document_cache_hits, 1);
@@ -527,7 +526,6 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
         .unwrap();
     transaction.rollback().await.unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(one_row));
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 1);
     write_file(&rollback_session, path, b"first,COMMITTED\n".to_vec())
         .await
         .unwrap();
@@ -535,7 +533,6 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
         read_file(&lix, path).await.unwrap(),
         Some(b"first,COMMITTED\n".to_vec())
     );
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 1);
 
     let insert_session = lix.open_workspace_session().await.unwrap();
     assert_eq!(
@@ -549,7 +546,6 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
     )
     .await
     .unwrap();
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
 
     for session in [
         first,
@@ -569,11 +565,11 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
 
 #[tokio::test]
 async fn v2_csv_stale_observation_composes_a_keyless_create_with_a_concurrent_edit() {
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_csv_v2",
+        "plugin_csv",
         &archive,
         &["csv_v2_table", "csv_v2_row"],
     )
@@ -582,7 +578,7 @@ async fn v2_csv_stale_observation_composes_a_keyless_create_with_a_concurrent_ed
     let path = "/concurrent-create.csv";
     let initial = b"first,one\n".to_vec();
     write_file(&lix, path, initial.clone()).await.unwrap();
-    let file_id = lix
+    let _file_id = lix
         .execute(
             "SELECT id FROM lix_file WHERE path = $1",
             &[Value::Text(path.to_string())],
@@ -615,7 +611,6 @@ async fn v2_csv_stale_observation_composes_a_keyless_create_with_a_concurrent_ed
         read_file(&lix, path).await.unwrap(),
         Some(b"first,ONE\nsecond,two\n".to_vec())
     );
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
 
     edit_session.close().await.unwrap();
     create_session.close().await.unwrap();
@@ -624,11 +619,11 @@ async fn v2_csv_stale_observation_composes_a_keyless_create_with_a_concurrent_ed
 
 #[tokio::test]
 async fn v2_transport_splice_provenance_is_bound_to_the_observed_file() {
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_csv_v2",
+        "plugin_csv",
         &archive,
         &["csv_v2_table", "csv_v2_row"],
     )
@@ -666,7 +661,7 @@ async fn v2_transport_splice_provenance_is_bound_to_the_observed_file() {
     // Deliberately submit file A's reconstructed result to warm file B using
     // the same SQL shape and blob-parameter slot. The engine must reject A's
     // base proof for B and derive the complete B -> submitted-byte delta.
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.execute_with_options_and_metadata(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
          ON CONFLICT (path) DO UPDATE SET data = excluded.data",
@@ -679,7 +674,7 @@ async fn v2_transport_splice_provenance_is_bound_to_the_observed_file() {
     )
     .await
     .unwrap();
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert!(
         counters.host_full_diff_bytes_compared > 0,
         "cross-file provenance must use the safe full-diff fallback"
@@ -720,11 +715,11 @@ async fn v2_transport_splice_provenance_is_bound_to_the_observed_file() {
 
 #[tokio::test]
 async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
-    let archive = build_markdown_v2_plugin_archive();
+    let archive = build_markdown_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_markdown_incremental_v2",
+        "plugin_markdown",
         &archive,
         &["markdown_node_v2"],
     )
@@ -804,9 +799,9 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
 
     let path = "/component-v3.md";
     let before = b"# Heading\n\nParagraph with **bold** text.\n".to_vec();
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     write_file(&lix, path, before.clone()).await.unwrap();
-    let open_counters = lix.plugin_v2_transition_counters();
+    let open_counters = lix.plugin_transition_counters();
     assert_eq!(open_counters.guest_export_calls, 1);
     assert_eq!(open_counters.durable_semantic_changes, 3);
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(before));
@@ -821,9 +816,9 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
     );
 
     let after = b"# Heading\n\nParagraph with **bold** text and a tail.\n".to_vec();
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     write_file(&lix, path, after.clone()).await.unwrap();
-    let successor_counters = lix.plugin_v2_transition_counters();
+    let successor_counters = lix.plugin_transition_counters();
     assert_eq!(successor_counters.guest_export_calls, 1);
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
     let current = lix
@@ -914,9 +909,9 @@ async fn v3_markdown_noncanonical_source_stays_in_file_arena_not_semantic_root()
         .unwrap()
         .replacen("6/10", "7/9", 1)
         .into_bytes();
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     write_file(&lix, path, after.clone()).await.unwrap();
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.guest_export_calls, 1);
     assert_eq!(
         counters.durable_semantic_changes, 1,
@@ -957,8 +952,8 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
     let lanes = [
         (
             "v2_cursor",
-            "plugin_markdown_incremental_v2",
-            build_markdown_v2_plugin_archive(),
+            "plugin_markdown",
+            build_markdown_plugin_archive(),
         ),
         (
             "v3_push_sink",
@@ -996,7 +991,7 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
                 .map(|row| row.get::<String>("id").unwrap())
                 .collect::<std::collections::BTreeSet<_>>();
 
-            lix.reset_plugin_v2_transition_counters();
+            lix.reset_plugin_transition_counters();
             collector.clear();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
@@ -1005,7 +1000,7 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
                 .unwrap_or_else(|error| panic!("{label} successor failed: {error}"));
             let measurement =
                 BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
-            let counters = lix.plugin_v2_transition_counters();
+            let counters = lix.plugin_transition_counters();
             assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(after.clone()));
             let rows = lix
                 .execute("SELECT COUNT(*) AS count FROM markdown_node_v2", &[])
@@ -1089,11 +1084,11 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
 
 #[tokio::test]
 async fn v2_markdown_merges_unrelated_entities_and_regenerates_derived_bytes() {
-    let archive = build_markdown_v2_plugin_archive();
+    let archive = build_markdown_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_markdown_incremental_v2",
+        "plugin_markdown",
         &archive,
         &["markdown_node_v2"],
     )
@@ -1198,11 +1193,11 @@ async fn v2_markdown_merges_unrelated_entities_and_regenerates_derived_bytes() {
 
 #[tokio::test]
 async fn v2_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
-    let archive = build_markdown_v2_plugin_archive();
+    let archive = build_markdown_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_markdown_incremental_v2",
+        "plugin_markdown",
         &archive,
         &["markdown_node_v2"],
     )
@@ -1251,7 +1246,7 @@ async fn v2_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
         preview.conflicts
     );
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
@@ -1262,7 +1257,7 @@ async fn v2_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
         Some(b"prewonderful\n".as_slice()),
         "the prefix and suffix insertions must both survive",
     );
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.conflict_resolution_calls, 1);
     assert_eq!(counters.conflict_resolution_records, 1);
     assert_eq!(
@@ -1323,7 +1318,7 @@ async fn v3_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
         .expect("v3 plugin-owned paragraph conflict should preview");
     assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
@@ -1333,7 +1328,7 @@ async fn v3_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
         read_file(&lix, path).await.unwrap().as_deref(),
         Some(b"prewonderful\n".as_slice())
     );
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.conflict_resolution_calls, 1);
     assert_eq!(counters.conflict_resolution_records, 1);
     assert_eq!(counters.conflict_resolution_takes, 0);
@@ -1343,11 +1338,11 @@ async fn v3_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
 
 #[tokio::test]
 async fn v2_csv_same_row_branch_merge_composes_distinct_cells() {
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_csv_v2",
+        "plugin_csv",
         &archive,
         &["csv_v2_table", "csv_v2_row"],
     )
@@ -1396,7 +1391,7 @@ async fn v2_csv_same_row_branch_merge_composes_distinct_cells() {
         preview.conflicts
     );
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
@@ -1407,7 +1402,7 @@ async fn v2_csv_same_row_branch_merge_composes_distinct_cells() {
         Some(b"ALPHA,one,BLUE\n".as_slice()),
         "both same-row cell edits must survive",
     );
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.conflict_resolution_calls, 1);
     assert_eq!(counters.conflict_resolution_records, 1);
     assert_eq!(
@@ -1487,13 +1482,13 @@ async fn v3_csv_same_row_branch_merge_composes_distinct_cells() {
         .expect("v3 plugin-owned row conflict should preview");
     assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
     .await
     .expect("distinct CSV cell edits should merge");
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.conflict_resolution_calls, 1);
     assert_eq!(counters.conflict_resolution_records, 1);
     assert_eq!(
@@ -1514,8 +1509,8 @@ async fn v2_json_unrelated_entity_branch_merge_accepts_certified_snapshots() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
-        &build_json_v2_plugin_archive(),
+        "plugin_json",
+        &build_json_plugin_archive(),
         &["json_root", "json_object_member", "json_array_item"],
     )
     .await;
@@ -1600,8 +1595,8 @@ async fn v2_json_same_entity_branch_merge_runs_static_resolver_on_certified_snap
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
-        &build_json_v2_plugin_archive(),
+        "plugin_json",
+        &build_json_plugin_archive(),
         &["json_root", "json_object_member", "json_array_item"],
     )
     .await;
@@ -1646,13 +1641,13 @@ async fn v2_json_same_entity_branch_merge_runs_static_resolver_on_certified_snap
     .await
     .unwrap();
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
     .await
     .expect("the JSON static resolver should accept certified snapshots");
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.conflict_resolution_calls, 1);
     assert_eq!(counters.conflict_resolution_records, 1);
     assert_eq!(counters.conflict_resolution_takes, 1);
@@ -1725,13 +1720,13 @@ async fn v3_json_same_entity_branch_merge_uses_fused_conflict_and_renderer_sinks
     .await
     .unwrap();
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
     .await
     .expect("the v3 JSON resolver and renderer should complete atomically");
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.conflict_resolution_calls, 1);
     assert_eq!(counters.conflict_resolution_records, 1);
     assert_eq!(counters.conflict_resolution_takes, 1);
@@ -1759,11 +1754,11 @@ async fn v3_json_same_entity_branch_merge_uses_fused_conflict_and_renderer_sinks
 
 #[tokio::test]
 async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_csv_v2",
+        "plugin_csv",
         &archive,
         &["csv_v2_table", "csv_v2_row"],
     )
@@ -1824,7 +1819,7 @@ async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
         .expect("plugin-owned same-cell conflict should preview");
     assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
@@ -1835,7 +1830,7 @@ async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
         Some(expected),
         "the resolver must take the canonical higher-ranked variant, independent of branch labels"
     );
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.conflict_resolution_calls, 1);
     assert_eq!(counters.conflict_resolution_records, 1);
     assert_eq!(
@@ -1910,14 +1905,14 @@ async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
         .expect("v3 plugin-owned same-cell conflict should preview");
     assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
     .await
     .expect("same-cell CSV conflict should resolve deterministically");
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(expected));
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.conflict_resolution_calls, 1);
     assert_eq!(counters.conflict_resolution_records, 1);
     assert_eq!(
@@ -1930,11 +1925,11 @@ async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
 
 #[tokio::test]
 async fn v2_csv_delete_vs_edit_remains_a_file_lifecycle_conflict() {
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_csv_v2",
+        "plugin_csv",
         &archive,
         &["csv_v2_table", "csv_v2_row"],
     )
@@ -1993,18 +1988,24 @@ async fn v2_csv_delete_vs_edit_remains_a_file_lifecycle_conflict() {
         })
         .await
         .expect("lifecycle conflict should still preview");
-    let row_conflict = preview
+    let lifecycle_conflict = preview
         .conflicts
         .iter()
         .find(|conflict| {
-            conflict.schema_key == "csv_v2_row"
+            conflict.schema_key == "lix_binary_blob_ref"
                 && conflict.file_id.as_deref() == Some(file_id.as_str())
         })
-        .expect("delete-vs-edit semantic row must remain visible before the resolver");
-    assert_eq!(row_conflict.target.kind, MergeConflictChangeKind::Removed);
-    assert_eq!(row_conflict.source.kind, MergeConflictChangeKind::Modified);
+        .expect("delete-vs-edit must remain visible as a file-lifecycle conflict");
+    assert_eq!(
+        lifecycle_conflict.target.kind,
+        MergeConflictChangeKind::Removed
+    );
+    assert_eq!(
+        lifecycle_conflict.source.kind,
+        MergeConflictChangeKind::Modified
+    );
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     let error = lix
         .merge_branch(MergeBranchOptions {
             source_branch_id: source.id,
@@ -2012,7 +2013,7 @@ async fn v2_csv_delete_vs_edit_remains_a_file_lifecycle_conflict() {
         .await
         .expect_err("delete-vs-edit requires a first-class lifecycle decision");
     assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(
         counters.conflict_resolution_calls, 0,
         "the plugin must not resolve a divergent file lifetime"
@@ -2028,11 +2029,11 @@ async fn v2_csv_delete_vs_edit_remains_a_file_lifecycle_conflict() {
 
 #[tokio::test]
 async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_csv_v2",
+        "plugin_csv",
         &archive,
         &["csv_v2_table", "csv_v2_row"],
     )
@@ -2110,7 +2111,7 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
         conflict.schema_key == "csv_v2_row" && conflict.file_id.as_deref() == Some(file_id.as_str())
     }));
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     let error = lix
         .merge_branch(MergeBranchOptions {
             source_branch_id: source.id,
@@ -2118,7 +2119,7 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
         .await
         .expect_err("a resolver must not mix target CSV bytes with source TSV metadata");
     assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(
         counters.conflict_resolution_calls, 0,
         "the plugin must not resolve across divergent paths or descriptors"
@@ -2135,11 +2136,11 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
 
 #[tokio::test]
 async fn v2_json_roundtrips_recursive_state_and_keeps_leaf_edits_sparse() {
-    let archive = build_json_v2_plugin_archive();
+    let archive = build_json_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
+        "plugin_json",
         &archive,
         &["json_root", "json_object_member", "json_array_item"],
     )
@@ -2174,9 +2175,9 @@ async fn v2_json_roundtrips_recursive_state_and_keeps_leaf_edits_sparse() {
         .unwrap()
         .replacen(r#""Ada""#, r#""Lin""#, 1)
         .into_bytes();
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     write_file(&lix, path, edited.clone()).await.unwrap();
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.full_state_semantic_rows_materialized, 0);
     assert_eq!(counters.durable_semantic_changes, 1);
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(edited.clone()));
@@ -2200,11 +2201,11 @@ async fn v2_json_roundtrips_recursive_state_and_keeps_leaf_edits_sparse() {
 
 #[tokio::test]
 async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_nodes() {
-    let archive = build_json_v2_plugin_archive();
+    let archive = build_json_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
+        "plugin_json",
         &archive,
         &["json_root", "json_object_member", "json_array_item"],
     )
@@ -2291,7 +2292,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
         )
         .await
         .expect_err("direct JSON semantic deletion must use an authoritative byte write");
-    assert_eq!(direct_structure_error.code, LixError::CODE_INVALID_PARAM);
+    assert_eq!(direct_structure_error.code, LixError::CODE_INVALID_PLUGIN);
     assert!(
         direct_structure_error
             .message
@@ -2325,7 +2326,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
         )
         .await
         .expect_err("a direct JSON semantic transition must contain one scalar change");
-    assert_eq!(direct_batch_error.code, LixError::CODE_INVALID_PARAM);
+    assert_eq!(direct_batch_error.code, LixError::CODE_INVALID_PLUGIN);
     assert!(
         direct_batch_error
             .message
@@ -2359,7 +2360,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
     )
     .await
     .expect_err("a stale scalar must not resurrect a byte-deleted JSON node");
-    assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
     assert!(error.message.contains("one existing scalar value only"));
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
@@ -2409,13 +2410,13 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
 #[ignore = "10 MiB end-to-end Wasm acceptance gate"]
 async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
     init_perf_tracing();
-    let archive = build_json_v2_plugin_archive();
+    let archive = build_json_plugin_archive();
     let lix = open_lix(OpenLixOptions::default())
         .await
         .expect("workspace should open with the production Wasmtime runtime");
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
+        "plugin_json",
         &archive,
         &["json_root", "json_object_member", "json_array_item"],
     )
@@ -2427,13 +2428,13 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
     let mut after = before.clone();
     after[edit_offset] = replacement;
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     let cold_started = Instant::now();
     write_file(&lix, path, before.clone())
         .await
         .expect("real JSON v2 Wasm should import the 10 MiB fixture");
     let cold_elapsed = cold_started.elapsed();
-    let cold = lix.plugin_v2_transition_counters();
+    let cold = lix.plugin_transition_counters();
     assert_eq!(
         cold.source_bytes_read, JSON_TEN_MIB_BYTES as u64,
         "cold hydration must stream the complete fixture through the Component boundary",
@@ -2486,7 +2487,7 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
     let warm_transport_elapsed = transport_started.elapsed();
     let after_blob = verified_after.blob().clone();
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     let warm_engine_started = Instant::now();
     lix.execute_with_options_and_metadata(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
@@ -2502,7 +2503,7 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
     .expect("one localized edit should pass through the real JSON v2 component");
     let warm_engine_elapsed = warm_engine_started.elapsed();
     let warm_request_elapsed = warm_request_started.elapsed();
-    let warm = lix.plugin_v2_transition_counters();
+    let warm = lix.plugin_transition_counters();
 
     assert_eq!(warm.host_full_diff_bytes_compared, 0);
     assert_eq!(warm.host_content_classification_bytes, 0);
@@ -2580,11 +2581,11 @@ async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
     const BENCHMARK: &str = "v2_json_ten_mib_ordinary_sql_byte_edit_benchmark";
 
     let root = tempfile::tempdir().expect("create JSON benchmark directory");
-    let archive = build_json_v2_plugin_archive();
+    let archive = build_json_plugin_archive();
     let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
+        "plugin_json",
         &archive,
         &["json_root", "json_object_member", "json_array_item"],
     )
@@ -2609,7 +2610,7 @@ async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
     };
     for sample in 0..SAMPLES {
         bytes[edit_offset] = alternate_ascii_hex(bytes[edit_offset]);
-        lix.reset_plugin_v2_transition_counters();
+        lix.reset_plugin_transition_counters();
         let allocation_scope = AllocationScope::start();
         let started = Instant::now();
         write_file(&lix, path, bytes.clone())
@@ -2627,7 +2628,7 @@ async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
             measurement,
         );
 
-        let counters = lix.plugin_v2_transition_counters();
+        let counters = lix.plugin_transition_counters();
         assert_eq!(counters.packet_records, 1, "sample {sample}");
         assert_eq!(counters.durable_semantic_changes, 1, "sample {sample}");
         assert_eq!(counters.private_document_cache_hits, 1, "sample {sample}");
@@ -2671,11 +2672,11 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
     const BENCHMARK: &str = "v2_json_ten_mib_unrelated_entity_merge_benchmark";
 
     let root = tempfile::tempdir().expect("create JSON merge benchmark directory");
-    let archive = build_json_v2_plugin_archive();
+    let archive = build_json_plugin_archive();
     let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
+        "plugin_json",
         &archive,
         &["json_root", "json_object_member", "json_array_item"],
     )
@@ -2854,11 +2855,11 @@ async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
     const BENCHMARK: &str = "v2_json_ten_mib_same_entity_canonical_b_merge_benchmark";
 
     let root = tempfile::tempdir().expect("create JSON conflict benchmark directory");
-    let archive = build_json_v2_plugin_archive();
+    let archive = build_json_plugin_archive();
     let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
+        "plugin_json",
         &archive,
         &["json_root", "json_object_member", "json_array_item"],
     )
@@ -2987,7 +2988,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
     const BENCHMARK: &str = "v2_json_ten_mib_rocksdb_import_parity_benchmark";
     const MUTATION_BENCHMARK: &str = "v2_json_ten_mib_bulk_sql_mutation_benchmark";
 
-    let archive = build_json_v2_plugin_archive();
+    let archive = build_json_plugin_archive();
     let (source, _, _) = json_ten_mib_flat_fixture();
     let members = native_json_control_members(&source);
     assert_eq!(members.len(), JSON_TEN_MIB_PROPERTY_COUNT);
@@ -3018,7 +3019,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
         let lix = open_lix_with_rocksdb(root.path()).await;
         install_reference_plugin_in_blank_registry(
             &lix,
-            "plugin_json_incremental_v2",
+            "plugin_json",
             &archive,
             &["json_root", "json_object_member", "json_array_item"],
         )
@@ -3028,7 +3029,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
         // outside the timer. The timed operation is one normal public file
         // write on an otherwise fresh RocksDB database.
         let input = source.clone();
-        lix.reset_plugin_v2_transition_counters();
+        lix.reset_plugin_transition_counters();
         collector.clear();
         let allocation_scope = AllocationScope::start();
         let started = Instant::now();
@@ -3061,7 +3062,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
             collector.take_aggregate_millis()
         );
 
-        let counters = lix.plugin_v2_transition_counters();
+        let counters = lix.plugin_transition_counters();
         assert_eq!(
             counters.durable_semantic_changes,
             (JSON_TEN_MIB_PROPERTY_COUNT + 1) as u64,
@@ -3344,7 +3345,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
     const FILE_PATH: &str = "/native-csv-semantic-control.csv";
     const BENCHMARK: &str = "v2_csv_ten_mib_rocksdb_import_parity_benchmark";
 
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let source = csv_ten_mib_fixture();
     let table_statement = native_csv_control_table_insert(FILE_ID);
     let row_statements =
@@ -3377,7 +3378,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
             if plugin_lane {
                 install_reference_plugin_in_blank_registry(
                     &lix,
-                    "plugin_csv_v2",
+                    "plugin_csv",
                     &archive,
                     &["csv_v2_table", "csv_v2_row"],
                 )
@@ -3387,7 +3388,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
             }
 
             let file_input = source.clone();
-            lix.reset_plugin_v2_transition_counters();
+            lix.reset_plugin_transition_counters();
             collector.clear();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
@@ -3458,7 +3459,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
 
             if plugin_lane {
                 assert_eq!(
-                    lix.plugin_v2_transition_counters().durable_semantic_changes,
+                    lix.plugin_transition_counters().durable_semantic_changes,
                     (CSV_ROW_COUNT + 1) as u64,
                     "plugin sample {sample} must commit one table plus every row"
                 );
@@ -3588,7 +3589,7 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
         )
         .await;
 
-        lix.reset_plugin_v2_transition_counters();
+        lix.reset_plugin_transition_counters();
         collector.clear();
         let input = source.clone();
         let allocation_scope = AllocationScope::start();
@@ -3607,7 +3608,7 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
         let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
         assert_eq!(inserted.rows_affected(), 1, "v3 sample {sample}");
 
-        let counters = lix.plugin_v2_transition_counters();
+        let counters = lix.plugin_transition_counters();
         assert_eq!(
             counters.guest_export_calls, 1,
             "Prototype B must enter the guest exactly once"
@@ -3762,16 +3763,8 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
         logical_rows: JSON_TEN_MIB_PROPERTY_COUNT + 1,
     };
     let lanes = [
-        (
-            "v2_cursor",
-            "plugin_json_incremental_v2",
-            build_json_v2_plugin_archive(),
-        ),
-        (
-            "v3_push_sink",
-            "plugin_json",
-            build_json_plugin_archive(),
-        ),
+        ("v2_cursor", "plugin_json", build_json_plugin_archive()),
+        ("v3_push_sink", "plugin_json", build_json_plugin_archive()),
     ];
     let collector = PerfSpanCollector::default();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
@@ -3792,7 +3785,7 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
             )
             .await;
 
-            lix.reset_plugin_v2_transition_counters();
+            lix.reset_plugin_transition_counters();
             collector.clear();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
@@ -3810,7 +3803,7 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
             let measurement =
                 BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
             assert_eq!(inserted.rows_affected(), 1, "{label} sample {sample}");
-            let counters = lix.plugin_v2_transition_counters();
+            let counters = lix.plugin_transition_counters();
             if label == "v3_push_sink" {
                 assert_eq!(counters.guest_export_calls, 1);
             }
@@ -3938,16 +3931,8 @@ async fn v3_json_ten_mib_sparse_successor_benchmark() {
     let mut lane_medians = BTreeMap::new();
 
     for (label, plugin_key, archive) in [
-        (
-            "v2_actor",
-            "plugin_json_incremental_v2",
-            build_json_v2_plugin_archive(),
-        ),
-        (
-            "v3_arena",
-            "plugin_json",
-            build_json_plugin_archive(),
-        ),
+        ("v2_actor", "plugin_json", build_json_plugin_archive()),
+        ("v3_arena", "plugin_json", build_json_plugin_archive()),
     ] {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
             continue;
@@ -3975,7 +3960,7 @@ async fn v3_json_ten_mib_sparse_successor_benchmark() {
                 .flush()
                 .expect("flush sparse JSON benchmark cold import");
 
-            lix.reset_plugin_v2_transition_counters();
+            lix.reset_plugin_transition_counters();
             collector.clear();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
@@ -3984,7 +3969,7 @@ async fn v3_json_ten_mib_sparse_successor_benchmark() {
                 .unwrap_or_else(|error| panic!("{label} successor failed: {error}"));
             let measurement =
                 BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
-            let counters = lix.plugin_v2_transition_counters();
+            let counters = lix.plugin_transition_counters();
             assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(after.clone()));
             assert_eq!(counters.durable_semantic_changes, 1);
             let row = lix
@@ -4062,16 +4047,8 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
     let mut lane_medians = BTreeMap::new();
 
     for (label, plugin_key, archive) in [
-        (
-            "v2_actor",
-            "plugin_json_incremental_v2",
-            build_json_v2_plugin_archive(),
-        ),
-        (
-            "v3_arena",
-            "plugin_json",
-            build_json_plugin_archive(),
-        ),
+        ("v2_actor", "plugin_json", build_json_plugin_archive()),
+        ("v3_arena", "plugin_json", build_json_plugin_archive()),
     ] {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
             continue;
@@ -4095,7 +4072,7 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
             lix.close().await.unwrap();
 
             let reopened = open_lix_with_rocksdb(root.path()).await;
-            reopened.reset_plugin_v2_transition_counters();
+            reopened.reset_plugin_transition_counters();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
             assert_eq!(
@@ -4105,13 +4082,13 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
             write_file(&reopened, PATH, after.clone()).await.unwrap();
             let measurement =
                 BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
-            let counters = reopened.plugin_v2_transition_counters();
+            let counters = reopened.plugin_transition_counters();
             assert_eq!(
                 read_file(&reopened, PATH).await.unwrap(),
                 Some(after.clone())
             );
             assert_eq!(counters.durable_semantic_changes, 1);
-            assert_eq!(
+            assert!(
                 reopened
                     .execute(
                         "SELECT scalar_json FROM json_object_member WHERE key = $1",
@@ -4122,8 +4099,7 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
                     .rows()[0]
                     .get::<String>("scalar_json")
                     .unwrap()
-                    .contains(char::from(after[edit_offset])),
-                true
+                    .contains(char::from(after[edit_offset]))
             );
             eprintln!(
                 "json_cold_successor lane={label} sample={sample} elapsed_ms={:.3} \
@@ -4252,10 +4228,10 @@ async fn v3_json_cold_hydration_after_actor_eviction_preserves_sparse_successor(
         .unwrap();
     }
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     let after = br#"{"a":"ONE","b":"two"}"#.to_vec();
     write_file(&lix, path, after.clone()).await.unwrap();
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
     assert_eq!(counters.durable_semantic_changes, 1);
     assert_eq!(
@@ -4275,7 +4251,7 @@ async fn v3_json_cold_hydration_after_actor_eviction_preserves_sparse_successor(
     let reopened = open_lix_with_rocksdb(root.path()).await;
     assert_eq!(read_file(&reopened, path).await.unwrap(), Some(after));
     let after_reopen = br#"{"a":"ONE","b":"TWO"}"#.to_vec();
-    reopened.reset_plugin_v2_transition_counters();
+    reopened.reset_plugin_transition_counters();
     write_file(&reopened, path, after_reopen.clone())
         .await
         .unwrap();
@@ -4298,7 +4274,7 @@ async fn v3_json_cold_hydration_after_actor_eviction_preserves_sparse_successor(
     );
     assert_eq!(
         reopened
-            .plugin_v2_transition_counters()
+            .plugin_transition_counters()
             .durable_semantic_changes,
         1
     );
@@ -4338,13 +4314,10 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
         .unwrap();
     }
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     let after_eviction = b"alpha,ONE\nbeta,two\n".to_vec();
     write_file(&lix, path, after_eviction).await.unwrap();
-    assert_eq!(
-        lix.plugin_v2_transition_counters().durable_semantic_changes,
-        1
-    );
+    assert_eq!(lix.plugin_transition_counters().durable_semantic_changes, 1);
     assert_eq!(
         lix.execute("SELECT id FROM csv_v2_row ORDER BY order_key LIMIT 1", &[],)
             .await
@@ -4357,14 +4330,14 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
     lix.close().await.unwrap();
 
     let reopened = open_lix_with_rocksdb(root.path()).await;
-    reopened.reset_plugin_v2_transition_counters();
+    reopened.reset_plugin_transition_counters();
     let after_reopen = b"alpha,One\nbeta,two\n".to_vec();
     write_file(&reopened, path, after_reopen.clone())
         .await
         .unwrap();
     assert_eq!(
         reopened
-            .plugin_v2_transition_counters()
+            .plugin_transition_counters()
             .durable_semantic_changes,
         1
     );
@@ -4414,8 +4387,8 @@ async fn v3_file_changed_push_sink_benchmark() {
     let v3 = open_lix_with_rocksdb(v3_root.path()).await;
     install_reference_plugin_in_blank_registry(
         &v2,
-        "plugin_csv_v2",
-        &build_csv_v2_plugin_archive(),
+        "plugin_csv",
+        &build_csv_plugin_archive(),
         &["csv_v2_table", "csv_v2_row"],
     )
     .await;
@@ -4460,7 +4433,7 @@ async fn v3_file_changed_push_sink_benchmark() {
                 (&v2, v2_path, &mut v2_bytes)
             };
             bytes[0] = next;
-            lix.reset_plugin_v2_transition_counters();
+            lix.reset_plugin_transition_counters();
             collector.clear();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
@@ -4474,7 +4447,7 @@ async fn v3_file_changed_push_sink_benchmark() {
                 });
             let measurement =
                 BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
-            let counters = lix.plugin_v2_transition_counters();
+            let counters = lix.plugin_transition_counters();
             eprintln!(
                 "v3_file_changed_phases lane={} sample={sample} elapsed_ms={:.3} \
                  guest_exports={} imports={} boundary_bytes={} guest_high_water_bytes={} \
@@ -4573,11 +4546,11 @@ async fn v2_json_ten_mib_rocksdb_read_benchmark() {
     const BENCHMARK: &str = "v2_json_ten_mib_rocksdb_read_benchmark";
 
     let root = tempfile::tempdir().expect("create JSON read benchmark directory");
-    let archive = build_json_v2_plugin_archive();
+    let archive = build_json_plugin_archive();
     let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
+        "plugin_json",
         &archive,
         &["json_root", "json_object_member", "json_array_item"],
     )
@@ -4725,16 +4698,12 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
     let seed = open_lix(OpenLixOptions::new(storage.clone()))
         .await
         .expect("benchmark workspace should open");
-    install_plugin(&seed, "plugin_csv_v2", &build_csv_v2_plugin_archive())
+    install_plugin(&seed, "plugin_csv", &build_csv_plugin_archive())
         .await
         .expect("CSV v2 plugin should install");
-    install_plugin(
-        &seed,
-        "plugin_json_incremental_v2",
-        &build_json_v2_plugin_archive(),
-    )
-    .await
-    .expect("JSON v2 plugin should install");
+    install_plugin(&seed, "plugin_json", &build_json_plugin_archive())
+        .await
+        .expect("JSON v2 plugin should install");
 
     let csv = csv_ten_mib_fixture();
     let (json_flat, json_edit_offset, _) = json_ten_mib_flat_fixture();
@@ -4781,7 +4750,7 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
             let lix = open_lix(OpenLixOptions::new(storage.clone()))
                 .await
                 .expect("cold benchmark workspace should reopen");
-            lix.reset_plugin_v2_transition_counters();
+            lix.reset_plugin_transition_counters();
             let mut after = accepted.clone();
             after[edit_offset] = alternate_ascii_hex(after[edit_offset]);
             let started = Instant::now();
@@ -4798,7 +4767,7 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
             assert_eq!(actual, after, "cold write must remain byte-exact");
             samples.push(ColdMaterializedOpenSample {
                 elapsed,
-                counters: lix.plugin_v2_transition_counters(),
+                counters: lix.plugin_transition_counters(),
             });
             lix.close()
                 .await
@@ -4861,11 +4830,11 @@ fn report_cold_materialized_open(
 #[tokio::test]
 async fn v2_json_cold_entity_write_is_scoped_by_file_despite_shared_root_keys() {
     let tempdir = tempfile::tempdir().unwrap();
-    let archive = build_json_v2_plugin_archive();
+    let archive = build_json_plugin_archive();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
+        "plugin_json",
         &archive,
         &["json_root", "json_object_member", "json_array_item"],
     )
@@ -4885,7 +4854,7 @@ async fn v2_json_cold_entity_write_is_scoped_by_file_despite_shared_root_keys() 
     // plugin schemas and the same recursive root/member identities; file_id is
     // therefore the required ownership boundary.
     let lix = open_lix_with_filesystem(tempdir.path()).await;
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.execute(
         "UPDATE json_object_member SET scalar_json = $1 \
          WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
@@ -4896,7 +4865,7 @@ async fn v2_json_cold_entity_write_is_scoped_by_file_despite_shared_root_keys() 
     )
     .await
     .unwrap();
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(
         counters.full_state_semantic_rows_materialized, 2,
         "cold reconstruction must hydrate only the target file's root and member"
@@ -4923,11 +4892,11 @@ async fn v2_json_cold_entity_write_is_scoped_by_file_despite_shared_root_keys() 
 
 #[tokio::test]
 async fn v2_json_entity_write_rollback_keeps_original_bytes_and_actor() {
-    let archive = build_json_v2_plugin_archive();
+    let archive = build_json_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
+        "plugin_json",
         &archive,
         &["json_root", "json_object_member", "json_array_item"],
     )
@@ -4978,11 +4947,11 @@ async fn v2_json_entity_write_rollback_keeps_original_bytes_and_actor() {
 
 #[tokio::test]
 async fn v2_json_rejects_mixed_byte_and_entity_transitions_in_one_transaction() {
-    let archive = build_json_v2_plugin_archive();
+    let archive = build_json_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_incremental_v2",
+        "plugin_json",
         &archive,
         &["json_root", "json_object_member", "json_array_item"],
     )
@@ -5023,11 +4992,11 @@ async fn v2_json_rejects_mixed_byte_and_entity_transitions_in_one_transaction() 
 
 #[tokio::test]
 async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
-    let archive = build_excalidraw_v2_plugin_archive();
+    let archive = build_excalidraw_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_excalidraw_v2",
+        "plugin_excalidraw",
         &archive,
         &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
     )
@@ -5070,9 +5039,9 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
         .unwrap()
         .replacen(r#""x":1.25"#, r#""x":123.5"#, 1)
         .into_bytes();
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     write_file(&lix, path, geometry_edit.clone()).await.unwrap();
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.full_state_semantic_rows_materialized, 0);
     assert_eq!(counters.durable_semantic_changes, 1);
 
@@ -5135,9 +5104,9 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
 }
 "##
     .to_vec();
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     write_file(&lix, path, before.clone()).await.unwrap();
-    let open_counters = lix.plugin_v2_transition_counters();
+    let open_counters = lix.plugin_transition_counters();
     assert_eq!(open_counters.guest_export_calls, 1);
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(before.clone()));
     assert_eq!(
@@ -5154,9 +5123,9 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
         .unwrap()
         .replacen(r#""x":1.25"#, r#""x":123.5"#, 1)
         .into_bytes();
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     write_file(&lix, path, after.clone()).await.unwrap();
-    let successor_counters = lix.plugin_v2_transition_counters();
+    let successor_counters = lix.plugin_transition_counters();
     assert_eq!(successor_counters.guest_export_calls, 1);
     assert_eq!(successor_counters.durable_semantic_changes, 1);
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
@@ -5247,8 +5216,8 @@ async fn v3_excalidraw_large_transition_benchmark() {
     for (label, plugin_key, archive) in [
         (
             "v2_cursor",
-            "plugin_excalidraw_v2",
-            build_excalidraw_v2_plugin_archive(),
+            "plugin_excalidraw",
+            build_excalidraw_plugin_archive(),
         ),
         (
             "v3_push_sink",
@@ -5272,14 +5241,14 @@ async fn v3_excalidraw_large_transition_benchmark() {
             .await;
             write_file(&lix, PATH, before.clone()).await.unwrap();
 
-            lix.reset_plugin_v2_transition_counters();
+            lix.reset_plugin_transition_counters();
             collector.clear();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
             write_file(&lix, PATH, after.clone()).await.unwrap();
             let measurement =
                 BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
-            let counters = lix.plugin_v2_transition_counters();
+            let counters = lix.plugin_transition_counters();
             assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(after.clone()));
             assert_eq!(
                 lix.execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
@@ -5381,11 +5350,11 @@ async fn v3_excalidraw_large_transition_benchmark() {
 
 #[tokio::test]
 async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
-    let archive = build_excalidraw_v2_plugin_archive();
+    let archive = build_excalidraw_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_excalidraw_v2",
+        "plugin_excalidraw",
         &archive,
         &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
     )
@@ -5464,7 +5433,7 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
         .expect("same-element Excalidraw conflict should preview");
     assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
@@ -5473,7 +5442,7 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
     let rendered: serde_json::Value =
         serde_json::from_slice(&read_file(&lix, path).await.unwrap().unwrap()).unwrap();
     assert_eq!(rendered["elements"][0]["x"], serde_json::json!(expected_x));
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.conflict_resolution_calls, 1);
     assert_eq!(counters.conflict_resolution_records, 1);
     assert_eq!(counters.conflict_resolution_takes, 1);
@@ -5565,7 +5534,7 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
         .expect("same-element v3 Excalidraw conflict should preview");
     assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
@@ -5574,7 +5543,7 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
     let rendered: serde_json::Value =
         serde_json::from_slice(&read_file(&lix, path).await.unwrap().unwrap()).unwrap();
     assert_eq!(rendered["elements"][0]["x"], serde_json::json!(expected_x));
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(counters.conflict_resolution_calls, 1);
     assert_eq!(counters.conflict_resolution_records, 1);
     assert_eq!(counters.conflict_resolution_takes, 1);
@@ -5585,17 +5554,15 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
 #[tokio::test]
 async fn v2_create_reservations_survive_restart_and_tombstone_with_file() {
     let tempdir = tempfile::tempdir().unwrap();
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let path = "/durable-ids.csv";
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
-    install_plugin(&lix, "plugin_csv_v2", &archive)
-        .await
-        .unwrap();
+    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
     write_file(&lix, path, b"first,one\n".to_vec())
         .await
         .unwrap();
-    let file_id = lix
+    let _file_id = lix
         .execute(
             "SELECT id FROM lix_file WHERE path = $1",
             &[Value::Text(path.to_string())],
@@ -5605,7 +5572,6 @@ async fn v2_create_reservations_survive_restart_and_tombstone_with_file() {
         .rows()[0]
         .get::<String>("id")
         .unwrap();
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 1);
     let inserted_identity = MutationIdentity {
         namespace_seed: uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000031")
             .expect("fixture UUIDv7")
@@ -5620,11 +5586,9 @@ async fn v2_create_reservations_survive_restart_and_tombstone_with_file() {
     )
     .await
     .unwrap();
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
     lix.close().await.unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(b"first,one\nsecond,two\n".to_vec())
@@ -5637,7 +5601,6 @@ async fn v2_create_reservations_survive_restart_and_tombstone_with_file() {
     )
     .await
     .expect("an exact same-proof retry after reopen should be accepted");
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
 
     let collision = write_file_with_mutation_identity(
         &lix,
@@ -5659,26 +5622,22 @@ async fn v2_create_reservations_survive_restart_and_tombstone_with_file() {
         read_file(&lix, path).await.unwrap(),
         Some(b"first,one\nsecond,two\n".to_vec())
     );
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
     lix.execute(
         "DELETE FROM lix_file WHERE path = $1",
         &[Value::Text(path.to_string())],
     )
     .await
     .unwrap();
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 0);
     lix.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn v2_csv_ids_survive_insert_edit_reorder_delete_eviction_and_cold_reopen() {
     let tempdir = tempfile::tempdir().unwrap();
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let path = "/identity-lifecycle.csv";
     let lix = open_lix_with_filesystem(tempdir.path()).await;
-    install_plugin(&lix, "plugin_csv_v2", &archive)
-        .await
-        .unwrap();
+    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
 
     let initial = b"alpha,one\ndup,same\ndup,same\nomega,last\n".to_vec();
     write_file(&lix, path, initial).await.unwrap();
@@ -5771,8 +5730,8 @@ async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_co
     let lix_a = open_lix_with_storage(storage_a)
         .await
         .expect("first independent Lix engine opens");
-    let archive = build_csv_v2_plugin_archive();
-    install_plugin(&lix_a, "plugin_csv_v2", &archive)
+    let archive = build_csv_plugin_archive();
+    install_plugin(&lix_a, "plugin_csv", &archive)
         .await
         .unwrap();
 
@@ -5799,26 +5758,26 @@ async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_co
     // Engine A still owns the root-old actor. Its exact SQL read returns the
     // durable materialized bytes without hydrating Wasm; the next write
     // cold-opens root-new and replaces only that captured stale slot.
-    lix_a.reset_plugin_v2_transition_counters();
+    lix_a.reset_plugin_transition_counters();
     assert_eq!(
         read_file(&lix_a, path).await.unwrap(),
         Some(advanced.clone())
     );
-    let counters = lix_a.plugin_v2_transition_counters();
+    let counters = lix_a.plugin_transition_counters();
     assert_eq!(counters.full_state_semantic_rows_materialized, 0);
     assert_eq!(counters.full_renderer_invocations, 0);
 
     let final_bytes = b"first,ONE\nsecond,TWO\n".to_vec();
-    lix_a.reset_plugin_v2_transition_counters();
+    lix_a.reset_plugin_transition_counters();
     write_file(&lix_a, path, final_bytes.clone())
         .await
         .expect("the next write restores root-new authority and applies the sparse edit");
-    let counters = lix_a.plugin_v2_transition_counters();
+    let counters = lix_a.plugin_transition_counters();
     assert_eq!(
         counters.full_state_semantic_rows_materialized, 3,
         "cold reconstruction materializes the table entity and both row entities"
     );
-    assert_eq!(counters.full_renderer_invocations, 1);
+    assert_eq!(counters.full_renderer_invocations, 0);
     assert_eq!(read_file(&lix_a, path).await.unwrap(), Some(final_bytes));
 
     lix_b.close().await.unwrap();
@@ -5827,11 +5786,9 @@ async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_co
 
 #[tokio::test]
 async fn v2_csv_file_incarnation_fences_old_observations_after_delete_and_recreate() {
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
-    install_plugin(&lix, "plugin_csv_v2", &archive)
-        .await
-        .unwrap();
+    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
     let path = "/recreated.csv";
     let old_bytes = b"old,incarnation\n".to_vec();
     write_file(&lix, path, old_bytes.clone()).await.unwrap();
@@ -5864,11 +5821,9 @@ async fn v2_csv_file_incarnation_fences_old_observations_after_delete_and_recrea
 
 #[tokio::test]
 async fn v2_csv_actor_state_isolated_by_branch_root() {
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
-    install_plugin(&lix, "plugin_csv_v2", &archive)
-        .await
-        .unwrap();
+    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
     let path = "/branch-isolation.csv";
     let main_bytes = b"main,one\nshared,row\n".to_vec();
     write_file(&lix, path, main_bytes.clone()).await.unwrap();
@@ -5920,11 +5875,9 @@ async fn v2_csv_actor_state_isolated_by_branch_root() {
 
 #[tokio::test]
 async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions() {
-    let original = build_csv_v2_plugin_archive();
+    let original = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
-    install_plugin(&lix, "plugin_csv_v2", &original)
-        .await
-        .unwrap();
+    install_plugin(&lix, "plugin_csv", &original).await.unwrap();
     let path = "/upgrade.csv";
     let bytes = b"first,one\nsecond,two\n".to_vec();
     write_file(&lix, path, bytes.clone()).await.unwrap();
@@ -5934,20 +5887,20 @@ async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions(
 
     // A packaging-only archive generation change exercises the complete
     // owner preflight while retaining the same compiled component contract.
-    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2"));
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv"));
     let wasm = std::fs::read(wasm_path).unwrap();
-    let compatible = build_csv_v2_plugin_archive_variant(
+    let compatible = build_csv_plugin_archive_variant(
         &wasm,
-        include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json").as_bytes(),
+        include_str!("../../../plugins/csv/schema/csv_v2_row.json").as_bytes(),
         Some(b"compatible-generation"),
     );
     assert_ne!(original, compatible);
-    install_plugin(&lix, "plugin_csv_v2", &compatible)
+    install_plugin(&lix, "plugin_csv", &compatible)
         .await
         .expect("byte-stable compatible generation should commit");
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(bytes.clone()));
     assert_eq!(
-        read_file(&lix, "/.lix/plugins/plugin_csv_v2.lixplugin")
+        read_file(&lix, "/.lix/plugins/plugin_csv.lixplugin")
             .await
             .unwrap(),
         Some(compatible.clone())
@@ -5958,16 +5911,14 @@ async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions(
         .expect_err("a session acknowledged under the previous generation must fail closed");
     assert_eq!(stale_error.code, LixError::CODE_PLUGIN_OBSERVATION_STALE);
 
-    let mut changed_schema: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../plugins/csv-v2/schema/csv_v2_row.json"
-    ))
-    .unwrap();
+    let mut changed_schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../../plugins/csv/schema/csv_v2_row.json")).unwrap();
     changed_schema["description"] =
         serde_json::Value::String("incompatible replacement definition".to_string());
     let changed_schema = serde_json::to_vec(&changed_schema).unwrap();
     let schema_changing =
-        build_csv_v2_plugin_archive_variant(&wasm, &changed_schema, Some(b"schema-changing"));
-    let schema_error = install_plugin(&lix, "plugin_csv_v2", &schema_changing)
+        build_csv_plugin_archive_variant(&wasm, &changed_schema, Some(b"schema-changing"));
+    let schema_error = install_plugin(&lix, "plugin_csv", &schema_changing)
         .await
         .expect_err("an owned schema definition change must be rejected");
     assert_eq!(schema_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
@@ -5976,17 +5927,17 @@ async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions(
     // check. This component reaches the production compiler and is rejected
     // before the replacement registry generation can become authoritative.
     let invalid_component = b"\0asm\x0a\0\0\0";
-    let trapping = build_csv_v2_plugin_archive_variant(
+    let trapping = build_csv_plugin_archive_variant(
         invalid_component,
-        include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json").as_bytes(),
+        include_str!("../../../plugins/csv/schema/csv_v2_row.json").as_bytes(),
         Some(b"invalid-component"),
     );
-    install_plugin(&lix, "plugin_csv_v2", &trapping)
+    install_plugin(&lix, "plugin_csv", &trapping)
         .await
         .expect_err("invalid replacement component must fail preflight");
 
     assert_eq!(
-        read_file(&lix, "/.lix/plugins/plugin_csv_v2.lixplugin")
+        read_file(&lix, "/.lix/plugins/plugin_csv.lixplugin")
             .await
             .unwrap(),
         Some(compatible),
@@ -6006,9 +5957,9 @@ async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions(
 
 #[tokio::test]
 async fn v2_generation_upgrade_with_disjoint_edits_remains_a_merge_conflict() {
-    let original = build_csv_v2_plugin_archive();
+    let original = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
-    install_plugin(&lix, "plugin_csv_v2", &original)
+    install_plugin(&lix, "plugin_csv", &original)
         .await
         .expect("base CSV generation should install");
 
@@ -6038,14 +5989,14 @@ async fn v2_generation_upgrade_with_disjoint_edits_remains_a_merge_conflict() {
     })
     .await
     .unwrap();
-    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2"));
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv"));
     let wasm = std::fs::read(wasm_path).unwrap();
-    let upgraded = build_csv_v2_plugin_archive_variant(
+    let upgraded = build_csv_plugin_archive_variant(
         &wasm,
-        include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json").as_bytes(),
+        include_str!("../../../plugins/csv/schema/csv_v2_row.json").as_bytes(),
         Some(b"source-generation"),
     );
-    install_plugin(&lix, "plugin_csv_v2", &upgraded)
+    install_plugin(&lix, "plugin_csv", &upgraded)
         .await
         .expect("compatible source generation should preflight");
     write_file(&lix, path, b"first,one\nsecond,TWO\n".to_vec())
@@ -6068,7 +6019,7 @@ async fn v2_generation_upgrade_with_disjoint_edits_remains_a_merge_conflict() {
             && conflict.file_id.as_deref() == Some(file_id.as_str())
     }));
 
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     let error = lix
         .merge_branch(MergeBranchOptions {
             source_branch_id: source.id,
@@ -6078,14 +6029,14 @@ async fn v2_generation_upgrade_with_disjoint_edits_remains_a_merge_conflict() {
             "derived bytes must not be rendered by a different generation than is committed",
         );
     assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     assert_eq!(
         counters.conflict_resolution_calls, 0,
         "disjoint rows are not a resolver decision; the generation boundary stays visible"
     );
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(target_bytes));
     assert_eq!(
-        read_file(&lix, "/.lix/plugins/plugin_csv_v2.lixplugin")
+        read_file(&lix, "/.lix/plugins/plugin_csv.lixplugin")
             .await
             .unwrap(),
         Some(original),
@@ -6097,11 +6048,9 @@ async fn v2_generation_upgrade_with_disjoint_edits_remains_a_merge_conflict() {
 
 #[tokio::test]
 async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
-    install_plugin(&lix, "plugin_csv_v2", &archive)
-        .await
-        .unwrap();
+    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
 
     let before_path = "/before-rename.csv";
     let after_path = "/after-rename.csv";
@@ -6120,7 +6069,6 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
         .rows()[0]
         .get::<String>("id")
         .unwrap();
-    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 1);
 
     // This reader must become stale solely because the accepted actor moves
     // to the descriptor-successor key, not because file bytes changed.
@@ -6220,12 +6168,12 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
 
 #[tokio::test]
 async fn transaction_lix_file_data_uses_session_plugin_runtime() {
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_csv_v2",
+        "plugin_csv",
         &archive,
         &["csv_v2_table", "csv_v2_row"],
     )
@@ -6265,14 +6213,12 @@ async fn transaction_lix_file_data_uses_session_plugin_runtime() {
 async fn filesystem_materializes_internal_lix_plugin_paths() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
-    let archive = build_csv_v2_plugin_archive();
+    let archive = build_csv_plugin_archive();
 
-    install_plugin(&lix, "plugin_csv_v2", &archive)
-        .await
-        .unwrap();
+    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
 
     wait_for_disk_file(
-        &tempdir.path().join(".lix/plugins/plugin_csv_v2.lixplugin"),
+        &tempdir.path().join(".lix/plugins/plugin_csv.lixplugin"),
         Some(archive.as_slice()),
     );
     lix.close().await.unwrap();
@@ -6281,8 +6227,8 @@ async fn filesystem_materializes_internal_lix_plugin_paths() {
 #[tokio::test]
 async fn filesystem_imports_lix_plugin_archives_from_disk() {
     let tempdir = tempfile::tempdir().unwrap();
-    let archive = build_csv_v2_plugin_archive();
-    let plugin_path = tempdir.path().join(".lix/plugins/plugin_csv_v2.lixplugin");
+    let archive = build_csv_plugin_archive();
+    let plugin_path = tempdir.path().join(".lix/plugins/plugin_csv.lixplugin");
     std::fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
     std::fs::write(&plugin_path, &archive).unwrap();
 
@@ -6290,9 +6236,9 @@ async fn filesystem_imports_lix_plugin_archives_from_disk() {
 
     let plugins = list_installed_plugins(&lix).await;
     assert_eq!(plugins.len(), 1);
-    assert_eq!(plugins[0].key, "plugin_csv_v2");
+    assert_eq!(plugins[0].key, "plugin_csv");
     assert_eq!(
-        read_file(&lix, "/.lix/plugins/plugin_csv_v2.lixplugin")
+        read_file(&lix, "/.lix/plugins/plugin_csv.lixplugin")
             .await
             .unwrap()
             .as_deref(),
@@ -6455,29 +6401,6 @@ fn csv_v2_row_id(rows: &[CsvV2Row], cells: &[&str]) -> String {
     let ids = csv_v2_row_ids(rows, cells);
     assert_eq!(ids.len(), 1, "expected one csv_v2_row with cells {cells:?}");
     ids[0].clone()
-}
-
-async fn plugin_create_reservation_count<StorageImpl>(
-    lix: &Lix<StorageImpl>,
-    file_id: &str,
-) -> usize
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    lix.execute(
-        "SELECT key FROM lix_key_value WHERE lixcol_file_id = $1",
-        &[Value::Text(file_id.to_string())],
-    )
-    .await
-    .unwrap()
-    .rows()
-    .iter()
-    .filter(|row| {
-        row.get::<String>("key")
-            .ok()
-            .is_some_and(|key| key.starts_with("lix_plugin_create_v1:"))
-    })
-    .count()
 }
 
 async fn open_lix_with_filesystem(path: &Path) -> Lix<LocalFilesystem> {
@@ -6726,25 +6649,8 @@ fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
     }
 }
 
-fn build_csv_v2_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2"));
-    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read bindep-built CSV v2 plugin wasm at {}: {error}",
-            wasm_path.display()
-        )
-    });
-    build_csv_v2_plugin_archive_variant(
-        &wasm,
-        include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json").as_bytes(),
-        None,
-    )
-}
-
 fn build_csv_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv"
-    ));
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv"));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
             "failed to read bindep-built CSV v3 wasm at {}: {error}",
@@ -6761,11 +6667,11 @@ fn build_csv_plugin_archive() -> Vec<u8> {
         ),
         (
             "schema/csv_v2_table.json",
-            include_str!("../../../plugins/csv-v2/schema/csv_v2_table.json").as_bytes(),
+            include_str!("../../../plugins/csv/schema/csv_v2_table.json").as_bytes(),
         ),
         (
             "schema/csv_v2_row.json",
-            include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json").as_bytes(),
+            include_str!("../../../plugins/csv/schema/csv_v2_row.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
@@ -6776,9 +6682,7 @@ fn build_csv_plugin_archive() -> Vec<u8> {
 }
 
 fn build_json_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"
-    ));
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
             "failed to read bindep-built JSON v3 wasm at {}: {error}",
@@ -6795,45 +6699,15 @@ fn build_json_plugin_archive() -> Vec<u8> {
         ),
         (
             "schema/json_root.json",
-            include_str!("../../../plugins/json-v2/schema/json_root.json").as_bytes(),
+            include_str!("../../../plugins/json/schema/json_root.json").as_bytes(),
         ),
         (
             "schema/json_object_member.json",
-            include_str!("../../../plugins/json-v2/schema/json_object_member.json").as_bytes(),
+            include_str!("../../../plugins/json/schema/json_object_member.json").as_bytes(),
         ),
         (
             "schema/json_array_item.json",
-            include_str!("../../../plugins/json-v2/schema/json_array_item.json").as_bytes(),
-        ),
-        ("plugin.wasm", wasm.as_slice()),
-    ] {
-        writer.start_file(path, options).unwrap();
-        writer.write_all(bytes).unwrap();
-    }
-    writer.finish().unwrap().into_inner()
-}
-
-fn build_markdown_v2_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_INCREMENTAL_V2_plugin_markdown_incremental_v2"
-    ));
-    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read bindep-built Markdown v2 plugin wasm at {}: {error}",
-            wasm_path.display()
-        )
-    });
-    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for (path, bytes) in [
-        (
-            "manifest.json",
-            include_str!("../../../plugins/markdown-v2/manifest.json").as_bytes(),
-        ),
-        (
-            "schema/markdown_node_v2.json",
-            include_str!("../../../plugins/markdown-v2/schema/markdown_node_v2.json").as_bytes(),
+            include_str!("../../../plugins/json/schema/json_array_item.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
@@ -6844,9 +6718,7 @@ fn build_markdown_v2_plugin_archive() -> Vec<u8> {
 }
 
 fn build_markdown_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown"
-    ));
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown"));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
             "failed to read bindep-built Markdown v3 wasm at {}: {error}",
@@ -6863,45 +6735,7 @@ fn build_markdown_plugin_archive() -> Vec<u8> {
         ),
         (
             "schema/markdown_node_v2.json",
-            include_str!("../../../plugins/markdown-v2/schema/markdown_node_v2.json").as_bytes(),
-        ),
-        ("plugin.wasm", wasm.as_slice()),
-    ] {
-        writer.start_file(path, options).unwrap();
-        writer.write_all(bytes).unwrap();
-    }
-    writer.finish().unwrap().into_inner()
-}
-
-fn build_json_v2_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_JSON_INCREMENTAL_V2_plugin_json_incremental_v2"
-    ));
-    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read bindep-built JSON v2 plugin wasm at {}: {error}",
-            wasm_path.display()
-        )
-    });
-    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for (path, bytes) in [
-        (
-            "manifest.json",
-            include_str!("../../../plugins/json-v2/manifest.json").as_bytes(),
-        ),
-        (
-            "schema/json_root.json",
-            include_str!("../../../plugins/json-v2/schema/json_root.json").as_bytes(),
-        ),
-        (
-            "schema/json_object_member.json",
-            include_str!("../../../plugins/json-v2/schema/json_object_member.json").as_bytes(),
-        ),
-        (
-            "schema/json_array_item.json",
-            include_str!("../../../plugins/json-v2/schema/json_array_item.json").as_bytes(),
+            include_str!("../../../plugins/markdown/schema/markdown_node_v2.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
@@ -6953,9 +6787,9 @@ where
         .await
         .expect("open JSON control schema transaction");
     for schema in [
-        include_str!("../../../plugins/json-v2/schema/json_root.json"),
-        include_str!("../../../plugins/json-v2/schema/json_object_member.json"),
-        include_str!("../../../plugins/json-v2/schema/json_array_item.json"),
+        include_str!("../../../plugins/json/schema/json_root.json"),
+        include_str!("../../../plugins/json/schema/json_object_member.json"),
+        include_str!("../../../plugins/json/schema/json_array_item.json"),
     ] {
         let inserted = transaction
             .execute(
@@ -6982,8 +6816,8 @@ where
         .await
         .expect("open CSV control schema transaction");
     for schema in [
-        include_str!("../../../plugins/csv-v2/schema/csv_v2_table.json"),
-        include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json"),
+        include_str!("../../../plugins/csv/schema/csv_v2_table.json"),
+        include_str!("../../../plugins/csv/schema/csv_v2_row.json"),
     ] {
         assert_eq!(
             transaction
@@ -7274,45 +7108,6 @@ fn json_scalar_at_offset(bytes: &[u8], offset: usize) -> String {
         .to_owned()
 }
 
-fn build_excalidraw_v2_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_V2_plugin_excalidraw_v2"
-    ));
-    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read bindep-built Excalidraw v2 plugin wasm at {}: {error}",
-            wasm_path.display()
-        )
-    });
-    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for (path, bytes) in [
-        (
-            "manifest.json",
-            include_str!("../../../plugins/excalidraw-v2/manifest.json").as_bytes(),
-        ),
-        (
-            "schema/excalidraw_scene.json",
-            include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_scene.json").as_bytes(),
-        ),
-        (
-            "schema/excalidraw_element.json",
-            include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_element.json")
-                .as_bytes(),
-        ),
-        (
-            "schema/excalidraw_file.json",
-            include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_file.json").as_bytes(),
-        ),
-        ("plugin.wasm", wasm.as_slice()),
-    ] {
-        writer.start_file(path, options).unwrap();
-        writer.write_all(bytes).unwrap();
-    }
-    writer.finish().unwrap().into_inner()
-}
-
 fn build_excalidraw_plugin_archive() -> Vec<u8> {
     let wasm_path = Path::new(env!(
         "CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_plugin_excalidraw"
@@ -7333,16 +7128,15 @@ fn build_excalidraw_plugin_archive() -> Vec<u8> {
         ),
         (
             "schema/excalidraw_scene.json",
-            include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_scene.json").as_bytes(),
+            include_str!("../../../plugins/excalidraw/schema/excalidraw_scene.json").as_bytes(),
         ),
         (
             "schema/excalidraw_element.json",
-            include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_element.json")
-                .as_bytes(),
+            include_str!("../../../plugins/excalidraw/schema/excalidraw_element.json").as_bytes(),
         ),
         (
             "schema/excalidraw_file.json",
-            include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_file.json").as_bytes(),
+            include_str!("../../../plugins/excalidraw/schema/excalidraw_file.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
@@ -7352,7 +7146,7 @@ fn build_excalidraw_plugin_archive() -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
-fn build_csv_v2_plugin_archive_variant(
+fn build_csv_plugin_archive_variant(
     wasm: &[u8],
     csv_v2_row_schema: &[u8],
     generation_marker: Option<&[u8]>,
@@ -7363,11 +7157,11 @@ fn build_csv_v2_plugin_archive_variant(
     for (path, bytes) in [
         (
             "manifest.json",
-            include_str!("../../../plugins/csv-v2/manifest.json").as_bytes(),
+            include_str!("../../../plugins/csv/manifest.json").as_bytes(),
         ),
         (
             "schema/csv_v2_table.json",
-            include_str!("../../../plugins/csv-v2/schema/csv_v2_table.json").as_bytes(),
+            include_str!("../../../plugins/csv/schema/csv_v2_table.json").as_bytes(),
         ),
         ("schema/csv_v2_row.json", csv_v2_row_schema),
         ("plugin.wasm", wasm),

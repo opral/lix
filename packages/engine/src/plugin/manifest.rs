@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::wasm::{WASM_COMPONENT_V2_API_VERSION, WASM_COMPONENT_V3_PROTOTYPE_API_VERSION};
+use crate::wasm::WASM_COMPONENT_API_VERSION;
 
 static PLUGIN_MANIFEST_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static PLUGIN_MANIFEST_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceLock::new();
@@ -14,10 +14,10 @@ static PLUGIN_MANIFEST_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceL
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PluginRuntime {
-    WasmComponentV2,
+    WasmComponent,
 }
 
-/// Durable byte-materialization contract for a Component-v2 plugin.
+/// Durable byte-materialization contract for a Component plugin.
 ///
 /// `Blob` retains rendered bytes in the binary CAS. `Derived` makes durable
 /// semantic rows authoritative and retains only a byte fingerprint; readers
@@ -138,13 +138,11 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
 /// durable-registry boundaries. The latter matters because registry snapshots
 /// can outlive the process that originally validated an archive.
 pub(crate) fn validate_runtime_api_version(manifest: &PluginManifest) -> Result<(), LixError> {
-    if manifest.api_version != WASM_COMPONENT_V2_API_VERSION
-        && manifest.api_version != WASM_COMPONENT_V3_PROTOTYPE_API_VERSION
-    {
+    if manifest.api_version != WASM_COMPONENT_API_VERSION {
         return Err(LixError::new(
             LixError::CODE_INVALID_PLUGIN,
             format!(
-                "wasm-component-v2 requires api_version '{WASM_COMPONENT_V2_API_VERSION}' or experimental '{WASM_COMPONENT_V3_PROTOTYPE_API_VERSION}', got '{}'",
+                "wasm-component requires api_version '{WASM_COMPONENT_API_VERSION}', got '{}'",
                 manifest.api_version
             ),
         ));
@@ -250,12 +248,12 @@ mod tests {
     use super::{PluginContentType, PluginRuntime, glob_matches_path, parse_plugin_manifest_json};
 
     #[test]
-    fn parses_valid_v2_manifest() {
+    fn parses_valid_manifest() {
         let validated = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_json",
-                "runtime":"wasm-component-v2",
-                "api_version":"2.1.0",
+                "runtime":"wasm-component",
+                "api_version":"3.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.json"},
                 "entry":"plugin.wasm",
@@ -265,16 +263,16 @@ mod tests {
         .expect("manifest should parse");
 
         assert_eq!(validated.manifest.key, "plugin_json");
-        assert_eq!(validated.manifest.runtime, PluginRuntime::WasmComponentV2);
+        assert_eq!(validated.manifest.runtime, PluginRuntime::WasmComponent);
         assert_eq!(validated.manifest.entry, "plugin.wasm");
     }
 
     #[test]
-    fn parses_experimental_v3_manifest() {
+    fn parses_v3_manifest() {
         let validated = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_csv",
-                "runtime":"wasm-component-v2",
+                "runtime":"wasm-component",
                 "api_version":"3.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.csv"},
@@ -282,37 +280,37 @@ mod tests {
                 "schemas":["schema/csv_row.json"]
             }"#,
         )
-        .expect("experimental v3 manifest should parse");
+        .expect("v3 manifest should parse");
 
         assert_eq!(validated.manifest.api_version, "3.0.0");
     }
 
     #[test]
-    fn rejects_pre_conflict_resolution_v2_manifest() {
+    fn rejects_legacy_manifest() {
         let error = parse_plugin_manifest_json(
             r#"{
-                "key":"plugin_csv_v2",
-                "runtime":"wasm-component-v2",
-                "api_version":"2.0.0",
+                "key":"plugin_csv",
+                "runtime":"wasm-component",
+                "api_version":"2.1.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.csv"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/csv_row.json"]
             }"#,
         )
-        .expect_err("the runtime must fence pre-conflict-resolution components");
+        .expect_err("the runtime must fence legacy components");
 
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
         assert!(error.message.contains("api_version"));
-        assert!(error.message.contains("2.1.0"));
+        assert!(error.message.contains("3.0.0"));
     }
 
     #[test]
     fn rejects_invalid_manifest() {
         let err = parse_plugin_manifest_json(
             r#"{
-                "runtime":"wasm-component-v2",
-                "api_version":"2.1.0",
+                "runtime":"wasm-component",
+                "api_version":"3.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.json"},
                 "entry":"plugin.wasm",
@@ -331,8 +329,8 @@ mod tests {
         let error = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_markdown",
-                "runtime":"wasm-component-v2",
-                "api_version":"2.1.0",
+                "runtime":"wasm-component",
+                "api_version":"3.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.{md,mdx"},
                 "entry":"plugin.wasm",
@@ -388,8 +386,8 @@ mod tests {
         let validated = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_text",
-                "runtime":"wasm-component-v2",
-                "api_version":"2.1.0",
+                "runtime":"wasm-component",
+                "api_version":"3.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"**/*", "content_type":"text"},
                 "entry":"plugin.wasm",
@@ -409,8 +407,8 @@ mod tests {
         let err = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_markdown",
-                "runtime":"wasm-component-v2",
-                "api_version":"2.1.0",
+                "runtime":"wasm-component",
+                "api_version":"3.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.{md,mdx}"},
                 "entry":"plugin.wasm",
@@ -432,8 +430,8 @@ mod tests {
     fn manifest_with(path_glob: &str, schemas: &[String]) -> String {
         serde_json::json!({
             "key": "plugin_bounds",
-            "runtime": "wasm-component-v2",
-            "api_version": "2.1.0",
+            "runtime": "wasm-component",
+            "api_version": "3.0.0",
             "materialization": "blob",
             "match": { "path_glob": path_glob },
             "entry": "plugin.wasm",

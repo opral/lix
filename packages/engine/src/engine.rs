@@ -13,7 +13,7 @@ use crate::live_state::LiveStateRowRequest;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{
-    DEFAULT_MAX_LIVE_PLUGIN_STORES, DEFAULT_PLUGIN_V2_MEMORY_BYTES, PluginRuntimeHost,
+    DEFAULT_MAX_LIVE_PLUGIN_STORES, DEFAULT_PLUGIN_MEMORY_BYTES, PluginRuntimeHost,
 };
 use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
@@ -51,8 +51,8 @@ pub struct Engine<StorageImpl: Storage = crate::storage_adapter::Memory> {
 pub struct EngineOptions {
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
-    plugin_v2_max_memory_bytes: u64,
-    plugin_v2_max_live_stores: usize,
+    plugin_max_memory_bytes: u64,
+    plugin_max_live_stores: usize,
 }
 
 impl Default for EngineOptions {
@@ -60,8 +60,8 @@ impl Default for EngineOptions {
         Self {
             wasm_runtime: None,
             telemetry: None,
-            plugin_v2_max_memory_bytes: DEFAULT_PLUGIN_V2_MEMORY_BYTES,
-            plugin_v2_max_live_stores: DEFAULT_MAX_LIVE_PLUGIN_STORES,
+            plugin_max_memory_bytes: DEFAULT_PLUGIN_MEMORY_BYTES,
+            plugin_max_live_stores: DEFAULT_MAX_LIVE_PLUGIN_STORES,
         }
     }
 }
@@ -93,13 +93,13 @@ impl EngineOptions {
     /// candidates, and upgrade preflight Stores consume the same
     /// workspace-wide budget. Completed publications may retire their Stores
     /// under pressure and cold-open again after commit.
-    pub fn with_plugin_v2_resource_limits(
+    pub fn with_plugin_resource_limits(
         mut self,
         max_memory_bytes: u64,
         max_live_stores: usize,
     ) -> Self {
-        self.plugin_v2_max_memory_bytes = max_memory_bytes;
-        self.plugin_v2_max_live_stores = max_live_stores;
+        self.plugin_max_memory_bytes = max_memory_bytes;
+        self.plugin_max_live_stores = max_live_stores;
         self
     }
 }
@@ -151,10 +151,10 @@ where
         let wasm_runtime = options
             .wasm_runtime
             .unwrap_or_else(|| Arc::new(UnsupportedWasmRuntime));
-        let plugin_host = PluginRuntimeHost::new_with_v2_limits(
+        let plugin_host = PluginRuntimeHost::new_with_limits(
             wasm_runtime,
-            options.plugin_v2_max_memory_bytes,
-            options.plugin_v2_max_live_stores,
+            options.plugin_max_memory_bytes,
+            options.plugin_max_live_stores,
         )?;
 
         let tracked_state = Arc::new(TrackedStateContext::new());
@@ -259,15 +259,15 @@ where
     /// Returns process-local work accumulated by completed v2 transitions on
     /// this engine. The snapshot is shared by every session cloned from it.
     #[doc(hidden)]
-    pub fn plugin_v2_transition_counters(&self) -> WasmTransitionCounters {
-        self.plugin_host.v2_transition_counters()
+    pub fn plugin_transition_counters(&self) -> WasmTransitionCounters {
+        self.plugin_host.transition_counters()
     }
 
     /// Resets the process-local v2 transition aggregate used by profiling and
     /// invariant tests. This does not mutate durable workspace state.
     #[doc(hidden)]
-    pub fn reset_plugin_v2_transition_counters(&self) {
-        self.plugin_host.reset_v2_transition_counters();
+    pub fn reset_plugin_transition_counters(&self) {
+        self.plugin_host.reset_transition_counters();
     }
 
     /// Rebuilds the tracked serving commit root for one branch from changelog.

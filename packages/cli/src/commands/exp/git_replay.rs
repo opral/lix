@@ -25,10 +25,10 @@ const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
 // window before draining responses without depending on a platform's larger
 // pipe capacity or deadlocking behind a large blob response.
 const CAT_FILE_REQUESTS_PER_BATCH: usize = 4;
-const GIT_TEXT_PLUGIN_KEY: &str = "plugin_git_text_v2";
-const CSV_PLUGIN_KEY: &str = "plugin_csv_v2";
-const MARKDOWN_PLUGIN_KEY: &str = "plugin_markdown_incremental_v2";
-const EXCALIDRAW_PLUGIN_KEY: &str = "plugin_excalidraw_v2";
+const GIT_TEXT_PLUGIN_KEY: &str = "plugin_git_text";
+const CSV_PLUGIN_KEY: &str = "plugin_csv";
+const MARKDOWN_PLUGIN_KEY: &str = "plugin_markdown";
+const EXCALIDRAW_PLUGIN_KEY: &str = "plugin_excalidraw";
 const GIT_REPLAY_MARKER_KEY: &str = "git_replay_marker_v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,11 +433,11 @@ where
         {
             marker_only += 1;
         }
-        lix.reset_plugin_v2_transition_counters();
+        lix.reset_plugin_transition_counters();
         let execute_started = Instant::now();
         execute_statements_as_transaction(&lix, &statements, commit_sha)?;
         let execute_ms = duration_to_ms(execute_started.elapsed());
-        let plugin_counters = lix.plugin_v2_transition_counters().into();
+        let plugin_counters = lix.plugin_transition_counters().into();
         phase_totals.execute_ms += execute_ms;
         applied += 1;
         let checkpoint_ms = if checkpoint_every.is_some_and(|interval| (index + 1) % interval == 0)
@@ -2106,74 +2106,68 @@ where
         (
             GIT_TEXT_PLUGIN_KEY,
             build_embedded_plugin_archive(
-                include_str!("../../../../../plugins/text-v2/manifest.json"),
+                include_str!("../../../../../plugins/text/manifest.json"),
                 &[(
                     "schema/git_text_line_v2.json",
-                    include_bytes!("../../../../../plugins/text-v2/schema/git_text_line_v2.json"),
+                    include_bytes!("../../../../../plugins/text/schema/git_text_line_v2.json"),
                 )],
-                Path::new(env!(
-                    "CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_V2_plugin_git_text_v2"
-                )),
+                Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text")),
             )?,
         ),
         (
             CSV_PLUGIN_KEY,
             build_embedded_plugin_archive(
-                include_str!("../../../../../plugins/csv-v2/manifest.json"),
+                include_str!("../../../../../plugins/csv/manifest.json"),
                 &[
                     (
                         "schema/csv_v2_table.json",
-                        include_bytes!("../../../../../plugins/csv-v2/schema/csv_v2_table.json"),
+                        include_bytes!("../../../../../plugins/csv/schema/csv_v2_table.json"),
                     ),
                     (
                         "schema/csv_v2_row.json",
-                        include_bytes!("../../../../../plugins/csv-v2/schema/csv_v2_row.json"),
+                        include_bytes!("../../../../../plugins/csv/schema/csv_v2_row.json"),
                     ),
                 ],
-                Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2")),
+                Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv")),
             )?,
         ),
         (
             MARKDOWN_PLUGIN_KEY,
             build_embedded_plugin_archive(
-                include_str!("../../../../../plugins/markdown-v2/manifest.json"),
+                include_str!("../../../../../plugins/markdown/manifest.json"),
                 &[(
                     "schema/markdown_node_v2.json",
-                    include_bytes!(
-                        "../../../../../plugins/markdown-v2/schema/markdown_node_v2.json"
-                    ),
+                    include_bytes!("../../../../../plugins/markdown/schema/markdown_node_v2.json"),
                 )],
-                Path::new(env!(
-                    "CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_INCREMENTAL_V2_plugin_markdown_incremental_v2"
-                )),
+                Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown")),
             )?,
         ),
         (
             EXCALIDRAW_PLUGIN_KEY,
             build_embedded_plugin_archive(
-                include_str!("../../../../../plugins/excalidraw-v2/manifest.json"),
+                include_str!("../../../../../plugins/excalidraw/manifest.json"),
                 &[
                     (
                         "schema/excalidraw_scene.json",
                         include_bytes!(
-                            "../../../../../plugins/excalidraw-v2/schema/excalidraw_scene.json"
+                            "../../../../../plugins/excalidraw/schema/excalidraw_scene.json"
                         ),
                     ),
                     (
                         "schema/excalidraw_element.json",
                         include_bytes!(
-                            "../../../../../plugins/excalidraw-v2/schema/excalidraw_element.json"
+                            "../../../../../plugins/excalidraw/schema/excalidraw_element.json"
                         ),
                     ),
                     (
                         "schema/excalidraw_file.json",
                         include_bytes!(
-                            "../../../../../plugins/excalidraw-v2/schema/excalidraw_file.json"
+                            "../../../../../plugins/excalidraw/schema/excalidraw_file.json"
                         ),
                     ),
                 ],
                 Path::new(env!(
-                    "CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_V2_plugin_excalidraw_v2"
+                    "CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_plugin_excalidraw"
                 )),
             )?,
         ),

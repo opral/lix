@@ -20,17 +20,17 @@ pub(crate) use actor::{
     PluginActorKey, PluginActorLease, PluginActorStore, PluginActorStorePermit, PluginObservation,
 };
 pub(crate) use archive::{ParsedPluginArchive, parse_plugin_archive_for_install};
-pub(crate) use component::{DEFAULT_PLUGIN_V2_MEMORY_BYTES, PluginRuntimeHost};
+pub(crate) use component::{DEFAULT_PLUGIN_MEMORY_BYTES, PluginRuntimeHost};
 pub(crate) use create_context::{
     BoundCreateContext, is_reservation_key, local_mutation_identity, materialize_keyless_creates,
     require_existing_id_authorities, reservation_tombstone_row, reserve_create_row,
     validate_create_changes, validate_create_reservation,
 };
 pub(crate) use incremental::{
-    ArcByteSource, FileBytesSha256, LiveBatchEntitySource, V2SchemaAllowlist,
+    ArcByteSource, FileBytesSha256, LiveBatchEntitySource, SchemaAllowlist,
     ValidatedConflictTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
     VecEntityChangeSource, VecEntityConflictSource, VecEntitySource, build_file_update_splices,
-    canonicalize_v2_snapshot, certify_dense_v2_fresh_file, drain_conflict_transition_resolutions,
+    canonicalize_snapshot, certify_dense_fresh_file, drain_conflict_transition_resolutions,
     drain_entity_transition_edits, drain_file_transition_changes,
     host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
     transport_splice_preserves_git_text, transport_splice_preserves_utf8,

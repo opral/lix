@@ -1,7 +1,7 @@
-//! Engine-side plumbing for incremental Wasm Component v2 transitions.
+//! Engine-side plumbing for incremental Wasm Component transitions.
 //!
 //! This module owns validation and bounded host adapters around the host-
-//! neutral `wasm::v2` traits. It deliberately does not decide transaction,
+//! neutral `wasm` traits. It deliberately does not decide transaction,
 //! conflict-resolution, observation, or actor-publication policy.
 
 use std::collections::{BTreeSet, VecDeque};
@@ -22,7 +22,7 @@ use crate::live_state::MaterializedLiveStateBatch;
 use crate::wasm::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
     WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedEntityBatch,
-    WasmChangeDrainValidator, WasmChangePage, WasmComponentV2Actor, WasmConflictResolution,
+    WasmChangeDrainValidator, WasmChangePage, WasmComponentActor, WasmConflictResolution,
     WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTransition,
     WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange,
     WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflict, WasmEntityConflictPage,
@@ -126,12 +126,16 @@ impl WasmByteSource for ArcByteSource {
 
     fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, LixError> {
         if length == 0 {
-            return Err(invalid_input("v2 byte-source reads must request bytes"));
+            return Err(invalid_input(
+                "component byte-source reads must request bytes",
+            ));
         }
         let start = usize::try_from(offset)
-            .map_err(|_| invalid_input("v2 byte-source offset does not fit this host"))?;
+            .map_err(|_| invalid_input("component byte-source offset does not fit this host"))?;
         if start > self.bytes.len() {
-            return Err(invalid_input("v2 byte-source offset is out of bounds"));
+            return Err(invalid_input(
+                "component byte-source offset is out of bounds",
+            ));
         }
         let end = start.saturating_add(length as usize).min(self.bytes.len());
         let result = self.bytes[start..end].to_vec();
@@ -247,7 +251,7 @@ fn require_framed_record_fits(
 ) -> Result<(), LixError> {
     if bytes > u64::from(limits.max_record_bytes) {
         return Err(invalid_input(format!(
-            "v2 {kind} record exceeds max_record_bytes even with a lazy snapshot attachment"
+            "component {kind} record exceeds max_record_bytes even with a lazy snapshot attachment"
         )));
     }
     if bytes
@@ -255,7 +259,7 @@ fn require_framed_record_fits(
         .is_none_or(|framed| framed > u64::from(limits.max_page_bytes))
     {
         return Err(invalid_input(format!(
-            "v2 {kind} record does not fit max_page_bytes even with a lazy snapshot attachment"
+            "component {kind} record does not fit max_page_bytes even with a lazy snapshot attachment"
         )));
     }
     Ok(())
@@ -364,7 +368,7 @@ pub(crate) fn build_file_update_splices(
         .len()
         .checked_sub(prefix)
         .and_then(|length| length.checked_sub(suffix))
-        .ok_or_else(|| invalid_input("v2 splice deletion length underflowed"))?;
+        .ok_or_else(|| invalid_input("component splice deletion length underflowed"))?;
     if delete_len == 0 && insert.is_empty() {
         return Ok(BuiltInputSplices {
             edits: Vec::new(),
@@ -586,16 +590,18 @@ fn common_suffix_len(left: &[u8], right: &[u8], max: usize) -> (usize, u64) {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct V2SchemaAllowlist {
+pub(crate) struct SchemaAllowlist {
     schema_keys: BTreeSet<String>,
     catalog: Option<Arc<CatalogSnapshot>>,
 }
 
-impl V2SchemaAllowlist {
+impl SchemaAllowlist {
     pub(crate) fn new(schema_keys: impl IntoIterator<Item = String>) -> Result<Self, LixError> {
         let schema_keys = schema_keys.into_iter().collect::<BTreeSet<_>>();
         if schema_keys.is_empty() {
-            return Err(invalid_input("v2 schema allowlist must not be empty"));
+            return Err(invalid_input(
+                "component schema allowlist must not be empty",
+            ));
         }
         Ok(Self {
             schema_keys,
@@ -619,7 +625,7 @@ impl V2SchemaAllowlist {
     fn validate(&self, schema_key: &str) -> Result<(), LixError> {
         if !self.schema_keys.contains(schema_key) {
             return Err(invalid_guest(format!(
-                "v2 plugin emitted undeclared schema '{schema_key}'"
+                "component plugin emitted undeclared schema '{schema_key}'"
             )));
         }
         Ok(())
@@ -682,21 +688,27 @@ impl<'de> Visitor<'de> for NumberFreeJsonValueVisitor {
     where
         E: serde::de::Error,
     {
-        Err(E::custom("JSON numbers are not enabled for production v2"))
+        Err(E::custom(
+            "JSON numbers are not enabled for production component",
+        ))
     }
 
     fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Err(E::custom("JSON numbers are not enabled for production v2"))
+        Err(E::custom(
+            "JSON numbers are not enabled for production component",
+        ))
     }
 
     fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Err(E::custom("JSON numbers are not enabled for production v2"))
+        Err(E::custom(
+            "JSON numbers are not enabled for production component",
+        ))
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
@@ -728,12 +740,14 @@ impl<'de> Visitor<'de> for NumberFreeJsonValueVisitor {
     }
 }
 
-/// Parses, duplicate-checks, number-gates, and canonically encodes one v2
+/// Parses, duplicate-checks, number-gates, and canonically encodes one component
 /// snapshot. Snapshot roots must be objects.
-pub(crate) fn canonicalize_v2_snapshot(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
+pub(crate) fn canonicalize_snapshot(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
     let value = parse_number_free_snapshot(bytes)?;
     if !value.is_object() {
-        return Err(invalid_guest("v2 entity snapshots must be JSON objects"));
+        return Err(invalid_guest(
+            "component entity snapshots must be JSON objects",
+        ));
     }
     let mut canonical = Vec::new();
     encode_number_free_json(&value, &mut canonical)?;
@@ -804,10 +818,10 @@ impl CanonicalJsonBatchBuilder {
             .position(|existing| Arc::ptr_eq(existing, &fingerprint))
         {
             return u32::try_from(index)
-                .map_err(|_| invalid_guest("v2 canonical JSON page has too many schemas"));
+                .map_err(|_| invalid_guest("component canonical JSON page has too many schemas"));
         }
         let index = u32::try_from(self.schema_fingerprints.len())
-            .map_err(|_| invalid_guest("v2 canonical JSON page has too many schemas"))?;
+            .map_err(|_| invalid_guest("component canonical JSON page has too many schemas"))?;
         self.schema_fingerprints.push(fingerprint);
         Ok(index)
     }
@@ -816,14 +830,16 @@ impl CanonicalJsonBatchBuilder {
         self.parse_count = self.parse_count.saturating_add(1);
         let value = parse_number_free_snapshot(bytes)?;
         if !value.is_object() {
-            return Err(invalid_guest("v2 entity snapshots must be JSON objects"));
+            return Err(invalid_guest(
+                "component entity snapshots must be JSON objects",
+            ));
         }
 
         let encoded_len = canonical_json_encoded_len(&value)?;
         let start = self.normalized_len;
         let end = start
             .checked_add(encoded_len)
-            .ok_or_else(|| invalid_guest("v2 canonical JSON page exceeds u32"))?;
+            .ok_or_else(|| invalid_guest("component canonical JSON page exceeds u32"))?;
         self.normalized_len = end;
         let row = self.row_kinds.len();
         self.reserve_decoded_column();
@@ -837,11 +853,11 @@ impl CanonicalJsonBatchBuilder {
         &mut self,
         bytes: Bytes,
         key: &crate::wasm::WasmEntityKey,
-        schemas: &V2SchemaAllowlist,
+        schemas: &SchemaAllowlist,
     ) -> Result<usize, LixError> {
         self.parse_count = self.parse_count.saturating_add(1);
         let certificate = if let Some(plan) = schemas.schema_plan(&key.schema_key) {
-            plan.certify_or_normalize_v2_plugin_row(&bytes, key)?
+            plan.certify_or_normalize_plugin_row(&bytes, key)?
                 .map(|row| (row, plan.shared_fingerprint()))
         } else {
             None
@@ -855,11 +871,11 @@ impl CanonicalJsonBatchBuilder {
                 None => bytes,
             };
             let encoded_len = u32::try_from(normalized.len())
-                .map_err(|_| invalid_guest("v2 canonical JSON row exceeds u32"))?;
+                .map_err(|_| invalid_guest("component canonical JSON row exceeds u32"))?;
             let start = self.normalized_len;
             let end = start
                 .checked_add(encoded_len)
-                .ok_or_else(|| invalid_guest("v2 canonical JSON page exceeds u32"))?;
+                .ok_or_else(|| invalid_guest("component canonical JSON page exceeds u32"))?;
             self.normalized_len = end;
             let row = self.row_kinds.len();
             self.reserve_certified_columns();
@@ -880,13 +896,15 @@ impl CanonicalJsonBatchBuilder {
         // pass and serialize once at batch finalization.
         let value = parse_number_free_snapshot(&bytes)?;
         if !value.is_object() {
-            return Err(invalid_guest("v2 entity snapshots must be JSON objects"));
+            return Err(invalid_guest(
+                "component entity snapshots must be JSON objects",
+            ));
         }
         let encoded_len = canonical_json_encoded_len(&value)?;
         let start = self.normalized_len;
         let end = start
             .checked_add(encoded_len)
-            .ok_or_else(|| invalid_guest("v2 canonical JSON page exceeds u32"))?;
+            .ok_or_else(|| invalid_guest("component canonical JSON page exceeds u32"))?;
         self.normalized_len = end;
         let row = self.row_kinds.len();
         self.reserve_decoded_column();
@@ -994,7 +1012,7 @@ fn canonical_json_encoded_len(value: &serde_json::Value) -> Result<u32, LixError
     fn add(total: &mut u64, value: u64) -> Result<(), LixError> {
         *total = total
             .checked_add(value)
-            .ok_or_else(|| invalid_guest("v2 canonical JSON size overflowed"))?;
+            .ok_or_else(|| invalid_guest("component canonical JSON size overflowed"))?;
         Ok(())
     }
 
@@ -1004,7 +1022,7 @@ fn canonical_json_encoded_len(value: &serde_json::Value) -> Result<u32, LixError
             serde_json::Value::Bool(true) => add(total, 4),
             serde_json::Value::Bool(false) => add(total, 5),
             serde_json::Value::Number(_) => Err(invalid_guest(
-                "JSON numbers are not enabled for production v2",
+                "JSON numbers are not enabled for production component",
             )),
             serde_json::Value::String(value) => encoded_json_string_len(value, total),
             serde_json::Value::Array(values) => {
@@ -1049,7 +1067,7 @@ fn canonical_json_encoded_len(value: &serde_json::Value) -> Result<u32, LixError
 
     let mut total = 0;
     visit(value, &mut total)?;
-    u32::try_from(total).map_err(|_| invalid_guest("v2 canonical JSON row exceeds u32"))
+    u32::try_from(total).map_err(|_| invalid_guest("component canonical JSON row exceeds u32"))
 }
 
 fn parse_number_free_snapshot(bytes: &[u8]) -> Result<serde_json::Value, LixError> {
@@ -1057,12 +1075,12 @@ fn parse_number_free_snapshot(bytes: &[u8]) -> Result<serde_json::Value, LixErro
     let NumberFreeJsonValue(value) =
         NumberFreeJsonValue::deserialize(&mut deserializer).map_err(|error| {
             invalid_guest(format!(
-                "v2 snapshot must be duplicate-free number-free UTF-8 JSON: {error}"
+                "component snapshot must be duplicate-free number-free UTF-8 JSON: {error}"
             ))
         })?;
     deserializer.end().map_err(|error| {
         invalid_guest(format!(
-            "v2 snapshot contains trailing or invalid JSON input: {error}"
+            "component snapshot contains trailing or invalid JSON input: {error}"
         ))
     })?;
     Ok(value)
@@ -1101,7 +1119,7 @@ fn encode_number_free_json(
         }
         serde_json::Value::Number(_) => {
             return Err(invalid_guest(
-                "JSON numbers are not enabled for production v2",
+                "JSON numbers are not enabled for production component",
             ));
         }
     }
@@ -1176,18 +1194,20 @@ impl WasmEntitySource for VecEntitySource {
         while let Some(entity) = self.entities.front() {
             let record_bytes = encoded_entity_record_bytes(entity)?;
             if record_bytes > u64::from(self.state.limits.max_record_bytes) {
-                return Err(invalid_input("v2 entity record exceeds max_record_bytes"));
+                return Err(invalid_input(
+                    "component entity record exceeds max_record_bytes",
+                ));
             }
             let framed_bytes = record_bytes
                 .checked_add(4)
-                .ok_or_else(|| invalid_input("v2 entity frame length overflowed"))?;
+                .ok_or_else(|| invalid_input("component entity frame length overflowed"))?;
             if page_bytes
                 .checked_add(framed_bytes)
                 .is_none_or(|size| size > page_limit)
             {
                 if entities.is_empty() {
                     return Err(invalid_input(
-                        "v2 entity record does not fit the requested page",
+                        "component entity record does not fit the requested page",
                     ));
                 }
                 break;
@@ -1195,7 +1215,7 @@ impl WasmEntitySource for VecEntitySource {
             page_bytes += framed_bytes;
             page_refs = page_refs
                 .checked_add(host_bytes_attachment_refs(&entity.snapshot_content))
-                .ok_or_else(|| invalid_input("v2 entity attachment count overflowed"))?;
+                .ok_or_else(|| invalid_input("component entity attachment count overflowed"))?;
             entities.push(
                 self.entities
                     .pop_front()
@@ -1231,7 +1251,7 @@ impl LiveBatchEntitySource {
             if left.schema_key() == right.schema_key() && left.entity_pk() == right.entity_pk() {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "durable v2 entity hydration returned duplicate keys",
+                    "durable component entity hydration returned duplicate keys",
                 ));
             }
         }
@@ -1286,18 +1306,20 @@ impl WasmEntitySource for LiveBatchEntitySource {
         while let Some(entity) = self.next_entity()? {
             let record_bytes = encoded_entity_record_bytes(&entity)?;
             if record_bytes > u64::from(self.state.limits.max_record_bytes) {
-                return Err(invalid_input("v2 entity record exceeds max_record_bytes"));
+                return Err(invalid_input(
+                    "component entity record exceeds max_record_bytes",
+                ));
             }
             let framed_bytes = record_bytes
                 .checked_add(4)
-                .ok_or_else(|| invalid_input("v2 entity frame length overflowed"))?;
+                .ok_or_else(|| invalid_input("component entity frame length overflowed"))?;
             if page_bytes
                 .checked_add(framed_bytes)
                 .is_none_or(|size| size > page_limit)
             {
                 if entities.is_empty() {
                     return Err(invalid_input(
-                        "v2 entity record does not fit the requested page",
+                        "component entity record does not fit the requested page",
                     ));
                 }
                 self.pending = Some(entity);
@@ -1306,7 +1328,7 @@ impl WasmEntitySource for LiveBatchEntitySource {
             page_bytes += framed_bytes;
             page_refs = page_refs
                 .checked_add(host_bytes_attachment_refs(&entity.snapshot_content))
-                .ok_or_else(|| invalid_input("v2 entity attachment count overflowed"))?;
+                .ok_or_else(|| invalid_input("component entity attachment count overflowed"))?;
             entities.push(entity);
         }
         if entities.is_empty() {
@@ -1342,7 +1364,9 @@ impl VecEntityChangeSource {
                 }
                 WasmEntityChange::Upsert { entity, .. } => validate_host_entity(entity)?,
                 WasmEntityChange::Delete(key) if key.entity_pk.is_empty() => {
-                    return Err(invalid_input("v2 entity primary keys must not be empty"));
+                    return Err(invalid_input(
+                        "component entity primary keys must not be empty",
+                    ));
                 }
                 WasmEntityChange::Delete(_) => {}
             }
@@ -1371,18 +1395,20 @@ impl WasmEntityChangeSource for VecEntityChangeSource {
         while let Some(change) = self.changes.front() {
             let record_bytes = encoded_entity_change_record_bytes(change)?;
             if record_bytes > u64::from(self.state.limits.max_record_bytes) {
-                return Err(invalid_input("v2 change record exceeds max_record_bytes"));
+                return Err(invalid_input(
+                    "component change record exceeds max_record_bytes",
+                ));
             }
             let framed_bytes = record_bytes
                 .checked_add(4)
-                .ok_or_else(|| invalid_input("v2 change frame length overflowed"))?;
+                .ok_or_else(|| invalid_input("component change frame length overflowed"))?;
             if page_bytes
                 .checked_add(framed_bytes)
                 .is_none_or(|size| size > page_limit)
             {
                 if changes.is_empty() {
                     return Err(invalid_input(
-                        "v2 change record does not fit the requested page",
+                        "component change record does not fit the requested page",
                     ));
                 }
                 break;
@@ -1390,7 +1416,7 @@ impl WasmEntityChangeSource for VecEntityChangeSource {
             page_bytes += framed_bytes;
             page_refs = page_refs
                 .checked_add(change_attachment_refs(change))
-                .ok_or_else(|| invalid_input("v2 change attachment count overflowed"))?;
+                .ok_or_else(|| invalid_input("component change attachment count overflowed"))?;
             changes.push(
                 self.changes
                     .pop_front()
@@ -1421,11 +1447,11 @@ impl VecEntityConflictSource {
         for (expected_ordinal, conflict) in conflicts.iter().enumerate() {
             if conflict.ordinal
                 != u32::try_from(expected_ordinal).map_err(|_| {
-                    invalid_input("v2 conflict source has more than u32::MAX records")
+                    invalid_input("component conflict source has more than u32::MAX records")
                 })?
             {
                 return Err(invalid_input(
-                    "v2 conflict source ordinals must be zero-based and contiguous",
+                    "component conflict source ordinals must be zero-based and contiguous",
                 ));
             }
             for snapshot in [&conflict.base, &conflict.a, &conflict.b]
@@ -1462,18 +1488,20 @@ impl WasmEntityConflictSource for VecEntityConflictSource {
         while let Some(conflict) = self.conflicts.front() {
             let record_bytes = encoded_entity_conflict_record_bytes(conflict)?;
             if record_bytes > u64::from(self.state.limits.max_record_bytes) {
-                return Err(invalid_input("v2 conflict record exceeds max_record_bytes"));
+                return Err(invalid_input(
+                    "component conflict record exceeds max_record_bytes",
+                ));
             }
             let framed_bytes = record_bytes
                 .checked_add(4)
-                .ok_or_else(|| invalid_input("v2 conflict frame length overflowed"))?;
+                .ok_or_else(|| invalid_input("component conflict frame length overflowed"))?;
             if page_bytes
                 .checked_add(framed_bytes)
                 .is_none_or(|size| size > page_limit)
             {
                 if conflicts.is_empty() {
                     return Err(invalid_input(
-                        "v2 conflict record does not fit the requested page",
+                        "component conflict record does not fit the requested page",
                     ));
                 }
                 break;
@@ -1485,7 +1513,9 @@ impl WasmEntityConflictSource for VecEntityConflictSource {
             {
                 page_refs = page_refs
                     .checked_add(host_bytes_attachment_refs(snapshot))
-                    .ok_or_else(|| invalid_input("v2 conflict attachment count overflowed"))?;
+                    .ok_or_else(|| {
+                        invalid_input("component conflict attachment count overflowed")
+                    })?;
             }
             conflicts.push(
                 self.conflicts
@@ -1520,11 +1550,13 @@ impl VecSourceState {
 
     fn page_limit(&self, requested: u32) -> Result<u64, LixError> {
         if requested == 0 {
-            return Err(invalid_input("v2 packet source page size must be positive"));
+            return Err(invalid_input(
+                "component packet source page size must be positive",
+            ));
         }
         if requested > self.limits.max_page_bytes {
             return Err(invalid_input(
-                "v2 packet source page request exceeds max_page_bytes",
+                "component packet source page request exceeds max_page_bytes",
             ));
         }
         Ok(u64::from(requested))
@@ -1534,24 +1566,26 @@ impl VecSourceState {
         self.pages = self
             .pages
             .checked_add(1)
-            .ok_or_else(|| invalid_input("v2 packet source page count overflowed"))?;
+            .ok_or_else(|| invalid_input("component packet source page count overflowed"))?;
         self.total_inline_bytes = self
             .total_inline_bytes
             .checked_add(inline_bytes)
-            .ok_or_else(|| invalid_input("v2 packet source byte count overflowed"))?;
+            .ok_or_else(|| invalid_input("component packet source byte count overflowed"))?;
         self.attachment_refs = self
             .attachment_refs
             .checked_add(refs)
-            .ok_or_else(|| invalid_input("v2 packet source attachment count overflowed"))?;
+            .ok_or_else(|| invalid_input("component packet source attachment count overflowed"))?;
         if self.pages > self.limits.max_pages {
-            return Err(invalid_input("v2 packet source exceeds max_pages"));
+            return Err(invalid_input("component packet source exceeds max_pages"));
         }
         if self.total_inline_bytes > self.limits.max_total_bytes {
-            return Err(invalid_input("v2 packet source exceeds max_total_bytes"));
+            return Err(invalid_input(
+                "component packet source exceeds max_total_bytes",
+            ));
         }
         if self.attachment_refs > self.limits.max_attachment_refs {
             return Err(invalid_input(
-                "v2 packet source exceeds max_attachment_refs",
+                "component packet source exceeds max_attachment_refs",
             ));
         }
         Ok(())
@@ -1562,7 +1596,7 @@ fn validate_entity_order(entities: &[WasmHostEntity]) -> Result<(), LixError> {
     for pair in entities.windows(2) {
         if pair[0].key >= pair[1].key {
             return Err(invalid_input(
-                "v2 complete entity sources must be strictly key-sorted and unique",
+                "component complete entity sources must be strictly key-sorted and unique",
             ));
         }
     }
@@ -1579,7 +1613,7 @@ fn validate_change_order<B>(changes: &[WasmEntityChange<B>]) -> Result<(), LixEr
     for pair in changes.windows(2) {
         if pair[0].entity_key() >= pair[1].entity_key() {
             return Err(invalid_input(
-                "v2 entity changes must be strictly key-sorted and unique",
+                "component entity changes must be strictly key-sorted and unique",
             ));
         }
     }
@@ -1592,14 +1626,14 @@ fn validate_conflict_order(
     for conflict in conflicts {
         if conflict.key.entity_pk.is_empty() {
             return Err(invalid_input(
-                "v2 conflict entity primary keys must not be empty",
+                "component conflict entity primary keys must not be empty",
             ));
         }
     }
     for pair in conflicts.windows(2) {
         if pair[0].key >= pair[1].key {
             return Err(invalid_input(
-                "v2 conflict sources must be strictly key-sorted and unique",
+                "component conflict sources must be strictly key-sorted and unique",
             ));
         }
     }
@@ -1608,7 +1642,9 @@ fn validate_conflict_order(
 
 fn validate_host_entity(entity: &WasmHostEntity) -> Result<(), LixError> {
     if entity.key.entity_pk.is_empty() {
-        return Err(invalid_input("v2 entity primary keys must not be empty"));
+        return Err(invalid_input(
+            "component entity primary keys must not be empty",
+        ));
     }
     if let WasmHostBytes::Source(slice) = &entity.snapshot_content {
         slice.validate()?;
@@ -1619,7 +1655,7 @@ fn validate_host_entity(entity: &WasmHostEntity) -> Result<(), LixError> {
 fn encoded_entity_record_bytes(entity: &WasmHostEntity) -> Result<u64, LixError> {
     encoded_entity_key_bytes(&entity.key)?
         .checked_add(encoded_host_bytes_ref_bytes(&entity.snapshot_content)?)
-        .ok_or_else(|| invalid_input("v2 entity record size overflowed"))
+        .ok_or_else(|| invalid_input("component entity record size overflowed"))
 }
 
 fn encoded_entity_change_record_bytes(
@@ -1635,7 +1671,7 @@ fn encoded_entity_change_record_bytes(
         return encoded_text_bytes(schema_key)?
             .checked_add(1 + 8)
             .and_then(|size| size.checked_add(snapshot_bytes))
-            .ok_or_else(|| invalid_input("v2 create record size overflowed"));
+            .ok_or_else(|| invalid_input("component create record size overflowed"));
     }
     let key_bytes = encoded_entity_key_bytes(
         change
@@ -1644,13 +1680,13 @@ fn encoded_entity_change_record_bytes(
     )?;
     let mut size = 1_u64
         .checked_add(key_bytes)
-        .ok_or_else(|| invalid_input("v2 change record size overflowed"))?;
+        .ok_or_else(|| invalid_input("component change record size overflowed"))?;
     if let WasmEntityChange::Upsert { entity, .. } = change {
         let snapshot_bytes = encoded_host_bytes_ref_bytes(&entity.snapshot_content)?;
         size = size
             .checked_add(1)
             .and_then(|size| size.checked_add(snapshot_bytes))
-            .ok_or_else(|| invalid_input("v2 change record size overflowed"))?;
+            .ok_or_else(|| invalid_input("component change record size overflowed"))?;
     }
     Ok(size)
 }
@@ -1660,17 +1696,17 @@ fn encoded_entity_conflict_record_bytes(
 ) -> Result<u64, LixError> {
     let mut size = encoded_entity_key_bytes(&conflict.key)?
         .checked_add(4)
-        .ok_or_else(|| invalid_input("v2 conflict record size overflowed"))?;
+        .ok_or_else(|| invalid_input("component conflict record size overflowed"))?;
     for snapshot in [&conflict.base, &conflict.a, &conflict.b] {
         // One state tag: 0 for an absent/tombstoned value, 1 followed by the
         // normal lazy blob reference for a live complete snapshot.
         size = size
             .checked_add(1)
-            .ok_or_else(|| invalid_input("v2 conflict record size overflowed"))?;
+            .ok_or_else(|| invalid_input("component conflict record size overflowed"))?;
         if let Some(snapshot) = snapshot {
             size = size
                 .checked_add(encoded_host_bytes_ref_bytes(snapshot)?)
-                .ok_or_else(|| invalid_input("v2 conflict record size overflowed"))?;
+                .ok_or_else(|| invalid_input("component conflict record size overflowed"))?;
         }
     }
     Ok(size)
@@ -1678,24 +1714,26 @@ fn encoded_entity_conflict_record_bytes(
 
 fn encoded_entity_key_bytes(key: &crate::wasm::WasmEntityKey) -> Result<u64, LixError> {
     if key.entity_pk.is_empty() {
-        return Err(invalid_input("v2 entity primary keys must not be empty"));
+        return Err(invalid_input(
+            "component entity primary keys must not be empty",
+        ));
     }
     let _ = u32::try_from(key.entity_pk.len())
-        .map_err(|_| invalid_input("v2 entity primary key has too many components"))?;
+        .map_err(|_| invalid_input("component entity primary key has too many components"))?;
     let mut size = encoded_text_bytes(&key.schema_key)?
         .checked_add(4)
-        .ok_or_else(|| invalid_input("v2 entity key size overflowed"))?;
+        .ok_or_else(|| invalid_input("component entity key size overflowed"))?;
     for component in &key.entity_pk {
         size = size
             .checked_add(encoded_text_bytes(component)?)
-            .ok_or_else(|| invalid_input("v2 entity key size overflowed"))?;
+            .ok_or_else(|| invalid_input("component entity key size overflowed"))?;
     }
     Ok(size)
 }
 
 fn encoded_text_bytes(value: &str) -> Result<u64, LixError> {
     let length = u32::try_from(value.len())
-        .map_err(|_| invalid_input("v2 packet text exceeds u32 framing"))?;
+        .map_err(|_| invalid_input("component packet text exceeds u32 framing"))?;
     Ok(u64::from(length) + 4)
 }
 
@@ -1703,12 +1741,12 @@ fn encoded_host_bytes_ref_bytes(value: &WasmHostBytes) -> Result<u64, LixError> 
     match value {
         WasmHostBytes::Inline(bytes) => {
             let length = u32::try_from(bytes.len())
-                .map_err(|_| invalid_input("v2 inline snapshot exceeds u32 framing"))?;
+                .map_err(|_| invalid_input("component inline snapshot exceeds u32 framing"))?;
             Ok(1 + 4 + u64::from(length))
         }
         WasmHostBytes::CanonicalJson(json) => {
             let length = u32::try_from(json.normalized().len())
-                .map_err(|_| invalid_input("v2 inline snapshot exceeds u32 framing"))?;
+                .map_err(|_| invalid_input("component inline snapshot exceeds u32 framing"))?;
             Ok(1 + 4 + u64::from(length))
         }
         WasmHostBytes::Source(slice) => {
@@ -1787,7 +1825,7 @@ pub(crate) struct ValidatedEntityTransition {
 
 fn validate_certified_entity_batches(
     batches: &[WasmCertifiedEntityBatch],
-    schemas: &V2SchemaAllowlist,
+    schemas: &SchemaAllowlist,
 ) -> Result<(), LixError> {
     for batch in batches {
         for schema_key in &batch.schema_keys {
@@ -1816,14 +1854,14 @@ fn host_certified_dense_schema(schema_key: &str) -> bool {
 }
 
 /// Retains a complete, eagerly validated generic-text import in dense packet
-/// pages. The ordinary v2 change list remains intact for changelog and
+/// pages. The ordinary component change list remains intact for changelog and
 /// transaction materialization; the tracked-head writer may use this complete
 /// batch as the authoritative current-state owner instead of persisting a
 /// second expanded HOT row per line.
-pub(crate) fn certify_dense_v2_fresh_file(
+pub(crate) fn certify_dense_fresh_file(
     transition: &mut ValidatedFileTransition,
     creates: crate::wasm::WasmCreateContext,
-    schemas: &V2SchemaAllowlist,
+    schemas: &SchemaAllowlist,
 ) -> Result<(), LixError> {
     if !transition.certified_batches.is_empty()
         || transition.changes.changes.len() < HOST_CERTIFIED_PACKET_MIN_ROWS
@@ -1975,7 +2013,7 @@ fn finish_host_certified_packet_page(
 
 fn validate_certified_snapshot_packets(
     batch: &WasmCertifiedEntityBatch,
-    schemas: &V2SchemaAllowlist,
+    schemas: &SchemaAllowlist,
 ) -> Result<(), LixError> {
     let mut rows = 0_u64;
     let mut encountered = BTreeSet::new();
@@ -2063,7 +2101,7 @@ fn validate_certified_snapshot_packets(
                         );
                         None
                     } else {
-                        plan.certify_or_normalize_v2_plugin_row_parts(
+                        plan.certify_or_normalize_plugin_row_parts(
                             snapshot,
                             schema_key,
                             &components,
@@ -2144,7 +2182,7 @@ fn validate_certified_snapshot_packets(
                     } else {
                         let key =
                             crate::wasm::WasmEntityKey::from_owned_parts(schema_key, vec![id]);
-                        plan.certify_or_normalize_v2_plugin_row(&snapshot, &key)?
+                        plan.certify_or_normalize_plugin_row(&snapshot, &key)?
                             .ok_or_else(|| {
                                 invalid_guest(format!(
                                     "certified batch schema '{schema_key}' has no streaming validator"
@@ -2267,9 +2305,9 @@ impl<'a> CertifiedPacketReader<'a> {
 /// invoked. Cursor-wide key uniqueness is checked once over borrowed references
 /// after the final stable change vector has been assembled.
 pub(crate) async fn drain_file_transition_changes(
-    actor: &mut dyn WasmComponentV2Actor,
+    actor: &mut dyn WasmComponentActor,
     transition: WasmFileTransition,
-    schemas: &V2SchemaAllowlist,
+    schemas: &SchemaAllowlist,
     limits: WasmTransitionLimits,
 ) -> Result<ValidatedFileTransition, LixError> {
     let transition_handle = transition.transition;
@@ -2280,9 +2318,9 @@ pub(crate) async fn drain_file_transition_changes(
 }
 
 async fn drain_file_transition_changes_inner(
-    actor: &mut dyn WasmComponentV2Actor,
+    actor: &mut dyn WasmComponentActor,
     transition: WasmFileTransition,
-    schemas: &V2SchemaAllowlist,
+    schemas: &SchemaAllowlist,
     limits: WasmTransitionLimits,
 ) -> Result<ValidatedFileTransition, LixError> {
     let mut validator = WasmChangeDrainValidator::new(limits)?;
@@ -2312,7 +2350,10 @@ async fn drain_file_transition_changes_inner(
         )
         .in_scope(|| {
             validator.accept_page(&page).map_err(|error| {
-                invalid_guest(format!("invalid v2 change cursor page: {}", error.message))
+                invalid_guest(format!(
+                    "invalid component change cursor page: {}",
+                    error.message
+                ))
             })?;
             prevalidate_change_page(&page, schemas, &mut budget)
         })?;
@@ -2430,7 +2471,10 @@ async fn drain_file_transition_changes_inner(
     }
 
     validate_change_cursor_key_uniqueness(&changes).map_err(|error| {
-        invalid_guest(format!("invalid v2 change cursor page: {}", error.message))
+        invalid_guest(format!(
+            "invalid component change cursor page: {}",
+            error.message
+        ))
     })?;
     let certified_batches = actor.take_certified_entity_batches(transition.transition);
     validate_certified_entity_batches(&certified_batches, schemas)?;
@@ -2454,7 +2498,7 @@ async fn drain_file_transition_changes_inner(
 /// the source's canonical key order. This lets `Take(B)` reuse a durable
 /// historical row without moving its snapshot through guest memory.
 pub(crate) async fn drain_conflict_transition_resolutions(
-    actor: &mut dyn WasmComponentV2Actor,
+    actor: &mut dyn WasmComponentActor,
     transition: WasmConflictTransition,
     expected_count: usize,
     limits: WasmTransitionLimits,
@@ -2469,7 +2513,7 @@ pub(crate) async fn drain_conflict_transition_resolutions(
 }
 
 async fn drain_conflict_transition_resolutions_inner(
-    actor: &mut dyn WasmComponentV2Actor,
+    actor: &mut dyn WasmComponentActor,
     transition: WasmConflictTransition,
     expected_count: usize,
     limits: WasmTransitionLimits,
@@ -2496,7 +2540,7 @@ async fn drain_conflict_transition_resolutions_inner(
         };
         validator.accept_page(&page).map_err(|error| {
             invalid_guest(format!(
-                "invalid v2 resolution cursor page: {}",
+                "invalid component resolution cursor page: {}",
                 error.message
             ))
         })?;
@@ -2522,11 +2566,11 @@ async fn drain_conflict_transition_resolutions_inner(
         let mut page_snapshot_ordinal = 0usize;
         for (ordinal, resolution) in page.ordinals.into_iter().zip(page.resolutions) {
             let expected_ordinal = u32::try_from(resolutions.len()).map_err(|_| {
-                invalid_guest("v2 conflict resolver has more than u32::MAX results")
+                invalid_guest("component conflict resolver has more than u32::MAX results")
             })?;
             if ordinal != expected_ordinal {
                 return Err(invalid_guest(format!(
-                    "v2 conflict resolver returned ordinal {ordinal}, expected {expected_ordinal}",
+                    "component conflict resolver returned ordinal {ordinal}, expected {expected_ordinal}",
                 )));
             }
             let resolved = match resolution {
@@ -2564,7 +2608,7 @@ async fn drain_conflict_transition_resolutions_inner(
             resolutions.push(resolved);
             if resolutions.len() > expected_count {
                 return Err(invalid_guest(
-                    "v2 conflict resolver returned more results than input conflicts",
+                    "component conflict resolver returned more results than input conflicts",
                 ));
             }
         }
@@ -2591,7 +2635,7 @@ async fn drain_conflict_transition_resolutions_inner(
     }
     if resolutions.len() != expected_count {
         return Err(invalid_guest(format!(
-            "v2 conflict resolver returned {} results for {expected_count} input conflicts",
+            "component conflict resolver returned {} results for {expected_count} input conflicts",
             resolutions.len()
         )));
     }
@@ -2608,7 +2652,7 @@ async fn drain_conflict_transition_resolutions_inner(
 /// against one immutable base, and optionally proves byte equality with an
 /// independently reconstructed expected result.
 pub(crate) async fn drain_entity_transition_edits(
-    actor: &mut dyn WasmComponentV2Actor,
+    actor: &mut dyn WasmComponentActor,
     transition: WasmEntityTransition,
     base: &[u8],
     expected: Option<Blob>,
@@ -2632,7 +2676,7 @@ pub(crate) async fn drain_entity_transition_edits(
 }
 
 async fn drain_entity_transition_edits_inner(
-    actor: &mut dyn WasmComponentV2Actor,
+    actor: &mut dyn WasmComponentActor,
     transition: WasmEntityTransition,
     base: &[u8],
     expected: Option<Blob>,
@@ -2658,7 +2702,10 @@ async fn drain_entity_transition_edits_inner(
             break;
         };
         validator.accept_page(&page).map_err(|error| {
-            invalid_guest(format!("invalid v2 edit cursor page: {}", error.message))
+            invalid_guest(format!(
+                "invalid component edit cursor page: {}",
+                error.message
+            ))
         })?;
         prevalidate_edit_page(&page, &mut budget)?;
         local_counters.packet_pages = local_counters.packet_pages.saturating_add(1);
@@ -2698,7 +2745,7 @@ async fn drain_entity_transition_edits_inner(
                 .is_some_and(|expected| expected.as_ref() != bytes.as_ref())
             {
                 return Err(invalid_guest(
-                    "v2 renderer edits do not reproduce the independently expected bytes",
+                    "component renderer edits do not reproduce the independently expected bytes",
                 ));
             }
             (bytes, same_length_output_splice)
@@ -2742,7 +2789,7 @@ fn same_length_output_splice_after_host_validation(
 }
 
 async fn cleanup_rejected_transition(
-    actor: &mut dyn WasmComponentV2Actor,
+    actor: &mut dyn WasmComponentActor,
     transition: WasmTransitionHandle,
     rejection: LixError,
 ) -> LixError {
@@ -2779,38 +2826,37 @@ fn validate_resolved_output_against_known_delta(
 ) -> Result<(), LixError> {
     let output_len = output.iter().try_fold(base.len(), |length, edit| {
         let delete_len = usize::try_from(edit.delete_len)
-            .map_err(|_| invalid_guest("v2 output deletion does not fit this host"))?;
+            .map_err(|_| invalid_guest("component output deletion does not fit this host"))?;
         length
             .checked_sub(delete_len)
             .and_then(|length| length.checked_add(edit.insert.len()))
-            .ok_or_else(|| invalid_guest("v2 rendered result length overflowed"))
+            .ok_or_else(|| invalid_guest("component rendered result length overflowed"))
     })?;
     if output_len != expected.len() {
         return Err(invalid_guest(
-            "v2 renderer edits do not reproduce the independently expected length",
+            "component renderer edits do not reproduce the independently expected length",
         ));
     }
 
     let mut covered = vec![false; input.len()];
     for edit in output {
         let start = usize::try_from(edit.offset)
-            .map_err(|_| invalid_guest("v2 output offset does not fit this host"))?;
-        let end =
-            start
-                .checked_add(usize::try_from(edit.delete_len).map_err(|_| {
-                    invalid_guest("v2 output deletion length does not fit this host")
-                })?)
-                .ok_or_else(|| invalid_guest("v2 output deletion range overflowed"))?;
+            .map_err(|_| invalid_guest("component output offset does not fit this host"))?;
+        let end = start
+            .checked_add(usize::try_from(edit.delete_len).map_err(|_| {
+                invalid_guest("component output deletion length does not fit this host")
+            })?)
+            .ok_or_else(|| invalid_guest("component output deletion range overflowed"))?;
         let mut reconstructed = Vec::with_capacity(edit.insert.len());
         let mut cursor = start;
         for (index, input_edit) in input.iter().enumerate() {
             let input_start = usize::try_from(input_edit.offset)
-                .map_err(|_| invalid_input("v2 input offset does not fit this host"))?;
+                .map_err(|_| invalid_input("component input offset does not fit this host"))?;
             let input_end = input_start
                 .checked_add(usize::try_from(input_edit.delete_len).map_err(|_| {
-                    invalid_input("v2 input deletion length does not fit this host")
+                    invalid_input("component input deletion length does not fit this host")
                 })?)
-                .ok_or_else(|| invalid_input("v2 input deletion range overflowed"))?;
+                .ok_or_else(|| invalid_input("component input deletion range overflowed"))?;
             let is_inside = input_start >= start
                 && input_end <= end
                 && (input_start < end || (input_start == end && input_edit.delete_len == 0));
@@ -2819,7 +2865,7 @@ fn validate_resolved_output_against_known_delta(
             }
             if covered[index] || input_start < cursor {
                 return Err(invalid_guest(
-                    "v2 renderer edits do not cover the known input delta exactly once",
+                    "component renderer edits do not cover the known input delta exactly once",
                 ));
             }
             reconstructed.extend_from_slice(&base[cursor..input_start]);
@@ -2827,13 +2873,14 @@ fn validate_resolved_output_against_known_delta(
                 WasmInputBytes::Inline(bytes) => reconstructed.extend_from_slice(bytes),
                 WasmInputBytes::AfterRange(range) => {
                     let range_start = usize::try_from(range.offset).map_err(|_| {
-                        invalid_input("v2 after-range offset does not fit this host")
+                        invalid_input("component after-range offset does not fit this host")
                     })?;
-                    let range_end = usize::try_from(range.end()?)
-                        .map_err(|_| invalid_input("v2 after-range end does not fit this host"))?;
+                    let range_end = usize::try_from(range.end()?).map_err(|_| {
+                        invalid_input("component after-range end does not fit this host")
+                    })?;
                     reconstructed.extend_from_slice(
                         expected.get(range_start..range_end).ok_or_else(|| {
-                            invalid_input("v2 after-range is out of expected-result bounds")
+                            invalid_input("component after-range is out of expected-result bounds")
                         })?,
                     );
                 }
@@ -2841,19 +2888,19 @@ fn validate_resolved_output_against_known_delta(
             cursor = input_end;
             covered[index] = true;
         }
-        reconstructed.extend_from_slice(
-            base.get(cursor..end)
-                .ok_or_else(|| invalid_guest("v2 output deletion exceeds accepted bytes"))?,
-        );
+        reconstructed
+            .extend_from_slice(base.get(cursor..end).ok_or_else(|| {
+                invalid_guest("component output deletion exceeds accepted bytes")
+            })?);
         if reconstructed != edit.insert {
             return Err(invalid_guest(
-                "v2 renderer edit does not reproduce the independently expected local region",
+                "component renderer edit does not reproduce the independently expected local region",
             ));
         }
     }
     if covered.iter().any(|covered| !covered) {
         return Err(invalid_guest(
-            "v2 renderer edits omitted part of the independently expected delta",
+            "component renderer edits omitted part of the independently expected delta",
         ));
     }
     Ok(())
@@ -2861,11 +2908,11 @@ fn validate_resolved_output_against_known_delta(
 
 fn prevalidate_change_page(
     page: &WasmChangePage,
-    schemas: &V2SchemaAllowlist,
+    schemas: &SchemaAllowlist,
     budget: &mut OutputDrainBudget,
 ) -> Result<(), LixError> {
     if page.format_version != PACKET_FORMAT_V1 {
-        return Err(invalid_guest("unsupported v2 change packet format"));
+        return Err(invalid_guest("unsupported component change packet format"));
     }
     let mut inline_bytes = 0u64;
     let mut output_bytes = 0u64;
@@ -2876,7 +2923,9 @@ fn prevalidate_change_page(
         if let Some(key) = change.entity_key()
             && key.entity_pk.is_empty()
         {
-            return Err(invalid_guest("v2 entity primary keys must not be empty"));
+            return Err(invalid_guest(
+                "component entity primary keys must not be empty",
+            ));
         }
         let snapshot = match change {
             WasmEntityChange::Create {
@@ -2888,20 +2937,25 @@ fn prevalidate_change_page(
         if let Some(snapshot) = snapshot {
             match snapshot {
                 WasmGuestBytes::Inline(bytes) => {
-                    inline_bytes = inline_bytes
-                        .checked_add(bytes.len() as u64)
-                        .ok_or_else(|| invalid_guest("v2 inline snapshot bytes overflowed"))?;
+                    inline_bytes =
+                        inline_bytes
+                            .checked_add(bytes.len() as u64)
+                            .ok_or_else(|| {
+                                invalid_guest("component inline snapshot bytes overflowed")
+                            })?;
                 }
                 WasmGuestBytes::Output(range) => {
-                    output_bytes = output_bytes
-                        .checked_add(range.length)
-                        .ok_or_else(|| invalid_guest("v2 output snapshot bytes overflowed"))?;
+                    output_bytes = output_bytes.checked_add(range.length).ok_or_else(|| {
+                        invalid_guest("component output snapshot bytes overflowed")
+                    })?;
                     minimum_attachment_reads = minimum_attachment_reads
                         .checked_add(budget.minimum_attachment_reads(range.length))
-                        .ok_or_else(|| invalid_guest("v2 attachment page count overflowed"))?;
+                        .ok_or_else(|| {
+                            invalid_guest("component attachment page count overflowed")
+                        })?;
                     references = references
                         .checked_add(1)
-                        .ok_or_else(|| invalid_guest("v2 output references overflowed"))?;
+                        .ok_or_else(|| invalid_guest("component output references overflowed"))?;
                 }
             }
         }
@@ -2939,19 +2993,19 @@ fn prevalidate_conflict_resolution_page(
                 inline_bytes = inline_bytes
                     .checked_add(bytes.len() as u64)
                     .ok_or_else(|| {
-                        invalid_guest("v2 conflict replacement inline bytes overflowed")
+                        invalid_guest("component conflict replacement inline bytes overflowed")
                     })?;
             }
             WasmGuestBytes::Output(range) => {
                 output_bytes = output_bytes.checked_add(range.length).ok_or_else(|| {
-                    invalid_guest("v2 conflict replacement output bytes overflowed")
+                    invalid_guest("component conflict replacement output bytes overflowed")
                 })?;
                 minimum_attachment_reads = minimum_attachment_reads
                     .checked_add(budget.minimum_attachment_reads(range.length))
-                    .ok_or_else(|| invalid_guest("v2 attachment page count overflowed"))?;
+                    .ok_or_else(|| invalid_guest("component attachment page count overflowed"))?;
                 references = references
                     .checked_add(1)
-                    .ok_or_else(|| invalid_guest("v2 output references overflowed"))?;
+                    .ok_or_else(|| invalid_guest("component output references overflowed"))?;
             }
         }
     }
@@ -2975,7 +3029,7 @@ fn prevalidate_edit_page(
     let mut output_bytes = 0u64;
     let cursor_metadata_bytes = EDIT_SPLICE_METADATA_BYTES
         .checked_mul(page.edits.len() as u64)
-        .ok_or_else(|| invalid_guest("v2 edit page metadata bytes overflowed"))?;
+        .ok_or_else(|| invalid_guest("component edit page metadata bytes overflowed"))?;
     let mut minimum_attachment_reads = 0u64;
     let mut references = 0u32;
     for edit in &page.edits {
@@ -2983,18 +3037,18 @@ fn prevalidate_edit_page(
             WasmGuestBytes::Inline(bytes) => {
                 inline_bytes = inline_bytes
                     .checked_add(bytes.len() as u64)
-                    .ok_or_else(|| invalid_guest("v2 inline edit bytes overflowed"))?;
+                    .ok_or_else(|| invalid_guest("component inline edit bytes overflowed"))?;
             }
             WasmGuestBytes::Output(range) => {
                 output_bytes = output_bytes
                     .checked_add(range.length)
-                    .ok_or_else(|| invalid_guest("v2 output edit bytes overflowed"))?;
+                    .ok_or_else(|| invalid_guest("component output edit bytes overflowed"))?;
                 minimum_attachment_reads = minimum_attachment_reads
                     .checked_add(budget.minimum_attachment_reads(range.length))
-                    .ok_or_else(|| invalid_guest("v2 attachment page count overflowed"))?;
+                    .ok_or_else(|| invalid_guest("component attachment page count overflowed"))?;
                 references = references
                     .checked_add(1)
-                    .ok_or_else(|| invalid_guest("v2 edit output references overflowed"))?;
+                    .ok_or_else(|| invalid_guest("component edit output references overflowed"))?;
             }
         }
     }
@@ -3008,7 +3062,7 @@ fn prevalidate_edit_page(
 }
 
 async fn resolve_guest_bytes(
-    actor: &mut dyn WasmComponentV2Actor,
+    actor: &mut dyn WasmComponentActor,
     transition: WasmTransitionHandle,
     outputs: Option<WasmByteOutputsHandle>,
     bytes: WasmGuestBytes,
@@ -3025,7 +3079,7 @@ async fn resolve_guest_bytes(
         }
         WasmGuestBytes::Output(range) => {
             let outputs = outputs.ok_or_else(|| {
-                invalid_guest("v2 output range is missing its page-local output table")
+                invalid_guest("component output range is missing its page-local output table")
             })?;
             read_output_range(actor, transition, outputs, range, budget, counters).await
         }
@@ -3033,7 +3087,7 @@ async fn resolve_guest_bytes(
 }
 
 async fn read_output_range(
-    actor: &mut dyn WasmComponentV2Actor,
+    actor: &mut dyn WasmComponentActor,
     transition: WasmTransitionHandle,
     outputs: WasmByteOutputsHandle,
     range: WasmOutputRange,
@@ -3043,28 +3097,28 @@ async fn read_output_range(
     let end = range
         .offset
         .checked_add(range.length)
-        .ok_or_else(|| invalid_guest("v2 output range overflowed"))?;
+        .ok_or_else(|| invalid_guest("component output range overflowed"))?;
     let output_len = actor.output_len(transition, outputs, range.index).await?;
     if end > output_len {
-        return Err(invalid_guest("v2 output range is out of bounds"));
+        return Err(invalid_guest("component output range is out of bounds"));
     }
     let capacity = usize::try_from(range.length)
-        .map_err(|_| invalid_guest("v2 output range does not fit this host"))?;
+        .map_err(|_| invalid_guest("component output range does not fit this host"))?;
     let mut bytes = Vec::with_capacity(capacity);
     let mut offset = range.offset;
     while bytes.len() < capacity {
         let remaining = capacity - bytes.len();
         let page_limit = usize::try_from(budget.limits.max_page_bytes)
-            .map_err(|_| invalid_guest("v2 output page limit does not fit this host"))?;
+            .map_err(|_| invalid_guest("component output page limit does not fit this host"))?;
         let requested_len = remaining.min(page_limit);
         let requested = u32::try_from(requested_len)
-            .map_err(|_| invalid_guest("v2 output read length exceeds the component ABI"))?;
+            .map_err(|_| invalid_guest("component output read length exceeds the component ABI"))?;
         let chunk = actor
             .read_output(transition, outputs, range.index, offset, requested)
             .await?;
         if chunk.is_empty() || chunk.len() > requested_len {
             return Err(invalid_guest(
-                "v2 output reads must return a non-empty bounded prefix before EOF",
+                "component output reads must return a non-empty bounded prefix before EOF",
             ));
         }
         budget.charge_attachment_read(chunk.len() as u64)?;
@@ -3077,7 +3131,7 @@ async fn read_output_range(
             .saturating_add(chunk.len() as u64);
         offset = offset
             .checked_add(chunk.len() as u64)
-            .ok_or_else(|| invalid_guest("v2 output read offset overflowed"))?;
+            .ok_or_else(|| invalid_guest("component output read offset overflowed"))?;
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes.into())
@@ -3116,27 +3170,29 @@ impl OutputDrainBudget {
             .checked_add(output_bytes)
             .and_then(|bytes| bytes.checked_add(cursor_metadata_bytes))
             .and_then(|bytes| self.total_bytes.checked_add(bytes))
-            .ok_or_else(|| invalid_guest("v2 transition output byte count overflowed"))?;
+            .ok_or_else(|| invalid_guest("component transition output byte count overflowed"))?;
         let prospective_refs = self
             .attachment_refs
             .checked_add(references)
-            .ok_or_else(|| invalid_guest("v2 attachment reference count overflowed"))?;
+            .ok_or_else(|| invalid_guest("component attachment reference count overflowed"))?;
         let minimum_pages = u64::from(self.pages)
             .checked_add(1)
             .and_then(|pages| pages.checked_add(minimum_attachment_reads))
-            .ok_or_else(|| invalid_guest("v2 output page count overflowed"))?;
+            .ok_or_else(|| invalid_guest("component output page count overflowed"))?;
         if prospective_bytes > self.limits.max_total_bytes {
             return Err(invalid_guest(
-                "v2 transition output exceeds max_total_bytes",
+                "component transition output exceeds max_total_bytes",
             ));
         }
         if prospective_refs > self.limits.max_attachment_refs {
             return Err(invalid_guest(
-                "v2 transition output exceeds max_attachment_refs",
+                "component transition output exceeds max_attachment_refs",
             ));
         }
         if minimum_pages > u64::from(self.limits.max_pages) {
-            return Err(invalid_guest("v2 transition output exceeds max_pages"));
+            return Err(invalid_guest(
+                "component transition output exceeds max_pages",
+            ));
         }
         self.pages += 1;
         self.attachment_refs = prospective_refs;
@@ -3157,14 +3213,18 @@ impl OutputDrainBudget {
 
     fn charge_attachment_read(&mut self, bytes: u64) -> Result<(), LixError> {
         if bytes == 0 || bytes > u64::from(self.limits.max_page_bytes) {
-            return Err(invalid_guest("v2 attachment read violates its page bound"));
+            return Err(invalid_guest(
+                "component attachment read violates its page bound",
+            ));
         }
         self.pages = self
             .pages
             .checked_add(1)
-            .ok_or_else(|| invalid_guest("v2 transition page count overflowed"))?;
+            .ok_or_else(|| invalid_guest("component transition page count overflowed"))?;
         if self.pages > self.limits.max_pages {
-            return Err(invalid_guest("v2 transition output exceeds max_pages"));
+            return Err(invalid_guest(
+                "component transition output exceeds max_pages",
+            ));
         }
         self.charge_bytes(bytes)
     }
@@ -3173,10 +3233,10 @@ impl OutputDrainBudget {
         self.total_bytes = self
             .total_bytes
             .checked_add(bytes)
-            .ok_or_else(|| invalid_guest("v2 transition byte count overflowed"))?;
+            .ok_or_else(|| invalid_guest("component transition byte count overflowed"))?;
         if self.total_bytes > self.limits.max_total_bytes {
             return Err(invalid_guest(
-                "v2 transition output exceeds max_total_bytes",
+                "component transition output exceeds max_total_bytes",
             ));
         }
         Ok(())
@@ -3192,21 +3252,22 @@ fn apply_resolved_output_splices(
     let mut previous_end = 0usize;
     for edit in edits {
         let start = usize::try_from(edit.offset)
-            .map_err(|_| invalid_guest("v2 output splice offset does not fit this host"))?;
-        let delete_len = usize::try_from(edit.delete_len)
-            .map_err(|_| invalid_guest("v2 output splice deletion does not fit this host"))?;
+            .map_err(|_| invalid_guest("component output splice offset does not fit this host"))?;
+        let delete_len = usize::try_from(edit.delete_len).map_err(|_| {
+            invalid_guest("component output splice deletion does not fit this host")
+        })?;
         let end = start
             .checked_add(delete_len)
-            .ok_or_else(|| invalid_guest("v2 output splice deletion range overflowed"))?;
+            .ok_or_else(|| invalid_guest("component output splice deletion range overflowed"))?;
         if previous_start == Some(start) || start < previous_end || end > base.len() {
             return Err(invalid_guest(
-                "v2 output splices are not globally sorted, unique, and in bounds",
+                "component output splices are not globally sorted, unique, and in bounds",
             ));
         }
         capacity = capacity
             .checked_sub(delete_len)
             .and_then(|capacity| capacity.checked_add(edit.insert.len()))
-            .ok_or_else(|| invalid_guest("v2 rendered result length overflowed"))?;
+            .ok_or_else(|| invalid_guest("component rendered result length overflowed"))?;
         previous_start = Some(start);
         previous_end = end;
     }
@@ -3215,12 +3276,13 @@ fn apply_resolved_output_splices(
     let mut cursor = 0usize;
     for edit in edits {
         let start = usize::try_from(edit.offset)
-            .map_err(|_| invalid_guest("v2 output splice offset does not fit this host"))?;
-        let delete_len = usize::try_from(edit.delete_len)
-            .map_err(|_| invalid_guest("v2 output splice deletion does not fit this host"))?;
+            .map_err(|_| invalid_guest("component output splice offset does not fit this host"))?;
+        let delete_len = usize::try_from(edit.delete_len).map_err(|_| {
+            invalid_guest("component output splice deletion does not fit this host")
+        })?;
         let end = start
             .checked_add(delete_len)
-            .ok_or_else(|| invalid_guest("v2 output splice deletion range overflowed"))?;
+            .ok_or_else(|| invalid_guest("component output splice deletion range overflowed"))?;
         bytes.extend_from_slice(&base[cursor..start]);
         bytes.extend_from_slice(&edit.insert);
         cursor = end;
@@ -3601,7 +3663,7 @@ mod tests {
     #[test]
     fn canonical_csv_json_rejects_numbers_and_decoded_duplicate_keys() {
         let canonical =
-            canonicalize_v2_snapshot(r#"{"z":"\n","a":[true,null,"é"],"slash":"/"}"#.as_bytes())
+            canonicalize_snapshot(r#"{"z":"\n","a":[true,null,"é"],"slash":"/"}"#.as_bytes())
                 .unwrap();
         assert_eq!(
             canonical,
@@ -3619,16 +3681,16 @@ mod tests {
         assert_eq!(json.value()["z"], "\n");
         assert_eq!(json.value()["a"][0], true);
 
-        assert!(canonicalize_v2_snapshot(br#"{"nested":{"n":1}}"#).is_err());
-        let duplicate = canonicalize_v2_snapshot(br#"{"a":"x","\u0061":"y"}"#)
+        assert!(canonicalize_snapshot(br#"{"nested":{"n":1}}"#).is_err());
+        let duplicate = canonicalize_snapshot(br#"{"a":"x","\u0061":"y"}"#)
             .expect_err("escaped and literal decoded keys are duplicates");
         assert!(duplicate.message.contains("duplicate"), "{duplicate:?}");
-        assert!(canonicalize_v2_snapshot(br#"["not","an","object"]"#).is_err());
+        assert!(canonicalize_snapshot(br#"["not","an","object"]"#).is_err());
     }
 
     #[test]
     fn canonical_json_uses_exact_serde_control_escape_spelling() {
-        let canonical = canonicalize_v2_snapshot(
+        let canonical = canonicalize_snapshot(
             br#"{"controls":"\b\t\n\f\r\u0001\u001f","quote":"\"","slash":"\\","solidus":"/"}"#,
         )
         .unwrap();
@@ -3693,7 +3755,7 @@ mod tests {
     #[test]
     fn certified_plugin_rows_retain_source_buffers_without_an_arena() {
         let schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+            "../../../../plugins/csv/schema/csv_v2_row.json"
         ))
         .expect("CSV row schema");
         let catalog =
@@ -3703,9 +3765,8 @@ mod tests {
                 schema,
             )])
             .expect("CSV row catalog");
-        let schemas =
-            V2SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
-                .expect("CSV allowlist");
+        let schemas = SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
+            .expect("CSV allowlist");
 
         let first = Bytes::from(
             br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
@@ -3783,7 +3844,7 @@ mod tests {
     #[test]
     fn canonical_plugin_rows_skip_dom_and_share_the_normalized_arena() {
         let schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+            "../../../../plugins/csv/schema/csv_v2_row.json"
         ))
         .expect("CSV row schema");
         let catalog =
@@ -3793,9 +3854,8 @@ mod tests {
                 schema,
             )])
             .expect("CSV row catalog");
-        let schemas =
-            V2SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
-                .expect("CSV allowlist");
+        let schemas = SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
+            .expect("CSV allowlist");
         let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(2);
         batch
             .push_plugin(
@@ -3842,7 +3902,7 @@ mod tests {
     #[test]
     fn plugin_row_parser_counts_one_pass_for_canonical_compatibility_and_invalid_rows() {
         let schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+            "../../../../plugins/csv/schema/csv_v2_row.json"
         ))
         .expect("CSV row schema");
         let catalog =
@@ -3852,9 +3912,8 @@ mod tests {
                 schema,
             )])
             .expect("CSV row catalog");
-        let schemas =
-            V2SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
-                .expect("CSV allowlist");
+        let schemas = SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
+            .expect("CSV allowlist");
 
         let mut canonical = CanonicalJsonBatchBuilder::with_row_capacity(1);
         canonical
@@ -3917,11 +3976,11 @@ mod tests {
     #[test]
     fn streaming_plugin_parser_matches_dom_canonicalization_for_compatibility_corpus() {
         let row_schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+            "../../../../plugins/csv/schema/csv_v2_row.json"
         ))
         .expect("CSV row schema");
         let table_schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv-v2/schema/csv_v2_table.json"
+            "../../../../plugins/csv/schema/csv_v2_table.json"
         ))
         .expect("CSV table schema");
         let catalog = CatalogSnapshot::from_schema_facts(&[
@@ -3937,7 +3996,7 @@ mod tests {
             ),
         ])
         .expect("CSV catalog");
-        let schemas = V2SchemaAllowlist::from_catalog(
+        let schemas = SchemaAllowlist::from_catalog(
             &["csv_v2_row".to_owned(), "csv_v2_table".to_owned()],
             Arc::new(catalog),
         )
@@ -3969,7 +4028,7 @@ mod tests {
             ),
         ];
         for (input, key) in valid {
-            let expected = canonicalize_v2_snapshot(input).expect("DOM compatibility oracle");
+            let expected = canonicalize_snapshot(input).expect("DOM compatibility oracle");
             let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(1);
             batch
                 .push_plugin(Bytes::copy_from_slice(input), &key, &schemas)
@@ -4000,7 +4059,7 @@ mod tests {
             br#"{"cells":["\uDE00"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
         ] {
             let dom_error =
-                canonicalize_v2_snapshot(input).expect_err("DOM oracle must reject hostile input");
+                canonicalize_snapshot(input).expect_err("DOM oracle must reject hostile input");
             let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(1);
             let streaming_error = batch
                 .push_plugin(
@@ -4126,7 +4185,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl WasmComponentV2Actor for FakeActor {
+    impl WasmComponentActor for FakeActor {
         async fn fork_document(
             &mut self,
             document: WasmDocumentHandle,
@@ -4535,7 +4594,7 @@ mod tests {
             document: WasmDocumentHandle(2),
             changes: WasmChangeCursorHandle(3),
         };
-        let schemas = V2SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
+        let schemas = SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
 
         let drained = drain_file_transition_changes(
             &mut actor,
@@ -4597,7 +4656,7 @@ mod tests {
             document: WasmDocumentHandle(12),
             changes: WasmChangeCursorHandle(13),
         };
-        let schemas = V2SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
+        let schemas = SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
 
         let drained = drain_file_transition_changes(
             &mut actor,
@@ -4666,7 +4725,7 @@ mod tests {
             document: WasmDocumentHandle(15),
             changes: WasmChangeCursorHandle(16),
         };
-        let schemas = V2SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
+        let schemas = SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
 
         let drained = drain_file_transition_changes(
             &mut actor,
@@ -4746,7 +4805,7 @@ mod tests {
         let error = drain_file_transition_changes(
             &mut actor,
             transition,
-            &V2SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
+            &SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
             WasmTransitionLimits::default(),
         )
         .await
@@ -4755,7 +4814,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
         assert_eq!(
             error.message,
-            "invalid v2 change cursor page: a v2 entity key may occur only once across a change cursor"
+            "invalid component change cursor page: a component entity key may occur only once across a change cursor"
         );
         assert_eq!(actor.discarded_transitions, vec![transition.transition]);
         assert!(!actor.finished);
@@ -4796,7 +4855,7 @@ mod tests {
                 document: WasmDocumentHandle(2),
                 changes: WasmChangeCursorHandle(3),
             },
-            &V2SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
+            &SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
             WasmTransitionLimits::default(),
         )
         .await
@@ -4821,7 +4880,7 @@ mod tests {
                 document: WasmDocumentHandle(5),
                 changes: WasmChangeCursorHandle(6),
             },
-            &V2SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
+            &SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
             WasmTransitionLimits::default(),
         )
         .await
@@ -4858,7 +4917,7 @@ mod tests {
                 document: WasmDocumentHandle(2),
                 changes: WasmChangeCursorHandle(3),
             },
-            &V2SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
+            &SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
             WasmTransitionLimits::default(),
         )
         .await

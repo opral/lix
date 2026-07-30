@@ -401,7 +401,7 @@ pub(crate) struct SchemaPlan {
 }
 
 #[derive(Debug)]
-pub(crate) struct CertifiedV2PluginRow {
+pub(crate) struct CertifiedPluginRow {
     pub(crate) entity_pk: EntityPk,
     /// `None` retains the guest buffer because its spelling is already
     /// canonical. `Some` is the canonical spelling produced by the same
@@ -431,18 +431,18 @@ impl SchemaPlan {
     /// DOM. Eligible compatibility spellings return one canonical byte
     /// buffer from that same pass. `Ok(None)` is reserved for plans that need
     /// the general DOM validation path.
-    pub(crate) fn certify_or_normalize_v2_plugin_row(
+    pub(crate) fn certify_or_normalize_plugin_row(
         &self,
         bytes: &[u8],
         key: &WasmEntityKey,
-    ) -> Result<Option<CertifiedV2PluginRow>, LixError> {
+    ) -> Result<Option<CertifiedPluginRow>, LixError> {
         let emitted = key
             .entity_pk
             .iter()
             .map(|component| component.as_str())
             .collect::<SmallVec<[_; 2]>>();
         let Some(normalized) =
-            self.certify_or_normalize_v2_plugin_row_parts(bytes, &key.schema_key, &emitted)?
+            self.certify_or_normalize_plugin_row_parts(bytes, &key.schema_key, &emitted)?
         else {
             return Ok(None);
         };
@@ -452,7 +452,7 @@ impl SchemaPlan {
             .expect("certificate eligibility requires typed primary-key components");
         EntityPk::from_shared_external_parts(key.entity_pk.iter().cloned(), component_types)
             .map(|entity_pk| {
-                Some(CertifiedV2PluginRow {
+                Some(CertifiedPluginRow {
                     entity_pk,
                     normalized,
                 })
@@ -468,13 +468,13 @@ impl SchemaPlan {
             })
     }
 
-    pub(crate) fn certify_or_normalize_v2_plugin_row_parts(
+    pub(crate) fn certify_or_normalize_plugin_row_parts(
         &self,
         bytes: &[u8],
         schema_key: &str,
         entity_pk: &[&str],
     ) -> Result<Option<Option<Vec<u8>>>, LixError> {
-        if !self.accepts_v2_canonical_certificate() {
+        if !self.accepts_canonical_certificate() {
             return Ok(None);
         }
         let validation = self
@@ -533,7 +533,7 @@ impl SchemaPlan {
             })
     }
 
-    pub(crate) fn accepts_v2_canonical_certificate(&self) -> bool {
+    pub(crate) fn accepts_canonical_certificate(&self) -> bool {
         self.fast_object_validation
             .as_ref()
             .is_some_and(FastObjectValidationPlan::supports_canonical_streaming)
@@ -2852,7 +2852,7 @@ mod tests {
     #[test]
     fn fast_object_validation_compiles_actual_json_v2_schemas() {
         let root = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json-v2/schema/json_root.json"
+            "../../../../plugins/json/schema/json_root.json"
         ));
         for value in [
             json!({"id": "root", "kind": "object"}),
@@ -2877,7 +2877,7 @@ mod tests {
         }
 
         let object_member = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json-v2/schema/json_object_member.json"
+            "../../../../plugins/json/schema/json_object_member.json"
         ));
         for value in [
             json!({
@@ -2915,7 +2915,7 @@ mod tests {
         }
 
         let array_item = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json-v2/schema/json_array_item.json"
+            "../../../../plugins/json/schema/json_array_item.json"
         ));
         assert_fast_validation(
             &array_item,
@@ -2946,7 +2946,7 @@ mod tests {
     #[test]
     fn fast_object_validation_compiles_actual_csv_v2_schemas() {
         let row = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+            "../../../../plugins/csv/schema/csv_v2_row.json"
         ));
         for value in [
             json!({"id": UUID_A, "order_key": "01", "cells": ["alpha"]}),
@@ -2993,7 +2993,7 @@ mod tests {
         }
 
         let table = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv-v2/schema/csv_v2_table.json"
+            "../../../../plugins/csv/schema/csv_v2_table.json"
         ));
         for value in [
             json!({
@@ -3078,12 +3078,12 @@ mod tests {
     #[test]
     fn canonical_plugin_row_certificate_proves_csv_schema_and_typed_identity() {
         let plan = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+            "../../../../plugins/csv/schema/csv_v2_row.json"
         ));
-        assert!(plan.accepts_v2_canonical_certificate());
+        assert!(plan.accepts_canonical_certificate());
         let key = WasmEntityKey::from_owned_parts("csv_v2_row", vec![UUID_A.to_owned()]);
         let certified = plan
-            .certify_or_normalize_v2_plugin_row(
+            .certify_or_normalize_plugin_row(
                 br#"{"cells":["a","b"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
                 &key,
             )
@@ -3130,7 +3130,7 @@ mod tests {
         );
 
         let normalized = plan
-            .certify_or_normalize_v2_plugin_row(
+            .certify_or_normalize_plugin_row(
                 br#"{"id":"019a0000-0000-7000-8000-000000000001","order_key":"01","cells":["a","b"]}"#,
                 &key,
             )
@@ -3143,7 +3143,7 @@ mod tests {
             br#"{"cells":["a","b"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
         );
         let normalized = plan
-            .certify_or_normalize_v2_plugin_row(
+            .certify_or_normalize_plugin_row(
                 br#"{"cells":["line\u000Abreak"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
                 &key,
             )
@@ -3156,7 +3156,7 @@ mod tests {
             br#"{"cells":["line\nbreak"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
         );
         assert!(
-            plan.certify_or_normalize_v2_plugin_row(
+            plan.certify_or_normalize_plugin_row(
                 br#"{"cells":["line\nbreak"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
                 &key,
             )
@@ -3167,7 +3167,7 @@ mod tests {
             "exact serde control escapes must remain on the certificate path"
         );
         assert!(
-            plan.certify_or_normalize_v2_plugin_row(
+            plan.certify_or_normalize_plugin_row(
                 br#"{"cells":["\b\t\n\f\r\u0001\u001f"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
                 &key,
             )
@@ -3177,7 +3177,7 @@ mod tests {
             .is_none()
         );
         let normalized = plan
-            .certify_or_normalize_v2_plugin_row(
+            .certify_or_normalize_plugin_row(
                 br#"{"cells":["\u001F"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
                 &key,
             )
@@ -3212,11 +3212,11 @@ mod tests {
             &BTreeMap::new(),
         )
         .expect("UUID schema should compile");
-        assert!(plan.accepts_v2_canonical_certificate());
+        assert!(plan.accepts_canonical_certificate());
         let key = WasmEntityKey::from_owned_parts("uuid_format_row", vec!["row-1".to_owned()]);
 
         let certified = plan
-            .certify_or_normalize_v2_plugin_row(
+            .certify_or_normalize_plugin_row(
                 br#"{"external_id":"019a0000-0000-7000-8000-000000000001","id":"row-1"}"#,
                 &key,
             )
@@ -3225,10 +3225,7 @@ mod tests {
         assert!(certified.normalized.is_none());
 
         let error = plan
-            .certify_or_normalize_v2_plugin_row(
-                br#"{"external_id":"not-a-uuid","id":"row-1"}"#,
-                &key,
-            )
+            .certify_or_normalize_plugin_row(br#"{"external_id":"not-a-uuid","id":"row-1"}"#, &key)
             .expect_err("invalid non-primary UUID must not receive a certificate");
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
     }
@@ -3236,12 +3233,12 @@ mod tests {
     #[test]
     fn canonical_certificate_covers_csv_table_and_json_v2_schemas() {
         let table = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv-v2/schema/csv_v2_table.json"
+            "../../../../plugins/csv/schema/csv_v2_table.json"
         ));
-        assert!(table.accepts_v2_canonical_certificate());
+        assert!(table.accepts_canonical_certificate());
         assert!(
             table
-                .certify_or_normalize_v2_plugin_row(
+                .certify_or_normalize_plugin_row(
                     br#"{"dialect":{"delimiter":",","quote":"\"","terminator":"\n"},"id":"root"}"#,
                     &WasmEntityKey::from_owned_parts("csv_v2_table", vec!["root".to_owned()],),
                 )
@@ -3252,12 +3249,12 @@ mod tests {
         );
 
         let json_root = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json-v2/schema/json_root.json"
+            "../../../../plugins/json/schema/json_root.json"
         ));
-        assert!(json_root.accepts_v2_canonical_certificate());
+        assert!(json_root.accepts_canonical_certificate());
         assert!(
             json_root
-                .certify_or_normalize_v2_plugin_row(
+                .certify_or_normalize_plugin_row(
                     br#"{"id":"root","kind":"object"}"#,
                     &WasmEntityKey::from_owned_parts("json_root", vec!["root".to_owned()]),
                 )
@@ -3268,12 +3265,12 @@ mod tests {
         );
 
         let object_member = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json-v2/schema/json_object_member.json"
+            "../../../../plugins/json/schema/json_object_member.json"
         ));
-        assert!(object_member.accepts_v2_canonical_certificate());
+        assert!(object_member.accepts_canonical_certificate());
         assert!(
             object_member
-                .certify_or_normalize_v2_plugin_row(
+                .certify_or_normalize_plugin_row(
                     br#"{"key":"name","kind":"string","order_key":"01","parent_id":"root","scalar_json":"\"Lix\""}"#,
                     &WasmEntityKey::from_owned_parts(
                         "json_object_member",
@@ -3287,12 +3284,12 @@ mod tests {
         );
 
         let array_item = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/json-v2/schema/json_array_item.json"
+            "../../../../plugins/json/schema/json_array_item.json"
         ));
-        assert!(array_item.accepts_v2_canonical_certificate());
+        assert!(array_item.accepts_canonical_certificate());
         assert!(
             array_item
-                .certify_or_normalize_v2_plugin_row(
+                .certify_or_normalize_plugin_row(
                     br#"{"id":"019a0000-0000-7000-8000-000000000001","kind":"null","order_key":"01","parent_id":"root","scalar_json":"null"}"#,
                     &WasmEntityKey::from_owned_parts(
                         "json_array_item",
@@ -3309,7 +3306,7 @@ mod tests {
     #[test]
     fn canonical_plugin_row_certificate_rejects_hostile_rows() {
         let plan = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+            "../../../../plugins/csv/schema/csv_v2_row.json"
         ));
         let key = WasmEntityKey::from_owned_parts("csv_v2_row", vec![UUID_A.to_owned()]);
 
@@ -3320,13 +3317,13 @@ mod tests {
             br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01""#.as_slice(),
         ] {
             let error = plan
-                .certify_or_normalize_v2_plugin_row(bytes, &key)
+                .certify_or_normalize_plugin_row(bytes, &key)
                 .expect_err("hostile plugin snapshot must be rejected");
             assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN, "{bytes:?}");
         }
 
         let wrong_identity = plan
-            .certify_or_normalize_v2_plugin_row(
+            .certify_or_normalize_plugin_row(
                 br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"01"}"#,
                 &key,
             )
@@ -3334,7 +3331,7 @@ mod tests {
         assert_eq!(wrong_identity.code, LixError::CODE_SCHEMA_VALIDATION);
 
         let invalid_order_key = plan
-            .certify_or_normalize_v2_plugin_row(
+            .certify_or_normalize_plugin_row(
                 br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"00"}"#,
                 &key,
             )

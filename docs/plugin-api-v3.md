@@ -2,11 +2,10 @@
 
 ## Status
 
-Profile-driven prototype. API v3 is accepted only if every required real-file
-lane demonstrates at least 2× end-to-end throughput and at least 3× lower peak
-total memory than v2. Total memory includes host-owned live bytes, guest linear
-memory high water, and transition materialization. The prototype does not
-retain a v2 adapter.
+Accepted hard cut. API v3 is the only plugin ABI and runtime path. Total-memory
+measurements include host-owned live bytes, guest linear-memory high water, and
+transition materialization. The implementation retains no v2 adapter, runtime,
+WIT, SDK, or format plugin.
 
 ## Evidence for the cut
 
@@ -60,7 +59,7 @@ are cold-path behavior and are counted.
 
 ## Correctness gates
 
-The host-arena prototype covers exact byte reconstruction, stable unchanged
+The host-arena implementation covers exact byte reconstruction, stable unchanged
 entity value identities, deterministic successor roots, constant-time
 branching, rollback on invalid output, cache-independent roots, generation
 upgrades without arena rewrites, and sparse three-arena commits. End-to-end

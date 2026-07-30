@@ -1,4 +1,4 @@
-//! Durable create-context authority for production v2 plugins.
+//! Durable create-context authority for production component plugins.
 //!
 //! Components see a compact UUIDv7 create context. The engine retains the full
 //! operation proof, binds the context to the file authority, and writes one
@@ -55,11 +55,11 @@ impl BoundCreateContext {
         }
         let authority_binding = authority_binding(actor_key);
         let namespace_digest = framed_digest(
-            b"lix.plugin-v2.bound-namespace.v2\0",
+            b"lix.plugin-component.bound-namespace.component\0",
             &[&identity.namespace_seed, &authority_binding],
         );
         let bound_operation_proof = framed_digest(
-            b"lix.plugin-v2.bound-operation-proof.v2\0",
+            b"lix.plugin-component.bound-operation-proof.component\0",
             &[&identity.operation_proof, &authority_binding],
         );
         let mut prefix = [0_u8; 12];
@@ -100,7 +100,7 @@ pub(crate) fn local_mutation_identity(namespace_seed: [u8; 16]) -> MutationIdent
     MutationIdentity {
         namespace_seed,
         operation_proof: framed_digest(
-            b"lix.plugin-v2.local-operation-proof.v2\0",
+            b"lix.plugin-component.local-operation-proof.component\0",
             &[&namespace_seed],
         ),
     }
@@ -108,7 +108,7 @@ pub(crate) fn local_mutation_identity(namespace_seed: [u8; 16]) -> MutationIdent
 
 fn authority_binding(actor_key: &PluginActorKey) -> [u8; 32] {
     framed_digest(
-        b"lix.plugin-v2.id-authority.v2\0",
+        b"lix.plugin-component.id-authority.component\0",
         &[
             actor_key.branch_id.as_bytes(),
             actor_key.file_id.as_bytes(),
@@ -549,7 +549,7 @@ mod tests {
             file_id: "01920000-0000-7000-8000-0000000000a2".to_string(),
             path: "/a.csv".to_string(),
             owner_change_id: "owner-a".to_string(),
-            plugin_key: "plugin_csv_v2".to_string(),
+            plugin_key: "plugin_csv".to_string(),
             plugin_generation: "a".repeat(64),
         }
     }
@@ -567,17 +567,17 @@ mod tests {
 
     fn plugin() -> PluginRegistryEntry {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
-            key: "plugin_csv_v2".to_string(),
-            runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.1.0".to_string(),
+            key: "plugin_csv".to_string(),
+            runtime: PluginRuntime::WasmComponent,
+            api_version: "3.0.0".to_string(),
             path_glob: "*.csv".to_string(),
             content_type: None,
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
             create_schema_keys: vec!["csv_row".to_string()],
-            manifest_json: r#"{"key":"plugin_csv_v2","runtime":"wasm-component-v2","api_version":"2.1.0","materialization":"blob","match":{"path_glob":"*.csv"},"entry":"plugin.wasm","schemas":["schema/csv_row.json"]}"#.to_string(),
-            archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv_v2"),
-            archive_path: "/.lix/plugins/plugin_csv_v2.lixplugin".to_string(),
+            manifest_json: r#"{"key":"plugin_csv","runtime":"wasm-component","api_version":"3.0.0","materialization":"blob","match":{"path_glob":"*.csv"},"entry":"plugin.wasm","schemas":["schema/csv_row.json"]}"#.to_string(),
+            archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv"),
+            archive_path: "/.lix/plugins/plugin_csv.lixplugin".to_string(),
             archive_blob_hash: "a".repeat(64),
             wasm_blob_hash: "b".repeat(64),
         })

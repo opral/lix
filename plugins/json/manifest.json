@@ -1,6 +1,6 @@
 {
   "key": "plugin_json",
-  "runtime": "wasm-component-v2",
+  "runtime": "wasm-component",
   "api_version": "3.0.0",
   "materialization": "blob",
   "match": {

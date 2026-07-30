@@ -1,13 +1,9 @@
-//! Fused Markdown experiment for Component API v3.
+//! Markdown support for the fused Component API v3.
 #![allow(dead_code)]
 
-#[path = "../../markdown-v2/src/core.rs"]
 mod core;
-#[path = "../../markdown-v2/src/markdown_file.rs"]
 mod markdown_file;
-#[path = "../../markdown-v2/src/model.rs"]
 mod model;
-#[path = "../../markdown-v2/src/schemas.rs"]
 mod schemas;
 
 use core::{

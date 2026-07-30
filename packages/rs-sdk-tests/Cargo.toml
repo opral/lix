@@ -15,15 +15,11 @@ lix_sdk = { path = "../rs-sdk", version = "0.9.0", default-features = false, fea
 [dev-dependencies]
 lix_engine = { path = "../engine", version = "0.9.0", features = ["storage-benches"] }
 lix_rocksdb_storage = { path = "../rocksdb-storage", version = "0.9.0" }
-plugin_csv_v2 = { path = "../../plugins/csv-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_excalidraw = { path = "../../plugins/excalidraw", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
-plugin_markdown_incremental_v2 = { path = "../../plugins/markdown-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_markdown = { path = "../../plugins/markdown", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
-plugin_excalidraw_v2 = { path = "../../plugins/excalidraw-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
-plugin_json_incremental_v2 = { path = "../../plugins/json-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_json = { path = "../../plugins/json", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
-plugin_git_text_v2 = { path = "../../plugins/text-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_git_text = { path = "../../plugins/text", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 
 async-trait = "0.1"
 base64 = "0.22"

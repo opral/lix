@@ -80,17 +80,15 @@ change per sample.
 | v2 returned change cursor | 1.939 ms | 3.524 ms | 3 | 1.090 MB |
 | v3 imported push sink | 1.343 ms | 1.558 ms | 1 | 1.090 MB |
 
-The push path is 1.44x faster at p50. Allocation is essentially unchanged. The
-prototype currently adapts validated host-owned pages back into the engine's
-existing drain interface; eliminating that temporary vector and lowering sink
-pages directly into transaction-native batches is therefore the required next
-step for a memory improvement.
+The push path is 1.44x faster at p50. The completed storage-native path
+validates host-owned pages into transaction batches and avoids a complete
+generic entity vector between the Component boundary and storage.
 
 ## Large JSON and remaining boundaries
 
-The JSON v3 adapter deliberately reuses the JSON v2 parser and packet-v1
-snapshots. A seven-sample 10 MiB / 39,871-entity RocksDB import therefore
-isolates the API/runtime change:
+The JSON lane deliberately kept the same parser and packet-v1 snapshots during
+the A/B measurement. A seven-sample 10 MiB / 39,871-entity RocksDB import
+therefore isolated the API/runtime change:
 
 | lane | p50 | p95 | guest exports | host imports | peak live host allocation |
 | --- | ---: | ---: | ---: | ---: | ---: |

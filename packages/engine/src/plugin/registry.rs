@@ -154,12 +154,12 @@ impl PluginRegistryEntry {
     }
 
     /// Verifies the durable contract that every existing owner relies on
-    /// before a content-addressed v2 component generation is replaced.
+    /// before a content-addressed component component generation is replaced.
     ///
     /// Schema definitions themselves live in `lix_registered_schema` and are
     /// compared by the lifecycle reconciler. This check covers the registry
     /// half of that contract, including the exact schema-key set.
-    pub(crate) fn validate_owned_v2_upgrade_contract(
+    pub(crate) fn validate_owned_upgrade_contract(
         &self,
         replacement: &Self,
     ) -> Result<(), LixError> {
@@ -174,7 +174,7 @@ impl PluginRegistryEntry {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
                 format!(
-                    "owned plugin '{}' may only upgrade between wasm-component-v2 generations with the same API version, matcher, materialization, content type, schema keys, and create-default contract",
+                    "owned plugin '{}' may only upgrade between wasm-component generations with the same API version, matcher, materialization, content type, schema keys, and create-default contract",
                     self.key
                 ),
             )
@@ -1168,9 +1168,9 @@ mod tests {
                 "schemas":["schema/default.json"],
                 "entry":"plugin.wasm",
                 "match":{{"path_glob":{path_glob:?}{content_type}}},
-                "api_version":"2.1.0",
+                "api_version":"3.0.0",
                 "materialization":"blob",
-                "runtime":"wasm-component-v2",
+                "runtime":"wasm-component",
                 "key":{key:?}
             }}"#
         )
@@ -1188,8 +1188,8 @@ mod tests {
     ) -> PluginRegistryEntry {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
-            runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.1.0".to_string(),
+            runtime: PluginRuntime::WasmComponent,
+            api_version: "3.0.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type,
             entry: "plugin.wasm".to_string(),
@@ -1204,34 +1204,34 @@ mod tests {
         .expect("test registry entry should be valid")
     }
 
-    fn v2_entry(hash_byte: char) -> PluginRegistryEntry {
-        let key = "plugin_csv_v2";
+    fn component_entry(hash_byte: char) -> PluginRegistryEntry {
+        let key = "plugin_csv";
         let path_glob = "*.csv";
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
-            runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.1.0".to_string(),
+            runtime: PluginRuntime::WasmComponent,
+            api_version: "3.0.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
             create_schema_keys: vec!["csv_row".to_string()],
             manifest_json: format!(
-                r#"{{"api_version":"2.1.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"materialization":"blob","runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}}"#
+                r#"{{"api_version":"3.0.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"materialization":"blob","runtime":"wasm-component","schemas":["schema/csv_row.json"]}}"#
             ),
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
             archive_blob_hash: hash(hash_byte),
             wasm_blob_hash: hash(hash_byte),
         })
-        .expect("test v2 registry entry should be valid")
+        .expect("test component registry entry should be valid")
     }
 
     #[test]
-    fn durable_registry_rejects_pre_conflict_resolution_component_api() {
-        let mut legacy = v2_entry('a');
+    fn durable_registry_rejects_pre_v3_component_api() {
+        let mut legacy = component_entry('a');
         legacy.api_version = "2.0.0".to_owned();
-        legacy.manifest_json = legacy.manifest_json.replacen("2.1.0", "2.0.0", 1);
+        legacy.manifest_json = legacy.manifest_json.replacen("3.0.0", "2.0.0", 1);
         let plugins = vec![legacy];
         let wire = PluginRegistryWire {
             version: PLUGIN_REGISTRY_FORMAT_VERSION,
@@ -1244,15 +1244,15 @@ mod tests {
             .expect_err("durable pre-conflict-resolution components must hard fail");
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
         assert!(error.message.contains("api_version"));
-        assert!(error.message.contains("2.1.0"));
+        assert!(error.message.contains("3.0.0"));
     }
 
     #[test]
-    fn owned_v2_upgrade_contract_allows_only_generation_packaging_changes() {
-        let previous = v2_entry('a');
-        let replacement = v2_entry('b');
+    fn owned_component_upgrade_contract_allows_only_generation_packaging_changes() {
+        let previous = component_entry('a');
+        let replacement = component_entry('b');
         previous
-            .validate_owned_v2_upgrade_contract(&replacement)
+            .validate_owned_upgrade_contract(&replacement)
             .expect("content-addressed component replacement should preserve the contract");
 
         let mut incompatible = Vec::new();
@@ -1274,7 +1274,7 @@ mod tests {
 
         for replacement in incompatible {
             let error = previous
-                .validate_owned_v2_upgrade_contract(&replacement)
+                .validate_owned_upgrade_contract(&replacement)
                 .expect_err("owned plugin contract mutation must fail closed");
             assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
         }
@@ -1430,8 +1430,8 @@ mod tests {
         let wasm = b"compiled component".to_vec();
         let mut input = PluginRegistryEntryInput {
             key: "plugin_a".to_string(),
-            runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.1.0".to_string(),
+            runtime: PluginRuntime::WasmComponent,
+            api_version: "3.0.0".to_string(),
             path_glob: "*.json".to_string(),
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),

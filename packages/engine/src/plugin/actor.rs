@@ -1,4 +1,4 @@
-//! Persistent, failure-isolated v2 plugin actors.
+//! Persistent, failure-isolated component plugin actors.
 //!
 //! A compiled component may be shared, but a mutable Component instance and
 //! its document handles belong to exactly one branch/file actor.  This cache
@@ -15,7 +15,7 @@ use tokio::sync::{
 };
 
 use super::incremental::FileBytesSha256;
-use crate::wasm::{WasmComponentV2Actor, WasmDocumentHandle};
+use crate::wasm::{WasmComponentActor, WasmDocumentHandle};
 use crate::{Blob, LixError};
 
 pub(crate) const DEFAULT_MAX_LIVE_PLUGIN_STORES: usize = 16;
@@ -77,13 +77,13 @@ struct PluginActorAcceptedState {
 /// Field order is deliberate: Rust drops fields in declaration order, so the
 /// actor (and its Wasmtime Store) is destroyed before the permit is returned.
 pub(crate) struct PluginActorStore {
-    actor: Box<dyn WasmComponentV2Actor>,
+    actor: Box<dyn WasmComponentActor>,
     _store_permit: PluginActorStorePermit,
 }
 
 impl PluginActorStore {
     pub(crate) fn new(
-        actor: Box<dyn WasmComponentV2Actor>,
+        actor: Box<dyn WasmComponentActor>,
         store_permit: PluginActorStorePermit,
     ) -> Self {
         Self {
@@ -92,7 +92,7 @@ impl PluginActorStore {
         }
     }
 
-    pub(crate) fn actor_mut(&mut self) -> &mut dyn WasmComponentV2Actor {
+    pub(crate) fn actor_mut(&mut self) -> &mut dyn WasmComponentActor {
         self.actor.as_mut()
     }
 }
@@ -706,7 +706,7 @@ fn plugin_store_resource_limit(capacity: NonZeroUsize) -> LixError {
         ),
     )
     .with_hint(
-        "finish transactions holding existing-document plugin leases, or raise EngineOptions::with_plugin_v2_resource_limits",
+        "finish transactions holding existing-document plugin leases, or raise EngineOptions::with_plugin_resource_limits",
     )
 }
 
@@ -756,7 +756,7 @@ pub(crate) struct PluginActorLease {
 }
 
 impl PluginActorLease {
-    pub(crate) fn actor_mut(&mut self) -> &mut dyn WasmComponentV2Actor {
+    pub(crate) fn actor_mut(&mut self) -> &mut dyn WasmComponentActor {
         self.guard
             .as_deref_mut()
             .expect("actor lease guard exists")
@@ -1101,7 +1101,7 @@ mod tests {
 
     use super::*;
     use crate::wasm::{
-        WasmChangeCursorHandle, WasmChangePage, WasmComponentV2Actor, WasmEditCursorHandle,
+        WasmChangeCursorHandle, WasmChangePage, WasmComponentActor, WasmEditCursorHandle,
         WasmEditPage, WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
         WasmOpenEntitiesInput, WasmOpenFileInput, WasmTransitionCounters, WasmTransitionHandle,
         WasmTransitionLimits,
@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl WasmComponentV2Actor for TestActor {
+    impl WasmComponentActor for TestActor {
         async fn fork_document(
             &mut self,
             document: WasmDocumentHandle,
@@ -1256,7 +1256,7 @@ mod tests {
             file_id: "file".to_owned(),
             path: path.to_owned(),
             owner_change_id: "incarnation".to_owned(),
-            plugin_key: "plugin_csv_v2".to_owned(),
+            plugin_key: "plugin_csv".to_owned(),
             plugin_generation: generation.to_owned(),
         }
     }
@@ -1722,7 +1722,7 @@ mod tests {
         lease.begin_guest_call().unwrap();
         let deadline = LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "v2 transition deadline elapsed",
+            "component transition deadline elapsed",
         );
         let _ = lease.handle_guest_call_error(deadline);
         drop(lease);

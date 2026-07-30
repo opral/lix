@@ -20,17 +20,17 @@ pub use client_state::ClientState;
 pub use filesystem::{LocalFilesystem, LocalFilesystemOpenOptions};
 pub use lix::{
     Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_storage,
-    open_lix_with_storage_and_plugin_v2_resource_limits, open_lix_with_telemetry,
+    open_lix_with_storage_and_plugin_resource_limits, open_lix_with_telemetry,
 };
 pub use lix_engine::telemetry::{
     CallbackTelemetrySink, CompletedTelemetrySpan, TelemetryAttribute, TelemetrySink,
     TelemetrySpanEnd, TelemetrySpanHandle, TelemetrySpanKind, TelemetrySpanStart,
     TelemetrySpanStatus, TelemetryValue, TracingTelemetrySink,
 };
-/// Host-side contract for supplying a custom Component API v2 runtime through
+/// Host-side contract for supplying a custom Component runtime through
 /// [`OpenLixOptions::with_wasm_runtime`]. This is the engine/embedding boundary,
 /// not a plugin-authoring SDK.
-pub use lix_engine::wasm::v2::*;
+pub use lix_engine::wasm::*;
 pub use lix_engine::wasm::{WasmLimits, WasmRuntime};
 pub use lix_engine::{
     Blob, CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt,

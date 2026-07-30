@@ -3,10 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::binary_cas::BlobHash;
 use crate::common::LixError;
-use crate::wasm::{
-    WASM_COMPONENT_V3_PROTOTYPE_API_VERSION, WasmComponentV2Factory, WasmLimits, WasmRuntime,
-    WasmTransitionCounters,
-};
+use crate::wasm::{WasmComponentFactory, WasmLimits, WasmRuntime, WasmTransitionCounters};
 
 use super::{
     CompiledPluginCatalog, DEFAULT_MAX_LIVE_PLUGIN_STORES, InstalledPlugin, PluginActorCache,
@@ -20,9 +17,9 @@ use super::{
 const MAX_PLUGIN_EXECUTION_TIMEOUT_MS: u64 = 60_000;
 /// Preserve enough headroom for recursive plugins and large minified text
 /// snapshots. The live-Store working set remains independently bounded.
-pub(crate) const DEFAULT_PLUGIN_V2_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const DEFAULT_PLUGIN_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 
-fn plugin_v2_wasm_limits(max_memory_bytes: u64) -> Result<WasmLimits, LixError> {
+fn plugin_wasm_limits(max_memory_bytes: u64) -> Result<WasmLimits, LixError> {
     if max_memory_bytes == 0 {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
@@ -37,15 +34,15 @@ fn plugin_v2_wasm_limits(max_memory_bytes: u64) -> Result<WasmLimits, LixError> 
 }
 
 #[cfg(test)]
-fn default_plugin_v2_wasm_limits() -> WasmLimits {
-    plugin_v2_wasm_limits(DEFAULT_PLUGIN_V2_MEMORY_BYTES)
+fn default_plugin_wasm_limits() -> WasmLimits {
+    plugin_wasm_limits(DEFAULT_PLUGIN_MEMORY_BYTES)
         .expect("the default plugin memory limit is positive")
 }
 
 #[derive(Clone)]
-struct CachedPluginV2Factory {
+struct CachedPluginFactory {
     wasm_hash: BlobHash,
-    factory: Arc<dyn WasmComponentV2Factory>,
+    factory: Arc<dyn WasmComponentFactory>,
 }
 
 #[derive(Default)]
@@ -57,10 +54,10 @@ struct PluginRegistryReadCache {
 #[derive(Clone)]
 pub(crate) struct PluginRuntimeHost {
     wasm_runtime: Arc<dyn WasmRuntime>,
-    plugin_v2_factory_cache: Arc<Mutex<BTreeMap<String, CachedPluginV2Factory>>>,
-    plugin_v2_wasm_limits: WasmLimits,
+    plugin_factory_cache: Arc<Mutex<BTreeMap<String, CachedPluginFactory>>>,
+    plugin_wasm_limits: WasmLimits,
     plugin_actor_cache: PluginActorCache,
-    plugin_v2_transition_counters: Arc<Mutex<WasmTransitionCounters>>,
+    plugin_transition_counters: Arc<Mutex<WasmTransitionCounters>>,
     plugin_catalog_cache: Arc<Mutex<PluginCatalogCache>>,
     plugin_registry_read_cache: Arc<Mutex<PluginRegistryReadCache>>,
     /// Ordinary plugin writes share this gate; lifecycle replacements take it
@@ -72,25 +69,25 @@ pub(crate) struct PluginRuntimeHost {
 
 impl PluginRuntimeHost {
     pub(crate) fn new(wasm_runtime: Arc<dyn WasmRuntime>) -> Self {
-        Self::new_with_v2_limits(
+        Self::new_with_limits(
             wasm_runtime,
-            DEFAULT_PLUGIN_V2_MEMORY_BYTES,
+            DEFAULT_PLUGIN_MEMORY_BYTES,
             DEFAULT_MAX_LIVE_PLUGIN_STORES,
         )
         .expect("default plugin resource limits are valid")
     }
 
-    pub(crate) fn new_with_v2_limits(
+    pub(crate) fn new_with_limits(
         wasm_runtime: Arc<dyn WasmRuntime>,
         max_memory_bytes: u64,
         max_live_stores: usize,
     ) -> Result<Self, LixError> {
         Ok(Self {
             wasm_runtime,
-            plugin_v2_factory_cache: Arc::new(Mutex::new(BTreeMap::new())),
-            plugin_v2_wasm_limits: plugin_v2_wasm_limits(max_memory_bytes)?,
+            plugin_factory_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            plugin_wasm_limits: plugin_wasm_limits(max_memory_bytes)?,
             plugin_actor_cache: PluginActorCache::new(max_live_stores)?,
-            plugin_v2_transition_counters: Arc::new(Mutex::new(WasmTransitionCounters::default())),
+            plugin_transition_counters: Arc::new(Mutex::new(WasmTransitionCounters::default())),
             plugin_catalog_cache: Arc::new(Mutex::new(PluginCatalogCache::default())),
             plugin_registry_read_cache: Arc::new(Mutex::new(PluginRegistryReadCache::default())),
             plugin_generation_fence: Arc::new(tokio::sync::RwLock::new(())),
@@ -186,47 +183,42 @@ impl PluginRuntimeHost {
 
     /// Aggregates validated guest work and host-owned lifecycle facts.
     /// Poison recovery is deliberate: diagnostics must not fail a transaction.
-    pub(crate) fn record_v2_transition_counters(&self, counters: WasmTransitionCounters) {
-        self.plugin_v2_transition_counters
+    pub(crate) fn record_transition_counters(&self, counters: WasmTransitionCounters) {
+        self.plugin_transition_counters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .accumulate(counters);
     }
 
-    pub(crate) fn v2_transition_counters(&self) -> WasmTransitionCounters {
+    pub(crate) fn transition_counters(&self) -> WasmTransitionCounters {
         *self
-            .plugin_v2_transition_counters
+            .plugin_transition_counters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(crate) fn reset_v2_transition_counters(&self) {
+    pub(crate) fn reset_transition_counters(&self) {
         *self
-            .plugin_v2_transition_counters
+            .plugin_transition_counters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = WasmTransitionCounters::default();
     }
 
     /// Shares only compiled code. Every file actor created from this factory
     /// receives a distinct Store/instance through `instantiate_actor`.
-    pub(crate) async fn load_or_compile_v2_factory(
+    pub(crate) async fn load_or_compile_factory(
         &self,
         plugin: &InstalledPlugin,
-    ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError> {
-        if let Some(factory) = self.cached_plugin_v2_factory(&plugin.key, plugin.wasm_hash)? {
+    ) -> Result<Arc<dyn WasmComponentFactory>, LixError> {
+        if let Some(factory) = self.cached_plugin_factory(&plugin.key, plugin.wasm_hash)? {
             return Ok(factory);
         }
-        let compiled = if plugin.api_version == WASM_COMPONENT_V3_PROTOTYPE_API_VERSION {
-            self.wasm_runtime
-                .compile_component_v3_prototype(plugin.wasm.clone(), self.plugin_v2_wasm_limits)
-                .await?
-        } else {
-            self.wasm_runtime
-                .compile_component_v2(plugin.wasm.clone(), self.plugin_v2_wasm_limits)
-                .await?
-        };
+        let compiled = self
+            .wasm_runtime
+            .compile_component(plugin.wasm.clone(), self.plugin_wasm_limits)
+            .await?;
         let mut cache = self
-            .plugin_v2_factory_cache
+            .plugin_factory_cache
             .lock()
             .map_err(|_| component_cache_lock_error())?;
         if let Some(cached) = cache.get(&plugin.key)
@@ -236,7 +228,7 @@ impl PluginRuntimeHost {
         }
         cache.insert(
             plugin.key.clone(),
-            CachedPluginV2Factory {
+            CachedPluginFactory {
                 wasm_hash: plugin.wasm_hash,
                 factory: Arc::clone(&compiled),
             },
@@ -244,13 +236,13 @@ impl PluginRuntimeHost {
         Ok(compiled)
     }
 
-    pub(crate) fn cached_plugin_v2_factory(
+    pub(crate) fn cached_plugin_factory(
         &self,
         plugin_key: &str,
         wasm_hash: BlobHash,
-    ) -> Result<Option<Arc<dyn WasmComponentV2Factory>>, LixError> {
+    ) -> Result<Option<Arc<dyn WasmComponentFactory>>, LixError> {
         let cache = self
-            .plugin_v2_factory_cache
+            .plugin_factory_cache
             .lock()
             .map_err(|_| component_cache_lock_error())?;
         Ok(cache
@@ -276,20 +268,20 @@ mod tests {
     fn plugin_memory_policy_is_explicit() {
         assert_eq!(WasmLimits::default().max_memory_bytes, 64 * 1024 * 1024);
         assert_eq!(
-            default_plugin_v2_wasm_limits().max_memory_bytes,
+            default_plugin_wasm_limits().max_memory_bytes,
             128 * 1024 * 1024
         );
         assert_eq!(
-            DEFAULT_PLUGIN_V2_MEMORY_BYTES * DEFAULT_MAX_LIVE_PLUGIN_STORES as u64,
+            DEFAULT_PLUGIN_MEMORY_BYTES * DEFAULT_MAX_LIVE_PLUGIN_STORES as u64,
             2 * 1024 * 1024 * 1024
         );
         assert_eq!(
-            default_plugin_v2_wasm_limits().timeout_ms,
+            default_plugin_wasm_limits().timeout_ms,
             Some(MAX_PLUGIN_EXECUTION_TIMEOUT_MS)
         );
-        assert!(plugin_v2_wasm_limits(0).is_err());
+        assert!(plugin_wasm_limits(0).is_err());
         assert_eq!(
-            plugin_v2_wasm_limits(192 * 1024 * 1024)
+            plugin_wasm_limits(192 * 1024 * 1024)
                 .expect("custom limit should validate")
                 .max_memory_bytes,
             192 * 1024 * 1024
@@ -380,16 +372,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_host_aggregates_and_resets_v2_transition_counters() {
+    fn runtime_host_aggregates_and_resets_transition_counters() {
         let host = PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime));
-        host.record_v2_transition_counters(WasmTransitionCounters {
+        host.record_transition_counters(WasmTransitionCounters {
             packet_pages: 2,
             durable_semantic_changes: 1,
             guest_linear_memory_high_water_bytes: 128,
             host_content_classification_bytes: 10,
             ..WasmTransitionCounters::default()
         });
-        host.record_v2_transition_counters(WasmTransitionCounters {
+        host.record_transition_counters(WasmTransitionCounters {
             packet_pages: 3,
             private_document_cache_hits: 1,
             guest_linear_memory_high_water_bytes: 64,
@@ -397,16 +389,16 @@ mod tests {
             ..WasmTransitionCounters::default()
         });
 
-        let counters = host.v2_transition_counters();
+        let counters = host.transition_counters();
         assert_eq!(counters.packet_pages, 5);
         assert_eq!(counters.durable_semantic_changes, 1);
         assert_eq!(counters.private_document_cache_hits, 1);
         assert_eq!(counters.guest_linear_memory_high_water_bytes, 128);
         assert_eq!(counters.host_content_classification_bytes, 17);
 
-        host.reset_v2_transition_counters();
+        host.reset_transition_counters();
         assert_eq!(
-            host.v2_transition_counters(),
+            host.transition_counters(),
             WasmTransitionCounters::default()
         );
     }

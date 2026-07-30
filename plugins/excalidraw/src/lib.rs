@@ -1,7 +1,6 @@
-//! Fused Excalidraw experiment for Component API v3.
+//! Excalidraw support for the fused Component API v3.
 #![allow(dead_code)]
 
-#[path = "../../excalidraw-v2/src/core.rs"]
 mod core;
 
 use core::{ArenaElementSpan, ChangeEffect, Document, EntityChange, IdNamespace, InputSplice};

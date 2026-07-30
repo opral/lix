@@ -1,12 +1,11 @@
-//! Fused JSON experiment for Component API v3.
+//! JSON support for the fused Component API v3.
 #![allow(dead_code)]
 
-#[path = "../../json-v2/src/core.rs"]
 mod core;
 
 use core::{
-    ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, EntityChange, IdNamespace,
-    InputSplice,
+    ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, EntityChange, EntityRecord,
+    IdNamespace, InputSplice,
 };
 use lix_plugin_api as sdk;
 use serde_json::Value;
@@ -16,6 +15,7 @@ struct JsonPlugin;
 const SCALAR_INDEX_STATE: &[u8] = b"json/scalar-index-v1";
 const SCALAR_SHIFTS_STATE: &[u8] = b"json/scalar-shifts-v1";
 const ID_NAMESPACE_STATE: &[u8] = b"json/id-namespace-v1";
+const FALLBACK_ENTITIES_STATE: &[u8] = b"json/fallback-entities-v1";
 const SCALAR_INDEX_MAGIC: &[u8; 4] = b"JSS1";
 const SCALAR_INDEX_HEADER_BYTES: u32 = 12;
 const SCALAR_INDEX_ENTRY_BYTES: u32 = 20;
@@ -42,16 +42,17 @@ impl sdk::FormatPlugin for JsonPlugin {
         let namespace = read_namespace(&update.before, ID_NAMESPACE_STATE)?
             .or_else(|| namespace_from_changes(&changes))
             .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        let (document, _) = Document::open_file(
+        let document = read_fallback_document(
+            &update.before,
             before.clone(),
             update.before_file.path.as_deref(),
             namespace,
-        )
-        .map_err(sdk::Error::invalid_input)?;
-        let (_, edits) = document
+        )?;
+        let (successor, edits) = document
             .entities_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
+        store_fallback_entities(sink, &successor)?;
         Ok(())
     }
 
@@ -86,7 +87,8 @@ impl sdk::FormatPlugin for JsonPlugin {
                 insert,
             })
             .collect::<Vec<_>>();
-        if update.before_file.path == update.after_file.path
+        if update.before.state_len(FALLBACK_ENTITIES_STATE)?.is_none()
+            && update.before_file.path == update.after_file.path
             && let [edit] = update.edits.as_slice()
             && let Some((change, shifts)) = sparse_scalar_change(update, edit, &inserts[0])?
         {
@@ -95,33 +97,153 @@ impl sdk::FormatPlugin for JsonPlugin {
             return Ok(());
         }
 
-        let (document, _) = Document::open_file(
-            update.before.read_all()?,
+        let before_bytes = update.before.read_all()?;
+        let document = read_fallback_document(
+            &update.before,
+            before_bytes,
             update.before_file.path.as_deref(),
             namespace,
-        )
-        .map_err(sdk::Error::invalid_input)?;
+        )?;
         let (document, changes) = document
             .file_changed(&splices, namespace)
             .map_err(sdk::Error::invalid_input)?;
         let old_page_count = scalar_page_count(update)?;
-        let (index, pages) = encode_scalar_state(
-            &document
-                .arena_scalars()
-                .map_err(sdk::Error::invalid_input)?,
+        update.successor.put_state(
+            FALLBACK_ENTITIES_STATE,
+            &encode_entity_records(
+                &document
+                    .entity_records()
+                    .map_err(sdk::Error::invalid_input)?,
+            )?,
         )?;
-        update.successor.put_state(SCALAR_INDEX_STATE, &index)?;
-        for (ordinal, page) in pages.iter().enumerate() {
-            update
-                .successor
-                .put_state(&scalar_page_key(ordinal as u32), page)?;
-        }
-        for ordinal in pages.len() as u32..old_page_count {
+        update.successor.delete_state(SCALAR_INDEX_STATE)?;
+        for ordinal in 0..old_page_count {
             update.successor.delete_state(&scalar_page_key(ordinal))?;
         }
         update.successor.delete_state(SCALAR_SHIFTS_STATE)?;
         emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
         Ok(())
+    }
+}
+
+fn read_fallback_document(
+    root: &sdk::Root<'_>,
+    accepted: Vec<u8>,
+    path: Option<&str>,
+    namespace: IdNamespace,
+) -> sdk::Result<Document> {
+    let Some(encoded) = root.get_state(FALLBACK_ENTITIES_STATE)? else {
+        return Document::open_file(accepted, path, namespace)
+            .map(|(document, _)| document)
+            .map_err(sdk::Error::invalid_input);
+    };
+    let (document, _) = Document::open_entities(decode_entity_records(&encoded)?)
+        .map_err(sdk::Error::invalid_input)?;
+    let rendered = document.bytes();
+    if rendered == accepted {
+        return Ok(document);
+    }
+    let reconcile = [InputSplice {
+        offset: 0,
+        delete_len: rendered.len() as u64,
+        insert: &accepted,
+    }];
+    document
+        .file_changed(&reconcile, namespace)
+        .map(|(document, _)| document)
+        .map_err(sdk::Error::invalid_input)
+}
+
+fn store_fallback_entities(sink: &mut sdk::Sink<'_>, document: &Document) -> sdk::Result<()> {
+    let records = document
+        .entity_records()
+        .map_err(sdk::Error::invalid_input)?;
+    sink.put_state(FALLBACK_ENTITIES_STATE, &encode_entity_records(&records)?)
+}
+
+fn encode_entity_records(records: &[EntityRecord]) -> sdk::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output.extend_from_slice(
+        &u32::try_from(records.len())
+            .map_err(|_| sdk::Error::limit_exceeded("too many JSON fallback entities"))?
+            .to_le_bytes(),
+    );
+    for record in records {
+        push_text(&mut output, &record.schema_key)?;
+        output.extend_from_slice(
+            &u32::try_from(record.entity_pk.len())
+                .map_err(|_| sdk::Error::limit_exceeded("too many JSON key components"))?
+                .to_le_bytes(),
+        );
+        for component in &record.entity_pk {
+            push_text(&mut output, component)?;
+        }
+        output.extend_from_slice(
+            &u32::try_from(record.snapshot.len())
+                .map_err(|_| sdk::Error::limit_exceeded("JSON snapshot is too large"))?
+                .to_le_bytes(),
+        );
+        output.extend_from_slice(&record.snapshot);
+    }
+    Ok(output)
+}
+
+fn decode_entity_records(bytes: &[u8]) -> sdk::Result<Vec<EntityRecord>> {
+    let mut input = StateReader { bytes, offset: 0 };
+    let count = input.u32()? as usize;
+    let mut records = Vec::with_capacity(count.min(bytes.len() / 16));
+    for _ in 0..count {
+        let schema_key = input.text()?;
+        let component_count = input.u32()? as usize;
+        let mut entity_pk = Vec::with_capacity(component_count.min(4));
+        for _ in 0..component_count {
+            entity_pk.push(input.text()?);
+        }
+        let snapshot_len = input.u32()? as usize;
+        let snapshot = input.bytes(snapshot_len)?.to_vec();
+        records.push(EntityRecord {
+            schema_key,
+            entity_pk,
+            snapshot,
+        });
+    }
+    if input.offset != bytes.len() {
+        return Err(sdk::Error::invalid_input(
+            "JSON fallback state contains trailing bytes",
+        ));
+    }
+    Ok(records)
+}
+
+struct StateReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl StateReader<'_> {
+    fn bytes(&mut self, length: usize) -> sdk::Result<&[u8]> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| sdk::Error::invalid_input("JSON fallback state range overflowed"))?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| sdk::Error::invalid_input("JSON fallback state is truncated"))?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u32(&mut self) -> sdk::Result<u32> {
+        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().map_err(
+            |_| sdk::Error::invalid_input("invalid JSON fallback u32"),
+        )?))
+    }
+
+    fn text(&mut self) -> sdk::Result<String> {
+        let length = self.u32()? as usize;
+        String::from_utf8(self.bytes(length)?.to_vec())
+            .map_err(|_| sdk::Error::invalid_input("JSON fallback text is not UTF-8"))
     }
 }
 

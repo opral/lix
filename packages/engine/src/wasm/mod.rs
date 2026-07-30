@@ -4,21 +4,14 @@ use async_trait::async_trait;
 
 use crate::LixError;
 
-mod component_v2;
+mod component;
 
-pub use component_v2::*;
+pub use component::*;
 
-/// Public path for Component v2 runtime implementations.
+/// Host-owned immutable arena primitives for Component plugins.
 ///
-/// Engine code should import these facade types directly from `crate::wasm`.
-pub mod v2 {
-    pub use super::component_v2::*;
-}
-
-/// Host-owned immutable arena primitives for the Component v3 prototype.
-///
-/// Unlike v2 document handles, these values are independent of a Wasm Store
-/// and remain valid across branch switches, actor eviction, and cold reopen.
+/// These values are independent of a Wasm Store and remain valid across branch
+/// switches, actor eviction, and cold reopen.
 pub mod v3 {
     pub use lix_plugin_arena::{
         Acceptance, Archive, ByteArena, ByteEdit, Digest, Error, FormatLayout, MapArena, Metrics,
@@ -50,32 +43,18 @@ impl Default for WasmLimits {
     }
 }
 
-/// Runtime contract for the incremental Component v2 protocol.
+/// Runtime contract for the fused Component protocol.
 #[async_trait]
 pub trait WasmRuntime: Send + Sync {
     /// Compiles a Component once so immutable machine code can be shared by
     /// many file actors. Each actor must subsequently call
-    /// [`WasmComponentV2Factory::instantiate_actor`] to obtain an isolated
+    /// [`WasmComponentFactory::instantiate_actor`] to obtain an isolated
     /// Store/instance; document handles never cross actor boundaries.
-    async fn compile_component_v2(
+    async fn compile_component(
         &self,
         bytes: Vec<u8>,
         limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError>;
-
-    /// Compiles the deliberately incompatible fused Component v3 prototype.
-    /// The returned adapter implements the existing actor trait so transaction
-    /// validation and storage lowering remain unchanged for Prototype A.
-    async fn compile_component_v3_prototype(
-        &self,
-        _bytes: Vec<u8>,
-        _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError> {
-        Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "configured WASM runtime does not support the Component v3 prototype",
-        ))
-    }
+    ) -> Result<Arc<dyn WasmComponentFactory>, LixError>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -83,14 +62,14 @@ pub struct UnsupportedWasmRuntime;
 
 #[async_trait]
 impl WasmRuntime for UnsupportedWasmRuntime {
-    async fn compile_component_v2(
+    async fn compile_component(
         &self,
         _bytes: Vec<u8>,
         _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError> {
+    ) -> Result<Arc<dyn WasmComponentFactory>, LixError> {
         Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "plugin execution requires a configured WASM component v2 runtime",
+            "plugin execution requires a configured WASM component runtime",
         ))
     }
 }

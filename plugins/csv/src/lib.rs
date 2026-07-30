@@ -1,12 +1,12 @@
-//! Fused initial-import CSV experiment for Component API v3.
+//! CSV support for the fused Component API v3.
 #![allow(dead_code)]
 
-#[path = "../../csv-v2/src/core.rs"]
 mod core;
 
 use core::{
-    ArenaRowIndex, ChangeEffect, ColdInitialImport, Document, EntityChange, IdNamespace,
-    ROW_SCHEMA_KEY, RowConflictResolution, TABLE_SCHEMA_KEY, resolve_row_conflict,
+    ArenaRowIndex, ChangeEffect, ColdInitialImport, Document, EntityChange, EntityRecord,
+    IdNamespace, InputSplice, ROW_SCHEMA_KEY, RowConflictResolution, TABLE_SCHEMA_KEY,
+    resolve_row_conflict,
 };
 use lix_plugin_api as sdk;
 use serde_json::Value;
@@ -15,6 +15,7 @@ struct CsvPlugin;
 
 const CERTIFIED_CSV_PAGE_BYTES: usize = 256 * 1024;
 const CSV_INDEX_KEY: &[u8] = b"csv/index-v1";
+const CSV_FALLBACK_ENTITIES_KEY: &[u8] = b"csv/fallback-entities-v1";
 const ID_NAMESPACE_STATE: &[u8] = b"csv/id-namespace-v1";
 const CSV_INDEX_HEADER_BYTES: u32 = 36;
 
@@ -100,22 +101,21 @@ impl sdk::FormatPlugin for CsvPlugin {
     }
 
     fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
-        if update.before_file.path != update.after_file.path {
-            return Err(sdk::Error::invalid_input(
-                "CSV plugin does not support descriptor changes",
-            ));
+        if update
+            .before
+            .state_len(CSV_FALLBACK_ENTITIES_KEY)?
+            .is_some()
+            || update.before_file.path != update.after_file.path
+            || update.edits.len() != 1
+            || u64::try_from(update.edits[0].insert.len()).expect("usize fits u64")
+                != update.edits[0].delete_len
+        {
+            return fallback_file_changed(update, sink);
         }
         let [edit] = update.edits.as_slice() else {
-            return Err(sdk::Error::invalid_input(
-                "CSV plugin requires one sparse byte edit",
-            ));
+            unreachable!("the sparse path requires exactly one edit")
         };
         let insert = &edit.insert;
-        if u64::try_from(insert.len()).expect("usize fits u64") != edit.delete_len {
-            return Err(sdk::Error::invalid_input(
-                "CSV plugin currently requires a length-preserving edit",
-            ));
-        }
         let (index, range) = if let Some(state_len) = update.before.state_len(CSV_INDEX_KEY)? {
             let header = update
                 .before
@@ -172,6 +172,160 @@ impl sdk::FormatPlugin for CsvPlugin {
         encoder.push(change, update.creates, sink)?;
         encoder.flush(sink)?;
         Ok(())
+    }
+}
+
+fn fallback_file_changed(
+    update: &sdk::FileUpdate<'_>,
+    sink: &mut sdk::Sink<'_>,
+) -> sdk::Result<()> {
+    let before_bytes = update.before.read_all()?;
+    let document = if let Some(encoded) = update.before.get_state(CSV_FALLBACK_ENTITIES_KEY)? {
+        let (document, _) = Document::open_entities(decode_entity_records(&encoded)?)
+            .map_err(sdk::Error::invalid_input)?;
+        let rendered = document.bytes();
+        if rendered == before_bytes {
+            document
+        } else {
+            let reconcile = [InputSplice {
+                offset: 0,
+                delete_len: rendered.len() as u64,
+                insert: &before_bytes,
+            }];
+            let namespace =
+                IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
+            document
+                .file_changed_with_paths(
+                    &reconcile,
+                    update.before_file.path.as_deref(),
+                    update.before_file.path.as_deref(),
+                    namespace,
+                )
+                .map_err(sdk::Error::invalid_input)?
+                .0
+        }
+    } else {
+        let namespace =
+            read_namespace(&update.before)?.unwrap_or_else(|| IdNamespace::from_halves(0, 0));
+        Document::open_file(before_bytes, update.before_file.path.as_deref(), namespace)
+            .map_err(sdk::Error::invalid_input)?
+            .0
+    };
+    let splices = update
+        .edits
+        .iter()
+        .map(|edit| InputSplice {
+            offset: edit.offset,
+            delete_len: edit.delete_len,
+            insert: &edit.insert,
+        })
+        .collect::<Vec<_>>();
+    let namespace = IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
+    let (successor, changes) = document
+        .file_changed_with_paths(
+            &splices,
+            update.before_file.path.as_deref(),
+            update.after_file.path.as_deref(),
+            namespace,
+        )
+        .map_err(sdk::Error::invalid_input)?;
+    let records = successor
+        .entity_records()
+        .map_err(sdk::Error::invalid_input)?;
+    update
+        .successor
+        .put_state(CSV_FALLBACK_ENTITIES_KEY, &encode_entity_records(&records)?)?;
+    update.successor.delete_state(CSV_INDEX_KEY)?;
+    let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
+    for change in changes {
+        encoder.push(change, update.creates, sink)?;
+    }
+    encoder.flush(sink)
+}
+
+fn encode_entity_records(records: &[EntityRecord]) -> sdk::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output.extend_from_slice(
+        &u32::try_from(records.len())
+            .map_err(|_| sdk::Error::limit_exceeded("too many CSV fallback entities"))?
+            .to_le_bytes(),
+    );
+    for record in records {
+        push_text(&mut output, &record.schema_key)?;
+        output.extend_from_slice(
+            &u32::try_from(record.entity_pk.len())
+                .map_err(|_| sdk::Error::limit_exceeded("too many CSV key components"))?
+                .to_le_bytes(),
+        );
+        for component in &record.entity_pk {
+            push_text(&mut output, component)?;
+        }
+        output.extend_from_slice(
+            &u32::try_from(record.snapshot.len())
+                .map_err(|_| sdk::Error::limit_exceeded("CSV snapshot is too large"))?
+                .to_le_bytes(),
+        );
+        output.extend_from_slice(&record.snapshot);
+    }
+    Ok(output)
+}
+
+fn decode_entity_records(bytes: &[u8]) -> sdk::Result<Vec<EntityRecord>> {
+    let mut input = StateReader { bytes, offset: 0 };
+    let count = input.u32()? as usize;
+    let mut records = Vec::with_capacity(count.min(bytes.len() / 16));
+    for _ in 0..count {
+        let schema_key = input.text()?;
+        let component_count = input.u32()? as usize;
+        let mut entity_pk = Vec::with_capacity(component_count.min(4));
+        for _ in 0..component_count {
+            entity_pk.push(input.text()?);
+        }
+        let snapshot_len = input.u32()? as usize;
+        let snapshot = input.bytes(snapshot_len)?.to_vec();
+        records.push(EntityRecord {
+            schema_key,
+            entity_pk,
+            snapshot,
+        });
+    }
+    if input.offset != bytes.len() {
+        return Err(sdk::Error::invalid_input(
+            "CSV fallback state contains trailing bytes",
+        ));
+    }
+    Ok(records)
+}
+
+struct StateReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl StateReader<'_> {
+    fn bytes(&mut self, length: usize) -> sdk::Result<&[u8]> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| sdk::Error::invalid_input("CSV fallback state range overflowed"))?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| sdk::Error::invalid_input("CSV fallback state is truncated"))?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u32(&mut self) -> sdk::Result<u32> {
+        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().map_err(
+            |_| sdk::Error::invalid_input("invalid CSV fallback u32"),
+        )?))
+    }
+
+    fn text(&mut self) -> sdk::Result<String> {
+        let length = self.u32()? as usize;
+        String::from_utf8(self.bytes(length)?.to_vec())
+            .map_err(|_| sdk::Error::invalid_input("CSV fallback text is not UTF-8"))
     }
 }
 

@@ -78,7 +78,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
             .and_then(TransactionJson::canonical_batch_normalized_shared)
             .expect("a canonical v2 certificate belongs to a canonical batch row");
         if certificate.schema_fingerprint() != schema_plan.fingerprint()
-            || !schema_plan.accepts_v2_canonical_certificate()
+            || !schema_plan.accepts_canonical_certificate()
         {
             // A schema amendment can be staged after the plugin transition
             // was drained against its pinned SQL catalog. The old certificate

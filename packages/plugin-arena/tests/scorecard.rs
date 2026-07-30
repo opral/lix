@@ -4,8 +4,7 @@ use std::time::Instant;
 
 #[test]
 fn component_v3_wit_is_valid_and_has_no_guest_document_resource() {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin-api/wit");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin-api/wit");
     let mut resolve = wit_parser::Resolve::default();
     resolve
         .push_dir(&path)
