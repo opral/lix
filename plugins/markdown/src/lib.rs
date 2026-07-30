@@ -974,4 +974,19 @@ mod tests {
             MAX_BLOCK_SHIFT_RECORDS * 12
         );
     }
+
+    #[test]
+    fn persisted_arena_ranges_exclude_parser_only_eof_sentinels() {
+        let bytes = b"# Heading\n\nFirst paragraph.\n\nSecond paragraph.\n".to_vec();
+        let namespace = IdNamespace::from_halves(7, 11);
+        let (document, _) =
+            Document::open_file(bytes.clone(), Some("doc.md"), namespace).expect("parse Markdown");
+        let (_, blocks) = document.arena_state().expect("arena state");
+        assert!(
+            blocks
+                .iter()
+                .all(|block| block.start <= block.end && block.end <= bytes.len() as u64),
+            "persisted arena ranges must exclude parser-only EOF sentinels",
+        );
+    }
 }

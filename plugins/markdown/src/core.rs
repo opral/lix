@@ -2115,7 +2115,7 @@ impl Document {
         }
         let mut children = Vec::with_capacity(blocks.len());
         let mut ranges = Vec::with_capacity(blocks.len());
-        for block in blocks {
+        for (ordinal, block) in blocks.into_iter().enumerate() {
             let child = serde_json::from_slice(&block.tree_json).map_err(|error| {
                 PluginError::InvalidInput(format!("invalid Markdown arena block: {error}"))
             })?;
@@ -2126,9 +2126,10 @@ impl Document {
                 PluginError::InvalidInput("Markdown arena block end exceeds usize".to_owned())
             })?;
             if start > end || end > bytes.len() {
-                return Err(PluginError::InvalidInput(
-                    "Markdown arena block range is outside accepted bytes".to_owned(),
-                ));
+                return Err(PluginError::InvalidInput(format!(
+                    "Markdown arena block {ordinal} range {start}..{end} is outside accepted length {}",
+                    bytes.len()
+                )));
             }
             children.push(child);
             ranges.push(start..end);
@@ -2158,14 +2159,15 @@ impl Document {
             PluginError::Internal(format!("serialize Markdown arena root: {error}"))
         })?);
         let mut blocks = Vec::with_capacity(self.top_level_ranges.len());
+        let bytes_len = self.bytes.len;
         for (index, range) in self.top_level_ranges.iter().enumerate() {
             let tree = self.tree.top_level_tree(index).ok_or_else(|| {
                 PluginError::Internal("Markdown arena range has no matching block".to_owned())
             })?;
             blocks.push(ArenaMarkdownBlock {
-                start: u64::try_from(range.start)
+                start: u64::try_from(range.start.min(bytes_len))
                     .map_err(|_| PluginError::Internal("Markdown range exceeds u64".to_owned()))?,
-                end: u64::try_from(range.end)
+                end: u64::try_from(range.end.min(bytes_len))
                     .map_err(|_| PluginError::Internal("Markdown range exceeds u64".to_owned()))?,
                 tree_json: serde_json::to_vec(tree).map_err(|error| {
                     PluginError::Internal(format!("serialize Markdown arena block: {error}"))
