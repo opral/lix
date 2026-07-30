@@ -20,11 +20,11 @@
     },
     "runtime": {
       "type": "string",
-      "const": "wasm-component-v2"
+      "const": "wasm-component"
     },
     "api_version": {
       "type": "string",
-      "enum": ["2.1.0", "3.0.0"]
+      "const": "3.0.0"
     },
     "materialization": {
       "type": "string",

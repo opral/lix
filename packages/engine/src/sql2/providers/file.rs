@@ -4955,7 +4955,7 @@ async fn render_plugin_files_for_sql(
                         plugin.key(),
                     )));
                 }
-                let bytes = render_derived_v2_file_for_sql(
+                let bytes = render_derived_file_for_sql(
                     plugin_render,
                     blob_reader,
                     live_rows,
@@ -4967,15 +4967,8 @@ async fn render_plugin_files_for_sql(
                 )
                 .await?;
                 if plugin_render.session_file_views.is_some() {
-                    acknowledge_derived_v2_file(
-                        plugin_render,
-                        live_rows,
-                        key,
-                        path,
-                        plugin,
-                        derived,
-                    )
-                    .await?;
+                    acknowledge_derived_file(plugin_render, live_rows, key, path, plugin, derived)
+                        .await?;
                 }
                 rendered.insert(key.clone(), bytes);
             }
@@ -4994,7 +4987,7 @@ async fn render_plugin_files_for_sql(
         }
     }
     for file_key in materialized_file_keys {
-        acknowledge_materialized_v2_file(
+        acknowledge_materialized_file(
             plugin_render,
             blob_reader,
             live_rows,
@@ -5010,7 +5003,7 @@ async fn render_plugin_files_for_sql(
     Ok(rendered)
 }
 
-async fn render_derived_v2_file_for_sql(
+async fn render_derived_file_for_sql(
     plugin_render: &PluginRenderContext,
     blob_reader: &Arc<dyn BlobDataReader>,
     live_rows: &LiveStateBatchOwners,
@@ -5065,7 +5058,7 @@ async fn render_derived_v2_file_for_sql(
     let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
     let factory = match plugin_render
         .host
-        .cached_plugin_v2_factory(plugin.key(), wasm_hash)?
+        .cached_plugin_factory(plugin.key(), wasm_hash)?
     {
         Some(factory) => factory,
         None => {
@@ -5088,7 +5081,7 @@ async fn render_derived_v2_file_for_sql(
             let installed = plugin.to_installed_plugin(wasm)?;
             plugin_render
                 .host
-                .load_or_compile_v2_factory(&installed)
+                .load_or_compile_factory(&installed)
                 .await?
         }
     };
@@ -5154,13 +5147,13 @@ async fn render_derived_v2_file_for_sql(
     let counters = validated.counters;
     let drop_result = store.actor_mut().drop_document(document).await;
     let retire_result = store.actor_mut().retire().await;
-    plugin_render.host.record_v2_transition_counters(counters);
+    plugin_render.host.record_transition_counters(counters);
     drop_result?;
     retire_result?;
     Ok(bytes.to_vec())
 }
 
-async fn acknowledge_derived_v2_file(
+async fn acknowledge_derived_file(
     plugin_render: &PluginRenderContext,
     live_rows: &LiveStateBatchOwners,
     file_key: &FilesystemDescriptorKey,
@@ -5194,7 +5187,7 @@ async fn acknowledge_derived_v2_file(
     Ok(())
 }
 
-async fn acknowledge_materialized_v2_file(
+async fn acknowledge_materialized_file(
     plugin_render: &PluginRenderContext,
     _blob_reader: &Arc<dyn BlobDataReader>,
     live_rows: &LiveStateBatchOwners,
@@ -9000,12 +8993,12 @@ mod tests {
         wasm: &[u8],
     ) -> PluginRegistryEntry {
         let mut manifest = serde_json::json!({
-            "api_version": "2.1.0",
+            "api_version":"3.0.0",
             "entry": "plugin.wasm",
             "key": key,
             "match": { "path_glob": path_glob },
             "materialization": "blob",
-            "runtime": "wasm-component-v2",
+            "runtime": "wasm-component",
             "schemas": ["schema/plugin.json"],
         });
         if let Some(content_type) = content_type {
@@ -9015,8 +9008,8 @@ mod tests {
         let manifest_json = manifest.to_string();
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
-            runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.1.0".to_string(),
+            runtime: PluginRuntime::WasmComponent,
+            api_version: "3.0.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type,
             entry: "plugin.wasm".to_string(),
@@ -9029,40 +9022,6 @@ mod tests {
             wasm_blob_hash: BlobHash::from_content(wasm).to_hex(),
         })
         .expect("test plugin registry entry should be valid")
-    }
-
-    fn test_v2_plugin_registry_entry(
-        key: &str,
-        path_glob: &str,
-        schema_key: &str,
-        wasm: &[u8],
-    ) -> PluginRegistryEntry {
-        let manifest_json = serde_json::json!({
-            "api_version": "2.1.0",
-            "entry": "plugin.wasm",
-            "key": key,
-            "match": { "path_glob": path_glob },
-            "materialization": "blob",
-            "runtime": "wasm-component-v2",
-            "schemas": ["schema/plugin.json"],
-        })
-        .to_string();
-        PluginRegistryEntry::new(PluginRegistryEntryInput {
-            key: key.to_string(),
-            runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.1.0".to_string(),
-            path_glob: path_glob.to_string(),
-            content_type: None,
-            entry: "plugin.wasm".to_string(),
-            schema_keys: vec![schema_key.to_string()],
-            create_schema_keys: Vec::new(),
-            manifest_json,
-            archive_file_id: plugin_storage_archive_file_id(key),
-            archive_path: plugin_storage_archive_path(key),
-            archive_blob_hash: BlobHash::from_content(format!("archive-{key}").as_bytes()).to_hex(),
-            wasm_blob_hash: BlobHash::from_content(wasm).to_hex(),
-        })
-        .expect("test v2 plugin registry entry should be valid")
     }
 
     fn live_plugin_registry_row(
@@ -9109,8 +9068,8 @@ mod tests {
         let manifest_json = format!(
             r#"{{
                 "key": "plugin_sentinel",
-                "runtime": "wasm-component-v2",
-                "api_version": "2.1.0",
+                "runtime": "wasm-component",
+                "api_version":"3.0.0",
                 "materialization": "blob",
                 "match": {{ "path_glob": "{path_glob}" }},
                 "entry": "plugin.wasm",
@@ -10141,8 +10100,8 @@ mod tests {
                 rows: vec![
                     live_plugin_registry_row(
                         "01920000-0000-7000-8000-0000000000b1",
-                        vec![test_v2_plugin_registry_entry(
-                            "plugin_csv_v2",
+                        vec![test_plugin_registry_entry(
+                            "plugin_csv",
                             "*.csv",
                             "csv_row",
                             wasm,
@@ -10151,7 +10110,7 @@ mod tests {
                     live_plugin_owner_row(
                         "01920000-0000-7000-8000-0000000000b1",
                         "01920000-0000-7000-8000-0000000000d2",
-                        "plugin_csv_v2",
+                        "plugin_csv",
                         vec!["csv_row".to_string()],
                     ),
                 ],

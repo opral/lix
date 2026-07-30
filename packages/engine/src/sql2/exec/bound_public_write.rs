@@ -2379,7 +2379,7 @@ fn certified_entity_insert_batch(
     let Some((_, schema_plan)) = schema_catalog.plan_for_key(&layout.schema_key) else {
         return Ok(None);
     };
-    if !schema_plan.accepts_v2_canonical_certificate() || !spec.defaults.is_empty() {
+    if !schema_plan.accepts_canonical_certificate() || !spec.defaults.is_empty() {
         return Ok(None);
     }
     if spec.columns.iter().any(|column| {
@@ -2605,7 +2605,7 @@ fn certified_entity_insert_batch(
             derived_entity_pk.clone().into_parts(),
         );
         let certified = schema_plan
-            .certify_or_normalize_v2_plugin_row(&normalized[start..], &key)?
+            .certify_or_normalize_plugin_row(&normalized[start..], &key)?
             .ok_or_else(|| {
                 LixError::unknown("eligible certified INSERT row declined its schema certificate")
             })?;

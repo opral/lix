@@ -7876,7 +7876,7 @@ mod tests {
                     "key": PLUGIN_OWNER_KEY,
                     "value": {
                         "version": 1,
-                        "plugin_key": "plugin_json_incremental_v2",
+                        "plugin_key": "plugin_json",
                         "schema_keys": ["json_root"],
                     },
                 })

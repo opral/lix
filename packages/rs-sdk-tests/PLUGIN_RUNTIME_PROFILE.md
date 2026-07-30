@@ -325,35 +325,99 @@ was shorter lived than the validation sequence and repeatedly hydrated the
 full segment. It remains removed.
 
 A generated 1.849 MB Excalidraw document with 20,000 elements changes one
-element:
+element. The current sparse arena implementation stores source-span metadata
+once, binary-searches that index through bounded state reads, reads only the
+selected element, and emits one semantic overlay:
 
 | lane | p50 | host allocation | peak host allocation | exports / imports | guest high water |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Excalidraw v2 cursor | 229.7 ms | 5.0 MB | 3.0 MB | 3 / 0 | 42.1 MB |
-| Excalidraw v3 push | 217.5 ms | 38.8 MB | 7.7 MB | 1 / 1 | 41.8 MB |
+| Excalidraw v2 cursor | 233.4 ms | 4.187 MB | 2.957 MB | 3 / 0 | 42.140 MB |
+| Excalidraw v3 push | 3.482 ms | 4.209 MB | 2.959 MB | 1 / 23 | 25.166 MB |
 
-Heaptrack shows repeated certified-segment consumption on the semantic read
-path. Stable-primary-key packets now retain their already-certified canonical
-snapshot bytes directly instead of parsing and serializing them again. That
-improves later queries, but it does not change the transition allocation:
-the large v3 import actor is evicted, so its successor reconstructs the prior
-20,000-element document. This is a concrete cross-format acceptance case for
-`apply-cold-successor`, not for more cursor tuning.
+The seven-sample v3 result is **67.0x faster** while cumulative and peak host
+allocation stay within one percent of v2. The 23 imports are small range reads
+for the persistent span index and selected element; total boundary payload is
+about 1 KiB. The benchmark now fails unless v3 remains at least ten percent
+faster than v2 and both cumulative and peak host allocation remain within five
+percent. The earlier 217.5 ms result predated direct cold arena hydration and
+the sparse span index: it rebuilt the predecessor and is no longer
+representative of the current runtime.
 
-Current five-sample verification after the sparse-overlay and localized
-Markdown policies:
+The final Markdown cut also stopped storing the complete accepted source as a
+base64 semantic-root fallback. Exact bytes already live in the file arena, so
+the sparse successor now reads only the edited top-level block and emits one
+semantic overlay. Seven paired samples measured 33.302 ms for v2 and 5.702 ms
+for v3 (5.84x), with peak host allocation falling from 11.247 MB to 3.756 MB
+and Component boundary traffic falling from 1.651 MB to roughly 3 KiB.
+
+Bulk JSON had the same smaller-scale duplicate-materialization pattern. Its
+packet encoder allocated and copied one temporary vector per entity, while
+the sparse arena index generated a complete scalar snapshot, parsed that JSON
+back into a value tree to remove `scalar_json`, and serialized it again.
+Encoding directly into the bounded sink page and serializing arena metadata
+directly reduced the five-sample v3 p50 from 459.9 ms to 380.5 ms (17.3%).
+The next profile showed that every node still constructed a temporary
+`serde_json::Map` and `Value` tree solely to produce its canonical semantic
+snapshot. Writing those already-known fields directly in canonical key order
+reduced v3 again from 380.5 ms to 320.7 ms (15.7%). The paired v2 p50 was
+590.8 ms, so v3 is 1.84x faster with 115.0 MB cumulative and 63.2 MB peak host
+allocation versus v2's 336.3 MB and 85.7 MB. The direct encoder preserves
+serde_json string escaping and the existing snapshot bytes; all 23 JSON
+correctness tests and the benchmark's exact-byte, semantic, history, and
+RocksDB-reopen checks pass.
+
+The scalar checkpoint then proved to be another redundant representation: its
+metadata embedded a JSON snapshot repeating the relation, identity, order, and
+layout fields already present in the same record. Replacing that snapshot with
+a compact tagged binary record reduced v3 from 320.7 ms to 264.6 ms (17.5%),
+peak host allocation from 63.2 MB to 55.2 MB, guest high water from 44.2 MB to
+35.3 MB, and boundary traffic from 33.85 MB to 29.90 MB. The paired v2 median
+was 641.3 ms, making v3 2.42x faster. Removing the checkpoint entirely measured
+258.6 ms, so only about 2.3% remains in that subsystem. A borrowed
+snapshot-direct-to-packet experiment regressed the median to 281.3 ms with
+flat memory and was removed rather than expanding the API.
+
+The same 10 MiB JSON fixture changes one scalar in 6.779 ms warm versus
+8.222 ms for v2 (1.21x). A process-cold reopen plus successor is 216.1 ms
+versus 533.6 ms (2.47x), hydrates zero semantic rows, and invokes zero
+predecessor renders.
+
+Current release verification after the sparse-overlay, direct cold-arena, and
+non-duplicated-source policies:
 
 | workload | v3 p50 | v3 p95 | peak host allocation | guest high water |
 | --- | ---: | ---: | ---: | ---: |
-| CSV, 10.68 MiB / 220,001 entities | 127.7 ms | 164.2 ms | 36.1 MB | 41.2 MB |
-| JSON, 10 MiB / 39,871 entities | 237.8 ms | 250.7 ms | 45.5 MB | 29.8 MB |
-| Markdown, 1.24 MiB / 3,808 entities | 42.8 ms | 60.8 ms | 21.0 MB | 56.8 MB |
-| Excalidraw, 1.85 MiB / 20,000 entities | 217.5 ms | 226.1 ms | 7.7 MB | 41.8 MB |
+| CSV, 10.68 MiB / 220,001 entities | 137.8 ms | 418.2 ms | 34.8 MB | 41.2 MB |
+| JSON, 10 MiB / 39,871 entities | 264.6 ms | 281.4 ms | 55.2 MB | 35.3 MB |
+| Markdown, 1.24 MiB / 3,808 entities | 5.702 ms | 5.789 ms | 3.756 MB | 53.477 MB |
+| Excalidraw, 1.85 MiB / 20,000 entities | 3.482 ms | 3.659 ms | 2.959 MB | 25.166 MB |
 
 All four lanes remain Wasm components. They use one guest export and bounded
 push pages, preserve exact file bytes and semantic cardinality, and retain the
 format-specific history and RocksDB reopen checks. CSV creates no per-row
 history segments or locator records before hot publication.
+
+The subsequent hard API cut added the borrowed atomic transition,
+host-imported conflict-resolution sink, lazy conflict/entity sources, and the
+fused semantic renderer. Paired release verification on the `origin/main`
+tracked-head/protocol changes merged in #976 shows that this control-flow cut
+retains the optimized paths:
+
+| workload | v2 p50 | hard-cut v3 p50 | speedup | v3 peak host allocation |
+| --- | ---: | ---: | ---: | ---: |
+| JSON, 10 MiB / 39,871 entities | 618.340 ms | 287.018 ms | 2.15x | 55.294 MB |
+| Markdown, exact VS Code API transition | 34.090 ms | 6.236 ms | 5.47x | 3.756 MB |
+| Excalidraw, 20,000 elements | 243.150 ms | 3.507 ms | 69.33x | 2.959 MB |
+
+JSON v3 allocated 107.3 MB cumulatively versus 352.4 MB for v2 and performed
+79,061 allocations versus 485,051. Markdown v3 allocated 21.2 MB versus
+29.5 MB and reduced peak live host allocation by 66.6%. Excalidraw reduced
+guest linear-memory high water from 42.140 MB to 25.166 MB. Every v3 lane used
+one top-level guest export and preserved exact output bytes and semantic rows.
+
+The hard-cut CSV lane remains in the same performance band at 146.824 ms p50
+with 35.024 MB peak live host allocation; its prior matched post-#976 result
+was 141.625 ms. This 3.7% movement is below the ten-percent reprofile gate.
 
 ## Reproduction
 

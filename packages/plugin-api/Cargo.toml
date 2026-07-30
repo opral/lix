@@ -1,13 +1,13 @@
 [package]
-name = "lix_plugin_api_v2"
+name = "lix_plugin_api"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-description = "Author-facing Rust API for Lix Wasm Component v2 plugins"
+description = "Author-facing Rust API for fused Lix Wasm Component plugins"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-documentation = "https://docs.rs/lix_plugin_api_v2"
+documentation.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
@@ -17,6 +17,5 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-serde_json = "1"
 uuid = { version = "1", features = ["std"] }
 wit-bindgen = "0.57"

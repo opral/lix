@@ -1,0 +1,14 @@
+{
+  "key": "plugin_markdown",
+  "runtime": "wasm-component",
+  "api_version": "3.0.0",
+  "materialization": "blob",
+  "match": {
+    "path_glob": "*.{md,markdown}",
+    "content_type": "text"
+  },
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/markdown_node_v2.json"
+  ]
+}

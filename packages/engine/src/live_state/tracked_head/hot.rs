@@ -822,10 +822,33 @@ fn certified_external_page_plan(
         return Ok(None);
     }
     let schema_count = input.u16()? as usize;
+    let mut schema_keys = Vec::with_capacity(schema_count);
     for _ in 0..schema_count {
-        let _schema = input.text()?;
+        schema_keys.push(input.text()?);
     }
-    let _file_id = input.text()?;
+    let file_id = input.text()?;
+    if !request.filter.schema_keys.is_empty()
+        && !request
+            .filter
+            .schema_keys
+            .iter()
+            .any(|candidate| schema_keys.contains(&candidate.as_str()))
+    {
+        return Ok(Some(Vec::new()));
+    }
+    if !request.filter.file_ids.is_empty()
+        && !request
+            .filter
+            .file_ids
+            .iter()
+            .any(|candidate| match candidate {
+                NullableKeyFilter::Any => true,
+                NullableKeyFilter::Null => false,
+                NullableKeyFilter::Value(candidate) => candidate == file_id,
+            })
+    {
+        return Ok(Some(Vec::new()));
+    }
     let _commit_id = input.bytes(16)?;
     let _timestamp = input.text()?;
     let format = input.u16()?;
@@ -1157,6 +1180,33 @@ fn decode_certified_entity_batch_rows(
         high: input.u64()?,
         low: input.u32()?,
     };
+    // Exact reads from a certified CSV segment should not allocate an
+    // `EntityPk` for every row merely to reject all but one of them. Created
+    // CSV identities encode their parse-local reference in the final four
+    // UUID bytes, so compare that compact value while walking the pages and
+    // materialize an identity only for a selected row.
+    let selected_csv_local_refs =
+        (format == 1 && !request.filter.entity_pks.is_empty()).then(|| {
+            let high = creates.high.to_be_bytes();
+            let low = creates.low.to_be_bytes();
+            request
+                .filter
+                .entity_pks
+                .iter()
+                .filter_map(|entity_pk| match entity_pk.components.as_slice() {
+                    [crate::entity_pk::EntityPkComponent::Uuid(bytes)]
+                        if bytes[..8] == high && bytes[8..12] == low =>
+                    {
+                        Some(u32::from_be_bytes(
+                            bytes[12..]
+                                .try_into()
+                                .expect("UUID local-reference suffix is four bytes"),
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>()
+        });
     let page_count = input.u32()?;
     if !request.filter.schema_keys.is_empty()
         && !request
@@ -1247,17 +1297,11 @@ fn decode_certified_entity_batch_rows(
             let quote_layout_len = rows.u32()? as usize;
             let quote_layout = rows.bytes(quote_layout_len)?;
             let field_count = rows.u16()?;
-            let id = creates
-                .component_uuid_bytes(u64::from(local_ref))
-                .map_err(|error| head_value_error(error.to_string()))?;
-            let entity_pk = EntityPk::uuid_from_bytes(id);
-            let selected = request.filter.entity_pks.is_empty()
-                || request
-                    .filter
-                    .entity_pks
-                    .iter()
-                    .any(|candidate| candidate == &entity_pk);
-            let mut cells = needs_snapshot.then(|| Vec::with_capacity(field_count as usize));
+            let selected = selected_csv_local_refs
+                .as_ref()
+                .is_none_or(|selected| selected.contains(&local_ref));
+            let mut cells =
+                (selected && needs_snapshot).then(|| Vec::with_capacity(field_count as usize));
             for _ in 0..field_count {
                 let cell_len = rows.u32()? as usize;
                 let cell = std::str::from_utf8(rows.bytes(cell_len)?).map_err(|error| {
@@ -1271,6 +1315,10 @@ fn decode_certified_entity_batch_rows(
             if !selected {
                 continue;
             }
+            let id = creates
+                .component_uuid_bytes(u64::from(local_ref))
+                .map_err(|error| head_value_error(error.to_string()))?;
+            let entity_pk = EntityPk::uuid_from_bytes(id);
             let snapshot = cells
                 .map(|cells| {
                     let mut object = serde_json::Map::new();
@@ -2296,30 +2344,43 @@ where
                 )
             })
             .collect::<BTreeSet<_>>();
-        let certified_rows = scan_certified_entity_batch_rows(
-            &self.store,
-            branch_id,
-            generation,
-            request,
-            if overlay_identities.is_empty() {
-                request.limit.map(|limit| limit.saturating_sub(rows.len()))
-            } else {
-                None
-            },
-        )
-        .await?
-        .filter(
-            |row| {
-                !overlay_identities
-                    .iter()
-                    .any(|(schema_key, entity_pk, file_id)| {
-                        schema_key == row.schema_key()
-                            && entity_pk == row.entity_pk()
-                            && file_id.as_deref() == row.file_id()
-                    })
-            },
-            None,
-        );
+        // Format plugins cannot publish engine-owned schemas. Do not even
+        // inspect certified semantic manifests for a scan that can only match
+        // engine rows such as file descriptors or blob materializations.
+        let certified_rows = if !request.filter.schema_keys.is_empty()
+            && request
+                .filter
+                .schema_keys
+                .iter()
+                .all(|schema_key| schema_key.starts_with("lix_"))
+        {
+            MaterializedLiveStateBatch::default()
+        } else {
+            scan_certified_entity_batch_rows(
+                &self.store,
+                branch_id,
+                generation,
+                request,
+                if overlay_identities.is_empty() {
+                    request.limit.map(|limit| limit.saturating_sub(rows.len()))
+                } else {
+                    None
+                },
+            )
+            .await?
+            .filter(
+                |row| {
+                    !overlay_identities
+                        .iter()
+                        .any(|(schema_key, entity_pk, file_id)| {
+                            schema_key == row.schema_key()
+                                && entity_pk == row.entity_pk()
+                                && file_id.as_deref() == row.file_id()
+                        })
+                },
+                None,
+            )
+        };
         let rows = if certified_rows.is_empty() {
             rows
         } else if rows.is_empty() {

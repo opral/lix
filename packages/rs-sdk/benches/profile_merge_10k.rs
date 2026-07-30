@@ -58,7 +58,7 @@ fn main() {
             ))
             .await
             .unwrap();
-            install_plugin(&lix, "plugin_csv_v2", &plugin).await;
+            install_plugin(&lix, "plugin_csv", &plugin).await;
             let initial_csv = csv_bytes_from_rows(&initial_rows);
             let start = Instant::now();
             write_file(&lix, CSV_PATH, initial_csv).await;
@@ -197,7 +197,7 @@ fn build_csv_v2_plugin() -> Vec<u8> {
     // option_env: the bindep artifact env var is absent in some CI target
     // contexts; this harness is only ever run manually, so resolve at
     // runtime and fail with instructions instead of failing the compile.
-    let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2") else {
+    let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv") else {
         eprintln!(
             "CSV v2 plugin wasm path unavailable; build via `cargo build --bench \
              profile_merge_10k --features sqlite` so cargo provides the bindep artifact"
@@ -211,15 +211,15 @@ fn build_csv_v2_plugin() -> Vec<u8> {
     for (path, bytes) in [
         (
             "manifest.json",
-            include_str!("../../../plugins/csv-v2/manifest.json").as_bytes(),
+            include_str!("../../../plugins/csv/manifest.json").as_bytes(),
         ),
         (
             "schema/csv_v2_table.json",
-            include_str!("../../../plugins/csv-v2/schema/csv_v2_table.json").as_bytes(),
+            include_str!("../../../plugins/csv/schema/csv_v2_table.json").as_bytes(),
         ),
         (
             "schema/csv_v2_row.json",
-            include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json").as_bytes(),
+            include_str!("../../../plugins/csv/schema/csv_v2_row.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {

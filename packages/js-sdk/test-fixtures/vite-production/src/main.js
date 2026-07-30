@@ -7,9 +7,9 @@ async function run() {
 	try {
 		const query = await lix.execute("SELECT $1 AS message", ["production"]);
 		const archives = await bundledPluginArchives();
-		const csvPlugin = archives.find((plugin) => plugin.key === "plugin_csv_v2");
+		const csvPlugin = archives.find((plugin) => plugin.key === "plugin_csv");
 		const markdownPlugin = archives.find(
-			(plugin) => plugin.key === "plugin_markdown_incremental_v2",
+			(plugin) => plugin.key === "plugin_markdown",
 		);
 		if (!csvPlugin) throw new Error("Bundled CSV plugin is missing");
 		if (!markdownPlugin) throw new Error("Bundled Markdown plugin is missing");

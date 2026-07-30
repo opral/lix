@@ -1076,7 +1076,7 @@ async fn render_derived_file_history_bytes(
         ))
     })?;
     let limits = WasmTransitionLimits::default();
-    let entities = historical_v2_host_entities(
+    let entities = historical_host_entities(
         state
             .plugin_states_by_file
             .get(&descriptor.id)
@@ -1096,7 +1096,7 @@ async fn render_derived_file_history_bytes(
     )?;
     let source = VecEntitySource::new(entities, limits)?;
     let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
-    let factory = match plugin_host.cached_plugin_v2_factory(plugin.key(), wasm_hash)? {
+    let factory = match plugin_host.cached_plugin_factory(plugin.key(), wasm_hash)? {
         Some(factory) => factory,
         None => {
             let wasm = blob_reader
@@ -1114,7 +1114,7 @@ async fn render_derived_file_history_bytes(
                     ))
                 })?;
             let installed = plugin.to_installed_plugin(wasm)?;
-            plugin_host.load_or_compile_v2_factory(&installed).await?
+            plugin_host.load_or_compile_factory(&installed).await?
         }
     };
     let store_permit = plugin_host.actor_cache().admit_store()?;
@@ -1175,13 +1175,13 @@ async fn render_derived_file_history_bytes(
     let counters = validated.counters;
     let drop_result = store.actor_mut().drop_document(validated.document).await;
     let retire_result = store.actor_mut().retire().await;
-    plugin_host.record_v2_transition_counters(counters);
+    plugin_host.record_transition_counters(counters);
     drop_result?;
     retire_result?;
     Ok(bytes)
 }
 
-fn historical_v2_host_entities<'a>(
+fn historical_host_entities<'a>(
     rows: impl Iterator<Item = &'a FileHistoryObservedPluginStateRecord>,
     state: &FileHistoryObservedState,
     limits: WasmTransitionLimits,
@@ -2990,19 +2990,19 @@ mod tests {
     fn plugin_registry(plugin_key: &str, schema_keys: &[&str]) -> PluginRegistry {
         let wasm = b"test wasm";
         let manifest_json = serde_json::json!({
-            "api_version": "2.1.0",
+            "api_version":"3.0.0",
             "entry": "plugin.wasm",
             "key": plugin_key,
             "match": { "path_glob": "*.plugin-test" },
             "materialization": "blob",
-            "runtime": "wasm-component-v2",
+            "runtime": "wasm-component",
             "schemas": ["schema/plugin.json"],
         })
         .to_string();
         let entry = PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: plugin_key.to_string(),
-            runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.1.0".to_string(),
+            runtime: PluginRuntime::WasmComponent,
+            api_version: "3.0.0".to_string(),
             path_glob: "*.plugin-test".to_string(),
             content_type: None,
             entry: "plugin.wasm".to_string(),

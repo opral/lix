@@ -4,6 +4,10 @@ date: "2026-07-23"
 
 # Incremental Wasm file plugins
 
+> Historical design note: the v2 contract described below has been superseded
+> by the hard-cut v3 contract in `docs/plugin-api-v3.md`. No v2 runtime or
+> compatibility adapter remains in the workspace.
+
 ## Summary
 
 Lix file plugins remain sandboxed WebAssembly Components, but API v2 replaces

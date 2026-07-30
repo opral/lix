@@ -1,0 +1,222 @@
+package lix:plugin@3.0.0;
+
+interface host {
+  type bytes = list<u8>;
+
+  variant host-error {
+    invalid-range,
+    limit-exceeded(string),
+    rejected(string),
+  }
+
+  enum map-space {
+    entity,
+    state,
+  }
+
+  record record-chunk {
+    total-len: u64,
+    bytes: bytes,
+  }
+
+  /// One immutable host-owned file/entity/checkpoint version.
+  resource snapshot {
+    file-len: func() -> u64;
+    read-file: func(offset: u64, length: u32) -> result<bytes, host-error>;
+    read-record: func(
+      space: map-space,
+      key: bytes,
+      offset: u64,
+      max-bytes: u32,
+    ) -> result<option<record-chunk>, host-error>;
+  }
+
+  record change-page {
+    record-count: u32,
+    payload: bytes,
+  }
+
+  record packed-page {
+    codec: string,
+    format-version: u16,
+    record-count: u32,
+    payload: bytes,
+  }
+
+  enum change-effect {
+    content,
+    format-only,
+  }
+
+  record entity-change-meta {
+    ordinal: u32,
+    schema-key: string,
+    entity-pk: list<string>,
+    snapshot-len: option<u64>,
+    effect: change-effect,
+  }
+
+  resource entity-change-source {
+    len: func() -> u32;
+    get: func(index: u32) -> result<entity-change-meta, host-error>;
+    read-snapshot: func(
+      index: u32,
+      offset: u64,
+      length: u32,
+    ) -> result<option<bytes>, host-error>;
+  }
+
+  /// The sole host-owned atomic output capability. Checkpoints and semantic
+  /// pages remain staged until the enclosing guest export succeeds.
+  resource transition {
+    max-batch-bytes: func() -> u32;
+    put-state: func(key: bytes, value: bytes) -> result<_, host-error>;
+    delete-state: func(key: bytes) -> result<_, host-error>;
+    emit-changes: func(page: change-page) -> result<_, host-error>;
+    emit-packed: func(page: packed-page) -> result<_, host-error>;
+    begin-file-replacement: func(total-length: u64) -> result<_, host-error>;
+    write-file-replacement: func(chunk: bytes) -> result<_, host-error>;
+    finish-file-replacement: func() -> result<_, host-error>;
+  }
+
+  enum conflict-side {
+    base,
+    a,
+    b,
+  }
+
+  record conflict-meta {
+    ordinal: u32,
+    schema-key: string,
+    entity-pk: list<string>,
+    base-len: option<u64>,
+    a-len: option<u64>,
+    b-len: option<u64>,
+  }
+
+  /// A bounded lazy view of canonically ordered semantic conflicts.
+  resource conflict-source {
+    len: func() -> u32;
+    get: func(index: u32) -> result<conflict-meta, host-error>;
+    read-value: func(
+      index: u32,
+      side: conflict-side,
+      offset: u64,
+      length: u32,
+    ) -> result<option<bytes>, host-error>;
+  }
+
+  enum resolution-effect {
+    content,
+    format-only,
+  }
+
+  /// Ordered, host-staged conflict results. Replacement snapshots stream in
+  /// bounded chunks; a trap or validation failure publishes nothing.
+  resource resolution-sink {
+    max-batch-bytes: func() -> u32;
+    take: func(ordinal: u32, side: conflict-side) -> result<_, host-error>;
+    delete: func(ordinal: u32) -> result<_, host-error>;
+    begin-replace: func(
+      ordinal: u32,
+      effect: resolution-effect,
+      total-length: u64,
+    ) -> result<_, host-error>;
+    write-replacement: func(chunk: bytes) -> result<_, host-error>;
+    finish-replace: func() -> result<_, host-error>;
+  }
+}
+
+interface api {
+  use host.{bytes, conflict-source, entity-change-source, resolution-sink, snapshot, transition};
+
+  variant plugin-error {
+    invalid-input(string),
+    limit-exceeded(string),
+    internal(string),
+  }
+
+  record file-descriptor {
+    path: option<string>,
+    media-type: option<string>,
+  }
+
+  record create-context {
+    high: u64,
+    low: u32,
+  }
+
+  record input-splice {
+    offset: u64,
+    delete-len: u64,
+    insert: bytes,
+  }
+
+  record open-request {
+    descriptor: file-descriptor,
+    accepted: own<snapshot>,
+    creates: create-context,
+  }
+
+  record update-request {
+    before-descriptor: file-descriptor,
+    after-descriptor: file-descriptor,
+    before: own<snapshot>,
+    edits: list<input-splice>,
+    creates: create-context,
+  }
+
+  variant transition-request {
+    open(open-request),
+    update(update-request),
+  }
+
+  record conflict-update {
+    descriptor: file-descriptor,
+    conflicts: own<conflict-source>,
+  }
+
+  record entity-update {
+    before-descriptor: file-descriptor,
+    after-descriptor: file-descriptor,
+    before: own<snapshot>,
+    changes: own<entity-change-source>,
+  }
+
+  record hydrate-request {
+    descriptor: file-descriptor,
+    accepted: option<own<snapshot>>,
+    entities: own<entity-change-source>,
+  }
+
+  /// All file transitions use one fused guest entry and one borrowed,
+  /// host-owned atomic output capability.
+  apply: func(
+    request: transition-request,
+    output: borrow<transition>,
+  ) -> result<_, plugin-error>;
+
+  /// Stateless merge resolution: no document hydration and no returned cursor.
+  resolve-conflicts: func(
+    input: conflict-update,
+    output: borrow<resolution-sink>,
+  ) -> result<_, plugin-error>;
+
+  entities-changed: func(
+    input: entity-update,
+    output: borrow<transition>,
+  ) -> result<_, plugin-error>;
+
+  /// Rebuild one evicted arena from the complete durable entity set. Blob
+  /// plugins also receive their exact accepted bytes; derived plugins render
+  /// those bytes from entities through the transition sink.
+  hydrate: func(
+    input: hydrate-request,
+    output: borrow<transition>,
+  ) -> result<_, plugin-error>;
+}
+
+world plugin {
+  import host;
+  export api;
+}

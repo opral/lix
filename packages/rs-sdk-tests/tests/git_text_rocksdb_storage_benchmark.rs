@@ -15,7 +15,7 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const PLUGIN_KEY: &str = "plugin_git_text_v2";
+const PLUGIN_KEY: &str = "plugin_git_text";
 const CORPUS_BYTES: usize = 16 * 1024 * 1024;
 const CORPUS_PATH: &str = "/git-text-storage-corpus.txt";
 
@@ -284,7 +284,7 @@ fn build_plugin_archive(materialization: &str) -> Vec<u8> {
         matches!(materialization, "derived" | "blob"),
         "benchmark supports only the two materialization contracts"
     );
-    let manifest = include_str!("../../../plugins/text-v2/manifest.json").replace(
+    let manifest = include_str!("../../../plugins/text/manifest.json").replace(
         "\"materialization\": \"derived\"",
         &format!("\"materialization\": \"{materialization}\""),
     );
@@ -292,9 +292,7 @@ fn build_plugin_archive(materialization: &str) -> Vec<u8> {
         manifest.contains(&format!("\"materialization\": \"{materialization}\"")),
         "benchmark archive must differ only in its materialization contract"
     );
-    let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_V2_plugin_git_text_v2"
-    ));
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text"));
     let wasm = fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
             "failed to read bindep-built Git text plugin wasm at {}: {error}",
@@ -308,7 +306,7 @@ fn build_plugin_archive(materialization: &str) -> Vec<u8> {
         ("manifest.json", manifest.as_bytes()),
         (
             "schema/git_text_line_v2.json",
-            include_str!("../../../plugins/text-v2/schema/git_text_line_v2.json").as_bytes(),
+            include_str!("../../../plugins/text/schema/git_text_line_v2.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {

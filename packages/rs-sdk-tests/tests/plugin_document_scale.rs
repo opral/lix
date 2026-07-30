@@ -5,13 +5,13 @@ use std::time::{Duration, Instant};
 
 use lix_sdk::{ExecuteBatchStatement, Lix, OpenLixOptions, Storage, Value, open_lix};
 
-const MARKDOWN_PLUGIN_KEY: &str = "plugin_markdown_incremental_v2";
+const MARKDOWN_PLUGIN_KEY: &str = "plugin_markdown";
 
 #[tokio::test]
 async fn atomic_markdown_import_scales_to_1184_documents() {
     assert_format_scales(
         MARKDOWN_PLUGIN_KEY,
-        build_markdown_v2_plugin_archive(),
+        build_markdown_plugin_archive(),
         "md",
         (0..1_184)
             .map(|index| format!("# Document {index}\n\nBody {index}.\n").into_bytes())
@@ -24,8 +24,8 @@ async fn atomic_markdown_import_scales_to_1184_documents() {
 #[tokio::test]
 async fn atomic_plugin_import_scaling_is_format_independent() {
     assert_format_scales(
-        "plugin_csv_v2",
-        build_csv_v2_plugin_archive(),
+        "plugin_csv",
+        build_csv_plugin_archive(),
         "csv",
         (0..17)
             .map(|index| format!("name,value\nrow-{index},{index}\n").into_bytes())
@@ -34,7 +34,7 @@ async fn atomic_plugin_import_scaling_is_format_independent() {
     )
     .await;
     assert_format_scales(
-        "plugin_git_text_v2",
+        "plugin_git_text",
         build_git_text_v2_plugin_archive(),
         "txt",
         (0..17)
@@ -44,8 +44,8 @@ async fn atomic_plugin_import_scaling_is_format_independent() {
     )
     .await;
     assert_format_scales(
-        "plugin_excalidraw_v2",
-        build_excalidraw_v2_plugin_archive(),
+        "plugin_excalidraw",
+        build_excalidraw_plugin_archive(),
         "excalidraw",
         (0..17)
             .map(|index| {
@@ -67,12 +67,7 @@ async fn sequential_batches_survive_observation_cache_eviction() {
     let lix = open_lix(OpenLixOptions::default())
         .await
         .expect("document-scale workspace should open");
-    install_plugin(
-        &lix,
-        "plugin_git_text_v2",
-        &build_git_text_v2_plugin_archive(),
-    )
-    .await;
+    install_plugin(&lix, "plugin_git_text", &build_git_text_v2_plugin_archive()).await;
 
     lix.execute_batch(&[file_insert_statement(
         "txt",
@@ -227,31 +222,29 @@ where
     .expect("reference plugin should install");
 }
 
-fn build_markdown_v2_plugin_archive() -> Vec<u8> {
+fn build_markdown_plugin_archive() -> Vec<u8> {
     build_plugin_archive(
-        Path::new(env!(
-            "CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_INCREMENTAL_V2_plugin_markdown_incremental_v2"
-        )),
-        include_str!("../../../plugins/markdown-v2/manifest.json"),
+        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown")),
+        include_str!("../../../plugins/markdown/manifest.json"),
         &[(
             "schema/markdown_node_v2.json",
-            include_str!("../../../plugins/markdown-v2/schema/markdown_node_v2.json"),
+            include_str!("../../../plugins/markdown/schema/markdown_node_v2.json"),
         )],
     )
 }
 
-fn build_csv_v2_plugin_archive() -> Vec<u8> {
+fn build_csv_plugin_archive() -> Vec<u8> {
     build_plugin_archive(
-        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2")),
-        include_str!("../../../plugins/csv-v2/manifest.json"),
+        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv")),
+        include_str!("../../../plugins/csv/manifest.json"),
         &[
             (
                 "schema/csv_v2_table.json",
-                include_str!("../../../plugins/csv-v2/schema/csv_v2_table.json"),
+                include_str!("../../../plugins/csv/schema/csv_v2_table.json"),
             ),
             (
                 "schema/csv_v2_row.json",
-                include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json"),
+                include_str!("../../../plugins/csv/schema/csv_v2_row.json"),
             ),
         ],
     )
@@ -259,35 +252,33 @@ fn build_csv_v2_plugin_archive() -> Vec<u8> {
 
 fn build_git_text_v2_plugin_archive() -> Vec<u8> {
     build_plugin_archive(
-        Path::new(env!(
-            "CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_V2_plugin_git_text_v2"
-        )),
-        include_str!("../../../plugins/text-v2/manifest.json"),
+        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text")),
+        include_str!("../../../plugins/text/manifest.json"),
         &[(
             "schema/git_text_line_v2.json",
-            include_str!("../../../plugins/text-v2/schema/git_text_line_v2.json"),
+            include_str!("../../../plugins/text/schema/git_text_line_v2.json"),
         )],
     )
 }
 
-fn build_excalidraw_v2_plugin_archive() -> Vec<u8> {
+fn build_excalidraw_plugin_archive() -> Vec<u8> {
     build_plugin_archive(
         Path::new(env!(
-            "CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_V2_plugin_excalidraw_v2"
+            "CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_plugin_excalidraw"
         )),
-        include_str!("../../../plugins/excalidraw-v2/manifest.json"),
+        include_str!("../../../plugins/excalidraw/manifest.json"),
         &[
             (
                 "schema/excalidraw_scene.json",
-                include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_scene.json"),
+                include_str!("../../../plugins/excalidraw/schema/excalidraw_scene.json"),
             ),
             (
                 "schema/excalidraw_element.json",
-                include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_element.json"),
+                include_str!("../../../plugins/excalidraw/schema/excalidraw_element.json"),
             ),
             (
                 "schema/excalidraw_file.json",
-                include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_file.json"),
+                include_str!("../../../plugins/excalidraw/schema/excalidraw_file.json"),
             ),
         ],
     )

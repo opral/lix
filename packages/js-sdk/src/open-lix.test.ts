@@ -664,7 +664,7 @@ test("fs storage imports files through installed WASM plugins", async () => {
 	});
 	const lix = await openLix({ storage });
 	const markdownPlugin = (await bundledPluginArchives()).find(
-		(plugin) => plugin.key === "plugin_markdown_incremental_v2",
+		(plugin) => plugin.key === "plugin_markdown",
 	);
 	if (!markdownPlugin) throw new Error("expected bundled Markdown plugin");
 
@@ -1058,7 +1058,7 @@ test("SQL plugin archive upsert installs bundled plugin archive schemas", async 
 test("SQL plugin archive upsert stores the archive and installs schemas", async () => {
 	const lix = await openLix();
 	const csvPlugin = (await bundledPluginArchives()).find(
-		(plugin) => plugin.key === "plugin_csv_v2",
+		(plugin) => plugin.key === "plugin_csv",
 	);
 	if (!csvPlugin) {
 		throw new Error("expected bundled CSV plugin");
@@ -1090,7 +1090,7 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 test("bundled Markdown plugin executes detect-changes and render", async () => {
 	const lix = await openLix();
 	const markdownPlugin = (await bundledPluginArchives()).find(
-		(plugin) => plugin.key === "plugin_markdown_incremental_v2",
+		(plugin) => plugin.key === "plugin_markdown",
 	);
 	if (!markdownPlugin) {
 		throw new Error("expected bundled Markdown plugin");

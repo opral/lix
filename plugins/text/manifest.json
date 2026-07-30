@@ -1,0 +1,14 @@
+{
+  "key": "plugin_git_text",
+  "runtime": "wasm-component",
+  "api_version": "3.0.0",
+  "materialization": "blob",
+  "match": {
+    "path_glob": "*",
+    "content_type": "git_text"
+  },
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/git_text_line_v2.json"
+  ]
+}

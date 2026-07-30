@@ -1502,7 +1502,7 @@ where
             })
             .collect::<Result<Vec<_>, LixError>>()?;
         let resolved = transaction
-            .resolve_v2_plugin_conflicts(&group.plugin, group.descriptor, conflicts)
+            .resolve_plugin_conflicts(&group.plugin, group.descriptor, conflicts)
             .await?;
         if resolved.resolutions.len() != group.conflicts.len() {
             return Err(LixError::new(
@@ -1899,7 +1899,7 @@ mod tests {
     fn owner_row(file_id: &str, incarnation: &str) -> MaterializedTrackedStateRow {
         let owner = PluginFileOwner::new(
             file_id,
-            "plugin_csv_v2",
+            "plugin_csv",
             vec!["csv_v2_row".to_owned(), "csv_v2_table".to_owned()],
         )
         .unwrap();
@@ -2007,12 +2007,8 @@ mod tests {
     fn derived_file_owner(file_id: &str) -> BTreeMap<String, PluginFileOwner> {
         BTreeMap::from([(
             file_id.to_owned(),
-            PluginFileOwner::new(
-                file_id,
-                "plugin_git_text_v2",
-                vec!["git_text_line".to_owned()],
-            )
-            .unwrap(),
+            PluginFileOwner::new(file_id, "plugin_git_text", vec!["git_text_line".to_owned()])
+                .unwrap(),
         )])
     }
 

@@ -5,7 +5,7 @@ import { bundledPluginArchives, openLix } from "../dist/index.js";
 const warmupIterations = Number(process.env.WARMUP_ITERATIONS ?? 2);
 const measuredIterations = Number(process.env.MEASURED_ITERATIONS ?? 12);
 const archives = await bundledPluginArchives();
-const csvPlugin = archives.find((plugin) => plugin.key === "plugin_csv_v2");
+const csvPlugin = archives.find((plugin) => plugin.key === "plugin_csv");
 if (!csvPlugin) throw new Error("expected bundled CSV plugin");
 
 for (let index = 0; index < warmupIterations; index += 1) {

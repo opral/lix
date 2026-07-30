@@ -78,14 +78,14 @@ async fn markdown_lix_byte_hotpath_profile() {
     assert!(samples > 0);
 
     let corpus = markdown_corpus(target_bytes);
-    let archive = build_markdown_v2_plugin_archive();
+    let archive = build_markdown_plugin_archive();
     let root = tempfile::tempdir().expect("create Markdown profile directory");
     let lix = open_lix_with_rocksdb(root.path()).await;
-    install_plugin(&lix, "plugin_markdown_incremental_v2", &archive).await;
+    install_plugin(&lix, "plugin_markdown", &archive).await;
     write_file(&lix, "/profile.md", corpus.bytes.clone()).await;
 
     let mut bytes = corpus.bytes;
-    lix.reset_plugin_v2_transition_counters();
+    lix.reset_plugin_transition_counters();
     let started = Instant::now();
     for sample in 0..samples {
         let index = spread_index(sample, samples, corpus.edit_offsets.len() / 2);
@@ -94,7 +94,7 @@ async fn markdown_lix_byte_hotpath_profile() {
         write_file(&lix, "/profile.md", bytes.clone()).await;
     }
     let elapsed = started.elapsed();
-    let counters = lix.plugin_v2_transition_counters();
+    let counters = lix.plugin_transition_counters();
     eprintln!(
         "markdown_lix_hot_profile bytes={} samples={} total_ms={:.3} mean_ms={:.3} counters={counters:?}",
         bytes.len(),
@@ -127,13 +127,13 @@ async fn markdown_syntax_rich_initial_import_control() {
     assert!(samples > 0);
     let source = syntax_rich_markdown_corpus(target_bytes);
     assert!(source.len() >= target_bytes.saturating_sub(1_024));
-    let archive = build_markdown_v2_plugin_archive();
+    let archive = build_markdown_plugin_archive();
     let mut imports = Vec::with_capacity(samples);
 
     for _sample in 0..samples {
         let root = tempfile::tempdir().expect("create syntax-rich Markdown benchmark directory");
         let lix = open_lix_with_rocksdb(root.path()).await;
-        install_plugin(&lix, "plugin_markdown_incremental_v2", &archive).await;
+        install_plugin(&lix, "plugin_markdown", &archive).await;
 
         let started = Instant::now();
         write_file(&lix, "/syntax-rich.md", source.clone()).await;
@@ -185,11 +185,11 @@ async fn markdown_git_semantic_entities_benchmark() {
         corpus.texts.len() > edit_samples.max(semantic_edit_samples) + merge_samples * 4,
         "benchmark corpus must contain enough unrelated paragraphs"
     );
-    let archive = build_markdown_v2_plugin_archive();
+    let archive = build_markdown_plugin_archive();
 
     let lix_root = tempfile::tempdir().expect("create semantic Lix benchmark directory");
     let baseline_lix = open_lix_with_rocksdb(lix_root.path()).await;
-    install_plugin(&baseline_lix, "plugin_markdown_incremental_v2", &archive).await;
+    install_plugin(&baseline_lix, "plugin_markdown", &archive).await;
     baseline_lix.close().await.expect("close baseline Lix");
     let lix_fixed = lix_repo_sizes(lix_root.path());
 
@@ -332,7 +332,7 @@ async fn markdown_git_semantic_entities_benchmark() {
 
     let byte_root = tempfile::tempdir().expect("create byte-path Lix benchmark directory");
     let byte_lix = open_lix_with_rocksdb(byte_root.path()).await;
-    install_plugin(&byte_lix, "plugin_markdown_incremental_v2", &archive).await;
+    install_plugin(&byte_lix, "plugin_markdown", &archive).await;
     write_file(&byte_lix, "/benchmark.md", corpus.bytes.clone()).await;
     let mut byte_state = corpus.bytes.clone();
     let mut lix_byte_edits = Vec::with_capacity(edit_samples);
@@ -670,7 +670,7 @@ async fn semantic_table_merge_quality(archive: &[u8]) {
 
     let root = tempfile::tempdir().expect("create Lix semantic quality directory");
     let lix = open_lix_with_rocksdb(root.path()).await;
-    install_plugin(&lix, "plugin_markdown_incremental_v2", archive).await;
+    install_plugin(&lix, "plugin_markdown", archive).await;
     write_file(&lix, "/quality.md", TABLE.to_vec()).await;
     let file_id = file_id_at_path(&lix, "/quality.md").await;
     let cells = markdown_nodes_by_kind(&lix, &file_id, "table_cell").await;
@@ -1047,10 +1047,8 @@ where
         .expect("benchmark file ID should be text")
 }
 
-fn build_markdown_v2_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_INCREMENTAL_V2_plugin_markdown_incremental_v2"
-    ));
+fn build_markdown_plugin_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown"));
     let wasm = fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
             "failed to read Markdown v2 component at {}: {error}",
@@ -1063,11 +1061,11 @@ fn build_markdown_v2_plugin_archive() -> Vec<u8> {
     for (path, bytes) in [
         (
             "manifest.json",
-            include_str!("../../../plugins/markdown-v2/manifest.json").as_bytes(),
+            include_str!("../../../plugins/markdown/manifest.json").as_bytes(),
         ),
         (
             "schema/markdown_node_v2.json",
-            include_str!("../../../plugins/markdown-v2/schema/markdown_node_v2.json").as_bytes(),
+            include_str!("../../../plugins/markdown/schema/markdown_node_v2.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
