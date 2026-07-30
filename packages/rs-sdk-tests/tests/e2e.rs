@@ -1198,7 +1198,7 @@ async fn v3_markdown_noncanonical_source_stays_in_file_arena_not_semantic_root()
 }
 
 #[tokio::test]
-#[ignore = "exact VS Code Docs d5badf Markdown transition v2 versus v3 benchmark"]
+#[ignore = "exact VS Code Docs d5badf Markdown transition benchmark"]
 async fn v3_markdown_vscode_api_exact_transition_benchmark() {
     const BENCHMARK: &str = "v3_markdown_vscode_api_exact_transition_benchmark";
     const PATH: &str = "/api/references/vscode-api.md";
@@ -1221,20 +1221,12 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
     let _dispatcher = tracing::dispatcher::set_default(&dispatch);
 
-    let lanes = [
-        (
-            "v2_cursor",
-            "plugin_markdown",
-            build_markdown_plugin_archive(),
-        ),
-        (
-            "v3_push_sink",
-            "plugin_markdown",
-            build_markdown_plugin_archive(),
-        ),
-    ];
+    let lanes = [(
+        "v3_push_sink",
+        "plugin_markdown",
+        build_markdown_plugin_archive(),
+    )];
     let mut expected_rows = None;
-    let mut lane_medians = BTreeMap::new();
     for (label, plugin_key, archive) in lanes {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
             continue;
@@ -1299,9 +1291,7 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
             } else {
                 expected_rows = Some(rows);
             }
-            if label == "v3_push_sink" {
-                assert_eq!(counters.guest_export_calls, 1);
-            }
+            assert_eq!(counters.guest_export_calls, 1);
             eprintln!(
                 "vscode_markdown lane={label} sample={sample} elapsed_ms={:.3} \
                  allocations={} allocated_mb={:.3} peak_live_mb={:.3} \
@@ -1344,13 +1334,6 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
             BenchmarkGate::BulkWrite,
             &measurements,
         );
-        lane_medians.insert(label, benchmark_medians(&measurements));
-    }
-    if let (Some(v2), Some(v3)) = (
-        lane_medians.get("v2_cursor"),
-        lane_medians.get("v3_push_sink"),
-    ) {
-        assert_v3_benchmark_win(BENCHMARK, *v2, *v3);
     }
 }
 
@@ -4143,11 +4126,12 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
     );
 }
 
-/// Matched large JSON import through the v2 returned cursor and the v3
-/// host-imported push sink. Both lanes use the same parser and packet-v1
-/// encoding, so this isolates control-flow and runtime materialization.
+/// Large JSON import through the current host-imported push sink.
+///
+/// The removed v2 runtime must be benchmarked from its frozen revision; using
+/// the current archive for both labels would only compare v3 against itself.
 #[tokio::test]
-#[ignore = "10 MiB JSON v2 cursor versus v3 push-sink import benchmark"]
+#[ignore = "10 MiB JSON v3 push-sink import benchmark"]
 async fn v3_json_ten_mib_push_sink_benchmark() {
     const FILE_ID: &str = "019a0000-0000-7000-8000-000000000330";
     const FILE_PATH: &str = "/v3-json-large.json";
@@ -4172,15 +4156,10 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
         input_bytes: source.len(),
         logical_rows: JSON_TEN_MIB_PROPERTY_COUNT + 1,
     };
-    let lanes = [
-        ("v2_cursor", "plugin_json", build_json_plugin_archive()),
-        ("v3_push_sink", "plugin_json", build_json_plugin_archive()),
-    ];
+    let lanes = [("v3_push_sink", "plugin_json", build_json_plugin_archive())];
     let collector = PerfSpanCollector::default();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
     let _dispatcher = tracing::dispatcher::set_default(&dispatch);
-    let mut lane_medians = BTreeMap::new();
-
     for (label, plugin_key, archive) in lanes {
         let mut measurements = Vec::with_capacity(samples);
         let mut elapsed_ms = Vec::with_capacity(samples);
@@ -4214,9 +4193,7 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
                 BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
             assert_eq!(inserted.rows_affected(), 1, "{label} sample {sample}");
             let counters = lix.plugin_transition_counters();
-            if label == "v3_push_sink" {
-                assert_eq!(counters.guest_export_calls, 1);
-            }
+            assert_eq!(counters.guest_export_calls, 1);
             assert_eq!(
                 counters.durable_semantic_changes,
                 (JSON_TEN_MIB_PROPERTY_COUNT + 1) as u64
@@ -4314,17 +4291,11 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
             BenchmarkGate::BulkWrite,
             &measurements,
         );
-        lane_medians.insert(label, benchmark_medians(&measurements));
     }
-    assert_v3_benchmark_win(
-        BENCHMARK,
-        lane_medians["v2_cursor"],
-        lane_medians["v3_push_sink"],
-    );
 }
 
 #[tokio::test]
-#[ignore = "10 MiB JSON sparse successor v2 actor versus v3 arena benchmark"]
+#[ignore = "10 MiB JSON sparse successor v3 arena benchmark"]
 async fn v3_json_ten_mib_sparse_successor_benchmark() {
     const PATH: &str = "/v3-json-sparse.json";
     let samples = std::env::var("LIX_BENCH_SAMPLES")
@@ -4338,12 +4309,7 @@ async fn v3_json_ten_mib_sparse_successor_benchmark() {
     let collector = PerfSpanCollector::default();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
     let _dispatcher = tracing::dispatcher::set_default(&dispatch);
-    let mut lane_medians = BTreeMap::new();
-
-    for (label, plugin_key, archive) in [
-        ("v2_actor", "plugin_json", build_json_plugin_archive()),
-        ("v3_arena", "plugin_json", build_json_plugin_archive()),
-    ] {
+    for (label, plugin_key, archive) in [("v3_arena", "plugin_json", build_json_plugin_archive())] {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
             continue;
         }
@@ -4435,10 +4401,6 @@ async fn v3_json_ten_mib_sparse_successor_benchmark() {
             BenchmarkGate::ElapsedRegression,
             &measurements,
         );
-        lane_medians.insert(label, benchmark_medians(&measurements));
-    }
-    if let (Some(v2), Some(v3)) = (lane_medians.get("v2_actor"), lane_medians.get("v3_arena")) {
-        assert_v3_benchmark_win("v3_json_ten_mib_sparse_successor_benchmark", *v2, *v3);
     }
 }
 
@@ -4559,7 +4521,7 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
         lane_medians.get("hydrate_then_update"),
         lane_medians.get("cold_successor"),
     ) {
-        assert_v3_benchmark_win("v3_json_ten_mib_cold_successor_benchmark", *hydrate, *cold);
+        assert_candidate_benchmark_win("v3_json_ten_mib_cold_successor_benchmark", *hydrate, *cold);
     }
 }
 
@@ -5277,12 +5239,12 @@ async fn v3_derived_cold_hydration_renders_from_durable_entities() {
     lix.close().await.unwrap();
 }
 
-/// Matched warm file transitions over the same CSV implementation. v2 returns
-/// a guest change cursor and requires `next(Some)` plus `next(None)` exports;
-/// v3 pushes the same packet page into a borrowed host sink before its single
-/// `file-changed` export returns.
+/// Warm file transitions through the current CSV push sink.
+///
+/// A real v2 comparison is run from the frozen v2 revision. The hard-cut tree
+/// no longer contains the returned-cursor runtime.
 #[tokio::test]
-#[ignore = "Component v2 change cursor versus v3 push-sink benchmark"]
+#[ignore = "Component v3 push-sink benchmark"]
 async fn v3_file_changed_push_sink_benchmark() {
     const ROW_COUNT: usize = 220_000;
     const BENCHMARK: &str = "v3_file_changed_push_sink_benchmark";
@@ -5300,161 +5262,93 @@ async fn v3_file_changed_push_sink_benchmark() {
     let collector = PerfSpanCollector::default();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
     let _dispatcher = tracing::dispatcher::set_default(&dispatch);
-    let v2_root = tempfile::tempdir().expect("create v2 push-sink benchmark directory");
-    let v3_root = tempfile::tempdir().expect("create v3 push-sink benchmark directory");
-    let v2 = open_lix_with_rocksdb(v2_root.path()).await;
-    let v3 = open_lix_with_rocksdb(v3_root.path()).await;
+    let root = tempfile::tempdir().expect("create v3 push-sink benchmark directory");
+    let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
-        &v2,
+        &lix,
         "plugin_csv",
         &build_csv_plugin_archive(),
         &["csv_v2_table", "csv_v2_row"],
     )
     .await;
-    install_reference_plugin_in_blank_registry(
-        &v3,
-        "plugin_csv",
-        &build_csv_plugin_archive(),
-        &["csv_v2_table", "csv_v2_row"],
-    )
-    .await;
-    let v2_path = "/cursor.csv";
-    let v3_path = "/push-sink.csv";
-    write_file(&v2, v2_path, source.clone())
-        .await
-        .expect("v2 benchmark import should succeed");
-    write_file(&v3, v3_path, source.clone())
+    let path = "/push-sink.csv";
+    write_file(&lix, path, source.clone())
         .await
         .expect("v3 benchmark import should succeed");
-    assert_eq!(read_file(&v2, v2_path).await.unwrap(), Some(source.clone()));
-    assert_eq!(read_file(&v3, v3_path).await.unwrap(), Some(source.clone()));
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(source.clone()));
 
-    let mut v2_bytes = source.clone();
-    let mut v3_bytes = source;
-    let mut v2_measurements = Vec::with_capacity(samples);
-    let mut v3_measurements = Vec::with_capacity(samples);
-    let mut v2_ms = Vec::with_capacity(samples);
-    let mut v3_ms = Vec::with_capacity(samples);
-    let mut v2_export_calls = Vec::with_capacity(samples);
-    let mut v3_export_calls = Vec::with_capacity(samples);
+    let mut bytes = source;
+    let mut measurements = Vec::with_capacity(samples);
+    let mut elapsed_ms = Vec::with_capacity(samples);
 
     for sample in 0..samples {
         let next = if sample % 2 == 0 { b'9' } else { b'0' };
-        let lanes = if sample % 2 == 0 {
-            [false, true]
-        } else {
-            [true, false]
-        };
-        for push_sink in lanes {
-            let (lix, path, bytes) = if push_sink {
-                (&v3, v3_path, &mut v3_bytes)
-            } else {
-                (&v2, v2_path, &mut v2_bytes)
-            };
-            bytes[0] = next;
-            lix.reset_plugin_transition_counters();
-            collector.clear();
-            let allocation_scope = AllocationScope::start();
-            let started = Instant::now();
-            write_file(lix, path, bytes.clone())
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "{} sample {sample} should succeed: {error:?}",
-                        if push_sink { "v3" } else { "v2" }
-                    )
-                });
-            let measurement =
-                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
-            let counters = lix.plugin_transition_counters();
-            eprintln!(
-                "v3_file_changed_phases lane={} sample={sample} elapsed_ms={:.3} \
-                 guest_exports={} imports={} boundary_bytes={} guest_high_water_bytes={} \
-                 phase_close_live_bytes={:?} phases_ms={:?}",
-                if push_sink {
-                    "v3_push_sink"
-                } else {
-                    "v2_cursor"
-                },
-                measurement.elapsed_ms,
-                counters.guest_export_calls,
-                counters.component_import_calls,
-                counters.component_boundary_bytes,
-                counters.guest_linear_memory_high_water_bytes,
-                collector.take_close_live_bytes(),
-                collector.take_aggregate_millis(),
-            );
-            assert_eq!(counters.packet_records, 1, "sample {sample}");
-            assert_eq!(counters.durable_semantic_changes, 1, "sample {sample}");
-            if push_sink {
-                assert_eq!(
-                    counters.guest_export_calls, 1,
-                    "v3 must use one guest export"
-                );
-                v3_export_calls.push(counters.guest_export_calls);
-                v3_ms.push(measurement.elapsed_ms);
-                v3_measurements.push(measurement);
-            } else {
-                assert_eq!(
-                    counters.guest_export_calls, 3,
-                    "v2 must call file-changed, next(Some), and next(None)"
-                );
-                v2_export_calls.push(counters.guest_export_calls);
-                v2_ms.push(measurement.elapsed_ms);
-                v2_measurements.push(measurement);
-            }
-        }
+        bytes[0] = next;
+        lix.reset_plugin_transition_counters();
+        collector.clear();
+        let allocation_scope = AllocationScope::start();
+        let started = Instant::now();
+        write_file(&lix, path, bytes.clone())
+            .await
+            .unwrap_or_else(|error| panic!("v3 sample {sample} should succeed: {error:?}"));
+        let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+        let counters = lix.plugin_transition_counters();
+        eprintln!(
+            "v3_file_changed_phases lane=v3_push_sink sample={sample} elapsed_ms={:.3} \
+             guest_exports={} imports={} boundary_bytes={} guest_high_water_bytes={} \
+             phase_close_live_bytes={:?} phases_ms={:?}",
+            measurement.elapsed_ms,
+            counters.guest_export_calls,
+            counters.component_import_calls,
+            counters.component_boundary_bytes,
+            counters.guest_linear_memory_high_water_bytes,
+            collector.take_close_live_bytes(),
+            collector.take_aggregate_millis(),
+        );
+        assert_eq!(counters.packet_records, 1, "sample {sample}");
+        assert_eq!(counters.durable_semantic_changes, 1, "sample {sample}");
+        assert_eq!(
+            counters.guest_export_calls, 1,
+            "v3 must use one guest export"
+        );
+        emit_sample(
+            BENCHMARK,
+            "v3_push_sink",
+            sample,
+            fixture,
+            BenchmarkGate::ElapsedRegression,
+            measurement,
+        );
+        elapsed_ms.push(measurement.elapsed_ms);
+        measurements.push(measurement);
     }
 
-    assert_eq!(read_file(&v2, v2_path).await.unwrap(), Some(v2_bytes));
-    assert_eq!(read_file(&v3, v3_path).await.unwrap(), Some(v3_bytes));
-    let v2_row_count = v2
-        .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
-        .await
-        .expect("v2 semantic rows should query")
-        .rows()[0]
-        .get::<i64>("count")
-        .expect("v2 row count should be integer");
-    let v3_row_count = v3
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(bytes));
+    let row_count = lix
         .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
         .await
         .expect("v3 semantic rows should query")
         .rows()[0]
         .get::<i64>("count")
         .expect("v3 row count should be integer");
-    assert_eq!(v2_row_count, ROW_COUNT as i64);
-    assert_eq!(v3_row_count, ROW_COUNT as i64);
+    assert_eq!(row_count, ROW_COUNT as i64);
 
-    v2_ms.sort_by(f64::total_cmp);
-    v3_ms.sort_by(f64::total_cmp);
+    elapsed_ms.sort_by(f64::total_cmp);
     eprintln!(
         "v3_file_changed_push_sink bytes={} rows={} samples={samples} \
-         v2_raw_ms={v2_ms:?} v2_p50_ms={:.3} v2_guest_exports={} \
-         v3_raw_ms={v3_ms:?} v3_p50_ms={:.3} v3_guest_exports={} speedup={:.3}",
+         raw_ms={elapsed_ms:?} p50_ms={:.3} guest_exports=1",
         fixture.input_bytes,
         ROW_COUNT,
-        p50_ms(&v2_ms),
-        v2_export_calls[0],
-        p50_ms(&v3_ms),
-        v3_export_calls[0],
-        p50_ms(&v2_ms) / p50_ms(&v3_ms),
-    );
-    emit_summary(
-        BENCHMARK,
-        "v2_guest_cursor",
-        fixture,
-        BenchmarkGate::ElapsedRegression,
-        &v2_measurements,
+        p50_ms(&elapsed_ms),
     );
     emit_summary(
         BENCHMARK,
         "v3_push_sink",
         fixture,
         BenchmarkGate::ElapsedRegression,
-        &v3_measurements,
+        &measurements,
     );
-    v2.close().await.expect("close v2 benchmark");
-    v3.close().await.expect("close v3 benchmark");
+    lix.close().await.expect("close v3 benchmark");
 }
 
 #[tokio::test]
@@ -6273,7 +6167,7 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
 }
 
 #[tokio::test]
-#[ignore = "large Excalidraw local-edit transition v2 versus v3 benchmark"]
+#[ignore = "large Excalidraw local-edit v3 transition benchmark"]
 async fn v3_excalidraw_large_transition_benchmark() {
     const ELEMENTS: usize = 20_000;
     const PATH: &str = "/large.excalidraw";
@@ -6312,20 +6206,11 @@ async fn v3_excalidraw_large_transition_benchmark() {
         input_bytes: after.len(),
         logical_rows: ELEMENTS,
     };
-    let mut lane_measurements = BTreeMap::new();
-
-    for (label, plugin_key, archive) in [
-        (
-            "v2_cursor",
-            "plugin_excalidraw",
-            build_excalidraw_plugin_archive(),
-        ),
-        (
-            "v3_push_sink",
-            "plugin_excalidraw",
-            build_excalidraw_plugin_archive(),
-        ),
-    ] {
+    for (label, plugin_key, archive) in [(
+        "v3_push_sink",
+        "plugin_excalidraw",
+        build_excalidraw_plugin_archive(),
+    )] {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
             continue;
         }
@@ -6361,9 +6246,7 @@ async fn v3_excalidraw_large_transition_benchmark() {
                 ELEMENTS as i64
             );
             assert_eq!(counters.durable_semantic_changes, 1);
-            if label == "v3_push_sink" {
-                assert_eq!(counters.guest_export_calls, 1);
-            }
+            assert_eq!(counters.guest_export_calls, 1);
             eprintln!(
                 "large_excalidraw lane={label} sample={sample} input_mb={:.3} \
                  elapsed_ms={:.3} allocations={} allocated_mb={:.3} peak_live_mb={:.3} \
@@ -6408,45 +6291,7 @@ async fn v3_excalidraw_large_transition_benchmark() {
             "large_excalidraw lane={label} raw_ms={elapsed_ms:?} p50_ms={:.3}",
             elapsed_ms[elapsed_ms.len() / 2]
         );
-        let mut allocated_bytes = measurements
-            .iter()
-            .map(|measurement| measurement.allocations.allocated_bytes)
-            .collect::<Vec<_>>();
-        allocated_bytes.sort_unstable();
-        let mut peak_live_bytes = measurements
-            .iter()
-            .map(|measurement| measurement.allocations.peak_live_bytes_delta)
-            .collect::<Vec<_>>();
-        peak_live_bytes.sort_unstable();
-        lane_measurements.insert(
-            label,
-            (
-                elapsed_ms[elapsed_ms.len() / 2],
-                allocated_bytes[allocated_bytes.len() / 2],
-                peak_live_bytes[peak_live_bytes.len() / 2],
-            ),
-        );
     }
-    let &(v2_ms, v2_allocated, v2_peak) = lane_measurements
-        .get("v2_cursor")
-        .expect("v2 Excalidraw lane must run");
-    let &(v3_ms, v3_allocated, v3_peak) = lane_measurements
-        .get("v3_push_sink")
-        .expect("v3 Excalidraw lane must run");
-    assert!(
-        v3_ms < v2_ms * 0.9,
-        "v3 Excalidraw must be at least 10% faster: v2={v2_ms:.3}ms v3={v3_ms:.3}ms"
-    );
-    assert!(
-        v3_allocated <= v2_allocated.saturating_mul(105) / 100,
-        "v3 Excalidraw cumulative host allocation regressed by more than 5%: \
-         v2={v2_allocated} v3={v3_allocated}"
-    );
-    assert!(
-        v3_peak <= v2_peak.saturating_mul(105) / 100,
-        "v3 Excalidraw peak live host allocation regressed by more than 5%: \
-         v2={v2_peak} v3={v3_peak}"
-    );
 }
 
 #[tokio::test]
@@ -7602,26 +7447,30 @@ fn benchmark_medians(measurements: &[BenchmarkMeasurement]) -> BenchmarkMedians 
     }
 }
 
-fn assert_v3_benchmark_win(benchmark: &str, v2: BenchmarkMedians, v3: BenchmarkMedians) {
+fn assert_candidate_benchmark_win(
+    benchmark: &str,
+    baseline: BenchmarkMedians,
+    candidate: BenchmarkMedians,
+) {
     assert!(
-        v3.elapsed_ms < v2.elapsed_ms * 0.9,
-        "{benchmark}: v3 must be at least 10% faster; v2={:.3}ms v3={:.3}ms",
-        v2.elapsed_ms,
-        v3.elapsed_ms,
+        candidate.elapsed_ms < baseline.elapsed_ms * 0.9,
+        "{benchmark}: candidate must be at least 10% faster; baseline={:.3}ms candidate={:.3}ms",
+        baseline.elapsed_ms,
+        candidate.elapsed_ms,
     );
     assert!(
-        u128::from(v3.allocated_bytes) * 100 <= u128::from(v2.allocated_bytes) * 105,
-        "{benchmark}: v3 cumulative host allocation regressed by more than 5%; \
-         v2={} v3={}",
-        v2.allocated_bytes,
-        v3.allocated_bytes,
+        u128::from(candidate.allocated_bytes) * 100 <= u128::from(baseline.allocated_bytes) * 105,
+        "{benchmark}: candidate cumulative host allocation regressed by more than 5%; \
+         baseline={} candidate={}",
+        baseline.allocated_bytes,
+        candidate.allocated_bytes,
     );
     assert!(
-        u128::from(v3.peak_live_bytes) * 100 <= u128::from(v2.peak_live_bytes) * 105,
-        "{benchmark}: v3 peak live host allocation regressed by more than 5%; \
-         v2={} v3={}",
-        v2.peak_live_bytes,
-        v3.peak_live_bytes,
+        u128::from(candidate.peak_live_bytes) * 100 <= u128::from(baseline.peak_live_bytes) * 105,
+        "{benchmark}: candidate peak live host allocation regressed by more than 5%; \
+         baseline={} candidate={}",
+        baseline.peak_live_bytes,
+        candidate.peak_live_bytes,
     );
 }
 
