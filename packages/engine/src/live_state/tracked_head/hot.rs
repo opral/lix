@@ -1679,7 +1679,7 @@ where
         let mut snapshots = Vec::new();
         let mut json_refs = Vec::new();
         let mut deferred = Vec::new();
-        for bytes in hot_scan_values(entries) {
+        for bytes in hot_scan_values_in_logical_order(entries) {
             let value = decode_head_value(&bytes)?;
             if value.deleted {
                 continue;
@@ -4020,9 +4020,12 @@ async fn materialize_hot_scan_entries(
     }
 }
 
-fn hot_scan_values(entries: HotScanEntries<'_>) -> Vec<Bytes> {
+fn hot_scan_values_in_logical_order(entries: HotScanEntries<'_>) -> Vec<Bytes> {
     match entries {
-        HotScanEntries::Decoded(entries) => entries.into_iter().map(|(_, value)| value).collect(),
+        HotScanEntries::Decoded(mut entries) => {
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            entries.into_iter().map(|(_, value)| value).collect()
+        }
         HotScanEntries::Finite(batches) => batches
             .into_iter()
             .flat_map(|batch| batch.values.into_iter().flatten())

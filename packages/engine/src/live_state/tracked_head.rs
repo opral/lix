@@ -3312,6 +3312,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entity_snapshot_scan_restores_logical_primary_key_order() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let generation = CommitId::for_test_label("generation");
+        let head = CommitId::for_test_label("head");
+        let control = BranchHeadControl {
+            head_commit_id: head,
+            generation,
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+            ref_change_id: ChangeId::for_test_label("branch-ref"),
+        };
+        let mut writes = StorageWriteSet::new();
+        for (entity, file_id) in [("a", "z-file"), ("b", "a-file")] {
+            let identity = HeadIdentity {
+                branch_id: branch_id.to_string(),
+                generation,
+                schema_key: "schema".to_string(),
+                entity_pk: EntityPk::single(entity),
+                file_id: Some(file_id.to_string()),
+            };
+            stage_put(
+                &mut writes,
+                &identity,
+                &HeadValue {
+                    change_id: Some(ChangeId::for_test_label(entity)),
+                    commit_id: Some(head),
+                    untracked: false,
+                    deleted: false,
+                    created_at: ts("2026-01-01T00:00:00Z"),
+                    updated_at: ts("2026-01-01T00:00:00Z"),
+                    snapshot: JsonSlot::from_json(&format!(r#"{{"entity":"{entity}"}}"#)),
+                    metadata: JsonSlot::None,
+                },
+            )
+            .expect("stage file-backed row");
+        }
+        stage_branch_head_control(&mut writes, branch_id, control)
+            .expect("stage matching branch control");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit file-backed rows");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open entity snapshot read");
+        let snapshots = TrackedHeadContext::new()
+            .reader(read)
+            .scan_entity_snapshots(branch_id, control, "schema", &[], None)
+            .await
+            .expect("scan snapshots");
+        let snapshots = snapshots
+            .into_iter()
+            .map(|snapshot| {
+                String::from_utf8(snapshot.expect("row has a snapshot").to_vec())
+                    .expect("snapshot is UTF-8")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots, [r#"{"entity":"a"}"#, r#"{"entity":"b"}"#]);
+    }
+
+    #[tokio::test]
     async fn file_id_reads_use_file_first_primary_values() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
