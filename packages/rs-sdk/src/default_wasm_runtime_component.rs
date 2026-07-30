@@ -20,12 +20,12 @@ use lix_engine::wasm::{
     PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmCertifiedEntityBatch, WasmChangeCursorHandle,
     WasmChangeEffect, WasmChangePage, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
     WasmConflictResolution, WasmConflictResolutionPage, WasmConflictTake, WasmConflictTransition,
-    WasmConflictUpdate, WasmCreateContext, WasmDocumentHandle, WasmEditCursorHandle, WasmEditPage,
-    WasmEntity, WasmEntityChange, WasmEntityChanges, WasmEntityKey, WasmEntityTransition,
-    WasmEntityUpdate, WasmFileTransition, WasmFileUpdate, WasmGuestBytes, WasmGuestEntityChanges,
-    WasmHostBytes, WasmHostEntityConflict, WasmInputBytes, WasmOpenEntitiesInput,
-    WasmOpenFileInput, WasmOutputRange, WasmOutputSplice, WasmResolutionCursorHandle,
-    WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
+    WasmConflictUpdate, WasmCreateContext, WasmDocumentCheckpoint, WasmDocumentHandle,
+    WasmEditCursorHandle, WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChanges,
+    WasmEntityKey, WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
+    WasmGuestBytes, WasmGuestEntityChanges, WasmHostBytes, WasmHostEntityConflict, WasmInputBytes,
+    WasmOpenEntitiesInput, WasmOpenFileInput, WasmOutputRange, WasmOutputSplice,
+    WasmResolutionCursorHandle, WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
 };
 use lix_engine::{LixError, SharedStr};
 use wasmtime::Store;
@@ -3406,6 +3406,37 @@ impl WasmComponentActor for V3Actor {
         let fork = self.worker.fork(document.0)?;
         self.next_document = self.next_document.max(fork.saturating_add(1));
         Ok(WasmDocumentHandle(fork))
+    }
+
+    async fn checkpoint_document(
+        &mut self,
+        document: WasmDocumentHandle,
+    ) -> Result<Option<WasmDocumentCheckpoint>, LixError> {
+        self.ensure_active()?;
+        let root = self
+            .worker
+            .documents
+            .get(&document.0)
+            .ok_or_else(|| v3_error("unknown v3 document handle"))?
+            .root
+            .clone();
+        let retained_bytes = u64::try_from(root.retained_heap_bytes()).unwrap_or(u64::MAX);
+        Ok(Some(WasmDocumentCheckpoint::new(root, retained_bytes)))
+    }
+
+    async fn restore_document(
+        &mut self,
+        checkpoint: &WasmDocumentCheckpoint,
+    ) -> Result<WasmDocumentHandle, LixError> {
+        self.ensure_active()?;
+        let root = checkpoint
+            .downcast_ref::<ArenaRoot>()
+            .ok_or_else(|| v3_error("v3 document checkpoint belongs to another runtime"))?
+            .clone();
+        let document = self.allocate_document()?;
+        self.worker.documents.insert(document, V3Document { root });
+        self.worker.next_document = self.worker.next_document.max(document.saturating_add(1));
+        Ok(WasmDocumentHandle(document))
     }
 
     async fn open_file(

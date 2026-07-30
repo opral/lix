@@ -13,6 +13,7 @@
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::mem::size_of;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -700,6 +701,43 @@ impl Root {
         self.id
     }
 
+    /// Approximate heap bytes retained by this immutable root.
+    ///
+    /// This includes unique page payloads plus the per-entity keys, arenas,
+    /// segment arrays, and a conservative allowance for `BTreeMap` nodes and
+    /// allocation headers. It deliberately overcounts shared metadata so a
+    /// decoded-root cache remains a hard memory bound without serializing or
+    /// copying payloads merely to measure them.
+    pub fn retained_heap_bytes(&self) -> usize {
+        let mut pages = BTreeMap::<Digest, usize>::new();
+        record_byte_pages(&self.bytes, &mut pages);
+        let mut retained = byte_arena_metadata_bytes(&self.bytes);
+        for value in self.entities.entries.values() {
+            record_byte_pages(value, &mut pages);
+            retained = retained.saturating_add(byte_arena_metadata_bytes(value));
+        }
+        for value in self.state.entries.values() {
+            record_byte_pages(value, &mut pages);
+            retained = retained.saturating_add(byte_arena_metadata_bytes(value));
+        }
+        for (key, _) in self
+            .entities
+            .entries
+            .iter()
+            .chain(self.state.entries.iter())
+        {
+            retained = retained
+                .saturating_add(key.capacity())
+                .saturating_add(size_of::<(Vec<u8>, ByteArena)>())
+                .saturating_add(64);
+        }
+        pages.values().fold(retained, |total, payload| {
+            total
+                .saturating_add(*payload)
+                .saturating_add(2 * size_of::<usize>())
+        })
+    }
+
     pub fn transaction(&self) -> Transaction {
         Transaction {
             base: self.clone(),
@@ -780,6 +818,20 @@ impl Root {
             a.state.clone(),
         ))
     }
+}
+
+fn record_byte_pages(arena: &ByteArena, output: &mut BTreeMap<Digest, usize>) {
+    for segment in arena.segments.iter() {
+        output
+            .entry(segment.page.id)
+            .or_insert(segment.page.bytes.len());
+    }
+}
+
+fn byte_arena_metadata_bytes(arena: &ByteArena) -> usize {
+    size_of::<ByteArena>()
+        .saturating_add(arena.segments.len().saturating_mul(size_of::<Segment>()))
+        .saturating_add(2 * size_of::<usize>())
 }
 
 fn same_value(a: Option<&ByteArena>, b: Option<&ByteArena>) -> bool {
@@ -1107,6 +1159,30 @@ mod tests {
         let metrics = store.metrics();
         assert_eq!(metrics.page_reads, 1);
         assert_eq!(metrics.page_bytes_read, 2);
+    }
+
+    #[test]
+    fn retained_heap_accounting_includes_entity_index_overhead() {
+        let store = Store::new(64);
+        let empty = Root::empty(store.clone(), "generation-a");
+        let populated = Root::import(
+            store,
+            "generation-a",
+            b"x",
+            (0..1_000).map(|index| {
+                (
+                    format!("row/{index:04}").into_bytes(),
+                    format!("{{\"id\":{index}}}").into_bytes(),
+                )
+            }),
+            std::iter::empty(),
+        );
+
+        assert!(populated.retained_heap_bytes() > empty.retained_heap_bytes());
+        assert!(
+            populated.retained_heap_bytes() > 100_000,
+            "small entity snapshots still retain map, key, arena, and allocation metadata"
+        );
     }
 
     #[test]
