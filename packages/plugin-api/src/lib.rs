@@ -469,6 +469,7 @@ pub struct EntityChange {
 pub struct EntityChangeReader<'a> {
     source: &'a EntityChangeSource,
     page: std::vec::IntoIter<WitEntityChangeInput>,
+    max_page_bytes: u32,
     next: u32,
     eof: bool,
 }
@@ -479,16 +480,18 @@ impl std::fmt::Debug for EntityChangeReader<'_> {
             .debug_struct("EntityChangeReader")
             .field("next", &self.next)
             .field("buffered", &self.page.len())
+            .field("max_page_bytes", &self.max_page_bytes)
             .field("eof", &self.eof)
             .finish_non_exhaustive()
     }
 }
 
 impl EntityChangeReader<'_> {
-    fn new(source: &EntityChangeSource) -> EntityChangeReader<'_> {
+    fn new(source: &EntityChangeSource, max_page_bytes: u32) -> EntityChangeReader<'_> {
         EntityChangeReader {
             source,
             page: Vec::new().into_iter(),
+            max_page_bytes,
             next: 0,
             eof: false,
         }
@@ -501,7 +504,7 @@ impl EntityChangeReader<'_> {
             }
             let Some(page) = self
                 .source
-                .next_page(2 * 1024 * 1024)
+                .next_page(self.max_page_bytes)
                 .map_err(|error| host_error("host entity-change page read failed", error))?
             else {
                 self.eof = true;
@@ -822,7 +825,7 @@ impl<P: FormatPlugin> Guest for Component<P> {
             before: Root {
                 inner: &input.before,
             },
-            changes: EntityChangeReader::new(&input.changes),
+            changes: EntityChangeReader::new(&input.changes, max_batch_bytes),
         };
         let mut sink = Sink {
             inner: output,
@@ -851,7 +854,7 @@ impl<P: FormatPlugin> Guest for Component<P> {
                 media_type: input.descriptor.media_type,
             },
             accepted,
-            entities: EntityChangeReader::new(&input.entities),
+            entities: EntityChangeReader::new(&input.entities, max_batch_bytes),
             successor: Transaction { inner: output },
         };
         let mut sink = Sink {
@@ -891,7 +894,7 @@ impl<P: FormatPlugin> Guest for Component<P> {
                     insert: edit.insert,
                 })
                 .collect(),
-            entities: EntityChangeReader::new(&input.entities),
+            entities: EntityChangeReader::new(&input.entities, max_batch_bytes),
             successor: Transaction { inner: output },
             creates: CreateContext {
                 high: input.creates.high,
