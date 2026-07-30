@@ -663,6 +663,22 @@ where
         Self::load_exact_batch(self, request).await
     }
 
+    async fn collection_generation(
+        &self,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
+        let controls = load_branch_head_controls(&self.store, &[branch_id.to_owned()]).await?;
+        let Some(control) = controls.get(branch_id).copied() else {
+            return Ok(None);
+        };
+        self.tracked_head
+            .reader(&self.store)
+            .collection_generation(branch_id, control.generation, scope)
+            .await
+            .map(Some)
+    }
+
     async fn scan_tracked_batch(
         &self,
         request: &LiveStateScanRequest,

@@ -65,6 +65,18 @@ pub(crate) trait LiveStateReader: Send + Sync {
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError>;
+
+    /// Loads collection control from this reader's coherent storage snapshot.
+    ///
+    /// Readers without a published tracked-head projection conservatively
+    /// decline the proof so callers retain their ordinary identity scans.
+    async fn collection_generation(
+        &self,
+        _branch_id: &str,
+        _scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

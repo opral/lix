@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::branch::BranchRefReader;
@@ -1342,72 +1343,86 @@ where
         idempotency: Option<ExecuteIdempotency>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let telemetry_sink = self.telemetry.clone();
-        self.with_write_transaction(move |transaction| {
-            Box::pin(async move {
-                if let Some(results) = try_execute_transaction_parameter_batch(
-                    transaction,
-                    &statements,
-                    &parsed,
-                    &options,
-                    &statement_metadata,
-                    telemetry_sink.as_ref(),
-                )
-                .await?
-                {
+        let statements = Arc::new(statements);
+        let transaction_statements = Arc::clone(&statements);
+        let parameter_route = Arc::new(AtomicBool::new(false));
+        let transaction_parameter_route = Arc::clone(&parameter_route);
+        let transaction_telemetry_sink = telemetry_sink.clone();
+        let result = self
+            .with_write_transaction(move |transaction| {
+                Box::pin(async move {
+                    if let Some(results) = try_execute_transaction_parameter_batch(
+                        transaction,
+                        &transaction_statements,
+                        &parsed,
+                        &options,
+                        &statement_metadata,
+                        &transaction_parameter_route,
+                    )
+                    .await?
+                    {
+                        if let Some(idempotency) = &idempotency {
+                            let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
+                            transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
+                        }
+                        return Ok(results);
+                    }
+                    let mut results = Vec::with_capacity(transaction_statements.len());
+                    let parsed = parsed.into_vec();
+                    for (statement_index, ((statement, parsed), metadata)) in transaction_statements
+                        .iter()
+                        .zip(parsed)
+                        .zip(statement_metadata)
+                        .enumerate()
+                    {
+                        let telemetry = SqlStatementTelemetry::start(
+                            transaction_telemetry_sink.as_ref(),
+                            &statement.sql,
+                            "batch",
+                            Some(statement_index),
+                        );
+                        let operation = async {
+                            execute_transaction_statement(
+                                transaction,
+                                &statement.sql,
+                                parsed,
+                                &statement.params,
+                                options.clone(),
+                                metadata,
+                            )
+                            .await
+                            .map_err(|error| {
+                                with_batch_statement_index(
+                                    normalize_sql_surface_error(error, &statement.sql),
+                                    statement_index,
+                                )
+                            })
+                        };
+                        let result = match telemetry.as_ref() {
+                            Some(telemetry) => telemetry.instrument(operation).await,
+                            None => operation.await,
+                        };
+                        if let Some(telemetry) = telemetry {
+                            telemetry.finish(&result);
+                        }
+                        results.push(result?);
+                    }
                     if let Some(idempotency) = &idempotency {
                         let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
                         transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
                     }
-                    return Ok(results);
-                }
-                let mut results = Vec::with_capacity(statements.len());
-                let parsed = parsed.into_vec();
-                for (statement_index, ((statement, parsed), metadata)) in statements
-                    .iter()
-                    .zip(parsed)
-                    .zip(statement_metadata)
-                    .enumerate()
-                {
-                    let telemetry = SqlStatementTelemetry::start(
-                        telemetry_sink.as_ref(),
-                        &statement.sql,
-                        "batch",
-                        Some(statement_index),
-                    );
-                    let operation = async {
-                        execute_transaction_statement(
-                            transaction,
-                            &statement.sql,
-                            parsed,
-                            &statement.params,
-                            options.clone(),
-                            metadata,
-                        )
-                        .await
-                        .map_err(|error| {
-                            with_batch_statement_index(
-                                normalize_sql_surface_error(error, &statement.sql),
-                                statement_index,
-                            )
-                        })
-                    };
-                    let result = match telemetry.as_ref() {
-                        Some(telemetry) => telemetry.instrument(operation).await,
-                        None => operation.await,
-                    };
-                    if let Some(telemetry) = telemetry {
-                        telemetry.finish(&result);
-                    }
-                    results.push(result?);
-                }
-                if let Some(idempotency) = &idempotency {
-                    let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
-                    transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
-                }
-                Ok(results)
+                    Ok(results)
+                })
             })
-        })
-        .await
+            .await;
+        if parameter_route.load(Ordering::Relaxed) {
+            finish_parameter_batch_statement_telemetry(
+                telemetry_sink.as_ref(),
+                &statements,
+                &result,
+            );
+        }
+        result
     }
 
     async fn execute_read_only_batch(
@@ -2235,7 +2250,7 @@ async fn try_execute_transaction_parameter_batch<StorageImpl>(
     parsed: &TransactionBatchStatements,
     options: &ExecuteOptions,
     statement_metadata: &[ExecuteStatementMetadata],
-    telemetry_sink: Option<&Arc<dyn crate::telemetry::TelemetrySink>>,
+    parameter_route: &AtomicBool,
 ) -> Result<Option<Vec<ExecuteResult>>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -2299,17 +2314,19 @@ where
                 with_batch_statement_index(error, 0)
             }
         });
-    finish_parameter_batch_statement_telemetry(telemetry_sink, statements, &result);
+    if !matches!(result, Ok(None)) {
+        parameter_route.store(true, Ordering::Relaxed);
+    }
     result
 }
 
 fn finish_parameter_batch_statement_telemetry(
     telemetry_sink: Option<&Arc<dyn crate::telemetry::TelemetrySink>>,
     statements: &[ExecuteBatchStatement],
-    result: &Result<Option<Vec<ExecuteResult>>, LixError>,
+    result: &Result<Vec<ExecuteResult>, LixError>,
 ) {
     match result {
-        Ok(Some(results)) => {
+        Ok(results) => {
             for (statement_index, (statement, result)) in statements.iter().zip(results).enumerate()
             {
                 let Some(telemetry) = SqlStatementTelemetry::start(
@@ -2338,7 +2355,6 @@ fn finish_parameter_batch_statement_telemetry(
             };
             telemetry.finish(&Err(error.clone()));
         }
-        Ok(None) => {}
     }
 }
 
@@ -4064,6 +4080,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn certified_empty_batch_rechecks_concurrent_insert_at_commit_snapshot() {
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized storage should create engine");
+        let setup = engine.open_workspace_session().await.unwrap();
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "concurrent_parameter_insert_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        setup
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        let first = engine.open_workspace_session().await.unwrap();
+        let second = engine.open_workspace_session().await.unwrap();
+        let sql = "INSERT INTO concurrent_parameter_insert_probe (id, value) VALUES ($1, $2)";
+        let first_statements = [
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("first-only".to_string()),
+                    Value::Text("first".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("shared".to_string()),
+                    Value::Text("first".to_string()),
+                ],
+            },
+        ];
+        let parsed = TransactionBatchStatements::Shared {
+            statement: sql2::parse_statement(sql).unwrap(),
+            len: first_statements.len(),
+        };
+        let mut first_transaction = first.begin_transaction().await.unwrap();
+        let parameter_route = AtomicBool::new(false);
+        let staged = try_execute_transaction_parameter_batch(
+            first_transaction.transaction_mut().unwrap(),
+            &first_statements,
+            &parsed,
+            &ExecuteOptions::default(),
+            &vec![ExecuteStatementMetadata::default(); first_statements.len()],
+            &parameter_route,
+        )
+        .await
+        .unwrap();
+        assert!(
+            staged.is_some(),
+            "first batch should take the certified route"
+        );
+
+        second
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("second-only".to_string()),
+                        Value::Text("second".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("shared".to_string()),
+                        Value::Text("second".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .expect("concurrent batch should commit first");
+
+        let error = first_transaction
+            .commit()
+            .await
+            .expect_err("commit snapshot must observe the concurrent identity");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+        let rows = second
+            .execute(
+                "SELECT value FROM concurrent_parameter_insert_probe WHERE id = 'shared'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "second");
+    }
+
+    #[tokio::test]
     async fn execute_batch_declines_uncertified_entity_insert_rows() {
         let session = open_session().await;
         let schema = serde_json::json!({
@@ -4119,6 +4241,123 @@ mod tests {
             sql2::take_certified_entity_insert_parameter_batch_executions(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn execute_batch_declines_json_marked_utf8_for_string_columns() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_insert_json_string_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_certified_entity_insert_parameter_batch_executions();
+        let sql = "INSERT INTO parameter_insert_json_string_probe (id, value) VALUES ($1, $2)";
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("a".to_string()),
+                        Value::Json(serde_json::json!({"not": "text"})),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("b".to_string()),
+                        Value::Json(serde_json::json!({"also": "not text"})),
+                    ],
+                },
+            ])
+            .await
+            .expect_err("JSON objects must not be coerced into string column values");
+        assert_eq!(error.details.unwrap()["statementIndex"], 0);
+        assert_eq!(
+            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            0
+        );
+        let rows = session
+            .execute("SELECT id FROM parameter_insert_json_string_probe", &[])
+            .await
+            .unwrap();
+        assert!(rows.rows().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_batch_preserves_early_duplicate_before_later_schema_error() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_insert_error_order_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string", "minLength": 1 }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_certified_entity_insert_parameter_batch_executions();
+        let sql = "INSERT INTO parameter_insert_error_order_probe (id, value) VALUES ($1, $2)";
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("a".to_string()),
+                        Value::Text("valid".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("a".to_string()),
+                        Value::Text("also valid".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![Value::Text("b".to_string()), Value::Text(String::new())],
+                },
+            ])
+            .await
+            .expect_err("the earlier duplicate must precede later schema validation");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+        assert_eq!(
+            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            0
+        );
+        let rows = session
+            .execute("SELECT id FROM parameter_insert_error_order_probe", &[])
+            .await
+            .unwrap();
+        assert!(rows.rows().is_empty());
     }
 
     #[tokio::test]

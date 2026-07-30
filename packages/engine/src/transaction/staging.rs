@@ -322,6 +322,7 @@ pub(crate) struct PreparedInsertSelection {
     count: usize,
     bits: Vec<u64>,
     origins: Vec<Option<TransactionWriteOrigin>>,
+    statement_indices: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -329,10 +330,12 @@ pub(crate) struct PreparedInsertRef<'a> {
     pub(crate) row_index: usize,
     pub(crate) row: PreparedStateRowRef<'a>,
     pub(crate) origin: Option<&'a TransactionWriteOrigin>,
+    pub(crate) statement_index: Option<usize>,
 }
 
 impl PreparedInsertSelection {
     const WORD_BITS: usize = u64::BITS as usize;
+    const NO_STATEMENT_INDEX: u32 = u32::MAX;
 
     pub(crate) fn new() -> Self {
         Self::default()
@@ -344,6 +347,7 @@ impl PreparedInsertSelection {
             count: 0,
             bits: Vec::with_capacity(row_capacity.div_ceil(Self::WORD_BITS)),
             origins: Vec::with_capacity(row_capacity),
+            statement_indices: Vec::new(),
         }
     }
 
@@ -382,13 +386,14 @@ impl PreparedInsertSelection {
                 row_index,
                 row: rows.row(row_index),
                 origin: self.origins[row_index].as_ref(),
+                statement_index: self.statement_index(row_index),
             })
     }
 
-    fn push(&mut self, origin: Option<&TransactionWriteOrigin>) {
+    fn push(&mut self, origin: Option<&TransactionWriteOrigin>, statement_index: Option<usize>) {
         let row_index = self.row_count;
         self.resize_rows(row_index + 1);
-        self.mark(row_index, origin);
+        self.mark(row_index, origin, statement_index);
     }
 
     fn push_not_insert(&mut self) {
@@ -421,10 +426,19 @@ impl PreparedInsertSelection {
         if !self.bits.is_empty() {
             self.bits.resize(row_count.div_ceil(Self::WORD_BITS), 0);
         }
+        if !self.statement_indices.is_empty() {
+            self.statement_indices
+                .resize(row_count, Self::NO_STATEMENT_INDEX);
+        }
         self.row_count = row_count;
     }
 
-    fn mark(&mut self, row_index: usize, origin: Option<&TransactionWriteOrigin>) {
+    fn mark(
+        &mut self,
+        row_index: usize,
+        origin: Option<&TransactionWriteOrigin>,
+        statement_index: Option<usize>,
+    ) {
         debug_assert!(row_index < self.row_count);
         let word = row_index / Self::WORD_BITS;
         let bit = row_index % Self::WORD_BITS;
@@ -439,6 +453,23 @@ impl PreparedInsertSelection {
             self.count += 1;
             self.origins[row_index] = origin.cloned();
         }
+        if let Some(statement_index) = statement_index {
+            let statement_index =
+                u32::try_from(statement_index).expect("batch statement index must fit u32");
+            if self.statement_indices.is_empty() {
+                self.statement_indices
+                    .resize(self.row_count, Self::NO_STATEMENT_INDEX);
+            }
+            self.statement_indices[row_index] = statement_index;
+        }
+    }
+
+    fn statement_index(&self, row_index: usize) -> Option<usize> {
+        self.statement_indices
+            .get(row_index)
+            .copied()
+            .filter(|index| *index != Self::NO_STATEMENT_INDEX)
+            .map(|index| index as usize)
     }
 
     pub(crate) fn select_rows(&mut self, source_by_destination: &[usize]) {
@@ -449,7 +480,7 @@ impl PreparedInsertSelection {
         let mut selected = Self::with_row_capacity(source_by_destination.len());
         for &source in source_by_destination {
             if self.contains(source) {
-                selected.push(self.origins[source].as_ref());
+                selected.push(self.origins[source].as_ref(), self.statement_index(source));
             } else {
                 selected.push_not_insert();
             }
@@ -624,6 +655,7 @@ impl<'a> PreparedWriteValidationSet<'a> {
                 row_index,
                 row: self.state_rows.row(row_index),
                 origin: self.insert_selection.origin(row_index),
+                statement_index: self.insert_selection.statement_index(row_index),
             }
         })
     }
@@ -706,7 +738,8 @@ impl PreparedWriteSet {
             .iter()
             .position(|candidate| PreparedStateRowIdentity::from(candidate) == identity)
             .expect("test INSERT row must already exist in the prepared batch");
-        self.insert_selection.mark(row_index, row.origin.as_ref());
+        self.insert_selection
+            .mark(row_index, row.origin.as_ref(), None);
     }
 }
 
@@ -774,6 +807,7 @@ impl TransactionWriteBuffer {
         &self,
         mode: Option<TransactionWriteMode>,
         mut rows: PreparedStateBatch,
+        statement_indices: Option<&[u32]>,
     ) -> Result<AppendOnlyStage, LixError> {
         let inserts = mode == Some(TransactionWriteMode::Insert);
         if !matches!(
@@ -832,9 +866,12 @@ impl TransactionWriteBuffer {
             }
         }
         insert_selection.reserve_rows(rows.len(), inserts);
-        for row in &rows {
+        for (row_index, row) in rows.iter().enumerate() {
             if inserts {
-                insert_selection.push(row.origin);
+                insert_selection.push(
+                    row.origin,
+                    statement_indices.map(|indices| indices[row_index] as usize),
+                );
             } else {
                 insert_selection.push_not_insert();
             }
@@ -952,7 +989,7 @@ impl TransactionWriteBuffer {
         for index in 0..rows.len() {
             let row = rows.row(index);
             if row_is_insert(mode, row) {
-                insert_selection.push(row.origin);
+                insert_selection.push(row.origin, None);
             } else {
                 insert_selection.push_not_insert();
             }
@@ -1343,11 +1380,31 @@ impl TransactionWriteBuffer {
         &self,
         write: PreparedTransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write_inner(write, None)
+    }
+
+    pub(crate) fn stage_parameter_batch_insert(
+        &self,
+        write: PreparedTransactionWrite,
+        statement_indices: Vec<u32>,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write_inner(write, Some(statement_indices))
+    }
+
+    fn stage_write_inner(
+        &self,
+        write: PreparedTransactionWrite,
+        statement_indices: Option<Vec<u32>>,
+    ) -> Result<TransactionWriteOutcome, LixError> {
         let (mode, count) = match &write {
             PreparedTransactionWrite::Rows { mode, rows } => (Some(*mode), rows.len() as u64),
             PreparedTransactionWrite::RowsWithFileData { mode, count, .. } => (Some(*mode), *count),
         };
         let (mut rows, file_data_writes) = self.state_rows_from_stage_write(write);
+        if let Some(statement_indices) = &statement_indices {
+            debug_assert_eq!(mode, Some(TransactionWriteMode::Insert));
+            debug_assert_eq!(statement_indices.len(), rows.len());
+        }
         if rows.is_empty() {
             if !file_data_writes.is_empty() {
                 self.file_data_writes
@@ -1363,7 +1420,7 @@ impl TransactionWriteBuffer {
             return Ok(TransactionWriteOutcome { count });
         }
         if file_data_writes.is_empty() {
-            match self.stage_append_only_if_possible(mode, rows)? {
+            match self.stage_append_only_if_possible(mode, rows, statement_indices.as_deref())? {
                 AppendOnlyStage::Staged => return Ok(TransactionWriteOutcome { count }),
                 AppendOnlyStage::Fallback(fallback_rows) => rows = fallback_rows,
             }
@@ -1475,7 +1532,12 @@ impl TransactionWriteBuffer {
                 );
                 let identity = PreparedStateRowIdentity::from(row);
                 if is_insert {
-                    insert_selection.push(row.origin);
+                    insert_selection.push(
+                        row.origin,
+                        statement_indices
+                            .as_ref()
+                            .map(|indices| indices[index] as usize),
+                    );
                 } else {
                     insert_selection.push_not_insert();
                 }
@@ -1524,8 +1586,13 @@ impl TransactionWriteBuffer {
             let commit_id =
                 add_row_to_commit_change_refs(&mut commit_change_refs_guard, row, &self.functions);
             let identity = PreparedStateRowIdentity::from(row);
-            let insert_origin = if is_insert {
-                Some(row.origin.cloned())
+            let insert_metadata = if is_insert {
+                Some((
+                    row.origin.cloned(),
+                    statement_indices
+                        .as_ref()
+                        .map(|indices| indices[source_index] as usize),
+                ))
             } else {
                 None
             };
@@ -1539,8 +1606,8 @@ impl TransactionWriteBuffer {
                     index
                 }
             };
-            if let Some(origin) = insert_origin {
-                inserted_destinations.push((destination, origin));
+            if let Some(metadata) = insert_metadata {
+                inserted_destinations.push((destination, metadata));
             }
             placements.push((destination, source_index));
             latest_incoming_source_by_destination.insert(destination, source_index);
@@ -1558,8 +1625,8 @@ impl TransactionWriteBuffer {
         }
         staged_rows.truncate_rows(next_destination);
         insert_selection.resize_rows(next_destination);
-        for (destination, origin) in inserted_destinations {
-            insert_selection.mark(destination, origin.as_ref());
+        for (destination, (origin, statement_index)) in inserted_destinations {
+            insert_selection.mark(destination, origin.as_ref(), statement_index);
         }
         for index in new_candidate_destinations {
             by_candidate.insert(staged_rows.row(index), RowSlot::State(index));

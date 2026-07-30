@@ -1374,6 +1374,32 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
     live_state: &dyn LiveStateReader,
     prepared_writes: &PreparedWriteSet,
 ) -> Result<(), LixError> {
+    let mut inserts = prepared_writes
+        .insert_selection
+        .iter(&prepared_writes.state_rows);
+    if let Some(first) = inserts.next()
+        && inserts.all(|insert| {
+            insert.row.branch_id == first.row.branch_id
+                && insert.row.schema_key == first.row.schema_key
+                && insert.row.file_id == first.row.file_id
+        })
+    {
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: first.row.schema_key,
+            file_id: first.row.file_id.map(crate::common::SharedStr::as_str),
+        };
+        if live_state
+            .collection_generation(first.row.branch_id, scope)
+            .await?
+            .is_some_and(|generation| generation.live_count == 0)
+        {
+            // This proof comes from the exact coherent read used to resolve
+            // commit parents and branch-control preconditions. A concurrent
+            // insert before the read makes the count nonzero; one after the
+            // read invalidates the publication CAS.
+            return Ok(());
+        }
+    }
     validate_committed_insert_identity_entries(
         live_state,
         prepared_writes
@@ -1480,27 +1506,54 @@ where
                 } else {
                     "tracked"
                 };
-                return Err(LixError::new(
-                    LixError::CODE_UNIQUE,
-                    format!(
-                        "cannot insert {requested} row for schema '{}' entity_pk {:?}: a canonical {existing} row already exists; delete it first",
-                        insert.row.schema_key, insert.row.entity_pk,
+                return Err(with_insert_statement_index(
+                    LixError::new(
+                        LixError::CODE_UNIQUE,
+                        format!(
+                            "cannot insert {requested} row for schema '{}' entity_pk {:?}: a canonical {existing} row already exists; delete it first",
+                            insert.row.schema_key, insert.row.entity_pk,
+                        ),
                     ),
+                    insert.statement_index,
                 ));
             }
-            return Err(LixError::new(
-                LixError::CODE_UNIQUE,
-                duplicate_insert_identity_message(
-                    insert.row.schema_key,
-                    insert.row.entity_pk,
-                    None,
-                    insert.origin,
+            return Err(with_insert_statement_index(
+                LixError::new(
+                    LixError::CODE_UNIQUE,
+                    duplicate_insert_identity_message(
+                        insert.row.schema_key,
+                        insert.row.entity_pk,
+                        None,
+                        insert.origin,
+                    ),
                 ),
+                insert.statement_index,
             ));
         }
         group_start = group_end;
     }
     Ok(())
+}
+
+fn with_insert_statement_index(mut error: LixError, statement_index: Option<usize>) -> LixError {
+    let Some(statement_index) = statement_index else {
+        return error;
+    };
+    let mut details = match error.details.take() {
+        Some(serde_json::Value::Object(details)) => details,
+        Some(details) => {
+            let mut wrapped = serde_json::Map::new();
+            wrapped.insert("cause".to_string(), details);
+            wrapped
+        }
+        None => serde_json::Map::new(),
+    };
+    details.insert(
+        "statementIndex".to_string(),
+        serde_json::Value::from(statement_index),
+    );
+    error.details = Some(serde_json::Value::Object(details));
+    error
 }
 
 fn insert_scope_key<'a>(
