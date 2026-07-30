@@ -29,7 +29,7 @@ use lix_engine::wasm::{
 };
 use lix_engine::{LixError, SharedStr};
 use wasmtime::Store;
-use wasmtime::component::{Component, Linker, Resource};
+use wasmtime::component::{Component, Linker, Resource, ResourceTable};
 
 use super::{
     CompileProfile, CompiledComponentKey, TimeoutTickerLease, WasiHostState, WasmtimePluginRuntime,
@@ -39,6 +39,16 @@ use super::{
 const V3_MAX_BATCH_BYTES: u32 = 2 * 1024 * 1024;
 const CERTIFIED_TYPED_CSV_V1: u16 = 1;
 const CERTIFIED_CREATED_PACKET_V1: u16 = 2;
+
+fn take_borrowed_resource<T: Send + 'static>(
+    table: &mut ResourceTable,
+    resource: Resource<T>,
+    context: &str,
+) -> Result<T, LixError> {
+    table
+        .delete(resource)
+        .map_err(|error| v3_error(format!("{context}: {error}")))
+}
 
 pub(super) mod bindings {
     wasmtime::component::bindgen!({
@@ -2263,25 +2273,26 @@ impl V3Worker {
             &binding_input,
             Resource::new_borrow(transition_rep),
         );
+        let transition = take_borrowed_resource(
+            &mut self.store.data_mut().table,
+            transition,
+            "failed to recover v3 transaction",
+        )?;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
+                drop(transition);
                 return Err(v3_error(format!("v3 open-file rejected input: {error:?}")));
             }
             Err(error) => {
+                drop(transition);
                 return Err(wasm_runtime_error("v3 open-file trapped", error));
             }
         }
-        let transaction = self
-            .store
-            .data_mut()
-            .table
-            .delete(transition)
-            .map_err(|error| v3_error(format!("failed to recover v3 transaction: {error}")))?;
         let TransitionResource {
             transaction,
             state: transaction_state,
-        } = transaction;
+        } = transition;
         drop(transaction_state);
         let root = transaction
             .commit()
@@ -2398,27 +2409,28 @@ impl V3Worker {
                     Resource::new_borrow(transition_rep),
                 )
             });
+        let transition = take_borrowed_resource(
+            &mut self.store.data_mut().table,
+            transition,
+            "failed to recover v3 transaction",
+        )?;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
+                drop(transition);
                 return Err(v3_error(format!(
                     "v3 file-changed rejected input: {error:?}"
                 )));
             }
             Err(error) => {
+                drop(transition);
                 return Err(wasm_runtime_error("v3 file-changed trapped", error));
             }
         }
-        let transaction = self
-            .store
-            .data_mut()
-            .table
-            .delete(transition)
-            .map_err(|error| v3_error(format!("failed to recover v3 transaction: {error}")))?;
         let TransitionResource {
             transaction,
             state: transaction_state,
-        } = transaction;
+        } = transition;
         drop(transaction_state);
         let root = tracing::debug_span!(target: "lix_perf", "lix.perf.v3_arena_commit").in_scope(
             || {
@@ -2616,25 +2628,24 @@ impl V3Worker {
             &binding_input,
             Resource::new_borrow(transition_rep),
         );
+        let transition = take_borrowed_resource(
+            &mut self.store.data_mut().table,
+            transition,
+            "failed to recover v3 entity transition",
+        )?;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
+                drop(transition);
                 return Err(v3_error(format!(
                     "v3 entities-changed rejected input: {error:?}"
                 )));
             }
             Err(error) => {
+                drop(transition);
                 return Err(wasm_runtime_error("v3 entities-changed trapped", error));
             }
         }
-        let transition = self
-            .store
-            .data_mut()
-            .table
-            .delete(transition)
-            .map_err(|error| {
-                v3_error(format!("failed to recover v3 entity transition: {error}"))
-            })?;
         let TransitionResource {
             mut transaction,
             state: transaction_state,
@@ -2767,27 +2778,29 @@ impl V3Worker {
                 },
             },
         );
-        match self.guest.call_apply(
+        let result = self.guest.call_apply(
             &mut self.store,
             &request,
             Resource::new_borrow(transition_rep),
-        ) {
+        );
+        let transition = take_borrowed_resource(
+            &mut self.store.data_mut().table,
+            transition,
+            "failed to recover v3 cold transition",
+        )?;
+        match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
+                drop(transition);
                 return Err(v3_error(format!(
                     "v3 cold hydration rejected input: {error:?}"
                 )));
             }
             Err(error) => {
+                drop(transition);
                 return Err(wasm_runtime_error("v3 cold hydration trapped", error));
             }
         }
-        let transition = self
-            .store
-            .data_mut()
-            .table
-            .delete(transition)
-            .map_err(|error| v3_error(format!("failed to recover v3 cold transition: {error}")))?;
         let TransitionResource {
             transaction,
             state: transaction_state,
@@ -3599,5 +3612,18 @@ mod tests {
             duplicate_explicit.message,
             "a component entity key may occur only once across certified packet pages"
         );
+    }
+
+    #[test]
+    fn borrowed_transition_owner_is_reclaimed_before_error_propagation() {
+        let mut table = ResourceTable::new();
+        let transition = table.push(vec![1_u8, 2, 3]).expect("transition resource");
+
+        let recovered =
+            take_borrowed_resource(&mut table, transition, "recover rejected transition")
+                .expect("host owner remains deletable after a borrowed guest call");
+
+        assert_eq!(recovered, vec![1, 2, 3]);
+        assert!(table.is_empty());
     }
 }

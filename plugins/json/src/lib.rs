@@ -419,7 +419,20 @@ fn sparse_scalar_change(
         -i64::try_from(edit.delete_len - insert_len)
             .map_err(|_| sdk::Error::limit_exceeded("JSON scalar shrink exceeds i64"))?
     };
-    shifts.push((ordinal, delta));
+    if delta != 0 {
+        match shifts.binary_search_by_key(&ordinal, |(changed, _)| *changed) {
+            Ok(index) => {
+                shifts[index].1 = shifts[index]
+                    .1
+                    .checked_add(delta)
+                    .ok_or_else(|| sdk::Error::invalid_input("JSON scalar shift overflowed"))?;
+                if shifts[index].1 == 0 {
+                    shifts.remove(index);
+                }
+            }
+            Err(index) => shifts.insert(index, (ordinal, delta)),
+        }
+    }
     Ok(Some((change, encode_scalar_shifts(&shifts))))
 }
 
@@ -684,15 +697,23 @@ fn decode_scalar_shifts(bytes: &[u8]) -> sdk::Result<Vec<(u32, i64)>> {
             "truncated JSON scalar shift overlay",
         ));
     }
-    Ok(bytes
-        .chunks_exact(12)
-        .map(|record| {
-            (
-                u32::from_le_bytes(record[0..4].try_into().expect("fixed shift record")),
-                i64::from_le_bytes(record[4..12].try_into().expect("fixed shift record")),
-            )
-        })
-        .collect())
+    let mut shifts = std::collections::BTreeMap::<u32, i64>::new();
+    for record in bytes.chunks_exact(12) {
+        let ordinal = u32::from_le_bytes(record[0..4].try_into().expect("fixed shift record"));
+        let delta = i64::from_le_bytes(record[4..12].try_into().expect("fixed shift record"));
+        let total = shifts
+            .get(&ordinal)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(delta)
+            .ok_or_else(|| sdk::Error::invalid_input("JSON scalar shift overflowed"))?;
+        if total == 0 {
+            shifts.remove(&ordinal);
+        } else {
+            shifts.insert(ordinal, total);
+        }
+    }
+    Ok(shifts.into_iter().collect())
 }
 
 fn encode_scalar_shifts(shifts: &[(u32, i64)]) -> Vec<u8> {
@@ -919,3 +940,21 @@ fn push_inline_blob(output: &mut Vec<u8>, bytes: &[u8]) -> sdk::Result<()> {
 
 #[cfg(target_family = "wasm")]
 lix_plugin_api::export_plugin!(JsonPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalar_shift_overlay_compacts_repeated_and_zero_delta_edits() {
+        let mut encoded = Vec::new();
+        for (ordinal, delta) in [(7_u32, 3_i64), (2, 4), (7, -1), (2, -4), (7, 0)] {
+            encoded.extend_from_slice(&ordinal.to_le_bytes());
+            encoded.extend_from_slice(&delta.to_le_bytes());
+        }
+
+        let shifts = decode_scalar_shifts(&encoded).expect("valid shift overlay");
+        assert_eq!(shifts, vec![(7, 2)]);
+        assert_eq!(encode_scalar_shifts(&shifts).len(), 12);
+    }
+}

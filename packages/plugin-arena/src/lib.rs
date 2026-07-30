@@ -14,7 +14,8 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 pub const DEFAULT_PAGE_BYTES: usize = 64 * 1024;
 pub const REQUIRED_V3_SPEEDUP: u64 = 2;
@@ -145,7 +146,8 @@ pub struct Store {
 #[derive(Debug)]
 struct StoreInner {
     page_bytes: usize,
-    pages: Mutex<HashMap<Digest, Arc<[u8]>>>,
+    pages: Mutex<HashMap<Digest, Weak<[u8]>>>,
+    interns_since_sweep: AtomicUsize,
     metrics: Mutex<Metrics>,
 }
 
@@ -162,6 +164,7 @@ impl Store {
             inner: Arc::new(StoreInner {
                 page_bytes,
                 pages: Mutex::new(HashMap::new()),
+                interns_since_sweep: AtomicUsize::new(0),
                 metrics: Mutex::new(Metrics::default()),
             }),
         }
@@ -180,61 +183,93 @@ impl Store {
     }
 
     pub fn unique_page_count(&self) -> usize {
-        self.inner.pages.lock().len()
+        let mut pages = self.inner.pages.lock();
+        pages.retain(|_, page| page.strong_count() > 0);
+        pages.len()
     }
 
     pub fn unique_page_bytes(&self) -> usize {
-        self.inner
-            .pages
-            .lock()
+        let mut pages = self.inner.pages.lock();
+        pages.retain(|_, page| page.strong_count() > 0);
+        pages
             .values()
+            .filter_map(Weak::upgrade)
             .map(|page| page.len())
             .sum()
     }
 
-    fn intern(&self, bytes: &[u8]) -> Digest {
+    fn intern(&self, bytes: &[u8]) -> Page {
         let id = digest(b"lix-plugin-v3/page\0", [bytes]);
         let mut pages = self.inner.pages.lock();
-        if let std::collections::hash_map::Entry::Vacant(entry) = pages.entry(id) {
-            entry.insert(Arc::from(bytes));
+        if self
+            .inner
+            .interns_since_sweep
+            .fetch_add(1, Ordering::Relaxed)
+            >= 1_023
+        {
+            pages.retain(|_, page| page.strong_count() > 0);
+            self.inner.interns_since_sweep.store(0, Ordering::Relaxed);
+        }
+        if let Some(bytes) = pages.get(&id).and_then(Weak::upgrade) {
+            return Page { id, bytes };
+        }
+        let bytes: Arc<[u8]> = Arc::from(bytes);
+        pages.insert(id, Arc::downgrade(&bytes));
+        {
             let mut metrics = self.inner.metrics.lock();
             metrics.pages_interned = metrics.pages_interned.saturating_add(1);
             metrics.page_bytes_interned = metrics
                 .page_bytes_interned
                 .saturating_add(bytes.len() as u64);
         }
-        id
+        Page { id, bytes }
     }
 
-    fn read_page(&self, id: Digest, range: Range<usize>) -> Result<Vec<u8>, Error> {
-        let pages = self.inner.pages.lock();
-        let page = pages.get(&id).ok_or(Error::MissingPage(id))?;
-        let selected = page.get(range).ok_or(Error::InvalidPageRange)?;
+    fn read_page(&self, page: &Page, range: Range<usize>) -> Result<Vec<u8>, Error> {
+        let selected = page.bytes.get(range).ok_or(Error::InvalidPageRange)?;
         let output = selected.to_vec();
-        drop(pages);
         let mut metrics = self.inner.metrics.lock();
         metrics.page_reads = metrics.page_reads.saturating_add(1);
         metrics.page_bytes_read = metrics.page_bytes_read.saturating_add(output.len() as u64);
         Ok(output)
     }
 
-    fn insert_archived_page(&self, expected: Digest, bytes: &[u8]) -> Result<(), Error> {
+    fn insert_archived_page(&self, expected: Digest, bytes: &[u8]) -> Result<Page, Error> {
         let actual = digest(b"lix-plugin-v3/page\0", [bytes]);
         if actual != expected {
             return Err(Error::CorruptArchive);
         }
+        Ok(self.intern(bytes))
+    }
+
+    fn page(&self, id: Digest) -> Result<Page, Error> {
         self.inner
             .pages
             .lock()
-            .entry(expected)
-            .or_insert_with(|| Arc::from(bytes));
-        Ok(())
+            .get(&id)
+            .and_then(Weak::upgrade)
+            .map(|bytes| Page { id, bytes })
+            .ok_or(Error::MissingPage(id))
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+struct Page {
+    id: Digest,
+    bytes: Arc<[u8]>,
+}
+
+impl PartialEq for Page {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Page {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Segment {
-    page: Digest,
+    page: Page,
     offset: u32,
     len: u32,
 }
@@ -268,7 +303,7 @@ impl ByteArena {
         let mut parts = Vec::with_capacity(1 + segments.len() * 3);
         parts.push(len.to_le_bytes().to_vec());
         for segment in &segments {
-            parts.push(segment.page.0.to_vec());
+            parts.push(segment.page.id.0.to_vec());
             parts.push(segment.offset.to_le_bytes().to_vec());
             parts.push(segment.len.to_le_bytes().to_vec());
         }
@@ -318,7 +353,7 @@ impl ByteArena {
                     .map_err(|_| Error::RangeOverflow)?;
                 output.extend_from_slice(
                     &self.store.read_page(
-                        segment.page,
+                        &segment.page,
                         start
                             ..start
                                 .checked_add(selected_len)
@@ -384,7 +419,7 @@ impl ByteArena {
             let selected_end = end.min(segment_end);
             if selected_start < selected_end {
                 output.push(Segment {
-                    page: segment.page,
+                    page: segment.page.clone(),
                     offset: u32::try_from(
                         u64::from(segment.offset) + selected_start.saturating_sub(logical),
                     )
@@ -406,7 +441,7 @@ fn coalesce_segments(segments: &mut Vec<Segment>) {
     let mut output: Vec<Segment> = Vec::with_capacity(segments.len());
     for segment in segments.drain(..) {
         if let Some(last) = output.last_mut()
-            && last.page == segment.page
+            && last.page.id == segment.page.id
             && last.offset.checked_add(last.len) == Some(segment.offset)
             && last.len.checked_add(segment.len).is_some()
         {
@@ -707,23 +742,26 @@ fn collect_byte_pages(
     arena: &ByteArena,
     output: &mut BTreeMap<Digest, Vec<u8>>,
 ) -> Result<(), Error> {
-    let pages = arena.store.inner.pages.lock();
     for segment in arena.segments.iter() {
-        let page = pages
-            .get(&segment.page)
-            .ok_or(Error::MissingPage(segment.page))?;
         output
-            .entry(segment.page)
-            .or_insert_with(|| page.as_ref().to_vec());
+            .entry(segment.page.id)
+            .or_insert_with(|| segment.page.bytes.as_ref().to_vec());
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ArchivedSegment {
+    page: Digest,
+    offset: u32,
+    len: u32,
 }
 
 #[derive(Debug, Clone)]
 struct ArchivedByteArena {
     id: Digest,
     len: u64,
-    segments: Vec<Segment>,
+    segments: Vec<ArchivedSegment>,
 }
 
 impl ByteArena {
@@ -731,12 +769,31 @@ impl ByteArena {
         ArchivedByteArena {
             id: self.id,
             len: self.len,
-            segments: self.segments.to_vec(),
+            segments: self
+                .segments
+                .iter()
+                .map(|segment| ArchivedSegment {
+                    page: segment.page.id,
+                    offset: segment.offset,
+                    len: segment.len,
+                })
+                .collect(),
         }
     }
 
     fn reopen(store: Store, archived: &ArchivedByteArena) -> Result<Self, Error> {
-        let arena = Self::from_segments(store, archived.len, archived.segments.clone());
+        let segments = archived
+            .segments
+            .iter()
+            .map(|segment| {
+                Ok(Segment {
+                    page: store.page(segment.page)?,
+                    offset: segment.offset,
+                    len: segment.len,
+                })
+            })
+            .collect::<Result<_, Error>>()?;
+        let arena = Self::from_segments(store, archived.len, segments);
         if arena.id != archived.id {
             return Err(Error::CorruptArchive);
         }
@@ -766,9 +823,11 @@ pub struct Archive {
 impl Archive {
     pub fn reopen(&self) -> Result<(Store, Root), Error> {
         let store = Store::new(self.page_bytes);
-        for (id, bytes) in &self.pages {
-            store.insert_archived_page(*id, bytes)?;
-        }
+        let _pages = self
+            .pages
+            .iter()
+            .map(|(id, bytes)| store.insert_archived_page(*id, bytes))
+            .collect::<Result<Vec<_>, Error>>()?;
         let root = Root::new(
             self.generation.clone(),
             ByteArena::reopen(store.clone(), &self.bytes)?,
@@ -889,6 +948,31 @@ mod tests {
         );
         assert_ne!(root.id(), successor.id());
         assert!(store.unique_page_count() < base_pages * 2 + 8);
+    }
+
+    #[test]
+    fn dropped_roots_reclaim_unreferenced_page_contents() {
+        let store = Store::new(4);
+        let mut root = Root::import(
+            store.clone(),
+            "generation-a",
+            b"abcdefgh",
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        for value in 0_u8..64 {
+            let mut transaction = root.transaction();
+            transaction.edit_bytes(ByteEdit {
+                offset: 0,
+                delete_len: 1,
+                insert: vec![value],
+            });
+            root = transaction.commit().unwrap();
+        }
+
+        assert_eq!(root.bytes.read(0, root.bytes.len()).unwrap().len(), 8);
+        assert_eq!(store.unique_page_count(), root.bytes.segment_count());
+        assert!(store.unique_page_bytes() <= 8 + store.page_bytes());
     }
 
     #[test]
