@@ -630,6 +630,9 @@ pub(crate) async fn stage_certified_entity_batches(
                     2 | crate::wasm::HOST_CERTIFIED_PACKET_FORMAT => {
                         certified_packet_page_local_ref_range(page)?.unwrap_or((0, u32::MAX))
                     }
+                    crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT => {
+                        certified_zstd_packet_page_header(page)?.0
+                    }
                     _ => (0, u32::MAX),
                 };
                 value.extend_from_slice(&first_local_ref.to_le_bytes());
@@ -756,6 +759,59 @@ fn certified_packet_page_local_ref_range(page: &[u8]) -> Result<Option<(u32, u32
     Ok(first.zip(last))
 }
 
+fn certified_zstd_packet_page_header(page: &[u8]) -> Result<((u32, u32), usize, &[u8]), LixError> {
+    let (header, compressed) = page
+        .split_at_checked(12)
+        .ok_or_else(|| head_value_error("compressed certified packet page is truncated"))?;
+    let first_local_ref = u32::from_le_bytes(
+        header[..4]
+            .try_into()
+            .expect("compressed packet first local ref"),
+    );
+    let last_local_ref = u32::from_le_bytes(
+        header[4..8]
+            .try_into()
+            .expect("compressed packet last local ref"),
+    );
+    if first_local_ref > last_local_ref {
+        return Err(head_value_error(
+            "compressed certified packet page has an inverted local-ref range",
+        ));
+    }
+    let uncompressed_len = u32::from_le_bytes(
+        header[8..12]
+            .try_into()
+            .expect("compressed packet uncompressed length"),
+    ) as usize;
+    if uncompressed_len == 0 || uncompressed_len > 64 * 1024 * 1024 {
+        return Err(head_value_error(
+            "compressed certified packet page has an invalid uncompressed length",
+        ));
+    }
+    Ok((
+        (first_local_ref, last_local_ref),
+        uncompressed_len,
+        compressed,
+    ))
+}
+
+fn decode_certified_zstd_packet_page(page: &[u8]) -> Result<Vec<u8>, LixError> {
+    let (_, uncompressed_len, compressed) = certified_zstd_packet_page_header(page)?;
+    let decoded =
+        crate::compression::decompress_zstd(compressed, uncompressed_len).map_err(|error| {
+            head_value_error(format!(
+                "compressed certified packet page failed to decode: {error}"
+            ))
+        })?;
+    if decoded.len() != uncompressed_len {
+        return Err(head_value_error(format!(
+            "compressed certified packet page decoded to {} bytes, expected {uncompressed_len}",
+            decoded.len(),
+        )));
+    }
+    Ok(decoded)
+}
+
 fn certified_external_page_plan(
     bytes: &[u8],
     content_key: &[u8],
@@ -778,32 +834,34 @@ fn certified_external_page_plan(
         high: input.u64()?,
         low: input.u32()?,
     };
-    let selected_local_refs =
-        ((format == 1 || format == 2 || format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT)
-            && !request.filter.entity_pks.is_empty())
-        .then(|| {
-            let high = creates.high.to_be_bytes();
-            let low = creates.low.to_be_bytes();
-            request
-                .filter
-                .entity_pks
-                .iter()
-                .map(|entity_pk| match entity_pk.components.as_slice() {
-                    [crate::entity_pk::EntityPkComponent::Uuid(bytes)]
-                        if bytes[..8] == high && bytes[8..12] == low =>
-                    {
-                        Ok(u32::from_be_bytes(
-                            bytes[12..]
-                                .try_into()
-                                .expect("UUID local-reference suffix is four bytes"),
-                        ))
-                    }
-                    _ => Err(()),
-                })
-                .collect::<Result<BTreeSet<_>, _>>()
-                .ok()
-        })
-        .flatten();
+    let selected_local_refs = ((format == 1
+        || format == 2
+        || format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+        || format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT)
+        && !request.filter.entity_pks.is_empty())
+    .then(|| {
+        let high = creates.high.to_be_bytes();
+        let low = creates.low.to_be_bytes();
+        request
+            .filter
+            .entity_pks
+            .iter()
+            .map(|entity_pk| match entity_pk.components.as_slice() {
+                [crate::entity_pk::EntityPkComponent::Uuid(bytes)]
+                    if bytes[..8] == high && bytes[8..12] == low =>
+                {
+                    Ok(u32::from_be_bytes(
+                        bytes[12..]
+                            .try_into()
+                            .expect("UUID local-reference suffix is four bytes"),
+                    ))
+                }
+                _ => Err(()),
+            })
+            .collect::<Result<BTreeSet<_>, _>>()
+            .ok()
+    })
+    .flatten();
     let page_count = input.u32()?;
     let mut pages = Vec::with_capacity(page_count as usize);
     for page_index in 0..page_count {
@@ -841,17 +899,50 @@ async fn scan_certified_entity_batch_rows(
     if matches!(limit, Some(0)) {
         return Ok(MaterializedLiveStateBatch::default());
     }
-    let manifests = ScanPlan::prefix(
-        CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-        StoragePrefix {
-            bytes: Bytes::copy_from_slice(generation.as_uuid().as_bytes()),
-        },
-    )
-    .collect(store, StorageScanOptions::default())
-    .await?;
-    let content_keys = manifests
-        .value
-        .entries
+    let exact_file_ids = (!request.filter.file_ids.is_empty()
+        && !request
+            .filter
+            .file_ids
+            .iter()
+            .any(|file_id| matches!(file_id, NullableKeyFilter::Any)))
+    .then(|| {
+        request
+            .filter
+            .file_ids
+            .iter()
+            .filter_map(|file_id| match file_id {
+                NullableKeyFilter::Value(file_id) => Some(file_id.as_str()),
+                NullableKeyFilter::Any | NullableKeyFilter::Null => None,
+            })
+            .collect::<BTreeSet<_>>()
+    });
+    let mut manifest_entries = Vec::new();
+    if let Some(file_ids) = exact_file_ids {
+        for file_id in file_ids {
+            let mut prefix = generation.as_uuid().as_bytes().to_vec();
+            append_batch_text(&mut prefix, file_id)?;
+            let manifests = ScanPlan::prefix(
+                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+                StoragePrefix {
+                    bytes: Bytes::from(prefix),
+                },
+            )
+            .collect(store, StorageScanOptions::default())
+            .await?;
+            manifest_entries.extend(manifests.value.entries);
+        }
+    } else {
+        let manifests = ScanPlan::prefix(
+            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+            StoragePrefix {
+                bytes: Bytes::copy_from_slice(generation.as_uuid().as_bytes()),
+            },
+        )
+        .collect(store, StorageScanOptions::default())
+        .await?;
+        manifest_entries = manifests.value.entries;
+    }
+    let content_keys = manifest_entries
         .into_iter()
         .map(|entry| full_value_bytes(entry.value).map(StorageKey))
         .collect::<Result<Vec<_>, _>>()?;
@@ -867,35 +958,46 @@ async fn scan_certified_entity_batch_rows(
             .columns
             .iter()
             .any(|column| column == "snapshot_content");
-    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(
-        limit.unwrap_or_else(|| contents.len().saturating_mul(1024)),
-    );
+    let mut decode_inputs = Vec::with_capacity(content_keys.len());
+    let mut page_routes = Vec::new();
+    let mut page_keys = Vec::new();
     for (content_key, value) in content_keys.into_iter().zip(contents) {
         let Some(value) = value else {
             continue;
         };
         let value = full_value_bytes(value)?;
         let external_plan = certified_external_page_plan(&value, content_key.0.as_ref(), request)?;
-        let external_pages = if let Some(plan) = &external_plan {
-            let keys = plan.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
-            let values = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_PAGE_SPACE, &keys)
-                .materialize(store, StorageGetOptions::default())
-                .await?
-                .value;
-            Some(
-                plan.iter()
-                    .zip(values)
-                    .map(|((page_index, _), value)| {
-                        let value = value.ok_or_else(|| {
-                            head_value_error("certified entity batch page is missing")
-                        })?;
-                        Ok((*page_index, full_value_bytes(value)?))
-                    })
-                    .collect::<Result<Vec<_>, LixError>>()?,
-            )
-        } else {
-            None
-        };
+        let input_index = decode_inputs.len();
+        let external_pages = external_plan
+            .as_ref()
+            .map(|plan| Vec::with_capacity(plan.len()));
+        if let Some(plan) = external_plan {
+            for (page_index, key) in plan {
+                page_routes.push((input_index, page_index));
+                page_keys.push(key);
+            }
+        }
+        decode_inputs.push((value, external_pages));
+    }
+    if !page_keys.is_empty() {
+        let page_values = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_PAGE_SPACE, &page_keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?
+            .value;
+        for ((input_index, page_index), value) in page_routes.into_iter().zip(page_values) {
+            let value =
+                value.ok_or_else(|| head_value_error("certified entity batch page is missing"))?;
+            decode_inputs[input_index]
+                .1
+                .as_mut()
+                .expect("external page route belongs to an external batch")
+                .push((page_index, full_value_bytes(value)?));
+        }
+    }
+    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(
+        limit.unwrap_or_else(|| decode_inputs.len().saturating_mul(1024)),
+    );
+    for (value, external_pages) in decode_inputs {
         decode_certified_entity_batch_rows(
             &value,
             external_pages.as_deref(),
@@ -1041,7 +1143,11 @@ fn decode_certified_entity_batch_rows(
     );
     let timestamp = LixTimestamp::parse(input.text()?).map_err(head_value_error)?;
     let format = input.u16()?;
-    if format != 1 && format != 2 && format != crate::wasm::HOST_CERTIFIED_PACKET_FORMAT {
+    if format != 1
+        && format != 2
+        && format != crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+        && format != crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+    {
         return Err(head_value_error(format!(
             "unsupported certified entity batch format {format}"
         )));
@@ -1101,7 +1207,17 @@ fn decode_certified_entity_batch_rows(
             let page_len = input.u32()? as usize;
             input.bytes(page_len)?
         };
-        if format == 2 || format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT {
+        let decoded_page;
+        let page = if format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT {
+            decoded_page = decode_certified_zstd_packet_page(page)?;
+            decoded_page.as_slice()
+        } else {
+            page
+        };
+        if format == 2
+            || format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+            || format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+        {
             decoded_rows = decoded_rows.saturating_add(decode_certified_packet_rows(
                 page,
                 &creates,
@@ -6537,11 +6653,46 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use bytes::Bytes;
 
     use super::*;
     use crate::branch::{BranchHeadControl, stage_branch_head_control};
-    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::{
+        Memory, StorageAdapter, StorageGetManyRequest, StorageGetManyResult, StorageKeyRange,
+        StorageReadOptions, StorageScanChunk, StorageScanOptions, StorageSpaceId,
+        StorageWriteOptions,
+    };
+
+    struct CountingRead<R> {
+        inner: R,
+        get_many_calls: Arc<AtomicUsize>,
+    }
+
+    impl<R: StorageAdapterRead> StorageAdapterRead for CountingRead<R> {
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+
+        async fn get_many(
+            &self,
+            requests: &[StorageGetManyRequest<'_>],
+        ) -> Result<StorageGetManyResult, crate::storage_adapter::StorageError> {
+            self.get_many_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_many(requests).await
+        }
+
+        async fn scan(
+            &self,
+            space: StorageSpaceId,
+            range: StorageKeyRange,
+            opts: StorageScanOptions,
+        ) -> Result<StorageScanChunk, crate::storage_adapter::StorageError> {
+            self.inner.scan(space, range, opts).await
+        }
+    }
 
     fn timestamp() -> LixTimestamp {
         LixTimestamp::expect_parse("hot working-diff test timestamp", "2026-01-01T00:00:00Z")
@@ -6631,6 +6782,86 @@ mod tests {
         assert_eq!(certified_packet_page_local_ref_range(&keyed).unwrap(), None);
     }
 
+    #[test]
+    fn compressed_certified_page_rejects_invalid_bounds_and_corruption() {
+        let mut inverted = Vec::new();
+        inverted.extend_from_slice(&2_u32.to_le_bytes());
+        inverted.extend_from_slice(&1_u32.to_le_bytes());
+        inverted.extend_from_slice(&1_u32.to_le_bytes());
+        inverted.push(0);
+        assert!(certified_zstd_packet_page_header(&inverted).is_err());
+
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&1_u32.to_le_bytes());
+        oversized.extend_from_slice(&2_u32.to_le_bytes());
+        oversized.extend_from_slice(&(64_u32 * 1024 * 1024 + 1).to_le_bytes());
+        oversized.push(0);
+        assert!(certified_zstd_packet_page_header(&oversized).is_err());
+
+        let mut corrupt = Vec::new();
+        corrupt.extend_from_slice(&1_u32.to_le_bytes());
+        corrupt.extend_from_slice(&2_u32.to_le_bytes());
+        corrupt.extend_from_slice(&16_u32.to_le_bytes());
+        corrupt.extend_from_slice(b"not a zstd frame");
+        assert!(decode_certified_zstd_packet_page(&corrupt).is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_file_certified_scan_does_not_read_unrelated_manifest() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("exact-certified-file-generation");
+        let malformed_content_key = StorageKey(Bytes::from_static(b"malformed-content"));
+        let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
+        append_batch_text(&mut manifest_key, "unrelated.md").unwrap();
+        manifest_key
+            .extend_from_slice(&crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
+        manifest_key.extend_from_slice(
+            CommitId::for_test_label("unrelated-certified-commit")
+                .as_uuid()
+                .as_bytes(),
+        );
+        let mut writes = storage.new_write_set();
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+            StorageKey(Bytes::from(manifest_key)),
+            StorageValue {
+                bytes: malformed_content_key.0.clone(),
+            },
+        );
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_SPACE,
+            malformed_content_key,
+            StorageValue {
+                bytes: Bytes::from_static(b"malformed"),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let rows = scan_certified_entity_batch_rows(
+            &read,
+            "main",
+            generation,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    file_ids: vec![NullableKeyFilter::Value("requested.md".to_owned())],
+                    ..TrackedStateFilter::default()
+                },
+                ..TrackedStateScanRequest::default()
+            },
+            None,
+        )
+        .await
+        .expect("exact-file scan must not decode unrelated certified content");
+        assert!(rows.is_empty());
+    }
+
     #[tokio::test]
     async fn branch_creation_inherits_certified_manifests_from_same_head() {
         const EMPTY_BRANCH: &str = "a-empty";
@@ -6638,6 +6869,7 @@ mod tests {
         const SECOND_DONOR_BRANCH: &str = "donor-two";
         const CREATED_BRANCH: &str = "created";
         const FILE_ID: &str = "inherited.csv";
+        const SECOND_FILE_ID: &str = "inherited-two.csv";
         const SCHEMA_KEY: &str = "inherited_row";
 
         let storage = StorageAdapter::new(Memory::new());
@@ -6677,19 +6909,34 @@ mod tests {
         page.extend_from_slice(&1_u16.to_le_bytes());
         page.extend_from_slice(&5_u32.to_le_bytes());
         page.extend_from_slice(b"value");
-        let batches = [WasmCertifiedEntityBatch {
+        let batch = WasmCertifiedEntityBatch {
             format: 1,
             schema_keys: vec![SCHEMA_KEY.to_owned()],
             row_count: 1,
             creates,
             complete_file_state: true,
             pages: vec![Bytes::from(page)],
+        };
+        let batches = [batch.clone()];
+        let second_batches = [WasmCertifiedEntityBatch {
+            creates: WasmCreateContext {
+                low: creates.low + 1,
+                ..creates
+            },
+            ..batch
         }];
-        let files = [CertifiedEntityBatchFileRef {
-            branch_id: DONOR_BRANCH,
-            file_id: FILE_ID,
-            batches: &batches,
-        }];
+        let files = [
+            CertifiedEntityBatchFileRef {
+                branch_id: DONOR_BRANCH,
+                file_id: FILE_ID,
+                batches: &batches,
+            },
+            CertifiedEntityBatchFileRef {
+                branch_id: DONOR_BRANCH,
+                file_id: SECOND_FILE_ID,
+                batches: &second_batches,
+            },
+        ];
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -6787,6 +7034,11 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("created branch verification read should open");
+        let get_many_calls = Arc::new(AtomicUsize::new(0));
+        let read = CountingRead {
+            inner: read,
+            get_many_calls: Arc::clone(&get_many_calls),
+        };
         let rows = scan_certified_entity_batch_rows(
             &read,
             CREATED_BRANCH,
@@ -6805,9 +7057,15 @@ mod tests {
         )
         .await
         .expect("created branch certified rows should scan");
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows.row(0).schema_key(), SCHEMA_KEY);
         assert_eq!(rows.row(0).file_id(), Some(FILE_ID));
+        assert_eq!(rows.row(1).file_id(), Some(SECOND_FILE_ID));
+        assert_eq!(
+            get_many_calls.load(Ordering::Relaxed),
+            2,
+            "one content read and one page read must serve every certified batch"
+        );
     }
 
     fn diff_identity(branch_id: &str, generation: CommitId, entity: &str) -> HeadIdentity {

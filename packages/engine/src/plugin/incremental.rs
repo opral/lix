@@ -1810,7 +1810,10 @@ fn validate_certified_entity_batches(
 
 const HOST_CERTIFIED_PACKET_TARGET_BYTES: usize = 256 * 1024;
 const HOST_CERTIFIED_PACKET_MIN_ROWS: usize = 64;
-const DENSE_TEXT_SCHEMA_KEY: &str = "git_text_line_v2";
+
+fn host_certified_dense_schema(schema_key: &str) -> bool {
+    matches!(schema_key, "git_text_line_v2" | "markdown_node_v2")
+}
 
 /// Retains a complete, eagerly validated generic-text import in dense packet
 /// pages. The ordinary v2 change list remains intact for changelog and
@@ -1827,23 +1830,34 @@ pub(crate) fn certify_dense_v2_fresh_file(
     {
         return Ok(());
     }
+    let Some(schema_key) = transition.changes.changes.first().and_then(|change| {
+        let WasmEntityChange::Create { schema_key, .. } = change else {
+            return None;
+        };
+        host_certified_dense_schema(schema_key).then_some(schema_key.as_str())
+    }) else {
+        return Ok(());
+    };
     if !transition.changes.changes.iter().all(|change| {
         matches!(
             change,
             WasmEntityChange::Create {
-                schema_key,
+                schema_key: candidate_schema_key,
                 resolved_key: None,
                 snapshot_content: WasmHostBytes::CanonicalJson(_),
                 ..
-            } if schema_key == DENSE_TEXT_SCHEMA_KEY
+            } if candidate_schema_key == schema_key
         )
     }) {
         return Ok(());
     }
-    schemas.validate(DENSE_TEXT_SCHEMA_KEY)?;
+    schemas.validate(schema_key)?;
+    let compressed_pages = schema_key == "markdown_node_v2";
 
     let mut pages = Vec::new();
     let mut page = Vec::with_capacity(HOST_CERTIFIED_PACKET_TARGET_BYTES);
+    let mut page_first_local_ref = None;
+    let mut page_last_local_ref = None;
     for change in &transition.changes.changes {
         let WasmEntityChange::Create {
             schema_key,
@@ -1865,12 +1879,25 @@ pub(crate) fn certify_dense_v2_fresh_file(
         let framed_len = 4_usize
             .checked_add(record_len)
             .ok_or_else(|| invalid_guest("host certified packet frame size overflowed"))?;
+        let page_local_ref = u32::try_from(*local_ref)
+            .map_err(|_| invalid_guest("host certified packet local reference exceeds u32"))?;
         if !page.is_empty()
             && page.len().saturating_add(framed_len) > HOST_CERTIFIED_PACKET_TARGET_BYTES
         {
-            pages.push(Bytes::from(std::mem::take(&mut page)));
+            pages.push(finish_host_certified_packet_page(
+                std::mem::take(&mut page),
+                page_first_local_ref
+                    .take()
+                    .expect("non-empty packet page has a first local ref"),
+                page_last_local_ref
+                    .take()
+                    .expect("non-empty packet page has a last local ref"),
+                compressed_pages,
+            )?);
             page = Vec::with_capacity(HOST_CERTIFIED_PACKET_TARGET_BYTES.max(framed_len));
         }
+        page_first_local_ref.get_or_insert(page_local_ref);
+        page_last_local_ref = Some(page_local_ref);
         page.extend_from_slice(
             &u32::try_from(record_len)
                 .map_err(|_| invalid_guest("host certified packet record exceeds u32"))?
@@ -1893,14 +1920,23 @@ pub(crate) fn certify_dense_v2_fresh_file(
         page.extend_from_slice(snapshot_bytes);
     }
     if !page.is_empty() {
-        pages.push(Bytes::from(page));
+        pages.push(finish_host_certified_packet_page(
+            page,
+            page_first_local_ref.expect("non-empty packet page has a first local ref"),
+            page_last_local_ref.expect("non-empty packet page has a last local ref"),
+            compressed_pages,
+        )?);
     }
     let batch = WasmCertifiedEntityBatch {
-        // Format 3 is the host-only equivalent of the format-2 packet codec.
-        // Guest batches are validated before this synthesis point and the
-        // guest-facing validator intentionally rejects format 3.
-        format: crate::wasm::HOST_CERTIFIED_PACKET_FORMAT,
-        schema_keys: vec![DENSE_TEXT_SCHEMA_KEY.to_owned()],
+        // Formats 3 and 4 are host-only equivalents of the format-2 packet
+        // codec. Guest batches are validated before this synthesis point and
+        // the guest-facing validator intentionally rejects both formats.
+        format: if compressed_pages {
+            crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+        } else {
+            crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+        },
+        schema_keys: vec![schema_key.to_owned()],
         row_count: transition.changes.changes.len() as u64,
         creates,
         complete_file_state: true,
@@ -1908,6 +1944,33 @@ pub(crate) fn certify_dense_v2_fresh_file(
     };
     transition.certified_batches.push(batch);
     Ok(())
+}
+
+fn finish_host_certified_packet_page(
+    page: Vec<u8>,
+    first_local_ref: u32,
+    last_local_ref: u32,
+    compressed: bool,
+) -> Result<Bytes, LixError> {
+    if !compressed {
+        return Ok(Bytes::from(page));
+    }
+    let compressed = crate::compression::compress_zstd_level_1(&page).map_err(|error| {
+        LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!("host-certified packet compression failed: {error}"),
+        )
+    })?;
+    let mut encoded = Vec::with_capacity(12 + compressed.len());
+    encoded.extend_from_slice(&first_local_ref.to_le_bytes());
+    encoded.extend_from_slice(&last_local_ref.to_le_bytes());
+    encoded.extend_from_slice(
+        &u32::try_from(page.len())
+            .map_err(|_| invalid_guest("host-certified packet page exceeds u32"))?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&compressed);
+    Ok(Bytes::from(encoded))
 }
 
 fn validate_certified_snapshot_packets(
@@ -3223,6 +3286,23 @@ mod tests {
                     .into(),
             ),
         }
+    }
+
+    #[test]
+    fn compressed_host_certified_packet_page_roundtrips() {
+        let packet = vec![b'x'; 32 * 1024];
+        let encoded = finish_host_certified_packet_page(packet.clone(), 7, 11, true).unwrap();
+        let first = u32::from_le_bytes(encoded[..4].try_into().unwrap());
+        let last = u32::from_le_bytes(encoded[4..8].try_into().unwrap());
+        let uncompressed_len = u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize;
+        let compressed = &encoded[12..];
+        assert_eq!((first, last), (7, 11));
+        assert_eq!(uncompressed_len, packet.len());
+        assert!(compressed.len() < packet.len());
+        assert_eq!(
+            crate::compression::decompress_zstd(compressed, uncompressed_len).unwrap(),
+            packet
+        );
     }
 
     #[test]
