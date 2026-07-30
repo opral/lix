@@ -31,16 +31,20 @@ use object_store::{
     GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
     PutOptions, PutPayload, PutResult,
 };
+use slatedb::admin::AdminBuilder;
 use slatedb::config::{
-    CompressionCodec, DurabilityLevel, FlushOptions, FlushType, ObjectStoreCacheOptions,
-    ReadOptions as SlateDBReadOptions, ScanOptions as SlateDBScanOptions, Settings,
-    WriteOptions as SlateDBWriteOptions,
+    CompressionCodec, DurabilityLevel, FlushOptions, FlushType, GarbageCollectorDirectoryOptions,
+    GarbageCollectorOptions, ObjectStoreCacheOptions, ReadOptions as SlateDBReadOptions,
+    ScanOptions as SlateDBScanOptions, Settings, WriteOptions as SlateDBWriteOptions,
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
 use slatedb::filter_policy::BloomFilterPolicy;
 use slatedb::prefix_extractor::{PrefixExtractor, PrefixTarget};
-use slatedb::{CloseReason, Db, DbIterator, DbSnapshot, DbStatus, KeyValue, WriteBatch};
+use slatedb::{
+    CloseReason, Db, DbIterator, DbSnapshot, DbStatus, GarbageCollectorBuilder, KeyValue,
+    WriteBatch,
+};
 use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Handle, Runtime};
@@ -76,6 +80,9 @@ const SCAN_MAX_FETCH_TASKS: usize = 16;
 const SCAN_CACHE_BLOCKS: bool = true;
 const OBJECT_STORE_CACHE_PART_SIZE_BYTES: usize = 2 * 1024 * 1024;
 const COMPACTOR_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
+// SlateDB 0.14.1 hard-codes this lifetime for the unnamed checkpoints that
+// protect compaction inputs from concurrent readers while a manifest changes.
+const COMPACTOR_SAFETY_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const WRITE_PIPELINE_MAX_PENDING_ENTRIES: usize = 1024 * 1024;
 const WRITE_PIPELINE_MAX_PENDING_BYTES: usize = 128 * 1024 * 1024;
 const LOCAL_SST_FILE_CACHE_ENTRIES: usize = 256;
@@ -2589,7 +2596,7 @@ impl SlateDBWorker {
         db_path: String,
         object_store: Arc<dyn ObjectStore>,
         options: SlateDBObjectStoreOptions,
-        read_on_caller_current_thread: bool,
+        local_filesystem: bool,
         metrics: Option<Arc<DefaultMetricsRecorder>>,
     ) -> Result<Self, StorageError> {
         let in_flight = InFlightTracker::default();
@@ -2608,6 +2615,7 @@ impl SlateDBWorker {
                     shutdown_rx,
                     opened_tx,
                     manager_in_flight,
+                    local_filesystem,
                 );
             })
             .map_err(|error| StorageError::Io(format!("spawn slatedb worker: {error}")))?;
@@ -2623,7 +2631,7 @@ impl SlateDBWorker {
                         runtime,
                         db,
                         status,
-                        read_on_caller_current_thread,
+                        read_on_caller_current_thread: local_filesystem,
                         in_flight,
                         reclamation,
                         shutdown,
@@ -2807,6 +2815,7 @@ fn run_slatedb_manager(
     shutdown: mpsc::Receiver<()>,
     opened: mpsc::Sender<Result<(Handle, Arc<Db>), StorageError>>,
     in_flight: InFlightTracker,
+    collect_local_garbage_on_close: bool,
 ) {
     let runtime = match Builder::new_multi_thread()
         .worker_threads(RUNTIME_WORKER_THREADS)
@@ -2822,7 +2831,13 @@ fn run_slatedb_manager(
         }
     };
 
-    let db = match open_slatedb(&runtime, db_path, object_store, options, metrics) {
+    let db = match open_slatedb(
+        &runtime,
+        db_path.clone(),
+        Arc::clone(&object_store),
+        options,
+        metrics,
+    ) {
         Ok(db) => db,
         Err(error) => {
             let _ = opened.send(Err(error));
@@ -2839,8 +2854,69 @@ fn run_slatedb_manager(
         return;
     }
     let _ = shutdown.recv();
+    // This is the last local handle: every Lix read/write has drained, and
+    // Db::close flushes the memtable and stops the compactor before collection.
     in_flight.wait_until_idle();
-    let _ = runtime.block_on(db.close());
+    if runtime.block_on(db.close()).is_ok() && collect_local_garbage_on_close {
+        runtime.block_on(collect_local_garbage(db_path, object_store));
+    }
+}
+
+async fn collect_local_garbage(db_path: String, object_store: Arc<dyn ObjectStore>) {
+    let physical_db_path = join_db_path(&db_path, SEGMENTED_FORMAT_PATH);
+    release_local_compactor_checkpoints(&physical_db_path, Arc::clone(&object_store)).await;
+    GarbageCollectorBuilder::new(physical_db_path, object_store)
+        .with_options(local_close_gc_options())
+        .build()
+        .run_gc_once()
+        .await;
+}
+
+async fn release_local_compactor_checkpoints(
+    physical_db_path: &str,
+    object_store: Arc<dyn ObjectStore>,
+) {
+    let admin = AdminBuilder::new(physical_db_path, object_store).build();
+    let checkpoints = match admin.list_checkpoints(None).await {
+        Ok(checkpoints) => checkpoints,
+        Err(_) => return,
+    };
+    for checkpoint in checkpoints {
+        // Preserve named user checkpoints and reader checkpoints (which use a
+        // different lifetime). The exact unnamed 15-minute shape is internal
+        // to SlateDB's compactor and is redundant once the local DB is closed.
+        if !is_compactor_safety_checkpoint(&checkpoint) {
+            continue;
+        }
+        let _ = admin.delete_checkpoint(checkpoint.id).await;
+    }
+}
+
+fn is_compactor_safety_checkpoint(checkpoint: &slatedb::Checkpoint) -> bool {
+    checkpoint.name.is_none()
+        && checkpoint.expire_time.is_some_and(|expire_time| {
+            expire_time
+                .signed_duration_since(checkpoint.create_time)
+                .to_std()
+                == Ok(COMPACTOR_SAFETY_CHECKPOINT_LIFETIME)
+        })
+}
+
+fn local_close_gc_options() -> GarbageCollectorOptions {
+    let immediate = || GarbageCollectorDirectoryOptions {
+        interval: None,
+        min_age: Duration::ZERO,
+        dry_run: false,
+    };
+    GarbageCollectorOptions {
+        manifest_options: None,
+        wal_options: Some(immediate()),
+        wal_fence_options: None,
+        compacted_options: Some(immediate()),
+        compactions_options: None,
+        detach_options: None,
+        metric_level: None,
+    }
 }
 
 fn open_slatedb(
@@ -3513,7 +3589,8 @@ mod tests {
         ListResult, MultipartUpload, ObjectMeta, ObjectStoreExt, PutMultipartOptions, PutOptions,
         PutPayload, PutResult, RenameOptions, Result as ObjectStoreResult,
     };
-    use slatedb::config::{FlushOptions, FlushType};
+    use slatedb::config::{CheckpointOptions, FlushOptions, FlushType};
+    use std::collections::BTreeSet;
     use std::ops::Range;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
@@ -3627,6 +3704,65 @@ mod tests {
     }
 
     #[test]
+    fn local_close_collects_only_immediately_safe_data_files() {
+        let options = local_close_gc_options();
+        assert!(options.manifest_options.is_none());
+        assert!(options.wal_fence_options.is_none());
+        assert!(options.compactions_options.is_none());
+        assert!(options.detach_options.is_none());
+        for directory in [options.wal_options, options.compacted_options] {
+            let directory = directory.expect("local close enables data-file collection");
+            assert_eq!(directory.min_age, Duration::ZERO);
+            assert!(!directory.dry_run);
+        }
+    }
+
+    #[test]
+    fn local_close_releases_only_unnamed_compactor_safety_checkpoints() {
+        let store = Arc::new(InMemory::new());
+        let db_path = "test-local-close-compactor-checkpoints";
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("create checkpoint fixture");
+        drop(storage);
+        let physical_db_path = join_db_path(db_path, SEGMENTED_FORMAT_PATH);
+        let admin = AdminBuilder::new(physical_db_path.clone(), store.clone()).build();
+        let compactor = block_on(admin.create_detached_checkpoint(&CheckpointOptions {
+            lifetime: Some(COMPACTOR_SAFETY_CHECKPOINT_LIFETIME),
+            ..CheckpointOptions::default()
+        }))
+        .expect("create compactor-shaped checkpoint");
+        let named = block_on(admin.create_detached_checkpoint(&CheckpointOptions {
+            lifetime: Some(COMPACTOR_SAFETY_CHECKPOINT_LIFETIME),
+            name: Some("keep".to_string()),
+            ..CheckpointOptions::default()
+        }))
+        .expect("create named checkpoint");
+        let reader = block_on(admin.create_detached_checkpoint(&CheckpointOptions {
+            lifetime: Some(Duration::from_secs(10 * 60)),
+            ..CheckpointOptions::default()
+        }))
+        .expect("create reader-shaped checkpoint");
+
+        block_on(release_local_compactor_checkpoints(
+            &physical_db_path,
+            store,
+        ));
+
+        let remaining = block_on(admin.list_checkpoints(None))
+            .expect("list checkpoints after local release")
+            .into_iter()
+            .map(|checkpoint| checkpoint.id)
+            .collect::<BTreeSet<_>>();
+        assert!(!remaining.contains(&compactor.id));
+        assert!(remaining.contains(&named.id));
+        assert!(remaining.contains(&reader.id));
+    }
+
+    #[test]
     fn bounds_unflushed_memory_to_two_l0_tables() {
         let settings = slatedb_settings();
         assert_eq!(settings.max_unflushed_bytes, MAX_UNFLUSHED_BYTES);
@@ -3727,6 +3863,53 @@ mod tests {
         let directory = tempfile::tempdir().expect("create fresh local storage directory");
         let storage = SlateDB::open(directory.path()).expect("open fresh local LZ4 storage");
         assert_eq!(storage.path(), directory.path());
+    }
+
+    #[test]
+    fn local_close_reclaims_a_flushed_wal() {
+        let directory = tempfile::tempdir().expect("create local GC storage directory");
+        let storage = SlateDB::open(directory.path()).expect("open local GC storage");
+        for key in [b"a", b"b", b"c", b"d"] {
+            let mut write = block_on(storage.begin_write(WriteOptions::default()))
+                .expect("begin local GC write");
+            block_on(write.put_many(
+                SpaceId(7),
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: Key(Bytes::copy_from_slice(key)),
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"value"),
+                        },
+                    }],
+                },
+            ))
+            .expect("stage local GC row");
+            block_on(write.commit()).expect("commit local GC row");
+            block_on(storage.flush_memtable_for_diagnostics()).expect("flush local GC memtable");
+        }
+        let wal = directory
+            .path()
+            .join(DB_PATH)
+            .join(SEGMENTED_FORMAT_PATH)
+            .join("wal");
+        let before = std::fs::read_dir(&wal)
+            .expect("list flushed local GC WAL")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .count();
+        assert!(before > 2, "the fixture should create obsolete WAL SSTs");
+
+        drop(storage);
+
+        let after = std::fs::read_dir(&wal)
+            .expect("list local GC WAL after close")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .count();
+        assert!(
+            after < before,
+            "local close should collect obsolete WAL SSTs"
+        );
     }
 
     #[test]
