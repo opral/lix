@@ -2,7 +2,7 @@ import { invalidArgument } from "./errors.js";
 import {
 	ACTIVE_BRANCH_CLIENT_STATE_KEY,
 	type LixClientState,
-	type ManagedLixClientState,
+	type ManagedClientState,
 	unavailableClientState,
 } from "./client-state.js";
 import type {
@@ -64,7 +64,7 @@ export class Lix {
 
 	constructor(
 		private readonly binding: LixBinding,
-		private readonly managedClientState?: ManagedLixClientState,
+		private readonly managedClientState?: ManagedClientState,
 	) {
 		this.clientState = managedClientState
 			? {

@@ -6,6 +6,7 @@ import type { LixBinding } from "./binding-types.js";
 import {
 	ACTIVE_BRANCH_CLIENT_STATE_KEY,
 	openClientState,
+	openStoredClientState,
 } from "./client-state.js";
 import { Lix } from "./lix.js";
 import type {
@@ -115,22 +116,10 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 			return new Lix(await openRemoteLixBinding(options.server));
 		}
 		assertSnapshotStorage(options.storage);
-		const { openPersistentLixWorkerBinding } =
-			await import("./worker/client.js");
-		const clientBinding = await openPersistentLixWorkerBinding({
+		const clientState = await openStoredClientState({
 			storage: options.storage,
 			namespace: remoteClientStateNamespace(options.server.url),
 		});
-		let clientState;
-		try {
-			clientState = await openClientState({
-				binding: clientBinding,
-				closeBinding: true,
-			});
-		} catch (error) {
-			await clientBinding.close().catch(() => undefined);
-			throw error;
-		}
 
 		const restoredBranchId = clientState.get<string>(
 			ACTIVE_BRANCH_CLIENT_STATE_KEY,
