@@ -273,7 +273,7 @@ mod tests {
     fn parses_experimental_v3_manifest() {
         let validated = parse_plugin_manifest_json(
             r#"{
-                "key":"plugin_csv_v3_prototype",
+                "key":"plugin_csv",
                 "runtime":"wasm-component-v2",
                 "api_version":"3.0.0",
                 "materialization":"blob",

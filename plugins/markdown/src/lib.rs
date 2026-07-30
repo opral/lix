@@ -14,10 +14,10 @@ use core::{
     ArenaMarkdownBlock, ChangeEffect, Document, EntityChange, IdNamespace, InputSplice,
     NODE_SCHEMA_KEY, PluginError,
 };
-use lix_plugin_api_v3_prototype as sdk;
+use lix_plugin_api as sdk;
 use serde_json::Value;
 
-struct MarkdownV3Prototype;
+struct MarkdownPlugin;
 
 const ID_NAMESPACE_STATE: &[u8] = b"markdown/id-namespace-v1";
 const ROOT_STATE: &[u8] = b"markdown/root-v1";
@@ -30,7 +30,7 @@ const BLOCK_INDEX_HEADER_BYTES: u32 = 12;
 const BLOCK_INDEX_ENTRY_BYTES: u32 = 28;
 const BLOCK_PAGE_BYTES: usize = 1024 * 1024;
 
-impl sdk::FormatPlugin for MarkdownV3Prototype {
+impl sdk::FormatPlugin for MarkdownPlugin {
     fn entities_changed(
         update: &mut sdk::EntityUpdate<'_>,
         sink: &mut sdk::Sink<'_>,
@@ -859,4 +859,4 @@ fn push_inline_blob(output: &mut Vec<u8>, bytes: &[u8]) -> sdk::Result<()> {
 }
 
 #[cfg(target_family = "wasm")]
-lix_plugin_api_v3_prototype::export_v3_prototype!(MarkdownV3Prototype);
+lix_plugin_api::export_plugin!(MarkdownPlugin);

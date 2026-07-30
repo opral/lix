@@ -1,5 +1,5 @@
 {
-  "key": "plugin_excalidraw_v3_prototype",
+  "key": "plugin_excalidraw",
   "runtime": "wasm-component-v2",
   "api_version": "3.0.0",
   "materialization": "blob",

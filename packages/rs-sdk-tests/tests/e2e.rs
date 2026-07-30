@@ -796,8 +796,8 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
     let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_markdown_v3_prototype",
-        &build_markdown_v3_prototype_archive(),
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
         &["markdown_node_v2"],
     )
     .await;
@@ -884,8 +884,8 @@ async fn v3_markdown_noncanonical_source_stays_in_file_arena_not_semantic_root()
     let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_markdown_v3_prototype",
-        &build_markdown_v3_prototype_archive(),
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
         &["markdown_node_v2"],
     )
     .await;
@@ -962,8 +962,8 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
         ),
         (
             "v3_push_sink",
-            "plugin_markdown_v3_prototype",
-            build_markdown_v3_prototype_archive(),
+            "plugin_markdown",
+            build_markdown_plugin_archive(),
         ),
     ];
     let mut expected_rows = None;
@@ -1278,8 +1278,8 @@ async fn v3_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_markdown_v3_prototype",
-        &build_markdown_v3_prototype_archive(),
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
         &["markdown_node_v2"],
     )
     .await;
@@ -1423,8 +1423,8 @@ async fn v3_csv_same_row_branch_merge_composes_distinct_cells() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_csv_v3_prototype",
-        &build_csv_v3_prototype_archive(),
+        "plugin_csv",
+        &build_csv_plugin_archive(),
         &["csv_v2_table", "csv_v2_row"],
     )
     .await;
@@ -1679,8 +1679,8 @@ async fn v3_json_same_entity_branch_merge_uses_fused_conflict_and_renderer_sinks
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_v3_prototype",
-        &build_json_v3_prototype_archive(),
+        "plugin_json",
+        &build_json_plugin_archive(),
         &["json_root", "json_object_member", "json_array_item"],
     )
     .await;
@@ -1851,8 +1851,8 @@ async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_csv_v3_prototype",
-        &build_csv_v3_prototype_archive(),
+        "plugin_csv",
+        &build_csv_plugin_archive(),
         &["csv_v2_table", "csv_v2_row"],
     )
     .await;
@@ -3554,18 +3554,18 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
 /// sends CSV rows as bounded typed batches without guest-side JSON snapshots.
 #[tokio::test]
 #[ignore = "Component v3 Prototype B typed CSV batch import benchmark"]
-async fn v3_prototype_b_csv_ten_mib_typed_batch_benchmark() {
+async fn v3_csv_ten_mib_typed_batch_benchmark() {
     const CSV_ROW_COUNT: usize = 220_000;
     const FILE_ID: &str = "019a0000-0000-7000-8000-000000000320";
-    const FILE_PATH: &str = "/v3-prototype-b.csv";
-    const BENCHMARK: &str = "v3_prototype_b_csv_ten_mib_typed_batch_benchmark";
+    const FILE_PATH: &str = "/v3-typed-batch.csv";
+    const BENCHMARK: &str = "v3_csv_ten_mib_typed_batch_benchmark";
 
     let samples = std::env::var("LIX_BENCH_SAMPLES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|samples| *samples > 0)
         .unwrap_or(5);
-    let archive = build_csv_v3_prototype_archive();
+    let archive = build_csv_plugin_archive();
     let source = csv_ten_mib_fixture();
     let fixture = BenchmarkFixture {
         input_bytes: source.len(),
@@ -3582,7 +3582,7 @@ async fn v3_prototype_b_csv_ten_mib_typed_batch_benchmark() {
         let lix = open_lix_with_rocksdb(root.path()).await;
         install_reference_plugin_in_blank_registry(
             &lix,
-            "plugin_csv_v3_prototype",
+            "plugin_csv",
             &archive,
             &["csv_v2_table", "csv_v2_row"],
         )
@@ -3673,7 +3673,7 @@ async fn v3_prototype_b_csv_ten_mib_typed_batch_benchmark() {
 
         let phase_close_live_bytes = collector.take_close_live_bytes();
         eprintln!(
-            "v3_prototype_b_phases sample={sample} elapsed_ms={:.3} \
+            "v3_typed_batch_phases sample={sample} elapsed_ms={:.3} \
              guest_export_calls={} actor_executor_threads_created={} \
              source_sink_import_calls={} packet_pages={} packet_records={} \
              boundary_bytes={} guest_high_water_bytes={} phase_close_live_bytes={:?} phases_ms={:?}",
@@ -3716,7 +3716,7 @@ async fn v3_prototype_b_csv_ten_mib_typed_batch_benchmark() {
 
     elapsed_ms.sort_by(f64::total_cmp);
     eprintln!(
-        "v3_prototype_b_csv_ten_mib bytes={} rows={} samples={samples} \
+        "v3_csv_ten_mib_typed_batch bytes={} rows={} samples={samples} \
          raw_ms={elapsed_ms:?} p50_ms={:.3} p95_ms={:.3}",
         source.len(),
         CSV_ROW_COUNT + 1,
@@ -3769,8 +3769,8 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
         ),
         (
             "v3_push_sink",
-            "plugin_json_v3_prototype",
-            build_json_v3_prototype_archive(),
+            "plugin_json",
+            build_json_plugin_archive(),
         ),
     ];
     let collector = PerfSpanCollector::default();
@@ -3945,8 +3945,8 @@ async fn v3_json_ten_mib_sparse_successor_benchmark() {
         ),
         (
             "v3_arena",
-            "plugin_json_v3_prototype",
-            build_json_v3_prototype_archive(),
+            "plugin_json",
+            build_json_plugin_archive(),
         ),
     ] {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
@@ -4069,8 +4069,8 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
         ),
         (
             "v3_arena",
-            "plugin_json_v3_prototype",
-            build_json_v3_prototype_archive(),
+            "plugin_json",
+            build_json_plugin_archive(),
         ),
     ] {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
@@ -4174,8 +4174,8 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
     let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_v3_prototype",
-        &build_json_v3_prototype_archive(),
+        "plugin_json",
+        &build_json_plugin_archive(),
         &["json_root", "json_object_member", "json_array_item"],
     )
     .await;
@@ -4232,8 +4232,8 @@ async fn v3_json_cold_hydration_after_actor_eviction_preserves_sparse_successor(
     let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_json_v3_prototype",
-        &build_json_v3_prototype_archive(),
+        "plugin_json",
+        &build_json_plugin_archive(),
         &["json_root", "json_object_member", "json_array_item"],
     )
     .await;
@@ -4311,8 +4311,8 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
     let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_csv_v3_prototype",
-        &build_csv_v3_prototype_archive(),
+        "plugin_csv",
+        &build_csv_plugin_archive(),
         &["csv_v2_table", "csv_v2_row"],
     )
     .await;
@@ -4421,8 +4421,8 @@ async fn v3_file_changed_push_sink_benchmark() {
     .await;
     install_reference_plugin_in_blank_registry(
         &v3,
-        "plugin_csv_v3_prototype",
-        &build_csv_v3_prototype_archive(),
+        "plugin_csv",
+        &build_csv_plugin_archive(),
         &["csv_v2_table", "csv_v2_row"],
     )
     .await;
@@ -5113,8 +5113,8 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
     let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_excalidraw_v3_prototype",
-        &build_excalidraw_v3_prototype_archive(),
+        "plugin_excalidraw",
+        &build_excalidraw_plugin_archive(),
         &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
     )
     .await;
@@ -5252,8 +5252,8 @@ async fn v3_excalidraw_large_transition_benchmark() {
         ),
         (
             "v3_push_sink",
-            "plugin_excalidraw_v3_prototype",
-            build_excalidraw_v3_prototype_archive(),
+            "plugin_excalidraw",
+            build_excalidraw_plugin_archive(),
         ),
     ] {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
@@ -5486,8 +5486,8 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
-        "plugin_excalidraw_v3_prototype",
-        &build_excalidraw_v3_prototype_archive(),
+        "plugin_excalidraw",
+        &build_excalidraw_plugin_archive(),
         &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
     )
     .await;
@@ -6741,13 +6741,13 @@ fn build_csv_v2_plugin_archive() -> Vec<u8> {
     )
 }
 
-fn build_csv_v3_prototype_archive() -> Vec<u8> {
+fn build_csv_plugin_archive() -> Vec<u8> {
     let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_CSV_V3_PROTOTYPE_plugin_csv_v3_prototype"
+        "CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv"
     ));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
-            "failed to read bindep-built CSV v3 prototype wasm at {}: {error}",
+            "failed to read bindep-built CSV v3 wasm at {}: {error}",
             wasm_path.display()
         )
     });
@@ -6757,7 +6757,7 @@ fn build_csv_v3_prototype_archive() -> Vec<u8> {
     for (path, bytes) in [
         (
             "manifest.json",
-            include_str!("../../../plugins/csv-v3-prototype/manifest.json").as_bytes(),
+            include_str!("../../../plugins/csv/manifest.json").as_bytes(),
         ),
         (
             "schema/csv_v2_table.json",
@@ -6775,13 +6775,13 @@ fn build_csv_v3_prototype_archive() -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
-fn build_json_v3_prototype_archive() -> Vec<u8> {
+fn build_json_plugin_archive() -> Vec<u8> {
     let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_JSON_V3_PROTOTYPE_plugin_json_v3_prototype"
+        "CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"
     ));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
-            "failed to read bindep-built JSON v3 prototype wasm at {}: {error}",
+            "failed to read bindep-built JSON v3 wasm at {}: {error}",
             wasm_path.display()
         )
     });
@@ -6791,7 +6791,7 @@ fn build_json_v3_prototype_archive() -> Vec<u8> {
     for (path, bytes) in [
         (
             "manifest.json",
-            include_str!("../../../plugins/json-v3-prototype/manifest.json").as_bytes(),
+            include_str!("../../../plugins/json/manifest.json").as_bytes(),
         ),
         (
             "schema/json_root.json",
@@ -6843,13 +6843,13 @@ fn build_markdown_v2_plugin_archive() -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
-fn build_markdown_v3_prototype_archive() -> Vec<u8> {
+fn build_markdown_plugin_archive() -> Vec<u8> {
     let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_V3_PROTOTYPE_plugin_markdown_v3_prototype"
+        "CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown"
     ));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
-            "failed to read bindep-built Markdown v3 prototype wasm at {}: {error}",
+            "failed to read bindep-built Markdown v3 wasm at {}: {error}",
             wasm_path.display()
         )
     });
@@ -6859,7 +6859,7 @@ fn build_markdown_v3_prototype_archive() -> Vec<u8> {
     for (path, bytes) in [
         (
             "manifest.json",
-            include_str!("../../../plugins/markdown-v3-prototype/manifest.json").as_bytes(),
+            include_str!("../../../plugins/markdown/manifest.json").as_bytes(),
         ),
         (
             "schema/markdown_node_v2.json",
@@ -7313,9 +7313,9 @@ fn build_excalidraw_v2_plugin_archive() -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
-fn build_excalidraw_v3_prototype_archive() -> Vec<u8> {
+fn build_excalidraw_plugin_archive() -> Vec<u8> {
     let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_V3_PROTOTYPE_plugin_excalidraw_v3_prototype"
+        "CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_plugin_excalidraw"
     ));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
@@ -7329,7 +7329,7 @@ fn build_excalidraw_v3_prototype_archive() -> Vec<u8> {
     for (path, bytes) in [
         (
             "manifest.json",
-            include_str!("../../../plugins/excalidraw-v3-prototype/manifest.json").as_bytes(),
+            include_str!("../../../plugins/excalidraw/manifest.json").as_bytes(),
         ),
         (
             "schema/excalidraw_scene.json",

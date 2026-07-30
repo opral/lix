@@ -5,9 +5,9 @@
 mod core;
 
 use core::{ArenaElementSpan, ChangeEffect, Document, EntityChange, IdNamespace, InputSplice};
-use lix_plugin_api_v3_prototype as sdk;
+use lix_plugin_api as sdk;
 
-struct ExcalidrawV3Prototype;
+struct ExcalidrawPlugin;
 
 const ELEMENT_INDEX_KEY: &[u8] = b"excalidraw/element-spans-v1";
 const ELEMENT_SHIFTS_KEY: &[u8] = b"excalidraw/element-shifts-v1";
@@ -16,7 +16,7 @@ const ELEMENT_INDEX_MAGIC: &[u8; 4] = b"EXS1";
 const ELEMENT_INDEX_HEADER_BYTES: u32 = 8;
 const ELEMENT_INDEX_ENTRY_BYTES: u32 = 32;
 
-impl sdk::FormatPlugin for ExcalidrawV3Prototype {
+impl sdk::FormatPlugin for ExcalidrawPlugin {
     fn entities_changed(
         update: &mut sdk::EntityUpdate<'_>,
         sink: &mut sdk::Sink<'_>,
@@ -540,4 +540,4 @@ fn push_inline_blob(output: &mut Vec<u8>, bytes: &[u8]) -> sdk::Result<()> {
 }
 
 #[cfg(target_family = "wasm")]
-lix_plugin_api_v3_prototype::export_v3_prototype!(ExcalidrawV3Prototype);
+lix_plugin_api::export_plugin!(ExcalidrawPlugin);

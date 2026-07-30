@@ -1,15 +1,14 @@
 {
-  "key": "plugin_csv_v3_prototype",
+  "key": "plugin_markdown",
   "runtime": "wasm-component-v2",
   "api_version": "3.0.0",
   "materialization": "blob",
   "match": {
-    "path_glob": "*.{csv,tsv}",
+    "path_glob": "*.{md,markdown}",
     "content_type": "text"
   },
   "entry": "plugin.wasm",
   "schemas": [
-    "schema/csv_v2_table.json",
-    "schema/csv_v2_row.json"
+    "schema/markdown_node_v2.json"
   ]
 }

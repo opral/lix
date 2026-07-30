@@ -42,7 +42,7 @@ const CERTIFIED_CREATED_PACKET_V1: u16 = 2;
 
 pub(super) mod bindings {
     wasmtime::component::bindgen!({
-        path: "../plugin-api-v3-prototype/wit",
+        path: "../plugin-api/wit",
         world: "plugin",
         with: {
             "lix:plugin/host.snapshot": super::SnapshotResource,

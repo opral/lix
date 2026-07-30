@@ -8,17 +8,17 @@ use core::{
     ArenaRowIndex, ChangeEffect, ColdInitialImport, Document, EntityChange, IdNamespace,
     ROW_SCHEMA_KEY, RowConflictResolution, TABLE_SCHEMA_KEY, resolve_row_conflict,
 };
-use lix_plugin_api_v3_prototype as sdk;
+use lix_plugin_api as sdk;
 use serde_json::Value;
 
-struct CsvV3Prototype;
+struct CsvPlugin;
 
 const CERTIFIED_CSV_PAGE_BYTES: usize = 256 * 1024;
 const CSV_INDEX_KEY: &[u8] = b"csv/index-v1";
 const ID_NAMESPACE_STATE: &[u8] = b"csv/id-namespace-v1";
 const CSV_INDEX_HEADER_BYTES: u32 = 36;
 
-impl sdk::FormatPlugin for CsvV3Prototype {
+impl sdk::FormatPlugin for CsvPlugin {
     fn entities_changed(
         update: &mut sdk::EntityUpdate<'_>,
         sink: &mut sdk::Sink<'_>,
@@ -102,18 +102,18 @@ impl sdk::FormatPlugin for CsvV3Prototype {
     fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
         if update.before_file.path != update.after_file.path {
             return Err(sdk::Error::invalid_input(
-                "arena CSV prototype does not yet support descriptor changes",
+                "CSV plugin does not support descriptor changes",
             ));
         }
         let [edit] = update.edits.as_slice() else {
             return Err(sdk::Error::invalid_input(
-                "arena CSV prototype requires one sparse byte edit",
+                "CSV plugin requires one sparse byte edit",
             ));
         };
         let insert = &edit.insert;
         if u64::try_from(insert.len()).expect("usize fits u64") != edit.delete_len {
             return Err(sdk::Error::invalid_input(
-                "arena CSV prototype currently requires a length-preserving edit",
+                "CSV plugin currently requires a length-preserving edit",
             ));
         }
         let (index, range) = if let Some(state_len) = update.before.state_len(CSV_INDEX_KEY)? {
@@ -385,4 +385,4 @@ fn push_inline_blob(output: &mut Vec<u8>, bytes: &[u8]) -> sdk::Result<()> {
 }
 
 #[cfg(target_family = "wasm")]
-lix_plugin_api_v3_prototype::export_v3_prototype!(CsvV3Prototype);
+lix_plugin_api::export_plugin!(CsvPlugin);

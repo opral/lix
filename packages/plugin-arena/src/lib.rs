@@ -1,4 +1,4 @@
-//! Host-owned immutable arenas for the Lix plugin API v3 prototype.
+//! Host-owned immutable arenas for the Lix plugin API v3.
 //!
 //! A [`Root`] names three independently persistent values:
 //!

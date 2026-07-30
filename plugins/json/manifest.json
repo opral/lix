@@ -1,14 +1,16 @@
 {
-  "key": "plugin_markdown_v3_prototype",
+  "key": "plugin_json",
   "runtime": "wasm-component-v2",
   "api_version": "3.0.0",
   "materialization": "blob",
   "match": {
-    "path_glob": "*.{md,markdown}",
+    "path_glob": "*.json",
     "content_type": "text"
   },
   "entry": "plugin.wasm",
   "schemas": [
-    "schema/markdown_node_v2.json"
+    "schema/json_root.json",
+    "schema/json_object_member.json",
+    "schema/json_array_item.json"
   ]
 }

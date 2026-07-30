@@ -5,12 +5,12 @@ use std::time::Instant;
 #[test]
 fn component_v3_wit_is_valid_and_has_no_guest_document_resource() {
     let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin-api-v3-prototype/wit");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin-api/wit");
     let mut resolve = wit_parser::Resolve::default();
     resolve
         .push_dir(&path)
         .unwrap_or_else(|error| panic!("parse {}: {error:#}", path.display()));
-    let wit = std::fs::read_to_string(path.join("lix-plugin-v3.wit")).unwrap();
+    let wit = std::fs::read_to_string(path.join("lix-plugin.wit")).unwrap();
     assert!(wit.contains("package lix:plugin@3.0.0"));
     assert!(wit.contains("resource snapshot"));
     assert!(wit.contains("resource transition"));
@@ -179,7 +179,7 @@ fn score(format: Format) -> Score {
 }
 
 #[test]
-fn four_format_sparse_scorecard_reports_prototype_ratios() {
+fn four_format_sparse_scorecard_reports_arena_ratios() {
     for format in Format::ALL {
         let score = score(format);
         eprintln!("{score:?}");

@@ -1,4 +1,4 @@
-# Plugin API v3 prototype scorecard
+# Plugin API v3 scorecard
 
 Measured on 2026-07-29 from `origin/main` at `57d619aad`. Release results are
 from a local Linux x86-64 build and are intended for relative design guidance,

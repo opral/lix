@@ -1,180 +1,130 @@
-# Lix Plugin API v2
+# Lix plugin API v3
 
-This is the small Rust authoring API for Lix's production Component-v2 ABI.
-It does **not** replace Wasm or WIT. It hides packet framing, pages,
-attachments, resources, and transport limits while exposing bounded lazy byte
-sources where a format genuinely needs local context.
+The canonical, intentionally incompatible Component API for Lix plugins. It
+uses fused guest transitions with host-owned sources and push sinks.
 
-An author implements one trait with four required lifecycle operations. The
-trait also has one stateless conflict hook whose default deterministically
-takes canonical `b` (or deletes when `b` is absent):
+## Current contract
 
-```rust
-use lix_plugin_api_v2 as lix;
-use std::sync::Arc;
+`wit/lix-plugin.wit` is the single canonical definition. The host owns
+immutable `snapshot` inputs and the atomic `transition` output. A file
+successor enters the guest once through `apply(request, borrow<transition>)`;
+the guest emits bounded generic or typed pages through host imports while that
+export remains entered. Semantic edits use `entities-changed` with a lazy
+entity source and stream exact replacement bytes to the same transition.
+Conflict resolution is stateless: `resolve-conflicts` reads canonical inputs
+lazily and pushes ordered resolutions into a host-owned sink.
 
-struct MyFormat;
+There are no guest-owned document, edit-cursor, change-cursor, or returned
+transaction resources. A failed export, invalid page, or renderer failure
+publishes none of the staged state, semantic changes, or file bytes.
 
-impl lix::FormatPlugin for MyFormat {
-    // The API runtime's `fork` clones this value. Use Arc or another persistent
-    // structure so speculative transitions stay cheap.
-    type Document = Arc<MyPersistentDocument>;
+The implementation was developed in phases:
 
-    fn open_file(input: lix::OpenFile<'_>) -> lix::Result<(Self::Document, lix::Changes)> {
-        // Explicit cold-path materialization for a parser that needs all bytes.
-        let bytes = input.source.read_all()?;
-        let (document, changes) =
-            MyPersistentDocument::parse(bytes, input.file.path.as_deref(), input.creates)?;
-        Ok((Arc::new(document), lix::changes(changes)))
-    }
+- A: one exported call per transition on one persistent actor executor;
+- B: bounded typed CSV row batches without guest JSON snapshots or UUIDs;
+- C: storage-native batch consumption;
+- D: `apply-cold-successor(durable-entities, new-source, sink)` plus bounded
+  execution across independent files;
+- E: checkpoint-plus-tail hydration for operations that truly need a retained
+  document.
 
-    fn open_entities(mut input: lix::OpenEntities<'_>)
-        -> lix::Result<(Self::Document, lix::Edits)>
-    {
-        // If `input.accepted` is present, edits are relative to that verified
-        // checkpoint; otherwise they are relative to an empty file.
-        let (document, edits) =
-            MyPersistentDocument::from_entities(&mut input.entities, input.accepted)?;
-        Ok((Arc::new(document), lix::edits(edits)))
-    }
+Warm `file-changed` no longer returns a guest-owned change cursor. The
+document export accepts a borrowed host sink and emits every bounded packet
+while that one export remains entered. A two-page producer/consumer channel
+lets reconciliation validate pages concurrently instead of retaining the
+complete pushed transition. Transaction atomicity is unchanged: nothing is
+published unless the export, complete drain, and subsequent commit all succeed.
 
-    fn file_changed(document: &Self::Document, update: lix::FileUpdate<'_>)
-        -> lix::Result<(Self::Document, lix::Changes)>
-    {
-        // `update.edits` are verified base-relative splices. For a large
-        // replacement, `update.read_insert(edit)` reads only that range.
-        let (next, changes) = document.apply_file_splices(&update.edits, update.creates)?;
-        Ok((Arc::new(next), lix::changes(changes)))
-    }
+Cold-successor is not ordinary hydration. A cache miss during replay must not
+rebuild and render the predecessor merely to parse the successor. Warm apply,
+cold successor, and explicit hydration are separate v3 operations so the host
+cannot accidentally reintroduce that work through an adapter.
 
-    fn entities_changed(document: &Self::Document, update: lix::EntityUpdate<'_>)
-        -> lix::Result<(Self::Document, lix::Edits)>
-    {
-        let (next, edits) = document.apply_entity_changes(&mut update.changes)?;
-        Ok((Arc::new(next), lix::edits(edits)))
-    }
-}
+Measured on the 10.68 MiB / 220,001-entity CSV fixture:
 
-#[cfg(target_family = "wasm")]
-lix_plugin_api_v2::export_v2!(MyFormat);
-```
+| lane | p50 | peak live host allocation |
+| --- | ---: | ---: |
+| matched v2 | 5.169 s | 929.7 MB |
+| A, fused packet-v1 | 5.042 s | 929.7 MB |
+| B, typed CSV batch | 4.576 s | 927.8 MB |
+| B + certified import/storage-retention cuts | 2.325 s | 448.4 MB |
+| C, deferred storage-native lowering | 2.225 s | 282.4 MB |
+| C + streamed sink + one-shot cold CSV view | 2.066 s | 282.4 MB |
 
-The API package owns generated WIT traits, `document`/cursor resources, packet-v1
-encoding, bounded pages, lazy snapshots, output attachments, EOF rules, and
-host error mapping. It lowers to the `lix:plugin@2.1.0` world.
+The final measured lane is 2.50x faster and uses 3.29x less peak live host
+allocation than matched v2. It retains the compact prepared row owner through
+validation and expands hot row, file, and working-diff keys in 4,096-row pages
+only while lowering the atomic backend transaction. Exact file bytes, all
+220,000 CSV rows, the active checkpoint baseline and coverage proof, and
+INSERT absence validation remain unchanged.
 
-## Start a plugin
+The history-replay lane has a different multiplier. With only 16 cached actors,
+cache misses can materialize and render the predecessor before parsing the
+successor. v3 treats `apply-cold-successor(durable-entities, new-source, sink)`
+as a first-class operation rather than implementing it as `hydrate` followed
+by warm `apply`. The cache is an acceleration layer; correctness and replay
+complexity do not depend on keeping every file actor resident. Durable entities
+must be exposed as a bounded cursor and consumed inside the single successor
+guest call; passing a fully materialized `Vec<Entity>` would merely move the
+same amplification to the API boundary.
 
-```toml
-[dependencies]
-lix_plugin_api_v2 = "0.8.4"
-```
+## Warm transition push-sink benchmark
 
-Build the crate as a `cdylib` for `wasm32-wasip2`, implement `FormatPlugin`,
-and invoke `export_v2!(MyFormat)` under `cfg(target_family = "wasm")`. The
-plugin archive still supplies a normal Lix manifest, for example:
+A matched 25-pair release benchmark alternated lane order while toggling one
+byte in the same 980,000-byte / 20,000-row CSV document. Both lanes preserved
+exact bytes and semantic row count and committed exactly one durable semantic
+change per sample.
 
-```json
-{
-  "runtime": "wasm-component-v2",
-  "api_version": "2.1.0",
-  "key": "example-format",
-  "entry": "plugin.wasm"
-}
-```
+| lane | p50 | p95 | guest transition exports | peak live host allocation |
+| --- | ---: | ---: | ---: | ---: |
+| v2 returned change cursor | 1.939 ms | 3.524 ms | 3 | 1.090 MB |
+| v3 imported push sink | 1.343 ms | 1.558 ms | 1 | 1.090 MB |
 
-Add the matcher and schemas appropriate to the format. The archive contains
-the compiled Wasm component; it does not need the host engine crate.
+The push path is 1.44x faster at p50. Allocation is essentially unchanged. The
+prototype currently adapts validated host-owned pages back into the engine's
+existing drain interface; eliminating that temporary vector and lowering sink
+pages directly into transaction-native batches is therefore the required next
+step for a memory improvement.
 
-## Four lifecycle methods and one conflict hook
+## Large JSON and remaining boundaries
 
-| Method | Author reads | Author returns | Coordinate/base rule |
-|---|---|---|---|
-| `open_file` | `input.file`, `input.source`, `input.creates` | initial complete entity creates | First import of file bytes. |
-| `open_entities` | `input.file`, `input.entities`, optionally `input.accepted` | renderer edits | `accepted` is the edit base when present; otherwise the base is empty. |
-| `file_changed` | `update.before`/`after`, verified `update.edits`, optional bounded sources | complete upserts/tombstones | Splices are relative to the prior accepted file. |
-| `entities_changed` | final `update.changes`, `update.before`/`after`, optional `before_source` | sparse `ByteEdit`s | Edits are relative to the accepted materialized file. |
-| `resolve_conflict` | one lazy `base`/`a`/`b` semantic collision | `TakeBase`, `TakeA`, `TakeB`, `Replace`, or `Delete` | Stateless; `a` and `b` are canonically ordered independently of merge direction. |
+The JSON v3 adapter deliberately reuses the JSON v2 parser and packet-v1
+snapshots. A seven-sample 10 MiB / 39,871-entity RocksDB import therefore
+isolates the API/runtime change:
 
-Most formats can keep the default `resolve_conflict`. Override it only for a
-bounded, safe format rule. `ConflictValue::read()` is explicit: returning a
-`Take*` result retains the selected host-owned value without copying it through
-Wasm, while `Replace` carries one newly composed complete snapshot.
+| lane | p50 | p95 | guest exports | host imports | peak live host allocation |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| v2 returned cursor | 675.7 ms | 767.0 ms | 17 | 10 | 85.7 MB |
+| v3 push sink | 600.4 ms | 652.1 ms | 1 | 9 | 85.6 MB |
 
-## TSV-shaped entity example
+Bulk JSON is 1.13x faster at p50. The fused call plus 2 MiB bounded pages
+replace sixteen `cursor.next` exports with eight sink imports.
 
-A small table plugin can keep its format-specific state private and emit a
-complete row snapshot such as:
+The source side now returns any ABI-addressable complete file in one bounded
+host import instead of copying eleven 1 MiB results into a second guest vector.
+Together with the bounded producer/consumer sink, this changes v3 import-call
+counts from 26 to 9 for JSON and from 29 to 11 for CSV. Seven post-cut CSV
+samples have a 2.066 s p50 and 282.4 MB peak live host allocation.
 
-```rust
-let row_id = input.creates.id(new_row_ordinal)?;
-let snapshot = r#"{
-  "id": "…",
-  "order": "00000042",
-  "cells": ["alpha", "one"]
-}"#
-    .replace("…", &row_id)
-    .into_bytes();
+Large CSV opens now use a one-shot scan view instead of building a persistent
+guest document that the engine has already decided not to cache. Guest
+linear-memory high water fell from 53.0 MB to 41.2 MB (22%), but end-to-end
+host peak stayed flat. The remaining peak is the complete host transaction
+representation, not retained guest state or sink pages.
 
-let change = input.creates.keyless(lix::EntityChange::upsert(
-    "tsv_row",
-    vec![row_id],
-    snapshot,
-))?;
-```
+| phase | 10 MiB JSON | 10.68 MiB CSV |
+| --- | ---: | ---: |
+| plugin drain complete | 63.0 MB | 198.4 MB |
+| tracked-head publication | 94.1 MB | 235.0 MB |
+| end-to-end peak delta | 85.6 MB | 282.4 MB |
 
-The `order` fact is deliberate: row position is not an identity, but a row
-reorder is still semantic and must emit an updated complete snapshot. On a
-localized edit, preserve the acknowledged `id`, change only the affected row
-snapshot, and return exactly that `EntityChange`. In the reverse direction,
-turn only the changed row into a base-relative `ByteEdit`.
+Deferring packet decoding did not change end-to-end peak. The next cut cannot
+be another Component cursor optimization: the sink must validate into a
+transaction-native, page-backed owner and storage preparation must consume
+that owner without first constructing the complete
+`ValidatedFileTransition.changes` vector.
 
-## Performance rules
-
-- `Source::read_all()` is explicit. It is appropriate for cold parsing, not a
-  default warm-edit action.
-- Use `FileUpdate.edits` rather than comparing complete before/after files.
-  For a large splice, call `update.read_insert(edit)`; it reads only the
-  referenced range from the lazy `after_source`.
-- Iterate `EntityReader` and `EntityChangeReader`; do not collect a whole file
-  unless the format genuinely needs it.
-- Return `Changes` and `Edits` lazily. Large snapshots and inserts are attached
-  out of line automatically.
-- In `resolve_conflict`, inspect lengths before reading values and preserve the
-  zero-copy deterministic fallback for inputs too large for the format's
-  bounded heuristic.
-- Keep `Document` immutable and persistent. The API runtime makes `fork` a clone; the
-  format controls whether that clone is cheap.
-
-JSON, CSV, Markdown, and Excalidraw in this branch are executable examples of
-the same interface. Their parsers, stable identity rules, and semantic models
-remain separate by design.
-
-Creation is inferred from the schema. A creatable schema has `/id` as its
-primary key and gives that string property both `"format": "uuid"` and
-`"x-lix-default": "lix_uuid_v7()"`. Keep durable IDs for existing entities.
-For a new entity, choose a transition-local `u32` reference, derive the UUID
-with `input.creates.id(local_ref)`, and pass the complete upsert through
-`input.creates.keyless(...)`. The adapter verifies and removes the derived ID
-from the packet; the host applies the schema default, validates the completed
-snapshot, and returns the same canonical UUIDv7. An array position, row number,
-or byte offset is never a durable identity.
-
-## Semantic contract
-
-- Emit complete entity snapshots for an upsert, or an `EntityChange::delete`
-  tombstone. Prefer `EntityChange::upsert` and `EntityChange::delete`; the API package
-  does not merge partial records for a format.
-- `ChangeEffect::Content` is the normal semantic change. Use
-  `ChangeEffect::FormatOnly` when the same facts are serialized differently
-  (for example a CSV dialect or Markdown formatting change) and that lexical
-  fact must become durable.
-- `ByteEdit` coordinates refer to the accepted base file. Emit them in
-  ascending, non-overlapping order; do not make the next offset depend on a
-  previous inserted length.
-- If order is semantic (CSV rows, array items, or Markdown siblings), put a
-  stable order fact in each complete snapshot and compare it during a file
-  change. Matching only an entity's identity/content is not enough to make a
-  reorder a no-op.
-- `changes` and `edits` accept normal lazy iterators. If generating a later
-  record can fail, use `try_changes` or `try_edits` instead.
+Releasing shared canonical snapshot owners page-by-page after RocksDB encoding
+was also tested and removed: peak remained 282.4 MB while CSV p50 regressed
+from 2.127 s to 2.253 s. The remaining cut must remove the row representation
+itself rather than clearing payload owners that are already shared.

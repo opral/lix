@@ -8,10 +8,10 @@ use core::{
     ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, EntityChange, IdNamespace,
     InputSplice,
 };
-use lix_plugin_api_v3_prototype as sdk;
+use lix_plugin_api as sdk;
 use serde_json::Value;
 
-struct JsonV3Prototype;
+struct JsonPlugin;
 
 const SCALAR_INDEX_STATE: &[u8] = b"json/scalar-index-v1";
 const SCALAR_SHIFTS_STATE: &[u8] = b"json/scalar-shifts-v1";
@@ -21,7 +21,7 @@ const SCALAR_INDEX_HEADER_BYTES: u32 = 12;
 const SCALAR_INDEX_ENTRY_BYTES: u32 = 20;
 const SCALAR_PAGE_BYTES: usize = 1024 * 1024;
 
-impl sdk::FormatPlugin for JsonV3Prototype {
+impl sdk::FormatPlugin for JsonPlugin {
     fn entities_changed(
         update: &mut sdk::EntityUpdate<'_>,
         sink: &mut sdk::Sink<'_>,
@@ -794,4 +794,4 @@ fn push_inline_blob(output: &mut Vec<u8>, bytes: &[u8]) -> sdk::Result<()> {
 }
 
 #[cfg(target_family = "wasm")]
-lix_plugin_api_v3_prototype::export_v3_prototype!(JsonV3Prototype);
+lix_plugin_api::export_plugin!(JsonPlugin);
