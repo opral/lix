@@ -656,6 +656,18 @@ fn create_context_from_generated_entity(
     create_context_from_uuid(id.as_str())
 }
 
+fn ensure_source_page(
+    length: u32,
+    max_page_bytes: u32,
+) -> Result<(), bindings::lix::plugin::host::HostError> {
+    if length > max_page_bytes {
+        return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
+            "v3 source read exceeds max-page-bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 impl bindings::lix::plugin::host::HostSnapshot for WasiHostState {
     fn file_len(&mut self, resource: Resource<SnapshotResource>) -> u64 {
         self.table
@@ -676,6 +688,14 @@ impl bindings::lix::plugin::host::HostSnapshot for WasiHostState {
             let resource = self.table.get(&resource).map_err(host_table_error)?;
             (resource.root.clone(), resource.state.clone())
         };
+        ensure_source_page(
+            length,
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .limits
+                .max_page_bytes,
+        )?;
         let end = offset
             .checked_add(u64::from(length))
             .ok_or(bindings::lix::plugin::host::HostError::InvalidRange)?;
@@ -720,6 +740,14 @@ impl bindings::lix::plugin::host::HostSnapshot for WasiHostState {
             let resource = self.table.get(&resource).map_err(host_table_error)?;
             (resource.root.clone(), resource.state.clone())
         };
+        ensure_source_page(
+            max_bytes,
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .limits
+                .max_page_bytes,
+        )?;
         let total_len = match space {
             bindings::lix::plugin::host::MapSpace::Entity => root.entities.value_len(&key),
             bindings::lix::plugin::host::MapSpace::State => root.state.value_len(&key),
@@ -1191,6 +1219,7 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.check_active()?;
+        ensure_source_page(length, state.limits.max_page_bytes)?;
         let change = state
             .changes
             .get(index as usize)
@@ -1298,6 +1327,7 @@ impl bindings::lix::plugin::host::HostConflictSource for WasiHostState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.check_active()?;
+        ensure_source_page(length, state.limits.max_page_bytes)?;
         let conflict = state
             .conflicts
             .get(index as usize)
@@ -1546,6 +1576,7 @@ fn decode_typed_csv_rows(
     for _ in 0..row_count {
         let local_ref = u64::from(input.u32()?);
         let order_rank = input.u64()?;
+        validate_typed_csv_order_rank(order_rank)?;
         let ending = input.u8()?;
         if ending > 4 {
             return Err("typed CSV row has an invalid terminator code".to_owned());
@@ -1649,7 +1680,8 @@ fn validate_typed_csv_rows(row_count: u32, payload: &[u8]) -> Result<(u32, u32),
         }
         first_local_ref.get_or_insert(local_ref);
         previous_local_ref = Some(local_ref);
-        let _order_rank = input.u64()?;
+        let order_rank = input.u64()?;
+        validate_typed_csv_order_rank(order_rank)?;
         let ending = input.u8()?;
         if ending > 4 {
             return Err("typed CSV row has an invalid terminator code".to_owned());
@@ -1673,6 +1705,13 @@ fn validate_typed_csv_rows(row_count: u32, payload: &[u8]) -> Result<(u32, u32),
         first_local_ref.expect("positive row count has a first local ref"),
         previous_local_ref.expect("positive row count has a last local ref"),
     ))
+}
+
+fn validate_typed_csv_order_rank(order_rank: u64) -> Result<(), String> {
+    if order_rank & 0xff == 0 {
+        return Err("typed CSV row has an invalid order rank".to_owned());
+    }
+    Ok(())
 }
 
 struct ValidatedCreatedPacketPage {
@@ -3934,6 +3973,29 @@ mod tests {
             hydration_replacement_edit(17, 0).delete_len,
             0,
             "derived hydration still replaces an empty accepted source"
+        );
+    }
+
+    #[test]
+    fn source_reads_are_rejected_before_exceeding_one_page() {
+        assert!(ensure_source_page(2 * 1024 * 1024, 2 * 1024 * 1024).is_ok());
+        assert!(matches!(
+            ensure_source_page(2 * 1024 * 1024 + 1, 2 * 1024 * 1024),
+            Err(bindings::lix::plugin::host::HostError::LimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn typed_csv_certification_rejects_invalid_order_ranks() {
+        assert!(validate_typed_csv_order_rank(1).is_ok());
+        assert!(validate_typed_csv_order_rank(0xff).is_ok());
+        assert_eq!(
+            validate_typed_csv_order_rank(0).unwrap_err(),
+            "typed CSV row has an invalid order rank"
+        );
+        assert_eq!(
+            validate_typed_csv_order_rank(0x100).unwrap_err(),
+            "typed CSV row has an invalid order rank"
         );
     }
 
