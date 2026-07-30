@@ -48,22 +48,25 @@ interface host {
     format-only,
   }
 
-  record entity-change-meta {
+  record entity-change-input {
     ordinal: u32,
     schema-key: string,
     entity-pk: list<string>,
-    snapshot-len: option<u64>,
+    snapshot: option<bytes>,
     effect: change-effect,
   }
 
+  record entity-change-input-page {
+    changes: list<entity-change-input>,
+  }
+
   resource entity-change-source {
-    len: func() -> u32;
-    get: func(index: u32) -> result<entity-change-meta, host-error>;
-    read-snapshot: func(
-      index: u32,
-      offset: u64,
-      length: u32,
-    ) -> result<option<bytes>, host-error>;
+    /// Pull one complete bounded page while the enclosing guest export remains
+    /// entered. This avoids one metadata import plus one snapshot import for
+    /// every semantic row and lets the host retain storage-native paging.
+    next-page: func(
+      max-bytes: u32,
+    ) -> result<option<entity-change-input-page>, host-error>;
   }
 
   /// The sole host-owned atomic output capability. Checkpoints and semantic

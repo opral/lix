@@ -1653,8 +1653,18 @@ fn validate_host_entity(entity: &WasmHostEntity) -> Result<(), LixError> {
 }
 
 fn encoded_entity_record_bytes(entity: &WasmHostEntity) -> Result<u64, LixError> {
-    encoded_entity_key_bytes(&entity.key)?
-        .checked_add(encoded_host_bytes_ref_bytes(&entity.snapshot_content)?)
+    entity
+        .key
+        .entity_pk
+        .iter()
+        .try_fold(
+            entity.key.schema_key.len() as u64 + 24,
+            |size, component| {
+                size.checked_add(component.len() as u64)
+                    .ok_or_else(|| invalid_input("component entity record size overflowed"))
+            },
+        )?
+        .checked_add(entity.snapshot_content.len())
         .ok_or_else(|| invalid_input("component entity record size overflowed"))
 }
 
@@ -1667,25 +1677,24 @@ fn encoded_entity_change_record_bytes(
         ..
     } = change
     {
-        let snapshot_bytes = encoded_host_bytes_ref_bytes(snapshot_content)?;
-        return encoded_text_bytes(schema_key)?
-            .checked_add(1 + 8)
-            .and_then(|size| size.checked_add(snapshot_bytes))
+        return (schema_key.len() as u64)
+            .checked_add(24)
+            .and_then(|size| size.checked_add(snapshot_content.len()))
             .ok_or_else(|| invalid_input("component create record size overflowed"));
     }
-    let key_bytes = encoded_entity_key_bytes(
-        change
-            .entity_key()
-            .expect("non-create change has an entity key"),
-    )?;
-    let mut size = 1_u64
-        .checked_add(key_bytes)
-        .ok_or_else(|| invalid_input("component change record size overflowed"))?;
+    let key = change
+        .entity_key()
+        .expect("non-create change has an entity key");
+    let mut size =
+        key.entity_pk
+            .iter()
+            .try_fold(key.schema_key.len() as u64 + 24, |size, component| {
+                size.checked_add(component.len() as u64)
+                    .ok_or_else(|| invalid_input("component change record size overflowed"))
+            })?;
     if let WasmEntityChange::Upsert { entity, .. } = change {
-        let snapshot_bytes = encoded_host_bytes_ref_bytes(&entity.snapshot_content)?;
         size = size
-            .checked_add(1)
-            .and_then(|size| size.checked_add(snapshot_bytes))
+            .checked_add(entity.snapshot_content.len())
             .ok_or_else(|| invalid_input("component change record size overflowed"))?;
     }
     Ok(size)

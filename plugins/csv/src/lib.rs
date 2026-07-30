@@ -54,11 +54,10 @@ impl sdk::FormatPlugin for CsvPlugin {
             IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
         let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
         if let Some(accepted) = accepted {
-            let rendered = document.bytes();
-            if rendered != accepted {
+            if !document.bytes_equal(&accepted) {
                 let reconcile = [InputSplice {
                     offset: 0,
-                    delete_len: rendered.len() as u64,
+                    delete_len: document.byte_len() as u64,
                     insert: &accepted,
                 }];
                 document = document
@@ -75,7 +74,7 @@ impl sdk::FormatPlugin for CsvPlugin {
         let splices = if let Some(submitted) = submitted.as_ref() {
             let reconcile = [InputSplice {
                 offset: 0,
-                delete_len: document.bytes().len() as u64,
+                delete_len: document.byte_len() as u64,
                 insert: submitted,
             }];
             reconcile.to_vec()
@@ -98,15 +97,20 @@ impl sdk::FormatPlugin for CsvPlugin {
                 namespace,
             )
             .map_err(sdk::Error::invalid_input)?;
-        update
-            .successor
-            .put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
-        store_fallback_entities_fresh(
-            &update.successor,
-            &successor
-                .entity_records()
-                .map_err(sdk::Error::invalid_input)?,
-        )?;
+        if let Some((namespace, state)) = successor.canonical_arena_state() {
+            update.successor.put_state(ID_NAMESPACE_STATE, &namespace)?;
+            store_csv_index(&update.successor, &state)?;
+        } else {
+            update
+                .successor
+                .put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
+            store_fallback_entities_fresh(
+                &update.successor,
+                &successor
+                    .entity_records()
+                    .map_err(sdk::Error::invalid_input)?,
+            )?;
+        }
         let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
         for change in changes {
             encoder.push(change, update.creates, sink)?;
@@ -928,5 +932,44 @@ mod tests {
         assert!(pages.iter().all(|page| page.len() <= CSV_STATE_PAGE_BYTES));
         assert_eq!(page_count as usize, pages.len());
         assert_eq!(decoded, records);
+    }
+
+    #[test]
+    fn dense_successor_uses_the_compact_arena_without_row_snapshots() {
+        let namespace = IdNamespace::from_halves(7, 11);
+        let (document, _) =
+            Document::open_file(b"alpha,one\nbeta,two\n".to_vec(), None, namespace).unwrap();
+        let (stored_namespace, state) = document
+            .canonical_arena_state()
+            .expect("initial dense identities should use the compact arena");
+
+        assert_eq!(stored_namespace, namespace.0[..12]);
+        let index = ArenaRowIndex::decode(&state).expect("compact arena should decode");
+        assert_eq!(index.row_range_for_edit(1, 1).unwrap(), (0, 0, 10));
+    }
+
+    #[test]
+    fn structural_successor_keeps_the_paged_identity_checkpoint() {
+        let namespace = IdNamespace::from_halves(7, 11);
+        let (document, _) =
+            Document::open_file(b"alpha,one\nbeta,two\n".to_vec(), None, namespace).unwrap();
+        let inserted_namespace = IdNamespace::from_halves(13, 17);
+        let (successor, _) = document
+            .file_changed_with_paths(
+                &[InputSplice {
+                    offset: 0,
+                    delete_len: 0,
+                    insert: b"new,zero\n",
+                }],
+                None,
+                None,
+                inserted_namespace,
+            )
+            .unwrap();
+
+        assert!(
+            successor.canonical_arena_state().is_none(),
+            "a mixed-namespace structural successor cannot be represented by one dense namespace"
+        );
     }
 }

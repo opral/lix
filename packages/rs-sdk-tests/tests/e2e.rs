@@ -5583,14 +5583,21 @@ async fn v2_json_ten_mib_rocksdb_read_benchmark() {
 
 #[derive(Debug)]
 struct ColdMaterializedOpenSample {
-    elapsed: Duration,
+    measurement: BenchmarkMeasurement,
     counters: WasmTransitionCounters,
 }
 
 #[tokio::test]
-#[ignore = "large cold-open materialized-base benchmark"]
-async fn v2_cold_open_materialized_csv_and_json_benchmark() {
-    const SAMPLES: usize = 5;
+#[ignore = "large v3 cold-successor CSV and JSON benchmark"]
+async fn v3_cold_successor_csv_and_json_benchmark() {
+    let samples = std::env::var("LIX_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0)
+        .unwrap_or(5);
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
 
     let storage = lix_sdk::Memory::new();
     let seed = open_lix(OpenLixOptions::new(storage.clone()))
@@ -5642,20 +5649,28 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
             nested_prefix.len() + json_edit_offset,
         ),
     ] {
-        let mut samples = Vec::with_capacity(SAMPLES);
+        if std::env::var("LIX_BENCH_LANE").is_ok_and(|selected| selected != label) {
+            continue;
+        }
+        let mut lane_samples = Vec::with_capacity(samples);
         let mut accepted = initial.to_vec();
-        for _ in 0..SAMPLES {
+        for sample in 0..samples {
             let lix = open_lix(OpenLixOptions::new(storage.clone()))
                 .await
                 .expect("cold benchmark workspace should reopen");
             lix.reset_plugin_transition_counters();
+            collector.clear();
             let mut after = accepted.clone();
             after[edit_offset] = alternate_ascii_hex(after[edit_offset]);
+            let allocation_scope = AllocationScope::start();
             let started = Instant::now();
             write_file(&lix, path, after.clone())
                 .await
                 .unwrap_or_else(|error| panic!("cold write for {path} should succeed: {error:?}"));
-            let elapsed = started.elapsed();
+            let measurement =
+                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+            let phases_ms = collector.take_aggregate_millis();
+            let phase_close_live_bytes = collector.take_close_live_bytes();
             let actual = read_file(&lix, path)
                 .await
                 .unwrap_or_else(|error| {
@@ -5663,8 +5678,12 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
                 })
                 .unwrap_or_else(|| panic!("cold write result for {path} should exist"));
             assert_eq!(actual, after, "cold write must remain byte-exact");
-            samples.push(ColdMaterializedOpenSample {
-                elapsed,
+            eprintln!(
+                "v3_cold_successor_phases label={label} sample={sample} phases_ms={:?} phase_close_live_bytes={:?}",
+                phases_ms, phase_close_live_bytes,
+            );
+            lane_samples.push(ColdMaterializedOpenSample {
+                measurement,
                 counters: lix.plugin_transition_counters(),
             });
             lix.close()
@@ -5672,7 +5691,7 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
                 .expect("cold benchmark workspace should close");
             accepted = after;
         }
-        report_cold_materialized_open(label, accepted.len(), &samples);
+        report_cold_materialized_open(label, accepted.len(), &lane_samples);
     }
 }
 
@@ -5683,7 +5702,7 @@ fn report_cold_materialized_open(
 ) {
     let mut elapsed_ms = samples
         .iter()
-        .map(|sample| sample.elapsed.as_secs_f64() * 1_000.0)
+        .map(|sample| sample.measurement.elapsed_ms)
         .collect::<Vec<_>>();
     elapsed_ms.sort_by(f64::total_cmp);
     let p50_ms = elapsed_ms[elapsed_ms.len() / 2];
@@ -5693,25 +5712,36 @@ fn report_cold_materialized_open(
     for sample in samples {
         let counters = sample.counters;
         assert_eq!(
-            counters.full_renderer_invocations, 0,
-            "{label} cold materialized read must not render through a plugin"
+            counters.guest_export_calls, 1,
+            "{label} cold successor must not hydrate and re-enter the guest"
         );
-        assert_eq!(
-            counters.full_state_semantic_rows_materialized, 0,
-            "{label} cold materialized read must not hydrate semantic entities"
+        assert!(
+            counters.full_state_semantic_rows_materialized > 0,
+            "{label} cold successor must consume durable identities"
         );
-        assert_eq!(
-            counters.component_boundary_bytes, 0,
-            "{label} cold materialized read must not cross the Component boundary"
+        assert!(
+            counters.component_boundary_bytes > 0,
+            "{label} cold successor must account for its bounded entity pages"
         );
     }
 
     let representative = samples[elapsed_ms.len() / 2].counters;
+    let mut peak_live = samples
+        .iter()
+        .map(|sample| sample.measurement.allocations.peak_live_bytes_delta)
+        .collect::<Vec<_>>();
+    peak_live.sort_unstable();
+    let mut allocated = samples
+        .iter()
+        .map(|sample| sample.measurement.allocations.allocated_bytes)
+        .collect::<Vec<_>>();
+    allocated.sort_unstable();
     eprintln!(
-        "v2_cold_materialized_open label={label} bytes={expected_bytes} samples={} \
+        "v3_cold_successor label={label} bytes={expected_bytes} samples={} \
          p50_ms={p50_ms:.3} p95_ms={p95_ms:.3} source_read_calls={} source_bytes_read={} \
          packet_pages={} packet_records={} attachment_reads={} attachment_bytes_read={} \
-         boundary_bytes={} guest_high_water_bytes={} full_renderer_invocations={}",
+         boundary_bytes={} guest_high_water_bytes={} full_renderer_invocations={} \
+         host_peak_live_mb={:.3} host_allocated_mb={:.3}",
         samples.len(),
         representative.source_read_calls,
         representative.source_bytes_read,
@@ -5722,6 +5752,8 @@ fn report_cold_materialized_open(
         representative.component_boundary_bytes,
         representative.guest_linear_memory_high_water_bytes,
         representative.full_renderer_invocations,
+        peak_live[peak_live.len() / 2] as f64 / 1_000_000.0,
+        allocated[allocated.len() / 2] as f64 / 1_000_000.0,
     );
 }
 
