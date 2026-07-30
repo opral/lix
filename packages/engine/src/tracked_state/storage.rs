@@ -927,9 +927,11 @@ pub(crate) async fn load_change_record_by_id(
     if let Some(locator) = direct_change_locator(change_id)
         && let Some(manifest) = load_commit_delta_manifest(store, locator.commit_id).await?
     {
-        return load_change_record_at_locator_in_manifest(store, locator, &manifest)
-            .await
-            .map(Some);
+        if let Some(record) =
+            try_load_change_record_at_locator_in_manifest(store, locator, &manifest).await?
+        {
+            return Ok(Some(record));
+        }
     }
     let Some(locator) = load_change_locator_by_id(store, change_id).await? else {
         return Ok(None);
@@ -944,7 +946,8 @@ async fn load_canonical_change_locator(
     change_id: crate::changelog::ChangeId,
 ) -> Result<Option<CommitDeltaChangeLocator>, LixError> {
     if let Some(locator) = direct_change_locator(change_id)
-        && load_commit_delta_manifest(store, locator.commit_id)
+        && let Some(manifest) = load_commit_delta_manifest(store, locator.commit_id).await?
+        && try_load_change_record_at_locator_in_manifest(store, locator, &manifest)
             .await?
             .is_some()
     {
@@ -1017,6 +1020,22 @@ async fn load_change_record_at_locator_in_manifest(
     manifest: &CommitDeltaManifest,
 ) -> Result<crate::changelog::ChangeRecord, LixError> {
     let change_id = locator.change_id;
+    try_load_change_record_at_locator_in_manifest(store, locator, manifest)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("tracked_state change locator for '{change_id}' points to the wrong row"),
+            )
+        })
+}
+
+async fn try_load_change_record_at_locator_in_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    locator: CommitDeltaChangeLocator,
+    manifest: &CommitDeltaManifest,
+) -> Result<Option<crate::changelog::ChangeRecord>, LixError> {
+    let change_id = locator.change_id;
     let (segment, bounds) = if let Some(inline) = manifest.inline_segment() {
         if locator.segment_index != 0 {
             return Err(LixError::new(
@@ -1077,15 +1096,18 @@ async fn load_change_record_at_locator_in_manifest(
         )
     })?;
     let value = decode_value(entry.value)?;
-    if value.change_id != change_id || value.commit_id != locator.commit_id {
+    if value.commit_id != locator.commit_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("tracked_state change locator for '{change_id}' points to the wrong row"),
         ));
     }
+    if value.change_id != change_id {
+        return Ok(None);
+    }
     let key = decode_key(entry.key)?;
     let payload = payloads.decode(ordinal)?;
-    Ok(crate::changelog::ChangeRecord {
+    Ok(Some(crate::changelog::ChangeRecord {
         format_version: 2,
         change_id,
         schema_key: key.schema_key,
@@ -1095,7 +1117,7 @@ async fn load_change_record_at_locator_in_manifest(
         metadata: payload.metadata,
         created_at: value.updated_at,
         origin_key: payload.origin_key,
-    })
+    }))
 }
 
 fn decode_change_locator(
@@ -3249,6 +3271,63 @@ mod tests {
         assert_eq!(loaded.change_id, change_id);
         assert_eq!(loaded.schema_key, fixtures[source_index].schema_key);
         assert_eq!(loaded.entity_pk, fixtures[source_index].entity_pk);
+    }
+
+    #[tokio::test]
+    async fn address_shaped_explicit_change_id_falls_back_to_its_locator() {
+        let storage = StorageAdapter::new(Memory::new());
+        let addressable_commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1234_0000_0000,
+        ));
+        let address_target = packed_commit_delta_fixtures()
+            .into_iter()
+            .next()
+            .expect("fixture should exist");
+        let mut writes = storage.new_write_set();
+        let target_deltas =
+            commit_delta_refs(addressable_commit_id, std::slice::from_ref(&address_target));
+        let target_staged =
+            super::stage_addressable_commit_deltas(&mut writes, &target_deltas, &[false])
+                .expect("non-addressable target should stage");
+        stage_change_locators(&mut writes, &target_staged.locators);
+
+        let explicit_change_id =
+            super::addressable_change_id(addressable_commit_id, 0, 0).expect("valid direct shape");
+        let explicit_commit_id = CommitId::for_test_label("address-shaped-explicit-commit");
+        let mut explicit = packed_commit_delta_fixtures()
+            .into_iter()
+            .nth(1)
+            .expect("second fixture should exist");
+        explicit.change_id = explicit_change_id;
+        let explicit_deltas =
+            commit_delta_refs(explicit_commit_id, std::slice::from_ref(&explicit));
+        let explicit_staged =
+            super::stage_addressable_commit_deltas(&mut writes, &explicit_deltas, &[false])
+                .expect("explicit change should stage with a locator");
+        assert_eq!(explicit_staged.locators.len(), 1);
+        stage_change_locators(&mut writes, &explicit_staged.locators);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("collision fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("collision read should open");
+        let loaded = load_change_record_by_id(&read, explicit_change_id)
+            .await
+            .expect("explicit collision read should succeed")
+            .expect("explicit collision should resolve through its locator");
+        assert_eq!(loaded.change_id, explicit_change_id);
+        assert_eq!(loaded.schema_key, explicit.schema_key);
+        assert_eq!(loaded.entity_pk, explicit.entity_pk);
+        assert_ne!(loaded.entity_pk, address_target.entity_pk);
+        let canonical = super::load_canonical_change_locator(&read, explicit_change_id)
+            .await
+            .expect("canonical locator read should succeed")
+            .expect("explicit collision should retain a canonical locator");
+        assert_eq!(canonical.commit_id, explicit_commit_id);
     }
 
     #[test]
