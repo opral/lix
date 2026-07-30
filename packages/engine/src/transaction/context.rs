@@ -5026,6 +5026,12 @@ where
         allow_homogeneous: bool,
     ) -> Result<PreparedStateBatch, LixError> {
         let row_count = rows.len();
+        // SQL statement time is stable across every row in one write batch.
+        // Besides matching mature database semantics, this avoids formatting
+        // and sampling the wall clock once per row on bulk writes. Keep the
+        // sample lazy so normalization errors retain precedence over scalar
+        // provider calls.
+        let mut default_timestamp = None;
         let staged = self.staged_writes.staging_overlay()?;
         let read = SharedStorageAdapterRead::new(
             self.storage
@@ -5048,6 +5054,7 @@ where
                     rows.row(index),
                     normalized,
                     &functions,
+                    *default_timestamp.get_or_insert_with(|| functions.call_timestamp()),
                 )?);
             }
             if rows.iter().any(|row| {
@@ -5144,6 +5151,7 @@ where
                         .take()
                         .expect("normalized domain row must have facts"),
                     &functions,
+                    *default_timestamp.get_or_insert_with(|| functions.call_timestamp()),
                 )?;
                 scalar_ordinal_by_row[index] = scalar_facts.schema_plan_ids.len();
                 scalar_facts.push(scalar);
@@ -6316,6 +6324,7 @@ fn plan_prepared_row_scalars(
     row: RawWriteRowRef<'_>,
     normalized: NormalizedRowFacts,
     functions: &FunctionProviderHandle,
+    default_timestamp: LixTimestamp,
 ) -> Result<PreparedScalarRow, LixError> {
     let NormalizedRowFacts {
         schema_plan_id,
@@ -6323,7 +6332,7 @@ fn plan_prepared_row_scalars(
     } = normalized;
     let updated_at = match row.updated_at {
         Some(updated_at) => parse_prepared_timestamp("updated_at", updated_at)?,
-        None => functions.call_timestamp(),
+        None => default_timestamp,
     };
     let created_at = match row.created_at {
         Some(created_at) => parse_prepared_timestamp("created_at", created_at)?,
