@@ -475,47 +475,81 @@ pub(crate) async fn stage_certified_entity_batches(
         }
     }
 
+    let needs_branch_creation_donor = controls.keys().any(|branch_id| {
+        observations
+            .get(branch_id)
+            .is_none_or(|observation| observation.control.is_none())
+    });
+    let durable_controls = if needs_branch_creation_donor {
+        BranchHeadControlContext::new().reader(read).scan().await?
+    } else {
+        Vec::new()
+    };
+
+    let mut inherited_manifests = BTreeMap::new();
     for (branch_id, control) in controls {
-        let Some(previous) = observations
+        let source_generations = observations
             .get(branch_id)
             .and_then(|observation| observation.control)
-        else {
-            continue;
-        };
-        if previous.generation == control.generation {
-            continue;
-        }
-        let previous_prefix = previous.generation.as_uuid().as_bytes().to_vec();
-        let manifests = ScanPlan::prefix(
-            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(previous_prefix.clone()),
-            },
-        )
-        .collect(read, StorageScanOptions::default())
-        .await?;
-        for entry in manifests.value.entries {
-            let suffix = entry
-                .key
-                .0
-                .get(previous_prefix.len()..)
-                .ok_or_else(|| head_value_error("truncated certified manifest key"))?;
-            if complete_manifest_suffixes
-                .get(branch_id)
-                .is_some_and(|prefixes| prefixes.iter().any(|prefix| suffix.starts_with(prefix)))
-            {
-                continue;
-            }
-            let mut key = control.generation.as_uuid().as_bytes().to_vec();
-            key.extend_from_slice(suffix);
-            writes.put(
+            .map(|previous| BTreeSet::from([previous.generation]))
+            .unwrap_or_else(|| {
+                durable_controls
+                    .iter()
+                    .filter(|(_, candidate)| candidate.head_commit_id == control.head_commit_id)
+                    .map(|(_, candidate)| candidate.generation)
+                    .collect()
+            });
+        for source_generation in source_generations
+            .into_iter()
+            .filter(|generation| *generation != control.generation)
+        {
+            let previous_prefix = source_generation.as_uuid().as_bytes().to_vec();
+            let manifests = ScanPlan::prefix(
                 CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-                StorageKey(Bytes::from(key)),
-                StorageValue {
-                    bytes: full_value_bytes(entry.value)?,
+                StoragePrefix {
+                    bytes: Bytes::from(previous_prefix.clone()),
                 },
-            );
+            )
+            .collect(read, StorageScanOptions::default())
+            .await?;
+            for entry in manifests.value.entries {
+                let suffix = entry
+                    .key
+                    .0
+                    .get(previous_prefix.len()..)
+                    .ok_or_else(|| head_value_error("truncated certified manifest key"))?;
+                if complete_manifest_suffixes
+                    .get(branch_id)
+                    .is_some_and(|prefixes| {
+                        prefixes.iter().any(|prefix| suffix.starts_with(prefix))
+                    })
+                {
+                    continue;
+                }
+                let mut key = control.generation.as_uuid().as_bytes().to_vec();
+                key.extend_from_slice(suffix);
+                let value = full_value_bytes(entry.value)?;
+                match inherited_manifests.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(value);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get() == &value => {}
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        return Err(head_value_error(
+                            "certified manifests disagree for the same inherited key",
+                        ));
+                    }
+                }
+            }
         }
+    }
+    for (key, value) in inherited_manifests {
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+            StorageKey(Bytes::from(key)),
+            StorageValue { bytes: value },
+        );
     }
 
     for file in file_writes {
@@ -6595,6 +6629,185 @@ mod tests {
         let mut keyed = create_record(7);
         keyed[4] = 0;
         assert_eq!(certified_packet_page_local_ref_range(&keyed).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn branch_creation_inherits_certified_manifests_from_same_head() {
+        const EMPTY_BRANCH: &str = "a-empty";
+        const DONOR_BRANCH: &str = "donor";
+        const SECOND_DONOR_BRANCH: &str = "donor-two";
+        const CREATED_BRANCH: &str = "created";
+        const FILE_ID: &str = "inherited.csv";
+        const SCHEMA_KEY: &str = "inherited_row";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let head_commit_id = CommitId::for_test_label("certified-inherited-head");
+        let donor_generation = CommitId::for_test_label("certified-inherited-donor");
+        let created_generation = CommitId::for_test_label("certified-inherited-created");
+        let created_at = timestamp();
+        let donor_control = BranchHeadControl {
+            head_commit_id,
+            generation: donor_generation,
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at,
+            updated_at: created_at,
+            ref_change_id: ChangeId::for_test_label("certified-inherited-donor-ref"),
+        };
+        let empty_control = BranchHeadControl {
+            generation: CommitId::for_test_label("certified-inherited-empty"),
+            ref_change_id: ChangeId::for_test_label("certified-inherited-empty-ref"),
+            ..donor_control
+        };
+        let second_donor_control = BranchHeadControl {
+            generation: CommitId::for_test_label("certified-inherited-donor-two"),
+            ref_change_id: ChangeId::for_test_label("certified-inherited-donor-two-ref"),
+            ..donor_control
+        };
+        let creates = WasmCreateContext {
+            high: 0x0192_0000_0000_7000,
+            low: 0x8000_0000,
+        };
+        let mut page = Vec::new();
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.extend_from_slice(&1_u64.to_le_bytes());
+        page.push(0);
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.extend_from_slice(&1_u16.to_le_bytes());
+        page.extend_from_slice(&5_u32.to_le_bytes());
+        page.extend_from_slice(b"value");
+        let batches = [WasmCertifiedEntityBatch {
+            format: 1,
+            schema_keys: vec![SCHEMA_KEY.to_owned()],
+            row_count: 1,
+            creates,
+            complete_file_state: true,
+            pages: vec![Bytes::from(page)],
+        }];
+        let files = [CertifiedEntityBatchFileRef {
+            branch_id: DONOR_BRANCH,
+            file_id: FILE_ID,
+            batches: &batches,
+        }];
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("donor certified read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_branch_head_control(&mut writes, EMPTY_BRANCH, empty_control)
+            .expect("empty same-head control should stage");
+        stage_branch_head_control(&mut writes, DONOR_BRANCH, donor_control)
+            .expect("donor control should stage");
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &files,
+            &BTreeMap::from([(DONOR_BRANCH.to_owned(), donor_control)]),
+            &BTreeMap::from([(
+                DONOR_BRANCH.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: Some(donor_control),
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::from([(head_commit_id, created_at)]),
+        )
+        .await
+        .expect("donor certified batch should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("donor certified batch should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("second donor read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_branch_head_control(&mut writes, SECOND_DONOR_BRANCH, second_donor_control)
+            .expect("second donor control should stage");
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &[],
+            &BTreeMap::from([(SECOND_DONOR_BRANCH.to_owned(), second_donor_control)]),
+            &BTreeMap::from([(
+                SECOND_DONOR_BRANCH.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: None,
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("second donor should inherit certified manifests");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("second donor certified manifests should commit");
+
+        let created_control = BranchHeadControl {
+            generation: created_generation,
+            ref_change_id: ChangeId::for_test_label("certified-inherited-created-ref"),
+            ..donor_control
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("created branch read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &[],
+            &BTreeMap::from([(CREATED_BRANCH.to_owned(), created_control)]),
+            &BTreeMap::from([(
+                CREATED_BRANCH.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: None,
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("created branch should inherit certified manifests");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("created branch certified manifests should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("created branch verification read should open");
+        let rows = scan_certified_entity_batch_rows(
+            &read,
+            CREATED_BRANCH,
+            created_generation,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![SCHEMA_KEY.to_owned()],
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: None,
+            },
+            None,
+        )
+        .await
+        .expect("created branch certified rows should scan");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.row(0).schema_key(), SCHEMA_KEY);
+        assert_eq!(rows.row(0).file_id(), Some(FILE_ID));
     }
 
     fn diff_identity(branch_id: &str, generation: CommitId, entity: &str) -> HeadIdentity {

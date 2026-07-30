@@ -344,7 +344,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &prepared_writes.checkpoint_publications,
         &staged_hot_heads.controls,
     )?;
-    stage_branch_head_control_publications(
+    let published_branch_controls = stage_branch_head_control_publications(
         read,
         &mut writes,
         &staged_hot_heads.controls,
@@ -375,7 +375,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         read,
         &mut writes,
         &certified_files,
-        &staged_hot_heads.controls,
+        &published_branch_controls,
         &branch_control_observations,
         &commit_created_at,
     )
@@ -2566,7 +2566,7 @@ async fn stage_branch_head_control_publications(
     checkpoint_publications: &[crate::gc::CheckpointPublication],
     preconditions: &mut Vec<StoragePrecondition>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
-) -> Result<(), LixError> {
+) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
     let checkpoint_epochs = checkpoint_epoch_bindings(checkpoint_publications)?;
     let mut publications = normal_controls
         .iter()
@@ -2693,7 +2693,7 @@ async fn stage_branch_head_control_publications(
                 "checkpoint epoch publication has no corresponding branch-control publication",
             ));
         }
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
     for (branch_id, desired) in &mut publications {
         if let Some(checkpoint_commit_id) = checkpoint_epochs.get(branch_id) {
@@ -2724,7 +2724,10 @@ async fn stage_branch_head_control_publications(
             None => stage_delete_branch_head_control(writes, branch_id)?,
         }
     }
-    Ok(())
+    Ok(publications
+        .into_iter()
+        .filter_map(|(branch_id, control)| control.map(|control| (branch_id, control)))
+        .collect())
 }
 
 fn checkpoint_epoch_bindings(
