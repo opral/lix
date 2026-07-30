@@ -181,6 +181,27 @@ pub(crate) async fn materialize_known_change_payloads<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
+    Ok(
+        materialize_known_change_payloads_in_order(store, changes, projection)
+            .await?
+            .into_iter()
+            .collect(),
+    )
+}
+
+/// Hydrates retained change records without collapsing repeated change ids.
+///
+/// Eager plugin materialization can produce multiple semantic identities from
+/// one source change. Lifecycle operations such as checkpoints must preserve
+/// each identity-specific payload even though those rows share a change id.
+pub(crate) async fn materialize_known_change_payloads_in_order<S>(
+    store: &S,
+    changes: impl Iterator<Item = ChangeRecord>,
+    projection: ChangeRecordProjection,
+) -> Result<Vec<(ChangeId, MaterializedChangePayload)>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
     let changes = changes.collect::<Vec<_>>();
     if !projection.requires_payload() {
         return Ok(changes
@@ -329,7 +350,9 @@ fn materialized_json_string(
 mod tests {
     use super::*;
     use crate::changelog::test_support::test_change_record;
-    use crate::storage_adapter::RequestedToUniqueRef;
+    use crate::storage_adapter::{
+        Memory, RequestedToUniqueRef, StorageAdapter, StorageReadOptions,
+    };
 
     fn encoded_change(schema_key: &str) -> Bytes {
         let mut record = test_change_record();
@@ -408,6 +431,49 @@ mod tests {
             error
                 .to_string()
                 .contains("returned 1 values for 2 unique ids")
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_materialization_preserves_repeated_change_ids() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let first = test_change_record();
+        let mut second = first.clone();
+        second.schema_key = "derived-row".to_owned();
+        second.entity_pk = crate::entity_pk::EntityPk::single("entity-2");
+
+        let payloads = materialize_known_change_payloads_in_order(
+            &read,
+            [first.clone(), second.clone()].into_iter(),
+            ChangeRecordProjection::full(),
+        )
+        .await
+        .expect("repeated source ids should materialize");
+
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].0, first.change_id);
+        assert_eq!(payloads[1].0, first.change_id);
+        assert_eq!(
+            payloads[0]
+                .1
+                .identity
+                .as_ref()
+                .expect("first identity")
+                .schema_key,
+            first.schema_key
+        );
+        assert_eq!(
+            payloads[1]
+                .1
+                .identity
+                .as_ref()
+                .expect("second identity")
+                .schema_key,
+            second.schema_key
         );
     }
 

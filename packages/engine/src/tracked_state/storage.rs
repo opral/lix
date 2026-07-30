@@ -1136,8 +1136,8 @@ pub(crate) async fn load_commit_delta_change_records(
 ///
 /// A known commit without a manifest is an empty commit. A present manifest is
 /// authoritative: every identity must carry its payload in the same packed
-/// record, and duplicate change ids are corruption even when their identities
-/// differ.
+/// record. Selected cascade tombstones may share their source change id; live
+/// and authored rows remain unique by change id.
 pub(crate) async fn load_commit_delta_members_with_payloads(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
@@ -1194,7 +1194,6 @@ pub(crate) async fn scan_commit_delta_members(
 ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
     let batch = scan_commit_delta_values(store, commit_id, &[]).await?;
     let mut members = Vec::with_capacity(batch.len());
-    let mut change_ids = BTreeSet::new();
     for row in batch.iter() {
         let key = row.key_ref();
         let key = TrackedStateKey {
@@ -1211,15 +1210,6 @@ pub(crate) async fn scan_commit_delta_members(
             ));
         }
         let value = row.value().clone();
-        if !change_ids.insert(value.change_id) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state commit_delta for commit '{commit_id}' contains duplicate change id '{}'",
-                    value.change_id
-                ),
-            ));
-        }
         members.push((key, value));
     }
     Ok(members)
@@ -1238,6 +1228,7 @@ pub(crate) async fn load_commit_delta_change_ids(
         .map(|(_, value)| value.change_id)
         .collect::<Vec<_>>();
     change_ids.sort_unstable();
+    change_ids.dedup();
     Ok(change_ids)
 }
 
@@ -1490,6 +1481,10 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                 if member.authored {
                     visit(member.change)?;
                     emitted += 1;
+                } else if is_payload_free_selected_tombstone(&member) {
+                    // Cascade tombstones preserve identity history but do not
+                    // introduce another public changelog fact.
+                    continue;
                 } else {
                     let locator = load_change_locator_by_id(store, member.change.change_id)
                         .await?
@@ -1661,6 +1656,9 @@ pub(crate) async fn scan_commit_delta_inventory(
         }
         validate_commit_delta_member_order_and_ids(commit_id, &members)?;
         for member in &members {
+            if is_payload_free_selected_tombstone(member) {
+                continue;
+            }
             if let Some(existing) =
                 authoritative_changes.insert(member.change.change_id, member.change.clone())
                 && existing != member.change
@@ -1925,20 +1923,31 @@ fn validate_commit_delta_member_order_and_ids(
             ),
         ));
     }
-    let mut change_ids = BTreeSet::new();
-    if let Some(change_id) = members
-        .iter()
-        .map(|member| member.value.change_id)
-        .find(|change_id| !change_ids.insert(*change_id))
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked_state commit_delta for commit '{commit_id}' contains duplicate change id '{change_id}'"
-            ),
-        ));
+    let mut change_ids = BTreeMap::new();
+    for member in members {
+        if let Some(previous_is_selected_tombstone) = change_ids.insert(
+            member.value.change_id,
+            is_payload_free_selected_tombstone(member),
+        ) && !(previous_is_selected_tombstone && is_payload_free_selected_tombstone(member))
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state commit_delta for commit '{commit_id}' contains duplicate change id '{}'",
+                    member.value.change_id
+                ),
+            ));
+        }
     }
     Ok(())
+}
+
+fn is_payload_free_selected_tombstone(member: &CommitDeltaMember) -> bool {
+    !member.authored
+        && member.value.deleted
+        && member.change.snapshot.is_none()
+        && member.change.metadata.is_none()
+        && member.change.origin_key.is_none()
 }
 
 fn encode_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<Vec<u8>, LixError> {
@@ -2964,7 +2973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_local_and_global_authority_reject_duplicate_change_ids() {
+    async fn public_membership_dedupes_ids_but_payload_authority_rejects_conflicts() {
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = CommitId::for_test_label("duplicate-change-id");
         let mut fixtures = packed_commit_delta_fixtures()
@@ -2984,10 +2993,12 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let error = load_commit_delta_change_ids(&read, commit_id)
-            .await
-            .expect_err("commit-local authority must reject duplicate change ids");
-        assert!(error.to_string().contains("contains duplicate change id"));
+        assert_eq!(
+            load_commit_delta_change_ids(&read, commit_id)
+                .await
+                .expect("public commit membership should load"),
+            vec![fixtures[0].change_id]
+        );
         let error = scan_commit_delta_inventory(&read)
             .await
             .expect_err("global authority must reject duplicate change ids");
@@ -2996,6 +3007,50 @@ mod tests {
             .await
             .expect_err("streaming authority must reject duplicate change ids");
         assert!(error.to_string().contains("contains duplicate change id"));
+    }
+
+    #[tokio::test]
+    async fn selected_tombstones_may_share_one_source_change_id() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("duplicate-selected-tombstone");
+        let mut fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        fixtures[0].deleted = true;
+        fixtures[1].deleted = true;
+        fixtures[1].change_id = fixtures[0].change_id;
+        let mut deltas = commit_delta_refs(commit_id, &fixtures);
+        for delta in &mut deltas {
+            delta.authored = false;
+        }
+        let mut writes = storage.new_write_set();
+        stage_commit_deltas(&mut writes, &deltas).expect("selected tombstones should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("selected tombstones should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        assert_eq!(
+            load_commit_delta_members_with_payloads(&read, commit_id)
+                .await
+                .expect("selected tombstones should remain identity-addressable")
+                .len(),
+            2
+        );
+        assert!(
+            scan_change_records_from_commit_deltas(&read)
+                .await
+                .expect("selected tombstones should not conflict with public authority")
+                .is_empty()
+        );
+        scan_commit_delta_inventory(&read)
+            .await
+            .expect("selected tombstones should be valid inventory members");
     }
 
     #[tokio::test]
