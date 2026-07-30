@@ -918,13 +918,15 @@ fn current_state_delta_from_state_row(
 fn host_certified_batch_owns_live_row(
     row: PreparedStateRowRef<'_>,
     branch_id: &str,
+    certified_commit_id: CommitId,
     host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
 ) -> bool {
     // A complete certified batch replaces only the incoming live rows. An
     // ownership transition may stage tombstones for the previous plugin under
     // the same file/schema pair; those must remain HOT overlays so the old
     // entity identities disappear and collection counts are decremented.
-    row.snapshot.is_some()
+    row.commit_id == Some(certified_commit_id)
+        && row.snapshot.is_some()
         && row.file_id.is_some_and(|file_id| {
             host_certified_file_schemas
                 .get(branch_id)
@@ -1125,11 +1127,13 @@ fn stage_tracked_commit_delta_index(
             let row = state_rows.row(row_index);
             addressable.push(row.addressable_change_id);
             let mut delta = tracked_commit_delta_from_state_row(row)?;
-            delta.certified = host_certified_batch_owns_live_row(
-                row,
-                &root.branch_id,
-                host_certified_file_schemas,
-            );
+            delta.certified = root.publish_head
+                && host_certified_batch_owns_live_row(
+                    row,
+                    &root.branch_id,
+                    root.commit_id,
+                    host_certified_file_schemas,
+                );
             deltas.push(delta);
         }
         for change_ref in selected_changes(&staged.selected_change_batches) {
@@ -2074,6 +2078,7 @@ async fn stage_tracked_head(
                     !host_certified_batch_owns_live_row(
                         row,
                         &root.branch_id,
+                        root.commit_id,
                         host_certified_file_schemas,
                     )
                 })
@@ -3575,6 +3580,9 @@ mod tests {
         new_plugin_live.entity_pk = EntityPk::single("new-plugin-line");
         new_plugin_live.schema_key = "git_text_line_v2".into();
         new_plugin_live.file_id = Some("file-a".into());
+        let published_commit_id = new_plugin_live
+            .commit_id
+            .expect("test live row should have a commit");
 
         let certified = BTreeMap::from([(
             "main".to_string(),
@@ -3588,6 +3596,7 @@ mod tests {
             !host_certified_batch_owns_live_row(
                 old_plugin_tombstone.borrowed(),
                 "main",
+                published_commit_id,
                 &certified,
             ),
             "the previous owner's tombstone must remain in HOT publication",
@@ -3599,8 +3608,50 @@ mod tests {
             "the retained row must decrement collection counts as a deletion",
         );
         assert!(
-            host_certified_batch_owns_live_row(new_plugin_live.borrowed(), "main", &certified),
+            host_certified_batch_owns_live_row(
+                new_plugin_live.borrowed(),
+                "main",
+                published_commit_id,
+                &certified,
+            ),
             "the certified batch owns the replacement live row",
+        );
+    }
+
+    #[test]
+    fn host_certified_batch_does_not_own_intermediate_commit_rows() {
+        let published_commit_id = commit_id("published-certified-batch");
+        let mut published = tracked_branch_row("main", "published-live-row");
+        published.commit_id = Some(published_commit_id);
+        published.schema_key = "git_text_line_v2".into();
+        published.file_id = Some("file-a".into());
+
+        let mut intermediate = published.clone();
+        intermediate.commit_id = Some(commit_id("intermediate-write"));
+        intermediate.change_id = Some(change_id("intermediate-live-row"));
+
+        let certified = BTreeMap::from([(
+            "main".to_string(),
+            BTreeMap::from([(
+                "file-a".to_string(),
+                BTreeSet::from(["git_text_line_v2".to_string()]),
+            )]),
+        )]);
+
+        assert!(host_certified_batch_owns_live_row(
+            published.borrowed(),
+            "main",
+            published_commit_id,
+            &certified,
+        ));
+        assert!(
+            !host_certified_batch_owns_live_row(
+                intermediate.borrowed(),
+                "main",
+                published_commit_id,
+                &certified,
+            ),
+            "an intermediate commit has no certified batch under its own commit id",
         );
     }
 
