@@ -1008,6 +1008,137 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
 }
 
 #[tokio::test]
+async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node_v2"],
+    )
+    .await;
+    let path = "/markdown-multi-namespace.md";
+    write_file(&lix, path, b"Old paragraph.\n".to_vec())
+        .await
+        .unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    let original = lix
+        .execute(
+            "SELECT id FROM markdown_node_v2 \
+             WHERE kind = 'paragraph' AND lixcol_file_id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("id")
+        .unwrap();
+
+    write_file(&lix, path, b"Old paragraph.\n\nNew paragraph.\n".to_vec())
+        .await
+        .unwrap();
+    let rows = lix
+        .execute(
+            "SELECT id, payload_json FROM markdown_node_v2 \
+             WHERE kind = 'paragraph' AND lixcol_file_id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    let inserted = rows
+        .rows()
+        .iter()
+        .find(|row| {
+            row.get::<String>("payload_json")
+                .is_ok_and(|payload| payload.contains("New paragraph."))
+        })
+        .and_then(|row| row.get::<String>("id").ok())
+        .expect("inserted paragraph identity");
+    assert_ne!(inserted, original);
+
+    for index in 0..20 {
+        write_file(
+            &lix,
+            &format!("/markdown-evict-{index}.md"),
+            format!("Eviction paragraph {index}.\n").into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+    lix.execute(
+        "UPDATE markdown_node_v2 SET payload_json = $1 \
+         WHERE id = $2 AND lixcol_file_id = $3",
+        &[
+            Value::Text(
+                serde_json::json!({
+                    "inline": [{"type": "text", "value": "Edited after hydration."}]
+                })
+                .to_string(),
+            ),
+            Value::Text(inserted.clone()),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .expect("semantic edit must address the hydrated later-namespace identity");
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"Old paragraph.\n\nEdited after hydration.\n".to_vec())
+    );
+
+    write_file(
+        &lix,
+        path,
+        b"OLD paragraph.\n\nEdited after hydration.\n\nThird paragraph.\n".to_vec(),
+    )
+    .await
+    .expect("full file reconciliation must reuse the hydrated identity graph");
+    let retained = lix
+        .execute(
+            "SELECT id, payload_json FROM markdown_node_v2 \
+             WHERE kind = 'paragraph' AND lixcol_file_id = $1",
+            &[Value::Text(file_id)],
+        )
+        .await
+        .unwrap();
+    let retained_id = retained
+        .rows()
+        .iter()
+        .find(|row| {
+            row.get::<String>("payload_json")
+                .is_ok_and(|payload| payload.contains("Edited after hydration."))
+        })
+        .and_then(|row| row.get::<String>("id").ok())
+        .expect("edited paragraph remains queryable");
+    assert_eq!(retained_id, inserted);
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_markdown_one_large_block_spans_state_pages() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node_v2"],
+    )
+    .await;
+    let path = "/markdown-large-block.md";
+    let mut source = b"```\n".to_vec();
+    source.extend(std::iter::repeat_n(b'x', 1024 * 1024 + 257));
+    source.extend_from_slice(b"\n```\n");
+
+    write_file(&lix, path, source.clone())
+        .await
+        .expect("one block may span bounded Markdown state pages");
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(source));
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v3_markdown_noncanonical_source_stays_in_file_arena_not_semantic_root() {
     let root = tempfile::tempdir().expect("create noncanonical v3 Markdown directory");
     let lix = open_lix_with_rocksdb(root.path()).await;

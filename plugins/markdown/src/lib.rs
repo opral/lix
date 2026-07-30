@@ -15,11 +15,9 @@ use serde_json::Value;
 
 struct MarkdownPlugin;
 
-const ID_NAMESPACE_STATE: &[u8] = b"markdown/id-namespace-v1";
 const ROOT_STATE: &[u8] = b"markdown/root-v1";
 const BLOCKS_STATE: &[u8] = b"markdown/blocks-v1";
 const BLOCK_SHIFTS_STATE: &[u8] = b"markdown/block-shifts-v1";
-const NEXT_ID_ORDINAL_STATE: &[u8] = b"markdown/next-id-ordinal-v1";
 const LEXICAL_FALLBACK_FIELD: &str = "lexical_fallback_base64";
 const BLOCK_INDEX_MAGIC: &[u8; 4] = b"MDB2";
 const BLOCK_INDEX_HEADER_BYTES: u32 = 16;
@@ -45,15 +43,7 @@ impl sdk::FormatPlugin for MarkdownPlugin {
                 },
             });
         }
-        let namespace = read_namespace(&update.before)?
-            .or_else(|| namespace_from_changes(&changes))
-            .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        let (document, _) = Document::open_file(
-            before.clone(),
-            update.before_file.path.as_deref(),
-            namespace,
-        )
-        .map_err(core_error)?;
+        let document = load_markdown_document(&update.before, before.clone())?;
         let (successor, edits) = document.entities_changed(changes).map_err(core_error)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
         store_rendered_markdown_state(&update.before, sink, &successor)?;
@@ -76,12 +66,8 @@ impl sdk::FormatPlugin for MarkdownPlugin {
             .as_ref()
             .map(sdk::Root::read_all)
             .transpose()?;
-        let creates = markdown_create_context(&records)?;
         let (document, _) = Document::open_entities(records, accepted).map_err(core_error)?;
-        input
-            .successor
-            .put_state(ID_NAMESPACE_STATE, &creates.namespace_bytes())?;
-        store_markdown_state(&input.successor, &document, creates)?;
+        store_markdown_state(&input.successor, &document)?;
         if input.accepted.is_none() {
             sink.replace_file(&document.bytes())?;
         }
@@ -118,38 +104,17 @@ impl sdk::FormatPlugin for MarkdownPlugin {
     fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
         let bytes = input.accepted.read_all()?;
         let namespace = IdNamespace::from_halves(input.creates.high, input.creates.low);
-        input
-            .successor
-            .put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
         let (document, mut changes) =
             Document::open_file(bytes, input.file.path.as_deref(), namespace)
                 .map_err(core_error)?;
         strip_duplicated_lexical_fallback(&mut changes)?;
-        store_markdown_state(&input.successor, &document, input.creates)?;
+        store_markdown_state(&input.successor, &document)?;
         emit_changes(changes, input.creates, None, sink)?;
         Ok(())
     }
 
     fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
-        let namespace = update
-            .before
-            .get_state(ID_NAMESPACE_STATE)?
-            .ok_or_else(|| sdk::Error::invalid_input("Markdown arena root has no ID namespace"))?;
-        let namespace: [u8; 12] = namespace.try_into().map_err(|_| {
-            sdk::Error::invalid_input("Markdown arena ID namespace has invalid length")
-        })?;
-        let namespace = IdNamespace::from_halves(
-            u64::from_be_bytes(
-                namespace[..8]
-                    .try_into()
-                    .expect("eight-byte namespace prefix"),
-            ),
-            u32::from_be_bytes(
-                namespace[8..]
-                    .try_into()
-                    .expect("four-byte namespace suffix"),
-            ),
-        );
+        let namespace = IdNamespace::from_halves(update.creates.high, update.creates.low);
         let inserts = update
             .edits
             .iter()
@@ -167,33 +132,17 @@ impl sdk::FormatPlugin for MarkdownPlugin {
             .collect::<Vec<_>>();
         if update.before_file.path == update.after_file.path
             && let [edit] = update.edits.as_slice()
-            && let Some((
-                changes,
-                create_from_ordinal,
-                next_ordinal,
-                root,
-                block_key,
-                block,
-                shifts,
-            )) = sparse_block_change(update, edit, &inserts[0], namespace)?
+            && let Some((changes, root, block_key, block, shifts)) =
+                sparse_block_change(update, edit, &inserts[0], namespace)?
         {
             update.successor.put_state(ROOT_STATE, &root)?;
             update.successor.put_state(&block_key, &block)?;
             update.successor.put_state(BLOCK_SHIFTS_STATE, &shifts)?;
-            update
-                .successor
-                .put_state(NEXT_ID_ORDINAL_STATE, &next_ordinal.to_le_bytes())?;
-            emit_changes(changes, update.creates, Some(create_from_ordinal), sink)?;
+            emit_changes(changes, update.creates, Some(0), sink)?;
             return Ok(());
         }
 
-        let (document, _) = Document::open_file(
-            update.before.read_all()?,
-            update.before_file.path.as_deref(),
-            namespace,
-        )
-        .map_err(core_error)?;
-        let next_ordinal = read_next_ordinal(update)?;
+        let document = load_markdown_document(&update.before, update.before.read_all()?)?;
         let (document, mut changes) = document
             .file_changed(&splices, namespace)
             .map_err(core_error)?;
@@ -229,11 +178,7 @@ impl sdk::FormatPlugin for MarkdownPlugin {
             }
         }
         update.successor.delete_state(BLOCK_SHIFTS_STATE)?;
-        let successor_next = successor_next_ordinal(&changes, update.creates, next_ordinal)?;
-        update
-            .successor
-            .put_state(NEXT_ID_ORDINAL_STATE, &successor_next.to_le_bytes())?;
-        emit_changes(changes, update.creates, Some(next_ordinal), sink)?;
+        emit_changes(changes, update.creates, Some(0), sink)?;
         Ok(())
     }
 }
@@ -269,46 +214,6 @@ fn store_rendered_markdown_state(
     Ok(())
 }
 
-fn read_namespace(root: &sdk::Root<'_>) -> sdk::Result<Option<IdNamespace>> {
-    let Some(bytes) = root.get_state(ID_NAMESPACE_STATE)? else {
-        return Ok(None);
-    };
-    let bytes: [u8; 12] = bytes
-        .try_into()
-        .map_err(|_| sdk::Error::invalid_input("Markdown ID namespace has invalid length"))?;
-    Ok(Some(IdNamespace::from_halves(
-        u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
-        u32::from_be_bytes(bytes[8..].try_into().expect("four bytes")),
-    )))
-}
-
-fn markdown_create_context(records: &[EntityRecord]) -> sdk::Result<sdk::CreateContext> {
-    let id = records
-        .iter()
-        .flat_map(|record| &record.entity_pk)
-        .find_map(|component| uuid::Uuid::parse_str(component).ok())
-        .ok_or_else(|| sdk::Error::invalid_input("Markdown hydration has no generated identity"))?;
-    let bytes = id.into_bytes();
-    Ok(sdk::CreateContext {
-        high: u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
-        low: u32::from_be_bytes(bytes[8..12].try_into().expect("four bytes")),
-    })
-}
-
-fn namespace_from_changes(changes: &[EntityChange]) -> Option<IdNamespace> {
-    changes
-        .iter()
-        .flat_map(|change| &change.entity_pk)
-        .find_map(|component| uuid::Uuid::parse_str(component).ok())
-        .map(|id| {
-            let bytes = id.into_bytes();
-            IdNamespace::from_halves(
-                u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
-                u32::from_be_bytes(bytes[8..12].try_into().expect("four bytes")),
-            )
-        })
-}
-
 fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<u8>> {
     for edit in edits.iter().rev() {
         let start = usize::try_from(edit.offset)
@@ -328,11 +233,7 @@ fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<
     Ok(bytes)
 }
 
-fn store_markdown_state(
-    successor: &sdk::Transaction,
-    document: &Document,
-    creates: sdk::CreateContext,
-) -> sdk::Result<()> {
+fn store_markdown_state(successor: &sdk::Transaction, document: &Document) -> sdk::Result<()> {
     let (root, blocks) = document.arena_state().map_err(core_error)?;
     successor.put_state(ROOT_STATE, &root)?;
     let encoded = encode_blocks(&blocks)?;
@@ -343,20 +244,10 @@ fn store_markdown_state(
     for (ordinal, page) in encoded.block_pages.iter().enumerate() {
         successor.put_state(&block_page_key(ordinal as u32), page)?;
     }
-    let next_ordinal = next_arena_ordinal(&root, &blocks, creates)?;
-    successor.put_state(NEXT_ID_ORDINAL_STATE, &next_ordinal.to_le_bytes())?;
     Ok(())
 }
 
-type SparseBlockResult = (
-    Vec<EntityChange>,
-    u32,
-    u32,
-    Vec<u8>,
-    Vec<u8>,
-    Vec<u8>,
-    Vec<u8>,
-);
+type SparseBlockResult = (Vec<EntityChange>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 fn sparse_block_change(
     update: &sdk::FileUpdate<'_>,
@@ -393,7 +284,7 @@ fn sparse_block_change(
     let mut high = count;
     while low < high {
         let middle = low + (high - low) / 2;
-        let entry = read_block_entry(update, middle)?;
+        let entry = read_block_entry(&update.before, middle)?;
         if effective_block_position(entry.start, middle, &shifts)? <= edit.offset {
             low = middle + 1;
         } else {
@@ -404,7 +295,7 @@ fn sparse_block_change(
         return Ok(None);
     }
     let ordinal = low - 1;
-    let entry = read_block_entry(update, ordinal)?;
+    let entry = read_block_entry(&update.before, ordinal)?;
     let start = effective_block_position(entry.start, ordinal, &shifts)?;
     let end = effective_block_position(entry.end, ordinal + 1, &shifts)?;
     if edit.offset < start || edit_end > end {
@@ -413,20 +304,15 @@ fn sparse_block_change(
     let block_key = block_overlay_key(ordinal);
     let block = match update.before.get_state(&block_key)? {
         Some(block) => block,
-        None => update
-            .before
-            .read_state_range(
-                &block_page_key(entry.page),
-                u64::from(entry.blob_offset),
-                entry.blob_len,
-            )?
-            .ok_or_else(|| sdk::Error::invalid_input("Markdown block index disappeared"))?,
+        None => read_block_blob(&update.before, entry)?,
     };
+    if block.len() > BLOCK_PAGE_BYTES {
+        return Ok(None);
+    }
     let root = update
         .before
         .get_state(ROOT_STATE)?
         .ok_or_else(|| sdk::Error::invalid_input("Markdown arena root is missing"))?;
-    let create_from_ordinal = read_next_ordinal(update)?;
     let block_len = end
         .checked_sub(start)
         .ok_or_else(|| sdk::Error::invalid_input("Markdown block range is inverted"))?;
@@ -443,12 +329,15 @@ fn sparse_block_change(
             insert,
         },
         namespace,
-        create_from_ordinal,
+        0,
     )
     .map_err(core_error)?
     else {
         return Ok(None);
     };
+    if block.len() > BLOCK_PAGE_BYTES {
+        return Ok(None);
+    }
     let insert_len = u64::try_from(insert.len())
         .map_err(|_| sdk::Error::limit_exceeded("Markdown insert exceeds u64"))?;
     let delta = if insert_len >= edit.delete_len {
@@ -461,11 +350,8 @@ fn sparse_block_change(
     if !add_block_shift(&mut shifts, ordinal, delta)? {
         return Ok(None);
     }
-    let next_ordinal = successor_next_ordinal(&changes, update.creates, create_from_ordinal)?;
     Ok(Some((
         changes,
-        create_from_ordinal,
-        next_ordinal,
         root,
         block_key,
         block,
@@ -483,26 +369,28 @@ fn encode_blocks(blocks: &[ArenaMarkdownBlock]) -> sdk::Result<EncodedBlocks> {
     let mut block_pages = vec![Vec::with_capacity(BLOCK_PAGE_BYTES)];
     let mut locations = Vec::with_capacity(blocks.len());
     for block in blocks {
-        if block.tree_json.len() > BLOCK_PAGE_BYTES {
-            return Err(sdk::Error::limit_exceeded(
-                "one Markdown block exceeds the state-page limit",
-            ));
-        }
-        if !block_pages.last().expect("one page").is_empty()
-            && block_pages.last().expect("one page").len() + block.tree_json.len()
-                > BLOCK_PAGE_BYTES
-        {
+        if block_pages.last().expect("one page").len() == BLOCK_PAGE_BYTES {
             block_pages.push(Vec::with_capacity(BLOCK_PAGE_BYTES));
         }
         let page = u32::try_from(block_pages.len() - 1)
             .map_err(|_| sdk::Error::limit_exceeded("too many Markdown block pages"))?;
         let blob_offset = u32::try_from(block_pages.last().expect("one page").len())
             .map_err(|_| sdk::Error::limit_exceeded("Markdown block page exceeds 4GiB"))?;
-        block_pages
-            .last_mut()
-            .expect("one page")
-            .extend_from_slice(&block.tree_json);
         locations.push((page, blob_offset));
+        let mut remaining = block.tree_json.as_slice();
+        while !remaining.is_empty() {
+            let available = BLOCK_PAGE_BYTES - block_pages.last().expect("one page").len();
+            if available == 0 {
+                block_pages.push(Vec::with_capacity(BLOCK_PAGE_BYTES));
+                continue;
+            }
+            let take = available.min(remaining.len());
+            block_pages
+                .last_mut()
+                .expect("one page")
+                .extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+        }
     }
     if blocks.is_empty() {
         block_pages.clear();
@@ -563,12 +451,11 @@ struct BlockEntry {
     blob_len: u32,
 }
 
-fn read_block_entry(update: &sdk::FileUpdate<'_>, ordinal: u32) -> sdk::Result<BlockEntry> {
+fn read_block_entry(root: &sdk::Root<'_>, ordinal: u32) -> sdk::Result<BlockEntry> {
     let entries_per_page = (BLOCK_PAGE_BYTES / BLOCK_INDEX_ENTRY_BYTES as usize) as u32;
     let page = ordinal / entries_per_page;
     let offset = u64::from(ordinal % entries_per_page) * u64::from(BLOCK_INDEX_ENTRY_BYTES);
-    let bytes = update
-        .before
+    let bytes = root
         .read_state_range(&block_index_page_key(page), offset, BLOCK_INDEX_ENTRY_BYTES)?
         .ok_or_else(|| sdk::Error::invalid_input("Markdown block index disappeared"))?;
     Ok(BlockEntry {
@@ -578,6 +465,84 @@ fn read_block_entry(update: &sdk::FileUpdate<'_>, ordinal: u32) -> sdk::Result<B
         blob_offset: u32::from_le_bytes(bytes[20..24].try_into().expect("fixed block entry")),
         blob_len: u32::from_le_bytes(bytes[24..28].try_into().expect("fixed block entry")),
     })
+}
+
+fn read_block_blob(root: &sdk::Root<'_>, entry: BlockEntry) -> sdk::Result<Vec<u8>> {
+    let mut page = entry.page;
+    let mut offset = usize::try_from(entry.blob_offset)
+        .map_err(|_| sdk::Error::invalid_input("Markdown block offset exceeds usize"))?;
+    if offset >= BLOCK_PAGE_BYTES {
+        return Err(sdk::Error::invalid_input(
+            "Markdown block offset exceeds its state page",
+        ));
+    }
+    let mut remaining = usize::try_from(entry.blob_len)
+        .map_err(|_| sdk::Error::limit_exceeded("Markdown block length exceeds usize"))?;
+    let mut output = Vec::with_capacity(remaining);
+    while remaining > 0 {
+        let take = remaining.min(BLOCK_PAGE_BYTES - offset);
+        let bytes = root
+            .read_state_range(
+                &block_page_key(page),
+                u64::try_from(offset)
+                    .map_err(|_| sdk::Error::limit_exceeded("Markdown state offset exceeds u64"))?,
+                u32::try_from(take)
+                    .map_err(|_| sdk::Error::limit_exceeded("Markdown state read exceeds u32"))?,
+            )?
+            .ok_or_else(|| sdk::Error::invalid_input("Markdown block page disappeared"))?;
+        if bytes.len() != take {
+            return Err(sdk::Error::invalid_input(
+                "Markdown block page is truncated",
+            ));
+        }
+        output.extend_from_slice(&bytes);
+        remaining -= take;
+        if remaining > 0 {
+            page = page
+                .checked_add(1)
+                .ok_or_else(|| sdk::Error::limit_exceeded("Markdown block page overflowed"))?;
+        }
+        offset = 0;
+    }
+    Ok(output)
+}
+
+fn load_markdown_document(root: &sdk::Root<'_>, bytes: Vec<u8>) -> sdk::Result<Document> {
+    let root_json = root
+        .get_state(ROOT_STATE)?
+        .ok_or_else(|| sdk::Error::invalid_input("Markdown arena root is missing"))?;
+    let manifest = root
+        .get_state(BLOCKS_STATE)?
+        .ok_or_else(|| sdk::Error::invalid_input("Markdown block manifest is missing"))?;
+    if manifest.len() != BLOCK_INDEX_HEADER_BYTES as usize
+        || manifest.get(..4) != Some(BLOCK_INDEX_MAGIC)
+    {
+        return Err(sdk::Error::invalid_input(
+            "unsupported Markdown block index",
+        ));
+    }
+    let count = u32::from_le_bytes(manifest[4..8].try_into().expect("fixed Markdown header"));
+    let shifts = decode_block_shifts(
+        root.get_state(BLOCK_SHIFTS_STATE)?
+            .as_deref()
+            .unwrap_or_default(),
+    )?;
+    let mut blocks = Vec::with_capacity(count as usize);
+    for ordinal in 0..count {
+        let entry = read_block_entry(root, ordinal)?;
+        let start = effective_block_position(entry.start, ordinal, &shifts)?;
+        let end = effective_block_position(entry.end, ordinal + 1, &shifts)?;
+        let tree_json = match root.get_state(&block_overlay_key(ordinal))? {
+            Some(block) => block,
+            None => read_block_blob(root, entry)?,
+        };
+        blocks.push(ArenaMarkdownBlock {
+            start,
+            end,
+            tree_json,
+        });
+    }
+    Document::open_arena(bytes, &root_json, blocks).map_err(core_error)
 }
 
 fn block_page_key(ordinal: u32) -> Vec<u8> {
@@ -738,91 +703,6 @@ fn strip_duplicated_lexical_fallback(changes: &mut [EntityChange]) -> sdk::Resul
         })?;
     }
     Ok(())
-}
-
-fn next_arena_ordinal(
-    root: &[u8],
-    blocks: &[ArenaMarkdownBlock],
-    creates: sdk::CreateContext,
-) -> sdk::Result<u32> {
-    let root = root
-        .get(1..)
-        .ok_or_else(|| sdk::Error::invalid_input("Markdown arena root is empty"))?;
-    let mut next = next_json_ordinal(root, creates, 0)?;
-    for block in blocks {
-        next = next_json_ordinal(&block.tree_json, creates, next)?;
-    }
-    Ok(next)
-}
-
-fn next_json_ordinal(bytes: &[u8], creates: sdk::CreateContext, current: u32) -> sdk::Result<u32> {
-    fn visit(value: &Value, creates: sdk::CreateContext, next: &mut u32) -> sdk::Result<()> {
-        match value {
-            Value::Object(object) => {
-                if let Some(ordinal) = object
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .and_then(|id| local_ref(creates, id))
-                {
-                    *next = (*next).max(ordinal.checked_add(1).ok_or_else(|| {
-                        sdk::Error::limit_exceeded("Markdown ID ordinal space is exhausted")
-                    })?);
-                }
-                for value in object.values() {
-                    visit(value, creates, next)?;
-                }
-            }
-            Value::Array(values) => {
-                for value in values {
-                    visit(value, creates, next)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
-        sdk::Error::invalid_input(format!("invalid Markdown arena JSON: {error}"))
-    })?;
-    let mut next = current;
-    visit(&value, creates, &mut next)?;
-    Ok(next)
-}
-
-fn read_next_ordinal(update: &sdk::FileUpdate<'_>) -> sdk::Result<u32> {
-    let bytes = update
-        .before
-        .get_state(NEXT_ID_ORDINAL_STATE)?
-        .ok_or_else(|| sdk::Error::invalid_input("Markdown arena has no ID high-water mark"))?;
-    let bytes: [u8; 4] = bytes.try_into().map_err(|_| {
-        sdk::Error::invalid_input("Markdown arena ID high-water mark has invalid length")
-    })?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn successor_next_ordinal(
-    changes: &[EntityChange],
-    creates: sdk::CreateContext,
-    current: u32,
-) -> sdk::Result<u32> {
-    let mut next = current;
-    for change in changes {
-        if let Some(id) = change
-            .entity_pk
-            .first()
-            .filter(|_| change.entity_pk.len() == 1)
-            && let Some(ordinal) = local_ref(creates, id)
-        {
-            next = next.max(ordinal.checked_add(1).ok_or_else(|| {
-                sdk::Error::limit_exceeded("Markdown ID ordinal space is exhausted")
-            })?);
-        }
-        if let Some(snapshot) = &change.snapshot {
-            next = next_json_ordinal(snapshot, creates, next)?;
-        }
-    }
-    Ok(next)
 }
 
 fn emit_changes(
@@ -1034,6 +914,44 @@ mod tests {
                 .map(|page| page.len())
                 .sum::<usize>(),
             blocks.len() * BLOCK_INDEX_ENTRY_BYTES as usize
+        );
+    }
+
+    #[test]
+    fn one_large_block_spans_bounded_state_pages() {
+        let tree_json = vec![b'x'; BLOCK_PAGE_BYTES + 257];
+        let blocks = [ArenaMarkdownBlock {
+            start: 0,
+            end: tree_json.len() as u64,
+            tree_json: tree_json.clone(),
+        }];
+
+        let encoded = encode_blocks(&blocks).expect("encode spanning block");
+
+        assert_eq!(encoded.block_pages.len(), 2);
+        assert!(
+            encoded
+                .block_pages
+                .iter()
+                .all(|page| page.len() <= BLOCK_PAGE_BYTES)
+        );
+        assert_eq!(
+            encoded.block_pages.concat(),
+            tree_json,
+            "the paged block stream must remain byte-exact"
+        );
+        let entry = &encoded.index_pages[0][..BLOCK_INDEX_ENTRY_BYTES as usize];
+        assert_eq!(
+            u32::from_le_bytes(entry[16..20].try_into().expect("page")),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(entry[20..24].try_into().expect("offset")),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(entry[24..28].try_into().expect("length")) as usize,
+            tree_json.len()
         );
     }
 

@@ -2093,6 +2093,56 @@ impl Document {
         ))
     }
 
+    pub fn open_arena(
+        bytes: Vec<u8>,
+        root_json: &[u8],
+        blocks: Vec<ArenaMarkdownBlock>,
+    ) -> Result<Self, PluginError> {
+        let (&fallback_flag, root_json) = root_json
+            .split_first()
+            .ok_or_else(|| PluginError::InvalidInput("Markdown arena root is empty".to_owned()))?;
+        let mut root: NodeSnapshot = serde_json::from_slice(root_json).map_err(|error| {
+            PluginError::InvalidInput(format!("invalid Markdown arena root: {error}"))
+        })?;
+        if fallback_flag != 0 {
+            let format = root.format.as_object_mut().ok_or_else(|| {
+                PluginError::InvalidInput("Markdown arena root format must be an object".to_owned())
+            })?;
+            format.insert(
+                LEXICAL_FALLBACK_FIELD.to_owned(),
+                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+            );
+        }
+        let mut children = Vec::with_capacity(blocks.len());
+        let mut ranges = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let child = serde_json::from_slice(&block.tree_json).map_err(|error| {
+                PluginError::InvalidInput(format!("invalid Markdown arena block: {error}"))
+            })?;
+            let start = usize::try_from(block.start).map_err(|_| {
+                PluginError::InvalidInput("Markdown arena block start exceeds usize".to_owned())
+            })?;
+            let end = usize::try_from(block.end).map_err(|_| {
+                PluginError::InvalidInput("Markdown arena block end exceeds usize".to_owned())
+            })?;
+            if start > end || end > bytes.len() {
+                return Err(PluginError::InvalidInput(
+                    "Markdown arena block range is outside accepted bytes".to_owned(),
+                ));
+            }
+            children.push(child);
+            ranges.push(start..end);
+        }
+        Ok(Self {
+            bytes: PersistentBytes::from_vec(bytes),
+            tree: PersistentTree::new(NodeTree {
+                node: root,
+                children,
+            }),
+            top_level_ranges: Arc::new(ranges),
+        })
+    }
+
     pub fn fork(&self) -> Self {
         self.clone()
     }
