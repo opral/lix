@@ -1065,7 +1065,7 @@ async fn scan_certified_entity_batch_rows(
 }
 
 pub(crate) async fn scan_certified_history_rows(
-    store: &impl StorageAdapterRead,
+    store: &(impl StorageAdapterRead + ?Sized),
     commit_ids: &BTreeSet<CommitId>,
     request: &TrackedStateScanRequest,
 ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
@@ -6709,6 +6709,54 @@ where
                 writes.delete(HOT_DIFF_SPACE, entry.key);
             }
         }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Reclaims one superseded working-diff epoch without scanning any other
+/// branch or checkpoint. A checkpoint already performs work linear in its
+/// selected dirty set; this prefix-local scan keeps reclamation on the same
+/// bound while preventing unreachable epochs from accumulating until GC.
+pub(super) async fn stage_delete_hot_diff_scope<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    checkpoint_commit_id: CommitId,
+    generation: CommitId,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let plan = ScanPlan::prefix(
+        HOT_DIFF_SPACE,
+        StoragePrefix {
+            bytes: Bytes::from(encode_working_diff_scope_prefix(
+                branch_id,
+                checkpoint_commit_id,
+                generation,
+            )),
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        writes.delete_batch(
+            HOT_DIFF_SPACE,
+            page.value.entries.into_iter().map(|entry| entry.key),
+        );
         if !page.value.has_more || resume_after.is_none() {
             break;
         }

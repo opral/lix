@@ -1105,6 +1105,7 @@ mod tests {
                     metadata: change.metadata.as_ref_slot(),
                     origin_key: change.origin_key.as_deref(),
                     authored: true,
+                    certified: false,
                 })
                 .collect::<Vec<_>>();
             stage_commit_deltas(&mut writes, &deltas).expect("packed commit members should stage");

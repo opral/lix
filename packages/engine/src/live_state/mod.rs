@@ -20,7 +20,8 @@ pub(crate) use tracked_head::{
     HOT_FILE_SPACE, HOT_ROW_SPACE, HotTrackedSnapshot, TRACKED_WORKING_DIFF_MARKER_SPACE,
     TrackedHeadContext, TrackedWorkingDiff, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     scan_certified_history_rows, stage_certified_entity_batches,
-    stage_collect_stale_working_diff_indexes, stage_tracked_working_diff_epoch,
+    stage_collect_stale_working_diff_indexes, stage_delete_tracked_working_diff_epoch,
+    stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

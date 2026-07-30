@@ -6971,6 +6971,72 @@ mod tests {
             file_id: Some(FILE_ID.to_owned()),
             entity_pk: EntityPk::uuid_from_bytes(id),
         };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("certified authority read should open");
+        let certified = crate::live_state::scan_certified_history_rows(
+            &read,
+            &BTreeSet::from([commit_id]),
+            &TrackedStateScanRequest {
+                filter: crate::tracked_state::TrackedStateFilter {
+                    schema_keys: vec![SCHEMA_KEY.to_owned()],
+                    entity_pks: vec![key.entity_pk.clone()],
+                    file_ids: vec![crate::NullableKeyFilter::Value(FILE_ID.to_owned())],
+                    include_tombstones: true,
+                },
+                read_columns: crate::tracked_state::TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
+                },
+                limit: None,
+            },
+        )
+        .await
+        .expect("certified authority should scan");
+        let certified_change_id = certified[0]
+            .change_id
+            .expect("certified row should carry a change id");
+        let durable_change_id = ChangeId::for_test_label("certified-reference-durable-change-id");
+        assert_ne!(durable_change_id, certified_change_id);
+        let mut writes = storage.new_write_set();
+        let locators = crate::tracked_state::stage_commit_deltas(
+            &mut writes,
+            &[crate::tracked_state::TrackedStateCommitDeltaRef {
+                delta: TrackedStateDeltaRef {
+                    schema_key: SCHEMA_KEY,
+                    file_id: Some(FILE_ID),
+                    entity_pk: &key.entity_pk,
+                    change_id: durable_change_id,
+                    commit_id,
+                    deleted: false,
+                    created_at: control.created_at,
+                    updated_at: control.created_at,
+                },
+                snapshot: crate::json_store::JsonSlotRef::None,
+                metadata: crate::json_store::JsonSlotRef::None,
+                origin_key: Some("certified-origin"),
+                authored: true,
+                certified: true,
+            }],
+        )
+        .expect("certified commit delta should stage");
+        crate::tracked_state::stage_change_locators(&mut writes, &locators);
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("certified commit delta should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("certified locator read should open");
+        let canonical = crate::tracked_state::load_change_record_by_id(&read, durable_change_id)
+            .await
+            .expect("certified locator should hydrate")
+            .expect("certified locator should exist");
+        assert!(canonical.snapshot.is_some());
+        assert_eq!(canonical.origin_key.as_deref(), Some("certified-origin"));
+        drop(read);
         let exact = tracked_state
             .reader(
                 storage

@@ -32,9 +32,9 @@ use bytes::Bytes;
 pub(crate) const TRACKED_STATE_TREE_CHUNK_NAMESPACE: &str = "tracked_state.tree_chunk";
 pub(crate) const TRACKED_STATE_COMMIT_ROOT_NAMESPACE: &str = "tracked_state.commit_root";
 pub(crate) const TRACKED_STATE_COMMIT_DELTA_MANIFEST_NAMESPACE: &str =
-    "tracked_state.commit_delta_manifest.v2";
+    "tracked_state.commit_delta_manifest.v3";
 pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE: &str =
-    "tracked_state.commit_delta_segment.v2";
+    "tracked_state.commit_delta_segment.v3";
 pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE: &str = "tracked_state.change_locator.v1";
 pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_0001),
@@ -68,7 +68,7 @@ pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace
 
 const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
-const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD6";
+const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD7";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -104,18 +104,66 @@ struct CommitDeltaPayloadRef<'a> {
     #[musli(with = storage_codec::option)]
     origin_key: Option<&'a str>,
     authored: bool,
+    certified: bool,
+}
+
+#[derive(Clone, Copy, musli::Encode)]
+#[musli(packed)]
+struct CommitDeltaAuthoredPayloadRef<'a> {
+    #[musli(with = crate::json_store::json_slot_storage_ref)]
+    snapshot: crate::json_store::JsonSlotRef<'a>,
+    #[musli(with = crate::json_store::json_slot_storage_ref)]
+    metadata: crate::json_store::JsonSlotRef<'a>,
+    #[musli(with = storage_codec::option)]
+    origin_key: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, musli::Encode)]
+#[musli(packed)]
+struct CommitDeltaCertifiedPayloadRef<'a> {
+    #[musli(with = storage_codec::option)]
+    origin_key: Option<&'a str>,
 }
 
 #[derive(Debug, musli::Decode)]
 #[musli(packed)]
-struct CommitDeltaPayload {
+struct CommitDeltaCertifiedPayload {
+    #[musli(with = storage_codec::option)]
+    origin_key: Option<String>,
+}
+
+const COMMIT_DELTA_PAYLOAD_AUTHORED: u8 = 0;
+const COMMIT_DELTA_PAYLOAD_SELECTED_REF: u8 = 1;
+const COMMIT_DELTA_PAYLOAD_SELECTED_TOMBSTONE: u8 = 2;
+const COMMIT_DELTA_PAYLOAD_CERTIFIED_REF: u8 = 3;
+
+#[derive(Debug, musli::Decode)]
+#[musli(packed)]
+struct CommitDeltaAuthoredPayload {
     #[musli(with = crate::json_store::json_slot_storage)]
     snapshot: crate::json_store::JsonSlot,
     #[musli(with = crate::json_store::json_slot_storage)]
     metadata: crate::json_store::JsonSlot,
     #[musli(with = storage_codec::option)]
     origin_key: Option<String>,
-    authored: bool,
+}
+
+#[derive(Debug)]
+enum CommitDeltaPayload {
+    Authored(CommitDeltaAuthoredPayload),
+    SelectedRef,
+    SelectedTombstone,
+    CertifiedRef(Option<String>),
+}
+
+#[cfg(test)]
+impl CommitDeltaPayload {
+    fn authored_payload(&self) -> &CommitDeltaAuthoredPayload {
+        let Self::Authored(payload) = self else {
+            panic!("test expected an authored commit-delta payload");
+        };
+        payload
+    }
 }
 
 /// Borrowed fixed-width directory over independently encoded payload records.
@@ -146,9 +194,43 @@ impl<'a> CommitDeltaPayloadIndexRef<'a> {
                 "tracked_state commit_delta member is missing its authoritative payload",
             ));
         }
-        let payload: CommitDeltaPayload =
-            storage_codec::decode("tracked_state indexed commit_delta payload", range)?;
-        Ok(payload)
+        let (&tag, payload) = range.split_first().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta member has an empty payload record",
+            )
+        })?;
+        match tag {
+            COMMIT_DELTA_PAYLOAD_AUTHORED => {
+                let payload = storage_codec::decode(
+                    "tracked_state indexed authored commit_delta payload",
+                    payload,
+                )?;
+                Ok(CommitDeltaPayload::Authored(payload))
+            }
+            COMMIT_DELTA_PAYLOAD_SELECTED_REF if payload.is_empty() => {
+                Ok(CommitDeltaPayload::SelectedRef)
+            }
+            COMMIT_DELTA_PAYLOAD_SELECTED_TOMBSTONE if payload.is_empty() => {
+                Ok(CommitDeltaPayload::SelectedTombstone)
+            }
+            COMMIT_DELTA_PAYLOAD_CERTIFIED_REF => {
+                let origin_key = if payload.is_empty() {
+                    None
+                } else {
+                    storage_codec::decode::<CommitDeltaCertifiedPayload>(
+                        "tracked_state indexed certified commit_delta payload",
+                        payload,
+                    )?
+                    .origin_key
+                };
+                Ok(CommitDeltaPayload::CertifiedRef(origin_key))
+            }
+            _ => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta member has an invalid payload tag",
+            )),
+        }
     }
 
     fn payload_range(&self, entry_index: usize) -> Result<&[u8], LixError> {
@@ -202,6 +284,9 @@ pub(crate) struct LoadedCommitDeltaEntry {
     #[cfg(test)]
     pub(crate) value: TrackedStateIndexValue,
     pub(crate) change_record: crate::changelog::ChangeRecord,
+    selected_ref: bool,
+    certified_ref: bool,
+    owner_commit_id: CommitId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +312,18 @@ pub(crate) struct CommitDeltaMember {
     pub(crate) segment_index: u32,
     pub(crate) ordinal: u32,
     pub(crate) authored: bool,
+    selected_tombstone: bool,
+    certified_ref: bool,
+}
+
+impl CommitDeltaMember {
+    pub(crate) fn is_selected_payload_ref(&self) -> bool {
+        !self.authored && !self.selected_tombstone
+    }
+
+    pub(crate) fn is_certified_payload_ref(&self) -> bool {
+        self.certified_ref
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -665,6 +762,7 @@ fn stage_commit_deltas_inner(
             metadata: delta.metadata,
             origin_key: delta.origin_key,
             authored: delta.authored,
+            certified: delta.certified,
         });
     }
     let mutations = entries
@@ -1003,6 +1101,220 @@ async fn load_change_locator_by_id(
     decode_change_locator(change_id, &locator).map(Some)
 }
 
+async fn load_change_records_by_ids(
+    store: &(impl StorageAdapterRead + ?Sized),
+    change_ids: &[crate::changelog::ChangeId],
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
+    if change_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let locator_keys = change_ids
+        .iter()
+        .map(|change_id| StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes())))
+        .collect::<Vec<_>>();
+    let locator_values = PointReadPlan::new(TRACKED_STATE_CHANGE_LOCATOR_SPACE, &locator_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let locators = change_ids
+        .iter()
+        .copied()
+        .zip(locator_values.value)
+        .map(|(change_id, value)| {
+            let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state selected change '{change_id}' has no authoritative locator"
+                    ),
+                )
+            })?;
+            decode_change_locator(change_id, &bytes)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let commit_ids = locators
+        .iter()
+        .map(|locator| locator.commit_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let manifest_keys = commit_ids
+        .iter()
+        .map(|commit_id| StorageKey(Bytes::from(commit_delta_manifest_key(*commit_id))))
+        .collect::<Vec<_>>();
+    let manifest_values =
+        PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, &manifest_keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?;
+    let manifests = commit_ids
+        .into_iter()
+        .zip(manifest_values.value)
+        .map(|(commit_id, value)| {
+            let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state selected change references missing commit '{commit_id}'"
+                    ),
+                )
+            })?;
+            Ok((commit_id, decode_commit_delta_manifest(&bytes)?))
+        })
+        .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+
+    let routes = locators
+        .iter()
+        .filter_map(|locator| {
+            let manifest = &manifests[&locator.commit_id];
+            manifest.inline_segment().is_none().then_some((
+                locator.commit_id,
+                usize::try_from(locator.segment_index).expect("u32 fits usize"),
+            ))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let segment_keys = routes
+        .iter()
+        .map(|&(commit_id, segment_index)| {
+            commit_delta_segment_key(commit_id, segment_index)
+                .map(|key| StorageKey(Bytes::from(key)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let segment_values =
+        PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &segment_keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?;
+    let segments = routes
+        .into_iter()
+        .zip(segment_values.value)
+        .map(|(route, value)| {
+            value
+                .and_then(full_value_bytes)
+                .map(|bytes| (route, bytes))
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked_state selected change references absent segment {} of commit '{}'",
+                            route.1, route.0
+                        ),
+                    )
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+    let loaded = locators
+        .into_iter()
+        .map(|locator| {
+            let manifest = &manifests[&locator.commit_id];
+            let segment_index = usize::try_from(locator.segment_index).expect("u32 fits usize");
+            let (bytes, bounds) = if let Some(inline) = manifest.inline_segment() {
+                if segment_index != 0 {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state selected change references a nonzero inline segment",
+                    ));
+                }
+                (inline, None)
+            } else {
+                let bounds = manifest.segments.get(segment_index).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state selected change references an undeclared segment",
+                    )
+                })?;
+                (
+                    segments[&(locator.commit_id, segment_index)].as_ref(),
+                    Some(bounds),
+                )
+            };
+            decode_change_at_locator(bytes, bounds, locator).map(Some)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut loaded = loaded;
+    hydrate_certified_loaded_entries(store, &mut loaded).await?;
+    loaded
+        .into_iter()
+        .map(|entry| {
+            entry.map(|entry| entry.change_record).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state authoritative change unexpectedly disappeared",
+                )
+            })
+        })
+        .collect()
+}
+
+fn decode_change_at_locator(
+    segment: &[u8],
+    bounds: Option<&CommitDeltaSegmentBounds>,
+    locator: CommitDeltaChangeLocator,
+) -> Result<LoadedCommitDeltaEntry, LixError> {
+    let change_id = locator.change_id;
+    let (leaf, payloads) = decode_commit_delta_with_payloads(segment, bounds)?;
+    let ordinal = usize::from(locator.ordinal);
+    let entry = leaf.entry(ordinal)?.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state change locator for '{change_id}' references absent ordinal {}",
+                locator.ordinal
+            ),
+        )
+    })?;
+    let value = decode_value(entry.value)?;
+    if value.change_id != change_id || value.commit_id != locator.commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("tracked_state change locator for '{change_id}' points to the wrong row"),
+        ));
+    }
+    let key = decode_key(entry.key)?;
+    let (snapshot, metadata, origin_key, certified_ref) = match payloads.decode(ordinal)? {
+        CommitDeltaPayload::Authored(payload) => (
+            payload.snapshot,
+            payload.metadata,
+            payload.origin_key,
+            false,
+        ),
+        CommitDeltaPayload::CertifiedRef(origin_key) => (
+            crate::json_store::JsonSlot::None,
+            crate::json_store::JsonSlot::None,
+            origin_key,
+            true,
+        ),
+        CommitDeltaPayload::SelectedRef | CommitDeltaPayload::SelectedTombstone => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state authoritative change locator for '{change_id}' points to a selected row"
+                ),
+            ));
+        }
+    };
+    let updated_at = value.updated_at;
+    Ok(LoadedCommitDeltaEntry {
+        #[cfg(test)]
+        value,
+        change_record: crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id,
+            schema_key: key.schema_key,
+            entity_pk: key.entity_pk,
+            file_id: key.file_id,
+            snapshot,
+            metadata,
+            created_at: updated_at,
+            origin_key,
+        },
+        selected_ref: false,
+        certified_ref,
+        owner_commit_id: locator.commit_id,
+    })
+}
+
 async fn load_change_record_at_locator(
     store: &(impl StorageAdapterRead + ?Sized),
     locator: CommitDeltaChangeLocator,
@@ -1090,40 +1402,13 @@ async fn try_load_change_record_at_locator_in_manifest(
         })?;
         (segment, Some(bounds))
     };
-    let (leaf, payloads) = decode_commit_delta_with_payloads(&segment, bounds)?;
-    let ordinal = usize::from(locator.ordinal);
-    let entry = leaf.entry(ordinal)?.ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked_state change locator for '{change_id}' references absent ordinal {}",
-                locator.ordinal
-            ),
-        )
-    })?;
-    let value = decode_value(entry.value)?;
-    if value.commit_id != locator.commit_id {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("tracked_state change locator for '{change_id}' points to the wrong row"),
-        ));
-    }
-    if value.change_id != change_id {
-        return Ok(None);
-    }
-    let key = decode_key(entry.key)?;
-    let payload = payloads.decode(ordinal)?;
-    Ok(Some(crate::changelog::ChangeRecord {
-        format_version: 2,
-        change_id,
-        schema_key: key.schema_key,
-        entity_pk: key.entity_pk,
-        file_id: key.file_id,
-        snapshot: payload.snapshot,
-        metadata: payload.metadata,
-        created_at: value.updated_at,
-        origin_key: payload.origin_key,
-    }))
+    let mut loaded = vec![Some(decode_change_at_locator(&segment, bounds, locator)?)];
+    hydrate_certified_loaded_entries(store, &mut loaded).await?;
+    Ok(loaded
+        .pop()
+        .flatten()
+        .expect("one decoded change locator must remain")
+        .change_record)
 }
 
 fn decode_change_locator(
@@ -1418,8 +1703,150 @@ async fn load_commit_delta_members_from_manifest(
             )?;
         }
     }
+    hydrate_selected_members(store, &mut members).await?;
     validate_commit_delta_member_order_and_ids(commit_id, &members)?;
     Ok(members)
+}
+
+async fn hydrate_selected_members(
+    store: &(impl StorageAdapterRead + ?Sized),
+    members: &mut [CommitDeltaMember],
+) -> Result<(), LixError> {
+    let selected = members
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| !member.authored && !member.selected_tombstone)
+        .map(|(index, member)| (index, member.value.change_id))
+        .collect::<Vec<_>>();
+    let change_ids = selected
+        .iter()
+        .map(|(_, change_id)| *change_id)
+        .collect::<Vec<_>>();
+    let canonical = load_change_records_by_ids(store, &change_ids).await?;
+    for ((index, _), change_record) in selected.into_iter().zip(canonical) {
+        let member = &mut members[index];
+        if change_record.schema_key != member.key.schema_key
+            || change_record.file_id != member.key.file_id
+            || change_record.entity_pk != member.key.entity_pk
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state selected change '{}' references canonical authority for a different identity",
+                    member.value.change_id
+                ),
+            ));
+        }
+        member.change.snapshot = change_record.snapshot;
+        member.change.metadata = change_record.metadata;
+        member.change.origin_key = change_record.origin_key;
+    }
+    hydrate_certified_members(store, members).await?;
+    Ok(())
+}
+
+async fn hydrate_certified_members(
+    store: &(impl StorageAdapterRead + ?Sized),
+    members: &mut [CommitDeltaMember],
+) -> Result<(), LixError> {
+    let pending = members
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| member.certified_ref)
+        .map(|(index, member)| {
+            (
+                index,
+                member.value.commit_id,
+                member.value.change_id,
+                member.key.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let commit_ids = pending
+        .iter()
+        .map(|(_, commit_id, _, _)| *commit_id)
+        .collect::<BTreeSet<_>>();
+    let request = crate::tracked_state::TrackedStateScanRequest {
+        filter: crate::tracked_state::TrackedStateFilter {
+            schema_keys: pending
+                .iter()
+                .map(|(_, _, _, key)| key.schema_key.clone())
+                .collect(),
+            entity_pks: pending
+                .iter()
+                .map(|(_, _, _, key)| key.entity_pk.clone())
+                .collect(),
+            file_ids: pending
+                .iter()
+                .map(|(_, _, _, key)| {
+                    key.file_id.clone().map_or(
+                        crate::NullableKeyFilter::Null,
+                        crate::NullableKeyFilter::Value,
+                    )
+                })
+                .collect(),
+            include_tombstones: true,
+        },
+        read_columns: crate::tracked_state::TrackedStateReadColumns {
+            columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
+        },
+        limit: None,
+    };
+    let rows = crate::live_state::scan_certified_history_rows(store, &commit_ids, &request).await?;
+    let mut payloads = BTreeMap::new();
+    for row in rows {
+        let Some(commit_id) = row.commit_id else {
+            continue;
+        };
+        payloads.insert(
+            (commit_id, row.schema_key, row.file_id, row.entity_pk),
+            (
+                row.snapshot_content
+                    .map_or(crate::json_store::JsonSlot::None, |json| {
+                        crate::json_store::JsonSlot::Inline(json.as_str().into())
+                    }),
+                row.metadata
+                    .map_or(crate::json_store::JsonSlot::None, |json| {
+                        crate::json_store::JsonSlot::Inline(json.as_str().into())
+                    }),
+            ),
+        );
+    }
+    for (index, commit_id, change_id, key) in pending {
+        let lookup = (
+            commit_id,
+            key.schema_key.clone(),
+            key.file_id.clone(),
+            key.entity_pk.clone(),
+        );
+        let Some((snapshot, metadata)) = payloads.remove(&lookup) else {
+            let candidates = payloads
+                .keys()
+                .filter(|(candidate_commit, schema_key, file_id, _)| {
+                    *candidate_commit == commit_id
+                        && schema_key == &key.schema_key
+                        && file_id == &key.file_id
+                })
+                .take(5)
+                .map(|(_, _, _, entity_pk)| format!("{entity_pk:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state certified change '{change_id}' has no certified payload at commit '{commit_id}' for schema '{}' file {:?} entity {:?}; candidates: {candidates}",
+                    key.schema_key, key.file_id, key.entity_pk
+                ),
+            ));
+        };
+        members[index].change.snapshot = snapshot;
+        members[index].change.metadata = metadata;
+        members[index].certified_ref = false;
+    }
+    Ok(())
 }
 
 pub(crate) async fn scan_commit_delta_members(
@@ -1535,6 +1962,7 @@ pub(crate) async fn load_owned_commit_delta_entries(
     }
 
     if lookups_by_segment.is_empty() {
+        hydrate_selected_loaded_entries(store, &mut output).await?;
         return Ok(output);
     }
 
@@ -1587,7 +2015,121 @@ pub(crate) async fn load_owned_commit_delta_entries(
                 find_loaded_commit_delta_entry(&leaf, &payloads, &encoded_key, commit_id)?;
         }
     }
+    hydrate_selected_loaded_entries(store, &mut output).await?;
     Ok(output)
+}
+
+async fn hydrate_selected_loaded_entries(
+    store: &(impl StorageAdapterRead + ?Sized),
+    entries: &mut [Option<LoadedCommitDeltaEntry>],
+) -> Result<(), LixError> {
+    let selected = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            entry
+                .as_ref()
+                .filter(|entry| entry.selected_ref)
+                .map(|entry| (index, entry.change_record.change_id))
+        })
+        .collect::<Vec<_>>();
+    let change_ids = selected
+        .iter()
+        .map(|(_, change_id)| *change_id)
+        .collect::<Vec<_>>();
+    let canonical = load_change_records_by_ids(store, &change_ids).await?;
+    for ((index, _), change_record) in selected.into_iter().zip(canonical) {
+        let entry = entries[index]
+            .as_mut()
+            .expect("selected entry came from the output batch");
+        if entry.change_record.schema_key != change_record.schema_key
+            || entry.change_record.file_id != change_record.file_id
+            || entry.change_record.entity_pk != change_record.entity_pk
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state selected change '{}' references canonical authority for a different identity",
+                    entry.change_record.change_id
+                ),
+            ));
+        }
+        entry.change_record.snapshot = change_record.snapshot;
+        entry.change_record.metadata = change_record.metadata;
+        entry.change_record.origin_key = change_record.origin_key;
+        entry.selected_ref = false;
+    }
+    hydrate_certified_loaded_entries(store, entries).await?;
+    Ok(())
+}
+
+async fn hydrate_certified_loaded_entries(
+    store: &(impl StorageAdapterRead + ?Sized),
+    entries: &mut [Option<LoadedCommitDeltaEntry>],
+) -> Result<(), LixError> {
+    let pending = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            entry
+                .as_ref()
+                .filter(|entry| entry.certified_ref)
+                .map(|entry| {
+                    (
+                        index,
+                        entry.owner_commit_id,
+                        entry.change_record.change_id,
+                        TrackedStateKey {
+                            schema_key: entry.change_record.schema_key.clone(),
+                            file_id: entry.change_record.file_id.clone(),
+                            entity_pk: entry.change_record.entity_pk.clone(),
+                        },
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut members = pending
+        .iter()
+        .map(|(_, commit_id, change_id, key)| CommitDeltaMember {
+            key: key.clone(),
+            value: TrackedStateIndexValue {
+                change_id: *change_id,
+                commit_id: *commit_id,
+                deleted: false,
+                created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+                updated_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+            },
+            change: crate::changelog::ChangeRecord {
+                format_version: 2,
+                change_id: *change_id,
+                schema_key: key.schema_key.clone(),
+                entity_pk: key.entity_pk.clone(),
+                file_id: key.file_id.clone(),
+                snapshot: crate::json_store::JsonSlot::None,
+                metadata: crate::json_store::JsonSlot::None,
+                created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+                origin_key: None,
+            },
+            segment_index: 0,
+            ordinal: 0,
+            authored: true,
+            selected_tombstone: false,
+            certified_ref: true,
+        })
+        .collect::<Vec<_>>();
+    hydrate_certified_members(store, &mut members).await?;
+    for ((index, _, _, _), member) in pending.into_iter().zip(members) {
+        let entry = entries[index]
+            .as_mut()
+            .expect("certified entry came from the output batch");
+        entry.change_record.snapshot = member.change.snapshot;
+        entry.change_record.metadata = member.change.metadata;
+        entry.certified_ref = false;
+    }
+    Ok(())
 }
 
 /// Scans only the mutations in one commit that belong to one of the requested
@@ -1888,6 +2430,7 @@ pub(crate) async fn scan_commit_delta_inventory(
                 )?;
             }
         }
+        hydrate_selected_members(store, &mut members).await?;
         validate_commit_delta_member_order_and_ids(commit_id, &members)?;
         for member in &members {
             if is_payload_free_selected_tombstone(member) {
@@ -2122,16 +2665,51 @@ fn collect_strict_commit_delta_members(
         }
         let payload = payloads.decode(entry_index)?;
         let key = decode_key(entry.key)?;
+        let (snapshot, metadata, origin_key, authored, selected_tombstone, certified_ref) =
+            match payload {
+                CommitDeltaPayload::Authored(payload) => (
+                    payload.snapshot,
+                    payload.metadata,
+                    payload.origin_key,
+                    true,
+                    false,
+                    false,
+                ),
+                CommitDeltaPayload::SelectedRef => (
+                    crate::json_store::JsonSlot::None,
+                    crate::json_store::JsonSlot::None,
+                    None,
+                    false,
+                    false,
+                    false,
+                ),
+                CommitDeltaPayload::SelectedTombstone => (
+                    crate::json_store::JsonSlot::None,
+                    crate::json_store::JsonSlot::None,
+                    None,
+                    false,
+                    true,
+                    false,
+                ),
+                CommitDeltaPayload::CertifiedRef(origin_key) => (
+                    crate::json_store::JsonSlot::None,
+                    crate::json_store::JsonSlot::None,
+                    origin_key,
+                    true,
+                    false,
+                    true,
+                ),
+            };
         let change = crate::changelog::ChangeRecord {
             format_version: 2,
             change_id: value.change_id,
             schema_key: key.schema_key.clone(),
             entity_pk: key.entity_pk.clone(),
             file_id: key.file_id.clone(),
-            snapshot: payload.snapshot,
-            metadata: payload.metadata,
+            snapshot,
+            metadata,
             created_at: value.updated_at,
-            origin_key: payload.origin_key,
+            origin_key,
         };
         members.push(CommitDeltaMember {
             key,
@@ -2139,7 +2717,9 @@ fn collect_strict_commit_delta_members(
             change,
             segment_index,
             ordinal: u32::try_from(entry_index).expect("segment ordinal fits u32"),
-            authored: payload.authored,
+            authored,
+            selected_tombstone,
+            certified_ref,
         });
     }
     Ok(())
@@ -2177,11 +2757,7 @@ fn validate_commit_delta_member_order_and_ids(
 }
 
 fn is_payload_free_selected_tombstone(member: &CommitDeltaMember) -> bool {
-    !member.authored
-        && member.value.deleted
-        && member.change.snapshot.is_none()
-        && member.change.metadata.is_none()
-        && member.change.origin_key.is_none()
+    member.selected_tombstone
 }
 
 fn encode_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<Vec<u8>, LixError> {
@@ -2343,6 +2919,7 @@ fn encode_commit_delta_segment(entries: &[EncodedLeafEntry]) -> Vec<u8> {
             metadata: crate::json_store::JsonSlotRef::None,
             origin_key: None,
             authored: true,
+            certified: false,
         };
         entries.len()
     ];
@@ -2365,14 +2942,51 @@ fn encode_commit_delta_segment_layout(
     let leaf = encode_leaf_node(entries);
     let mut payload_offsets = Vec::with_capacity(payloads.len() + 1);
     let mut payload_bytes = Vec::new();
-    for payload in payloads {
+    for (entry, payload) in entries.iter().zip(payloads) {
         payload_offsets.push(
             u32::try_from(payload_bytes.len()).expect("commit-delta payload sidecar fits u32"),
         );
-        payload_bytes.extend_from_slice(
-            &storage_codec::encode("tracked_state indexed commit_delta payload", payload)
+        if payload.certified {
+            debug_assert!(payload.authored);
+            payload_bytes.push(COMMIT_DELTA_PAYLOAD_CERTIFIED_REF);
+            if payload.origin_key.is_some() {
+                payload_bytes.extend_from_slice(
+                    &storage_codec::encode(
+                        "tracked_state indexed certified commit_delta payload",
+                        &CommitDeltaCertifiedPayloadRef {
+                            origin_key: payload.origin_key,
+                        },
+                    )
+                    .expect("certified commit-delta payload refs are infallible to encode"),
+                );
+            }
+        } else if payload.authored {
+            payload_bytes.push(COMMIT_DELTA_PAYLOAD_AUTHORED);
+            let authored = CommitDeltaAuthoredPayloadRef {
+                snapshot: payload.snapshot,
+                metadata: payload.metadata,
+                origin_key: payload.origin_key,
+            };
+            payload_bytes.extend_from_slice(
+                &storage_codec::encode(
+                    "tracked_state indexed authored commit_delta payload",
+                    &authored,
+                )
                 .expect("commit-delta payload refs are infallible to encode"),
-        );
+            );
+        } else {
+            let value = decode_value(&entry.value)
+                .expect("commit-delta entries were encoded by the mutation builder");
+            let payload_free_tombstone = value.deleted
+                && matches!(payload.snapshot, crate::json_store::JsonSlotRef::None)
+                && matches!(payload.metadata, crate::json_store::JsonSlotRef::None)
+                && payload.origin_key.is_none();
+            payload_bytes.push(if payload_free_tombstone {
+                COMMIT_DELTA_PAYLOAD_SELECTED_TOMBSTONE
+            } else {
+                COMMIT_DELTA_PAYLOAD_SELECTED_REF
+            });
+        }
     }
     payload_offsets
         .push(u32::try_from(payload_bytes.len()).expect("commit-delta payload sidecar fits u32"));
@@ -2743,21 +3357,54 @@ fn find_loaded_commit_delta_entry(
     }
     let payload = payloads.decode(index)?;
     let key = decode_key(entry.key)?;
+    let (snapshot, metadata, origin_key, selected_ref, certified_ref) = match payload {
+        CommitDeltaPayload::Authored(payload) => (
+            payload.snapshot,
+            payload.metadata,
+            payload.origin_key,
+            false,
+            false,
+        ),
+        CommitDeltaPayload::SelectedRef => (
+            crate::json_store::JsonSlot::None,
+            crate::json_store::JsonSlot::None,
+            None,
+            true,
+            false,
+        ),
+        CommitDeltaPayload::SelectedTombstone => (
+            crate::json_store::JsonSlot::None,
+            crate::json_store::JsonSlot::None,
+            None,
+            false,
+            false,
+        ),
+        CommitDeltaPayload::CertifiedRef(origin_key) => (
+            crate::json_store::JsonSlot::None,
+            crate::json_store::JsonSlot::None,
+            origin_key,
+            false,
+            true,
+        ),
+    };
     let change_record = crate::changelog::ChangeRecord {
         format_version: 2,
         change_id: value.change_id,
         schema_key: key.schema_key,
         entity_pk: key.entity_pk,
         file_id: key.file_id,
-        snapshot: payload.snapshot,
-        metadata: payload.metadata,
+        snapshot,
+        metadata,
         created_at: value.updated_at,
-        origin_key: payload.origin_key,
+        origin_key,
     };
     Ok(Some(LoadedCommitDeltaEntry {
         #[cfg(test)]
         value,
         change_record,
+        selected_ref,
+        certified_ref,
+        owner_commit_id: expected_commit_id,
     }))
 }
 
@@ -3167,6 +3814,7 @@ mod tests {
             metadata,
             origin_key,
             authored: true,
+            certified: false,
         }
     }
 
@@ -3589,6 +4237,7 @@ mod tests {
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
                 authored: true,
+                certified: false,
             }],
         );
         let mut writes = orphan_storage.new_write_set();
@@ -3667,7 +4316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_inventory_allows_shared_payload_and_rejects_conflicting_payload() {
+    async fn global_inventory_hydrates_selected_payloads_from_canonical_authority() {
         let storage = StorageAdapter::new(Memory::new());
         let fixture = packed_commit_delta_fixtures()
             .into_iter()
@@ -3704,6 +4353,24 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("shared authority read should open");
+        let selected_manifest = super::load_commit_delta_manifest(&read, second_commit)
+            .await
+            .expect("selected manifest should load")
+            .expect("selected manifest should exist");
+        let (_, selected_payloads) = decode_commit_delta_with_payloads(
+            selected_manifest
+                .inline_segment()
+                .expect("one selected row should stay inline"),
+            None,
+        )
+        .expect("selected segment should decode");
+        assert_eq!(
+            selected_payloads
+                .payload_range(0)
+                .expect("selected payload range"),
+            &[super::COMMIT_DELTA_PAYLOAD_SELECTED_REF],
+            "selected rows must persist only the canonical-reference tag"
+        );
         assert_eq!(
             scan_commit_delta_inventory(&read)
                 .await
@@ -3738,21 +4405,17 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("conflicting authority read should open");
-        let error = scan_commit_delta_inventory(&read)
+        let inventory = scan_commit_delta_inventory(&read)
             .await
-            .expect_err("conflicting payloads for one change id must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("conflicting authoritative packed payloads")
-        );
-        let error = scan_change_records_from_commit_deltas(&read)
+            .expect("selected wire rows must ignore repeated caller payload bytes");
+        assert_eq!(inventory.commits.len(), 3);
+        let changes = scan_change_records_from_commit_deltas(&read)
             .await
-            .expect_err("streaming scan must reject conflicting packed payloads");
-        assert!(
-            error
-                .to_string()
-                .contains("conflicting authoritative packed payloads")
+            .expect("streaming scan must hydrate selected rows from canonical authority");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].snapshot,
+            crate::json_store::JsonSlot::Inline(shared_snapshot.into())
         );
     }
 
@@ -4060,6 +4723,7 @@ mod tests {
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
                 authored: true,
+                certified: false,
             }],
         );
         segment.pop();
@@ -4149,18 +4813,21 @@ mod tests {
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: Some("first"),
                 authored: true,
+                certified: false,
             },
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[1]),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
                 authored: true,
+                certified: false,
             },
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[2]),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: Some("last"),
                 authored: true,
+                certified: false,
             },
         ];
         let mut encoded = encode_commit_delta_segment_with_raw_sidecar(&entries, &payloads);
@@ -4173,6 +4840,7 @@ mod tests {
                 index
                     .decode(0)
                     .expect("first payload should decode")
+                    .authored_payload()
                     .snapshot,
                 crate::json_store::JsonSlot::Inline(snapshots[0].into())
             );
@@ -4180,6 +4848,7 @@ mod tests {
                 index
                     .decode(1)
                     .expect("sparse payload should decode")
+                    .authored_payload()
                     .snapshot,
                 crate::json_store::JsonSlot::Inline(snapshots[1].into()),
                 "every commit member must carry an authoritative payload"
@@ -4198,6 +4867,7 @@ mod tests {
             index
                 .decode(0)
                 .expect("an uncorrupted requested payload should still decode")
+                .authored_payload()
                 .origin_key
                 .as_deref(),
             Some("first"),
@@ -4207,9 +4877,10 @@ mod tests {
             .decode(2)
             .expect_err("a corrupt requested payload must fail");
         assert!(
-            error
-                .to_string()
-                .contains("failed to decode tracked_state indexed commit_delta payload"),
+            error.to_string().contains("invalid payload tag")
+                || error.to_string().contains(
+                    "failed to decode tracked_state indexed authored commit_delta payload"
+                ),
             "unexpected error: {error}"
         );
     }
@@ -4248,12 +4919,14 @@ mod tests {
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
                 authored: true,
+                certified: false,
             },
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(&second_snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
                 authored: true,
+                certified: false,
             },
         ];
         let encoded = encode_commit_delta_segment_with_payloads(&entries, &payloads);
@@ -4273,11 +4946,11 @@ mod tests {
         let (_, decoded) =
             decode_commit_delta_with_payloads(&encoded, None).expect("sidecar should decode");
         assert_eq!(
-            decoded.decode(0).unwrap().snapshot,
+            decoded.decode(0).unwrap().authored_payload().snapshot,
             crate::json_store::JsonSlot::Inline(first_snapshot.into_boxed_str())
         );
         assert_eq!(
-            decoded.decode(1).unwrap().snapshot,
+            decoded.decode(1).unwrap().authored_payload().snapshot,
             crate::json_store::JsonSlot::Inline(second_snapshot.into_boxed_str())
         );
 
@@ -4331,6 +5004,7 @@ mod tests {
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
                 authored: true,
+                certified: false,
             }],
         );
         let leaf_len = usize::try_from(u32::from_be_bytes(
@@ -4379,12 +5053,14 @@ mod tests {
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
                 authored: true,
+                certified: false,
             },
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"second":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
                 authored: true,
+                certified: false,
             },
         ];
         let mut encoded = encode_commit_delta_segment_with_raw_sidecar(&entries, &payloads);
@@ -4531,6 +5207,7 @@ mod tests {
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
                 authored: true,
+                certified: false,
             }],
         );
 

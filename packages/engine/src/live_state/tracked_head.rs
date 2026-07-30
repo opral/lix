@@ -711,6 +711,20 @@ where
     hot::stage_collect_stale_hot_diff_records(store, writes, &active).await
 }
 
+pub(crate) async fn stage_delete_tracked_working_diff_epoch<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    checkpoint_commit_id: CommitId,
+    generation: CommitId,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    hot::stage_delete_hot_diff_scope(store, writes, branch_id, checkpoint_commit_id, generation)
+        .await
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveWorkingDiffScope {
     checkpoint_commit_id: CommitId,

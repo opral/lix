@@ -714,6 +714,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn predecessor_v25_commit_delta_payload_protocol_is_rejected() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let mut writes = storage_adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            &b"hot-inline-fingerprint.v25"[..],
+        );
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("V25 protocol marker should commit");
+
+        let Err(error) = Engine::new(storage).await else {
+            panic!("V25 repositories must fail closed before LXCD6 payloads are decoded");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
     async fn tracked_entity_fast_path_serves_broad_sql_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
@@ -1204,6 +1228,83 @@ mod tests {
                 .map(|row| row.get::<String>("path").expect("row path"))
                 .collect::<Vec<_>>(),
             ["/after-checkpoint", "/checkpointed", "/workspace"]
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_reclaims_the_superseded_physical_working_diff_epoch() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) \
+                 VALUES ('/dirty', lix_json('{\"value\":\"before-checkpoint\"}'))",
+                &[],
+            )
+            .await
+            .expect("tracked row should create a working diff");
+
+        let adapter = StorageAdapter::new(storage.clone());
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("working-diff inventory read should open");
+        let before = ScanPlan::prefix(
+            crate::live_state::HOT_DIFF_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            },
+        )
+        .collect(&read, StorageScanOptions::default())
+        .await
+        .expect("working-diff inventory should scan");
+        assert!(
+            !before.value.entries.is_empty(),
+            "tracked mutation must persist a physical dirty-key epoch"
+        );
+        drop(read);
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should publish a clean working state");
+
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-checkpoint inventory read should open");
+        let after = ScanPlan::prefix(
+            crate::live_state::HOT_DIFF_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            },
+        )
+        .collect(&read, StorageScanOptions::default())
+        .await
+        .expect("post-checkpoint working-diff inventory should scan");
+        assert!(
+            after.value.entries.is_empty(),
+            "the superseded epoch must not remain until repository GC"
+        );
+        let logical = session
+            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
+            .await
+            .expect("post-checkpoint logical diff should execute");
+        assert_eq!(
+            logical.rows()[0]
+                .get::<i64>("entries")
+                .expect("working-diff count should be numeric"),
+            0
         );
     }
 

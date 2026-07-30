@@ -39,13 +39,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V25 persists content fingerprints beside inline HOT JSON. Opening an older
-/// store must fail closed before its differently framed current-state rows are
-/// decoded as the current layout.
+/// V26 replaces duplicated selected commit-delta payloads with canonical
+/// references. Opening an older store must fail closed before its differently
+/// framed payload sidecars are decoded as the current layout.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"hot-inline-fingerprint.v25";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"selected-payload-reference.v26";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -359,6 +359,7 @@ where
                 metadata: change.metadata.as_ref_slot(),
                 origin_key: change.origin_key.as_deref(),
                 authored: true,
+                certified: false,
             })
             .collect::<Vec<_>>();
         let locators = crate::tracked_state::stage_commit_deltas(&mut writes, &commit_deltas)?;
