@@ -28,6 +28,7 @@ use crate::tracked_state::types::{
 };
 use crate::{LixError, storage_codec};
 use bytes::Bytes;
+use futures_util::{StreamExt, TryStreamExt, stream};
 
 pub(crate) const TRACKED_STATE_TREE_CHUNK_NAMESPACE: &str = "tracked_state.tree_chunk";
 pub(crate) const TRACKED_STATE_COMMIT_ROOT_NAMESPACE: &str = "tracked_state.commit_root";
@@ -1107,6 +1108,32 @@ async fn load_change_records_by_ids(
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
     if change_ids.is_empty() {
         return Ok(Vec::new());
+    }
+    // Fresh changes use their commit-delta coordinates as their IDs and
+    // intentionally have no locator rows. Keep the legacy locator batch below
+    // for wholly explicit IDs; mixed/direct batches must validate the direct
+    // candidate and retain the existing explicit-locator fallback.
+    if change_ids
+        .iter()
+        .copied()
+        .any(|change_id| direct_change_locator(change_id).is_some())
+    {
+        return stream::iter(change_ids.iter().copied())
+            .map(|change_id| async move {
+                load_change_record_by_id(store, change_id)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "tracked_state selected change '{change_id}' has no authoritative locator"
+                            ),
+                        )
+                    })
+            })
+            .buffered(64)
+            .try_collect()
+            .await;
     }
     let locator_keys = change_ids
         .iter()
@@ -3926,6 +3953,11 @@ mod tests {
         assert_eq!(loaded.change_id, change_id);
         assert_eq!(loaded.schema_key, fixtures[source_index].schema_key);
         assert_eq!(loaded.entity_pk, fixtures[source_index].entity_pk);
+        let batch = super::load_change_records_by_ids(&read, &[change_id])
+            .await
+            .expect("direct address batch should read");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0], loaded);
     }
 
     #[tokio::test]
@@ -3978,6 +4010,10 @@ mod tests {
         assert_eq!(loaded.schema_key, explicit.schema_key);
         assert_eq!(loaded.entity_pk, explicit.entity_pk);
         assert_ne!(loaded.entity_pk, address_target.entity_pk);
+        let batch = super::load_change_records_by_ids(&read, &[explicit_change_id])
+            .await
+            .expect("explicit collision batch should fall back to its locator");
+        assert_eq!(batch, vec![loaded]);
         let canonical = super::load_canonical_change_locator(&read, explicit_change_id)
             .await
             .expect("canonical locator read should succeed")
