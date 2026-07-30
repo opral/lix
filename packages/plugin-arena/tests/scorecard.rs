@@ -10,7 +10,7 @@ fn component_v3_wit_is_valid_and_has_no_guest_document_resource() {
         .push_dir(&path)
         .unwrap_or_else(|error| panic!("parse {}: {error:#}", path.display()));
     let wit = std::fs::read_to_string(path.join("lix-plugin.wit")).unwrap();
-    assert!(wit.contains("package lix:plugin@3.0.0"));
+    assert!(wit.contains("package lix:plugin@4.0.0"));
     assert!(wit.contains("resource snapshot"));
     assert!(wit.contains("resource transition"));
     assert!(wit.contains("apply: func("));

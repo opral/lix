@@ -1,4 +1,4 @@
-package lix:plugin@3.0.0;
+package lix:plugin@4.0.0;
 
 interface host {
   type bytes = list<u8>;
@@ -48,19 +48,32 @@ interface host {
     format-only,
   }
 
-  record entity-change-meta {
+  record entity-change-input {
     ordinal: u32,
     schema-key: string,
     entity-pk: list<string>,
     snapshot-len: option<u64>,
+    /// Snapshots that fit the requested page are carried inline. Oversized
+    /// snapshots leave this empty and are read through `read-snapshot`.
+    snapshot: option<bytes>,
     effect: change-effect,
   }
 
+  record entity-change-input-page {
+    changes: list<entity-change-input>,
+  }
+
   resource entity-change-source {
-    len: func() -> u32;
-    get: func(index: u32) -> result<entity-change-meta, host-error>;
+    /// Pull one complete bounded page while the enclosing guest export remains
+    /// entered. This avoids one metadata import plus one snapshot import for
+    /// every semantic row and lets the host retain storage-native paging.
+    next-page: func(
+      max-bytes: u32,
+    ) -> result<option<entity-change-input-page>, host-error>;
+    /// Read an oversized snapshot advertised by the most recent page without
+    /// forcing that snapshot into the page allocation.
     read-snapshot: func(
-      index: u32,
+      ordinal: u32,
       offset: u64,
       length: u32,
     ) -> result<option<bytes>, host-error>;
@@ -189,6 +202,20 @@ interface api {
     entities: own<entity-change-source>,
   }
 
+  /// Rebuild an evicted actor directly as the successor of a byte transition.
+  /// Durable entities provide identity. Blob materializations provide
+  /// `before` plus sparse edits; derived materializations provide `after`
+  /// because their predecessor bytes must be rendered from the entities.
+  record cold-successor-request {
+    before-descriptor: file-descriptor,
+    after-descriptor: file-descriptor,
+    before: option<own<snapshot>>,
+    after: option<own<snapshot>>,
+    edits: list<input-splice>,
+    entities: own<entity-change-source>,
+    creates: create-context,
+  }
+
   /// All file transitions use one fused guest entry and one borrowed,
   /// host-owned atomic output capability.
   apply: func(
@@ -212,6 +239,13 @@ interface api {
   /// those bytes from entities through the transition sink.
   hydrate: func(
     input: hydrate-request,
+    output: borrow<transition>,
+  ) -> result<_, plugin-error>;
+
+  /// Cold update fast path: parse/reconcile the successor once without first
+  /// materializing a predecessor document in a separate guest export.
+  cold-successor: func(
+    input: cold-successor-request,
     output: borrow<transition>,
   ) -> result<_, plugin-error>;
 }

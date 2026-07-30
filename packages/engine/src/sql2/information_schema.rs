@@ -434,7 +434,12 @@ fn public_sql_type(data_type: &DataType) -> String {
 fn character_lengths(data_type: &DataType) -> (Option<u64>, Option<u64>) {
     match data_type {
         DataType::Utf8 | DataType::Binary => (None, Some(i32::MAX as u64)),
-        DataType::LargeUtf8 | DataType::LargeBinary => (None, Some(i64::MAX as u64)),
+        // Arrow's large variable-width types are bounded by an implementation
+        // offset, not by the public SQL column contract. Advertising i64::MAX
+        // as an octet length is both misleading and outside JavaScript's safe
+        // integer range, which makes SELECT * on information_schema.columns
+        // impossible to return through the JS SDK.
+        DataType::LargeUtf8 | DataType::LargeBinary => (None, None),
         _ => (None, None),
     }
 }

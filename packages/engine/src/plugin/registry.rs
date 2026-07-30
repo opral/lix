@@ -1168,7 +1168,7 @@ mod tests {
                 "schemas":["schema/default.json"],
                 "entry":"plugin.wasm",
                 "match":{{"path_glob":{path_glob:?}{content_type}}},
-                "api_version":"3.0.0",
+                "api_version":"4.0.0",
                 "materialization":"blob",
                 "runtime":"wasm-component",
                 "key":{key:?}
@@ -1189,7 +1189,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "3.0.0".to_string(),
+            api_version: "4.0.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type,
             entry: "plugin.wasm".to_string(),
@@ -1210,14 +1210,14 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "3.0.0".to_string(),
+            api_version: "4.0.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
             create_schema_keys: vec!["csv_row".to_string()],
             manifest_json: format!(
-                r#"{{"api_version":"3.0.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"materialization":"blob","runtime":"wasm-component","schemas":["schema/csv_row.json"]}}"#
+                r#"{{"api_version":"4.0.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"materialization":"blob","runtime":"wasm-component","schemas":["schema/csv_row.json"]}}"#
             ),
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
@@ -1231,7 +1231,7 @@ mod tests {
     fn durable_registry_rejects_pre_v3_component_api() {
         let mut legacy = component_entry('a');
         legacy.api_version = "2.0.0".to_owned();
-        legacy.manifest_json = legacy.manifest_json.replacen("3.0.0", "2.0.0", 1);
+        legacy.manifest_json = legacy.manifest_json.replacen("4.0.0", "2.0.0", 1);
         let plugins = vec![legacy];
         let wire = PluginRegistryWire {
             version: PLUGIN_REGISTRY_FORMAT_VERSION,
@@ -1244,7 +1244,7 @@ mod tests {
             .expect_err("durable pre-conflict-resolution components must hard fail");
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
         assert!(error.message.contains("api_version"));
-        assert!(error.message.contains("3.0.0"));
+        assert!(error.message.contains("4.0.0"));
     }
 
     #[test]
@@ -1431,7 +1431,7 @@ mod tests {
         let mut input = PluginRegistryEntryInput {
             key: "plugin_a".to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "3.0.0".to_string(),
+            api_version: "4.0.0".to_string(),
             path_glob: "*.json".to_string(),
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),

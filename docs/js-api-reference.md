@@ -126,7 +126,7 @@ const result = await lix.execute(
 	["/hello.txt"],
 );
 
-const path = result.rows[0]?.value("path").asText();
+const path = result.rows[0]?.get("path");
 const data = result.rows[0]?.value("data").asBytes();
 ```
 
@@ -298,20 +298,12 @@ Rows are returned by `execute()`.
 const row = result.rows[0]!;
 ```
 
-| Surface                    | Return type                      | Description                                                    |
-| -------------------------- | -------------------------------- | -------------------------------------------------------------- |
-| `row.columns`              | `string[]`                       | Column names for this row.                                     |
-| `row.get(columnName)`      | `LixNativeValue`                 | Native JS value for a column. Throws if the column is missing. |
-| `row.tryGet(columnName)`   | `LixNativeValue \| undefined`    | Native JS value, or `undefined` when the column is missing.    |
-| `row.value(columnName)`    | `Value`                          | Typed `Value` for a column. Throws if the column is missing.   |
-| `row.tryValue(columnName)` | `Value \| undefined`             | Typed `Value`, or `undefined` when the column is missing.      |
-| `row.getAt(index)`         | `LixNativeValue`                 | Native JS value by column index.                               |
-| `row.valueAt(index)`       | `Value`                          | Typed `Value` by column index.                                 |
-| `row.values()`             | `Value[]`                        | All typed values in column order.                              |
-| `row.toObject()`           | `Record<string, LixNativeValue>` | Object of native JS values keyed by column name.               |
-| `row.toValueMap()`         | `Record<string, Value>`          | Object of typed values keyed by column name.                   |
-
-`LixNativeValue` is `null`, boolean, number, string, JSON, or `Uint8Array`.
+| Surface                 | Return type              | Description                                                    |
+| ----------------------- | ------------------------ | -------------------------------------------------------------- |
+| `row.get(columnName)`   | `unknown`                | Native JS value for a column. Throws if the column is missing. |
+| `row.value(columnName)` | `Value`                  | Typed `Value` for a column. Throws if the column is missing.   |
+| `row.toObject()`        | `Record<string, unknown>` | Object of native JS values keyed by column name.              |
+| `row.toValueMap()`      | `Record<string, Value>`  | Object of typed values keyed by column name.                   |
 
 ## Value
 
@@ -319,15 +311,10 @@ const row = result.rows[0]!;
 
 Accessors:
 
-| Method        | Return type               | Description                           |
-| ------------- | ------------------------- | ------------------------------------- |
-| `asInteger()` | `number \| undefined`     | Returns a number for integer values.  |
-| `asBoolean()` | `boolean \| undefined`    | Returns a boolean for boolean values. |
-| `asReal()`    | `number \| undefined`     | Returns a number for real values.     |
-| `asText()`    | `string \| undefined`     | Returns a string for text values.     |
-| `asJson()`    | `JsonValue \| undefined`  | Returns a JSON value for JSON values. |
-| `asBytes()`   | `Uint8Array \| undefined` | Returns bytes for blob values.        |
-| `toJSON()`    | `LixValue`                | Serializes the typed value.           |
+| Method      | Return type               | Description                                      |
+| ----------- | ------------------------- | ------------------------------------------------ |
+| `toJS()`    | `unknown`                 | Returns a defensive copy of the native JS value. |
+| `asBytes()` | `Uint8Array \| undefined` | Returns a defensive copy for blob values.        |
 
 Constructors:
 

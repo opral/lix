@@ -23,6 +23,7 @@ plugin_git_text = { path = "../../plugins/text", lib = true, artifact = "cdylib"
 
 async-trait = "0.1"
 base64 = "0.22"
+bytes = "1"
 criterion = { package = "codspeed-criterion-compat", version = "4" }
 rand = { version = "0.9", features = ["small_rng"] }
 serde_json = "1"

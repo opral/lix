@@ -916,7 +916,11 @@ impl TableSpec for LixFileSpec {
         .await
         .map_err(lix_error_to_datafusion_error)?;
         let needs_data = scan_needs_data(&self.schema, projection, &filters);
-        let needs_blob_rows = scan_needs_blob_rows(&self.schema, projection, &filters);
+        let needs_required_blob_rows =
+            scan_needs_required_blob_rows(&self.schema, projection, &filters);
+        let needs_blob_rows = needs_required_blob_rows
+            || scan_needs_content_updated_at(&self.schema, projection, &filters);
+        let needs_file_timestamps = scan_needs_file_timestamps(&self.schema, projection, &filters);
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let target_directory_ids =
             exact_string_column_constraint_from_filters(&filters, "directory_id")?;
@@ -935,6 +939,7 @@ impl TableSpec for LixFileSpec {
         // A path predicate or exact file/directory ids can narrow those loads
         // to matching cached descriptors instead of scanning complete state.
         let use_path_index = should_use_path_index(&indexed_path_predicate, needs_blob_rows)
+            || needs_file_timestamps
             || matches!(&target_file_ids, FileIdConstraint::Ids(_))
             || matches!(&target_directory_ids, FileIdConstraint::Ids(_))
             || root_directory_filter;
@@ -1016,6 +1021,7 @@ impl TableSpec for LixFileSpec {
                     self.session_file_views.clone(),
                     needs_data,
                     needs_blob_rows,
+                    needs_required_blob_rows,
                     limit,
                 ),
                 |(
@@ -1033,10 +1039,11 @@ impl TableSpec for LixFileSpec {
                     session_file_views,
                     needs_data,
                     needs_blob_rows,
+                    needs_required_blob_rows,
                     limit,
                 )| async move {
                     if let Some(indexed_matches) = indexed_matches.as_ref()
-                        && !needs_blob_rows
+                        && !needs_required_blob_rows
                     {
                         // Without residual filters, the path-index order is the
                         // output order. Materialize only projected columns and
@@ -1099,7 +1106,7 @@ impl TableSpec for LixFileSpec {
                         ))
                     })?;
                     let acknowledge_plugin_data = needs_data && session_file_views.is_some();
-                    let plugin_render = if prepared.needs_plugin_render(needs_blob_rows)
+                    let plugin_render = if prepared.needs_plugin_render(needs_required_blob_rows)
                         || acknowledge_plugin_data
                     {
                         plugin_render_context_for_lix_file_scan(
@@ -4810,6 +4817,14 @@ async fn lix_file_record_batch_from_prepared(
             })
             .or_else(|| live_rows.row(file.live).change_id());
         let live = live_rows.row(file.live);
+        let content_live = blob_rows
+            .get(&blob_key)
+            .map(|blob_ref| live_rows.row(blob_ref.live))
+            .or_else(|| {
+                derived_rows
+                    .get(&blob_key)
+                    .map(|derived| live_rows.row(derived.live))
+            });
         let FileDescriptorRecord {
             id,
             directory_id,
@@ -4827,7 +4842,7 @@ async fn lix_file_record_batch_from_prepared(
             global: live.global(),
             change_id: projected_change_id.map(|id| id.to_string()),
             created_at: live.created_at().to_string(),
-            updated_at: live.updated_at().to_string(),
+            updated_at: content_live.unwrap_or(live).updated_at().to_string(),
             commit_id: live.commit_id().map(|id| id.to_string()),
             untracked: live.untracked(),
             metadata: live.metadata().map(|value| serialize_row_metadata(value)),
@@ -5653,7 +5668,7 @@ fn scan_needs_data(
     projected_needs_data || filters.iter().any(|filter| contains_column(filter, "data"))
 }
 
-fn scan_needs_blob_rows(
+fn scan_needs_required_blob_rows(
     base_schema: &SchemaRef,
     projection: Option<&Vec<usize>>,
     filters: &[Expr],
@@ -5673,8 +5688,46 @@ fn scan_needs_blob_rows(
         })
 }
 
+fn scan_needs_content_updated_at(
+    base_schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+) -> bool {
+    let projects_updated_at = match projection {
+        Some(indices) => indices
+            .iter()
+            .any(|index| base_schema.field(*index).name() == "lixcol_updated_at"),
+        None => true,
+    };
+    projects_updated_at
+        || filters
+            .iter()
+            .any(|filter| contains_column(filter, "lixcol_updated_at"))
+}
+
 fn should_use_path_index(path_predicate: &FilePathPredicate, needs_blob_rows: bool) -> bool {
     path_predicate != &FilePathPredicate::All || !needs_blob_rows
+}
+
+fn scan_needs_file_timestamps(
+    base_schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+) -> bool {
+    let projects_timestamp = match projection {
+        Some(indices) => indices.iter().any(|index| {
+            matches!(
+                base_schema.field(*index).name().as_str(),
+                "lixcol_created_at" | "lixcol_updated_at"
+            )
+        }),
+        None => true,
+    };
+    projects_timestamp
+        || filters.iter().any(|filter| {
+            contains_column(filter, "lixcol_created_at")
+                || contains_column(filter, "lixcol_updated_at")
+        })
 }
 
 fn lix_file_scan_request(
@@ -9072,7 +9125,7 @@ mod tests {
         wasm: &[u8],
     ) -> PluginRegistryEntry {
         let mut manifest = serde_json::json!({
-            "api_version":"3.0.0",
+            "api_version":"4.0.0",
             "entry": "plugin.wasm",
             "key": key,
             "match": { "path_glob": path_glob },
@@ -9088,7 +9141,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "3.0.0".to_string(),
+            api_version: "4.0.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type,
             entry: "plugin.wasm".to_string(),
@@ -9148,7 +9201,7 @@ mod tests {
             r#"{{
                 "key": "plugin_sentinel",
                 "runtime": "wasm-component",
-                "api_version":"3.0.0",
+                "api_version":"4.0.0",
                 "materialization": "blob",
                 "match": {{ "path_glob": "{path_glob}" }},
                 "entry": "plugin.wasm",

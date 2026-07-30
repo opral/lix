@@ -7,6 +7,143 @@ use serde_json::json;
 use super::assert_rows_eq;
 
 simulation_test!(
+    lix_file_public_timestamps_cover_descriptor_and_content_revisions,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let file_id = "74696d65-7374-816d-8073-000000000001";
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (id, path, data) \
+                     VALUES ('{file_id}', '/timestamps.txt', X'6F6E65')"
+                ),
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        let initial = session
+            .execute(
+                &format!(
+                    "SELECT lixcol_created_at, lixcol_updated_at, lixcol_change_id \
+                     FROM lix_file WHERE id = '{file_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("inserted file should be readable");
+        let initial_created_at = initial.rows()[0]
+            .get::<String>("lixcol_created_at")
+            .expect("created_at should be text");
+        let initial_updated_at = initial.rows()[0]
+            .get::<String>("lixcol_updated_at")
+            .expect("updated_at should be text");
+        let initial_change_id = initial.rows()[0]
+            .get::<String>("lixcol_change_id")
+            .expect("change_id should be text");
+
+        session
+            .execute(
+                &format!("UPDATE lix_file SET data = X'74776F' WHERE id = '{file_id}'"),
+                &[],
+            )
+            .await
+            .expect("content update should succeed");
+        let content_update = session
+            .execute(
+                &format!(
+                    "SELECT lixcol_created_at, lixcol_updated_at, lixcol_change_id \
+                     FROM lix_file WHERE id = '{file_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("content-updated file should be readable");
+        let content_created_at = content_update.rows()[0]
+            .get::<String>("lixcol_created_at")
+            .expect("created_at should be text");
+        let content_updated_at = content_update.rows()[0]
+            .get::<String>("lixcol_updated_at")
+            .expect("updated_at should be text");
+        let content_change_id = content_update.rows()[0]
+            .get::<String>("lixcol_change_id")
+            .expect("change_id should be text");
+        assert_eq!(content_created_at, initial_created_at);
+        assert_ne!(content_updated_at, initial_updated_at);
+        assert_ne!(content_change_id, initial_change_id);
+
+        let renamed_file_id = "74696d65-7374-816d-8073-000000000002";
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (id, path, data) \
+                     VALUES ('{renamed_file_id}', '/before-rename.txt', X'6F6E65')"
+                ),
+                &[],
+            )
+            .await
+            .expect("rename fixture insert should succeed");
+        let before_rename = session
+            .execute(
+                &format!(
+                    "SELECT lixcol_created_at, lixcol_updated_at \
+                     FROM lix_file WHERE id = '{renamed_file_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("rename fixture should be readable");
+        let rename_created_at = before_rename.rows()[0]
+            .get::<String>("lixcol_created_at")
+            .expect("created_at should be text");
+        let rename_updated_at = before_rename.rows()[0]
+            .get::<String>("lixcol_updated_at")
+            .expect("updated_at should be text");
+
+        session
+            .execute(
+                &format!(
+                    "UPDATE lix_file SET path = '/renamed-timestamps.txt' \
+                     WHERE id = '{renamed_file_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("rename should succeed");
+        let renamed = session
+            .execute(
+                &format!(
+                    "SELECT lixcol_created_at, lixcol_updated_at \
+                     FROM lix_file \
+                     WHERE path = '/renamed-timestamps.txt' AND id = '{renamed_file_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("renamed file should be readable");
+        assert_eq!(
+            renamed.rows()[0]
+                .get::<String>("lixcol_created_at")
+                .expect("created_at should be text"),
+            rename_created_at,
+        );
+        assert_eq!(
+            renamed.rows()[0]
+                .get::<String>("lixcol_updated_at")
+                .expect("updated_at should be text"),
+            rename_updated_at,
+        );
+    }
+);
+
+simulation_test!(
     file_descriptor_changes_always_carry_their_file_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -292,6 +429,26 @@ simulation_test!(
             .expect_err("the exact data batch must validate its pinned branch");
 
         assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
+    }
+);
+
+simulation_test!(
+    lix_file_unknown_metadata_column_suggests_public_name,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let error = session
+            .execute("SELECT metadata FROM lix_file", &[])
+            .await
+            .expect_err("metadata should not be a public column");
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
+        assert_eq!(error.hint.as_deref(), Some("Did you mean lixcol_metadata?"));
     }
 );
 

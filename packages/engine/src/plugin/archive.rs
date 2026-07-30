@@ -1115,7 +1115,7 @@ mod tests {
     const MANIFEST: &[u8] = br#"{
         "key":"plugin_test",
         "runtime":"wasm-component",
-        "api_version":"3.0.0",
+        "api_version":"4.0.0",
         "materialization":"blob",
         "match":{"path_glob":"*.test"},
         "entry":"plugin.wasm",
@@ -1135,7 +1135,7 @@ mod tests {
         let manifest = br#"{
             "key":"plugin_test",
             "runtime":"wasm-component",
-            "api_version":"3.0.0",
+            "api_version":"4.0.0",
             "materialization":"blob",
             "match":{"path_glob":"*.test"},
             "entry":"plugin.wasm",
@@ -1814,7 +1814,7 @@ mod benchmark_probe {
         let manifest = br#"{
             "key":"plugin_bench",
             "runtime":"wasm-component",
-            "api_version":"3.0.0",
+            "api_version":"4.0.0",
             "materialization":"blob",
             "match":{"path_glob":"*.bench"},
             "entry":"plugin.wasm",
