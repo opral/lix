@@ -2508,6 +2508,15 @@ async fn load_local_owned_commit_delta_entries(
     if requests.is_empty() {
         return Ok(Vec::new());
     }
+    if requests
+        .windows(2)
+        .all(|pair| pair[0].0 == pair[1].0 && pair[0].1 < pair[1].1)
+    {
+        return Box::pin(load_local_owned_commit_delta_entries_one_ordered(
+            store, requests,
+        ))
+        .await;
+    }
 
     let mut request_indices_by_commit = BTreeMap::<CommitId, Vec<usize>>::new();
     for (request_index, (commit_id, _)) in requests.iter().enumerate() {
@@ -2614,6 +2623,108 @@ async fn load_local_owned_commit_delta_entries(
             .remove(&(commit_id, segment_index))
             .expect("read segment came from the routed lookup set");
         for (request_index, encoded_key) in lookups {
+            output[request_index] =
+                find_loaded_commit_delta_entry(&leaf, &payloads, &encoded_key, commit_id)?;
+        }
+    }
+    hydrate_selected_loaded_entries(store, &mut output).await?;
+    Ok(output)
+}
+
+/// Fast path for one physical owner and an already ordered exact-key batch.
+///
+/// Dense current-state replacement reads naturally have this shape. Route the
+/// monotonic key stream through the manifest once instead of allocating a
+/// commit map, a segment B-tree, and one lookup vector per segment.
+async fn load_local_owned_commit_delta_entries_one_ordered(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[(CommitId, TrackedStateKey)],
+) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
+    let commit_id = requests[0].0;
+    let manifest_key = StorageKey(Bytes::from(commit_delta_manifest_key(commit_id)));
+    let manifest_values = PointReadPlan::new(
+        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        std::slice::from_ref(&manifest_key),
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?;
+    let Some(bytes) = manifest_values
+        .value
+        .into_iter()
+        .next()
+        .flatten()
+        .and_then(full_value_bytes)
+    else {
+        return Ok((0..requests.len()).map(|_| None).collect());
+    };
+    let manifest = decode_commit_delta_manifest(&bytes)?;
+    let mut output = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+    if let Some(inline_segment) = manifest.inline_segment() {
+        let (leaf, payloads) = decode_commit_delta_with_payloads(inline_segment, None)?;
+        for (request_index, (_, key)) in requests.iter().enumerate() {
+            let encoded_key = encoded_commit_delta_lookup_key(key);
+            output[request_index] =
+                find_loaded_commit_delta_entry(&leaf, &payloads, &encoded_key, commit_id)?;
+        }
+        hydrate_selected_loaded_entries(store, &mut output).await?;
+        return Ok(output);
+    }
+
+    let mut routed = Vec::<(usize, usize, Vec<u8>)>::with_capacity(requests.len());
+    let mut segment_indices = Vec::new();
+    for (request_index, (_, key)) in requests.iter().enumerate() {
+        let encoded_key = encoded_commit_delta_lookup_key(key);
+        let Some(segment_index) = commit_delta_segment_for_key(&manifest, &encoded_key) else {
+            continue;
+        };
+        if segment_indices.last().copied() != Some(segment_index) {
+            debug_assert!(
+                segment_indices
+                    .last()
+                    .is_none_or(|previous| *previous < segment_index),
+                "ordered commit-delta keys must route monotonically"
+            );
+            segment_indices.push(segment_index);
+        }
+        routed.push((request_index, segment_index, encoded_key));
+    }
+    let segment_keys = segment_indices
+        .iter()
+        .map(|&segment_index| {
+            commit_delta_segment_key(commit_id, segment_index)
+                .map(|key| StorageKey(Bytes::from(key)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let segment_values =
+        PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &segment_keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?;
+    let mut routed = routed.into_iter().peekable();
+    for (segment_index, segment_value) in segment_indices.into_iter().zip(segment_values.value) {
+        let bytes = segment_value.and_then(full_value_bytes).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state commit_delta manifest for commit '{commit_id}' references missing segment {segment_index}"
+                ),
+            )
+        })?;
+        let bounds = manifest.segments.get(segment_index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state commit_delta manifest for commit '{commit_id}' has no segment {segment_index}"
+                ),
+            )
+        })?;
+        let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(bounds))?;
+        while routed
+            .peek()
+            .is_some_and(|(_, routed_segment, _)| *routed_segment == segment_index)
+        {
+            let (request_index, _, encoded_key) = routed
+                .next()
+                .expect("peeked routed lookup remains available");
             output[request_index] =
                 find_loaded_commit_delta_entry(&leaf, &payloads, &encoded_key, commit_id)?;
         }
