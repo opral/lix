@@ -19,7 +19,11 @@ use crate::wasm::{WasmComponentActor, WasmDocumentCheckpoint, WasmDocumentHandle
 use crate::{Blob, LixError};
 
 pub(crate) const DEFAULT_MAX_LIVE_PLUGIN_STORES: usize = 16;
-const DEFAULT_MAX_DECODED_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+// The vscode-docs 303-path transition needs roughly 80-96 MiB to retain one
+// decoded predecessor per touched file. At 64 MiB the cache reparses 115
+// documents; 96 MiB retains the complete measured working set while remaining
+// well below the aggregate live-Store budget.
+const DEFAULT_MAX_DECODED_CHECKPOINT_BYTES: u64 = 96 * 1024 * 1024;
 // One predecessor is enough for the required two-reader serialization while
 // keeping each file actor's retained working set bounded.
 pub(crate) const DEFAULT_MAX_PLUGIN_FILE_HISTORY: usize = 1;
@@ -1590,7 +1594,7 @@ mod tests {
         let cache = PluginActorCache::new(2).unwrap();
         let first_key = key("main", "/first.csv", "g1");
         let second_key = key("main", "/second.csv", "g1");
-        let retained_bytes = 40 * 1024 * 1024;
+        let retained_bytes = DEFAULT_MAX_DECODED_CHECKPOINT_BYTES / 2 + 1;
         let first = cache
             .stage_checkpoint(
                 first_key.clone(),
