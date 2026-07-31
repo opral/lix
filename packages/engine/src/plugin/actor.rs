@@ -269,6 +269,67 @@ impl PluginEntityAuthorities {
         Ok(output)
     }
 
+    pub(crate) fn encode_checkpoint_bounded(&self, max_bytes: usize) -> Option<Vec<u8>> {
+        if self.checkpoint_encoded_upper_bound()? > max_bytes {
+            return None;
+        }
+        let encoded = self.encode_checkpoint().ok()?;
+        (encoded.len() <= max_bytes).then_some(encoded)
+    }
+
+    fn checkpoint_encoded_upper_bound(&self) -> Option<usize> {
+        fn add_text(len: usize, text: &str) -> Option<usize> {
+            len.checked_add(4)?.checked_add(text.len())
+        }
+
+        fn add_key(mut len: usize, key: &WasmEntityKey) -> Option<usize> {
+            len = add_text(len, key.schema_key.as_str())?;
+            len = len.checked_add(4)?;
+            for component in &key.entity_pk {
+                len = add_text(len, component.as_str())?;
+            }
+            Some(len)
+        }
+
+        fn add_keys<'a>(
+            mut len: usize,
+            keys: impl Iterator<Item = &'a WasmEntityKey>,
+        ) -> Option<usize> {
+            for key in keys {
+                len = add_key(len, key)?;
+            }
+            Some(len)
+        }
+
+        fn node_upper_bound(node: &PluginEntityAuthorityNode) -> Option<usize> {
+            match node {
+                PluginEntityAuthorityNode::Base {
+                    ranges,
+                    inserted,
+                    removed,
+                } => {
+                    let mut len = 20_usize;
+                    for range in ranges {
+                        len = add_text(len, &range.schema_key)?;
+                        len = len.checked_add(20)?;
+                    }
+                    add_keys(len, inserted.iter().chain(removed.iter()))
+                }
+                PluginEntityAuthorityNode::Delta {
+                    parent,
+                    inserted,
+                    removed,
+                    ..
+                } => add_keys(
+                    node_upper_bound(parent.node.as_ref())?,
+                    inserted.iter().chain(removed.iter()),
+                ),
+            }
+        }
+
+        node_upper_bound(self.node.as_ref())
+    }
+
     pub(crate) fn decode_checkpoint(bytes: &[u8]) -> Result<Self, LixError> {
         let mut reader = AuthorityCheckpointReader::new(bytes);
         if reader.take(8)? != b"LIXAUT01" {
@@ -2248,6 +2309,24 @@ mod tests {
         assert!(decoded.contains(&retained));
         assert!(!decoded.contains(&removed));
         assert!(decoded.contains(&inserted));
+    }
+
+    #[test]
+    fn entity_authority_checkpoint_respects_optional_byte_bound() {
+        let authorities = PluginEntityAuthorities::empty();
+        let encoded = authorities.encode_checkpoint().unwrap();
+
+        assert!(
+            authorities
+                .encode_checkpoint_bounded(encoded.len() - 1)
+                .is_none()
+        );
+        assert_eq!(
+            authorities
+                .encode_checkpoint_bounded(encoded.len())
+                .unwrap(),
+            encoded
+        );
     }
 
     #[tokio::test]

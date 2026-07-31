@@ -4064,7 +4064,7 @@ where
                             let decoded_checkpoint = cold_before.as_ref().and_then(|_| {
                                 cache.checkpoint(&actor_key, &visible_materialization.semantic_root)
                             });
-                            let durable_checkpoint = if decoded_checkpoint.is_none() {
+                            let mut durable_checkpoint = if decoded_checkpoint.is_none() {
                                 if let Some((state_hash, authority_hash)) =
                                     durable_checkpoint_hashes
                                 {
@@ -4102,8 +4102,6 @@ where
                             } else {
                                 None
                             };
-                            let restored_checkpoint =
-                                decoded_checkpoint.is_some() || durable_checkpoint.is_some();
                             let store_permit = loop {
                                 match cache.admit_cold_store(&mut cold_install) {
                                     Ok(permit) => break permit,
@@ -4133,6 +4131,39 @@ where
                                     "lix.perf.plugin_actor_instantiate"
                                 ))
                                 .await?;
+                            let durable_document = if decoded_checkpoint.is_none() {
+                                if let Some(checkpoint) = durable_checkpoint.as_ref() {
+                                    match actor
+                                        .restore_durable_document(
+                                            &checkpoint.runtime,
+                                            checkpoint_accepted_bytes
+                                                .as_deref()
+                                                .expect("durable checkpoints are blob-backed"),
+                                        )
+                                        .await
+                                    {
+                                        Ok(document) => Some(document),
+                                        Err(_) => {
+                                            let _ = actor.retire().await;
+                                            actor = factory
+                                                .instantiate_actor()
+                                                .instrument(tracing::debug_span!(
+                                                    target: "lix_perf",
+                                                    "lix.perf.plugin_actor_reinstantiate_after_checkpoint_miss"
+                                                ))
+                                                .await?;
+                                            durable_checkpoint = None;
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            let restored_checkpoint =
+                                decoded_checkpoint.is_some() || durable_document.is_some();
                             let mut cold_base_authorities: PluginEntityAuthorities =
                                 PluginEntityAuthorities::empty();
                             let transition_result = if let Some(checkpoint) = decoded_checkpoint {
@@ -4162,18 +4193,12 @@ where
                                     ))
                                     .await
                                     .map(|transition| (transition, 0))
-                            } else if let Some(checkpoint) = durable_checkpoint {
+                            } else if let Some(document) = durable_document {
+                                let checkpoint = durable_checkpoint
+                                    .expect("a restored durable document retains its authority");
                                 cold_base_authorities = checkpoint.authorities;
                                 drop(base);
                                 drop(read);
-                                let document = actor
-                                    .restore_durable_document(
-                                        &checkpoint.runtime,
-                                        checkpoint_accepted_bytes
-                                            .as_deref()
-                                            .expect("durable checkpoints are blob-backed"),
-                                    )
-                                    .await?;
                                 actor
                                     .file_changed(
                                         document,
@@ -8042,11 +8067,7 @@ impl PluginWriteReconciliation {
     ) -> Result<(), LixError> {
         let mut checkpoints = BTreeMap::<
             (String, String),
-            (
-                WasmDurableDocumentCheckpoint,
-                PluginEntityAuthorities,
-                String,
-            ),
+            (WasmDurableDocumentCheckpoint, crate::Blob, String),
         >::new();
         for publication in &self.actor_publications {
             let Some((branch_id, file_id, generation, checkpoint, authorities)) =
@@ -8054,12 +8075,17 @@ impl PluginWriteReconciliation {
             else {
                 continue;
             };
+            let Some(authority) = authorities
+                .encode_checkpoint_bounded(WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES)
+            else {
+                continue;
+            };
             checkpoints.insert(
                 (branch_id.to_owned(), file_id.to_owned()),
-                (checkpoint, authorities.clone(), generation.to_owned()),
+                (checkpoint, authority.into(), generation.to_owned()),
             );
         }
-        for ((branch_id, file_id), (checkpoint, authorities, generation)) in checkpoints {
+        for ((branch_id, file_id), (checkpoint, authority, generation)) in checkpoints {
             if self
                 .derived_materializations
                 .keys()
@@ -8080,7 +8106,6 @@ impl PluginWriteReconciliation {
                 })?;
             let state = encode_bound_plugin_checkpoint(&generation, &checkpoint)?;
             let state_hash = BlobHash::from_content(&state);
-            let authority: crate::Blob = authorities.encode_checkpoint()?.into();
             let authority_hash = BlobHash::from_content(&authority);
             write.set_plugin_checkpoint(state, state_hash, authority, authority_hash);
         }
