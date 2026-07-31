@@ -2460,7 +2460,77 @@ async fn scan_packed_current_base_rows(
     }
     let single_base = base_refs.len() == 1;
     let mut winners = BTreeMap::new();
+    let mut ordered_winners = None;
     for base_ref in base_refs {
+        let scan_members_with_payloads = request.filter.schema_keys.len() == 1
+            && request.filter.entity_pks.is_empty()
+            && request.filter.file_ids.is_empty()
+            && request.limit.is_none()
+            && request.read_columns.columns.as_slice() == ["snapshot_content"];
+        if scan_members_with_payloads {
+            // Native broad entity reads need every payload in the selected
+            // schema. Decode each packed segment once with its payload sidecar
+            // instead of first scanning the identity/value plane and then
+            // issuing a second manifest + segment pass for the same rows.
+            let members =
+                crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
+                    store,
+                    base_ref.commit_id,
+                    &request.filter.schema_keys,
+                    512,
+                )
+                .await?;
+            if single_base {
+                if let Some(members) = members {
+                    let mut ordered = Vec::with_capacity(members.len());
+                    for member in members {
+                        if member.value.deleted
+                            || !packed_member_matches_filter(&member, &request.filter)
+                        {
+                            continue;
+                        }
+                        ordered.push((member.key, member.value, member.change));
+                    }
+                    if ordered.iter().any(|row| row.0.file_id.is_some()) {
+                        ordered.sort_unstable_by(|left, right| {
+                            (&left.0.schema_key, &left.0.entity_pk, &left.0.file_id).cmp(&(
+                                &right.0.schema_key,
+                                &right.0.entity_pk,
+                                &right.0.file_id,
+                            ))
+                        });
+                    }
+                    ordered_winners = Some(ordered);
+                    break;
+                }
+            } else if let Some(members) = members {
+                for member in members {
+                    if member.value.deleted
+                        || !packed_member_matches_filter(&member, &request.filter)
+                    {
+                        continue;
+                    }
+                    let key = member.key;
+                    let identity = (
+                        key.schema_key.clone(),
+                        key.entity_pk.clone(),
+                        key.file_id.clone(),
+                    );
+                    match winners.entry(identity) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert((key, member.value, member.change));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry)
+                            if entry.get().1.commit_id < member.value.commit_id =>
+                        {
+                            entry.insert((key, member.value, member.change));
+                        }
+                        std::collections::btree_map::Entry::Occupied(_) => {}
+                    }
+                }
+                continue;
+            }
+        }
         let compact = crate::tracked_state::scan_commit_delta_values(
             store,
             base_ref.commit_id,
@@ -2521,12 +2591,13 @@ async fn scan_packed_current_base_rows(
         }
     }
     let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
-    let row_capacity = limit.map_or(winners.len(), |limit| limit.min(winners.len()));
+    let winner_rows = ordered_winners.unwrap_or_else(|| winners.into_values().collect::<Vec<_>>());
+    let row_capacity = limit.map_or(winner_rows.len(), |limit| limit.min(winner_rows.len()));
     let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(row_capacity);
     let mut json_refs = Vec::new();
     let mut deferred = Vec::new();
     let global = branch_id == crate::GLOBAL_BRANCH_ID;
-    for (_, (key, value, change)) in winners.into_iter().take(row_capacity) {
+    for (key, value, change) in winner_rows.into_iter().take(row_capacity) {
         let row_index = rows.len();
         let snapshot = materialize_packed_slot(
             projection.snapshot_content,
