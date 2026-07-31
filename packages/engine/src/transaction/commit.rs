@@ -265,6 +265,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let selected_change_records = load_selected_change_records(read, &commit_rows).await?;
 
     stage_tracked_commit_delta_index(
+        read,
         &mut writes,
         &mut state_rows,
         &row_index.tracked_row_indices_by_commit,
@@ -272,7 +273,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &commit_rows,
         &selected_change_records,
         &host_certified_file_schemas,
-    )?;
+    )
+    .await?;
 
     let staged_commits = stage_changelog_commits(
         read,
@@ -1107,7 +1109,8 @@ async fn materialize_selected_change_payloads(
         .collect()
 }
 
-fn stage_tracked_commit_delta_index(
+async fn stage_tracked_commit_delta_index(
+    read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &mut PreparedStateBatch,
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
@@ -1182,6 +1185,7 @@ fn stage_tracked_commit_delta_index(
             state_row_indices.len() + selected_change_count(&staged.selected_change_batches),
         );
         let mut addressable = Vec::with_capacity(deltas.capacity());
+        let mut selected_members_by_source = BTreeMap::<CommitId, usize>::new();
         for &row_index in state_row_indices {
             let row = state_rows.row(row_index);
             addressable.push(row.addressable_change_id);
@@ -1196,6 +1200,9 @@ fn stage_tracked_commit_delta_index(
             deltas.push(delta);
         }
         for change_ref in selected_changes(&staged.selected_change_batches) {
+            *selected_members_by_source
+                .entry(change_ref.source_commit_id)
+                .or_default() += 1;
             let key = selected_change_key(change_ref);
             let record = selected_change_records.get(&key);
             deltas.push(tracked_commit_delta_from_selected_change_ref(
@@ -1205,6 +1212,49 @@ fn stage_tracked_commit_delta_index(
             )?);
             addressable.push(false);
         }
+        if !selected_members_by_source.is_empty() {
+            tracing::info!(
+                target: "lix_perf",
+                commit_id = %root.commit_id,
+                selected_members = selected_members_by_source.values().sum::<usize>(),
+                selected_source_commits = selected_members_by_source.len(),
+                dominant_selected_source_members = selected_members_by_source
+                    .values()
+                    .copied()
+                    .max()
+                    .unwrap_or_default(),
+                "lix.perf.commit_delta_selected_sources"
+            );
+        }
+        let selected_source_alias = if selected_members_by_source.len() == 1 {
+            let source_commit_id = *selected_members_by_source
+                .first_key_value()
+                .expect("one selected source exists")
+                .0;
+            let selected = selected_changes(&staged.selected_change_batches)
+                .map(|change_ref| {
+                    (
+                        encode_key_ref(TrackedStateKeyRef {
+                            schema_key: change_ref.schema_key(),
+                            file_id: change_ref.file_id(),
+                            entity_pk: change_ref.entity_pk(),
+                        }),
+                        change_ref.change_id,
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let source =
+                crate::tracked_state::scan_commit_delta_values(read, source_commit_id, &[]).await?;
+            (source.len() == selected.len()
+                && source.iter().all(|row| {
+                    selected
+                        .get(row.encoded_key_ref())
+                        .is_some_and(|change_id| *change_id == row.value().change_id)
+                }))
+            .then_some(source_commit_id)
+        } else {
+            None
+        };
         let authored_change_ids = state_row_indices
             .iter()
             .filter_map(|&row_index| {
@@ -1214,7 +1264,18 @@ fn stage_tracked_commit_delta_index(
                     .flatten()
             })
             .collect::<std::collections::HashSet<_>>();
-        let staged = stage_addressable_commit_deltas(writes, &deltas, &addressable)?;
+        let staged = if let Some(source_commit_id) = selected_source_alias {
+            deltas.truncate(state_row_indices.len());
+            addressable.truncate(state_row_indices.len());
+            crate::tracked_state::stage_addressable_commit_deltas_with_selected_source(
+                writes,
+                &deltas,
+                &addressable,
+                source_commit_id,
+            )?
+        } else {
+            stage_addressable_commit_deltas(writes, &deltas, &addressable)?
+        };
         drop(deltas);
         for (source_index, &row_index) in state_row_indices.iter().enumerate() {
             if !state_rows.row(row_index).addressable_change_id {

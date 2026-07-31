@@ -362,6 +362,7 @@ impl CommitDeltaMember {
 pub(crate) struct CommitDeltaInventoryEntry {
     pub(crate) members: Vec<CommitDeltaMember>,
     pub(crate) segment_count: usize,
+    pub(crate) selected_source_commit_id: Option<CommitId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -383,6 +384,10 @@ const TRACKED_STATE_COMMIT_ROOT_MAGIC: &[u8] = b"LXTR3";
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 struct CommitDeltaManifest {
+    /// Complete selected state borrowed from one ordinary source commit.
+    /// Local inline/external segments are a disjoint authored overlay.
+    #[musli(with = storage_codec::option)]
+    selected_source_commit_id: Option<[u8; 16]>,
     /// A complete leaf payload for a commit that fits in one segment. Keeping
     /// it in the directory preserves the one-record shape of tiny commits;
     /// larger commits use the indexed segment list below.
@@ -738,7 +743,7 @@ pub(crate) fn stage_commit_deltas(
     writes: &mut StorageWriteSet,
     deltas: &[TrackedStateCommitDeltaRef<'_>],
 ) -> Result<Vec<CommitDeltaChangeLocator>, LixError> {
-    Ok(stage_commit_deltas_inner(writes, deltas, None)?.locators)
+    Ok(stage_commit_deltas_inner(writes, deltas, None, None)?.locators)
 }
 
 pub(crate) fn stage_addressable_commit_deltas(
@@ -752,7 +757,27 @@ pub(crate) fn stage_addressable_commit_deltas(
             "tracked_state addressability column does not match commit deltas",
         ));
     }
-    stage_commit_deltas_inner(writes, deltas, Some(addressable))
+    stage_commit_deltas_inner(writes, deltas, Some(addressable), None)
+}
+
+pub(crate) fn stage_addressable_commit_deltas_with_selected_source(
+    writes: &mut StorageWriteSet,
+    deltas: &[TrackedStateCommitDeltaRef<'_>],
+    addressable: &[bool],
+    selected_source_commit_id: CommitId,
+) -> Result<AddressableCommitDeltaStage, LixError> {
+    if addressable.len() != deltas.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state addressability column does not match commit deltas",
+        ));
+    }
+    stage_commit_deltas_inner(
+        writes,
+        deltas,
+        Some(addressable),
+        Some(selected_source_commit_id),
+    )
 }
 
 /// Streams an already ordered, fully addressable commit into bounded segments.
@@ -814,6 +839,7 @@ where
     let mut pending = VecDeque::with_capacity(COMMIT_DELTA_SEGMENT_MAX_ROWS);
     let mut first_segment = None::<(CommitDeltaSegmentBounds, Vec<u8>)>;
     let mut manifest = CommitDeltaManifest {
+        selected_source_commit_id: None,
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS)),
     };
@@ -977,6 +1003,7 @@ fn stage_commit_deltas_inner(
     writes: &mut StorageWriteSet,
     deltas: &[TrackedStateCommitDeltaRef<'_>],
     addressable: Option<&[bool]>,
+    selected_source_commit_id: Option<CommitId>,
 ) -> Result<AddressableCommitDeltaStage, LixError> {
     let Some(&commit_id) = deltas.first().map(|delta| &delta.delta.commit_id) else {
         return Ok(AddressableCommitDeltaStage {
@@ -1130,6 +1157,8 @@ fn stage_commit_deltas_inner(
             TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
             key(commit_delta_manifest_key(commit_id)),
             value(encode_commit_delta_manifest(&CommitDeltaManifest {
+                selected_source_commit_id: selected_source_commit_id
+                    .map(|commit_id| *commit_id.as_uuid().as_bytes()),
                 inline_segment,
                 segments: Vec::new(),
             })?),
@@ -1146,6 +1175,8 @@ fn stage_commit_deltas_inner(
     }
     writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, segment_count, 0);
     let mut manifest = CommitDeltaManifest {
+        selected_source_commit_id: selected_source_commit_id
+            .map(|commit_id| *commit_id.as_uuid().as_bytes()),
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(segment_count),
     };
@@ -1843,6 +1874,31 @@ pub(crate) async fn load_commit_delta_values_encoded(
     commit_id: CommitId,
     encoded_keys: &[Bytes],
 ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+    let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
+        return Ok(vec![None; encoded_keys.len()]);
+    };
+    let Some(source_commit_id) = manifest.selected_source_commit_id() else {
+        return load_local_commit_delta_values_encoded(store, commit_id, encoded_keys).await;
+    };
+    let mut values =
+        load_local_commit_delta_values_encoded(store, source_commit_id, encoded_keys).await?;
+    for value in values.iter_mut().flatten() {
+        value.commit_id = commit_id;
+    }
+    let local = load_local_commit_delta_values_encoded(store, commit_id, encoded_keys).await?;
+    for (value, local) in values.iter_mut().zip(local) {
+        if local.is_some() {
+            *value = local;
+        }
+    }
+    Ok(values)
+}
+
+async fn load_local_commit_delta_values_encoded(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    encoded_keys: &[Bytes],
+) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
     if encoded_keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -1954,7 +2010,44 @@ pub(crate) async fn load_commit_delta_members_with_payloads(
     let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
         return Ok(Vec::new());
     };
-    load_commit_delta_members_from_manifest(store, commit_id, &manifest).await
+    let mut local = load_commit_delta_members_from_manifest(store, commit_id, &manifest).await?;
+    let Some(source_commit_id) = manifest.selected_source_commit_id() else {
+        return Ok(local);
+    };
+    let source_manifest = load_commit_delta_manifest(store, source_commit_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "selected-source commit delta '{}' references missing source '{}'",
+                    commit_id, source_commit_id
+                ),
+            )
+        })?;
+    if source_manifest.selected_source_commit_id().is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "selected-source commit delta chains are unsupported",
+        ));
+    }
+    let mut members =
+        load_commit_delta_members_from_manifest(store, source_commit_id, &source_manifest).await?;
+    for member in &mut members {
+        member.value.commit_id = commit_id;
+        member.authored = false;
+        member.certified_ref = false;
+        member.selected_tombstone = member.value.deleted;
+    }
+    members.append(&mut local);
+    members.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+    if members.windows(2).any(|pair| pair[0].key == pair[1].key) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("selected-source commit delta '{commit_id}' has overlapping local rows"),
+        ));
+    }
+    Ok(members)
 }
 
 async fn load_commit_delta_members_from_manifest(
@@ -2188,6 +2281,54 @@ pub(crate) async fn load_commit_delta_change_ids(
 /// a second. Each selected segment is decoded once for both its index values
 /// and payload sidecar, preserving request order without topology replay.
 pub(crate) async fn load_owned_commit_delta_entries(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[(CommitId, TrackedStateKey)],
+) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
+    let mut output = load_local_owned_commit_delta_entries(store, requests).await?;
+    let mut source_requests = Vec::new();
+    let mut source_outputs = Vec::new();
+    let mut source_owner_commits = Vec::new();
+    for (request_index, (commit_id, key)) in requests.iter().enumerate() {
+        if output[request_index].is_some() {
+            continue;
+        }
+        let Some(manifest) = load_commit_delta_manifest(store, *commit_id).await? else {
+            continue;
+        };
+        let Some(source_commit_id) = manifest.selected_source_commit_id() else {
+            continue;
+        };
+        source_outputs.push(request_index);
+        source_owner_commits.push(*commit_id);
+        source_requests.push((source_commit_id, key.clone()));
+    }
+    let selected = load_local_owned_commit_delta_entries(store, &source_requests).await?;
+    for (((request_index, owner_commit_id), source_request), entry) in source_outputs
+        .into_iter()
+        .zip(source_owner_commits)
+        .zip(source_requests)
+        .zip(selected)
+    {
+        if let Some(mut entry) = entry {
+            entry.value.commit_id = owner_commit_id;
+            entry.selected_ref = true;
+            entry.certified_ref = false;
+            entry.owner_commit_id = owner_commit_id;
+            output[request_index] = Some(entry);
+        } else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "selected-source commit delta '{}' is missing borrowed identity {:?}",
+                    owner_commit_id, source_request.1
+                ),
+            ));
+        }
+    }
+    Ok(output)
+}
+
+async fn load_local_owned_commit_delta_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     requests: &[(CommitId, TrackedStateKey)],
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
@@ -2433,6 +2574,22 @@ pub(crate) async fn scan_commit_delta_values(
     let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
         return Ok(DecodedCommitDeltaBatch::default());
     };
+    let Some(source_commit_id) = manifest.selected_source_commit_id() else {
+        return scan_local_commit_delta_values(store, commit_id, schema_keys).await;
+    };
+    let source = scan_local_commit_delta_values(store, source_commit_id, schema_keys).await?;
+    let local = scan_local_commit_delta_values(store, commit_id, schema_keys).await?;
+    merge_selected_source_batches(source, local, commit_id)
+}
+
+async fn scan_local_commit_delta_values(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+) -> Result<DecodedCommitDeltaBatch, LixError> {
+    let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
+        return Ok(DecodedCommitDeltaBatch::default());
+    };
     let requested_schemas = schema_keys
         .iter()
         .map(String::as_str)
@@ -2480,11 +2637,113 @@ pub(crate) async fn scan_commit_delta_values(
     Ok(batch.finish())
 }
 
+fn merge_selected_source_batches(
+    mut source: DecodedCommitDeltaBatch,
+    mut local: DecodedCommitDeltaBatch,
+    commit_id: CommitId,
+) -> Result<DecodedCommitDeltaBatch, LixError> {
+    let arena_offset = u32::try_from(source.arenas.len()).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "selected-source commit delta has too many arenas",
+        )
+    })?;
+    let schema_offset = u32::try_from(source.schema_keys.len()).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "selected-source commit delta has too many schema keys",
+        )
+    })?;
+    let file_offset = u32::try_from(source.file_ids.len()).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "selected-source commit delta has too many file ids",
+        )
+    })?;
+    let mut entries = BTreeMap::<Vec<u8>, (DecodedCommitDeltaRow, TrackedStateIndexValue)>::new();
+    for (row, mut value) in source.rows.drain(..).zip(source.values.drain(..)) {
+        let key = source.arenas[row.arena_ordinal as usize]
+            .key(row.entry_ordinal as usize)?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "selected-source commit delta references a missing source key",
+                )
+            })?
+            .to_vec();
+        value.commit_id = commit_id;
+        entries.insert(key, (row, value));
+    }
+    for (mut row, value) in local.rows.drain(..).zip(local.values.drain(..)) {
+        let key = local.arenas[row.arena_ordinal as usize]
+            .key(row.entry_ordinal as usize)?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "selected-source commit delta references a missing local key",
+                )
+            })?
+            .to_vec();
+        row.arena_ordinal = row.arena_ordinal.checked_add(arena_offset).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "commit delta arena ordinal overflow",
+            )
+        })?;
+        row.schema_key_ordinal = row
+            .schema_key_ordinal
+            .checked_add(schema_offset)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "commit delta schema ordinal overflow",
+                )
+            })?;
+        if row.file_id_ordinal != u32::MAX {
+            row.file_id_ordinal =
+                row.file_id_ordinal
+                    .checked_add(file_offset)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "commit delta file ordinal overflow",
+                        )
+                    })?;
+        }
+        entries.insert(key, (row, value));
+    }
+    source.arenas.append(&mut local.arenas);
+    source.schema_keys.append(&mut local.schema_keys);
+    source.file_ids.append(&mut local.file_ids);
+    for (_, (row, value)) in entries {
+        source.rows.push(row);
+        source.values.push(value);
+    }
+    Ok(source)
+}
+
 /// Answers schema membership from the packed commit directory.
 ///
 /// Segmented commits are decided from manifest bounds without reading any
 /// payload page. Tiny inline commits inspect at most one bounded leaf.
 pub(crate) async fn commit_delta_contains_schema(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_key: &str,
+) -> Result<bool, LixError> {
+    let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
+        return Ok(false);
+    };
+    if local_commit_delta_contains_schema(store, commit_id, schema_key).await? {
+        return Ok(true);
+    }
+    let Some(source_commit_id) = manifest.selected_source_commit_id() else {
+        return Ok(false);
+    };
+    local_commit_delta_contains_schema(store, source_commit_id, schema_key).await
+}
+
+async fn local_commit_delta_contains_schema(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     schema_key: &str,
@@ -2721,9 +2980,7 @@ pub(crate) async fn scan_commit_delta_inventory(
         mut segments,
     } = scan_commit_delta_plane(store).await?;
     let mut inventory = CommitDeltaInventory::default();
-    let mut authoritative_changes =
-        BTreeMap::<crate::changelog::ChangeId, crate::changelog::ChangeRecord>::new();
-    for (commit_id, manifest) in manifests {
+    for (&commit_id, manifest) in &manifests {
         let physical_segments = segments.remove(&commit_id).unwrap_or_default();
         let segment_count = manifest.segments.len();
         let mut members = Vec::new();
@@ -2751,7 +3008,65 @@ pub(crate) async fn scan_commit_delta_inventory(
         }
         hydrate_selected_members(store, &mut members).await?;
         validate_commit_delta_member_order_and_ids(commit_id, &members)?;
-        for member in &members {
+        inventory.commits.insert(
+            commit_id,
+            CommitDeltaInventoryEntry {
+                members,
+                segment_count,
+                selected_source_commit_id: manifest.selected_source_commit_id(),
+            },
+        );
+    }
+    for (&commit_id, manifest) in &manifests {
+        let Some(source_commit_id) = manifest.selected_source_commit_id() else {
+            continue;
+        };
+        if manifests
+            .get(&source_commit_id)
+            .is_some_and(|source| source.selected_source_commit_id().is_some())
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "selected-source commit delta chains are unsupported",
+            ));
+        }
+        let mut selected = inventory
+            .commits
+            .get(&source_commit_id)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "selected-source commit delta '{commit_id}' references missing source '{source_commit_id}'"
+                    ),
+                )
+            })?
+            .members
+            .clone();
+        for member in &mut selected {
+            member.value.commit_id = commit_id;
+            member.authored = false;
+            member.certified_ref = false;
+            member.selected_tombstone = member.value.deleted;
+        }
+        let local = inventory
+            .commits
+            .get_mut(&commit_id)
+            .expect("alias manifest was inventoried locally");
+        selected.append(&mut local.members);
+        selected.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        if selected.windows(2).any(|pair| pair[0].key == pair[1].key) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("selected-source commit delta '{commit_id}' has overlapping local rows"),
+            ));
+        }
+        local.members = selected;
+    }
+    let mut authoritative_changes =
+        BTreeMap::<crate::changelog::ChangeId, crate::changelog::ChangeRecord>::new();
+    for entry in inventory.commits.values() {
+        for member in &entry.members {
             if is_payload_free_selected_tombstone(member) {
                 continue;
             }
@@ -2768,13 +3083,6 @@ pub(crate) async fn scan_commit_delta_inventory(
                 ));
             }
         }
-        inventory.commits.insert(
-            commit_id,
-            CommitDeltaInventoryEntry {
-                members,
-                segment_count,
-            },
-        );
     }
     debug_assert!(segments.is_empty());
     Ok(inventory)
@@ -3157,6 +3465,11 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
 }
 
 impl CommitDeltaManifest {
+    fn selected_source_commit_id(&self) -> Option<CommitId> {
+        self.selected_source_commit_id
+            .map(|bytes| CommitId::new(uuid::Uuid::from_bytes(bytes)))
+    }
+
     fn inline_segment(&self) -> Option<&[u8]> {
         (!self.inline_segment.is_empty()).then_some(self.inline_segment.as_slice())
     }
@@ -4025,7 +4338,8 @@ mod tests {
         load_commit_delta_change_records, load_commit_delta_members_with_payloads,
         load_commit_delta_values_encoded, load_owned_commit_delta_entries,
         scan_change_records_from_commit_deltas, scan_commit_delta_inventory,
-        scan_commit_delta_members, scan_commit_delta_values, stage_change_locators,
+        scan_commit_delta_members, scan_commit_delta_values,
+        stage_addressable_commit_deltas_with_selected_source, stage_change_locators,
         stage_commit_deltas, stage_delete_commit_delta_inventory_entry, value,
     };
 
@@ -4920,6 +5234,87 @@ mod tests {
         assert_eq!(changes[0].change_id, fixture.change_id);
     }
 
+    #[tokio::test]
+    async fn selected_source_alias_preserves_exact_members_inventory_and_canonical_history() {
+        let storage = StorageAdapter::new(Memory::new());
+        let source_commit = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_7777_0000_0000,
+        ));
+        let alias_commit = CommitId::for_test_label("selected-source-alias");
+        let mut fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .take(3)
+            .collect::<Vec<_>>();
+
+        let mut writes = storage.new_write_set();
+        let source_deltas = commit_delta_refs(source_commit, &fixtures[..2]);
+        let source_stage = super::stage_addressable_commit_deltas(
+            &mut writes,
+            &source_deltas,
+            &vec![true; source_deltas.len()],
+        )
+        .expect("source commit should stage direct addresses");
+        drop(source_deltas);
+        for (fixture, change_id) in fixtures[..2]
+            .iter_mut()
+            .zip(source_stage.assigned_change_ids)
+        {
+            fixture.change_id = change_id;
+        }
+
+        let overlay = commit_delta_refs(alias_commit, &fixtures[2..]);
+        stage_addressable_commit_deltas_with_selected_source(
+            &mut writes,
+            &overlay,
+            &[false],
+            source_commit,
+        )
+        .expect("source alias should stage one disjoint local overlay");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("source and alias commits should publish atomically");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("source alias read should open");
+        let keys = fixtures
+            .iter()
+            .map(CommitDeltaFixture::key)
+            .collect::<Vec<_>>();
+        let values = load_commit_delta_values_for_test(&read, alias_commit, &keys)
+            .await
+            .expect("alias exact values should load");
+        assert!(values.iter().all(Option::is_some));
+        assert!(
+            values
+                .iter()
+                .flatten()
+                .all(|value| value.commit_id == alias_commit)
+        );
+
+        let members = load_commit_delta_members_with_payloads(&read, alias_commit)
+            .await
+            .expect("alias root-rebuild members should load");
+        assert_eq!(members.len(), 3);
+        assert_eq!(members.iter().filter(|member| member.authored).count(), 1);
+        assert_eq!(members.iter().filter(|member| !member.authored).count(), 2);
+
+        let inventory = scan_commit_delta_inventory(&read)
+            .await
+            .expect("alias GC inventory should load");
+        assert_eq!(
+            inventory.commits[&alias_commit].selected_source_commit_id,
+            Some(source_commit)
+        );
+        assert_eq!(inventory.commits[&alias_commit].members.len(), 3);
+        let canonical = scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect("alias history should retain one canonical source authority");
+        assert_eq!(canonical.len(), 3);
+    }
+
     fn decoded_commit_delta_rows(
         batch: &DecodedCommitDeltaBatch,
     ) -> Vec<(TrackedStateKey, TrackedStateIndexValue)> {
@@ -5234,6 +5629,7 @@ mod tests {
             key(commit_delta_manifest_key(commit_id)),
             value(
                 encode_commit_delta_manifest(&CommitDeltaManifest {
+                    selected_source_commit_id: None,
                     inline_segment: segment,
                     segments: Vec::new(),
                 })
@@ -5969,6 +6365,7 @@ mod tests {
             key(commit_delta_manifest_key(commit_id)),
             value(
                 encode_commit_delta_manifest(&CommitDeltaManifest {
+                    selected_source_commit_id: None,
                     inline_segment: encode_commit_delta_segment(&entries),
                     segments: Vec::new(),
                 })
