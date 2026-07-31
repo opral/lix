@@ -22,3 +22,26 @@ pub(crate) use metadata::{
 pub(crate) use timestamp::LixTimestamp;
 pub use types::{Blob, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
 pub use wire::{WireQueryResult, WireValue};
+
+/// Renders a JSON value through the public SQL string-column coercion.
+///
+/// Registered schemas are validated separately. The SQL surface has
+/// historically kept malformed stored values readable by coercing any
+/// non-null JSON scalar or container to text, so native indexes and joins
+/// must use this exact representation too.
+pub(crate) fn json_value_to_string(value: &serde_json::Value) -> Result<Option<String>, LixError> {
+    Ok(match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            Some(serde_json::to_string(value).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("failed to render JSON string value: {error}"),
+                )
+            })?)
+        }
+    })
+}

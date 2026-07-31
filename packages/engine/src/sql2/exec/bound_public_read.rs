@@ -10,8 +10,9 @@ use std::collections::BTreeSet;
 
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, Expr, GroupByExpr, OrderByKind, Query, Select, SelectFlavor, SetExpr,
-    Statement as SqlStatement, TableFactor, Value as SqlValue,
+    BinaryOperator, Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, OrderByKind, Query,
+    Select, SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement, TableFactor,
+    Value as SqlValue,
 };
 use serde_json::Value as JsonValue;
 
@@ -36,6 +37,14 @@ pub(crate) async fn try_execute_bound_public_read<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
+    if let Some(shape) = strict_entity_left_join_read(statement, params) {
+        crate::sql2::bind_read_statement(sql, statement)?;
+        let catalog = ctx.public_catalog().await?;
+        if let Some(result) = execute_entity_left_join_read(ctx, &catalog, shape).await? {
+            return Ok(Some(result));
+        }
+        return Ok(None);
+    }
     let Some(shape) = strict_entity_primary_key_read(statement, params)
         .map(StrictEntityRead::PrimaryKey)
         .or_else(|| strict_entity_broad_read(statement, params).map(StrictEntityRead::Broad))
@@ -169,6 +178,229 @@ where
     }
 }
 
+async fn execute_entity_left_join_read<C>(
+    ctx: &C,
+    catalog: &crate::sql2::catalog::PublicCatalog,
+    shape: StrictEntityLeftJoinRead,
+) -> Result<Option<SqlQueryResult>, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    let Some(reader) = ctx.entity_snapshot_reader() else {
+        return Ok(None);
+    };
+    let mut specs = std::collections::BTreeMap::new();
+    for table in &shape.tables {
+        let Some(surface) = catalog.surface(table) else {
+            return Ok(None);
+        };
+        let PublicSurfaceKind::EntityBase { schema_key } = &surface.kind else {
+            return Ok(None);
+        };
+        let Some(spec) = catalog.entity_spec(schema_key) else {
+            return Ok(None);
+        };
+        specs.insert(table.clone(), spec);
+    }
+    if single_top_level_string_primary_key(specs[&shape.root_table])
+        != Some(shape.root_primary_key_column.as_str())
+    {
+        return Ok(None);
+    }
+    for projection in &shape.projection {
+        let Some(column) = specs
+            .get(&projection.table)
+            .and_then(|spec| spec.visible_column(&projection.column))
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            column.column_type,
+            EntityColumnType::String | EntityColumnType::Json
+        ) {
+            return Ok(None);
+        }
+    }
+    for join in &shape.joins {
+        let left_type = specs
+            .get(&join.left_table)
+            .and_then(|spec| spec.visible_column(&join.left_column))
+            .map(|column| column.column_type);
+        let right_type = specs
+            .get(&join.right_table)
+            .and_then(|spec| spec.visible_column(&join.right_column))
+            .map(|column| column.column_type);
+        if left_type != Some(EntityColumnType::String)
+            || right_type != Some(EntityColumnType::String)
+        {
+            return Ok(None);
+        }
+    }
+
+    let root_spec = specs[&shape.root_table];
+    let root_request = entity_snapshot_request(
+        ctx.active_branch_id(),
+        &root_spec.schema_key,
+        vec![EntityPk::single(shape.root_primary_key_value.clone())],
+    );
+    let Some(root_snapshots) = reader.scan_entity_snapshots(root_request).await? else {
+        return Ok(None);
+    };
+    type JoinedRow<'a> = std::collections::BTreeMap<&'a str, Option<std::sync::Arc<JsonValue>>>;
+    let mut joined = parse_join_snapshots(root_snapshots)?
+        .into_iter()
+        .map(|row| JoinedRow::from([(shape.root_table.as_str(), Some(row))]))
+        .collect::<Vec<_>>();
+    for join in &shape.joins {
+        if joined.is_empty() {
+            break;
+        }
+        let values = joined
+            .iter()
+            .map(|row| {
+                let value = row
+                    .get(join.left_table.as_str())
+                    .and_then(Option::as_deref)
+                    .and_then(|value| value.get(&join.left_column));
+                value
+                    .map(crate::common::json_value_to_string)
+                    .transpose()
+                    .map(Option::flatten)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            for row in &mut joined {
+                row.insert(join.right_table.as_str(), None);
+            }
+            continue;
+        }
+        let right_spec = specs[&join.right_table];
+        let request =
+            entity_snapshot_request(ctx.active_branch_id(), &right_spec.schema_key, Vec::new());
+        let snapshots = if let Some(snapshots) = reader
+            .scan_entity_snapshots_by_string_field(request.clone(), &join.right_column, &values)
+            .await?
+        {
+            snapshots
+        } else {
+            let Some(snapshots) = reader.scan_entity_snapshots(request).await? else {
+                return Ok(None);
+            };
+            snapshots
+        };
+        let right_rows = parse_join_snapshots(snapshots)?;
+        let mut next = Vec::new();
+        for row in joined {
+            let left_value = row
+                .get(join.left_table.as_str())
+                .and_then(Option::as_deref)
+                .and_then(|value| value.get(&join.left_column))
+                .map(crate::common::json_value_to_string)
+                .transpose()?
+                .flatten();
+            let mut matched = false;
+            if let Some(left_value) = left_value.as_deref() {
+                for right in &right_rows {
+                    let right_value = right
+                        .get(&join.right_column)
+                        .map(crate::common::json_value_to_string)
+                        .transpose()?
+                        .flatten();
+                    if right_value.as_deref() == Some(left_value) {
+                        let mut result = row.clone();
+                        result.insert(
+                            join.right_table.as_str(),
+                            Some(std::sync::Arc::clone(right)),
+                        );
+                        next.push(result);
+                        matched = true;
+                    }
+                }
+            }
+            if !matched {
+                let mut result = row;
+                result.insert(join.right_table.as_str(), None);
+                next.push(result);
+            }
+        }
+        joined = next;
+    }
+
+    let rows = joined
+        .into_iter()
+        .map(|row| {
+            shape
+                .projection
+                .iter()
+                .map(|projection| {
+                    let spec = specs[&projection.table];
+                    let column = spec
+                        .visible_column(&projection.column)
+                        .expect("join projection was validated");
+                    let value = row
+                        .get(projection.table.as_str())
+                        .and_then(Option::as_deref)
+                        .and_then(|row| row.get(&projection.column));
+                    materialize_value(column.column_type, value)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(SqlQueryResult {
+        columns: shape
+            .projection
+            .into_iter()
+            .map(|projection| projection.alias)
+            .collect(),
+        rows,
+        notices: Vec::new(),
+    }))
+}
+
+fn entity_snapshot_request(
+    branch_id: &str,
+    schema_key: &str,
+    entity_pks: Vec<EntityPk>,
+) -> LiveStateScanRequest {
+    LiveStateScanRequest {
+        filter: LiveStateFilter {
+            schema_keys: vec![schema_key.to_owned()],
+            entity_pks,
+            branch_ids: vec![branch_id.to_owned()],
+            include_tombstones: false,
+            ..LiveStateFilter::default()
+        },
+        projection: LiveStateProjection {
+            columns: vec!["snapshot_content".to_string()],
+        },
+        limit: None,
+    }
+}
+
+fn parse_join_snapshots(
+    snapshots: Vec<Option<bytes::Bytes>>,
+) -> Result<Vec<std::sync::Arc<JsonValue>>, LixError> {
+    snapshots
+        .into_iter()
+        .flatten()
+        .map(|snapshot| {
+            serde_json::from_slice(&snapshot)
+                .map(std::sync::Arc::new)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("direct entity join expected valid snapshot JSON: {error}"),
+                    )
+                })
+        })
+        .collect()
+}
+
 fn single_top_level_string_primary_key(
     spec: &crate::sql2::catalog::EntitySurfaceSpec,
 ) -> Option<&str> {
@@ -288,6 +520,164 @@ struct StrictEntityBroadRead {
     primary_key_column: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct StrictEntityJoinProjection {
+    table: String,
+    column: String,
+    alias: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StrictEntityJoin {
+    left_table: String,
+    left_column: String,
+    right_table: String,
+    right_column: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StrictEntityLeftJoinRead {
+    root_table: String,
+    root_primary_key_column: String,
+    root_primary_key_value: String,
+    tables: Vec<String>,
+    joins: Vec<StrictEntityJoin>,
+    projection: Vec<StrictEntityJoinProjection>,
+}
+
+/// Recognizes the document point-read shape emitted by query builders: an
+/// exact root lookup followed by a chain of simple left joins. Keeping this
+/// contract deliberately narrow lets the native route preserve SQL semantics
+/// without embedding a second general-purpose query engine.
+fn strict_entity_left_join_read(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<StrictEntityLeftJoinRead> {
+    let DataFusionStatement::Statement(statement) = statement else {
+        return None;
+    };
+    let SqlStatement::Query(query) = statement.as_ref() else {
+        return None;
+    };
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if !strict_plain_select(select) {
+        return None;
+    }
+    let [from] = select.from.as_slice() else {
+        return None;
+    };
+    if from.joins.is_empty() {
+        return None;
+    }
+    let root_table = strict_table_name(&from.relation)?;
+    let mut tables = vec![root_table.clone()];
+    let mut joins = Vec::with_capacity(from.joins.len());
+    for join in &from.joins {
+        let right_table = strict_table_name(&join.relation)?;
+        if tables.contains(&right_table) {
+            return None;
+        }
+        let constraint = match &join.join_operator {
+            JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => constraint,
+            _ => return None,
+        };
+        let JoinConstraint::On(Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        }) = constraint
+        else {
+            return None;
+        };
+        let (left_table, left_column) = strict_qualified_column(left)?;
+        let (candidate_right_table, right_column) = strict_qualified_column(right)?;
+        let (left_table, left_column, candidate_right_table, right_column) =
+            if candidate_right_table == right_table && tables.contains(&left_table) {
+                (left_table, left_column, candidate_right_table, right_column)
+            } else if left_table == right_table && tables.contains(&candidate_right_table) {
+                (candidate_right_table, right_column, left_table, left_column)
+            } else {
+                return None;
+            };
+        joins.push(StrictEntityJoin {
+            left_table,
+            left_column,
+            right_table: candidate_right_table,
+            right_column,
+        });
+        tables.push(right_table);
+    }
+
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| {
+            let SelectItem::ExprWithAlias { expr, alias } = item else {
+                return None;
+            };
+            let (table, column) = strict_qualified_column(expr)?;
+            tables.contains(&table).then(|| StrictEntityJoinProjection {
+                table,
+                column,
+                alias: alias.value.clone(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if projection.is_empty() {
+        return None;
+    }
+
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = select.selection.as_ref()?
+    else {
+        return None;
+    };
+    let mut highest_parameter = 0;
+    let ((filter_table, root_primary_key_column), root_primary_key_value) = match (
+        strict_qualified_column(left),
+        strict_qualified_column(right),
+    ) {
+        (Some(column), None) => (
+            column,
+            strict_text_value(right, params, &mut highest_parameter)?,
+        ),
+        (None, Some(column)) => (
+            column,
+            strict_text_value(left, params, &mut highest_parameter)?,
+        ),
+        _ => return None,
+    };
+    if filter_table != root_table || params.len() != highest_parameter {
+        return None;
+    }
+
+    Some(StrictEntityLeftJoinRead {
+        root_table,
+        root_primary_key_column,
+        root_primary_key_value,
+        tables,
+        joins,
+        projection,
+    })
+}
+
 /// Recognizes a single, active entity table with an `IN`/`=` primary-key
 /// predicate and canonical ascending primary-key order. It intentionally does
 /// not inspect catalog metadata: catalog mismatches are handled by the caller
@@ -362,25 +752,7 @@ fn strict_single_table_select(
     let SetExpr::Select(select) = query.body.as_ref() else {
         return None;
     };
-    if select.flavor != SelectFlavor::Standard
-        || select.optimizer_hint.is_some()
-        || select.distinct.is_some()
-        || select.select_modifiers.is_some()
-        || select.top.is_some()
-        || select.exclude.is_some()
-        || select.into.is_some()
-        || !select.lateral_views.is_empty()
-        || select.prewhere.is_some()
-        || !select.connect_by.is_empty()
-        || !group_by_is_empty(&select.group_by)
-        || !select.cluster_by.is_empty()
-        || !select.distribute_by.is_empty()
-        || !select.sort_by.is_empty()
-        || select.having.is_some()
-        || !select.named_window.is_empty()
-        || select.qualify.is_some()
-        || select.value_table_mode.is_some()
-    {
+    if !strict_plain_select(select) {
         return None;
     }
     let [from] = select.from.as_slice() else {
@@ -389,6 +761,31 @@ fn strict_single_table_select(
     if !from.joins.is_empty() {
         return None;
     }
+    Some((query, select, strict_table_name(&from.relation)?))
+}
+
+fn strict_plain_select(select: &Select) -> bool {
+    select.flavor == SelectFlavor::Standard
+        && select.optimizer_hint.is_none()
+        && select.distinct.is_none()
+        && select.select_modifiers.is_none()
+        && select.top.is_none()
+        && select.exclude.is_none()
+        && select.into.is_none()
+        && select.lateral_views.is_empty()
+        && select.prewhere.is_none()
+        && select.connect_by.is_empty()
+        && group_by_is_empty(&select.group_by)
+        && select.cluster_by.is_empty()
+        && select.distribute_by.is_empty()
+        && select.sort_by.is_empty()
+        && select.having.is_none()
+        && select.named_window.is_empty()
+        && select.qualify.is_none()
+        && select.value_table_mode.is_none()
+}
+
+fn strict_table_name(table: &TableFactor) -> Option<String> {
     let TableFactor::Table {
         name,
         alias,
@@ -401,7 +798,7 @@ fn strict_single_table_select(
         sample,
         index_hints,
         ..
-    } = &from.relation
+    } = table
     else {
         return None;
     };
@@ -419,25 +816,40 @@ fn strict_single_table_select(
         return None;
     }
     let table_identifier = name.0.first()?.as_ident()?;
-    if table_identifier.quote_style.is_some() {
-        return None;
-    }
-    Some((query, select, table_identifier.value.to_ascii_lowercase()))
+    Some(strict_identifier_name(table_identifier))
 }
 
-fn strict_projection(
-    projection: &[datafusion::sql::sqlparser::ast::SelectItem],
-) -> Option<Vec<String>> {
-    let columns =
-        projection
-            .iter()
-            .map(|item| match item {
-                datafusion::sql::sqlparser::ast::SelectItem::UnnamedExpr(Expr::Identifier(
-                    column,
-                )) if column.quote_style.is_none() => Some(column.value.to_ascii_lowercase()),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()?;
+fn strict_qualified_column(expression: &Expr) -> Option<(String, String)> {
+    let Expr::CompoundIdentifier(identifiers) = expression else {
+        return None;
+    };
+    let [table, column] = identifiers.as_slice() else {
+        return None;
+    };
+    Some((
+        strict_identifier_name(table),
+        strict_identifier_name(column),
+    ))
+}
+
+fn strict_identifier_name(identifier: &Ident) -> String {
+    if identifier.quote_style.is_some() {
+        identifier.value.clone()
+    } else {
+        identifier.value.to_ascii_lowercase()
+    }
+}
+
+fn strict_projection(projection: &[SelectItem]) -> Option<Vec<String>> {
+    let columns = projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(column)) if column.quote_style.is_none() => {
+                Some(column.value.to_ascii_lowercase())
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
     let unique_count = columns.iter().collect::<BTreeSet<_>>().len();
     (unique_count == columns.len()).then_some(columns)
 }
@@ -577,6 +989,52 @@ mod tests {
         assert_eq!(shape.table_name, "json_pointer");
         assert_eq!(shape.projection, ["path", "value"]);
         assert_eq!(shape.primary_key_column, "path");
+    }
+
+    #[test]
+    fn recognizes_document_point_read_left_join_chain() {
+        let shape = strict_entity_left_join_read(
+            &parse(
+                r#"SELECT "bundle"."id" AS "bundleId",
+                    "bundle"."declarations" AS "bundleDeclarations",
+                    "message"."id" AS "messageId",
+                    "message"."locale" AS "messageLocale",
+                    "variant"."id" AS "variantId",
+                    "variant"."pattern" AS "variantPattern"
+                FROM "bundle"
+                LEFT JOIN "message" ON "message"."bundleId" = "bundle"."id"
+                LEFT JOIN "variant" ON "variant"."messageId" = "message"."id"
+                WHERE "bundle"."id" = $1"#,
+            ),
+            &[Value::Text("bundle-1".to_string())],
+        )
+        .expect("document point read should use direct route");
+
+        assert_eq!(shape.root_table, "bundle");
+        assert_eq!(shape.root_primary_key_column, "id");
+        assert_eq!(shape.root_primary_key_value, "bundle-1");
+        assert_eq!(shape.tables, ["bundle", "message", "variant"]);
+        assert_eq!(shape.joins[0].left_table, "bundle");
+        assert_eq!(shape.joins[0].right_table, "message");
+        assert_eq!(shape.joins[0].right_column, "bundleId");
+        assert_eq!(shape.projection[0].alias, "bundleId");
+        assert_eq!(shape.projection[1].column, "declarations");
+    }
+
+    #[test]
+    fn join_read_rejects_shapes_that_need_general_sql() {
+        let params = [Value::Text("bundle-1".to_string())];
+        for sql in [
+            r#"SELECT "bundle"."id" AS "id" FROM "bundle" JOIN "message" ON "message"."bundleId" = "bundle"."id" WHERE "bundle"."id" = $1"#,
+            r#"SELECT "bundle"."id" AS "id" FROM "bundle" LEFT JOIN "message" ON "message"."bundleId" = "bundle"."id" WHERE "message"."id" = $1"#,
+            r#"SELECT count(*) AS "count" FROM "bundle" LEFT JOIN "message" ON "message"."bundleId" = "bundle"."id" WHERE "bundle"."id" = $1"#,
+            r#"SELECT "bundle"."id" AS "id" FROM "bundle" LEFT JOIN "message" ON "message"."bundleId" = "bundle"."id" WHERE "bundle"."id" = $1 ORDER BY "bundle"."id""#,
+        ] {
+            assert!(
+                strict_entity_left_join_read(&parse(sql), &params).is_none(),
+                "{sql} must fall back"
+            );
+        }
     }
 
     #[test]

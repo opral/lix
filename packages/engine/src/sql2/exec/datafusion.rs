@@ -2423,6 +2423,9 @@ mod tests {
         snapshots: Vec<Option<Bytes>>,
         requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
     }
+    struct SchemaEntitySnapshotReader {
+        snapshots: std::collections::BTreeMap<String, Vec<Option<Bytes>>>,
+    }
     struct DummyCommitGraphReader;
     struct DummyBranchRefReader;
     fn test_read_scope(storage: &StorageAdapter<Memory>) -> StorageAdapterReadScope<MemoryRead> {
@@ -3159,6 +3162,46 @@ mod tests {
     }
 
     #[async_trait]
+    impl EntitySnapshotReader for SchemaEntitySnapshotReader {
+        async fn scan_entity_snapshots(
+            &self,
+            request: LiveStateScanRequest,
+        ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+            let [schema_key] = request.filter.schema_keys.as_slice() else {
+                return Ok(None);
+            };
+            Ok(self.snapshots.get(schema_key).cloned())
+        }
+
+        async fn scan_entity_snapshots_by_string_field(
+            &self,
+            request: LiveStateScanRequest,
+            column: &str,
+            values: &[String],
+        ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+            let [schema_key] = request.filter.schema_keys.as_slice() else {
+                return Ok(None);
+            };
+            let Some(snapshots) = self.snapshots.get(schema_key) else {
+                return Ok(None);
+            };
+            let mut matched = Vec::new();
+            for snapshot in snapshots.iter().flatten() {
+                let value: serde_json::Value = serde_json::from_slice(snapshot).unwrap();
+                let value = value
+                    .get(column)
+                    .map(crate::common::json_value_to_string)
+                    .transpose()?
+                    .flatten();
+                if value.as_ref().is_some_and(|value| values.contains(value)) {
+                    matched.push(Some(snapshot.clone()));
+                }
+            }
+            Ok(Some(matched))
+        }
+    }
+
+    #[async_trait]
     impl BlobDataReader for DummyBlobReader {
         async fn load_bytes_many(
             &self,
@@ -3549,6 +3592,114 @@ mod tests {
             [
                 crate::entity_pk::EntityPk::single("entity-a"),
                 crate::entity_pk::EntityPk::single("entity-b"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_entity_left_join_preserves_matches_and_null_extension() {
+        let sql = r#"SELECT "bundle"."id" AS "bundleId",
+                         "message"."id" AS "messageId",
+                         "variant"."id" AS "variantId",
+                         "variant"."pattern" AS "variantPattern"
+                    FROM "bundle"
+                    LEFT JOIN "message" ON "message"."bundleId" = "bundle"."id"
+                    LEFT JOIN "variant" ON "variant"."messageId" = "message"."id"
+                   WHERE "bundle"."id" = $1"#;
+        let snapshot_reader = Arc::new(SchemaEntitySnapshotReader {
+            snapshots: std::collections::BTreeMap::from([
+                (
+                    "bundle".to_string(),
+                    vec![Some(Bytes::from_static(br#"{"id":"b1"}"#))],
+                ),
+                (
+                    "message".to_string(),
+                    vec![
+                        // Stored JSON can violate a registered string type.
+                        // The established SQL projection coerces it to text,
+                        // and native join operands must do the same.
+                        Some(Bytes::from_static(br#"{"id":true,"bundleId":"b1"}"#)),
+                        Some(Bytes::from_static(br#"{"id":"m2","bundleId":"b1"}"#)),
+                    ],
+                ),
+                (
+                    "variant".to_string(),
+                    vec![Some(Bytes::from_static(
+                        br#"{"id":"v1","messageId":true,"pattern":"Hello"}"#,
+                    ))],
+                ),
+            ]),
+        });
+        let ctx = DummySqlExecutionContext {
+            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
+            blob_reader: Arc::new(DummyBlobReader),
+            live_state: Arc::new(DummyLiveStateReader),
+            entity_snapshot_reader: Some(snapshot_reader),
+            schema_definitions: vec![
+                json!({
+                    "x-lix-key": "bundle",
+                    "x-lix-primary-key": ["/id"],
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }),
+                json!({
+                    "x-lix-key": "message",
+                    "x-lix-primary-key": ["/id"],
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "bundleId": { "type": "string" }
+                    },
+                    "required": ["id", "bundleId"],
+                    "additionalProperties": false
+                }),
+                json!({
+                    "x-lix-key": "variant",
+                    "x-lix-primary-key": ["/id"],
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "messageId": { "type": "string" },
+                        "pattern": { "type": "string" }
+                    },
+                    "required": ["id", "messageId", "pattern"],
+                    "additionalProperties": false
+                }),
+            ],
+        };
+        let statement = crate::sql2::parse_statement(sql).expect("test SQL should parse");
+
+        let result = super::super::bound_public_read::try_execute_bound_public_read(
+            &ctx,
+            sql,
+            &statement,
+            &[Value::Text("b1".to_string())],
+        )
+        .await
+        .expect("native route should execute")
+        .expect("strict entity join should use native route");
+
+        assert_eq!(
+            result.columns,
+            ["bundleId", "messageId", "variantId", "variantPattern"]
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Value::Text("b1".to_string()),
+                    Value::Text("true".to_string()),
+                    Value::Text("v1".to_string()),
+                    Value::Text("Hello".to_string()),
+                ],
+                vec![
+                    Value::Text("b1".to_string()),
+                    Value::Text("m2".to_string()),
+                    Value::Null,
+                    Value::Null,
+                ],
             ]
         );
     }

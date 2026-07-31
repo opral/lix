@@ -1,5 +1,6 @@
 #![allow(clippy::borrow_deref_ref, clippy::clone_on_copy)]
 
+use super::EntitySnapshotFieldIndexCache;
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::NullableKeyFilter;
@@ -40,6 +41,7 @@ pub(crate) struct LiveStateContext {
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
+    entity_field_index_cache: std::sync::Arc<EntitySnapshotFieldIndexCache>,
 }
 
 impl LiveStateContext {
@@ -51,6 +53,7 @@ impl LiveStateContext {
             tracked_head: TrackedHeadContext::new(),
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
+            entity_field_index_cache: std::sync::Arc::new(EntitySnapshotFieldIndexCache::default()),
         }
     }
 
@@ -64,6 +67,7 @@ impl LiveStateContext {
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
+            entity_field_index_cache: std::sync::Arc::clone(&self.entity_field_index_cache),
         }
     }
 
@@ -84,6 +88,7 @@ pub(crate) struct LiveStateStoreReader<S> {
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
+    entity_field_index_cache: std::sync::Arc<EntitySnapshotFieldIndexCache>,
 }
 
 impl<S> LiveStateStoreReader<S>
@@ -100,6 +105,81 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        let Some((requested_branch_id, requested_control, schema_key)) =
+            self.direct_entity_snapshot_scope(request).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.tracked_head
+                .reader(&self.store)
+                .scan_entity_snapshots(
+                    &requested_branch_id,
+                    requested_control,
+                    &schema_key,
+                    &request.filter.entity_pks,
+                    request.limit,
+                )
+                .await?,
+        ))
+    }
+
+    pub(crate) async fn scan_direct_entity_snapshots_by_string_field(
+        &self,
+        request: &LiveStateScanRequest,
+        column: &str,
+        values: &[String],
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        let Some((branch_id, control, schema_key)) =
+            self.direct_entity_snapshot_scope(request).await?
+        else {
+            return Ok(None);
+        };
+        let generation = format!("{}:{}", control.generation, control.current_state_revision);
+        if let Some(rows) =
+            self.entity_field_index_cache
+                .get(&branch_id, &generation, &schema_key, column, values)
+        {
+            return Ok(Some(rows));
+        }
+        let snapshots = self
+            .tracked_head
+            .reader(&self.store)
+            .scan_entity_snapshots(&branch_id, control, &schema_key, &[], None)
+            .await?;
+        let mut rows_by_value = std::collections::BTreeMap::<String, Vec<Option<Bytes>>>::new();
+        for snapshot in snapshots {
+            let Some(bytes) = snapshot else { continue };
+            let snapshot =
+                serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("entity field index expected valid snapshot JSON: {error}"),
+                    )
+                })?;
+            let value = snapshot
+                .get(column)
+                .map(crate::common::json_value_to_string)
+                .transpose()?
+                .flatten();
+            if let Some(value) = value {
+                rows_by_value.entry(value).or_default().push(Some(bytes));
+            }
+        }
+        Ok(Some(self.entity_field_index_cache.insert(
+            &branch_id,
+            &generation,
+            &schema_key,
+            column,
+            rows_by_value,
+            values,
+        )))
+    }
+
+    async fn direct_entity_snapshot_scope(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Option<(String, BranchHeadControl, String)>, LixError> {
         // The hot index carries tracked and untracked rows in one serving
         // plane, so this route never probes a separate retention index.
         if request.filter.untracked.is_some()
@@ -132,25 +212,17 @@ where
         let tracked_head = self.tracked_head.reader(&self.store);
         if requested_branch_id != GLOBAL_BRANCH_ID
             && let Some(global_control) = scope.branch_heads.get(GLOBAL_BRANCH_ID).copied()
-        {
-            let global_has_rows = tracked_head
+            && tracked_head
                 .has_schema_rows(GLOBAL_BRANCH_ID, global_control, schema_key)
-                .await?;
-            if global_has_rows {
-                return Ok(None);
-            }
+                .await?
+        {
+            return Ok(None);
         }
-        Ok(Some(
-            tracked_head
-                .scan_entity_snapshots(
-                    requested_branch_id,
-                    requested_control,
-                    schema_key,
-                    &request.filter.entity_pks,
-                    request.limit,
-                )
-                .await?,
-        ))
+        Ok(Some((
+            requested_branch_id.clone(),
+            requested_control,
+            schema_key.clone(),
+        )))
     }
 
     pub(crate) async fn scan_batch(
