@@ -12,8 +12,7 @@ const MAX_WEAK_QUERY_ENTRIES_BEFORE_PRUNE: usize = 1024;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ObserveSessionScope {
-    Workspace,
-    Pinned(String),
+    Branch(String),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

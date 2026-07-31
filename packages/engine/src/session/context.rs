@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
@@ -119,7 +119,7 @@ pub(crate) async fn load_workspace_branch_id_from_index(
 #[derive(Clone)]
 pub(crate) enum SessionMode {
     Pinned { branch_id: String },
-    Workspace { branch_id: String },
+    Workspace { branch_id: Arc<RwLock<String>> },
 }
 
 /// Session-context state for engine execution.
@@ -176,7 +176,9 @@ where
                 .await?;
         drop(read);
         Ok(Self::new(
-            SessionMode::Workspace { branch_id },
+            SessionMode::Workspace {
+                branch_id: Arc::new(RwLock::new(branch_id)),
+            },
             storage,
             live_state,
             tracked_state,
@@ -469,7 +471,15 @@ where
         self.ensure_open()?;
         match &self.mode {
             SessionMode::Pinned { branch_id } => Ok(branch_id.clone()),
-            SessionMode::Workspace { branch_id } => Ok(branch_id.clone()),
+            SessionMode::Workspace { branch_id } => branch_id
+                .read()
+                .map(|branch_id| branch_id.clone())
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "workspace branch selector cache is poisoned",
+                    )
+                }),
         }
     }
 

@@ -59,18 +59,29 @@ where
                         SessionMode::Pinned { .. } => Ok(SessionMode::Pinned {
                             branch_id: branch_id.clone(),
                         }),
-                        SessionMode::Workspace { .. } => {
+                        SessionMode::Workspace {
+                            branch_id: selector,
+                        } => {
                             let mut rows = RawWriteBatch::with_capacity(1);
                             rows.push(workspace_branch_stage_row(&branch_id)?);
                             transaction.stage_rows(rows).await?;
                             Ok(SessionMode::Workspace {
-                                branch_id: branch_id.clone(),
+                                branch_id: selector,
                             })
                         }
                     }
                 })
             })
             .await?;
+
+        if let SessionMode::Workspace { branch_id } = &next_mode {
+            *branch_id.write().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "workspace branch selector cache is poisoned",
+                )
+            })? = receipt_branch_id.clone();
+        }
 
         let session = Self::new_with_transaction_manager(
             next_mode,

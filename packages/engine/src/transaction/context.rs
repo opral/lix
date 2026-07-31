@@ -10028,10 +10028,19 @@ async fn resolve_active_branch_id(
     match mode {
         SessionMode::Pinned { branch_id } => Ok(branch_id.clone()),
         SessionMode::Workspace { branch_id } => {
+            let branch_id = branch_id
+                .read()
+                .map(|branch_id| branch_id.clone())
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "workspace branch selector cache is poisoned",
+                    )
+                })?;
             let branch_ref = branch_ctx.ref_reader(read);
             BranchLifecycle::new(&branch_ref)
                 .require_existing_ref(
-                    branch_id,
+                    &branch_id,
                     BranchOperation::LoadWorkspaceSelector,
                     BranchReferenceRole::WorkspaceSelector,
                 )
