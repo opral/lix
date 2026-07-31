@@ -104,8 +104,7 @@ where
 }
 
 fn csv_plugin_archive() -> Vec<u8> {
-    let wasm_path = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv")
-        .expect("Cargo must provide the CSV plugin artifact for rs-sdk tests");
+    let wasm_path = env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv");
     let wasm = std::fs::read(Path::new(wasm_path)).expect("read CSV plugin wasm");
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options =
