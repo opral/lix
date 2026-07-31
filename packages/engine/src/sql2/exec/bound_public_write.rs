@@ -29,7 +29,8 @@ use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::transaction::types::{
-    RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
+    CertifiedRawWriteBatchPreparation, PreparedRowFacts, RawWriteBatch, RawWriteRowRef,
+    TransactionJson, TransactionWrite, TransactionWriteMode,
 };
 use crate::wasm::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
@@ -2478,7 +2479,8 @@ fn certified_direct_parameter_insert_batch(
     let Some(schema_catalog) = ctx.schema_catalog_snapshot() else {
         return Ok(None);
     };
-    let Some((_, schema_plan)) = schema_catalog.plan_for_key(&layout.schema_key) else {
+    let Some((schema_plan_id, schema_plan)) = schema_catalog.plan_for_key(&layout.schema_key)
+    else {
         return Ok(None);
     };
     if !schema_plan.accepts_canonical_certificate() {
@@ -2590,7 +2592,7 @@ fn certified_direct_parameter_insert_batch(
         })?);
     let mut offsets = Vec::with_capacity(row_count);
     let mut entity_pks = Vec::with_capacity(row_count);
-    let mut unique_entity_pks = std::collections::HashSet::with_capacity(row_count);
+    let mut unordered_entity_pks = None::<std::collections::HashSet<EntityPk>>;
     let mut primary_key_parts = Vec::with_capacity(primary_key_columns.len());
     let mut typed_fields = Vec::with_capacity(columns.len());
 
@@ -2700,8 +2702,23 @@ fn certified_direct_parameter_insert_batch(
                 &typed_fields,
                 &primary_key_parts,
             )?;
-            if !unique_entity_pks.insert(entity_pk.clone()) {
-                return Ok(false);
+            if let Some(unique) = &mut unordered_entity_pks {
+                if !unique.insert(entity_pk.clone()) {
+                    return Ok(false);
+                }
+            } else if let Some(previous) = entity_pks.last()
+                && previous >= &entity_pk
+            {
+                // Ordered parameter batches prove uniqueness by adjacency and
+                // need no hash table. On the first disorder, seed the fallback
+                // index with exactly the already accepted prefix so duplicate
+                // detection and later validation retain statement order.
+                let mut unique = std::collections::HashSet::with_capacity(row_count);
+                unique.extend(entity_pks.iter().cloned());
+                if !unique.insert(entity_pk.clone()) {
+                    return Ok(false);
+                }
+                unordered_entity_pks = Some(unique);
             }
             offsets.push((start, normalized.len()));
             entity_pks.push(entity_pk);
@@ -2735,6 +2752,13 @@ fn certified_direct_parameter_insert_batch(
             branch_id.clone(),
         );
     }
+    rows.certify_preparation(CertifiedRawWriteBatchPreparation {
+        schema_plan_id,
+        facts: PreparedRowFacts {
+            row_content_validated: true,
+            requires_transaction_validation: false,
+        },
+    });
     Ok(Some(rows))
 }
 

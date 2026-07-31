@@ -757,6 +757,33 @@ impl TransactionWriteBuffer {
         }
     }
 
+    /// Returns whether this transaction has changed the schema catalog used
+    /// by `domain` without promoting the append-only staging journal.
+    ///
+    /// Typed SQL certificates are bound to the session's pinned catalog.
+    /// A transaction-local registered-schema row therefore invalidates those
+    /// certificates for the same branch/durability scope.
+    pub(crate) fn has_staged_schema_catalog_change(
+        &self,
+        domain: &Domain,
+    ) -> Result<bool, LixError> {
+        let rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let rows = match &*rows {
+            StagedPreparedRows::AppendOnly { rows, .. }
+            | StagedPreparedRows::Indexed { rows, .. } => rows,
+        };
+        Ok(rows.iter().any(|row| {
+            row.schema_key.as_str() == crate::transaction::normalization::REGISTERED_SCHEMA_KEY
+                && row.branch_id.as_str() == domain.branch_id()
+                && (row.untracked == domain.untracked() || (domain.untracked() && !row.untracked))
+        }))
+    }
+
     /// Promotes the compact ordered journal into the existing identity overlay
     /// only when a read or an irregular write needs read-your-writes lookup.
     fn ensure_identity_index(&self, materialize_empty: bool) -> Result<(), LixError> {

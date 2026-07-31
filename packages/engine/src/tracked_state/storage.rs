@@ -786,7 +786,12 @@ fn stage_commit_deltas_inner(
             )
         })
         .collect::<Vec<_>>();
-    pending.sort_unstable_by(|left, right| left.0.key.cmp(&right.0.key));
+    if !pending
+        .windows(2)
+        .all(|pair| pair[0].0.key <= pair[1].0.key)
+    {
+        pending.sort_unstable_by(|left, right| left.0.key.cmp(&right.0.key));
+    }
     let mut entries = Vec::with_capacity(pending.len());
     let mut payloads = Vec::with_capacity(pending.len());
     let mut addressable = Vec::with_capacity(pending.len());
@@ -809,6 +814,13 @@ fn stage_commit_deltas_inner(
     let mut encoded_segments = Vec::new();
     let mut assigned_change_ids = vec![crate::changelog::ChangeId::default(); deltas.len()];
     let mut segment_start = 0usize;
+    let mut sidecar_compressor =
+        crate::compression::ZstdLevel1Compressor::new().map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("tracked_state commit_delta compressor initialization failed: {error}"),
+            )
+        })?;
     while segment_start < entries.len() {
         let mut segment_end = (segment_start + COMMIT_DELTA_SEGMENT_MAX_ROWS).min(entries.len());
         let segment_index = encoded_segments.len();
@@ -834,6 +846,7 @@ fn stage_commit_deltas_inner(
             match try_encode_commit_delta_segment_with_payloads(
                 &candidate,
                 &payloads[segment_start..segment_end],
+                &mut sidecar_compressor,
             ) {
                 Ok(encoded)
                     if encoded.len() <= COMMIT_DELTA_SEGMENT_TARGET_BYTES
@@ -2985,14 +2998,15 @@ fn encode_commit_delta_segment(entries: &[EncodedLeafEntry]) -> Vec<u8> {
 fn try_encode_commit_delta_segment_with_payloads(
     entries: &[EncodedLeafEntry],
     payloads: &[CommitDeltaPayloadRef<'_>],
+    compressor: &mut crate::compression::ZstdLevel1Compressor,
 ) -> Result<Vec<u8>, CommitDeltaSegmentEncodeError> {
-    encode_commit_delta_segment_layout(entries, payloads, true)
+    encode_commit_delta_segment_layout(entries, payloads, Some(compressor))
 }
 
 fn encode_commit_delta_segment_layout(
     entries: &[EncodedLeafEntry],
     payloads: &[CommitDeltaPayloadRef<'_>],
-    compress_sidecar: bool,
+    compressor: Option<&mut crate::compression::ZstdLevel1Compressor>,
 ) -> Result<Vec<u8>, CommitDeltaSegmentEncodeError> {
     debug_assert_eq!(entries.len(), payloads.len());
     let leaf = encode_leaf_node(entries);
@@ -3062,8 +3076,8 @@ fn encode_commit_delta_segment_layout(
         sidecar.extend_from_slice(&offset.to_be_bytes());
     }
     sidecar.extend_from_slice(&payload_bytes);
-    let compressed = compress_sidecar
-        .then(|| crate::compression::compress_zstd_level_1(&sidecar))
+    let compressed = compressor
+        .map(|compressor| compressor.compress(&sidecar))
         .transpose()
         .map_err(|error| {
             CommitDeltaSegmentEncodeError::Codec(LixError::new(
@@ -3098,7 +3112,9 @@ fn encode_commit_delta_segment_with_payloads(
     entries: &[EncodedLeafEntry],
     payloads: &[CommitDeltaPayloadRef<'_>],
 ) -> Vec<u8> {
-    try_encode_commit_delta_segment_with_payloads(entries, payloads)
+    let mut compressor =
+        crate::compression::ZstdLevel1Compressor::new().expect("test compressor should initialize");
+    try_encode_commit_delta_segment_with_payloads(entries, payloads, &mut compressor)
         .map_err(CommitDeltaSegmentEncodeError::into_lix_error)
         .expect("test commit-delta segment should encode")
 }
@@ -3108,7 +3124,7 @@ fn encode_commit_delta_segment_with_raw_sidecar(
     entries: &[EncodedLeafEntry],
     payloads: &[CommitDeltaPayloadRef<'_>],
 ) -> Vec<u8> {
-    encode_commit_delta_segment_layout(entries, payloads, false)
+    encode_commit_delta_segment_layout(entries, payloads, None)
         .map_err(CommitDeltaSegmentEncodeError::into_lix_error)
         .expect("test raw commit-delta segment should encode")
 }

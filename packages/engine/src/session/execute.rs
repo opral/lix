@@ -4121,6 +4121,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn certified_parameter_batch_revalidates_after_staged_schema_amendment() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "amended_parameter_insert_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        let amended_schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "amended_parameter_insert_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" },
+                "source": { "type": "string", "default": "amended-plan" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        let mut transaction = session.begin_transaction().await.unwrap();
+        transaction
+            .execute(
+                "UPDATE lix_registered_schema SET value = $1 \
+                 WHERE lixcol_entity_pk = lix_json('[\"amended_parameter_insert_probe\"]')",
+                &[Value::Json(amended_schema)],
+            )
+            .await
+            .expect("compatible schema amendment should stage");
+
+        let sql = "INSERT INTO amended_parameter_insert_probe (id, value) VALUES ($1, $2)";
+        let statements = [
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("a".to_string()),
+                    Value::Text("first".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("b".to_string()),
+                    Value::Text("second".to_string()),
+                ],
+            },
+        ];
+        let parsed = TransactionBatchStatements::Shared {
+            statement: sql2::parse_statement(sql).unwrap(),
+            len: statements.len(),
+        };
+        let parameter_route = AtomicBool::new(false);
+        let staged = try_execute_transaction_parameter_batch(
+            transaction.transaction_mut().unwrap(),
+            &statements,
+            &parsed,
+            &ExecuteOptions::default(),
+            &vec![ExecuteStatementMetadata::default(); statements.len()],
+            &parameter_route,
+        )
+        .await
+        .expect("parameter batch should be revalidated");
+        assert!(
+            staged.is_some(),
+            "the SQL batch should still use its typed parameter route"
+        );
+        transaction
+            .commit()
+            .await
+            .expect("rows valid under the amended schema should commit");
+
+        let rows = session
+            .execute(
+                "SELECT id, source FROM amended_parameter_insert_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.rows()
+                .iter()
+                .all(|row| row.get::<String>("source").unwrap() == "amended-plan"),
+            "transaction normalization must apply the staged schema's default"
+        );
+    }
+
+    #[tokio::test]
     async fn certified_empty_batch_rechecks_concurrent_insert_at_commit_snapshot() {
         let storage = Memory::default();
         Engine::initialize(storage.clone())
