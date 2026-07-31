@@ -2517,7 +2517,7 @@ impl WasmComponentFactory for V3Factory {
             transitions: HashMap::new(),
             transition_permits: HashMap::new(),
             prospective_documents: ProspectiveDocuments::default(),
-            durable_checkpoints: HashMap::new(),
+            durable_checkpoint: DurableCheckpointCache::default(),
             retired: false,
             next_document: 1,
         }))
@@ -3494,7 +3494,7 @@ struct V3Actor {
     transitions: HashMap<u64, WasmTransitionCounters>,
     transition_permits: HashMap<u64, tokio::sync::OwnedSemaphorePermit>,
     prospective_documents: ProspectiveDocuments,
-    durable_checkpoints: HashMap<ArenaDigest, WasmDurableDocumentCheckpoint>,
+    durable_checkpoint: DurableCheckpointCache,
     retired: bool,
     next_document: u64,
 }
@@ -3508,6 +3508,22 @@ fn encode_durable_document_checkpoint(
     }
     let bytes = root.encode_successor_checkpoint().ok()?.into();
     WasmDurableDocumentCheckpoint::new(bytes).ok()
+}
+
+#[derive(Default)]
+struct DurableCheckpointCache(Option<(ArenaDigest, WasmDurableDocumentCheckpoint)>);
+
+impl DurableCheckpointCache {
+    fn get(&self, state_id: &ArenaDigest) -> Option<WasmDurableDocumentCheckpoint> {
+        self.0
+            .as_ref()
+            .filter(|(cached_state_id, _)| cached_state_id == state_id)
+            .map(|(_, checkpoint)| checkpoint.clone())
+    }
+
+    fn insert(&mut self, state_id: ArenaDigest, checkpoint: WasmDurableDocumentCheckpoint) {
+        self.0 = Some((state_id, checkpoint));
+    }
 }
 
 #[derive(Default)]
@@ -3615,16 +3631,15 @@ impl WasmComponentActor for V3Actor {
             .successor_checkpoint();
         let retained_bytes = u64::try_from(root.retained_heap_bytes()).unwrap_or(u64::MAX);
         let state_id = root.state.id();
-        let durable = if let Some(checkpoint) = self.durable_checkpoints.get(&state_id) {
-            Some(checkpoint.clone())
+        let durable = if let Some(checkpoint) = self.durable_checkpoint.get(&state_id) {
+            Some(checkpoint)
         } else {
             encode_durable_document_checkpoint(
                 &root,
                 WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES,
             )
             .inspect(|checkpoint| {
-                self.durable_checkpoints
-                    .insert(state_id, checkpoint.clone());
+                self.durable_checkpoint.insert(state_id, checkpoint.clone());
             })
         };
         Ok(Some(if let Some(durable) = durable {
@@ -3659,7 +3674,7 @@ impl WasmComponentActor for V3Actor {
             ArenaRoot::decode_successor_checkpoint(accepted, checkpoint).map_err(|error| {
                 v3_error(format!("failed to decode v3 document checkpoint: {error}"))
             })?;
-        self.durable_checkpoints.insert(
+        self.durable_checkpoint.insert(
             root.state.id(),
             WasmDurableDocumentCheckpoint::new(checkpoint.to_vec().into())?,
         );
@@ -4401,6 +4416,49 @@ mod tests {
 
         assert!(encode_durable_document_checkpoint(&root, encoded_len - 1).is_none());
         assert!(encode_durable_document_checkpoint(&root, encoded_len).is_some());
+    }
+
+    #[test]
+    fn durable_checkpoint_cache_retains_only_the_latest_state() {
+        let first = ArenaRoot::import(
+            ArenaStore::default(),
+            "checkpoint-test",
+            b"accepted",
+            std::iter::empty(),
+            [(b"index".to_vec(), b"first".to_vec())],
+        )
+        .successor_checkpoint();
+        let second = ArenaRoot::import(
+            ArenaStore::default(),
+            "checkpoint-test",
+            b"accepted",
+            std::iter::empty(),
+            [(b"index".to_vec(), b"second".to_vec())],
+        )
+        .successor_checkpoint();
+        let first_id = first.state.id();
+        let second_id = second.state.id();
+        let mut cache = DurableCheckpointCache::default();
+
+        cache.insert(
+            first_id,
+            encode_durable_document_checkpoint(
+                &first,
+                WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES,
+            )
+            .unwrap(),
+        );
+        cache.insert(
+            second_id,
+            encode_durable_document_checkpoint(
+                &second,
+                WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES,
+            )
+            .unwrap(),
+        );
+
+        assert!(cache.get(&first_id).is_none());
+        assert!(cache.get(&second_id).is_some());
     }
 
     fn push_text(output: &mut Vec<u8>, value: &str) {
