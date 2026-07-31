@@ -1,6 +1,6 @@
 # Verified-edit CAS delta results
 
-This change connects the format-neutral WASM edit stream to the binary CAS's
+The follow-up connects the format-neutral WASM edit stream to the binary CAS's
 bounded copy/insert representation. The interface contains no file-format,
 content-type, Git, or LFS policy. The format is a hard cut; existing databases
 are not migrated.
