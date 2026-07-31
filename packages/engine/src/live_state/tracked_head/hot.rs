@@ -6335,7 +6335,7 @@ async fn hot_working_diff_entries(
                 std::collections::btree_map::Entry::Occupied(mut entry)
                     if entry
                         .get()
-                        .is_some_and(|previous| previous.commit_id < version.commit_id) =>
+                        .is_none_or(|previous| previous.commit_id < version.commit_id) =>
                 {
                     entry.insert(Some(version));
                 }
@@ -6351,7 +6351,7 @@ async fn hot_working_diff_entries(
     let mut candidates = Vec::with_capacity(selected.len());
     for ((identity, after), base_after) in selected.into_iter().zip(after_values).zip(base_versions)
     {
-        let (before, after) = if let Some(after) = after {
+        let hot_after = if let Some(after) = after {
             let Ok(after) = decode_head_value(&after) else {
                 return Ok(None);
             };
@@ -6364,12 +6364,12 @@ async fn hot_working_diff_entries(
             let Some(after) = after.working_diff_version() else {
                 return Ok(None);
             };
-            (before, after)
+            Some((before, after))
         } else {
-            let Some(after) = base_after else {
-                return Ok(None);
-            };
-            (None, after)
+            None
+        };
+        let Some((before, after)) = choose_hot_or_packed_working_diff(hot_after, base_after) else {
+            return Ok(None);
         };
         let identity = identity.into_row_identity();
         candidates.push((
@@ -6383,6 +6383,18 @@ async fn hot_working_diff_entries(
         ));
     }
     Ok(Some(classify_hot_working_diff_entries(candidates)?))
+}
+
+fn choose_hot_or_packed_working_diff(
+    hot: Option<(Option<WorkingDiffVersion>, WorkingDiffVersion)>,
+    packed: Option<WorkingDiffVersion>,
+) -> Option<(Option<WorkingDiffVersion>, WorkingDiffVersion)> {
+    match (hot, packed) {
+        (Some(hot), Some(packed)) if hot.1.commit_id < packed.commit_id => Some((None, packed)),
+        (Some(hot), _) => Some(hot),
+        (None, Some(packed)) => Some((None, packed)),
+        (None, None) => None,
+    }
 }
 
 async fn hot_working_diff_entries_for_finite_filter(
@@ -8481,6 +8493,23 @@ mod tests {
                 hash: [0; JSON_REF_BYTES],
             },
         }
+    }
+
+    #[test]
+    fn packed_recreate_wins_over_older_hot_working_diff_tombstone() {
+        let mut hot = working_diff_version("hot-tombstone");
+        hot.commit_id = CommitId::new(uuid::Uuid::from_u128(1));
+        hot.deleted = true;
+        let mut packed = working_diff_version("packed-recreate");
+        packed.commit_id = CommitId::new(uuid::Uuid::from_u128(2));
+
+        let (before, after) =
+            choose_hot_or_packed_working_diff(Some((Some(hot), hot)), Some(packed))
+                .expect("one current version must win");
+
+        assert_eq!(before, None);
+        assert_eq!(after, packed);
+        assert!(!after.deleted);
     }
 
     fn single_hot_diff_segment(
