@@ -2340,6 +2340,28 @@ pub(crate) async fn load_owned_commit_delta_entries(
     requests: &[(CommitId, TrackedStateKey)],
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     let mut output = load_local_owned_commit_delta_entries(store, requests).await?;
+    let owner_commit_ids = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(request_index, (commit_id, _))| {
+            output[request_index].is_none().then_some(*commit_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let manifest_keys = owner_commit_ids
+        .iter()
+        .map(|commit_id| StorageKey(Bytes::from(commit_delta_manifest_key(*commit_id))))
+        .collect::<Vec<_>>();
+    let manifest_values =
+        PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, &manifest_keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?;
+    let mut owner_manifests = BTreeMap::new();
+    for (commit_id, value) in owner_commit_ids.into_iter().zip(manifest_values.value) {
+        let Some(bytes) = value.and_then(full_value_bytes) else {
+            continue;
+        };
+        owner_manifests.insert(commit_id, decode_commit_delta_manifest(&bytes)?);
+    }
     let mut source_requests = Vec::new();
     let mut source_outputs = Vec::new();
     let mut source_owner_commits = Vec::new();
@@ -2347,7 +2369,7 @@ pub(crate) async fn load_owned_commit_delta_entries(
         if output[request_index].is_some() {
             continue;
         }
-        let Some(manifest) = load_commit_delta_manifest(store, *commit_id).await? else {
+        let Some(manifest) = owner_manifests.get(commit_id) else {
             continue;
         };
         let Some(source_commit_id) = manifest.selected_source_commit_id() else {
@@ -2358,10 +2380,9 @@ pub(crate) async fn load_owned_commit_delta_entries(
         source_requests.push((source_commit_id, key.clone()));
     }
     let selected = load_local_owned_commit_delta_entries(store, &source_requests).await?;
-    for (((request_index, owner_commit_id), source_request), entry) in source_outputs
+    for ((request_index, owner_commit_id), entry) in source_outputs
         .into_iter()
         .zip(source_owner_commits)
-        .zip(source_requests)
         .zip(selected)
     {
         if let Some(mut entry) = entry {
@@ -2370,14 +2391,6 @@ pub(crate) async fn load_owned_commit_delta_entries(
             entry.certified_ref = false;
             entry.owner_commit_id = owner_commit_id;
             output[request_index] = Some(entry);
-        } else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "selected-source commit delta '{}' is missing borrowed identity {:?}",
-                    owner_commit_id, source_request.1
-                ),
-            ));
         }
     }
     Ok(output)
@@ -5403,6 +5416,19 @@ mod tests {
                 .flatten()
                 .all(|value| value.commit_id == alias_commit)
         );
+
+        let missing_key = TrackedStateKey {
+            schema_key: fixtures[0].schema_key.clone(),
+            file_id: fixtures[0].file_id.clone(),
+            entity_pk: EntityPk::single("missing-cascade-member"),
+        };
+        let missing_requests = (0..2_048)
+            .map(|_| (alias_commit, missing_key.clone()))
+            .collect::<Vec<_>>();
+        let missing = load_owned_commit_delta_entries(&read, &missing_requests)
+            .await
+            .expect("alias misses should remain available to cascade fallback");
+        assert!(missing.iter().all(Option::is_none));
 
         let members = load_commit_delta_members_with_payloads(&read, alias_commit)
             .await
