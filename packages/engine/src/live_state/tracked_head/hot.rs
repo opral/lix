@@ -3233,7 +3233,6 @@ where
             }));
         }
         let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
-        let engine_owned_only = keys.iter().all(|key| key.schema_key.starts_with("lix_"));
 
         // Certified immutable segments deliberately do not manufacture one
         // HOT_ROW entry per semantic row. Exact validation reads still need
@@ -3241,62 +3240,13 @@ where
         // proving that a keyed update or foreign-key target already exists.
         // Decode the matching segment rows only when the ordinary point-read
         // index misses, then preserve the original request alignment.
-        let certified_request = TrackedStateScanRequest {
-            filter: TrackedStateFilter {
-                schema_keys: keys.iter().map(|key| key.schema_key.to_owned()).collect(),
-                entity_pks: keys.iter().map(|key| key.entity_pk.clone()).collect(),
-                file_ids: keys
-                    .iter()
-                    .map(|key| {
-                        key.file_id.map_or(NullableKeyFilter::Null, |file_id| {
-                            NullableKeyFilter::Value(file_id.to_owned())
-                        })
-                    })
-                    .collect(),
-                include_tombstones: true,
-            },
-            read_columns: TrackedStateReadColumns {
-                columns: [
-                    projection.snapshot_content.then_some("snapshot_content"),
-                    projection.metadata.then_some("metadata"),
-                ]
-                .into_iter()
-                .flatten()
-                .map(str::to_owned)
-                .collect(),
-            },
-            limit: None,
-        };
         let packed =
             load_packed_current_base_exact(&self.store, branch_id, generation, keys, *projection)
                 .await?;
-        let certified = if engine_owned_only {
-            MaterializedLiveStateBatch::default()
-        } else {
-            scan_certified_entity_batch_rows(
-                &self.store,
-                branch_id,
-                generation,
-                &certified_request,
-                None,
-            )
-            .await?
-        };
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
-        let mut combined_slots = Vec::with_capacity(keys.len());
-        for (index, (key, slot)) in keys.iter().zip(slots).enumerate() {
+        let mut resolved = Vec::with_capacity(keys.len());
+        for (index, slot) in slots.into_iter().enumerate() {
             let mut row = slot.and_then(|slot| rows.get(slot as usize));
-            for candidate in [
-                packed.row(index),
-                certified.iter().find(|candidate| {
-                    candidate.schema_key() == key.schema_key
-                        && candidate.entity_pk() == key.entity_pk
-                        && candidate.file_id() == key.file_id
-                }),
-            ]
-            .into_iter()
-            .flatten()
-            {
+            if let Some(candidate) = packed.row(index) {
                 if row.is_none_or(
                     |current| match (current.commit_id(), candidate.commit_id()) {
                         (Some(current), Some(candidate)) => candidate > current,
@@ -3308,6 +3258,72 @@ where
                     row = Some(candidate);
                 }
             }
+            resolved.push(row.filter(|row| {
+                replaced_generation.is_none_or(|control| {
+                    row.commit_id()
+                        .is_some_and(|commit_id| commit_id > control.active_generation)
+                })
+            }));
+        }
+        let unresolved = keys
+            .iter()
+            .copied()
+            .zip(&resolved)
+            .filter_map(|(key, row)| {
+                (row.is_none() && !key.schema_key.starts_with("lix_")).then_some(key)
+            })
+            .collect::<Vec<_>>();
+        let certified = if unresolved.is_empty() {
+            MaterializedLiveStateBatch::default()
+        } else {
+            let certified_request = TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: unresolved
+                        .iter()
+                        .map(|key| key.schema_key.to_owned())
+                        .collect(),
+                    entity_pks: unresolved.iter().map(|key| key.entity_pk.clone()).collect(),
+                    file_ids: unresolved
+                        .iter()
+                        .map(|key| {
+                            key.file_id.map_or(NullableKeyFilter::Null, |file_id| {
+                                NullableKeyFilter::Value(file_id.to_owned())
+                            })
+                        })
+                        .collect(),
+                    include_tombstones: true,
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: [
+                        projection.snapshot_content.then_some("snapshot_content"),
+                        projection.metadata.then_some("metadata"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_owned)
+                    .collect(),
+                },
+                limit: None,
+            };
+            scan_certified_entity_batch_rows(
+                &self.store,
+                branch_id,
+                generation,
+                &certified_request,
+                None,
+            )
+            .await?
+        };
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
+        let mut combined_slots = Vec::with_capacity(keys.len());
+        for (key, row) in keys.iter().zip(resolved) {
+            let row = row.or_else(|| {
+                certified.iter().find(|candidate| {
+                    candidate.schema_key() == key.schema_key
+                        && candidate.entity_pk() == key.entity_pk
+                        && candidate.file_id() == key.file_id
+                })
+            });
             let row = row.filter(|row| {
                 replaced_generation.is_none_or(|control| {
                     row.commit_id()
@@ -8410,6 +8426,89 @@ mod tests {
         .await
         .expect("exact-file scan must not decode unrelated certified content");
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_hot_hit_skips_matching_certified_fallback() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000cf";
+        const COMMIT_LABEL: &str = "exact-hot-skips-certified";
+        const FILE_ID: &str = "requested.md";
+        const SCHEMA_KEY: &str = "plugin_row";
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label(COMMIT_LABEL);
+        let entity_pk = EntityPk::single("hot-row");
+        crate::test_support::seed_branch_head_with_rows(
+            storage.clone(),
+            BRANCH_ID,
+            COMMIT_LABEL,
+            &[MaterializedTrackedStateRow {
+                entity_pk: entity_pk.clone(),
+                schema_key: SCHEMA_KEY.to_owned(),
+                file_id: Some(FILE_ID.to_owned()),
+                snapshot_content: Some(r#"{"id":"hot-row"}"#.into()),
+                metadata: None,
+                deleted: false,
+                created_at: timestamp().to_string(),
+                updated_at: timestamp().to_string(),
+                change_id: ChangeId::for_test_label("exact-hot-change"),
+                commit_id: generation,
+            }],
+        )
+        .await;
+
+        let malformed_content_key = StorageKey(Bytes::from_static(b"matching-malformed-content"));
+        let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
+        append_batch_text(&mut manifest_key, FILE_ID).unwrap();
+        manifest_key
+            .extend_from_slice(&crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
+        manifest_key.extend_from_slice(
+            CommitId::for_test_label("matching-certified-commit")
+                .as_uuid()
+                .as_bytes(),
+        );
+        let mut writes = storage.new_write_set();
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+            StorageKey(Bytes::from(manifest_key)),
+            StorageValue {
+                bytes: malformed_content_key.0.clone(),
+            },
+        );
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_SPACE,
+            malformed_content_key,
+            StorageValue {
+                bytes: Bytes::from_static(b"malformed"),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("publish matching malformed certified fixture");
+
+        let reader = HotStateStoreReader {
+            store: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("open exact HOT read"),
+        };
+        let result = reader
+            .load_projected_live_batch_for_generation_refs(
+                BRANCH_ID,
+                generation,
+                &[TrackedStateKeyRef {
+                    schema_key: SCHEMA_KEY,
+                    file_id: Some(FILE_ID),
+                    entity_pk: &entity_pk,
+                }],
+                &ChangeRecordProjection::full(),
+            )
+            .await
+            .expect("authoritative HOT hit must not decode certified fallback");
+        let row = result.row(0).expect("HOT row remains visible");
+        assert_eq!(row.schema_key(), SCHEMA_KEY);
+        assert_eq!(row.file_id(), Some(FILE_ID));
+        assert_eq!(row.entity_pk(), &entity_pk);
     }
 
     #[tokio::test]
