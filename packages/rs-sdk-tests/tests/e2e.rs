@@ -1011,6 +1011,19 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
             .unwrap(),
         3
     );
+    let after_reopen = b"# Heading\n\nParagraph with **bold** text and a TAIL.\n".to_vec();
+    reopened.reset_plugin_transition_counters();
+    write_file(&reopened, path, after_reopen.clone())
+        .await
+        .unwrap();
+    let counters = reopened.plugin_transition_counters();
+    assert_eq!(counters.full_state_semantic_rows_materialized, 0);
+    assert_eq!(counters.private_document_cache_hits, 1);
+    assert_eq!(counters.full_document_reparses, 0);
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(after_reopen)
+    );
     reopened.close().await.unwrap();
 }
 
@@ -4550,7 +4563,9 @@ async fn v3_json_reopen_uses_one_export_for_cold_successor() {
     write_file(&reopened, PATH, after.clone()).await.unwrap();
     let counters = reopened.plugin_transition_counters();
     assert_eq!(counters.guest_export_calls, 1);
-    assert_eq!(counters.full_document_reparses, 1);
+    assert_eq!(counters.full_document_reparses, 0);
+    assert_eq!(counters.full_state_semantic_rows_materialized, 0);
+    assert_eq!(counters.private_document_cache_hits, 1);
     assert_eq!(read_file(&reopened, PATH).await.unwrap(), Some(after));
     let rows = reopened
         .execute(
@@ -5061,6 +5076,23 @@ async fn v3_json_cold_hydration_after_actor_eviction_preserves_sparse_successor(
             .durable_semantic_changes,
         1
     );
+    assert_eq!(
+        reopened
+            .plugin_transition_counters()
+            .full_state_semantic_rows_materialized,
+        0,
+        "durable JSON checkpoint restore must skip semantic-row hydration",
+    );
+    assert_eq!(
+        reopened
+            .plugin_transition_counters()
+            .private_document_cache_hits,
+        1,
+    );
+    assert_eq!(
+        reopened.plugin_transition_counters().full_document_reparses,
+        0,
+    );
     reopened.close().await.unwrap();
 }
 
@@ -5134,22 +5166,22 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
         1,
         "cold CSV reconciliation must not hydrate and re-enter the guest"
     );
-    assert!(
+    assert_eq!(
         reopened
             .plugin_transition_counters()
-            .full_state_semantic_rows_materialized
-            > 0,
-        "process restart must fall back to durable entity hydration"
+            .full_state_semantic_rows_materialized,
+        0,
+        "a durable checkpoint must avoid semantic-row hydration after process restart"
     );
     assert_eq!(
         reopened
             .plugin_transition_counters()
             .private_document_cache_hits,
-        0
+        1
     );
     assert_eq!(
         reopened.plugin_transition_counters().full_document_reparses,
-        1
+        0
     );
     assert_eq!(
         reopened
@@ -5653,10 +5685,12 @@ fn report_cold_materialized_open(
             counters.guest_export_calls, 1,
             "{label} cold successor must not hydrate and re-enter the guest"
         );
-        assert!(
-            counters.full_state_semantic_rows_materialized > 0,
-            "{label} cold successor must consume durable identities"
+        assert_eq!(
+            counters.full_state_semantic_rows_materialized, 0,
+            "{label} durable checkpoint must avoid semantic-row hydration"
         );
+        assert_eq!(counters.private_document_cache_hits, 1);
+        assert_eq!(counters.full_document_reparses, 0);
         assert!(
             counters.component_boundary_bytes > 0,
             "{label} cold successor must account for its bounded entity pages"
@@ -6036,6 +6070,9 @@ async fn v3_excalidraw_cold_successor_after_reopen_rebuilds_span_state() {
         counters.guest_export_calls, 1,
         "cold Excalidraw reconciliation must not hydrate and re-enter the guest"
     );
+    assert_eq!(counters.full_state_semantic_rows_materialized, 0);
+    assert_eq!(counters.private_document_cache_hits, 1);
+    assert_eq!(counters.full_document_reparses, 0);
     assert_eq!(counters.durable_semantic_changes, 1);
     assert_eq!(read_file(&reopened, path).await.unwrap(), Some(cold));
 
@@ -6743,8 +6780,8 @@ async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_co
         .expect("the next write restores root-new authority and applies the sparse edit");
     let counters = lix_a.plugin_transition_counters();
     assert_eq!(
-        counters.full_state_semantic_rows_materialized, 3,
-        "cold reconstruction materializes the table entity and both row entities"
+        counters.full_state_semantic_rows_materialized, 0,
+        "the durable checkpoint avoids materializing the table and row entities"
     );
     assert_eq!(counters.full_renderer_invocations, 0);
     assert_eq!(read_file(&lix_a, path).await.unwrap(), Some(final_bytes));
@@ -6915,9 +6952,17 @@ async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions(
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(bytes.clone()));
     let fresh = lix.open_workspace_session().await.unwrap();
     assert_eq!(read_file(&fresh, path).await.unwrap(), Some(bytes));
+    fresh.reset_plugin_transition_counters();
     write_file(&fresh, path, b"first,ONE\nsecond,two\n".to_vec())
         .await
         .expect("the retained authoritative generation should remain writable");
+    let counters = fresh.plugin_transition_counters();
+    assert!(
+        counters.full_state_semantic_rows_materialized > 0,
+        "a predecessor-generation checkpoint must fall back to durable entity hydration"
+    );
+    assert_eq!(counters.private_document_cache_hits, 0);
+    assert_eq!(counters.full_document_reparses, 1);
 
     stale.close().await.unwrap();
     fresh.close().await.unwrap();

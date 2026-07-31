@@ -4035,6 +4035,7 @@ fn stage_lix_file_data_blob_ref_write(
             .blob_hash()
             .expect("non-empty payload should have blob hash"),
         size_bytes: file_data.len(),
+        plugin_checkpoint_hashes: None,
         context: FilesystemRowContext {
             file_id: None,
             metadata: None,

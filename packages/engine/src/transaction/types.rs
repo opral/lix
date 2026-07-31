@@ -1423,6 +1423,8 @@ pub(crate) struct TransactionFileData {
     /// Plugin installation uses this for the extracted WASM component so
     /// steady-state reads can load it directly without reopening the archive.
     auxiliary_payloads: Vec<BlobPayload>,
+    plugin_state_checkpoint_hash: Option<BlobHash>,
+    plugin_authority_checkpoint_hash: Option<BlobHash>,
     /// Reconciliation may retain this record only as the owner of certified
     /// semantic batches after its file payload has already been materialized
     /// through the ordinary plugin path.
@@ -1455,6 +1457,8 @@ impl TransactionFileData {
             mutation_identity: None,
             payload: BlobPayload::from_bytes(data),
             auxiliary_payloads: Vec::new(),
+            plugin_state_checkpoint_hash: None,
+            plugin_authority_checkpoint_hash: None,
             stage_payload_at_commit: true,
             certified_entity_batches: Vec::new(),
         }
@@ -1492,6 +1496,26 @@ impl TransactionFileData {
 
     pub(crate) fn add_auxiliary_payload(&mut self, data: impl Into<crate::Blob>) {
         self.auxiliary_payloads.push(BlobPayload::from_bytes(data));
+    }
+
+    pub(crate) fn set_plugin_checkpoint(
+        &mut self,
+        state: impl Into<crate::Blob>,
+        state_hash: BlobHash,
+        authority: impl Into<crate::Blob>,
+        authority_hash: BlobHash,
+    ) {
+        let state = BlobPayload::from_hashed_bytes(state, state_hash);
+        let authority = BlobPayload::from_hashed_bytes(authority, authority_hash);
+        self.plugin_state_checkpoint_hash = Some(state_hash);
+        self.plugin_authority_checkpoint_hash = Some(authority_hash);
+        self.auxiliary_payloads.push(state);
+        self.auxiliary_payloads.push(authority);
+    }
+
+    pub(crate) fn plugin_checkpoint_hashes(&self) -> Option<(BlobHash, BlobHash)> {
+        self.plugin_state_checkpoint_hash
+            .zip(self.plugin_authority_checkpoint_hash)
     }
 
     pub(crate) fn set_certified_entity_batches(&mut self, batches: Vec<WasmCertifiedEntityBatch>) {

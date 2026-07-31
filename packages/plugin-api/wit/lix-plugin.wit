@@ -174,6 +174,10 @@ interface api {
   record update-request {
     before-descriptor: file-descriptor,
     after-descriptor: file-descriptor,
+    /// Accepted predecessor bytes plus opaque plugin state. Byte updates do
+    /// not expose semantic entities through this snapshot; entities are
+    /// transition outputs and host authority. This contract is identical for
+    /// warm execution and durable cold restoration.
     before: own<snapshot>,
     edits: list<input-splice>,
     creates: create-context,

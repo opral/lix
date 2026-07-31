@@ -13,7 +13,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use lix_engine::wasm::WasmLimits;
 use lix_engine::wasm::v3::{
-    ByteEdit as ArenaByteEdit, Root as ArenaRoot, Store as ArenaStore,
+    ByteEdit as ArenaByteEdit, Digest as ArenaDigest, Root as ArenaRoot, Store as ArenaStore,
     Transaction as ArenaTransaction,
 };
 use lix_engine::wasm::{
@@ -21,12 +21,12 @@ use lix_engine::wasm::{
     WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage, WasmColdFileUpdate,
     WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictResolutionPage,
     WasmConflictTake, WasmConflictTransition, WasmConflictUpdate, WasmCreateContext,
-    WasmDocumentCheckpoint, WasmDocumentHandle, WasmEditCursorHandle, WasmEditPage, WasmEntity,
-    WasmEntityChange, WasmEntityChanges, WasmEntityKey, WasmEntityTransition, WasmEntityUpdate,
-    WasmFileTransition, WasmFileUpdate, WasmGuestBytes, WasmGuestEntityChanges, WasmHostBytes,
-    WasmHostEntityConflict, WasmInputBytes, WasmOpenEntitiesInput, WasmOpenFileInput,
-    WasmOutputRange, WasmOutputSplice, WasmResolutionCursorHandle, WasmTransitionCounters,
-    WasmTransitionHandle, WasmTransitionLimits,
+    WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
+    WasmEditCursorHandle, WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChanges,
+    WasmEntityKey, WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
+    WasmGuestBytes, WasmGuestEntityChanges, WasmHostBytes, WasmHostEntityConflict, WasmInputBytes,
+    WasmOpenEntitiesInput, WasmOpenFileInput, WasmOutputRange, WasmOutputSplice,
+    WasmResolutionCursorHandle, WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
 };
 use lix_engine::{LixError, SharedStr};
 use wasmtime::Store;
@@ -2517,6 +2517,7 @@ impl WasmComponentFactory for V3Factory {
             transitions: HashMap::new(),
             transition_permits: HashMap::new(),
             prospective_documents: ProspectiveDocuments::default(),
+            durable_checkpoint: DurableCheckpointCache::default(),
             retired: false,
             next_document: 1,
         }))
@@ -2703,7 +2704,10 @@ impl V3Worker {
             .data_mut()
             .table
             .push(SnapshotResource {
-                root: root.clone(),
+                // Byte-successor parsing is defined over accepted bytes plus
+                // opaque plugin state. Semantic entities are outputs and host
+                // authority, not an additional warm-only input dependency.
+                root: root.successor_checkpoint(),
                 state: state.clone(),
             })
             .map_err(|error| v3_error(format!("failed to register v3 before root: {error}")))?;
@@ -3490,8 +3494,36 @@ struct V3Actor {
     transitions: HashMap<u64, WasmTransitionCounters>,
     transition_permits: HashMap<u64, tokio::sync::OwnedSemaphorePermit>,
     prospective_documents: ProspectiveDocuments,
+    durable_checkpoint: DurableCheckpointCache,
     retired: bool,
     next_document: u64,
+}
+
+fn encode_durable_document_checkpoint(
+    root: &ArenaRoot,
+    max_decoded_bytes: usize,
+) -> Option<WasmDurableDocumentCheckpoint> {
+    if root.successor_checkpoint_encoded_len().ok()? > max_decoded_bytes {
+        return None;
+    }
+    let bytes = root.encode_successor_checkpoint().ok()?.into();
+    WasmDurableDocumentCheckpoint::new(bytes).ok()
+}
+
+#[derive(Default)]
+struct DurableCheckpointCache(Option<(ArenaDigest, WasmDurableDocumentCheckpoint)>);
+
+impl DurableCheckpointCache {
+    fn get(&self, state_id: &ArenaDigest) -> Option<WasmDurableDocumentCheckpoint> {
+        self.0
+            .as_ref()
+            .filter(|(cached_state_id, _)| cached_state_id == state_id)
+            .map(|(_, checkpoint)| checkpoint.clone())
+    }
+
+    fn insert(&mut self, state_id: ArenaDigest, checkpoint: WasmDurableDocumentCheckpoint) {
+        self.0 = Some((state_id, checkpoint));
+    }
 }
 
 #[derive(Default)]
@@ -3596,9 +3628,25 @@ impl WasmComponentActor for V3Actor {
             .get(&document.0)
             .ok_or_else(|| v3_error("unknown v3 document handle"))?
             .root
-            .clone();
+            .successor_checkpoint();
         let retained_bytes = u64::try_from(root.retained_heap_bytes()).unwrap_or(u64::MAX);
-        Ok(Some(WasmDocumentCheckpoint::new(root, retained_bytes)))
+        let state_id = root.state.id();
+        let durable = if let Some(checkpoint) = self.durable_checkpoint.get(&state_id) {
+            Some(checkpoint)
+        } else {
+            encode_durable_document_checkpoint(
+                &root,
+                WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES,
+            )
+            .inspect(|checkpoint| {
+                self.durable_checkpoint.insert(state_id, checkpoint.clone());
+            })
+        };
+        Ok(Some(if let Some(durable) = durable {
+            WasmDocumentCheckpoint::new_with_durable(root, retained_bytes, durable)
+        } else {
+            WasmDocumentCheckpoint::new(root, retained_bytes)
+        }))
     }
 
     async fn restore_document(
@@ -3610,6 +3658,26 @@ impl WasmComponentActor for V3Actor {
             .downcast_ref::<ArenaRoot>()
             .ok_or_else(|| v3_error("v3 document checkpoint belongs to another runtime"))?
             .clone();
+        let document = self.allocate_document()?;
+        self.worker.documents.insert(document, V3Document { root });
+        self.worker.next_document = self.worker.next_document.max(document.saturating_add(1));
+        Ok(WasmDocumentHandle(document))
+    }
+
+    async fn restore_durable_document(
+        &mut self,
+        checkpoint: &[u8],
+        accepted: &[u8],
+    ) -> Result<WasmDocumentHandle, LixError> {
+        self.ensure_active()?;
+        let root =
+            ArenaRoot::decode_successor_checkpoint(accepted, checkpoint).map_err(|error| {
+                v3_error(format!("failed to decode v3 document checkpoint: {error}"))
+            })?;
+        self.durable_checkpoint.insert(
+            root.state.id(),
+            WasmDurableDocumentCheckpoint::new(checkpoint.to_vec().into())?,
+        );
         let document = self.allocate_document()?;
         self.worker.documents.insert(document, V3Document { root });
         self.worker.next_document = self.worker.next_document.max(document.saturating_add(1));
@@ -4333,6 +4401,65 @@ fn v3_transition_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_durable_checkpoint_is_omitted_without_rejecting_the_root() {
+        let root = ArenaRoot::import(
+            ArenaStore::default(),
+            "checkpoint-test",
+            b"accepted",
+            std::iter::empty(),
+            [(b"index".to_vec(), b"opaque-state".to_vec())],
+        )
+        .successor_checkpoint();
+        let encoded_len = root.successor_checkpoint_encoded_len().unwrap();
+
+        assert!(encode_durable_document_checkpoint(&root, encoded_len - 1).is_none());
+        assert!(encode_durable_document_checkpoint(&root, encoded_len).is_some());
+    }
+
+    #[test]
+    fn durable_checkpoint_cache_retains_only_the_latest_state() {
+        let first = ArenaRoot::import(
+            ArenaStore::default(),
+            "checkpoint-test",
+            b"accepted",
+            std::iter::empty(),
+            [(b"index".to_vec(), b"first".to_vec())],
+        )
+        .successor_checkpoint();
+        let second = ArenaRoot::import(
+            ArenaStore::default(),
+            "checkpoint-test",
+            b"accepted",
+            std::iter::empty(),
+            [(b"index".to_vec(), b"second".to_vec())],
+        )
+        .successor_checkpoint();
+        let first_id = first.state.id();
+        let second_id = second.state.id();
+        let mut cache = DurableCheckpointCache::default();
+
+        cache.insert(
+            first_id,
+            encode_durable_document_checkpoint(
+                &first,
+                WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES,
+            )
+            .unwrap(),
+        );
+        cache.insert(
+            second_id,
+            encode_durable_document_checkpoint(
+                &second,
+                WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES,
+            )
+            .unwrap(),
+        );
+
+        assert!(cache.get(&first_id).is_none());
+        assert!(cache.get(&second_id).is_some());
+    }
 
     fn push_text(output: &mut Vec<u8>, value: &str) {
         output.extend_from_slice(&(value.len() as u32).to_le_bytes());

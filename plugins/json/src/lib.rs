@@ -208,7 +208,13 @@ impl sdk::FormatPlugin for JsonPlugin {
             && let [edit] = update.edits.as_slice()
             && let Some((change, shifts)) = sparse_scalar_change(update, edit, &inserts[0])?
         {
-            update.successor.put_state(SCALAR_SHIFTS_STATE, &shifts)?;
+            if shifts.is_empty() {
+                if update.before.state_len(SCALAR_SHIFTS_STATE)?.is_some() {
+                    update.successor.delete_state(SCALAR_SHIFTS_STATE)?;
+                }
+            } else {
+                update.successor.put_state(SCALAR_SHIFTS_STATE, &shifts)?;
+            }
             emit_changes([Ok(change)], update.creates, sink)?;
             return Ok(());
         }
