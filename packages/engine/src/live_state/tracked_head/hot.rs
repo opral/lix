@@ -1987,7 +1987,7 @@ fn stage_incremental_collection_controls(
     branch_id: &str,
     branch_generation: CommitId,
     deltas: &[&CurrentStateDeltaRef<'_>],
-    previous_values: &[Option<Bytes>],
+    previous_values: &[Option<CertifiedCurrentStatePredecessor>],
     mut controls: BTreeMap<(String, Option<String>), HotCollectionControl>,
     certified_live_increments: &BTreeMap<(String, Option<String>), u64>,
 ) -> Result<(), LixError> {
@@ -2003,8 +2003,8 @@ fn stage_incremental_collection_controls(
         }
 
         let previous_live = previous
-            .as_deref()
-            .map(decode_head_value)
+            .as_ref()
+            .map(CertifiedCurrentStatePredecessor::view)
             .transpose()?
             .is_some_and(|value| {
                 !value.deleted
@@ -2663,6 +2663,7 @@ async fn load_packed_current_base_exact(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     generation: CommitId,
+    active_checkpoint_commit_id: Option<CommitId>,
     keys: &[TrackedStateKeyRef<'_>],
     projection: ChangeRecordProjection,
 ) -> Result<MaterializedLiveStateExactBatch, LixError> {
@@ -2690,6 +2691,14 @@ async fn load_packed_current_base_exact(
             continue;
         }
         let row_index = rows.len();
+        let durable_predecessor = CertifiedCurrentStatePredecessor::Packed(PackedHeadValue {
+            change_id: value.change_id,
+            commit_id: value.commit_id,
+            deleted: false,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            checkpoint_commit_id: active_checkpoint_commit_id,
+        });
         let snapshot = materialize_packed_slot(
             projection.snapshot_content,
             change_record.snapshot,
@@ -2724,6 +2733,7 @@ async fn load_packed_current_base_exact(
             false,
             branch_id,
         );
+        rows.set_durable_predecessor(row_index, durable_predecessor);
     }
     if !json_refs.is_empty() {
         let mut json_values = JsonStoreContext::new()
@@ -2835,6 +2845,7 @@ async fn load_packed_current_base_exact_entries(
     Ok(winners)
 }
 
+#[cfg(test)]
 fn compare_materialized_live_identities(
     left: &MaterializedLiveStateRow,
     right: &MaterializedLiveStateRow,
@@ -2845,6 +2856,7 @@ fn compare_materialized_live_identities(
         .then_with(|| left.file_id.cmp(&right.file_id))
 }
 
+#[cfg(test)]
 fn merge_ordered_live_rows(
     left: Vec<MaterializedLiveStateRow>,
     right: Vec<MaterializedLiveStateRow>,
@@ -2874,6 +2886,60 @@ fn merge_ordered_live_rows(
     merged.extend(left);
     merged.extend(right);
     merged
+}
+
+fn compare_materialized_live_identity_refs(
+    left: MaterializedLiveStateRowRef<'_>,
+    right: MaterializedLiveStateRowRef<'_>,
+) -> Ordering {
+    left.schema_key()
+        .cmp(right.schema_key())
+        .then_with(|| left.entity_pk().cmp(right.entity_pk()))
+        .then_with(|| left.file_id().cmp(&right.file_id()))
+}
+
+/// Merge two identity-ordered materialized batches without expanding their
+/// dictionary and payload columns into row-owned DTOs.
+fn merge_ordered_live_batches(
+    left: &MaterializedLiveStateBatch,
+    right: &MaterializedLiveStateBatch,
+) -> MaterializedLiveStateBatch {
+    let mut merged =
+        MaterializedLiveStateBatchBuilder::with_capacity(left.len().saturating_add(right.len()));
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+    while left_index < left.len() && right_index < right.len() {
+        let left_row = left.row(left_index);
+        let right_row = right.row(right_index);
+        match compare_materialized_live_identity_refs(left_row, right_row) {
+            Ordering::Less => {
+                merged.push_ref(left_row, None);
+                left_index += 1;
+            }
+            Ordering::Greater => {
+                merged.push_ref(right_row, None);
+                right_index += 1;
+            }
+            Ordering::Equal => {
+                if left_row.commit_id() < right_row.commit_id() {
+                    merged.push_ref(right_row, None);
+                } else {
+                    merged.push_ref(left_row, None);
+                }
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+    while left_index < left.len() {
+        merged.push_ref(left.row(left_index), None);
+        left_index += 1;
+    }
+    while right_index < right.len() {
+        merged.push_ref(right.row(right_index), None);
+        right_index += 1;
+    }
+    merged.finish()
 }
 
 /// Direct reader for one published hot generation.
@@ -3131,6 +3197,7 @@ where
                 &self.store,
                 branch_id,
                 generation,
+                active_checkpoint_commit_id,
                 &key_refs,
                 projection,
             )
@@ -3256,9 +3323,8 @@ where
                 None,
             )
         };
-        let combined = merge_ordered_live_rows(rows.into_rows(), packed_rows.into_rows());
-        let combined = merge_ordered_live_rows(combined, certified_rows.into_rows());
-        let rows = MaterializedLiveStateBatch::from_rows(combined);
+        let combined = merge_ordered_live_batches(&rows, &packed_rows);
+        let rows = merge_ordered_live_batches(&combined, &certified_rows);
         if request.filter.include_tombstones
             && request.limit.is_none()
             && replaced_generation.is_none()
@@ -3425,9 +3491,15 @@ where
         // proving that a keyed update or foreign-key target already exists.
         // Decode the matching segment rows only when the ordinary point-read
         // index misses, then preserve the original request alignment.
-        let packed =
-            load_packed_current_base_exact(&self.store, branch_id, generation, keys, *projection)
-                .await?;
+        let packed = load_packed_current_base_exact(
+            &self.store,
+            branch_id,
+            generation,
+            active_checkpoint_commit_id,
+            keys,
+            *projection,
+        )
+        .await?;
         let mut resolved = Vec::with_capacity(keys.len());
         for (index, slot) in slots.into_iter().enumerate() {
             let mut row = slot.and_then(|slot| rows.get(slot as usize));
@@ -3996,6 +4068,41 @@ where
             parent_generation,
             new_head,
             deltas,
+            &[],
+            absence_guards,
+            parent_rows,
+            preserved_untracked_rows,
+            working_diff_capture_checkpoint_commit_id,
+            coverage,
+            false,
+            None,
+            None,
+            false,
+            &BTreeMap::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_current_state_with_certified_predecessors(
+        &mut self,
+        branch_id: &str,
+        parent_generation: Option<CommitId>,
+        new_head: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        durable_predecessors: &[CertifiedCurrentStatePredecessorRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
+        parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
+        preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<CommitId, LixError> {
+        self.stage_current_state_with_working_diff_inner(
+            branch_id,
+            parent_generation,
+            new_head,
+            deltas,
+            durable_predecessors,
             absence_guards,
             parent_rows,
             preserved_untracked_rows,
@@ -4027,6 +4134,7 @@ where
             parent_generation,
             new_head,
             deltas,
+            &[],
             absence_guards,
             None,
             None,
@@ -4063,6 +4171,7 @@ where
                 Some(generation),
                 new_head,
                 deltas,
+                &[],
                 absence_guards,
                 None,
                 None,
@@ -4114,6 +4223,7 @@ where
                     parent_generation,
                     new_head,
                     deltas,
+                    &[],
                     &owned_guards,
                     parent_rows,
                     preserved_untracked_rows,
@@ -4133,6 +4243,7 @@ where
             parent_generation,
             new_head,
             deltas,
+            &[],
             &no_owned_guards,
             parent_rows,
             preserved_untracked_rows,
@@ -4154,6 +4265,7 @@ where
         parent_generation: Option<CommitId>,
         new_head: CommitId,
         deltas: &[CurrentStateDeltaRef<'_>],
+        durable_predecessors: &[CertifiedCurrentStatePredecessorRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
         preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
@@ -4200,7 +4312,46 @@ where
             sorted
         };
 
+        let durable_previous_values = {
+            let mut predecessor_index = 0usize;
+            let mut aligned = Vec::with_capacity(sorted.len());
+            for delta in &sorted {
+                let predecessor = durable_predecessors.get(predecessor_index);
+                match predecessor
+                    .map(|predecessor| compare_certified_predecessor_to_delta(predecessor, delta))
+                {
+                    Some(Ordering::Less) => {
+                        return Err(head_value_error(
+                            "certified predecessor does not belong to a staged delta",
+                        ));
+                    }
+                    Some(Ordering::Equal) => {
+                        let value = durable_predecessors[predecessor_index].value.view()?;
+                        if value.untracked || value.deleted {
+                            return Err(head_value_error(
+                                "certified predecessor must be a live tracked row",
+                            ));
+                        }
+                        aligned.push(Some(durable_predecessors[predecessor_index].value.clone()));
+                        predecessor_index += 1;
+                    }
+                    Some(Ordering::Greater) | None => aligned.push(None),
+                }
+            }
+            if predecessor_index != durable_predecessors.len() {
+                return Err(head_value_error(
+                    "certified predecessor does not belong to a staged delta",
+                ));
+            }
+            aligned
+        };
+
         if parent_generation.is_none() {
+            if !durable_predecessors.is_empty() {
+                return Err(head_value_error(
+                    "bootstrap publication cannot carry durable predecessors",
+                ));
+            }
             stage_hot_bootstrap(
                 self.writes,
                 branch_id,
@@ -4230,6 +4381,7 @@ where
             self.store,
             &identities,
             &sorted,
+            &durable_previous_values,
             absence_guards_validated,
             validated_absent_file_id,
         )
@@ -4241,13 +4393,16 @@ where
         let mut loaded_previous_values = loaded_previous_values.into_iter();
         let mut previous_values = sorted
             .iter()
-            .map(|delta| {
+            .zip(durable_previous_values.iter())
+            .map(|(delta, durable_predecessor)| {
                 if hot_delta_is_guarded_by_absent_file(
                     delta,
                     absence_guards_validated,
                     validated_absent_file_id,
                 ) {
                     None
+                } else if let Some(durable_predecessor) = durable_predecessor {
+                    Some(durable_predecessor.clone())
                 } else {
                     loaded_previous_values
                         .next()
@@ -4257,27 +4412,39 @@ where
             .collect::<Vec<_>>();
         let mut previous_from_packed = vec![false; previous_values.len()];
         debug_assert_eq!(loaded_previous_values.len(), 0);
-        let previous_keys = sorted
+        let packed_previous_indices = durable_previous_values
             .iter()
-            .map(|delta| TrackedStateKeyRef {
-                schema_key: delta.schema_key,
-                entity_pk: delta.entity_pk,
-                file_id: delta.file_id,
+            .enumerate()
+            .filter_map(|(index, predecessor)| predecessor.is_none().then_some(index))
+            .collect::<Vec<_>>();
+        let packed_previous_keys = packed_previous_indices
+            .iter()
+            .map(|&index| {
+                let delta = sorted[index];
+                TrackedStateKeyRef {
+                    schema_key: delta.schema_key,
+                    entity_pk: delta.entity_pk,
+                    file_id: delta.file_id,
+                }
             })
             .collect::<Vec<_>>();
         let packed_previous = Box::pin(load_packed_current_base_exact_entries(
             self.store,
             branch_id,
             generation,
-            &previous_keys,
+            &packed_previous_keys,
         ))
         .await?;
-        for (index, previous) in previous_values.iter_mut().enumerate() {
-            let Some((packed_value, packed_change)) = &packed_previous[index] else {
+        for (index, packed_previous) in packed_previous_indices.into_iter().zip(packed_previous) {
+            let previous = &mut previous_values[index];
+            let Some((packed_value, _)) = &packed_previous else {
                 continue;
             };
             let packed_is_newer = match (
-                previous.as_deref().map(decode_head_value).transpose()?,
+                previous
+                    .as_ref()
+                    .map(CertifiedCurrentStatePredecessor::view)
+                    .transpose()?,
                 Some(packed_value.commit_id),
             ) {
                 (None, Some(_)) => true,
@@ -4290,30 +4457,14 @@ where
                 continue;
             }
             previous_from_packed[index] = true;
-            *previous = Some(Bytes::from(encode_head_value(&HeadValueRef {
-                change_id: Some(packed_value.change_id),
-                commit_id: Some(packed_value.commit_id),
-                untracked: false,
+            *previous = Some(CertifiedCurrentStatePredecessor::Packed(PackedHeadValue {
+                change_id: packed_value.change_id,
+                commit_id: packed_value.commit_id,
                 deleted: packed_value.deleted,
                 created_at: packed_value.created_at,
                 updated_at: packed_value.updated_at,
-                snapshot: packed_change.snapshot.as_ref_slot(),
-                metadata: packed_change.metadata.as_ref_slot(),
-                working_diff_baseline: if let Some(checkpoint_commit_id) =
-                    working_diff_capture_checkpoint_commit_id
-                {
-                    // Checkpoints publish complete HOT rows. Therefore a
-                    // packed base in an active checkpoint generation was
-                    // created after that checkpoint and has an absent before
-                    // image; its O(1) manifest already owns the dirty-key
-                    // coverage.
-                    WorkingDiffBaseline::BeforeAbsent {
-                        checkpoint_commit_id,
-                    }
-                } else {
-                    WorkingDiffBaseline::Disabled
-                },
-            })?));
+                checkpoint_commit_id: working_diff_capture_checkpoint_commit_id,
+            }));
         }
         let mut collection_controls =
             load_incremental_collection_controls(self.store, branch_id, generation, &sorted)
@@ -4359,8 +4510,8 @@ where
                 continue;
             }
             let belongs_to_retired_generation = previous
-                .as_deref()
-                .map(decode_head_value)
+                .as_ref()
+                .map(CertifiedCurrentStatePredecessor::view)
                 .transpose()?
                 .is_some_and(|value| {
                     !row_belongs_to_active_collection_generation(
@@ -4382,7 +4533,7 @@ where
                 created_ats.push(delta.created_at);
                 continue;
             };
-            let existing = decode_head_value(previous)?;
+            let existing = previous.view()?;
             if let Some(borrowed_absence_guards) = borrowed_absence_guards {
                 reject_borrowed_guarded_live_member(borrowed_absence_guards, delta, existing)?;
             } else {
@@ -4430,8 +4581,8 @@ where
                     && delta.schema_key
                         != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
                     && previous
-                        .as_deref()
-                        .map(decode_head_value)
+                        .as_ref()
+                        .map(CertifiedCurrentStatePredecessor::view)
                         .transpose()?
                         .is_some_and(|value| {
                             value.change_id == delta.change_id
@@ -4529,7 +4680,10 @@ where
                 {
                     (WorkingDiffBaseline::Clean, false)
                 } else if working_diff_capture_checkpoint_commit_id.is_some() && !delta.untracked {
-                    let previous = previous.as_deref().map(decode_head_value).transpose()?;
+                    let previous = previous
+                        .as_ref()
+                        .map(CertifiedCurrentStatePredecessor::view)
+                        .transpose()?;
                     next_hot_working_diff_baseline(
                         working_diff_capture_checkpoint_commit_id,
                         delta,
@@ -5287,6 +5441,17 @@ fn compare_hot_deltas(
         .then_with(|| left.file_id.cmp(&right.file_id))
 }
 
+fn compare_certified_predecessor_to_delta(
+    predecessor: &CertifiedCurrentStatePredecessorRef<'_>,
+    delta: &CurrentStateDeltaRef<'_>,
+) -> Ordering {
+    predecessor
+        .schema_key
+        .cmp(delta.schema_key)
+        .then_with(|| predecessor.entity_pk.cmp(delta.entity_pk))
+        .then_with(|| predecessor.file_id.cmp(&delta.file_id))
+}
+
 fn hot_identity(
     branch_id: &str,
     generation: CommitId,
@@ -5380,22 +5545,30 @@ async fn hot_load_primary_mutation_identity_refs(
     store: &(impl StorageAdapterRead + ?Sized),
     identities: &EncodedHotMutationIdentities,
     deltas: &[&CurrentStateDeltaRef<'_>],
+    durable_predecessors: &[Option<CertifiedCurrentStatePredecessor>],
     absence_guards_validated: bool,
     validated_absent_file_id: Option<&str>,
-) -> Result<Vec<Option<Bytes>>, LixError> {
+) -> Result<Vec<Option<CertifiedCurrentStatePredecessor>>, LixError> {
     assert_eq!(
         identities.key_ranges.len(),
         deltas.len(),
         "every hot mutation identity must have one source delta"
     );
+    assert_eq!(
+        durable_predecessors.len(),
+        deltas.len(),
+        "every hot mutation identity must have one predecessor slot"
+    );
     let read_count = deltas
         .iter()
-        .filter(|delta| {
-            !hot_delta_is_guarded_by_absent_file(
-                delta,
-                absence_guards_validated,
-                validated_absent_file_id,
-            )
+        .zip(durable_predecessors)
+        .filter(|(delta, durable_predecessor)| {
+            durable_predecessor.is_none()
+                && !hot_delta_is_guarded_by_absent_file(
+                    delta,
+                    absence_guards_validated,
+                    validated_absent_file_id,
+                )
         })
         .count();
     if read_count == 0 {
@@ -5404,15 +5577,25 @@ async fn hot_load_primary_mutation_identity_refs(
     if read_count == deltas.len()
         && let Some(values) = hot_scan_dense_mutation_identity_range(store, identities).await?
     {
-        return Ok(values);
+        return Ok(values
+            .into_iter()
+            .map(|value| value.map(CertifiedCurrentStatePredecessor::Encoded))
+            .collect());
     }
     let mut keys = Vec::with_capacity(read_count);
-    for (identity, delta) in identities.key_ranges.iter().zip(deltas) {
-        if hot_delta_is_guarded_by_absent_file(
-            delta,
-            absence_guards_validated,
-            validated_absent_file_id,
-        ) {
+    for ((identity, delta), durable_predecessor) in identities
+        .key_ranges
+        .iter()
+        .zip(deltas)
+        .zip(durable_predecessors)
+    {
+        if durable_predecessor.is_some()
+            || hot_delta_is_guarded_by_absent_file(
+                delta,
+                absence_guards_validated,
+                validated_absent_file_id,
+            )
+        {
             continue;
         }
         let start = identity.row_key.offset();
@@ -5427,7 +5610,12 @@ async fn hot_load_primary_mutation_identity_refs(
         .await?
         .value
         .into_iter()
-        .map(|value| value.map(full_value_bytes).transpose())
+        .map(|value| {
+            value
+                .map(full_value_bytes)
+                .transpose()
+                .map(|value| value.map(CertifiedCurrentStatePredecessor::Encoded))
+        })
         .collect()
 }
 

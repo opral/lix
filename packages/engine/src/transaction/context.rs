@@ -1059,7 +1059,7 @@ where
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
-        self.stage_write_inner(write, None).await
+        Box::pin(self.stage_write_inner(write, None)).await
     }
 
     async fn stage_parameter_batch_insert(
@@ -1067,7 +1067,7 @@ where
         write: TransactionWrite,
         statement_indices: Vec<u32>,
     ) -> Result<TransactionWriteOutcome, LixError> {
-        self.stage_write_inner(write, Some(statement_indices)).await
+        Box::pin(self.stage_write_inner(write, Some(statement_indices))).await
     }
 
     /// Stages the fixed-shape public parameter INSERT proof without routing it
@@ -6794,6 +6794,7 @@ fn push_prepared_state_row_from_planned_parts(
     scalar: PreparedScalarRow,
     origin_key: Option<&SharedStr>,
 ) -> Result<(), LixError> {
+    let durable_predecessor = rows.take_durable_predecessor(row_index);
     let row = rows.row(row_index);
     let schema_key = row.schema_key.clone();
     let file_id = row.file_id.cloned();
@@ -6834,6 +6835,7 @@ fn push_prepared_state_row_from_planned_parts(
         untracked,
         branch_id,
     );
+    prepared.set_durable_predecessor(prepared.len() - 1, durable_predecessor);
     Ok(())
 }
 
@@ -7118,7 +7120,7 @@ where
         rows: RawWriteBatch,
     ) -> Result<TransactionWriteOutcome, LixError> {
         if rows.certified_preparation().is_some() {
-            return self.stage_certified_parameter_batch_insert(rows).await;
+            return Box::pin(self.stage_certified_parameter_batch_insert(rows)).await;
         }
         let statement_indices = (0..rows.len())
             .map(|index| {
