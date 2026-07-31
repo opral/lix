@@ -2356,6 +2356,39 @@ pub(crate) enum FastLixFilePathWriteConflict {
     DoNothing,
     UpdateData,
     UpdateDataAndMetadata,
+    IdDoNothing,
+    IdUpdateData,
+    IdUpdateDataAndMetadata,
+}
+
+impl FastLixFilePathWriteConflict {
+    fn targets_id(self) -> bool {
+        matches!(
+            self,
+            Self::IdDoNothing | Self::IdUpdateData | Self::IdUpdateDataAndMetadata
+        )
+    }
+
+    fn updates_existing(self) -> bool {
+        matches!(
+            self,
+            Self::UpdateData
+                | Self::UpdateDataAndMetadata
+                | Self::IdUpdateData
+                | Self::IdUpdateDataAndMetadata
+        )
+    }
+
+    pub(crate) fn updates_metadata(self) -> bool {
+        matches!(
+            self,
+            Self::UpdateDataAndMetadata | Self::IdUpdateDataAndMetadata
+        )
+    }
+
+    pub(crate) fn updates_data_only(self) -> bool {
+        matches!(self, Self::UpdateData | Self::IdUpdateData)
+    }
 }
 
 pub(crate) async fn execute_fast_lix_file_path_writes(
@@ -2400,13 +2433,14 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
     let active_branch_id = ctx.active_branch_id().to_string();
     let parsed_writes = parse_fast_lix_file_path_writes(writes)?;
 
-    if matches!(
-        conflict,
-        FastLixFilePathWriteConflict::UpdateData
-            | FastLixFilePathWriteConflict::UpdateDataAndMetadata
-    ) && let Some(indexed) =
+    let indexed = if conflict.targets_id() {
+        indexed_file_id_writes(ctx, &active_branch_id, &parsed_writes).await?
+    } else if conflict.updates_existing() {
         indexed_file_path_writes(ctx, &active_branch_id, &parsed_writes).await?
-    {
+    } else {
+        None
+    };
+    if let Some(indexed) = indexed {
         return stage_indexed_file_path_writes(
             ctx,
             &active_branch_id,
@@ -2476,8 +2510,10 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
                     )?;
                     staged.extend_filesystem_plan(plan)?;
                 }
-                FastLixFilePathWriteConflict::DoNothing => {}
-                FastLixFilePathWriteConflict::UpdateData => {
+                FastLixFilePathWriteConflict::DoNothing
+                | FastLixFilePathWriteConflict::IdDoNothing => {}
+                FastLixFilePathWriteConflict::UpdateData
+                | FastLixFilePathWriteConflict::IdUpdateData => {
                     let mut context = existing.scope.context(Some(existing.id.clone()));
                     if context.global {
                         context.branch_id = GLOBAL_BRANCH_ID.to_string();
@@ -2503,7 +2539,8 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
                     );
                     staged.add_count(1)?;
                 }
-                FastLixFilePathWriteConflict::UpdateDataAndMetadata => {
+                FastLixFilePathWriteConflict::UpdateDataAndMetadata
+                | FastLixFilePathWriteConflict::IdUpdateDataAndMetadata => {
                     let mut context = existing.scope.context(None);
                     if context.global {
                         context.branch_id = GLOBAL_BRANCH_ID.to_string();
@@ -2569,7 +2606,10 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
         FastLixFilePathWriteConflict::None => TransactionWriteMode::Insert,
         FastLixFilePathWriteConflict::DoNothing
         | FastLixFilePathWriteConflict::UpdateData
-        | FastLixFilePathWriteConflict::UpdateDataAndMetadata => TransactionWriteMode::Replace,
+        | FastLixFilePathWriteConflict::UpdateDataAndMetadata
+        | FastLixFilePathWriteConflict::IdDoNothing
+        | FastLixFilePathWriteConflict::IdUpdateData
+        | FastLixFilePathWriteConflict::IdUpdateDataAndMetadata => TransactionWriteMode::Replace,
     };
     stage_lix_file_fast_batch(ctx, mode, staged).await.map(Some)
 }
@@ -2634,6 +2674,52 @@ async fn indexed_file_path_writes(
     }))
 }
 
+async fn indexed_file_id_writes(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    active_branch_id: &str,
+    writes: &[FastLixFilePathWrite],
+) -> Result<Option<IndexedFilePathWrites>, LixError> {
+    let index = ctx
+        .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
+            active_branch_id.to_string(),
+        ]))
+        .await?;
+    let mut unique_ids = BTreeSet::new();
+    let mut existing = Vec::with_capacity(writes.len());
+    for write in writes {
+        let Some(id) = write.id.as_deref() else {
+            return Ok(None);
+        };
+        if !unique_ids.insert(id) {
+            return Ok(None);
+        }
+        match index.exact_file_id_entries(id).as_slice() {
+            [] => existing.push(None),
+            [entry] if entry.kind == FilesystemPathKind::File => {
+                existing.push(Some(Arc::clone(entry)));
+            }
+            _ => return Ok(None),
+        }
+    }
+    let has_missing = existing.iter().any(Option::is_none);
+    // An ID miss says nothing about path availability. Seed the resolver from
+    // the complete index even for root paths so a different file already at a
+    // proposed path still raises the normal uniqueness error.
+    let path_resolvers = if has_missing {
+        match directory_path_resolvers_from_path_index(&index, Some(active_branch_id)) {
+            Ok(resolvers) => Some(resolvers),
+            Err(error) if error.code == LixError::CODE_CONSTRAINT_VIOLATION => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    Ok(Some(IndexedFilePathWrites {
+        existing,
+        path_resolvers,
+    }))
+}
+
 async fn stage_indexed_file_path_writes(
     ctx: &mut dyn SqlWriteExecutionContext,
     active_branch_id: &str,
@@ -2643,29 +2729,36 @@ async fn stage_indexed_file_path_writes(
     mutation_identity: Option<MutationIdentity>,
 ) -> Result<u64, LixError> {
     debug_assert_eq!(writes.len(), indexed.existing.len());
-    debug_assert!(matches!(
-        conflict,
-        FastLixFilePathWriteConflict::UpdateData
-            | FastLixFilePathWriteConflict::UpdateDataAndMetadata
-    ));
+    debug_assert!(
+        conflict.updates_existing() || conflict == FastLixFilePathWriteConflict::IdDoNothing
+    );
     for (write, entry) in writes.iter().zip(&indexed.existing) {
-        if let Some(entry) = entry {
+        if !conflict.targets_id()
+            && let Some(entry) = entry
+        {
             validate_fast_lix_file_path_conflict_pair(
                 entry.key.is_untracked(),
                 &write.parsed.path,
             )?;
         }
     }
-    let existing = indexed
-        .existing
-        .iter()
-        .filter_map(|entry| entry.as_ref().map(Arc::clone))
-        .collect::<Vec<_>>();
+    let existing = if conflict.updates_existing() {
+        indexed
+            .existing
+            .iter()
+            .filter_map(|entry| entry.as_ref().map(Arc::clone))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let existing_materializations = load_exact_existing_materializations(ctx, &existing).await?;
     let mut staged = LixFileStagedBatch::with_row_capacity(writes.len().saturating_mul(3));
 
     for (write, entry) in writes.into_iter().zip(indexed.existing) {
         if let Some(entry) = entry {
+            if conflict == FastLixFilePathWriteConflict::IdDoNothing {
+                continue;
+            }
             let materialization = existing_materializations
                 .get(&entry.key)
                 .copied()
@@ -2681,10 +2774,12 @@ async fn stage_indexed_file_path_writes(
                 context.branch_id = GLOBAL_BRANCH_ID.to_string();
             }
             match conflict {
-                FastLixFilePathWriteConflict::UpdateData => {
+                FastLixFilePathWriteConflict::UpdateData
+                | FastLixFilePathWriteConflict::IdUpdateData => {
                     context.file_id = Some(entry.id().to_string());
                 }
-                FastLixFilePathWriteConflict::UpdateDataAndMetadata => {
+                FastLixFilePathWriteConflict::UpdateDataAndMetadata
+                | FastLixFilePathWriteConflict::IdUpdateDataAndMetadata => {
                     let metadata_changed = entry.metadata()
                         != write.metadata.as_ref().map(TransactionJson::normalized);
                     context.metadata = write.metadata;
@@ -2698,15 +2793,22 @@ async fn stage_indexed_file_path_writes(
                         .append_to(&mut staged.state_rows);
                     }
                 }
-                FastLixFilePathWriteConflict::None | FastLixFilePathWriteConflict::DoNothing => {
+                FastLixFilePathWriteConflict::None
+                | FastLixFilePathWriteConflict::DoNothing
+                | FastLixFilePathWriteConflict::IdDoNothing => {
                     unreachable!("indexed path route only handles conflict updates")
                 }
             }
+            let update_path = if conflict.targets_id() {
+                entry.path.clone()
+            } else {
+                write.parsed.path
+            };
             let file_data_start = staged.file_data_writes.len();
             stage_lix_file_data_update_write(
                 &mut staged,
                 entry.id().to_string(),
-                Some(write.parsed.path),
+                Some(update_path),
                 Some(entry.name.clone()),
                 write.data,
                 context,

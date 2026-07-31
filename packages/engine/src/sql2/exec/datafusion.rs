@@ -5660,6 +5660,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_multi_row_lix_file_id_upsert_uses_fast_writer() {
+        let rows = vec![
+            live_file_row(
+                "01920000-0000-7000-8000-000000000322",
+                "01920000-0000-7000-8000-0000000000a1",
+                None,
+                "existing.md",
+            ),
+            live_blob_ref_row(
+                "01920000-0000-7000-8000-000000000322",
+                "01920000-0000-7000-8000-0000000000a1",
+                b"old",
+            ),
+        ];
+        let (mut fast_ctx, fast_staged, _) = counting_write_context(rows);
+        let sql = "INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES \
+            ('01920000-0000-7000-8000-000000000322', '/ignored.md', X'6e6577', '{\"source\":\"update\"}'), \
+            ('01920000-0000-7000-8000-000000000323', '/fresh.md', X'6672657368', '{\"source\":\"insert\"}') \
+            ON CONFLICT (id) DO UPDATE SET data = excluded.data, lixcol_metadata = excluded.lixcol_metadata";
+
+        let (fast_result, fast_path) =
+            execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
+                .await
+                .expect("ID upsert should use the fast writer");
+        assert_eq!(fast_path, WriteExecutorPath::Fast);
+        assert_eq!(fast_result.rows, vec![vec![Value::Integer(2)]]);
+        let fast_rows = fast_staged.lock().expect("fast writes lock").deltas[0]
+            .pending_write_overlay()
+            .expect("fast staged delta should project")
+            .visible_all_semantic_rows();
+        let descriptor_rows = fast_rows
+            .iter()
+            .filter(|row| row.schema_key == "lix_file_descriptor")
+            .collect::<Vec<_>>();
+        assert!(descriptor_rows.iter().any(|row| {
+            row.entity_pk == "[\"01920000-0000-7000-8000-000000000322\"]"
+                && row
+                    .snapshot_content
+                    .as_deref()
+                    .is_some_and(|snapshot| snapshot.contains("existing.md"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_lix_file_id_upsert_rejects_path_collision_on_id_miss() {
+        let rows = vec![live_file_row(
+            "01920000-0000-7000-8000-000000000322",
+            "01920000-0000-7000-8000-0000000000a1",
+            None,
+            "existing.md",
+        )];
+        let (mut ctx, staged_writes, _) = counting_write_context(rows);
+        let error = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (id, path, data) VALUES \
+             ('01920000-0000-7000-8000-000000000323', '/existing.md', X'6e6577') \
+             ON CONFLICT (id) DO UPDATE SET data = excluded.data",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect_err("an ID miss must still enforce path uniqueness");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn execute_sql_multi_row_lix_file_duplicate_insert_paths_reject_before_staging() {
         for sql in [
             "INSERT INTO lix_file (path, data) \

@@ -77,14 +77,6 @@ pub struct ExpGitReplayArgs {
     #[arg(long, value_parser = value_parser!(u32).range(1..))]
     pub checkpoint_every: Option<u32>,
 
-    /// Verify changed files after each commit and the complete final tree.
-    #[arg(long, default_value_t = false)]
-    pub verify_state: bool,
-
-    /// Materialize Git LFS pointers from locally fetched LFS objects.
-    #[arg(long, default_value_t = false)]
-    pub git_lfs: bool,
-
     /// Replace an existing RocksDB output directory and output files.
     #[arg(long, default_value_t = false)]
     pub force: bool,

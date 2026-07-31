@@ -87,7 +87,6 @@ cargo run --release -p lix_cli -- exp git-replay \
   --branch d5badf95f8ab16c4deb91199dc696f2293d93554 \
   --from-commit d5badf95f8ab16c4deb91199dc696f2293d93554 \
   --num-commits 1 \
-  --verify-state \
   --force \
   --profile-json /tmp/vscode-d5badf-profile.json
 ```
