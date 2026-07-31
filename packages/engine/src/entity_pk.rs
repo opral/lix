@@ -201,6 +201,29 @@ impl EntityPk {
         )
     }
 
+    /// Builds an all-string identity after a typed producer has validated the
+    /// component count and scalar types against the active schema plan.
+    pub(crate) fn from_validated_shared_string_parts(
+        parts: impl IntoIterator<Item = SharedStr>,
+    ) -> Self {
+        let components = parts
+            .into_iter()
+            .map(EntityPkComponent::String)
+            .collect::<EntityPkComponentBuffer>();
+        debug_assert!(!components.is_empty());
+        Self {
+            components: EntityPkComponents::from_smallvec(components),
+        }
+    }
+
+    /// Builds the dominant one-column string identity without assembling an
+    /// intermediate component buffer after typed ingress validation.
+    pub(crate) fn from_validated_shared_string(value: SharedStr) -> Self {
+        Self {
+            components: EntityPkComponents::Single(EntityPkComponent::String(value)),
+        }
+    }
+
     pub(crate) fn into_parts(self) -> Vec<String> {
         self.components
             .iter()

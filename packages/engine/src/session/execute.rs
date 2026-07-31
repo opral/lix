@@ -4401,6 +4401,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consecutive_certified_batches_preserve_local_conflict_statement_index() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "consecutive_parameter_insert_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO consecutive_parameter_insert_probe (id, value) VALUES ('z', 'old')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let sql = "INSERT INTO consecutive_parameter_insert_probe (id, value) VALUES ($1, $2)";
+        let first_statements = [
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("a".to_string()),
+                    Value::Text("first-a".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("b".to_string()),
+                    Value::Text("first-b".to_string()),
+                ],
+            },
+        ];
+        let second_statements = [
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("c".to_string()),
+                    Value::Text("second-c".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("z".to_string()),
+                    Value::Text("duplicate-z".to_string()),
+                ],
+            },
+        ];
+        let mut transaction = session.begin_transaction().await.unwrap();
+        let mut conflict = None;
+        for (batch_index, statements) in [&first_statements[..], &second_statements[..]]
+            .into_iter()
+            .enumerate()
+        {
+            let parsed = TransactionBatchStatements::Shared {
+                statement: sql2::parse_statement(sql).unwrap(),
+                len: statements.len(),
+            };
+            let parameter_route = AtomicBool::new(false);
+            let staged = try_execute_transaction_parameter_batch(
+                transaction.transaction_mut().unwrap(),
+                statements,
+                &parsed,
+                &ExecuteOptions::default(),
+                &vec![ExecuteStatementMetadata::default(); statements.len()],
+                &parameter_route,
+            )
+            .await;
+            if batch_index == 0 {
+                assert!(
+                    staged.unwrap().is_some(),
+                    "the first batch should take the certified route"
+                );
+            } else {
+                conflict =
+                    Some(staged.expect_err(
+                        "the second row in the second batch conflicts with committed z",
+                    ));
+            }
+        }
+
+        let error = conflict.expect("the second batch must report its committed conflict");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+        drop(transaction);
+        let rows = session
+            .execute(
+                "SELECT id FROM consecutive_parameter_insert_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "both staged batches must roll back");
+        assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "z");
+    }
+
+    #[tokio::test]
     async fn execute_batch_declines_uncertified_entity_insert_rows() {
         let session = open_session().await;
         let schema = serde_json::json!({

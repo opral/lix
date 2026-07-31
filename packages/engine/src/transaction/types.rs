@@ -476,6 +476,7 @@ pub(crate) struct RawWriteBatch {
 pub(crate) struct CertifiedRawWriteBatchPreparation {
     pub(crate) schema_plan_id: SchemaPlanId,
     pub(crate) facts: PreparedRowFacts,
+    pub(crate) tracked_keys_strictly_ordered: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -536,6 +537,63 @@ impl RawWriteBatch {
             #[cfg(test)]
             origin_promotions: 0,
         }
+    }
+
+    /// Constructs the fixed-shape public INSERT ingress batch without
+    /// interning the same schema/branch pair and appending seven null system
+    /// columns once per row.
+    pub(crate) fn from_certified_parameter_insert(
+        entity_pks: Vec<EntityPk>,
+        snapshots: Vec<TransactionJson>,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        certificate: CertifiedRawWriteBatchPreparation,
+    ) -> Result<Self, LixError> {
+        if entity_pks.len() != snapshots.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified parameter INSERT columns are not aligned",
+            ));
+        }
+        let row_count = entity_pks.len();
+        if row_count >= RAW_WRITE_NONE as usize {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "certified parameter INSERT row count exceeds u32",
+            ));
+        }
+        let (strings, schema_key_ordinal, branch_id_ordinal) = if schema_key == branch_id {
+            (vec![schema_key], 0, 0)
+        } else {
+            (vec![schema_key, branch_id], 0, 1)
+        };
+        let slot = RawWriteSlot {
+            schema_key: schema_key_ordinal,
+            file_id: RAW_WRITE_NONE,
+            origin: RAW_WRITE_NONE,
+            created_at: RAW_WRITE_NONE,
+            updated_at: RAW_WRITE_NONE,
+            change_id: RAW_WRITE_NONE,
+            commit_id: RAW_WRITE_NONE,
+            branch_id: branch_id_ordinal,
+            flags: 0,
+        };
+        Ok(Self {
+            slots: vec![slot; row_count],
+            entity_pks: entity_pks.into_iter().map(Some).collect(),
+            snapshots: snapshots.into_iter().map(Some).collect(),
+            metadata: std::iter::repeat_with(|| None).take(row_count).collect(),
+            strings,
+            string_index: None,
+            expected_rows: row_count,
+            origins: Vec::new(),
+            origin_index: None,
+            certified_preparation: Some(certificate),
+            #[cfg(test)]
+            string_promotions: 0,
+            #[cfg(test)]
+            origin_promotions: 0,
+        })
     }
 
     #[cfg(test)]
@@ -669,10 +727,6 @@ impl RawWriteBatch {
     pub(crate) fn append_taken_row(&mut self, source: &mut Self, index: usize) {
         self.certified_preparation = None;
         source.move_row_into(index, self);
-    }
-
-    pub(crate) fn certify_preparation(&mut self, certificate: CertifiedRawWriteBatchPreparation) {
-        self.certified_preparation = Some(certificate);
     }
 
     pub(crate) fn certified_preparation(&self) -> Option<CertifiedRawWriteBatchPreparation> {
@@ -826,6 +880,7 @@ impl RawWriteBatch {
             origin_index: HashMap::new(),
             origin_column_sets: Vec::new(),
             origin_column_index: HashMap::new(),
+            certified_ordered_insert: certificate.tracked_keys_strictly_ordered,
         })
     }
 
@@ -2092,6 +2147,9 @@ pub(crate) struct PreparedStateBatch {
     origin_index: HashMap<TransactionWriteOrigin, u32>,
     origin_column_sets: Vec<Arc<[String]>>,
     origin_column_index: HashMap<Arc<[String]>, u32>,
+    /// The typed producer proved one strictly ordered, unique, ordinary
+    /// tracked INSERT batch. Any row topology change clears this proof.
+    certified_ordered_insert: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2191,6 +2249,7 @@ impl PreparedStateBatch {
             origin_index: HashMap::new(),
             origin_column_sets: Vec::new(),
             origin_column_index: HashMap::new(),
+            certified_ordered_insert: false,
         }
     }
 
@@ -2200,6 +2259,10 @@ impl PreparedStateBatch {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+
+    pub(crate) fn certified_ordered_insert(&self) -> bool {
+        self.certified_ordered_insert
     }
 
     pub(crate) fn iter(&self) -> PreparedStateRows<'_> {
@@ -2377,6 +2440,7 @@ impl PreparedStateBatch {
             *self = other;
             return;
         }
+        self.certified_ordered_insert = false;
         let entity_base =
             u32::try_from(self.entity_pks.len()).expect("prepared entity column must fit u32");
         let json_base = u32::try_from(self.json.len()).expect("prepared JSON column must fit u32");
@@ -2431,6 +2495,7 @@ impl PreparedStateBatch {
     }
 
     pub(crate) fn swap_rows(&mut self, left: usize, right: usize) {
+        self.certified_ordered_insert = false;
         self.slots.swap(left, right);
     }
 
@@ -2439,6 +2504,7 @@ impl PreparedStateBatch {
     /// Only compact slots move; typed owner columns remain stable and are
     /// still shared by the selected row ordinals.
     pub(crate) fn select_rows(&mut self, source_by_destination: &[usize]) {
+        self.certified_ordered_insert = false;
         debug_assert!(
             source_by_destination
                 .iter()
@@ -2480,6 +2546,9 @@ impl PreparedStateBatch {
     /// Unlike `select_rows`, this path allocates no O(live_rows) permutation
     /// buffers. Generic staging uses it for sparse point replacements.
     pub(crate) fn truncate_rows(&mut self, retained_len: usize) {
+        if retained_len != self.slots.len() {
+            self.certified_ordered_insert = false;
+        }
         self.slots.truncate(retained_len);
         if !self.should_compact_owner_columns(retained_len) {
             return;
@@ -2493,6 +2562,12 @@ impl PreparedStateBatch {
 
     pub(crate) fn set_commit_id(&mut self, index: usize, commit_id: Option<CommitId>) {
         self.slots[index].commit_id = commit_id;
+    }
+
+    pub(crate) fn set_commit_id_all(&mut self, commit_id: CommitId) {
+        for slot in &mut self.slots {
+            slot.commit_id = Some(commit_id);
+        }
     }
 
     pub(crate) fn set_change_id(&mut self, index: usize, change_id: Option<ChangeId>) {

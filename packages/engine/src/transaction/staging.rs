@@ -323,6 +323,7 @@ pub(crate) struct PreparedInsertSelection {
     bits: Vec<u64>,
     origins: Vec<Option<TransactionWriteOrigin>>,
     statement_indices: Vec<u32>,
+    statement_indices_are_row_ordinals: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -348,6 +349,7 @@ impl PreparedInsertSelection {
             bits: Vec::with_capacity(row_capacity.div_ceil(Self::WORD_BITS)),
             origins: Vec::with_capacity(row_capacity),
             statement_indices: Vec::new(),
+            statement_indices_are_row_ordinals: false,
         }
     }
 
@@ -391,9 +393,30 @@ impl PreparedInsertSelection {
     }
 
     fn push(&mut self, origin: Option<&TransactionWriteOrigin>, statement_index: Option<usize>) {
+        self.materialize_statement_indices();
         let row_index = self.row_count;
         self.resize_rows(row_index + 1);
         self.mark(row_index, origin, statement_index);
+    }
+
+    fn push_certified_ordinal_inserts(&mut self, row_count: usize) {
+        if self.row_count != 0 || self.count != 0 {
+            self.reserve_rows(row_count, true);
+            for statement_index in 0..row_count {
+                self.push(None, Some(statement_index));
+            }
+            return;
+        }
+        self.row_count = row_count;
+        self.count = row_count;
+        self.bits = vec![u64::MAX; row_count.div_ceil(Self::WORD_BITS)];
+        if let Some(last) = self.bits.last_mut()
+            && !row_count.is_multiple_of(Self::WORD_BITS)
+        {
+            *last = (1_u64 << (row_count % Self::WORD_BITS)) - 1;
+        }
+        self.origins.resize(row_count, None);
+        self.statement_indices_are_row_ordinals = true;
     }
 
     fn push_not_insert(&mut self) {
@@ -439,6 +462,7 @@ impl PreparedInsertSelection {
         origin: Option<&TransactionWriteOrigin>,
         statement_index: Option<usize>,
     ) {
+        self.materialize_statement_indices();
         debug_assert!(row_index < self.row_count);
         let word = row_index / Self::WORD_BITS;
         let bit = row_index % Self::WORD_BITS;
@@ -464,7 +488,19 @@ impl PreparedInsertSelection {
         }
     }
 
+    fn materialize_statement_indices(&mut self) {
+        if self.statement_indices_are_row_ordinals {
+            self.statement_indices = (0..self.row_count)
+                .map(|index| u32::try_from(index).expect("batch statement index must fit u32"))
+                .collect();
+            self.statement_indices_are_row_ordinals = false;
+        }
+    }
+
     fn statement_index(&self, row_index: usize) -> Option<usize> {
+        if self.statement_indices_are_row_ordinals && row_index < self.row_count {
+            return Some(row_index);
+        }
         self.statement_indices
             .get(row_index)
             .copied()
@@ -837,10 +873,12 @@ impl TransactionWriteBuffer {
         statement_indices: Option<&[u32]>,
     ) -> Result<AppendOnlyStage, LixError> {
         let inserts = mode == Some(TransactionWriteMode::Insert);
+        let certified_ordered_insert = inserts && rows.certified_ordered_insert();
         if !matches!(
             mode,
             Some(TransactionWriteMode::Replace | TransactionWriteMode::Insert)
-        ) || (inserts
+        ) || (!certified_ordered_insert
+            && inserts
             && !rows
                 .iter()
                 .all(|row| row_is_insert(mode, row) && row.snapshot.is_some()))
@@ -861,7 +899,18 @@ impl TransactionWriteBuffer {
         else {
             return Ok(AppendOnlyStage::Fallback(rows));
         };
-        if !rows_are_append_only_tracked(&rows, last_key.as_ref()) {
+        let append_shape_matches = if certified_ordered_insert {
+            rows.first().is_none_or(|first| {
+                is_normal_tracked_append_row(first)
+                    && first.snapshot.is_some()
+                    && last_key.as_ref().is_none_or(|previous| {
+                        compare_tracked_key_to_row(previous, first) == std::cmp::Ordering::Less
+                    })
+            })
+        } else {
+            rows_are_append_only_tracked(&rows, last_key.as_ref())
+        };
+        if !append_shape_matches {
             return Ok(AppendOnlyStage::Fallback(rows));
         }
 
@@ -888,19 +937,21 @@ impl TransactionWriteBuffer {
                 .expect("branch change refs were inserted above");
             let commit_id = change_refs.commit_id;
             change_refs.add_change_count(rows.len());
-            for index in 0..rows.len() {
-                rows.set_commit_id(index, Some(commit_id));
-            }
+            rows.set_commit_id_all(commit_id);
         }
-        insert_selection.reserve_rows(rows.len(), inserts);
-        for (row_index, row) in rows.iter().enumerate() {
-            if inserts {
-                insert_selection.push(
-                    row.origin,
-                    statement_indices.map(|indices| indices[row_index] as usize),
-                );
-            } else {
-                insert_selection.push_not_insert();
+        if certified_ordered_insert {
+            insert_selection.push_certified_ordinal_inserts(rows.len());
+        } else {
+            insert_selection.reserve_rows(rows.len(), inserts);
+            for (row_index, row) in rows.iter().enumerate() {
+                if inserts {
+                    insert_selection.push(
+                        row.origin,
+                        statement_indices.map(|indices| indices[row_index] as usize),
+                    );
+                } else {
+                    insert_selection.push_not_insert();
+                }
             }
         }
         if let Some(row) = rows.last() {
@@ -1416,6 +1467,45 @@ impl TransactionWriteBuffer {
         statement_indices: Vec<u32>,
     ) -> Result<TransactionWriteOutcome, LixError> {
         self.stage_write_inner(write, Some(statement_indices))
+    }
+
+    pub(crate) fn stage_certified_parameter_batch_insert(
+        &self,
+        write: PreparedTransactionWrite,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        let (mode, count) = match &write {
+            PreparedTransactionWrite::Rows { mode, rows } => (Some(*mode), rows.len() as u64),
+            PreparedTransactionWrite::RowsWithFileData { .. } => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified parameter INSERT unexpectedly contains file data",
+                ));
+            }
+        };
+        let (rows, file_data_writes) = self.state_rows_from_stage_write(write);
+        debug_assert!(file_data_writes.is_empty());
+        match self.stage_append_only_if_possible(mode, rows, None)? {
+            AppendOnlyStage::Staged => Ok(TransactionWriteOutcome { count }),
+            AppendOnlyStage::Fallback(rows) => {
+                let statement_indices = (0..rows.len())
+                    .map(|index| {
+                        u32::try_from(index).map_err(|_| {
+                            LixError::new(
+                                LixError::CODE_INVALID_PARAM,
+                                "parameter batch row count exceeds u32",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.stage_write_inner(
+                    PreparedTransactionWrite::Rows {
+                        mode: TransactionWriteMode::Insert,
+                        rows,
+                    },
+                    Some(statement_indices),
+                )
+            }
+        }
     }
 
     fn stage_write_inner(
@@ -2462,6 +2552,17 @@ mod tests {
         ($($row:expr),* $(,)?) => {
             PreparedStateBatch::from_test_rows(vec![$($row),*])
         };
+    }
+
+    #[test]
+    fn generic_insert_after_certified_batch_does_not_inherit_statement_index() {
+        let mut selection = PreparedInsertSelection::new();
+        selection.push_certified_ordinal_inserts(2);
+        selection.push(None, None);
+
+        assert_eq!(selection.statement_index(0), Some(0));
+        assert_eq!(selection.statement_index(1), Some(1));
+        assert_eq!(selection.statement_index(2), None);
     }
 
     #[test]
