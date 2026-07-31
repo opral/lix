@@ -15,7 +15,59 @@ Agents and tools work with files. Applications need a database. Teams need versi
 
 Lix combines all three: normal files for tools, SQL rows for apps, and version control for every change.
 
-## Files × database
+- 📁 **Keep normal files.** Existing tools and agents can keep reading and writing files on disk.
+- 🧠 **Query everything with SQL.** Query file content, app data, and change history without rereading whole files.
+- 🔍 **Track semantic changes.** Review the paragraph, CSV record, property, or app row that changed.
+- 🔀 **Branch and merge safely.** Give every user or agent an isolated workspace, then review and merge its work.
+- ✅ **Use ACID transactions.** Update files and rows together while Lix records their history.
+- 🤝 **Run locally or remotely.** Embed Lix in an app or connect to a shared workspace through the server protocol.
+
+## Try a demo app
+
+[Flashtype](https://flashtype.ai) is a Markdown editor for Claude and Codex built on Lix. Open local Markdown files, let agents edit them, review changes as diffs, and restore previous versions from history.
+
+[![Flashtype app preview](https://flashtype.ai/og.png)](https://flashtype.ai)
+
+## Getting started
+
+<p>
+  <img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript ·
+  <a href="https://github.com/opral/lix/issues/373"><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
+  <a href="https://github.com/opral/lix/issues/371"><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
+  <a href="https://github.com/opral/lix/issues/370"><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
+</p>
+
+```bash
+npm install @lix-js/sdk
+```
+
+```ts
+import { LocalFilesystem, openLix } from "@lix-js/sdk";
+
+const lix = await openLix({
+  storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
+});
+
+await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+  "/notes/status.txt",
+  new TextEncoder().encode("ready"),
+]);
+```
+
+Connect to a shared Lix server with the same API:
+
+```ts
+const lix = await openLix({
+  server: {
+    mode: "remote",
+    url: "https://example.com/workspaces/acme",
+  },
+});
+```
+
+## Why Lix?
+
+### Files × database
 
 Plugins map file parts such as paragraphs, cells, and properties to SQL rows. Your app can also define its own rows.
 
@@ -62,9 +114,9 @@ The SDK includes plugins for Markdown and CSV. Add a plugin for other formats, s
 | Branches and merging                       | Git: yes; filesystem: no             | You build them         | Yes                |
 | Reviews changes by paragraph, cell, or row | Text lines only                      | You build it           | Yes, with a plugin |
 
-## Prime use cases
+### Prime use cases
 
-### Give agents safe, isolated workspaces
+#### Give agents safe, isolated workspaces
 
 Give each agent its own branch. The agent works with normal files while the main branch stays stable. Preview its work, then merge or discard it.
 
@@ -83,9 +135,7 @@ if (preview.conflicts.length === 0) {
 }
 ```
 
-[Flashtype](https://flashtype.ai) is a Markdown editor for Claude and Codex built on Lix. Agents edit local files. Users review the changes and restore earlier versions.
-
-### Build file-based apps with SQL and version control
+#### Build file-based apps with SQL and version control
 
 Build editors, knowledge bases, and document workflows on normal files. Use SQL for app logic and Lix for history, rollback, branches, merging, and review.
 
@@ -114,43 +164,6 @@ const changes = await lix.execute(`
 Update Lix files and rows in one ACID transaction. Lix records the history automatically.
 
 [Read more about semantic changes →](https://lix.dev/docs/semantic-changes)
-
-## Getting started
-
-<p>
-  <img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript ·
-  <a href="https://github.com/opral/lix/issues/373"><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
-  <a href="https://github.com/opral/lix/issues/371"><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
-  <a href="https://github.com/opral/lix/issues/370"><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
-</p>
-
-```bash
-npm install @lix-js/sdk
-```
-
-```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
-
-const lix = await openLix({
-  storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
-});
-
-await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
-  "/notes/status.txt",
-  new TextEncoder().encode("ready"),
-]);
-```
-
-## Run locally or on a server
-
-```ts
-const lix = await openLix({
-  server: {
-    mode: "remote",
-    url: "https://example.com/workspaces/acme",
-  },
-});
-```
 
 ## Where this is going
 
