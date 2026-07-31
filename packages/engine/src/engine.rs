@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn predecessor_v26_hot_baseline_protocol_is_rejected() {
+    async fn predecessor_v26_selected_payload_protocol_is_rejected() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -756,9 +756,38 @@ mod tests {
             .expect("V26 protocol marker should commit");
 
         let Err(error) = Engine::new(storage).await else {
-            panic!("V26 repositories must fail closed before V7 HOT rows are decoded");
+            panic!("V26 repositories must fail closed before packed bases are read");
         };
         assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
+    async fn predecessor_v27_partial_current_state_protocols_are_rejected() {
+        for protocol in [
+            b"packed-current-base.v27".as_slice(),
+            b"checkpoint-owned-hot-baseline.v27".as_slice(),
+        ] {
+            let storage = Memory::new();
+            Engine::initialize(storage.clone())
+                .await
+                .expect("engine should initialize");
+            let storage_adapter = StorageAdapter::new(storage.clone());
+            let mut writes = storage_adapter.new_write_set();
+            writes.put(
+                crate::init::REPOSITORY_PROTOCOL_SPACE,
+                crate::init::REPOSITORY_PROTOCOL_KEY,
+                protocol,
+            );
+            storage_adapter
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("V27 protocol marker should commit");
+
+            let Err(error) = Engine::new(storage).await else {
+                panic!("V27 partial protocols must fail closed before HOT state is decoded");
+            };
+            assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+        }
     }
 
     #[tokio::test]
@@ -1283,7 +1312,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("working-diff inventory read should open");
-        let before = ScanPlan::prefix(
+        let before_sparse = ScanPlan::prefix(
             crate::live_state::HOT_DIFF_SPACE,
             StoragePrefix {
                 bytes: Bytes::new(),
@@ -1292,9 +1321,18 @@ mod tests {
         .collect(&read, StorageScanOptions::default())
         .await
         .expect("working-diff inventory should scan");
+        let before_packed = ScanPlan::prefix(
+            crate::live_state::PACKED_CURRENT_BASE_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            },
+        )
+        .collect(&read, StorageScanOptions::default())
+        .await
+        .expect("packed working-diff inventory should scan");
         assert!(
-            !before.value.entries.is_empty(),
-            "tracked mutation must persist a physical dirty-key epoch"
+            !before_sparse.value.entries.is_empty() || !before_packed.value.entries.is_empty(),
+            "tracked mutation must persist a sparse or packed physical dirty epoch"
         );
         drop(read);
 
@@ -1318,7 +1356,7 @@ mod tests {
         .expect("post-checkpoint working-diff inventory should scan");
         assert!(
             after.value.entries.is_empty(),
-            "the superseded epoch must not remain until repository GC"
+            "superseded sparse dirty keys must not remain until repository GC"
         );
         let logical = session
             .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])

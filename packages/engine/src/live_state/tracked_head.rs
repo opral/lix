@@ -13,7 +13,8 @@ pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
     DeferredFreshHotRowRef, DeferredFreshHotRows, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE,
-    HotTrackedSnapshot, scan_certified_history_rows, stage_certified_entity_batches,
+    HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
+    scan_certified_history_rows, stage_certified_entity_batches,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,10 +32,9 @@ use crate::branch::{BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
-#[cfg(test)]
-use crate::json_store::JsonSlot;
 use crate::json_store::{
-    JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlotRef, JsonStoreContext, JsonStoreWriter,
+    JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
+    JsonStoreWriter,
 };
 use crate::live_state::{
     MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
@@ -563,44 +563,6 @@ fn tracked_head_duplicate_insert_error_ref(schema_key: &str, entity_pk: &EntityP
             schema_key
         ),
     )
-}
-
-async fn materialize_entity_snapshot_refs(
-    store: &(impl StorageAdapterRead + ?Sized),
-    mut snapshots: Vec<Option<Bytes>>,
-    json_refs: Vec<JsonRef>,
-    deferred: Vec<(usize, JsonRef)>,
-) -> Result<Vec<Option<Bytes>>, LixError> {
-    if json_refs.is_empty() {
-        return Ok(snapshots);
-    }
-    let mut values = JsonStoreContext::new()
-        .load_bytes_many(
-            store,
-            JsonLoadRequestRef {
-                refs: &json_refs,
-                scope: JsonReadScopeRef::OutOfBand,
-            },
-        )
-        .await?
-        .into_values();
-    for (index, (row_index, json_ref)) in deferred.into_iter().enumerate() {
-        let bytes = values
-            .get_mut(index)
-            .ok_or_else(|| head_value_error("lost an out-of-band entity JSON value index"))?
-            .take()
-            .ok_or_else(|| {
-                head_value_error(&format!(
-                    "entity row is missing JSON payload '{}'",
-                    json_ref.to_hex()
-                ))
-            })?;
-        *snapshots
-            .get_mut(row_index)
-            .ok_or_else(|| head_value_error("lost an out-of-band entity JSON row index"))? =
-            Some(bytes);
-    }
-    Ok(snapshots)
 }
 
 fn matches_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bool {

@@ -625,7 +625,7 @@ where
         })
         .collect::<Vec<_>>();
 
-    db::block_on(lix.execute_batch(&batch)).map_err(|error| {
+    db::block_on(Box::pin(lix.execute_batch(&batch))).map_err(|error| {
         let sql_preview = batch
             .first()
             .map(|statement| statement.sql.chars().take(160).collect::<String>())

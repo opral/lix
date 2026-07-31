@@ -47,6 +47,12 @@ use tracing::Instrument as _;
 
 type RowIndex = usize;
 
+// Below this size, per-row HOT writes are cheaper and keep repeated ordinary
+// INSERT transactions at one point-addressable current-state lookup. Packed
+// bases are reserved for bulk publication where avoiding row write
+// amplification dominates the cost of retaining one immutable manifest.
+const PACKED_CURRENT_BASE_MIN_ROWS: usize = 1_024;
+
 /// Commits prepared transaction rows into tracked history and unified current
 /// live state.
 ///
@@ -315,7 +321,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         "lix.perf.materialization.tracked_roots"
     ))
     .await?;
-    let mut staged_hot_heads = stage_tracked_head(
+    // HOT publication has adapter-specific checkpoint, packed-base, and
+    // point-row futures. Keep their combined async state out of the parent
+    // commit future so an inactive bulk branch cannot inflate every ordinary
+    // SlateDB transaction's native stack.
+    let mut staged_hot_heads = Box::pin(stage_tracked_head(
         read,
         &mut writes,
         &state_rows,
@@ -331,7 +341,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &explicit_branch_targets,
         &branch_control_observations,
         &checkpoint_epochs,
-    )
+    ))
     .instrument(tracing::debug_span!(
         target: "lix_perf",
         "lix.perf.materialization.tracked_head"
@@ -2109,8 +2119,46 @@ async fn stage_tracked_head(
                     }),
             );
         }
-        let mut deltas = tracked_deltas;
-        deltas.extend(untracked_deltas);
+        let packed_schema_keys = tracked_deltas
+            .iter()
+            .map(|delta| delta.schema_key)
+            .collect::<BTreeSet<_>>();
+        let packed_guards_match = tracked_deltas.len() >= PACKED_CURRENT_BASE_MIN_ROWS
+            && packed_current_base_guards_match(&tracked_deltas, &absence_guards);
+        let can_publish_packed_current_base = !is_checkpoint_publication
+            && certified_fresh_plugin_file_id.is_none()
+            && !host_certified_live_increments.contains_key(&root.branch_id)
+            && staged.selected_change_batches.is_empty()
+            && packed_guards_match
+            && tracked_deltas.len() >= PACKED_CURRENT_BASE_MIN_ROWS
+            && tracked_deltas.iter().all(|delta| {
+                !delta.untracked
+                    && !delta.deleted
+                    && delta.file_id.is_none()
+                    && delta.schema_key
+                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    && delta.commit_id == Some(root.commit_id)
+                    && delta.change_id.is_some()
+            })
+            && untracked_deltas
+                .iter()
+                .all(|delta| !packed_schema_keys.contains(delta.schema_key));
+        tracing::debug!(
+            target: "lix_perf",
+            can_publish_packed_current_base,
+            tracked_delta_count = tracked_deltas.len(),
+            packed_min_rows = PACKED_CURRENT_BASE_MIN_ROWS,
+            untracked_delta_count = untracked_deltas.len(),
+            absence_guard_count = absence_guards.len(),
+            packed_guards_match,
+            is_checkpoint_publication,
+            has_certified_file = certified_fresh_plugin_file_id.is_some(),
+            has_certified_counts = host_certified_live_increments.contains_key(&root.branch_id),
+            has_selected_batches = !staged.selected_change_batches.is_empty(),
+            "packed current-base route decision"
+        );
+        let mut deltas = tracked_deltas.clone();
+        deltas.extend_from_slice(&untracked_deltas);
         // Every absence guard above is derived from one of these exact
         // transaction deltas. The fresh-file certificate likewise proves its
         // complete file-scoped namespace absent. The branch-control CAS
@@ -2137,6 +2185,42 @@ async fn stage_tracked_head(
                     "lix.perf.materialization.tracked_head.stage_checkpoint"
                 ))
                 .await?
+        } else if can_publish_packed_current_base {
+            let generation = writer
+                .stage_packed_insert_current_base(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    &tracked_deltas,
+                    &absence_guards,
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_packed_current_base"
+                ))
+                .await?;
+            if !untracked_deltas.is_empty() {
+                writer
+                    .stage_current_state_with_working_diff(
+                        &root.branch_id,
+                        Some(parent_generation),
+                        root.commit_id,
+                        &untracked_deltas,
+                        &BTreeSet::new(),
+                        None,
+                        None,
+                        None,
+                        &mut coverage,
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.materialization.tracked_head.stage_current_overlay"
+                    ))
+                    .await?;
+            }
+            generation
         } else if let Some(certified_live_increments) =
             host_certified_live_increments.get(&root.branch_id)
         {
@@ -2357,6 +2441,26 @@ fn owned_absence_guards(guards: &[TrackedStateKeyRef<'_>]) -> BTreeSet<TrackedSt
             entity_pk: guard.entity_pk.clone(),
         })
         .collect()
+}
+
+fn packed_current_base_guards_match(
+    deltas: &[crate::live_state::CurrentStateDeltaRef<'_>],
+    guards: &[TrackedStateKeyRef<'_>],
+) -> bool {
+    if deltas.len() != guards.len() {
+        return false;
+    }
+    let mut delta_identities = deltas
+        .iter()
+        .map(|delta| (delta.schema_key, delta.entity_pk, delta.file_id))
+        .collect::<Vec<_>>();
+    delta_identities.sort_unstable();
+    let mut guard_identities = guards
+        .iter()
+        .map(|guard| (guard.schema_key, guard.entity_pk, guard.file_id))
+        .collect::<Vec<_>>();
+    guard_identities.sort_unstable();
+    delta_identities == guard_identities
 }
 
 /// A selected historical change becomes visible through a newly materialized
@@ -3544,8 +3648,8 @@ mod tests {
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
     use crate::live_state::{
-        LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest,
-        LiveStateProjection, LiveStateRowRequest,
+        HOT_ROW_SPACE, LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest,
+        LiveStateProjection, LiveStateRowRequest, PACKED_CURRENT_BASE_SPACE,
     };
     use crate::storage::{
         CommitResult, GetManyResult, KeyRange, PutBatch, ScanChunk, ScanOptions, SpaceId, Storage,
@@ -3826,6 +3930,36 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn packed_route_rejects_equal_count_guards_for_other_identities() {
+        let tracked_pk = EntityPk::single("tracked-update");
+        let untracked_pk = EntityPk::single("untracked-insert");
+        let timestamp = ts("2026-01-01T00:00:00Z");
+        let delta = crate::live_state::CurrentStateDeltaRef {
+            schema_key: "tracked_schema",
+            file_id: None,
+            entity_pk: &tracked_pk,
+            change_id: Some(change_id("tracked-update")),
+            commit_id: Some(commit_id("tracked-update")),
+            untracked: false,
+            deleted: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+            snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"value":1}"#),
+            metadata: crate::json_store::JsonSlotRef::None,
+        };
+        let guard = TrackedStateKeyRef {
+            schema_key: "untracked_schema",
+            file_id: None,
+            entity_pk: &untracked_pk,
+        };
+
+        assert!(
+            !packed_current_base_guards_match(&[delta], &[guard]),
+            "equal counts from tracked updates and unrelated untracked inserts must fall back"
+        );
+    }
+
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             TrackedStateContext::new(),
@@ -3867,9 +4001,7 @@ mod tests {
                         .v10_marker_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if space == crate::live_state::HOT_ROW_SPACE.id
-                    || space == crate::live_state::HOT_FILE_SPACE.id
-                {
+                if space == HOT_ROW_SPACE.id || space == crate::live_state::HOT_FILE_SPACE.id {
                     self.counts
                         .row_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
@@ -3894,9 +4026,7 @@ mod tests {
             range: KeyRange,
             opts: ScanOptions,
         ) -> Result<ScanChunk, StorageError> {
-            if space == crate::live_state::HOT_ROW_SPACE.id
-                || space == crate::live_state::HOT_FILE_SPACE.id
-            {
+            if space == HOT_ROW_SPACE.id || space == crate::live_state::HOT_FILE_SPACE.id {
                 self.counts.row_scan_calls.fetch_add(1, Ordering::Relaxed);
             }
             if space == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
@@ -3974,6 +4104,14 @@ mod tests {
         assert!(
             !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
             "an ordinary tracked commit must not write commit-root metadata"
+        );
+        assert!(
+            writes.has_mutations_in_space(HOT_ROW_SPACE),
+            "a small ordinary tracked commit must retain point-addressable HOT state"
+        );
+        assert!(
+            !writes.has_mutations_in_space(PACKED_CURRENT_BASE_SPACE),
+            "a small ordinary tracked commit must not accumulate a packed manifest"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())

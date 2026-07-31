@@ -39,13 +39,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V27 gives dirty HOT baselines an explicit checkpoint owner so checkpoint
-/// publication can retain semantically identical rows without confusing a
-/// prior interval's baseline with the active interval.
+/// V28 combines branch-scoped immutable current-state bases with explicitly
+/// checkpoint-owned dirty HOT baselines. Opening either predecessor must fail
+/// closed before its partial layout is interpreted as the combined protocol.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"checkpoint-owned-hot-baseline.v27";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"packed-current-checkpoint-baseline.v28";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately

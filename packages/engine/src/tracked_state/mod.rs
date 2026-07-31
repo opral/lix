@@ -30,10 +30,12 @@ pub(crate) use row_materialization::{
 #[cfg(test)]
 pub(crate) use storage::load_commit_delta_change_ids;
 pub(crate) use storage::{
-    CommitDeltaChangeLocator, load_change_record_by_id, load_commit_delta_change_records,
-    load_commit_delta_members_with_payloads, scan_change_records_from_commit_deltas,
-    scan_commit_delta_inventory, stage_addressable_commit_deltas, stage_change_locators,
-    stage_commit_deltas, stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
+    CommitDeltaChangeLocator, CommitDeltaMember, commit_delta_contains_schema,
+    load_change_record_by_id, load_commit_delta_change_records,
+    load_commit_delta_members_with_payloads, load_owned_commit_delta_entries,
+    scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_values,
+    stage_addressable_commit_deltas, stage_change_locators, stage_commit_deltas,
+    stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
     stage_delete_commit_roots,
 };
 #[cfg(feature = "storage-benches")]
@@ -44,8 +46,8 @@ pub(crate) use storage::{
 };
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateDeltaRef,
-    TrackedStateFilter, TrackedStateReadColumns, TrackedStateRootMutationRef,
-    TrackedStateScanRequest,
+    TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
+    TrackedStateRootMutationRef, TrackedStateScanRequest,
 };
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 #[cfg(feature = "storage-benches")]
