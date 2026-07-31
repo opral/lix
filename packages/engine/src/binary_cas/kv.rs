@@ -3372,8 +3372,8 @@ mod tests {
 
         assert_eq!(
             writes.stats().staged_puts,
-            1,
-            "an inline repeat write should deterministically replace one manifest"
+            0,
+            "an inline repeat write should reuse its existing manifest"
         );
         assert_eq!(
             counted.presence_get_many_calls.load(Ordering::Relaxed),
@@ -3484,7 +3484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_chunk_aware_writer_batches_persisted_chunk_checks() {
+    async fn existing_chunk_aware_writer_batches_persisted_chunk_checks_without_a_hash() {
         let storage = StorageAdapter::new(Memory::new());
         let data = definitely_multi_chunk_blob_bytes();
         let payload = BlobPayload::from_bytes(data.clone());
@@ -3511,21 +3511,23 @@ mod tests {
             .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
-        let mut writer =
-            BinaryCasContext::new().writer_skipping_existing_chunks(&store, &mut writes);
-        writer
-            .stage_payload(&payload)
-            .await
-            .expect("repeat blob write should stage");
+        stage_blob_write_skipping_existing_chunks(
+            BinaryCasChunking::default(),
+            &store,
+            &mut writes,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &data,
+            None,
+        )
+        .await
+        .expect("repeat blob write should stage");
 
         assert_eq!(
             writes.stats().staged_puts,
             1 + u64::try_from(chunk_ranges.len()).expect("chunk count should fit in u64")
         );
         let metrics = crate::binary_cas::metrics::binary_cas_write_metrics_snapshot();
-        // These counters are process-global test metrics. Other tests in this
-        // binary can run concurrently, so assert this test's contribution
-        // instead of requiring exclusive ownership of the counters.
         assert!(metrics.chunk_lookup_count >= chunk_hashes.len() as u64);
         assert!(metrics.chunk_lookup_batch_count >= 1);
         assert!(metrics.chunk_lookup_hit_count >= chunk_hashes.len() as u64);
