@@ -1437,10 +1437,14 @@ where
     let Some(base_metadata) = metadata.get_mut(0).and_then(Option::take) else {
         return Ok(false);
     };
-    if !matches!(base_metadata.inline_blob, Some(InlineBlob::Full { .. })) {
+    let Some(InlineBlob::Full {
+        dictionary_hash: base_dictionary_hash,
+        ..
+    }) = base_metadata.inline_blob.as_ref()
+    else {
         return Ok(false);
-    }
-    let dictionaries = dictionary
+    };
+    let mut dictionaries = dictionary
         .map(|dictionary| {
             crate::compression::ZstdDictionaryDecoder::new(&dictionary.bytes)
                 .map(|decoder| (dictionary.hash, decoder))
@@ -1457,6 +1461,26 @@ where
         .transpose()?
         .into_iter()
         .collect::<HashMap<_, _>>();
+    if let Some(base_dictionary_hash) = base_dictionary_hash
+        && !dictionaries.contains_key(base_dictionary_hash)
+    {
+        let Some(bytes) = point_value(
+            store,
+            BINARY_CAS_DICTIONARY_SPACE,
+            base_dictionary_hash.as_bytes().to_vec(),
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        if BlobHash::from_content(&bytes) != *base_dictionary_hash {
+            return Ok(false);
+        }
+        let Ok(decoder) = crate::compression::ZstdDictionaryDecoder::new(&bytes) else {
+            return Ok(false);
+        };
+        dictionaries.insert(*base_dictionary_hash, decoder);
+    }
     let base = assemble_blob_bytes(
         base_metadata,
         &HashMap::new(),
@@ -2906,6 +2930,98 @@ mod tests {
             load_bytes_many(&store, &[updated_hash])
                 .await
                 .expect("delta blob should load")
+                .into_vec(),
+            vec![Some(updated)]
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_delta_loads_the_base_dictionary_when_another_is_current() {
+        let storage = StorageAdapter::new(Memory::new());
+        let base = deterministic_high_entropy_bytes(24 * 1024);
+        let mut updated = base.clone();
+        let edit = updated.len() / 2;
+        updated[edit..edit + 32].copy_from_slice(&[b'x'; 32]);
+        let first_dictionary = base[..8 * 1024].to_vec();
+        let mut second_dictionary = deterministic_high_entropy_bytes(8 * 1024);
+        for byte in &mut second_dictionary {
+            *byte ^= 0xa5;
+        }
+        let first_hash = BlobHash::from_content(&first_dictionary);
+        let second_hash = BlobHash::from_content(&second_dictionary);
+        assert_ne!(first_hash, second_hash);
+
+        let base_hash = BlobHash::from_content(&base);
+        let updated_hash = BlobHash::from_content(&updated);
+        let compressed_base = crate::compression::ZstdDictionaryCompressor::new(&first_dictionary)
+            .expect("first dictionary compressor should open")
+            .compress(&base)
+            .expect("base should compress");
+
+        let mut writes = storage.new_write_set();
+        writes.put(
+            BINARY_CAS_DICTIONARY_SPACE,
+            key(first_hash.as_bytes().to_vec()),
+            value(first_dictionary),
+        );
+        writes.put(
+            BINARY_CAS_DICTIONARY_SPACE,
+            key(second_hash.as_bytes().to_vec()),
+            value(second_dictionary),
+        );
+        writes.put(
+            BINARY_CAS_DICTIONARY_CONTROL_SPACE,
+            key(BINARY_CAS_DICTIONARY_CONTROL_KEY.to_vec()),
+            value(second_hash.as_bytes().to_vec()),
+        );
+        writes.put(
+            BINARY_CAS_MANIFEST_SPACE,
+            key(manifest_key(base_hash)),
+            value(encode_inline_dictionary_binary_cas_manifest(
+                base.len() as u64,
+                first_hash.into_bytes(),
+                &compressed_base,
+            )),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("concurrent dictionary fixture should commit");
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("delta staging read should open");
+        let mut writes = storage.new_write_set();
+        BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&store, &mut writes)
+            .stage_file_payload(
+                &BlobPayload::from_bytes(updated.clone()),
+                Some(base_hash),
+                None,
+            )
+            .await
+            .expect("a non-current base dictionary should remain delta eligible");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("delta should commit");
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("delta read should open");
+        assert!(matches!(
+            load_manifest(&store, updated_hash)
+                .await
+                .expect("updated manifest should load"),
+            Some(BinaryCasManifest::InlineDelta { .. })
+                | Some(BinaryCasManifest::InlineDictionaryDelta { .. })
+        ));
+        assert_eq!(
+            load_bytes_many(&store, &[updated_hash])
+                .await
+                .expect("delta should read through its historical base dictionary")
                 .into_vec(),
             vec![Some(updated)]
         );
