@@ -4059,6 +4059,7 @@ where
                 }
             })
             .collect::<Vec<_>>();
+        let mut previous_from_packed = vec![false; previous_values.len()];
         debug_assert_eq!(loaded_previous_values.len(), 0);
         let previous_keys = sorted
             .iter()
@@ -4092,6 +4093,7 @@ where
             if !packed_is_newer {
                 continue;
             }
+            previous_from_packed[index] = true;
             *previous = Some(Bytes::from(encode_head_value(&HeadValueRef {
                 change_id: Some(packed_value.change_id),
                 commit_id: Some(packed_value.commit_id),
@@ -4222,10 +4224,14 @@ where
             let mut retained_deltas = Vec::with_capacity(sorted.len());
             let mut retained_previous = Vec::with_capacity(previous_values.len());
             let mut retained_created_ats = Vec::with_capacity(created_ats.len());
-            for ((delta, previous), created_at) in
-                sorted.into_iter().zip(previous_values).zip(created_ats)
+            for (((delta, previous), created_at), previous_from_packed) in sorted
+                .into_iter()
+                .zip(previous_values)
+                .zip(created_ats)
+                .zip(previous_from_packed)
             {
-                let identical_immutable_change = !delta.untracked
+                let identical_immutable_change = !previous_from_packed
+                    && !delta.untracked
                     && delta.schema_key
                         != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
                     && previous
@@ -8395,14 +8401,14 @@ mod tests {
             .await
             .expect("open packed checkpoint read");
         let checkpoint_head = CommitId::for_test_label("checkpoint-packed-head");
-        let checkpoint_change = ChangeId::for_test_label("checkpoint-packed-change");
+        let checkpoint_change = ChangeId::for_test_label("checkpoint-packed-base-change");
         let snapshot = r#"{"key":"packed-row"}"#;
         let delta = CurrentStateDeltaRef {
             schema_key: SCHEMA_KEY,
             file_id: None,
             entity_pk: &entity_pk,
             change_id: Some(checkpoint_change),
-            commit_id: Some(checkpoint_head),
+            commit_id: Some(generation),
             untracked: false,
             deleted: false,
             created_at,
@@ -8455,6 +8461,24 @@ mod tests {
         .value;
         assert!(packed[0].is_none());
         assert!(control[0].is_none());
+        let hot = PointReadPlan::new(
+            HOT_ROW_SPACE,
+            &[StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
+                branch_id: BRANCH_ID.to_owned(),
+                generation,
+                schema_key: SCHEMA_KEY.to_owned(),
+                entity_pk,
+                file_id: None,
+            })))],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("read materialized checkpoint row")
+        .value;
+        assert!(
+            hot[0].is_some(),
+            "checkpoint must materialize a packed-only row before retiring its base"
+        );
     }
 
     #[tokio::test]
