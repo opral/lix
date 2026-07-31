@@ -42,7 +42,7 @@ pub(crate) use storage::{
 pub(crate) use storage::{
     TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
     TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_SPACE,
-    TRACKED_STATE_TREE_CHUNK_SPACE,
+    TRACKED_STATE_TREE_CHUNK_SPACE, decode_change_locator, direct_change_locator,
 };
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateDeltaRef,

@@ -102,9 +102,21 @@ pub(crate) enum BlobLayout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InlineBlob {
-    pub(crate) codec: BinaryChunkCodec,
-    pub(crate) payload: Vec<u8>,
+pub(crate) enum InlineBlob {
+    Full {
+        codec: BinaryChunkCodec,
+        dictionary_hash: Option<BlobHash>,
+        payload: Vec<u8>,
+    },
+    Delta {
+        base_blob_hash: BlobHash,
+        prefix_len: u64,
+        suffix_len: u64,
+        middle_len: u64,
+        codec: BinaryChunkCodec,
+        dictionary_hash: Option<BlobHash>,
+        payload: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

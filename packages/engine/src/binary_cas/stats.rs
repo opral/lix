@@ -48,7 +48,12 @@ where
             stats.logical_blob_bytes += manifest.size_bytes();
             match manifest {
                 BinaryCasManifest::Empty { .. } => stats.empty_blob_rows += 1,
-                BinaryCasManifest::Inline { .. } => stats.inline_blob_rows += 1,
+                BinaryCasManifest::Inline { .. }
+                | BinaryCasManifest::InlineDelta { .. }
+                | BinaryCasManifest::InlineDictionary { .. }
+                | BinaryCasManifest::InlineDictionaryDelta { .. } => {
+                    stats.inline_blob_rows += 1;
+                }
                 BinaryCasManifest::SingleChunk { .. } => {
                     stats.single_chunk_blob_rows += 1;
                     stats.total_chunk_refs += 1;
