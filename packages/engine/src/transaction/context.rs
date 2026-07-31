@@ -4073,29 +4073,31 @@ where
                                         &self.staged_writes,
                                         &[state_hash, authority_hash],
                                     )
-                                    .await?;
-                                    let mut values = batch.into_vec().into_iter();
-                                    values
-                                        .next()
-                                        .flatten()
-                                        .zip(values.next().flatten())
-                                        .and_then(|(runtime, authority)| {
-                                            let runtime = decode_bound_plugin_checkpoint(
-                                                &runtime,
-                                                &actor_key.plugin_generation,
-                                            )?;
-                                            Some(DecodedDurablePluginCheckpoint {
-                                                runtime: WasmDurableDocumentCheckpoint::decode(
+                                    .await;
+                                    batch.ok().and_then(|batch| {
+                                        let mut values = batch.into_vec().into_iter();
+                                        values
+                                            .next()
+                                            .flatten()
+                                            .zip(values.next().flatten())
+                                            .and_then(|(runtime, authority)| {
+                                                let runtime = decode_bound_plugin_checkpoint(
                                                     &runtime,
-                                                )
-                                                .ok()?,
-                                                authorities:
-                                                    PluginEntityAuthorities::decode_checkpoint(
-                                                        &authority,
+                                                    &actor_key.plugin_generation,
+                                                )?;
+                                                Some(DecodedDurablePluginCheckpoint {
+                                                    runtime: WasmDurableDocumentCheckpoint::decode(
+                                                        &runtime,
                                                     )
                                                     .ok()?,
+                                                    authorities:
+                                                        PluginEntityAuthorities::decode_checkpoint(
+                                                            &authority,
+                                                        )
+                                                        .ok()?,
+                                                })
                                             })
-                                        })
+                                    })
                                 } else {
                                     None
                                 }
