@@ -1,4 +1,5 @@
 mod context;
+mod entity_field_index;
 mod reader;
 mod tracked_head;
 mod types;
@@ -6,6 +7,7 @@ pub(crate) mod visibility;
 
 #[allow(unused_imports)]
 pub(crate) use context::{LiveStateContext, LiveStateStoreReader};
+pub(crate) use entity_field_index::EntitySnapshotFieldIndexCache;
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;
 #[cfg(test)]

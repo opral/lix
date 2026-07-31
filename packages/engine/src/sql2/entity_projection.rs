@@ -360,23 +360,7 @@ fn parse_json_value(raw: &RawValue) -> Result<JsonValue, LixError> {
 }
 
 fn raw_string_text(raw: &RawValue) -> Result<Option<String>, LixError> {
-    let json = raw.get();
-    let trimmed = json.trim();
-    if trimmed == "null" {
-        return Ok(None);
-    }
-    if trimmed == "true" || trimmed == "false" {
-        return Ok(Some(trimmed.to_string()));
-    }
-    if trimmed.starts_with('"') {
-        return serde_json::from_str::<String>(json)
-            .map(Some)
-            .map_err(snapshot_decode_error);
-    }
-    serde_json::from_str::<JsonValue>(json)
-        .and_then(|value| serde_json::to_string(&value))
-        .map(Some)
-        .map_err(snapshot_decode_error)
+    crate::common::json_value_to_string(&parse_json_value(raw)?)
 }
 
 fn raw_bool(raw: &RawValue) -> Option<bool> {
