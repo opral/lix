@@ -47,6 +47,12 @@ use tracing::Instrument as _;
 
 type RowIndex = usize;
 
+// Below this size, per-row HOT writes are cheaper and keep repeated ordinary
+// INSERT transactions at one point-addressable current-state lookup. Packed
+// bases are reserved for bulk publication where avoiding row write
+// amplification dominates the cost of retaining one immutable manifest.
+const PACKED_CURRENT_BASE_MIN_ROWS: usize = 1_024;
+
 /// Commits prepared transaction rows into tracked history and unified current
 /// live state.
 ///
@@ -2118,7 +2124,7 @@ async fn stage_tracked_head(
             && !host_certified_live_increments.contains_key(&root.branch_id)
             && staged.selected_change_batches.is_empty()
             && tracked_deltas.len() == absence_guards.len()
-            && !tracked_deltas.is_empty()
+            && tracked_deltas.len() >= PACKED_CURRENT_BASE_MIN_ROWS
             && tracked_deltas.iter().all(|delta| {
                 !delta.untracked
                     && !delta.deleted
@@ -2135,6 +2141,7 @@ async fn stage_tracked_head(
             target: "lix_perf",
             can_publish_packed_current_base,
             tracked_delta_count = tracked_deltas.len(),
+            packed_min_rows = PACKED_CURRENT_BASE_MIN_ROWS,
             untracked_delta_count = untracked_deltas.len(),
             absence_guard_count = absence_guards.len(),
             is_checkpoint_publication,
@@ -3614,8 +3621,8 @@ mod tests {
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
     use crate::live_state::{
-        LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest,
-        LiveStateProjection, LiveStateRowRequest,
+        HOT_ROW_SPACE, LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest,
+        LiveStateProjection, LiveStateRowRequest, PACKED_CURRENT_BASE_SPACE,
     };
     use crate::storage::{
         CommitResult, GetManyResult, KeyRange, PutBatch, ScanChunk, ScanOptions, SpaceId, Storage,
@@ -3937,9 +3944,7 @@ mod tests {
                         .v10_marker_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if space == crate::live_state::HOT_ROW_SPACE.id
-                    || space == crate::live_state::HOT_FILE_SPACE.id
-                {
+                if space == HOT_ROW_SPACE.id || space == crate::live_state::HOT_FILE_SPACE.id {
                     self.counts
                         .row_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
@@ -3964,9 +3969,7 @@ mod tests {
             range: KeyRange,
             opts: ScanOptions,
         ) -> Result<ScanChunk, StorageError> {
-            if space == crate::live_state::HOT_ROW_SPACE.id
-                || space == crate::live_state::HOT_FILE_SPACE.id
-            {
+            if space == HOT_ROW_SPACE.id || space == crate::live_state::HOT_FILE_SPACE.id {
                 self.counts.row_scan_calls.fetch_add(1, Ordering::Relaxed);
             }
             if space == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
@@ -4044,6 +4047,14 @@ mod tests {
         assert!(
             !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
             "an ordinary tracked commit must not write commit-root metadata"
+        );
+        assert!(
+            writes.has_mutations_in_space(HOT_ROW_SPACE),
+            "a small ordinary tracked commit must retain point-addressable HOT state"
+        );
+        assert!(
+            !writes.has_mutations_in_space(PACKED_CURRENT_BASE_SPACE),
+            "a small ordinary tracked commit must not accumulate a packed manifest"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
