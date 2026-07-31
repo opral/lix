@@ -213,6 +213,25 @@ impl TransactionJson {
         )
     }
 
+    /// Revokes a row-content proof while retaining its canonical bytes.
+    ///
+    /// A typed frontend can certify against its pinned catalog before an
+    /// explicit transaction stages a schema amendment. In that case the
+    /// transport remains useful, but transaction normalization must decode
+    /// and validate it against the amended plan.
+    fn revoke_row_content_certificate(self) -> Self {
+        match self.storage {
+            TransactionJsonStorage::CertifiedShared {
+                normalized,
+                certificate: TransactionJsonCertificate::RowContent,
+            } => Self::from_unvalidated_shared_normalized_content(normalized),
+            TransactionJsonStorage::Certified { normalized } => {
+                Self::from_unvalidated_shared_normalized_content(normalized.as_ref().into())
+            }
+            storage => Self { storage },
+        }
+    }
+
     pub(crate) fn canonical_batch_certificate(
         &self,
     ) -> Option<WasmCanonicalJsonCertificateRef<'_>> {
@@ -658,6 +677,17 @@ impl RawWriteBatch {
 
     pub(crate) fn certified_preparation(&self) -> Option<CertifiedRawWriteBatchPreparation> {
         self.certified_preparation
+    }
+
+    /// Downgrades a batch proof to canonical transport after its schema plan
+    /// has been invalidated by transaction-local catalog changes.
+    pub(crate) fn revoke_certified_preparation(&mut self) {
+        self.certified_preparation = None;
+        for snapshot in &mut self.snapshots {
+            if let Some(value) = snapshot.take() {
+                *snapshot = Some(value.revoke_row_content_certificate());
+            }
+        }
     }
 
     pub(crate) fn reserve(&mut self, additional: usize) {

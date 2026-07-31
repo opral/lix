@@ -5084,7 +5084,23 @@ where
         // sample lazy so normalization errors retain precedence over scalar
         // provider calls.
         let mut default_timestamp = None;
-        if allow_homogeneous && let Some(certificate) = rows.certified_preparation() {
+        let certified_preparation = rows.certified_preparation();
+        let certified_domain =
+            certified_preparation.and_then(|_| homogeneous_row_normalization_domain(&rows));
+        let certified_plan_is_current = allow_homogeneous
+            && match certified_domain.as_ref() {
+                Some(domain) => !self
+                    .staged_writes
+                    .has_staged_schema_catalog_change(domain)?,
+                None => false,
+            };
+        if certified_preparation.is_some() && !certified_plan_is_current {
+            rows.revoke_certified_preparation();
+        }
+        if allow_homogeneous
+            && certified_plan_is_current
+            && let Some(certificate) = certified_preparation
+        {
             let timestamp = self.functions.call_timestamp();
             let mut prepared_rows = PreparedStateBatch::with_dense_capacity(row_count, row_count);
             for index in 0..row_count {
