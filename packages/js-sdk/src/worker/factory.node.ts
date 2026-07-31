@@ -1,4 +1,6 @@
 import { Worker } from "node:worker_threads";
+import { openLixBinding } from "../binding.node.js";
+import type { LixBinding, LixStorageConfig, TelemetryDispatch } from "../binding-types.js";
 import type {
 	WorkerConnection,
 	WorkerInput,
@@ -37,3 +39,11 @@ export function createWorkerConnection(): WorkerConnection {
 		},
 	};
 }
+
+/// Native Lix already owns a dedicated serialized engine actor. Routing it
+/// through a second JavaScript worker adds two message-port hops per query
+/// without adding isolation or concurrency.
+export const openDirectLixBinding = (
+	storage: LixStorageConfig,
+	telemetry?: TelemetryDispatch,
+): Promise<LixBinding> => openLixBinding(storage, telemetry);
