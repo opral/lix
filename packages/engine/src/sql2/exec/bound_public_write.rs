@@ -5,7 +5,7 @@ use datafusion::common::ScalarValue;
 use serde_json::Value as JsonValue;
 use tracing::Instrument;
 
-use crate::catalog::{TypedJsonObjectFieldRef, TypedJsonScalarRef};
+use crate::catalog::TypedJsonScalarRef;
 use crate::changelog::CommitId;
 use crate::common::{
     ExecuteStatementMetadata, RequestBlobSpliceProvenance, SharedStr, validate_row_metadata,
@@ -2582,6 +2582,24 @@ struct DirectParameterInsertColumn {
     read_nullable: bool,
 }
 
+fn append_canonical_json_string(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
+    if value
+        .as_bytes()
+        .iter()
+        .all(|&byte| byte >= b' ' && byte != b'"' && byte != b'\\')
+    {
+        output.push(b'"');
+        output.extend_from_slice(value.as_bytes());
+        output.push(b'"');
+        return Ok(());
+    }
+    serde_json::to_writer(output, value).map_err(|error| {
+        LixError::unknown(format!(
+            "certified INSERT value serialization failed: {error}"
+        ))
+    })
+}
+
 fn certified_direct_parameter_insert_batch(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
@@ -2718,12 +2736,18 @@ fn certified_direct_parameter_insert_batch(
     let mut previous_primary_key_row = None;
     let mut unordered_entity_pks = None::<std::collections::HashSet<EntityPk>>;
     let mut primary_key_parts = Vec::with_capacity(primary_key_columns.len());
-    let mut typed_fields = Vec::with_capacity(columns.len());
+    let field_names = columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    let row_certificate =
+        schema_plan.certify_typed_object_layout(&layout.schema_key, &field_names)?;
+    let mut typed_values = Vec::with_capacity(columns.len());
 
     for statement_index in 0..row_count {
         let row_result = (|| -> Result<bool, LixError> {
             let start = normalized.len();
-            typed_fields.clear();
+            typed_values.clear();
             normalized.push(b'{');
             for (field_index, column) in columns.iter().enumerate() {
                 if field_index != 0 {
@@ -2748,23 +2772,13 @@ fn certified_direct_parameter_insert_batch(
                         ));
                     }
                     normalized.extend_from_slice(b"null");
-                    typed_fields.push(TypedJsonObjectFieldRef {
-                        name: &column.name,
-                        value: TypedJsonScalarRef::Null,
-                    });
+                    typed_values.push(TypedJsonScalarRef::Null);
                     continue;
                 }
                 match (column.column_type, parameter_value) {
                     (EntityColumnType::String, DirectParameterValue::String(value)) => {
-                        serde_json::to_writer(&mut normalized, value).map_err(|error| {
-                            LixError::unknown(format!(
-                                "certified INSERT value serialization failed: {error}"
-                            ))
-                        })?;
-                        typed_fields.push(TypedJsonObjectFieldRef {
-                            name: &column.name,
-                            value: TypedJsonScalarRef::String(value),
-                        });
+                        append_canonical_json_string(&mut normalized, value)?;
+                        typed_values.push(TypedJsonScalarRef::String(value));
                     }
                     (EntityColumnType::Boolean, DirectParameterValue::Boolean(value)) => {
                         normalized.extend_from_slice(if value {
@@ -2772,10 +2786,7 @@ fn certified_direct_parameter_insert_batch(
                         } else {
                             b"false".as_slice()
                         });
-                        typed_fields.push(TypedJsonObjectFieldRef {
-                            name: &column.name,
-                            value: TypedJsonScalarRef::Boolean,
-                        });
+                        typed_values.push(TypedJsonScalarRef::Boolean);
                     }
                     _ => unreachable!("direct parameter column type was certified"),
                 }
@@ -2802,19 +2813,6 @@ fn certified_direct_parameter_insert_batch(
                 }
             }
             let derived_entity_pk = if shared_string_primary_keys {
-                EntityPk::validate_external_parts(
-                    &primary_key_parts,
-                    &spec.primary_key_component_types,
-                )
-                .map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_SCHEMA_VALIDATION,
-                        format!(
-                            "INSERT failed to derive entity primary key for schema '{}': {error}",
-                            layout.schema_key
-                        ),
-                    )
-                })?;
                 None
             } else {
                 Some(
@@ -2833,11 +2831,7 @@ fn certified_direct_parameter_insert_batch(
                     })?,
                 )
             };
-            schema_plan.certify_typed_object_row(
-                &layout.schema_key,
-                &typed_fields,
-                &primary_key_parts,
-            )?;
+            row_certificate.certify_row(&typed_values, &primary_key_parts)?;
             if shared_string_primary_keys {
                 if let Some(previous_row) = previous_primary_key_row {
                     let ordering = primary_key_columns
@@ -4958,6 +4952,16 @@ fn entity_action(op: &BoundWriteOp) -> &'static str {
 mod primary_key_route_tests {
     use super::*;
     use crate::sql2::bind::expr::{BoundColumnRef, BoundParamRef};
+
+    #[test]
+    fn canonical_string_fast_path_matches_serde_for_safe_and_escaped_utf8() {
+        for value in ["plain", "café", "quote\"", "slash\\", "line\nfeed", "nul\0"] {
+            let mut actual = Vec::new();
+            append_canonical_json_string(&mut actual, value)
+                .expect("canonical string should serialize");
+            assert_eq!(actual, serde_json::to_vec(value).unwrap());
+        }
+    }
 
     #[test]
     fn compiles_single_text_primary_key_parameter_once() {

@@ -416,10 +416,77 @@ pub(crate) enum TypedJsonScalarRef<'a> {
     String(&'a str),
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TypedJsonObjectFieldRef<'a> {
-    pub(crate) name: &'a str,
-    pub(crate) value: TypedJsonScalarRef<'a>,
+/// Batch-stable validation compiled once for a fixed typed object layout.
+///
+/// SQL and future typed producers reuse the resolved property validators and
+/// primary-key column positions for every row instead of repeating structural
+/// schema work in the hot loop.
+pub(crate) struct TypedJsonObjectLayoutCertificate<'a> {
+    schema_key: &'a str,
+    field_names: Vec<String>,
+    field_validations: Vec<Option<&'a FastValueValidation>>,
+    primary_key_field_indices: Vec<usize>,
+    primary_key_component_types: &'a [crate::entity_pk::EntityPkComponentType],
+}
+
+impl TypedJsonObjectLayoutCertificate<'_> {
+    pub(crate) fn certify_row(
+        &self,
+        values: &[TypedJsonScalarRef<'_>],
+        entity_pk: &[&str],
+    ) -> Result<(), LixError> {
+        if values.len() != self.field_validations.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "typed object row does not match its certified layout",
+            ));
+        }
+        for ((name, validation), value) in self
+            .field_names
+            .iter()
+            .zip(&self.field_validations)
+            .zip(values.iter().copied())
+        {
+            if validation.is_some_and(|validation| !validation.accepts_typed(value)) {
+                return Err(typed_object_validation_error(
+                    self.schema_key,
+                    &format!("property '{name}' does not satisfy its schema"),
+                ));
+            }
+        }
+        if entity_pk.len() != self.primary_key_field_indices.len() {
+            return Err(typed_object_validation_error(
+                self.schema_key,
+                "snapshot primary-key component count does not match the emitted entity_pk",
+            ));
+        }
+        for (&field_index, expected) in self.primary_key_field_indices.iter().zip(entity_pk) {
+            let actual = match values[field_index] {
+                TypedJsonScalarRef::String(value) => Some(value),
+                TypedJsonScalarRef::Null | TypedJsonScalarRef::Boolean => None,
+            };
+            if actual != Some(*expected) {
+                return Err(typed_object_validation_error(
+                    self.schema_key,
+                    &format!(
+                        "snapshot primary-key property '{}' does not match the emitted entity_pk",
+                        self.field_names[field_index]
+                    ),
+                ));
+            }
+        }
+        EntityPk::validate_external_parts(entity_pk, self.primary_key_component_types).map_err(
+            |error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!(
+                        "typed entity_pk is invalid for schema '{}': {error}",
+                        self.schema_key
+                    ),
+                )
+            },
+        )
+    }
 }
 
 impl SchemaPlan {
@@ -437,18 +504,11 @@ impl SchemaPlan {
             .is_some_and(|plan| plan.accepts(value))
     }
 
-    /// Certifies one already-typed object row without constructing or parsing
-    /// a JSON DOM.
-    ///
-    /// Typed producers can keep scalar columns in their native representation,
-    /// validate them against the same compiled schema plan, and serialize
-    /// canonical storage bytes only once.
-    pub(crate) fn certify_typed_object_row(
-        &self,
+    pub(crate) fn certify_typed_object_layout<'a>(
+        &'a self,
         schema_key: &str,
-        fields: &[TypedJsonObjectFieldRef<'_>],
-        entity_pk: &[&str],
-    ) -> Result<(), LixError> {
+        field_names: &[&str],
+    ) -> Result<TypedJsonObjectLayoutCertificate<'a>, LixError> {
         if !self.accepts_canonical_certificate() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -468,7 +528,7 @@ impl SchemaPlan {
             .fast_object_validation
             .as_ref()
             .expect("certificate eligibility requires fast object validation");
-        if fields.len() < validation.min_properties {
+        if field_names.len() < validation.min_properties {
             return Err(typed_object_validation_error(
                 &self.key.schema_key,
                 "object has fewer properties than minProperties",
@@ -477,71 +537,52 @@ impl SchemaPlan {
         if let Some(required) = validation
             .required
             .iter()
-            .find(|required| !fields.iter().any(|field| field.name == required.as_str()))
+            .find(|required| !field_names.contains(&required.as_str()))
         {
             return Err(typed_object_validation_error(
                 &self.key.schema_key,
                 &format!("required property '{required}' is missing"),
             ));
         }
-        for field in fields {
-            let accepted = validation
-                .properties
-                .get(field.name)
-                .map_or(validation.additional_properties, |property| {
-                    property.accepts_typed(field.value)
-                });
-            if !accepted {
-                return Err(typed_object_validation_error(
-                    &self.key.schema_key,
-                    &format!("property '{}' does not satisfy its schema", field.name),
-                ));
+        let mut field_validations = Vec::with_capacity(field_names.len());
+        for &name in field_names {
+            match validation.properties.get(name) {
+                Some(property) => field_validations.push(Some(property)),
+                None if validation.additional_properties => field_validations.push(None),
+                None => {
+                    return Err(typed_object_validation_error(
+                        &self.key.schema_key,
+                        &format!("property '{name}' does not satisfy its schema"),
+                    ));
+                }
             }
         }
-
         let primary_key_paths = self
             .primary_key
             .as_deref()
             .expect("certificate eligibility requires a primary key");
-        if primary_key_paths.len() != entity_pk.len() {
-            return Err(typed_object_validation_error(
-                &self.key.schema_key,
-                "snapshot primary-key component count does not match the emitted entity_pk",
-            ));
-        }
-        for (path, expected) in primary_key_paths.iter().zip(entity_pk) {
+        let mut primary_key_field_indices = Vec::with_capacity(primary_key_paths.len());
+        for path in primary_key_paths {
             let [name] = path.as_slice() else {
                 unreachable!("certificate eligibility requires top-level primary keys");
             };
-            let actual =
-                fields
-                    .iter()
-                    .find(|field| field.name == name)
-                    .and_then(|field| match field.value {
-                        TypedJsonScalarRef::String(value) => Some(value),
-                        TypedJsonScalarRef::Null | TypedJsonScalarRef::Boolean => None,
-                    });
-            if actual != Some(*expected) {
+            let Some(field_index) = field_names.iter().position(|field| field == name) else {
                 return Err(typed_object_validation_error(
                     &self.key.schema_key,
-                    &format!(
-                        "snapshot primary-key property '{name}' does not match the emitted entity_pk"
-                    ),
+                    &format!("required primary-key property '{name}' is missing"),
                 ));
-            }
+            };
+            primary_key_field_indices.push(field_index);
         }
-        let component_types = self
-            .primary_key_component_types
-            .as_deref()
-            .expect("certificate eligibility requires typed primary-key components");
-        EntityPk::validate_external_parts(entity_pk, component_types).map_err(|error| {
-            LixError::new(
-                LixError::CODE_SCHEMA_VALIDATION,
-                format!(
-                    "typed entity_pk is invalid for schema '{}': {error}",
-                    self.key.schema_key
-                ),
-            )
+        Ok(TypedJsonObjectLayoutCertificate {
+            schema_key: &self.key.schema_key,
+            field_names: field_names.iter().map(|name| (*name).to_string()).collect(),
+            field_validations,
+            primary_key_field_indices,
+            primary_key_component_types: self
+                .primary_key_component_types
+                .as_deref()
+                .expect("certificate eligibility requires typed primary-key components"),
         })
     }
 
@@ -3031,36 +3072,22 @@ mod tests {
         .expect("typed-row schema should compile");
         assert!(plan.accepts_canonical_certificate());
 
-        let fields = [
-            TypedJsonObjectFieldRef {
-                name: "active",
-                value: TypedJsonScalarRef::Boolean,
-            },
-            TypedJsonObjectFieldRef {
-                name: "id",
-                value: TypedJsonScalarRef::String("row-1"),
-            },
+        let layout = plan
+            .certify_typed_object_layout("typed_rows", &["active", "id"])
+            .expect("typed-row layout should certify");
+        let values = [
+            TypedJsonScalarRef::Boolean,
+            TypedJsonScalarRef::String("row-1"),
         ];
-        plan.certify_typed_object_row("typed_rows", &fields, &["row-1"])
+        layout
+            .certify_row(&values, &["row-1"])
             .expect("matching typed row should certify");
 
-        let short_id = [
-            fields[0],
-            TypedJsonObjectFieldRef {
-                name: "id",
-                value: TypedJsonScalarRef::String("x"),
-            },
-        ];
+        let short_id = [TypedJsonScalarRef::Boolean, TypedJsonScalarRef::String("x")];
+        assert!(layout.certify_row(&short_id, &["x"]).is_err());
+        assert!(layout.certify_row(&values, &["other"]).is_err());
         assert!(
-            plan.certify_typed_object_row("typed_rows", &short_id, &["x"])
-                .is_err()
-        );
-        assert!(
-            plan.certify_typed_object_row("typed_rows", &fields, &["other"])
-                .is_err()
-        );
-        assert!(
-            plan.certify_typed_object_row("other", &fields, &["row-1"])
+            plan.certify_typed_object_layout("other", &["active", "id"])
                 .is_err()
         );
     }

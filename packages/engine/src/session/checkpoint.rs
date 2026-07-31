@@ -113,6 +113,7 @@ where
                         };
                         let mut selected_changes =
                             StagedCommitChangeBatchBuilder::with_capacity(entries.len());
+                        let mut source_membership_exact = true;
                         for entry in entries.into_iter().filter(|entry| {
                             entry.identity.schema_key() != CHECKPOINT_MARKER_SCHEMA_KEY
                         }) {
@@ -126,9 +127,14 @@ where
                                     ),
                                 )
                             })?;
-                            push_selected_change(&mut selected_changes, row, entry.kind);
+                            source_membership_exact &=
+                                push_selected_change(&mut selected_changes, row, entry.kind);
                         }
-                        selected_changes.finish()
+                        if source_membership_exact {
+                            selected_changes.finish_source_certified()
+                        } else {
+                            selected_changes.finish()
+                        }
                     };
                     gc_state.checkpoint_sequence = gc_state
                         .checkpoint_sequence
@@ -205,7 +211,7 @@ fn push_selected_change(
     selected_changes: &mut StagedCommitChangeBatchBuilder,
     row: TrackedStateDiffRow,
     kind: TrackedStateDiffKind,
-) {
+) -> bool {
     // A changelog change durably stores one timestamp, which rebuild uses for
     // both timestamps when the entity is absent from the parent checkpoint.
     // Canonicalize newly added rows to that representation so checkpoint roots
@@ -214,6 +220,7 @@ fn push_selected_change(
         TrackedStateDiffKind::Added => row.updated_at,
         TrackedStateDiffKind::Modified | TrackedStateDiffKind::Removed => row.created_at,
     };
+    let source_membership_exact = created_at == row.created_at;
     let deleted = row.deleted;
     let source_commit_id = row.commit_id;
     let change_id = row.change_id;
@@ -226,12 +233,54 @@ fn push_selected_change(
         created_at,
         updated_at,
     );
+    source_membership_exact
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CHECKPOINT_GC_MIN_AGE, checkpoint_gc_due};
+    use super::{CHECKPOINT_GC_MIN_AGE, checkpoint_gc_due, push_selected_change};
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
+    use crate::entity_pk::EntityPk;
     use crate::gc::CheckpointGcState;
+    use crate::tracked_state::{
+        TrackedStateDiffIdentity, TrackedStateDiffKind, TrackedStateDiffRow, TrackedStateKey,
+    };
+    use crate::transaction::types::StagedCommitChangeBatchBuilder;
+
+    #[test]
+    fn canonicalized_added_timestamp_declines_source_membership_certificate() {
+        let created_at = LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z");
+        let updated_at = LixTimestamp::expect_parse("updated_at", "2026-01-02T00:00:00Z");
+        let mut selected = StagedCommitChangeBatchBuilder::with_capacity(1);
+        let source_membership_exact = push_selected_change(
+            &mut selected,
+            TrackedStateDiffRow {
+                identity: TrackedStateDiffIdentity::from_key(TrackedStateKey {
+                    schema_key: "test_schema".to_string(),
+                    file_id: None,
+                    entity_pk: EntityPk::single("entity"),
+                }),
+                deleted: false,
+                created_at,
+                updated_at,
+                change_id: ChangeId::for_test_label("checkpoint-canonicalized-change"),
+                commit_id: CommitId::for_test_label("checkpoint-canonicalized-commit"),
+            },
+            TrackedStateDiffKind::Added,
+        );
+        let selected = if source_membership_exact {
+            selected.finish_source_certified()
+        } else {
+            selected.finish()
+        };
+
+        assert!(!selected.source_membership_certified());
+        assert_eq!(
+            selected.iter().next().expect("one selected row").created_at,
+            updated_at
+        );
+    }
 
     fn state(sequence: u64, last_gc_sequence: u64) -> CheckpointGcState {
         CheckpointGcState {
