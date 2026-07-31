@@ -87,6 +87,7 @@ pub(crate) use write::{
     create_write_plan_template_from_parsed, diff_command_query,
     execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,
     execute_write_logical_plan_value_batch, parameter_record_batch,
+    write_plan_requires_post_stage_returning_checkpoint,
 };
 
 pub(crate) enum SqlLogicalPlan {

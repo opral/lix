@@ -111,6 +111,7 @@ use crate::transaction::normalization::{
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{
     PreparedStateRowOverlay, PreparedWriteSet, TransactionWriteBuffer,
+    TransactionWriteBufferCheckpoint,
 };
 use crate::transaction::types::{
     PreparedRowFacts, PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
@@ -414,6 +415,15 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
     plugin_generation_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     plugin_generation_upgrade_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+/// State which must be restored when `RETURNING` evaluation fails after a
+/// write has been staged in an explicit SQL transaction.
+pub(crate) struct SqlStatementCheckpoint {
+    staged_writes: TransactionWriteBufferCheckpoint,
+    filesystem_path_index_epoch: usize,
+    pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
+    trust_filesystem_planner: bool,
 }
 
 #[derive(Clone)]
@@ -970,6 +980,65 @@ where
     /// rely on.
     pub(crate) async fn rollback(mut self) -> Result<(), LixError> {
         self.discard_pending_plugin_actor_publications().await;
+        Ok(())
+    }
+
+    /// Captures the mutable state an explicit SQL statement can change before
+    /// its `RETURNING` projection is evaluated.
+    ///
+    /// Most write errors occur before staging. Post-image `RETURNING` paths
+    /// intentionally stage first, though, so this checkpoint gives those paths
+    /// normal statement atomicity without adding work to the automatic-write
+    /// fast path.
+    pub(crate) fn begin_sql_statement_checkpoint(
+        &self,
+    ) -> Result<SqlStatementCheckpoint, LixError> {
+        Ok(SqlStatementCheckpoint {
+            staged_writes: self.staged_writes.checkpoint()?,
+            filesystem_path_index_epoch: self.filesystem_path_index_epoch.load(Ordering::SeqCst),
+            pending_file_view_mutations: self.pending_file_view_mutations.clone(),
+            trust_filesystem_planner: self.trust_filesystem_planner,
+        })
+    }
+
+    /// Restores an explicit transaction after a statement failed during
+    /// post-stage projection. Earlier successful statements remain staged.
+    pub(crate) async fn rollback_sql_statement_checkpoint(
+        &mut self,
+        checkpoint: SqlStatementCheckpoint,
+    ) -> Result<(), LixError> {
+        let SqlStatementCheckpoint {
+            staged_writes,
+            filesystem_path_index_epoch,
+            pending_file_view_mutations,
+            trust_filesystem_planner,
+        } = checkpoint;
+        self.staged_writes.restore(staged_writes)?;
+        self.filesystem_path_index_epoch
+            .store(filesystem_path_index_epoch, Ordering::SeqCst);
+        // The cache is derived from the discarded post-image. Evict it rather
+        // than cloning potentially large indexes solely for this error path.
+        self.filesystem_path_index_cache.clear();
+        self.pending_file_view_mutations = pending_file_view_mutations;
+        self.trust_filesystem_planner = trust_filesystem_planner;
+        // A failed statement may have chained a predecessor actor successor.
+        // Its prior document can no longer be restored byte-for-byte, so
+        // conservatively discard all unpublished actor cache work. The staged
+        // durable rows are restored above; a later read cold-opens from them.
+        let publications = std::mem::take(&mut self.pending_plugin_actor_publications);
+        let discarded_view_keys = publications
+            .iter()
+            .map(|publication| publication.session_key().clone())
+            .collect::<Vec<_>>();
+        discard_plugin_actor_publications(publications).await;
+        for key in discarded_view_keys {
+            self.pending_file_view_mutations
+                .insert(key.clone(), SessionFileViewMutation::Remove { key });
+        }
+        // Registered-schema normalization uses copy-on-write catalogs. Rebuild
+        // lazily from the restored staging overlay so failed registrations do
+        // not survive in a cached catalog while earlier ones still do.
+        self.schema_resolver.clear_cached_catalogs();
         Ok(())
     }
 
@@ -5537,6 +5606,7 @@ where
             validate_certified_fresh_plugin_file_import(&live_state, certificate).await?;
             return Ok(());
         }
+        let staged = self.staged_writes.staging_overlay()?;
         let validation_index = prepared_writes.validation_index();
         for scope in validation_index.schema_scopes() {
             #[cfg(feature = "storage-benches")]
@@ -5545,7 +5615,7 @@ where
             let live_state = self.live_state.reader(read);
             let schema_catalog = self
                 .schema_resolver
-                .catalog_for_validation(&live_state, scope)
+                .catalog_for_validation(&live_state, &staged, scope)
                 .await?;
             let mut validation_input = TransactionValidationInput::new(
                 &branch_prepared_writes,

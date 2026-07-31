@@ -3,6 +3,17 @@ use std::sync::{Arc, Mutex};
 use crate::cel::CelFunctionProvider;
 use crate::common::LixTimestamp;
 
+/// Restorable runtime-function state captured around an explicit SQL
+/// statement. Only deterministic providers have durable state that must be
+/// rewound when a post-stage statement error is rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FunctionProviderCheckpoint {
+    DeterministicSequence {
+        next_sequence: i64,
+        highest_seen: Option<i64>,
+    },
+}
+
 /// Engine-owned runtime function provider trait.
 pub(crate) trait FunctionProvider: Send {
     fn uuid_v7(&mut self) -> uuid::Uuid;
@@ -11,6 +22,12 @@ pub(crate) trait FunctionProvider: Send {
     fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
         None
     }
+
+    fn statement_checkpoint(&self) -> Option<FunctionProviderCheckpoint> {
+        None
+    }
+
+    fn restore_statement_checkpoint(&mut self, _checkpoint: FunctionProviderCheckpoint) {}
 }
 
 #[derive(Clone)]
@@ -46,6 +63,19 @@ impl FunctionProviderHandle {
         match self {
             Self::System => None,
             Self::Shared(provider) => provider.deterministic_sequence_persist_highest_seen(),
+        }
+    }
+
+    pub(crate) fn statement_checkpoint(&self) -> Option<FunctionProviderCheckpoint> {
+        match self {
+            Self::System => None,
+            Self::Shared(provider) => provider.statement_checkpoint(),
+        }
+    }
+
+    pub(crate) fn restore_statement_checkpoint(&self, checkpoint: FunctionProviderCheckpoint) {
+        if let Self::Shared(provider) = self {
+            provider.restore_statement_checkpoint(checkpoint);
         }
     }
 }
@@ -112,6 +142,14 @@ where
     pub(crate) fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
         self.with_lock(FunctionProvider::deterministic_sequence_persist_highest_seen)
     }
+
+    pub(crate) fn statement_checkpoint(&self) -> Option<FunctionProviderCheckpoint> {
+        self.with_lock(FunctionProvider::statement_checkpoint)
+    }
+
+    pub(crate) fn restore_statement_checkpoint(&self, checkpoint: FunctionProviderCheckpoint) {
+        self.with_lock_mut(|provider| provider.restore_statement_checkpoint(checkpoint));
+    }
 }
 
 impl<P> CelFunctionProvider for SharedFunctionProvider<P>
@@ -142,6 +180,14 @@ where
     fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
         Self::deterministic_sequence_persist_highest_seen(self)
     }
+
+    fn statement_checkpoint(&self) -> Option<FunctionProviderCheckpoint> {
+        Self::statement_checkpoint(self)
+    }
+
+    fn restore_statement_checkpoint(&mut self, checkpoint: FunctionProviderCheckpoint) {
+        Self::restore_statement_checkpoint(self, checkpoint);
+    }
 }
 
 impl<T> FunctionProvider for Box<T>
@@ -158,6 +204,14 @@ where
 
     fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
         (**self).deterministic_sequence_persist_highest_seen()
+    }
+
+    fn statement_checkpoint(&self) -> Option<FunctionProviderCheckpoint> {
+        (**self).statement_checkpoint()
+    }
+
+    fn restore_statement_checkpoint(&mut self, checkpoint: FunctionProviderCheckpoint) {
+        (**self).restore_statement_checkpoint(checkpoint);
     }
 }
 

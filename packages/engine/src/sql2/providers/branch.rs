@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -38,9 +38,10 @@ use crate::transaction::types::{
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{
-    PlannedDml, PlannedScan, TableSpec, projected_schema, register_spec_table, row_source,
+    DmlReturning, InsertApply, PlannedDml, PlannedScan, TableSpec, projected_schema,
+    register_spec_table, row_source, take_record_batch_rows,
 };
-use super::upsert::{StagedUpsert, UpsertSupport, materialize_omitted_column};
+use super::upsert::{StagedUpsert, UpsertReturningRow, UpsertSupport, materialize_omitted_column};
 use super::values::{required_bool_value, required_string_value};
 
 pub(super) async fn register_lix_branch_read_provider(
@@ -185,6 +186,77 @@ impl TableSpec for BranchSpec {
         Ok(count)
     }
 
+    async fn plan_insert_with_returning(
+        &self,
+        write_ctx: SqlWriteContext,
+        _input: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        returning: DmlReturning,
+    ) -> Result<InsertApply> {
+        let branch_ref = Arc::clone(&self.branch_ref);
+        Ok(Arc::new(move |batches| {
+            let write_ctx = write_ctx.clone();
+            let branch_ref = Arc::clone(&branch_ref);
+            let returning = returning.clone();
+            async move {
+                let default_commit_id = branch_ref
+                    .load_head(&write_ctx.active_branch_id())
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?
+                    .map(|head| head.commit_id)
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "INSERT into lix_branch could not resolve active branch head"
+                                .to_string(),
+                        )
+                    })?;
+                let row_capacity = batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+                    .saturating_mul(2);
+                let mut stage_rows = RawWriteBatch::with_capacity(row_capacity);
+                let mut post_rows = Vec::new();
+                let mut count = 0u64;
+                for batch in batches {
+                    let branch_rows = branch_insert_rows_from_batch(&batch, &default_commit_id)?;
+                    count = count
+                        .checked_add(u64::try_from(branch_rows.len()).map_err(|_| {
+                            DataFusionError::Execution("INSERT row count overflow".to_string())
+                        })?)
+                        .ok_or_else(|| {
+                            DataFusionError::Execution("INSERT row count overflow".to_string())
+                        })?;
+                    for row in &branch_rows {
+                        push_branch_stage_rows(
+                            &mut stage_rows,
+                            row.clone(),
+                            TransactionWriteOperation::Insert,
+                            false,
+                        );
+                    }
+                    post_rows.extend(branch_rows);
+                }
+
+                if !stage_rows.is_empty() {
+                    write_ctx
+                        .stage_write(TransactionWrite::Rows {
+                            mode: TransactionWriteMode::Insert,
+                            rows: stage_rows,
+                        })
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                }
+
+                let post_image = LIX_BRANCH_COLS
+                    .build(lix_branch_schema(), &post_rows)
+                    .map_err(branch_batch_error)?;
+                returning.capture(returning.project(&post_image)?);
+                Ok(count)
+            }
+            .boxed()
+        }))
+    }
+
     fn validate_update_assignments(&self, assignments: &[(String, Expr)]) -> Result<()> {
         validate_lix_branch_update_assignments(assignments)
     }
@@ -275,6 +347,60 @@ impl TableSpec for BranchSpec {
                             .map_err(lix_error_to_datafusion_error)?;
                     }
 
+                    Ok(count)
+                }
+                .boxed()
+            }),
+        })
+    }
+
+    async fn plan_update_with_returning(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        returning: DmlReturning,
+    ) -> Result<PlannedDml> {
+        let table_schema = lix_branch_schema();
+        Ok(PlannedDml {
+            source: self.write_row_source(filters),
+            apply: Arc::new(move |matched_batch| {
+                let write_ctx = write_ctx.clone();
+                let assignments = assignments.clone();
+                let table_schema = Arc::clone(&table_schema);
+                let returning = returning.clone();
+                async move {
+                    let branch_rows =
+                        branch_update_rows_from_batch(&matched_batch, &assignments, &table_schema)?;
+                    reject_protected_branch_updates(&branch_rows)?;
+                    let count = u64::try_from(branch_rows.len()).map_err(|_| {
+                        DataFusionError::Execution("UPDATE row count overflow".to_string())
+                    })?;
+                    let post_image = LIX_BRANCH_COLS
+                        .build(lix_branch_schema(), &branch_rows)
+                        .map_err(branch_batch_error)?;
+                    let mut rows =
+                        RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
+                    for row in branch_rows {
+                        push_branch_stage_rows(
+                            &mut rows,
+                            row,
+                            TransactionWriteOperation::Update,
+                            false,
+                        );
+                    }
+
+                    if !rows.is_empty() {
+                        write_ctx
+                            .stage_write(TransactionWrite::Rows {
+                                mode: TransactionWriteMode::Replace,
+                                rows,
+                            })
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                    }
+
+                    returning.capture(returning.project(&post_image)?);
                     Ok(count)
                 }
                 .boxed()
@@ -380,6 +506,86 @@ impl UpsertSupport for BranchSpec {
             .map(|_| Some(default_commit_id.to_string()))
             .collect::<StringArray>();
         materialize_omitted_column(&materialized, "commit_id", Arc::new(values))
+    }
+
+    async fn materialize_returning_insert_defaults(
+        &self,
+        write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        // Branch identity is always caller-provided. Reuse the existing
+        // excluded-default materialization so a conflict update and a fresh
+        // insert observe the same hidden/head defaults.
+        self.materialize_excluded_defaults(write_ctx, proposed)
+            .await
+    }
+
+    async fn capture_upsert_returning(
+        &self,
+        write_ctx: &SqlWriteContext,
+        affected_rows: Vec<UpsertReturningRow>,
+        returning: DmlReturning,
+    ) -> Result<()> {
+        let keys = affected_rows
+            .iter()
+            .map(|row| {
+                required_string_value(
+                    row.batch(),
+                    row.row_index(),
+                    "id",
+                    "INSERT ON CONFLICT RETURNING lix_branch",
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if keys.is_empty() {
+            let empty = RecordBatch::new_empty(lix_branch_schema());
+            returning.capture(returning.project(&empty)?);
+            return Ok(());
+        }
+
+        // Build fresh readers rather than reuse the session's cached branch
+        // ref: a conflict update may have just staged a new branch head.
+        let live_state: Arc<dyn LiveStateReader> =
+            Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let branch_ref: Arc<dyn BranchRefReader> = Arc::new(
+            crate::sql2::WriteContextBranchRefReader::new(write_ctx.clone()),
+        );
+        let rows = load_branch_rows(live_state, branch_ref, BranchHeadReadStrategy::Point)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        let batch = LIX_BRANCH_COLS
+            .build(lix_branch_schema(), &rows)
+            .map_err(branch_batch_error)?;
+        let mut post_rows = BTreeMap::new();
+        for row_index in 0..batch.num_rows() {
+            let id = required_string_value(
+                &batch,
+                row_index,
+                "id",
+                "INSERT ON CONFLICT RETURNING lix_branch",
+            )?;
+            let index = u32::try_from(row_index).map_err(|_| {
+                DataFusionError::Execution("lix_branch RETURNING row index overflow".into())
+            })?;
+            if post_rows.insert(id.clone(), index).is_some() {
+                return Err(DataFusionError::Execution(format!(
+                    "lix_branch RETURNING post-image contains duplicate row for id '{id}'"
+                )));
+            }
+        }
+        let indices = keys
+            .iter()
+            .map(|id| {
+                post_rows.get(id).copied().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "lix_branch RETURNING post-image is missing inserted or updated row '{id}'"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let post_image = take_record_batch_rows(&batch, &indices)?;
+        returning.capture(returning.project(&post_image)?);
+        Ok(())
     }
 
     async fn scan_conflict_candidates(

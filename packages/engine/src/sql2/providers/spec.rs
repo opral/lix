@@ -15,8 +15,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BooleanArray, UInt64Array};
-use datafusion::arrow::compute::{SortOptions, and, filter_record_batch};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, UInt32Array, UInt64Array};
+use datafusion::arrow::compute::{SortOptions, and, filter_record_batch, take};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
@@ -71,10 +71,12 @@ where
 pub(super) type DmlApply =
     Arc<dyn Fn(RecordBatch) -> BoxFuture<'static, Result<u64>> + Send + Sync>;
 
-/// Optional pre-delete projection captured from the exact batch that will be
-/// handed to a DML apply handler.  The capture is deliberately separate from
-/// the physical DML count output: callers continue to receive an accurate
-/// affected-row count even when a delete stages additional cascade rows.
+/// Optional DML projection captured by a write handler. DELETE captures its
+/// pre-image in [`SpecDmlExec`], while INSERT and UPDATE providers capture
+/// their post-image only after the staged write has succeeded. The capture is
+/// deliberately separate from the physical DML count output: callers still
+/// receive an accurate affected-row count even when a write stages auxiliary
+/// rows (for example, filesystem descriptors or cascades).
 #[derive(Clone)]
 pub(crate) struct DmlReturning {
     schema: SchemaRef,
@@ -105,7 +107,7 @@ impl DmlReturning {
         &self.required_columns
     }
 
-    fn project(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    pub(super) fn project(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let columns = self
             .expressions
             .iter()
@@ -118,21 +120,21 @@ impl DmlReturning {
         RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(DataFusionError::from)
     }
 
-    fn capture(&self, batch: RecordBatch) {
+    pub(super) fn capture(&self, batch: RecordBatch) {
         *self
             .captured
             .lock()
-            .expect("DELETE RETURNING capture mutex poisoned") = Some(batch);
+            .expect("DML RETURNING capture mutex poisoned") = Some(batch);
     }
 
     pub(crate) fn take_captured(&self) -> Result<RecordBatch> {
         self.captured
             .lock()
-            .expect("DELETE RETURNING capture mutex poisoned")
+            .expect("DML RETURNING capture mutex poisoned")
             .take()
             .ok_or_else(|| {
                 DataFusionError::Execution(
-                    "DELETE RETURNING execution completed without a captured result".to_string(),
+                    "DML RETURNING execution completed without a captured result".to_string(),
                 )
             })
     }
@@ -262,6 +264,22 @@ pub(super) trait TableSpec: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Plan an INSERT that must produce the exact inserted post-image.  This
+    /// intentionally has no default fallback to `stage_insert`: a provider
+    /// that does not explicitly construct and capture its post-image must not
+    /// turn `INSERT ... RETURNING` into a count-only mutation.
+    async fn plan_insert_with_returning(
+        &self,
+        _write_ctx: SqlWriteContext,
+        _input: &Arc<dyn ExecutionPlan>,
+        _returning: DmlReturning,
+    ) -> Result<InsertApply> {
+        Err(DataFusionError::Execution(format!(
+            "INSERT RETURNING is not supported on {}",
+            self.table_name()
+        )))
+    }
+
     /// Plan-time validation of UPDATE assignment targets.
     fn validate_update_assignments(&self, _assignments: &[(String, Expr)]) -> Result<()> {
         Ok(())
@@ -303,6 +321,23 @@ pub(super) trait TableSpec: Send + Sync + 'static {
     ) -> Result<PlannedDml> {
         Err(DataFusionError::Execution(format!(
             "UPDATE {} is not supported",
+            self.table_name()
+        )))
+    }
+
+    /// Plan an UPDATE that must produce the exact updated post-image.  Like
+    /// [`TableSpec::plan_insert_with_returning`], this deliberately rejects by
+    /// default so a newly writable provider cannot silently report only the
+    /// affected count for `UPDATE ... RETURNING`.
+    async fn plan_update_with_returning(
+        &self,
+        _write_ctx: SqlWriteContext,
+        _assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        _filters: &[Expr],
+        _returning: DmlReturning,
+    ) -> Result<PlannedDml> {
+        Err(DataFusionError::Execution(format!(
+            "UPDATE RETURNING is not supported on {}",
             self.table_name()
         )))
     }
@@ -373,6 +408,29 @@ impl SpecTableProvider {
         upsert::execute_upsert(support, &write_ctx, proposed_batches, &target, action).await
     }
 
+    /// Execute an `INSERT ... ON CONFLICT ... RETURNING` through the shared
+    /// upsert driver. The driver requires provider-owned post-image capture,
+    /// so this has no count-only fallback.
+    pub(crate) async fn execute_upsert_with_returning(
+        &self,
+        input: &Arc<dyn ExecutionPlan>,
+        proposed_batches: Vec<RecordBatch>,
+        target_columns: &[String],
+        action: &upsert::UpsertAction,
+        returning: DmlReturning,
+    ) -> Result<u64> {
+        let (write_ctx, support, target) = self.validate_upsert(input, target_columns).await?;
+        upsert::execute_upsert_with_returning(
+            support,
+            &write_ctx,
+            proposed_batches,
+            &target,
+            action,
+            returning,
+        )
+        .await
+    }
+
     pub(crate) async fn validate_upsert(
         &self,
         input: &Arc<dyn ExecutionPlan>,
@@ -403,6 +461,88 @@ impl SpecTableProvider {
         returning: DmlReturning,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         self.delete_impl(state, filters, Some(returning)).await
+    }
+
+    /// Plan an INSERT whose provider captures a post-write `RETURNING`
+    /// projection. This path is separate from `TableProvider::insert_into` so
+    /// only providers that explicitly implement post-image capture can expose
+    /// the SQL surface.
+    pub(crate) async fn insert_with_returning(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        returning: DmlReturning,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let table = self.spec.table_name();
+        let write_ctx = self
+            .write_access
+            .require_write(&format!("INSERT into {table}"))?;
+        self.schema
+            .logically_equivalent_names_and_types(&input.schema())?;
+        let omitted_insert_columns = write_ctx.explicit_insert_columns().map_or_else(
+            || InsertColumnIntents::from_input(&input).omitted_columns(self.schema.as_ref()),
+            |explicit_columns| {
+                self.schema
+                    .fields()
+                    .iter()
+                    .filter(|field| !explicit_columns.contains(field.name().as_str()))
+                    .map(|field| field.name().clone())
+                    .collect()
+            },
+        );
+        let apply = self
+            .spec
+            .plan_insert_with_returning(write_ctx, &input, returning)
+            .await?;
+        let sink: Arc<dyn InsertSink> = Arc::new(PlannedInsertSink {
+            table: table.into(),
+            apply,
+            omitted_insert_columns,
+        });
+        Ok(Arc::new(InsertExec::new(input, sink)))
+    }
+
+    /// Plan an UPDATE whose provider captures a post-write `RETURNING`
+    /// projection. `SpecDmlExec` receives no returning projection here because
+    /// its built-in capture is intentionally the DELETE pre-image path.
+    pub(crate) async fn update_with_returning(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+        returning: DmlReturning,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let table = self.spec.table_name();
+        let write_ctx = self
+            .write_access
+            .require_write(&format!("UPDATE {table}"))?;
+        self.spec.validate_update_assignments(&assignments)?;
+        let filters = self.spec.prepare_write_filters(filters)?;
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        let physical_assignments = assignments
+            .iter()
+            .map(|(column_name, expr)| {
+                Ok((
+                    column_name.clone(),
+                    create_physical_expr(expr, &df_schema, state.execution_props())?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let physical_filters = filters
+            .iter()
+            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .collect::<Result<Vec<_>>>()?;
+        let planned = self
+            .spec
+            .plan_update_with_returning(write_ctx, physical_assignments, &filters, returning)
+            .await?;
+        Ok(Arc::new(SpecDmlExec::new(
+            table.into(),
+            "UPDATE",
+            planned,
+            physical_filters,
+            None,
+        )))
     }
 
     async fn delete_impl(
@@ -928,6 +1068,20 @@ pub(super) fn filter_batch(
         return Ok(batch);
     };
     Ok(filter_record_batch(&batch, &mask)?)
+}
+
+/// Select rows from a fully materialized provider batch in a caller-defined
+/// order. `RETURNING` reloads use this after reading the transaction-visible
+/// post-image by stable provider identity, so the result still corresponds to
+/// the input write rows rather than incidental storage scan ordering.
+pub(super) fn take_record_batch_rows(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch> {
+    let indices = UInt32Array::from(indices.to_vec());
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| take(column.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(DataFusionError::from)
 }
 
 fn evaluate_filters(

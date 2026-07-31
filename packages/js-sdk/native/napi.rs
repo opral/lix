@@ -27,6 +27,19 @@ use tokio::sync::watch;
 type JsTelemetryDispatch = ThreadsafeFunction<String, (), String, Status, false>;
 type SharedJsTelemetryDispatch = Arc<JsTelemetryDispatch>;
 
+// SQL command and observation actors can compose catalog, filesystem, plugin,
+// and live-state async futures before their first suspension point. They must
+// not inherit the platform's small default thread stack for that graph.
+const NATIVE_ENGINE_ACTOR_STACK_SIZE: usize = 32 * 1024 * 1024;
+
+fn optional_telemetry_dispatch(
+    dispatch: Option<Function<'_, String, ()>>,
+) -> Result<Option<SharedJsTelemetryDispatch>> {
+    dispatch
+        .map(|dispatch| dispatch.build_threadsafe_function().build().map(Arc::new))
+        .transpose()
+}
+
 #[expect(missing_debug_implementations)]
 #[napi(js_name = "Lix")]
 pub struct NativeLix {
@@ -179,6 +192,7 @@ impl NativeLixActor {
         let actor_send_lock = Arc::clone(&actor.send_lock);
         thread::Builder::new()
             .name("lix-native".to_string())
+            .stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
             .spawn(move || run_lix_actor(lix, receiver, actor_closed, actor_send_lock))
             .map_err(to_napi_error)?;
         Ok(actor)
@@ -865,20 +879,22 @@ fn open_local_filesystem_native(
 impl NativeLix {
     #[napi(js_name = "openMemory")]
     pub fn open_memory(
-        telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
-    ) -> AsyncTask<OpenMemoryTask> {
-        AsyncTask::new(OpenMemoryTask { telemetry_dispatch })
+        telemetry_dispatch: Option<Function<'_, String, ()>>,
+    ) -> Result<AsyncTask<OpenMemoryTask>> {
+        Ok(AsyncTask::new(OpenMemoryTask {
+            telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
+        }))
     }
 
     #[napi(js_name = "openSQLite")]
     pub fn open_sqlite(
         path: String,
-        telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
-    ) -> AsyncTask<OpenSQLiteTask> {
-        AsyncTask::new(OpenSQLiteTask {
+        telemetry_dispatch: Option<Function<'_, String, ()>>,
+    ) -> Result<AsyncTask<OpenSQLiteTask>> {
+        Ok(AsyncTask::new(OpenSQLiteTask {
             path,
-            telemetry_dispatch,
-        })
+            telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
+        }))
     }
 
     #[napi(js_name = "openLocalFilesystem")]
@@ -886,14 +902,14 @@ impl NativeLix {
         path: String,
         lix_dir: Option<String>,
         sync_all_files: bool,
-        telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
-    ) -> AsyncTask<OpenLocalFilesystemTask> {
-        AsyncTask::new(OpenLocalFilesystemTask {
+        telemetry_dispatch: Option<Function<'_, String, ()>>,
+    ) -> Result<AsyncTask<OpenLocalFilesystemTask>> {
+        Ok(AsyncTask::new(OpenLocalFilesystemTask {
             path,
             lix_dir,
             sync_all_files,
-            telemetry_dispatch,
-        })
+            telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
+        }))
     }
 
     #[napi]
@@ -1137,6 +1153,7 @@ impl NativeObserveEvents {
         let actor_next_in_flight = Arc::clone(&next_in_flight);
         thread::Builder::new()
             .name("lix-observe-events".to_string())
+            .stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
             .spawn(move || {
                 run_observe_actor(
                     events,
