@@ -194,12 +194,38 @@ where
                         .await?
                 };
 
+                let plugin_resolution_stats = if analysis.outcome == MergeOutcome::MergeCommitted {
+                    let plugin_conflict_groups = {
+                        let mut reader = transaction.tracked_state_reader().await;
+                        plugin_merge_conflict_groups(
+                            &mut reader,
+                            &analysis,
+                            &derived_blob_files,
+                            &resolvable_plugin_conflicts,
+                        )
+                        .await?
+                    };
+                    let semantic_branch_id = SharedStr::from(active_branch_id.as_str());
+                    let resolved_plugin_rows = resolve_plugin_merge_conflict_groups(
+                        transaction,
+                        plugin_conflict_groups,
+                        &semantic_branch_id,
+                    )
+                    .await?;
+                    let mut reader = transaction.tracked_state_reader().await;
+                    plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows)
+                        .await?
+                } else {
+                    MergeChangeStats::default()
+                };
+
                 preview_from_analysis(
                     &active_branch_id,
                     &source_branch_id,
                     &analysis,
                     &derived_blob_files,
                     &resolvable_plugin_conflicts,
+                    &plugin_resolution_stats,
                 )
             })
         })
@@ -385,6 +411,17 @@ where
                 ))
                 .await?;
 
+                let plugin_resolution_stats = async {
+                    let mut reader = transaction.tracked_state_reader().await;
+                    plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows)
+                        .await
+                }
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.merge_plugin_resolution_stats"
+                ))
+                .await?;
+
                 let semantic_rows = async {
                     let mut reader = transaction.tracked_state_reader().await;
                     materialized_plugin_merge_rows(
@@ -449,7 +486,10 @@ where
                     target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
                     source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
                     created_merge_commit_id: Some(created_merge_commit_id),
-                    change_stats: merge_change_stats_from_analysis(&analysis.stats),
+                    change_stats: merge_change_stats_with_plugin_resolutions(
+                        &analysis.stats,
+                        &plugin_resolution_stats,
+                    ),
                 })
             })
         })
@@ -1740,12 +1780,104 @@ where
     Ok(rows)
 }
 
+async fn plugin_resolution_change_stats<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    analysis: &super::analysis::MergeAnalysis,
+    resolved_rows: &RawWriteBatch,
+) -> Result<MergeChangeStats, LixError>
+where
+    S: crate::storage_adapter::StorageAdapterRead,
+{
+    if resolved_rows.is_empty() {
+        return Ok(MergeChangeStats::default());
+    }
+    let keys = resolved_rows
+        .iter()
+        .map(|row| {
+            Ok(TrackedStateKeyRef {
+                schema_key: row.schema_key.as_str(),
+                file_id: row.file_id.map(SharedStr::as_str),
+                entity_pk: row.entity_pk.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "plugin resolution row omitted its entity identity",
+                    )
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let target_rows = reader
+        .load_projected_batch_at_commit_refs(
+            &analysis.commits.target_commit_id.to_string(),
+            &keys,
+            &ChangeRecordProjection::full(),
+        )
+        .await?;
+    let mut stats = MergeChangeStats::default();
+    for (index, resolved) in resolved_rows.iter().enumerate() {
+        let target = target_rows.row(index).filter(|row| !row.deleted());
+        let target_snapshot = target
+            .map(|row| {
+                row.snapshot_content().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "live plugin target row omitted its snapshot",
+                    )
+                })
+            })
+            .transpose()?;
+        match classify_plugin_resolution(
+            target_snapshot.map(SharedStr::as_str),
+            target
+                .and_then(MaterializedTrackedStateRowRef::metadata)
+                .map(SharedStr::as_str),
+            resolved.snapshot.map(TransactionJson::normalized),
+            resolved.metadata.map(TransactionJson::normalized),
+        ) {
+            Some(PluginResolutionChange::Added) => stats.added += 1,
+            Some(PluginResolutionChange::Modified) => stats.modified += 1,
+            Some(PluginResolutionChange::Removed) => stats.removed += 1,
+            None => {}
+        }
+    }
+    stats.total = stats.added + stats.modified + stats.removed;
+    Ok(stats)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginResolutionChange {
+    Added,
+    Modified,
+    Removed,
+}
+
+fn classify_plugin_resolution(
+    target_snapshot: Option<&str>,
+    target_metadata: Option<&str>,
+    resolved_snapshot: Option<&str>,
+    resolved_metadata: Option<&str>,
+) -> Option<PluginResolutionChange> {
+    match (target_snapshot, resolved_snapshot) {
+        (None, None) => None,
+        (None, Some(_)) => Some(PluginResolutionChange::Added),
+        (Some(_), None) => Some(PluginResolutionChange::Removed),
+        (Some(target), Some(resolved)) => {
+            if target == resolved && target_metadata == resolved_metadata {
+                None
+            } else {
+                Some(PluginResolutionChange::Modified)
+            }
+        }
+    }
+}
+
 fn preview_from_analysis(
     target_branch_id: &str,
     source_branch_id: &str,
     analysis: &super::analysis::MergeAnalysis,
     derived_blob_files: &BTreeMap<String, PluginFileOwner>,
     resolvable_plugin_conflicts: &BTreeSet<TrackedStateDiffIdentity>,
+    plugin_resolution_stats: &MergeChangeStats,
 ) -> Result<MergeBranchPreview, LixError> {
     let conflicts = analysis
         .conflict_batch()
@@ -1771,7 +1903,10 @@ fn preview_from_analysis(
         base_commit_id: analysis.commits.base_commit_id.to_string(),
         target_head_commit_id: analysis.commits.target_commit_id.to_string(),
         source_head_commit_id: analysis.commits.source_commit_id.to_string(),
-        change_stats: merge_change_stats_from_analysis(&analysis.stats),
+        change_stats: merge_change_stats_with_plugin_resolutions(
+            &analysis.stats,
+            plugin_resolution_stats,
+        ),
         conflicts,
     })
 }
@@ -1790,6 +1925,18 @@ fn merge_change_stats_from_analysis(stats: &MergeStats) -> MergeChangeStats {
         added: stats.added,
         modified: stats.modified,
         removed: stats.removed,
+    }
+}
+
+fn merge_change_stats_with_plugin_resolutions(
+    stats: &MergeStats,
+    plugin_resolution_stats: &MergeChangeStats,
+) -> MergeChangeStats {
+    MergeChangeStats {
+        total: stats.total + plugin_resolution_stats.total,
+        added: stats.added + plugin_resolution_stats.added,
+        modified: stats.modified + plugin_resolution_stats.modified,
+        removed: stats.removed + plugin_resolution_stats.removed,
     }
 }
 
@@ -1894,6 +2041,38 @@ mod tests {
             change_id: ChangeId::for_test_label("descriptor-change"),
             commit_id: CommitId::for_test_label("descriptor-commit"),
         }
+    }
+
+    #[test]
+    fn plugin_resolution_stats_follow_actual_target_delta() {
+        assert_eq!(
+            classify_plugin_resolution(Some("target"), None, Some("target"), None),
+            None,
+            "taking the target is not a change"
+        );
+        assert_eq!(
+            classify_plugin_resolution(Some("target"), None, None, None),
+            Some(PluginResolutionChange::Removed),
+            "deleting a modified source row is a removal from the target"
+        );
+        assert_eq!(
+            classify_plugin_resolution(None, None, Some("replacement"), None),
+            Some(PluginResolutionChange::Added)
+        );
+        assert_eq!(
+            classify_plugin_resolution(
+                Some("target"),
+                Some("target-meta"),
+                Some("replacement"),
+                None,
+            ),
+            Some(PluginResolutionChange::Modified)
+        );
+        assert_eq!(
+            classify_plugin_resolution(Some("target"), Some("target-meta"), Some("target"), None,),
+            Some(PluginResolutionChange::Modified),
+            "metadata-only resolver effects remain visible"
+        );
     }
 
     fn owner_row(file_id: &str, incarnation: &str) -> MaterializedTrackedStateRow {
