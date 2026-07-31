@@ -1360,7 +1360,6 @@ impl TransactionFileData {
         self.same_length_blob_splice
     }
 
-    #[cfg(test)]
     pub(crate) fn base_blob_hash(&self) -> Option<BlobHash> {
         self.base_blob_hash
     }

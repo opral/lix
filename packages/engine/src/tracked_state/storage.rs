@@ -1323,7 +1323,7 @@ async fn load_canonical_change_locator(
     direct_error.map_or(Ok(None), Err)
 }
 
-fn direct_change_locator(
+pub(crate) fn direct_change_locator(
     change_id: crate::changelog::ChangeId,
 ) -> Option<CommitDeltaChangeLocator> {
     let mut commit_bytes = *change_id.as_uuid().as_bytes();
@@ -1701,7 +1701,7 @@ async fn try_load_change_record_at_locator_in_manifest(
     ))
 }
 
-fn decode_change_locator(
+pub(crate) fn decode_change_locator(
     change_id: crate::changelog::ChangeId,
     bytes: &[u8],
 ) -> Result<CommitDeltaChangeLocator, LixError> {
@@ -3985,8 +3985,9 @@ mod tests {
 
     use crate::LixError;
     use crate::binary_cas::kv::{
-        BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        BINARY_CAS_MANIFEST_SPACE,
+        BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE,
+        BINARY_CAS_DICTIONARY_CONTROL_SPACE, BINARY_CAS_DICTIONARY_SAMPLE_SPACE,
+        BINARY_CAS_DICTIONARY_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE,
     };
     use crate::branch::BRANCH_HEAD_CONTROL_SPACE;
     use crate::changelog::{
@@ -6224,6 +6225,9 @@ mod tests {
             BINARY_CAS_MANIFEST_CHUNK_SPACE,
             BINARY_CAS_CHUNK_PRESENCE_SPACE,
             BINARY_CAS_CHUNK_SPACE,
+            BINARY_CAS_DICTIONARY_SPACE,
+            BINARY_CAS_DICTIONARY_CONTROL_SPACE,
+            BINARY_CAS_DICTIONARY_SAMPLE_SPACE,
             COMMIT_SPACE,
             CHANGE_SPACE,
             COMMIT_CHANGE_ID_SPACE,

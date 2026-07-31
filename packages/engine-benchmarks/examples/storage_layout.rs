@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use lix_engine::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix_engine::storage_bench::{
-    commit_delta_layout_accounting, layout_accounting, layout_space_catalog, space_inventory,
+    binary_manifest_layout_accounting, commit_delta_layout_accounting, layout_accounting,
+    layout_space_catalog, space_inventory,
 };
 use lix_slatedb_storage::SlateDB;
 use object_store::local::LocalFileSystem;
@@ -53,6 +54,13 @@ async fn main() {
         .expect("open storage snapshot");
     if mode
         .as_deref()
+        .is_some_and(|arg| arg == "--binary-manifest-only")
+    {
+        print_binary_manifest_layout(&read).await;
+        return;
+    }
+    if mode
+        .as_deref()
         .is_some_and(|arg| arg == "--commit-delta-only")
     {
         print_commit_delta_inventory(&read).await;
@@ -77,6 +85,7 @@ async fn main() {
     }
     println!("SPACE\tTOTAL\tTOTAL\t{total_rows}\t{total_keys}\t{total_values}");
     print_commit_delta_inventory(&read).await;
+    print_binary_manifest_layout(&read).await;
 
     let inventory = space_inventory(&read, HOT_SPACE).await;
     let mut groups = BTreeMap::<Vec<u8>, HotGroup>::new();
@@ -165,14 +174,42 @@ async fn main() {
     }
 }
 
+async fn print_binary_manifest_layout(read: &impl lix_engine::storage_adapter::StorageAdapterRead) {
+    let layout = binary_manifest_layout_accounting(read)
+        .await
+        .expect("decode binary manifest layout");
+    println!(
+        "BINARY_MANIFEST\tmanifests={}\tencoded_bytes={}\tinline={}\tinline_original_bytes={}\tinline_payload_bytes={}\tinline_raw={}\tinline_zstd={}\tconcat_zstd1_bytes={}\tconcat_zstd3_bytes={}\tconcat_zstd9_bytes={}\tdict64k_zstd3_bytes={}\tdict64k_bytes={}\tindividual_zstd3_bytes={}\tindividual_zstd9_bytes={}\tempty={}\tsingle_chunk={}\tchunked={}",
+        layout.manifests,
+        layout.encoded_bytes,
+        layout.inline_manifests,
+        layout.inline_original_bytes,
+        layout.inline_payload_bytes,
+        layout.inline_raw_manifests,
+        layout.inline_zstd_manifests,
+        layout.inline_concat_zstd1_bytes,
+        layout.inline_concat_zstd3_bytes,
+        layout.inline_concat_zstd9_bytes,
+        layout.inline_dict64k_zstd3_bytes,
+        layout.inline_dict64k_bytes,
+        layout.inline_individual_zstd3_bytes,
+        layout.inline_individual_zstd9_bytes,
+        layout.empty_manifests,
+        layout.single_chunk_manifests,
+        layout.chunked_manifests,
+    );
+}
+
 async fn print_commit_delta_inventory(read: &impl lix_engine::storage_adapter::StorageAdapterRead) {
     for entry in commit_delta_layout_accounting(read)
         .await
         .expect("decode commit-delta inventory")
     {
         println!(
-            "COMMIT_DELTA\tcommit={}\tsegments={}\tmembers={}\tauthored={}\tselected={}\tselected_tombstones={}\tcertified={}\tselected_certified={}",
+            "COMMIT_DELTA\tcommit={}\tphysical_key_bytes={}\tphysical_value_bytes={}\tsegments={}\tmembers={}\tauthored={}\tselected={}\tselected_tombstones={}\tcertified={}\tselected_certified={}\tselected_direct_addresses={}\tselected_source_commits={}\tdominant_selected_source_members={}",
             entry.commit_id,
+            entry.physical_key_bytes,
+            entry.physical_value_bytes,
             entry.segment_count,
             entry.members,
             entry.authored_members,
@@ -180,6 +217,9 @@ async fn print_commit_delta_inventory(read: &impl lix_engine::storage_adapter::S
             entry.selected_tombstones,
             entry.certified_members,
             entry.selected_certified_members,
+            entry.selected_direct_addresses,
+            entry.selected_source_commits,
+            entry.dominant_selected_source_members,
         );
     }
 }

@@ -311,9 +311,32 @@ pub struct StorageLayoutAccounting {
     pub value_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BinaryManifestLayoutAccounting {
+    pub manifests: u64,
+    pub encoded_bytes: u64,
+    pub inline_manifests: u64,
+    pub inline_original_bytes: u64,
+    pub inline_payload_bytes: u64,
+    pub inline_raw_manifests: u64,
+    pub inline_zstd_manifests: u64,
+    pub inline_concat_zstd1_bytes: u64,
+    pub inline_concat_zstd3_bytes: u64,
+    pub inline_concat_zstd9_bytes: u64,
+    pub inline_dict64k_zstd3_bytes: u64,
+    pub inline_dict64k_bytes: u64,
+    pub inline_individual_zstd3_bytes: u64,
+    pub inline_individual_zstd9_bytes: u64,
+    pub empty_manifests: u64,
+    pub single_chunk_manifests: u64,
+    pub chunked_manifests: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitDeltaLayoutAccounting {
     pub commit_id: String,
+    pub physical_key_bytes: u64,
+    pub physical_value_bytes: u64,
     pub segment_count: usize,
     pub members: usize,
     pub authored_members: usize,
@@ -321,6 +344,9 @@ pub struct CommitDeltaLayoutAccounting {
     pub selected_tombstones: usize,
     pub certified_members: usize,
     pub selected_certified_members: usize,
+    pub selected_direct_addresses: usize,
+    pub selected_source_commits: usize,
+    pub dominant_selected_source_members: usize,
 }
 
 pub async fn commit_delta_layout_accounting<R>(
@@ -330,6 +356,54 @@ where
     R: StorageAdapterRead,
 {
     let inventory = crate::tracked_state::scan_commit_delta_inventory(read).await?;
+    let mut physical_bytes_by_commit =
+        std::collections::BTreeMap::<crate::changelog::CommitId, (u64, u64)>::new();
+    for space in [
+        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+    ] {
+        for entry in scan_layout_entries(read, space).await {
+            let commit_id_bytes: [u8; 16] = entry
+                .key
+                .0
+                .get(..16)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| {
+                    crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        "benchmark commit-delta key has no commit UUID",
+                    )
+                })?;
+            let commit_id =
+                crate::changelog::CommitId::new(uuid::Uuid::from_bytes(commit_id_bytes));
+            let physical = physical_bytes_by_commit.entry(commit_id).or_default();
+            physical.0 += entry.key.0.len() as u64 + 4;
+            physical.1 += match entry.value {
+                StorageProjectedValue::KeyOnly => 0,
+                StorageProjectedValue::FullValue(value) => value.len() as u64,
+            };
+        }
+    }
+    let locator_entries = scan_layout_entries(
+        read,
+        crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+    )
+    .await;
+    let mut locator_commit_by_change_id = std::collections::BTreeMap::new();
+    for entry in locator_entries {
+        let change_id_bytes: [u8; 16] = entry.key.0.as_ref().try_into().map_err(|_| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "benchmark change locator key is not one UUID",
+            )
+        })?;
+        let change_id = crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(change_id_bytes));
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            unreachable!("change locator layout scan requests full values");
+        };
+        let locator = crate::tracked_state::decode_change_locator(change_id, &value)?;
+        locator_commit_by_change_id.insert(change_id, locator.commit_id);
+    }
     let certified_change_ids = inventory
         .commits
         .values()
@@ -337,6 +411,17 @@ where
         .filter(|member| member.is_certified_payload_ref())
         .map(|member| member.value.change_id)
         .collect::<std::collections::BTreeSet<_>>();
+    let authored_commit_by_change_id = inventory
+        .commits
+        .iter()
+        .flat_map(|(commit_id, entry)| {
+            entry
+                .members
+                .iter()
+                .filter(|member| member.authored)
+                .map(|member| (member.value.change_id, *commit_id))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     Ok(inventory
         .commits
         .into_iter()
@@ -369,8 +454,47 @@ where
                         && certified_change_ids.contains(&member.value.change_id)
                 })
                 .count();
+            let selected_direct_addresses = entry
+                .members
+                .iter()
+                .filter(|member| {
+                    member.is_selected_payload_ref()
+                        && crate::tracked_state::direct_change_locator(member.value.change_id)
+                            .is_some()
+                })
+                .count();
+            let mut selected_members_by_source = std::collections::BTreeMap::<_, usize>::new();
+            for member in entry
+                .members
+                .iter()
+                .filter(|member| member.is_selected_payload_ref())
+            {
+                if let Some(source_commit_id) = authored_commit_by_change_id
+                    .get(&member.value.change_id)
+                    .copied()
+                    .or_else(|| {
+                        crate::tracked_state::direct_change_locator(member.value.change_id)
+                            .map(|locator| locator.commit_id)
+                    })
+                    .or_else(|| {
+                        locator_commit_by_change_id
+                            .get(&member.value.change_id)
+                            .copied()
+                    })
+                {
+                    *selected_members_by_source
+                        .entry(source_commit_id)
+                        .or_default() += 1;
+                }
+            }
             CommitDeltaLayoutAccounting {
                 commit_id: commit_id.to_string(),
+                physical_key_bytes: physical_bytes_by_commit
+                    .get(&commit_id)
+                    .map_or(0, |bytes| bytes.0),
+                physical_value_bytes: physical_bytes_by_commit
+                    .get(&commit_id)
+                    .map_or(0, |bytes| bytes.1),
                 segment_count: entry.segment_count,
                 members: entry.members.len(),
                 authored_members,
@@ -378,6 +502,13 @@ where
                 selected_tombstones,
                 certified_members,
                 selected_certified_members,
+                selected_direct_addresses,
+                selected_source_commits: selected_members_by_source.len(),
+                dominant_selected_source_members: selected_members_by_source
+                    .values()
+                    .copied()
+                    .max()
+                    .unwrap_or_default(),
             }
         })
         .collect())
@@ -405,6 +536,169 @@ where
         accounting.push(scan_layout_space(read, *space).await);
     }
     accounting
+}
+
+pub async fn binary_manifest_layout_accounting<R>(
+    read: &R,
+) -> Result<BinaryManifestLayoutAccounting, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    let entries = scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE).await;
+    let mut accounting = BinaryManifestLayoutAccounting::default();
+    let mut inline_contents = Vec::new();
+    let mut inline_samples = Vec::new();
+    for entry in entries {
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            unreachable!("binary manifest layout scan requests full values");
+        };
+        accounting.manifests += 1;
+        accounting.encoded_bytes += value.len() as u64;
+        match crate::binary_cas::decode_binary_cas_manifest(&value)? {
+            crate::binary_cas::BinaryCasManifest::Empty { .. } => {
+                accounting.empty_manifests += 1;
+            }
+            crate::binary_cas::BinaryCasManifest::SingleChunk { .. } => {
+                accounting.single_chunk_manifests += 1;
+            }
+            crate::binary_cas::BinaryCasManifest::Chunked { .. } => {
+                accounting.chunked_manifests += 1;
+            }
+            crate::binary_cas::BinaryCasManifest::Inline {
+                size_bytes,
+                codec,
+                payload,
+            } => {
+                accounting.inline_manifests += 1;
+                accounting.inline_original_bytes += size_bytes;
+                accounting.inline_payload_bytes += payload.len() as u64;
+                match codec {
+                    crate::binary_cas::BinaryChunkCodec::Raw => {
+                        accounting.inline_raw_manifests += 1;
+                        inline_contents.extend_from_slice(&payload);
+                        inline_samples.push(payload);
+                    }
+                    crate::binary_cas::BinaryChunkCodec::Zstd => {
+                        accounting.inline_zstd_manifests += 1;
+                        let decoded = crate::compression::decompress_zstd(
+                            &payload,
+                            usize::try_from(size_bytes).expect("inline size fits usize"),
+                        )
+                        .map_err(|error| {
+                            crate::LixError::new(
+                                crate::LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "benchmark binary manifest payload failed to decode: {error}"
+                                ),
+                            )
+                        })?;
+                        inline_contents.extend_from_slice(&decoded);
+                        inline_samples.push(decoded);
+                    }
+                }
+            }
+            crate::binary_cas::BinaryCasManifest::InlineDelta {
+                size_bytes,
+                codec,
+                payload,
+                ..
+            } => {
+                accounting.inline_manifests += 1;
+                accounting.inline_original_bytes += size_bytes;
+                accounting.inline_payload_bytes += payload.len() as u64;
+                match codec {
+                    crate::binary_cas::BinaryChunkCodec::Raw => {
+                        accounting.inline_raw_manifests += 1;
+                    }
+                    crate::binary_cas::BinaryChunkCodec::Zstd => {
+                        accounting.inline_zstd_manifests += 1;
+                    }
+                }
+            }
+            crate::binary_cas::BinaryCasManifest::InlineDictionary {
+                size_bytes,
+                payload,
+                ..
+            } => {
+                accounting.inline_manifests += 1;
+                accounting.inline_original_bytes += size_bytes;
+                accounting.inline_payload_bytes += payload.len() as u64;
+                accounting.inline_zstd_manifests += 1;
+            }
+            crate::binary_cas::BinaryCasManifest::InlineDictionaryDelta {
+                size_bytes,
+                payload,
+                ..
+            } => {
+                accounting.inline_manifests += 1;
+                accounting.inline_original_bytes += size_bytes;
+                accounting.inline_payload_bytes += payload.len() as u64;
+                accounting.inline_zstd_manifests += 1;
+            }
+        }
+    }
+    if !inline_contents.is_empty() {
+        accounting.inline_concat_zstd1_bytes = zstd::bulk::compress(&inline_contents, 1)
+            .expect("benchmark zstd-1 should encode")
+            .len() as u64;
+        accounting.inline_concat_zstd3_bytes = zstd::bulk::compress(&inline_contents, 3)
+            .expect("benchmark zstd-3 should encode")
+            .len() as u64;
+        accounting.inline_concat_zstd9_bytes = zstd::bulk::compress(&inline_contents, 9)
+            .expect("benchmark zstd-9 should encode")
+            .len() as u64;
+    }
+    if inline_samples.len() >= 32 && inline_samples.iter().map(Vec::len).sum::<usize>() >= 32 * 512
+    {
+        let sample_refs = inline_samples.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let dictionary = zstd::dict::from_samples(&sample_refs, 64 * 1024).map_err(|error| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                format!("benchmark dictionary failed to train: {error}"),
+            )
+        })?;
+        let mut compressor =
+            zstd::bulk::Compressor::with_dictionary(3, &dictionary).map_err(|error| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    format!("benchmark dictionary compressor failed to initialize: {error}"),
+                )
+            })?;
+        accounting.inline_dict64k_zstd3_bytes = inline_samples
+            .iter()
+            .map(|sample| {
+                compressor
+                    .compress(sample)
+                    .map(|encoded| encoded.len() as u64)
+                    .map_err(|error| {
+                        crate::LixError::new(
+                            crate::LixError::CODE_INTERNAL_ERROR,
+                            format!("benchmark dictionary frame failed to encode: {error}"),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum();
+        accounting.inline_dict64k_bytes = dictionary.len() as u64;
+    }
+    accounting.inline_individual_zstd3_bytes = inline_samples
+        .iter()
+        .map(|sample| {
+            zstd::bulk::compress(sample, 3)
+                .expect("benchmark individual zstd-3 frame should encode")
+                .len() as u64
+        })
+        .sum();
+    accounting.inline_individual_zstd9_bytes = inline_samples
+        .iter()
+        .map(|sample| {
+            zstd::bulk::compress(sample, 9)
+                .expect("benchmark individual zstd-9 frame should encode")
+                .len() as u64
+        })
+        .sum();
+    Ok(accounting)
 }
 
 /// Per-row (key, value bytes) inventory of one space.
@@ -469,6 +763,9 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE,
         crate::binary_cas::kv::BINARY_CAS_CHUNK_PRESENCE_SPACE,
         crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
+        crate::binary_cas::kv::BINARY_CAS_DICTIONARY_SPACE,
+        crate::binary_cas::kv::BINARY_CAS_DICTIONARY_CONTROL_SPACE,
+        crate::binary_cas::kv::BINARY_CAS_DICTIONARY_SAMPLE_SPACE,
         crate::changelog::COMMIT_SPACE,
         crate::changelog::CHANGE_SPACE,
         crate::changelog::COMMIT_CHANGE_ID_SPACE,
@@ -580,12 +877,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckpointCommitScanBenchMode, plan_repository_gc_for_bench,
+        BinaryManifestLayoutAccounting, CheckpointCommitScanBenchMode,
+        binary_manifest_layout_accounting, plan_repository_gc_for_bench,
         scan_checkpoint_commits_for_bench,
     };
     use crate::Engine;
     use crate::changelog::bench::{append_ordered_commits, stage_append_once};
-    use crate::storage_adapter::{Memory, StorageAdapter};
+    use crate::storage_adapter::{
+        Memory, StorageAdapter, StorageKey, StorageValue, StorageWriteOptions,
+    };
 
     #[tokio::test]
     async fn checkpoint_commit_scan_baseline_matches_materialized_records_across_pages() {
@@ -644,6 +944,78 @@ mod tests {
                 .map(|(_, value)| value.len() as u64)
                 .sum::<u64>()
         );
+    }
+
+    #[tokio::test]
+    async fn binary_manifest_accounting_handles_empty_and_delta_only_repositories() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let read = adapter
+            .begin_read(crate::ReadOptions::default())
+            .await
+            .expect("begin empty manifest accounting read");
+        assert_eq!(
+            binary_manifest_layout_accounting(&read)
+                .await
+                .expect("empty manifest accounting should not train a dictionary"),
+            BinaryManifestLayoutAccounting::default()
+        );
+        drop(read);
+
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
+            StorageKey(bytes::Bytes::from(vec![1; 32])),
+            StorageValue {
+                bytes: bytes::Bytes::from(crate::binary_cas::encode_binary_cas_manifest(
+                    &crate::binary_cas::BinaryCasManifest::InlineDelta {
+                        size_bytes: 1_000,
+                        base_blob_hash: [3; 32],
+                        prefix_len: 400,
+                        suffix_len: 590,
+                        middle_len: 10,
+                        codec: crate::binary_cas::BinaryChunkCodec::Raw,
+                        payload: vec![4; 10],
+                    },
+                )),
+            },
+        );
+        writes.put(
+            crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
+            StorageKey(bytes::Bytes::from(vec![2; 32])),
+            StorageValue {
+                bytes: bytes::Bytes::from(crate::binary_cas::encode_binary_cas_manifest(
+                    &crate::binary_cas::BinaryCasManifest::InlineDictionaryDelta {
+                        size_bytes: 2_000,
+                        base_blob_hash: [5; 32],
+                        prefix_len: 900,
+                        suffix_len: 1_080,
+                        middle_len: 20,
+                        dictionary_hash: [6; 32],
+                        payload: vec![7; 20],
+                    },
+                )),
+            },
+        );
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("delta manifest fixtures should commit");
+
+        let read = adapter
+            .begin_read(crate::ReadOptions::default())
+            .await
+            .expect("begin delta manifest accounting read");
+        let accounting = binary_manifest_layout_accounting(&read)
+            .await
+            .expect("delta-only accounting should not train a dictionary");
+        assert_eq!(accounting.manifests, 2);
+        assert_eq!(accounting.inline_manifests, 2);
+        assert_eq!(accounting.inline_original_bytes, 3_000);
+        assert_eq!(accounting.inline_payload_bytes, 30);
+        assert_eq!(accounting.inline_raw_manifests, 1);
+        assert_eq!(accounting.inline_zstd_manifests, 1);
+        assert_eq!(accounting.inline_dict64k_bytes, 0);
+        assert_eq!(accounting.inline_dict64k_zstd3_bytes, 0);
     }
 
     #[tokio::test]
