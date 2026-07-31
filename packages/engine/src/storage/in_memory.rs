@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
+use crate::filesystem::PersistentMap;
 use crate::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use crate::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
@@ -12,7 +13,7 @@ use crate::storage::{
     WriteOptions, WriteStats,
 };
 
-type InMemoryMap = BTreeMap<Key, Bytes>;
+type InMemoryMap = PersistentMap<Key, Bytes>;
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"LIXMEM\0\x01";
 const SNAPSHOT_HEADER_BYTES: usize = SNAPSHOT_MAGIC.len() + size_of::<u32>();
@@ -48,20 +49,8 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
 }
 
 #[derive(Clone, Debug, Default)]
-enum EntriesState {
-    #[default]
-    Empty,
-    Flat(InMemoryMap),
-    Layered {
-        base: Arc<Self>,
-        puts: InMemoryMap,
-        deletes: BTreeSet<Key>,
-    },
-}
-
-#[derive(Clone, Debug, Default)]
 pub struct Memory {
-    entries: Arc<Mutex<Arc<EntriesState>>>,
+    entries: Arc<Mutex<InMemoryMap>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -69,19 +58,19 @@ pub struct MemoryFactory;
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryFixture {
-    entries: Arc<Mutex<Arc<EntriesState>>>,
+    entries: Arc<Mutex<InMemoryMap>>,
 }
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct MemoryRead {
-    entries: Arc<EntriesState>,
+    entries: InMemoryMap,
 }
 
 #[expect(missing_debug_implementations)]
 pub struct MemoryWrite {
-    parent: Arc<Mutex<Arc<EntriesState>>>,
-    base: Arc<EntriesState>,
+    parent: Arc<Mutex<InMemoryMap>>,
+    base: InMemoryMap,
     preconditions: Vec<Precondition>,
     overlay: EntriesOverlay,
     stats: WriteStats,
@@ -89,7 +78,7 @@ pub struct MemoryWrite {
 
 #[derive(Debug, Default)]
 struct EntriesOverlay {
-    puts: InMemoryMap,
+    puts: BTreeMap<Key, Bytes>,
     deletes: BTreeSet<Key>,
 }
 
@@ -102,20 +91,17 @@ impl Memory {
     /// returned by [`Self::export_snapshot`].
     pub fn from_snapshot(snapshot: &[u8]) -> Result<Self, StorageError> {
         let entries = decode_snapshot(snapshot)?;
-        let state = if entries.is_empty() {
-            EntriesState::Empty
-        } else {
-            EntriesState::Flat(entries)
-        };
         Ok(Self {
-            entries: Arc::new(Mutex::new(Arc::new(state))),
+            entries: Arc::new(Mutex::new(PersistentMap::from_sorted(
+                entries.into_iter().collect(),
+            ))),
         })
     }
 
     /// Exports one coherent, deterministic snapshot of the complete storage.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, StorageError> {
         let state = self.snapshot()?;
-        encode_snapshot(&flatten_entries(&state))
+        encode_snapshot(&state)
     }
 
     #[cfg(feature = "storage-benches")]
@@ -125,43 +111,20 @@ impl Memory {
         })
     }
 
-    fn snapshot(&self) -> Result<Arc<EntriesState>, StorageError> {
+    fn snapshot(&self) -> Result<InMemoryMap, StorageError> {
         self.entries
             .lock()
             .map_err(|_| StorageError::Io("in-memory storage lock poisoned".to_string()))
-            .map(|entries| Arc::clone(&entries))
-    }
-}
-
-fn flatten_entries(state: &EntriesState) -> InMemoryMap {
-    let mut entries = InMemoryMap::new();
-    apply_entries_state(state, &mut entries);
-    entries
-}
-
-fn apply_entries_state(state: &EntriesState, entries: &mut InMemoryMap) {
-    match state {
-        EntriesState::Empty => {}
-        EntriesState::Flat(flat) => entries.extend(flat.clone()),
-        EntriesState::Layered {
-            base,
-            puts,
-            deletes,
-        } => {
-            apply_entries_state(base, entries);
-            for key in deletes {
-                entries.remove(key);
-            }
-            entries.extend(puts.clone());
-        }
+            .map(|entries| entries.clone())
     }
 }
 
 fn encode_snapshot(entries: &InMemoryMap) -> Result<Vec<u8>, StorageError> {
     let entry_count = u32::try_from(entries.len())
         .map_err(|_| snapshot_corruption("too many entries to encode"))?;
+    let entries = entries.entries_range(Bound::Unbounded, Bound::Unbounded, usize::MAX);
     let mut encoded_len = SNAPSHOT_HEADER_BYTES;
-    for (key, value) in entries {
+    for (key, value) in &entries {
         let _ = u32::try_from(key.0.len())
             .map_err(|_| snapshot_corruption("key is too large to encode"))?;
         let _ = u32::try_from(value.len())
@@ -176,7 +139,7 @@ fn encode_snapshot(entries: &InMemoryMap) -> Result<Vec<u8>, StorageError> {
     let mut encoded = Vec::with_capacity(encoded_len);
     encoded.extend_from_slice(SNAPSHOT_MAGIC);
     encoded.extend_from_slice(&entry_count.to_be_bytes());
-    for (key, value) in entries {
+    for (key, value) in &entries {
         let key_len = u32::try_from(key.0.len())
             .map_err(|_| snapshot_corruption("key is too large to encode"))?;
         let value_len = u32::try_from(value.len())
@@ -189,7 +152,7 @@ fn encode_snapshot(entries: &InMemoryMap) -> Result<Vec<u8>, StorageError> {
     Ok(encoded)
 }
 
-fn decode_snapshot(snapshot: &[u8]) -> Result<InMemoryMap, StorageError> {
+fn decode_snapshot(snapshot: &[u8]) -> Result<BTreeMap<Key, Bytes>, StorageError> {
     let mut decoder = SnapshotDecoder::new(snapshot);
     let magic = decoder.take(SNAPSHOT_MAGIC.len(), "snapshot magic")?;
     if magic != SNAPSHOT_MAGIC {
@@ -200,7 +163,7 @@ fn decode_snapshot(snapshot: &[u8]) -> Result<InMemoryMap, StorageError> {
         return Err(snapshot_corruption("entry count exceeds snapshot length"));
     }
 
-    let mut entries = InMemoryMap::new();
+    let mut entries = BTreeMap::new();
     let mut previous_key: Option<Key> = None;
     for index in 0..entry_count {
         let key_len = decoder.read_u32("key length")? as usize;
@@ -439,23 +402,13 @@ impl StorageWrite for MemoryWrite {
             .lock()
             .map_err(|_| StorageError::Io("in-memory storage lock poisoned".to_string()))?;
         check_preconditions(&parent, &self.preconditions)?;
-        let base = if Arc::ptr_eq(&parent, &self.base) {
-            self.base
-        } else {
-            Arc::clone(&parent)
-        };
-        let entries = if self.overlay.puts.is_empty() && self.overlay.deletes.is_empty() {
-            base
-        } else if matches!(base.as_ref(), EntriesState::Empty) && self.overlay.deletes.is_empty() {
-            Arc::new(EntriesState::Flat(self.overlay.puts))
-        } else {
-            Arc::new(EntriesState::Layered {
-                base,
-                puts: self.overlay.puts,
-                deletes: self.overlay.deletes,
-            })
-        };
-
+        let mut entries = parent.clone();
+        for key in self.overlay.deletes {
+            entries = entries.remove(&key);
+        }
+        for (key, value) in self.overlay.puts {
+            entries = entries.insert(key, value);
+        }
         *parent = entries;
         Ok(CommitResult {
             commit_id: None,
@@ -469,7 +422,7 @@ impl StorageWrite for MemoryWrite {
 }
 
 fn check_preconditions(
-    entries: &EntriesState,
+    entries: &InMemoryMap,
     preconditions: &[Precondition],
 ) -> Result<(), StorageError> {
     let failures = preconditions
@@ -516,27 +469,7 @@ fn check_preconditions(
     }
 }
 
-impl EntriesState {
-    fn get(&self, key: &Key) -> Option<&Bytes> {
-        match self {
-            Self::Empty => None,
-            Self::Flat(entries) => entries.get(key),
-            Self::Layered {
-                base,
-                puts,
-                deletes,
-            } => puts.get(key).or_else(|| {
-                if deletes.contains(key) {
-                    None
-                } else {
-                    base.get(key)
-                }
-            }),
-        }
-    }
-}
-
-fn collect_range_chunk(entries: &EntriesState, range: KeyRange, opts: &ScanOptions) -> ScanChunk {
+fn collect_range_chunk(entries: &InMemoryMap, range: KeyRange, opts: &ScanOptions) -> ScanChunk {
     if opts.page_size() == 0 {
         return ScanChunk {
             entries: Vec::new(),
@@ -553,114 +486,20 @@ fn collect_range_chunk(entries: &EntriesState, range: KeyRange, opts: &ScanOptio
         };
     }
 
-    collect_entries_range(entries, lower, upper, opts)
-}
-
-fn collect_entries_range(
-    state: &EntriesState,
-    lower: Bound<&Key>,
-    upper: Bound<&Key>,
-    opts: &ScanOptions,
-) -> ScanChunk {
-    match state {
-        EntriesState::Empty => ScanChunk {
-            entries: Vec::new(),
-            has_more: false,
-        },
-        EntriesState::Flat(entries) => collect_flat_range(entries, lower, upper, opts),
-        EntriesState::Layered {
-            base,
-            puts,
-            deletes,
-        } if !range_has_entries(puts, &lower, &upper)
-            && !range_has_keys(deletes, &lower, &upper) =>
-        {
-            collect_entries_range(base, lower, upper, opts)
-        }
-        EntriesState::Layered { .. } => {
-            let mut rows = BTreeMap::<&Key, Option<&Bytes>>::new();
-            collect_layer_rows(state, &lower, &upper, &mut rows);
-            materialize_rows(rows, opts)
-        }
-    }
-}
-
-fn range_has_entries(entries: &InMemoryMap, lower: &Bound<&Key>, upper: &Bound<&Key>) -> bool {
-    entries.range((*lower, *upper)).next().is_some()
-}
-
-fn range_has_keys(keys: &BTreeSet<Key>, lower: &Bound<&Key>, upper: &Bound<&Key>) -> bool {
-    keys.range((*lower, *upper)).next().is_some()
-}
-
-fn collect_flat_range(
-    entries: &InMemoryMap,
-    lower: Bound<&Key>,
-    upper: Bound<&Key>,
-    opts: &ScanOptions,
-) -> ScanChunk {
-    let mut rows = entries.range((lower, upper));
+    let page_size = opts.page_size();
+    let mut rows = entries.entries_range(lower, upper, page_size.saturating_add(1));
+    let has_more = rows.len() > page_size;
+    rows.truncate(page_size);
     let collected = rows
-        .by_ref()
-        .take(opts.page_size())
+        .into_iter()
         .map(|(key, value)| ReadEntry {
-            key: key.clone(),
-            value: project_value(value, opts.projection),
+            key,
+            value: project_value(&value, opts.projection),
         })
         .collect();
     ScanChunk {
         entries: collected,
-        has_more: rows.next().is_some(),
-    }
-}
-
-fn collect_layer_rows<'a>(
-    state: &'a EntriesState,
-    lower: &Bound<&'a Key>,
-    upper: &Bound<&'a Key>,
-    rows: &mut BTreeMap<&'a Key, Option<&'a Bytes>>,
-) {
-    match state {
-        EntriesState::Empty => {}
-        EntriesState::Flat(entries) => {
-            for (key, value) in entries.range((*lower, *upper)) {
-                rows.entry(key).or_insert(Some(value));
-            }
-        }
-        EntriesState::Layered {
-            base,
-            puts,
-            deletes,
-        } => {
-            collect_layer_rows(base, lower, upper, rows);
-            for delete in deletes.range((*lower, *upper)) {
-                rows.insert(delete, None);
-            }
-            for (key, value) in puts.range((*lower, *upper)) {
-                rows.insert(key, Some(value));
-            }
-        }
-    }
-}
-
-fn materialize_rows<'a>(
-    rows: BTreeMap<&'a Key, Option<&'a Bytes>>,
-    opts: &ScanOptions,
-) -> ScanChunk {
-    let mut present = rows
-        .into_iter()
-        .filter_map(|(key, value)| value.map(|value| (key, value)));
-    let entries = present
-        .by_ref()
-        .take(opts.page_size())
-        .map(|(key, value)| ReadEntry {
-            key: key.clone(),
-            value: project_value(value, opts.projection),
-        })
-        .collect();
-    ScanChunk {
-        entries,
-        has_more: present.next().is_some(),
+        has_more,
     }
 }
 

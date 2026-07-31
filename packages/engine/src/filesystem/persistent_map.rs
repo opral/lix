@@ -7,7 +7,7 @@ use std::sync::Arc;
 /// Each mutation copies only the search path. Older readers retain their root,
 /// while a committed generation shares every untouched subtree with it.
 #[derive(Debug, Clone)]
-pub(super) struct PersistentMap<K, V> {
+pub(crate) struct PersistentMap<K, V> {
     root: Option<Arc<Node<K, V>>>,
     len: usize,
 }
@@ -32,7 +32,7 @@ where
     K: Clone + Ord,
     V: Clone,
 {
-    pub(super) fn from_sorted(entries: Vec<(K, V)>) -> Self {
+    pub(crate) fn from_sorted(entries: Vec<(K, V)>) -> Self {
         fn build<K: Clone, V: Clone>(entries: &[(K, V)]) -> Option<Arc<Node<K, V>>> {
             let (middle, rest) = entries.split_at(entries.len() / 2);
             let ((key, value), right) = rest.split_first()?;
@@ -50,12 +50,11 @@ where
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
-    pub(super) fn get<Q>(&self, key: &Q) -> Option<&V>
+    pub(crate) fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -71,7 +70,7 @@ where
         None
     }
 
-    pub(super) fn insert(&self, key: K, value: V) -> Self {
+    pub(crate) fn insert(&self, key: K, value: V) -> Self {
         let (root, replaced) = insert(self.root.as_ref(), key, value);
         Self {
             root: Some(root),
@@ -79,7 +78,7 @@ where
         }
     }
 
-    pub(super) fn remove<Q>(&self, key: &Q) -> Self
+    pub(crate) fn remove<Q>(&self, key: &Q) -> Self
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -91,7 +90,7 @@ where
         }
     }
 
-    pub(super) fn values(&self) -> Vec<V> {
+    pub(crate) fn values(&self) -> Vec<V> {
         let mut values = Vec::with_capacity(self.len);
         collect_values(self.root.as_deref(), &mut values);
         values
@@ -99,7 +98,7 @@ where
 
     /// Collects values whose key projection equals `needle` without scanning
     /// either side of the matching key range.
-    pub(super) fn values_equal_by<Q, F>(&self, needle: &Q, project: F) -> Vec<V>
+    pub(crate) fn values_equal_by<Q, F>(&self, needle: &Q, project: F) -> Vec<V>
     where
         Q: Ord + ?Sized,
         F: Fn(&K) -> &Q,
@@ -109,7 +108,7 @@ where
         values
     }
 
-    pub(super) fn values_range_by<Q, F>(
+    pub(crate) fn values_range_by<Q, F>(
         &self,
         lower: std::ops::Bound<&Q>,
         upper: std::ops::Bound<&Q>,
@@ -122,6 +121,17 @@ where
         let mut values = Vec::new();
         collect_range(self.root.as_deref(), lower, upper, &project, &mut values);
         values
+    }
+
+    pub(crate) fn entries_range(
+        &self,
+        lower: std::ops::Bound<&K>,
+        upper: std::ops::Bound<&K>,
+        limit: usize,
+    ) -> Vec<(K, V)> {
+        let mut entries = Vec::with_capacity(limit.min(self.len));
+        collect_entries_range(self.root.as_deref(), lower, upper, limit, &mut entries);
+        entries
     }
 }
 
@@ -383,9 +393,45 @@ fn collect_range<K, V, Q, F>(
     }
 }
 
+fn collect_entries_range<K, V>(
+    node: Option<&Node<K, V>>,
+    lower: std::ops::Bound<&K>,
+    upper: std::ops::Bound<&K>,
+    limit: usize,
+    entries: &mut Vec<(K, V)>,
+) where
+    K: Clone + Ord,
+    V: Clone,
+{
+    if entries.len() == limit {
+        return;
+    }
+    let Some(node) = node else { return };
+    let below_lower = match lower {
+        std::ops::Bound::Unbounded => false,
+        std::ops::Bound::Included(value) => &node.key < value,
+        std::ops::Bound::Excluded(value) => &node.key <= value,
+    };
+    let above_upper = match upper {
+        std::ops::Bound::Unbounded => false,
+        std::ops::Bound::Included(value) => &node.key > value,
+        std::ops::Bound::Excluded(value) => &node.key >= value,
+    };
+    if !below_lower {
+        collect_entries_range(node.left.as_deref(), lower, upper, limit, entries);
+    }
+    if entries.len() < limit && !below_lower && !above_upper {
+        entries.push((node.key.clone(), node.value.clone()));
+    }
+    if entries.len() < limit && !above_upper {
+        collect_entries_range(node.right.as_deref(), lower, upper, limit, entries);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::PersistentMap;
+    use std::ops::Bound;
 
     #[test]
     fn mutations_share_snapshots_and_keep_sorted_ranges() {
@@ -398,12 +444,17 @@ mod tests {
         assert_eq!(changed.get(&75), None);
         assert_eq!(changed.len(), 100);
         assert_eq!(
-            changed.values_range_by(
-                std::ops::Bound::Included(&98),
-                std::ops::Bound::Unbounded,
-                |key| key,
-            ),
+            changed.values_range_by(Bound::Included(&98), Bound::Unbounded, |key| key,),
             vec![980, 990, 1_010]
+        );
+        assert_eq!(
+            changed.entries_range(Bound::Included(&48), Bound::Excluded(&53), 3),
+            vec![(48, 480), (49, 490), (50, 999)]
+        );
+        assert!(
+            changed
+                .entries_range(Bound::Unbounded, Bound::Unbounded, 0)
+                .is_empty()
         );
     }
 }
