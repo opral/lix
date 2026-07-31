@@ -2918,7 +2918,7 @@ where
                             row.entity_pk().clone(),
                             row.file_id().map(str::to_owned),
                         );
-                        overlay_commits.get(&identity).is_none()
+                        !overlay_commits.contains_key(&identity)
                     }
                 },
                 None,
