@@ -12,7 +12,7 @@ use object_store::local::LocalFileSystem;
 use slatedb::{SstReader, ValueDeletable};
 
 const HOT_SPACE: &str = "live_state.hot_row.v20";
-const IMMUTABLE_BINARY_CAS_CHUNK_DIR: &str = "db/lix-immutable-binary-cas-chunk-v3";
+const IMMUTABLE_BINARY_CAS_CHUNK_DIR: &str = "db/lix-immutable-binary-cas-segment-v4";
 
 #[derive(Default)]
 struct HotGroup {
@@ -185,21 +185,9 @@ async fn print_binary_manifest_layout(read: &impl lix_engine::storage_adapter::S
         .await
         .expect("decode binary manifest layout");
     println!(
-        "BINARY_MANIFEST\tmanifests={}\tencoded_bytes={}\tinline={}\tinline_original_bytes={}\tinline_payload_bytes={}\tinline_raw={}\tinline_zstd={}\tconcat_zstd1_bytes={}\tconcat_zstd3_bytes={}\tconcat_zstd9_bytes={}\tdict64k_zstd3_bytes={}\tdict64k_bytes={}\tindividual_zstd3_bytes={}\tindividual_zstd9_bytes={}\tempty={}\tsingle_chunk={}\tchunked={}",
+        "BINARY_MANIFEST\tmanifests={}\tencoded_bytes={}\tempty={}\tsingle_chunk={}\tchunked={}",
         layout.manifests,
         layout.encoded_bytes,
-        layout.inline_manifests,
-        layout.inline_original_bytes,
-        layout.inline_payload_bytes,
-        layout.inline_raw_manifests,
-        layout.inline_zstd_manifests,
-        layout.inline_concat_zstd1_bytes,
-        layout.inline_concat_zstd3_bytes,
-        layout.inline_concat_zstd9_bytes,
-        layout.inline_dict64k_zstd3_bytes,
-        layout.inline_dict64k_bytes,
-        layout.inline_individual_zstd3_bytes,
-        layout.inline_individual_zstd9_bytes,
         layout.empty_manifests,
         layout.single_chunk_manifests,
         layout.chunked_manifests,

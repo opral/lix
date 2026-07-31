@@ -95,8 +95,6 @@ where
     chunking: BinaryCasChunking,
     blob_hashes: HashSet<[u8; 32]>,
     chunk_keys: HashSet<Vec<u8>>,
-    dictionary_sample_slots: HashSet<u8>,
-    dictionary: Option<Option<crate::binary_cas::kv::BinaryCasDictionary>>,
 }
 
 impl<'a, S> ExistingChunkAwareBinaryCasWriter<'a, S>
@@ -110,8 +108,6 @@ where
             chunking,
             blob_hashes: HashSet::new(),
             chunk_keys: HashSet::new(),
-            dictionary_sample_slots: HashSet::new(),
-            dictionary: None,
         }
     }
 
@@ -138,15 +134,8 @@ where
     pub(crate) async fn stage_file_payload(
         &mut self,
         payload: &BlobPayload,
-        base_blob_hash: Option<BlobHash>,
         same_length_splice: Option<BlobSameLengthSplice>,
     ) -> Result<(), LixError> {
-        if self.dictionary.is_none() {
-            self.dictionary = Some(
-                crate::binary_cas::kv::load_or_train_dictionary(self.store, self.writes).await?,
-            );
-        }
-        let dictionary = self.dictionary.as_ref().and_then(Option::as_ref).cloned();
         if let Some(splice) = same_length_splice
             && crate::binary_cas::kv::try_stage_blob_write_reusing_same_length_splice(
                 self.store,
@@ -159,67 +148,9 @@ where
             )
             .await?
         {
-            if dictionary.is_none() {
-                crate::binary_cas::kv::stage_dictionary_sample(
-                    self.writes,
-                    &mut self.dictionary_sample_slots,
-                    payload.bytes(),
-                    payload.hash(),
-                );
-            }
-            return Ok(());
-        }
-        if let Some(base_blob_hash) = base_blob_hash
-            && crate::binary_cas::kv::try_stage_inline_delta(
-                self.store,
-                self.writes,
-                &mut self.blob_hashes,
-                payload.bytes(),
-                payload.hash(),
-                base_blob_hash,
-                dictionary.as_ref(),
-            )
-            .await?
-        {
-            if dictionary.is_none() {
-                crate::binary_cas::kv::stage_dictionary_sample(
-                    self.writes,
-                    &mut self.dictionary_sample_slots,
-                    payload.bytes(),
-                    payload.hash(),
-                );
-            }
-            return Ok(());
-        }
-        if crate::binary_cas::kv::try_stage_inline_dictionary(
-            self.store,
-            self.writes,
-            &mut self.blob_hashes,
-            payload.bytes(),
-            payload.hash(),
-            dictionary.as_ref(),
-        )
-        .await?
-        {
-            if dictionary.is_none() {
-                crate::binary_cas::kv::stage_dictionary_sample(
-                    self.writes,
-                    &mut self.dictionary_sample_slots,
-                    payload.bytes(),
-                    payload.hash(),
-                );
-            }
             return Ok(());
         }
         self.stage_payload(payload).await?;
-        if dictionary.is_none() {
-            crate::binary_cas::kv::stage_dictionary_sample(
-                self.writes,
-                &mut self.dictionary_sample_slots,
-                payload.bytes(),
-                payload.hash(),
-            );
-        }
         Ok(())
     }
 }

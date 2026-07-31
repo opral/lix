@@ -1,23 +1,18 @@
 #![allow(clippy::cast_sign_loss)]
 
 use crate::LixError;
-use crate::binary_cas::chunking::{
-    INLINE_BINARY_CAS_MAX_BYTES, MAX_BINARY_CAS_CHUNK_BYTES, UNGUARDED_INLINE_BINARY_CAS_MAX_BYTES,
-    fastcdc_chunk_ranges_with_chunking,
-};
+use crate::binary_cas::chunking::{MAX_BINARY_CAS_CHUNK_BYTES, fastcdc_chunk_ranges_with_chunking};
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, decode_binary_cas_chunk, decode_binary_cas_manifest,
     decode_binary_cas_manifest_chunk, encode_binary_cas_chunk, encode_binary_cas_manifest,
-    encode_binary_cas_manifest_chunk, encode_inline_binary_cas_manifest,
-    encode_inline_delta_binary_cas_manifest, encode_inline_dictionary_binary_cas_manifest,
-    encode_inline_dictionary_delta_binary_cas_manifest,
+    encode_binary_cas_manifest_chunk,
 };
 use crate::binary_cas::compression::{decode_zstd_chunk, encode_chunk_payload};
 use crate::binary_cas::{
     BinaryCasChunking, BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
-    BlobSameLengthSplice, BlobWriteReceipt, InlineBlob,
+    BlobSameLengthSplice, BlobWriteReceipt,
 };
-#[cfg(any(test, not(target_family = "wasm")))]
+#[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageSpace, StorageWriteSet,
@@ -42,9 +37,6 @@ pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
 pub(crate) const BINARY_CAS_CHUNK_NAMESPACE: &str = "binary_cas.chunk";
 pub(crate) const BINARY_CAS_CHUNK_PRESENCE_NAMESPACE: &str = "binary_cas.chunk_presence";
-pub(crate) const BINARY_CAS_DICTIONARY_NAMESPACE: &str = "binary_cas.dictionary";
-pub(crate) const BINARY_CAS_DICTIONARY_CONTROL_NAMESPACE: &str = "binary_cas.dictionary_control";
-pub(crate) const BINARY_CAS_DICTIONARY_SAMPLE_NAMESPACE: &str = "binary_cas.dictionary_sample";
 pub(crate) const BINARY_CAS_MANIFEST_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0005_0001), BINARY_CAS_MANIFEST_NAMESPACE);
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::new(
@@ -57,20 +49,6 @@ pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::n
     StorageSpaceId(0x0005_0004),
     BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
 );
-pub(crate) const BINARY_CAS_DICTIONARY_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0005_0005), BINARY_CAS_DICTIONARY_NAMESPACE);
-pub(crate) const BINARY_CAS_DICTIONARY_CONTROL_SPACE: StorageSpace = StorageSpace::new(
-    StorageSpaceId(0x0005_0006),
-    BINARY_CAS_DICTIONARY_CONTROL_NAMESPACE,
-);
-pub(crate) const BINARY_CAS_DICTIONARY_SAMPLE_SPACE: StorageSpace = StorageSpace::new(
-    StorageSpaceId(0x0005_0007),
-    BINARY_CAS_DICTIONARY_SAMPLE_NAMESPACE,
-);
-const BINARY_CAS_DICTIONARY_CONTROL_KEY: &[u8] = b"current";
-const BINARY_CAS_DICTIONARY_SAMPLE_COUNT: usize = 32;
-const BINARY_CAS_DICTIONARY_SAMPLE_SLOTS: usize = 64;
-const BINARY_CAS_DICTIONARY_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 struct BlobWritePlan {
@@ -85,48 +63,6 @@ struct PreparedChunk {
     start: usize,
     end: usize,
     hash: BlobHash,
-}
-
-#[derive(Clone)]
-pub(in crate::binary_cas) struct BinaryCasDictionary {
-    pub(in crate::binary_cas) hash: BlobHash,
-    pub(in crate::binary_cas) bytes: Vec<u8>,
-    #[cfg(not(target_family = "wasm"))]
-    compressor: std::sync::Arc<
-        std::sync::OnceLock<Result<crate::compression::ZstdDictionaryCompressor, String>>,
-    >,
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn binary_cas_dictionary(hash: BlobHash, bytes: Vec<u8>) -> Result<BinaryCasDictionary, LixError> {
-    if BlobHash::from_content(&bytes) != hash {
-        return Err(LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!(
-                "binary CAS dictionary '{}' failed content-address verification",
-                hash.to_hex()
-            ),
-        ));
-    }
-    Ok(BinaryCasDictionary {
-        hash,
-        bytes,
-        compressor: std::sync::Arc::new(std::sync::OnceLock::new()),
-    })
-}
-
-#[cfg(target_family = "wasm")]
-fn binary_cas_dictionary(hash: BlobHash, bytes: Vec<u8>) -> Result<BinaryCasDictionary, LixError> {
-    if BlobHash::from_content(&bytes) != hash {
-        return Err(LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!(
-                "binary CAS dictionary '{}' failed content-address verification",
-                hash.to_hex()
-            ),
-        ));
-    }
-    Ok(BinaryCasDictionary { hash, bytes })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,102 +339,6 @@ pub(crate) async fn load_bytes_many(
     hashes: &[BlobHash],
 ) -> Result<BlobBytesBatch, LixError> {
     let metadata = load_metadata_many(store, hashes).await?.into_vec();
-    let delta_base_hashes = metadata
-        .iter()
-        .filter_map(|metadata| match metadata.as_ref()?.inline_blob.as_ref()? {
-            InlineBlob::Delta { base_blob_hash, .. } => Some(*base_blob_hash),
-            InlineBlob::Full { .. } => None,
-        })
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let delta_base_metadata = load_metadata_many(store, &delta_base_hashes)
-        .await?
-        .into_vec();
-    let dictionary_hashes = metadata
-        .iter()
-        .chain(delta_base_metadata.iter())
-        .filter_map(|metadata| match metadata.as_ref()?.inline_blob.as_ref()? {
-            InlineBlob::Full {
-                dictionary_hash, ..
-            }
-            | InlineBlob::Delta {
-                dictionary_hash, ..
-            } => *dictionary_hash,
-        })
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let dictionary_rows = point_values(
-        store,
-        BINARY_CAS_DICTIONARY_SPACE,
-        dictionary_hashes
-            .iter()
-            .map(|hash| hash.as_bytes().to_vec())
-            .collect(),
-    )
-    .await?;
-    let dictionaries_by_hash = dictionary_hashes
-        .into_iter()
-        .zip(dictionary_rows)
-        .map(|(hash, row)| {
-            let bytes = row.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!("binary CAS dictionary '{}' is missing", hash.to_hex()),
-                )
-            })?;
-            if BlobHash::from_content(&bytes) != hash {
-                return Err(LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!(
-                        "binary CAS dictionary '{}' failed content-address verification",
-                        hash.to_hex()
-                    ),
-                ));
-            }
-            let decoder =
-                crate::compression::ZstdDictionaryDecoder::new(&bytes).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_UNKNOWN,
-                        format!(
-                            "binary CAS dictionary '{}' failed to initialize: {error}",
-                            hash.to_hex()
-                        ),
-                    )
-                })?;
-            Ok((hash, decoder))
-        })
-        .collect::<Result<HashMap<_, _>, LixError>>()?;
-    let mut delta_bases_by_hash = HashMap::with_capacity(delta_base_hashes.len());
-    for (base_hash, metadata) in delta_base_hashes.into_iter().zip(delta_base_metadata) {
-        let metadata = metadata.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_UNKNOWN,
-                format!(
-                    "binary CAS inline delta base '{}' is missing",
-                    base_hash.to_hex()
-                ),
-            )
-        })?;
-        if !matches!(metadata.inline_blob, Some(InlineBlob::Full { .. })) {
-            return Err(LixError::new(
-                LixError::CODE_UNKNOWN,
-                format!(
-                    "binary CAS inline delta base '{}' is not one full inline blob",
-                    base_hash.to_hex()
-                ),
-            ));
-        }
-        let bytes = assemble_blob_bytes(
-            metadata,
-            &HashMap::new(),
-            None,
-            &HashMap::new(),
-            &dictionaries_by_hash,
-        )?;
-        delta_bases_by_hash.insert(base_hash, bytes);
-    }
     let mut seen_manifest_hashes = HashSet::new();
     let chunked_blobs = metadata
         .iter()
@@ -561,7 +401,7 @@ pub(crate) async fn load_bytes_many(
             continue;
         };
         match &metadata.layout {
-            BlobLayout::Empty | BlobLayout::Inline => {}
+            BlobLayout::Empty => {}
             BlobLayout::SingleChunk { chunk_hash } => {
                 if seen_chunks.insert(*chunk_hash) {
                     requested_chunks.push(*chunk_hash);
@@ -606,8 +446,6 @@ pub(crate) async fn load_bytes_many(
                         metadata,
                         &chunk_rows_by_hash,
                         chunked_manifests_by_hash.get(&hash),
-                        &delta_bases_by_hash,
-                        &dictionaries_by_hash,
                     )
                 })
                 .transpose()
@@ -650,206 +488,6 @@ async fn point_values(
         .collect())
 }
 
-async fn point_value(
-    store: &(impl StorageAdapterRead + ?Sized),
-    space: StorageSpace,
-    key: Vec<u8>,
-) -> Result<Option<Bytes>, LixError> {
-    Ok(point_values(store, space, vec![key])
-        .await?
-        .into_iter()
-        .next()
-        .flatten())
-}
-
-#[cfg(not(target_family = "wasm"))]
-pub(in crate::binary_cas) async fn load_or_train_dictionary(
-    store: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-) -> Result<Option<BinaryCasDictionary>, LixError> {
-    if let Some(control) = point_value(
-        store,
-        BINARY_CAS_DICTIONARY_CONTROL_SPACE,
-        BINARY_CAS_DICTIONARY_CONTROL_KEY.to_vec(),
-    )
-    .await?
-    {
-        let hash_bytes: [u8; 32] = control.as_ref().try_into().map_err(|_| {
-            LixError::new(
-                LixError::CODE_UNKNOWN,
-                "binary CAS dictionary control is not one hash",
-            )
-        })?;
-        let hash = BlobHash::from_bytes(hash_bytes);
-        let bytes = point_value(store, BINARY_CAS_DICTIONARY_SPACE, hash.as_bytes().to_vec())
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!(
-                        "binary CAS active dictionary '{}' is missing",
-                        hash.to_hex()
-                    ),
-                )
-            })?;
-        return binary_cas_dictionary(hash, bytes.to_vec()).map(Some);
-    }
-
-    let plan = ScanPlan::prefix(
-        BINARY_CAS_DICTIONARY_SAMPLE_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let samples = plan
-        .collect(
-            store,
-            StorageScanOptions {
-                projection: StorageCoreProjection::FullValue,
-                limit_rows: BINARY_CAS_DICTIONARY_SAMPLE_SLOTS,
-                ..StorageScanOptions::default()
-            },
-        )
-        .await?;
-    if samples.value.entries.len() < BINARY_CAS_DICTIONARY_SAMPLE_COUNT {
-        return Ok(None);
-    }
-    let sample_keys = samples
-        .value
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let _: [u8; 1] = entry.key.0.as_ref().try_into().map_err(|_| {
-                LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    "binary CAS dictionary sample key is not one slot",
-                )
-            })?;
-            let StorageProjectedValue::FullValue(hash_bytes) = entry.value else {
-                unreachable!("dictionary sample scan requested full values");
-            };
-            let hash: [u8; 32] = hash_bytes.as_ref().try_into().map_err(|_| {
-                LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    "binary CAS dictionary sample slot value is not one hash",
-                )
-            })?;
-            Ok((entry.key, BlobHash::from_bytes(hash)))
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    let sample_hashes = sample_keys
-        .iter()
-        .take(BINARY_CAS_DICTIONARY_SAMPLE_COUNT)
-        .map(|(_, hash)| *hash)
-        .collect::<Vec<_>>();
-    let sample_bytes = load_bytes_many(store, &sample_hashes)
-        .await?
-        .into_vec()
-        .into_iter()
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_UNKNOWN,
-                "binary CAS dictionary sample blob is missing",
-            )
-        })?;
-    let sample_refs = sample_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let bytes =
-        zstd::dict::from_samples(&sample_refs, BINARY_CAS_DICTIONARY_BYTES).map_err(|error| {
-            LixError::new(
-                LixError::CODE_UNKNOWN,
-                format!("binary CAS dictionary training failed: {error}"),
-            )
-        })?;
-    let hash = BlobHash::from_content(&bytes);
-    writes.put(
-        BINARY_CAS_DICTIONARY_SPACE,
-        key(hash.as_bytes().to_vec()),
-        value(bytes.clone()),
-    );
-    writes.put(
-        BINARY_CAS_DICTIONARY_CONTROL_SPACE,
-        key(BINARY_CAS_DICTIONARY_CONTROL_KEY.to_vec()),
-        value(hash.as_bytes().to_vec()),
-    );
-    writes.delete_batch(
-        BINARY_CAS_DICTIONARY_SAMPLE_SPACE,
-        sample_keys.into_iter().map(|(key, _)| key),
-    );
-    binary_cas_dictionary(hash, bytes).map(Some)
-}
-
-#[cfg(target_family = "wasm")]
-pub(in crate::binary_cas) async fn load_or_train_dictionary(
-    store: &(impl StorageAdapterRead + ?Sized),
-    _writes: &mut StorageWriteSet,
-) -> Result<Option<BinaryCasDictionary>, LixError> {
-    let Some(control) = point_value(
-        store,
-        BINARY_CAS_DICTIONARY_CONTROL_SPACE,
-        BINARY_CAS_DICTIONARY_CONTROL_KEY.to_vec(),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let hash_bytes: [u8; 32] = control.as_ref().try_into().map_err(|_| {
-        LixError::new(
-            LixError::CODE_UNKNOWN,
-            "binary CAS dictionary control is not one hash",
-        )
-    })?;
-    let hash = BlobHash::from_bytes(hash_bytes);
-    let bytes = point_value(store, BINARY_CAS_DICTIONARY_SPACE, hash.as_bytes().to_vec())
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_UNKNOWN,
-                format!(
-                    "binary CAS active dictionary '{}' is missing",
-                    hash.to_hex()
-                ),
-            )
-        })?;
-    binary_cas_dictionary(hash, bytes.to_vec()).map(Some)
-}
-
-#[cfg(not(target_family = "wasm"))]
-pub(in crate::binary_cas) fn stage_dictionary_sample(
-    writes: &mut StorageWriteSet,
-    staged_sample_slots: &mut HashSet<u8>,
-    bytes: &[u8],
-    hash: Option<BlobHash>,
-) {
-    let Some(hash) = hash else {
-        return;
-    };
-    if bytes.len() < 512
-        || bytes.len() > INLINE_BINARY_CAS_MAX_BYTES
-        || std::str::from_utf8(bytes).is_err()
-    {
-        return;
-    }
-    let slot = hash.as_bytes()[0] & (BINARY_CAS_DICTIONARY_SAMPLE_SLOTS as u8 - 1);
-    if !staged_sample_slots.insert(slot) {
-        return;
-    }
-    writes.put(
-        BINARY_CAS_DICTIONARY_SAMPLE_SPACE,
-        key(vec![slot]),
-        value(hash.as_bytes().to_vec()),
-    );
-}
-
-#[cfg(target_family = "wasm")]
-pub(in crate::binary_cas) fn stage_dictionary_sample(
-    _writes: &mut StorageWriteSet,
-    _staged_sample_slots: &mut HashSet<u8>,
-    _bytes: &[u8],
-    _hash: Option<BlobHash>,
-) {
-}
-
 fn key(bytes: Vec<u8>) -> StorageKey {
     StorageKey(Bytes::from(bytes))
 }
@@ -868,11 +506,9 @@ fn full_value(value: StorageProjectedValue) -> Option<Bytes> {
 }
 
 fn assemble_blob_bytes(
-    mut metadata: BlobMetadata,
+    metadata: BlobMetadata,
     chunk_rows_by_hash: &HashMap<BlobHash, Option<Bytes>>,
     chunked_manifest: Option<&Vec<KvBlobManifestChunk>>,
-    delta_bases_by_hash: &HashMap<BlobHash, Vec<u8>>,
-    dictionaries_by_hash: &HashMap<BlobHash, crate::compression::ZstdDictionaryDecoder>,
 ) -> Result<Vec<u8>, LixError> {
     let expected_blob_size = persisted_size_to_usize(metadata.size_bytes, "binary CAS blob")?;
     let bytes = match &metadata.layout {
@@ -887,53 +523,6 @@ fn assemble_blob_bytes(
                 ));
             }
             Vec::new()
-        }
-        BlobLayout::Inline => {
-            let inline_blob = metadata.inline_blob.take().ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "binary CAS inline blob '{}' is missing its encoded bytes",
-                        metadata.hash.to_hex()
-                    ),
-                )
-            })?;
-            match inline_blob {
-                InlineBlob::Full {
-                    codec,
-                    dictionary_hash,
-                    payload,
-                } => decode_inline_payload(
-                    metadata.hash,
-                    expected_blob_size,
-                    codec,
-                    dictionary_hash,
-                    payload,
-                    dictionaries_by_hash,
-                    true,
-                )?,
-                InlineBlob::Delta {
-                    base_blob_hash,
-                    prefix_len,
-                    suffix_len,
-                    middle_len,
-                    codec,
-                    dictionary_hash,
-                    payload,
-                } => assemble_inline_delta(
-                    metadata.hash,
-                    expected_blob_size,
-                    base_blob_hash,
-                    prefix_len,
-                    suffix_len,
-                    middle_len,
-                    codec,
-                    dictionary_hash,
-                    payload,
-                    delta_bases_by_hash,
-                    dictionaries_by_hash,
-                )?,
-            }
         }
         BlobLayout::SingleChunk { chunk_hash } => {
             let chunk = decode_chunk_from_map(
@@ -1014,137 +603,6 @@ fn assemble_blob_bytes(
         }
     };
     Ok(bytes)
-}
-
-#[expect(clippy::too_many_arguments)]
-fn assemble_inline_delta(
-    blob_hash: BlobHash,
-    expected_blob_size: usize,
-    base_blob_hash: BlobHash,
-    prefix_len: u64,
-    suffix_len: u64,
-    middle_len: u64,
-    codec: BinaryChunkCodec,
-    dictionary_hash: Option<BlobHash>,
-    payload: Vec<u8>,
-    delta_bases_by_hash: &HashMap<BlobHash, Vec<u8>>,
-    dictionaries_by_hash: &HashMap<BlobHash, crate::compression::ZstdDictionaryDecoder>,
-) -> Result<Vec<u8>, LixError> {
-    let base = delta_bases_by_hash.get(&base_blob_hash).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!(
-                "binary CAS inline delta base '{}' was not loaded",
-                base_blob_hash.to_hex()
-            ),
-        )
-    })?;
-    let prefix_len = persisted_size_to_usize(prefix_len, "inline delta prefix")?;
-    let suffix_len = persisted_size_to_usize(suffix_len, "inline delta suffix")?;
-    let middle_len = persisted_size_to_usize(middle_len, "inline delta middle")?;
-    if prefix_len.saturating_add(suffix_len) > base.len()
-        || prefix_len
-            .checked_add(middle_len)
-            .and_then(|len| len.checked_add(suffix_len))
-            != Some(expected_blob_size)
-    {
-        return Err(LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!(
-                "binary CAS inline delta '{}' has invalid ranges",
-                blob_hash.to_hex()
-            ),
-        ));
-    }
-    let middle = decode_inline_payload(
-        blob_hash,
-        middle_len,
-        codec,
-        dictionary_hash,
-        payload,
-        dictionaries_by_hash,
-        false,
-    )?;
-    if middle.len() != middle_len {
-        return Err(LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!(
-                "binary CAS inline delta '{}' expected {middle_len} middle bytes, got {}",
-                blob_hash.to_hex(),
-                middle.len()
-            ),
-        ));
-    }
-    let mut out = Vec::with_capacity(expected_blob_size);
-    out.extend_from_slice(&base[..prefix_len]);
-    out.extend_from_slice(&middle);
-    out.extend_from_slice(&base[base.len() - suffix_len..]);
-    if BlobHash::from_content(&out) != blob_hash {
-        return Err(LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!(
-                "binary CAS inline delta '{}' failed content verification",
-                blob_hash.to_hex()
-            ),
-        ));
-    }
-    Ok(out)
-}
-
-fn decode_inline_payload(
-    blob_hash: BlobHash,
-    uncompressed_len: usize,
-    codec: BinaryChunkCodec,
-    dictionary_hash: Option<BlobHash>,
-    payload: Vec<u8>,
-    dictionaries_by_hash: &HashMap<BlobHash, crate::compression::ZstdDictionaryDecoder>,
-    verify_content_hash: bool,
-) -> Result<Vec<u8>, LixError> {
-    let decoded = match (codec, dictionary_hash) {
-        (BinaryChunkCodec::Raw, None) => Ok(payload),
-        (BinaryChunkCodec::Zstd, None) => {
-            crate::compression::decompress_zstd(&payload, uncompressed_len)
-        }
-        (BinaryChunkCodec::Zstd, Some(dictionary_hash)) => {
-            let dictionary = dictionaries_by_hash.get(&dictionary_hash).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!(
-                        "binary CAS dictionary '{}' was not loaded",
-                        dictionary_hash.to_hex()
-                    ),
-                )
-            })?;
-            dictionary.decompress(&payload, uncompressed_len)
-        }
-        (BinaryChunkCodec::Raw, Some(_)) => {
-            return Err(LixError::new(
-                LixError::CODE_UNKNOWN,
-                "binary CAS raw payload cannot reference a dictionary",
-            ));
-        }
-    }
-    .map_err(|error| {
-        LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!(
-                "binary CAS inline payload '{}' decompression failed: {error}",
-                blob_hash.to_hex()
-            ),
-        )
-    })?;
-    if decoded.len() != uncompressed_len
-        || (verify_content_hash && BlobHash::from_content(&decoded) != blob_hash)
-    {
-        return Err(LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!(
-                "binary CAS inline payload '{}' failed content-address verification",
-                blob_hash.to_hex()
-            ),
-        ));
-    }
-    Ok(decoded)
 }
 
 fn decode_chunk_from_map(
@@ -1236,11 +694,10 @@ fn decode_and_verify_payload(
             ),
         ));
     }
-    // Native zstd level 1 does not enable frame checksums. Always authenticate
-    // decoded compressed bytes against the CAS key, including in release builds.
-    if (matches!(codec, BinaryChunkCodec::Zstd) || cfg!(debug_assertions))
-        && BlobHash::from_content(&decoded) != chunk_hash
-    {
+    // The immutable sidecar and its range cache are not independently
+    // authenticated. Verify raw and decoded compressed bytes against the CAS
+    // key in every build before returning them.
+    if BlobHash::from_content(&decoded) != chunk_hash {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
@@ -1428,253 +885,6 @@ where
     Ok(true)
 }
 
-pub(in crate::binary_cas) async fn try_stage_inline_delta<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    blob_hashes: &mut HashSet<[u8; 32]>,
-    bytes: &[u8],
-    precomputed_hash: Option<BlobHash>,
-    base_blob_hash: BlobHash,
-    dictionary: Option<&BinaryCasDictionary>,
-) -> Result<bool, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    if bytes.is_empty() || bytes.len() > INLINE_BINARY_CAS_MAX_BYTES {
-        return Ok(false);
-    }
-    let blob_hash = precomputed_hash.unwrap_or_else(|| BlobHash::from_content(bytes));
-    if blob_hash == base_blob_hash {
-        return Ok(true);
-    }
-    if blob_hashes.contains(&blob_hash.into_bytes()) {
-        return Ok(true);
-    }
-    let mut metadata = load_metadata_many(store, &[base_blob_hash, blob_hash])
-        .await?
-        .into_vec();
-    if metadata.get(1).is_some_and(Option::is_some) {
-        blob_hashes.insert(blob_hash.into_bytes());
-        return Ok(true);
-    }
-    let Some(base_metadata) = metadata.get_mut(0).and_then(Option::take) else {
-        return Ok(false);
-    };
-    let Some(InlineBlob::Full {
-        dictionary_hash: base_dictionary_hash,
-        ..
-    }) = base_metadata.inline_blob.as_ref()
-    else {
-        return Ok(false);
-    };
-    let mut dictionaries = dictionary
-        .map(|dictionary| {
-            crate::compression::ZstdDictionaryDecoder::new(&dictionary.bytes)
-                .map(|decoder| (dictionary.hash, decoder))
-                .map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_UNKNOWN,
-                        format!(
-                            "binary CAS dictionary '{}' failed to initialize: {error}",
-                            dictionary.hash.to_hex()
-                        ),
-                    )
-                })
-        })
-        .transpose()?
-        .into_iter()
-        .collect::<HashMap<_, _>>();
-    if let Some(base_dictionary_hash) = base_dictionary_hash
-        && !dictionaries.contains_key(base_dictionary_hash)
-    {
-        let Some(bytes) = point_value(
-            store,
-            BINARY_CAS_DICTIONARY_SPACE,
-            base_dictionary_hash.as_bytes().to_vec(),
-        )
-        .await?
-        else {
-            return Ok(false);
-        };
-        if BlobHash::from_content(&bytes) != *base_dictionary_hash {
-            return Ok(false);
-        }
-        let Ok(decoder) = crate::compression::ZstdDictionaryDecoder::new(&bytes) else {
-            return Ok(false);
-        };
-        dictionaries.insert(*base_dictionary_hash, decoder);
-    }
-    let base = assemble_blob_bytes(
-        base_metadata,
-        &HashMap::new(),
-        None,
-        &HashMap::new(),
-        &dictionaries,
-    )?;
-    let shared = base.len().min(bytes.len());
-    let prefix_len = base
-        .iter()
-        .zip(bytes)
-        .take(shared)
-        .take_while(|(left, right)| left == right)
-        .count();
-    let suffix_limit = (base.len() - prefix_len).min(bytes.len() - prefix_len);
-    let suffix_len = base
-        .iter()
-        .rev()
-        .zip(bytes.iter().rev())
-        .take(suffix_limit)
-        .take_while(|(left, right)| left == right)
-        .count();
-    let middle = &bytes[prefix_len..bytes.len() - suffix_len];
-    let encoded_middle = encode_chunk_payload(blob_hash, middle)?;
-    let mut delta = encode_inline_delta_binary_cas_manifest(
-        bytes.len() as u64,
-        base_blob_hash.into_bytes(),
-        prefix_len as u64,
-        suffix_len as u64,
-        middle.len() as u64,
-        encoded_middle.codec,
-        &encoded_middle.data,
-    );
-    let encoded_full_payload = encode_chunk_payload(blob_hash, bytes)?;
-    let mut full = encode_inline_binary_cas_manifest(
-        bytes.len() as u64,
-        encoded_full_payload.codec,
-        &encoded_full_payload.data,
-    );
-    if let Some(dictionary) = dictionary {
-        if let Some(compressed) = compress_with_dictionary(middle, dictionary)? {
-            let candidate = encode_inline_dictionary_delta_binary_cas_manifest(
-                bytes.len() as u64,
-                base_blob_hash.into_bytes(),
-                prefix_len as u64,
-                suffix_len as u64,
-                middle.len() as u64,
-                dictionary.hash.into_bytes(),
-                &compressed,
-            );
-            if candidate.len() < delta.len() {
-                delta = candidate;
-            }
-        }
-        if let Some(compressed) = compress_with_dictionary(bytes, dictionary)? {
-            let candidate = encode_inline_dictionary_binary_cas_manifest(
-                bytes.len() as u64,
-                dictionary.hash.into_bytes(),
-                &compressed,
-            );
-            if candidate.len() < full.len() {
-                full = candidate;
-            }
-        }
-    }
-    // The extra base point read must buy a material physical reduction.
-    // Requiring at least 12.5% and 128 bytes mirrors chunk compression's
-    // existing CPU/space gate and rejects noisy near-equal versions.
-    let minimum_savings = 128_usize.max(full.len().div_ceil(8));
-    if full.len().saturating_sub(delta.len()) < minimum_savings {
-        return Ok(false);
-    }
-    blob_hashes.insert(blob_hash.into_bytes());
-    writes.put(
-        BINARY_CAS_MANIFEST_SPACE,
-        key(manifest_key(blob_hash)),
-        value(delta),
-    );
-    Ok(true)
-}
-
-pub(in crate::binary_cas) async fn try_stage_inline_dictionary<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    blob_hashes: &mut HashSet<[u8; 32]>,
-    bytes: &[u8],
-    precomputed_hash: Option<BlobHash>,
-    dictionary: Option<&BinaryCasDictionary>,
-) -> Result<bool, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let Some(dictionary) = dictionary else {
-        return Ok(false);
-    };
-    if bytes.is_empty() || bytes.len() > INLINE_BINARY_CAS_MAX_BYTES {
-        return Ok(false);
-    }
-    let blob_hash = precomputed_hash.unwrap_or_else(|| BlobHash::from_content(bytes));
-    if blob_hashes.contains(&blob_hash.into_bytes()) {
-        return Ok(true);
-    }
-    if load_metadata_many(store, &[blob_hash])
-        .await?
-        .into_vec()
-        .into_iter()
-        .next()
-        .flatten()
-        .is_some()
-    {
-        blob_hashes.insert(blob_hash.into_bytes());
-        return Ok(true);
-    }
-    let Some(compressed) = compress_with_dictionary(bytes, dictionary)? else {
-        return Ok(false);
-    };
-    let candidate = encode_inline_dictionary_binary_cas_manifest(
-        bytes.len() as u64,
-        dictionary.hash.into_bytes(),
-        &compressed,
-    );
-    let ordinary = encode_chunk_payload(blob_hash, bytes)?;
-    let ordinary =
-        encode_inline_binary_cas_manifest(bytes.len() as u64, ordinary.codec, &ordinary.data);
-    let minimum_savings = 128_usize.max(ordinary.len().div_ceil(8));
-    if ordinary.len().saturating_sub(candidate.len()) < minimum_savings {
-        return Ok(false);
-    }
-    blob_hashes.insert(blob_hash.into_bytes());
-    writes.put(
-        BINARY_CAS_MANIFEST_SPACE,
-        key(manifest_key(blob_hash)),
-        value(candidate),
-    );
-    Ok(true)
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn compress_with_dictionary(
-    bytes: &[u8],
-    dictionary: &BinaryCasDictionary,
-) -> Result<Option<Vec<u8>>, LixError> {
-    if bytes.len() < 512 {
-        return Ok(None);
-    }
-    let compressor = dictionary
-        .compressor
-        .get_or_init(|| crate::compression::ZstdDictionaryCompressor::new(&dictionary.bytes))
-        .as_ref()
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_UNKNOWN,
-                format!("binary CAS dictionary compression failed: {error}"),
-            )
-        })?;
-    compressor.compress(bytes).map(Some).map_err(|error| {
-        LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!("binary CAS dictionary compression failed: {error}"),
-        )
-    })
-}
-
-#[cfg(target_family = "wasm")]
-fn compress_with_dictionary(
-    _bytes: &[u8],
-    _dictionary: &BinaryCasDictionary,
-) -> Result<Option<Vec<u8>>, LixError> {
-    Ok(None)
-}
-
 fn prepare_blob_write(
     chunking: BinaryCasChunking,
     bytes: &[u8],
@@ -1692,8 +902,6 @@ fn prepare_blob_write(
     }
     let (chunk_ranges, layout) = if bytes.is_empty() {
         (Vec::new(), BlobLayout::Empty)
-    } else if bytes.len() <= INLINE_BINARY_CAS_MAX_BYTES {
-        (Vec::new(), BlobLayout::Inline)
     } else {
         let chunk_ranges = fastcdc_chunk_ranges_with_chunking(bytes, chunking);
         let layout = match chunk_ranges.as_slice() {
@@ -1764,23 +972,6 @@ fn stage_prepared_blob_write(
                 &BinaryCasManifest::Empty { size_bytes: 0 },
             );
         }
-        BlobLayout::Inline => {
-            if bytes.len() > UNGUARDED_INLINE_BINARY_CAS_MAX_BYTES
-                && !should_stage_chunk(plan.blob_hash)?
-            {
-                return Ok(());
-            }
-            let encoded = encode_chunk_payload(plan.blob_hash, bytes)?;
-            writes.put(
-                BINARY_CAS_MANIFEST_SPACE,
-                key(manifest_key(plan.blob_hash)),
-                value(encode_inline_binary_cas_manifest(
-                    bytes.len() as u64,
-                    encoded.codec,
-                    &encoded.data,
-                )),
-            );
-        }
         BlobLayout::SingleChunk { chunk_hash } => {
             let chunk_hash = *chunk_hash;
             stage_manifest(
@@ -1836,16 +1027,6 @@ async fn missing_chunk_hashes(
     let mut candidates = Vec::<(BlobHash, StorageKey)>::new();
     match &plan.layout {
         BlobLayout::Empty => {}
-        BlobLayout::Inline
-            if plan.receipt.size_bytes
-                > u64::try_from(UNGUARDED_INLINE_BINARY_CAS_MAX_BYTES)
-                    .expect("inline CAS threshold fits u64") =>
-        {
-            let exists =
-                manifest_keys_exist(store, vec![key(manifest_key(plan.blob_hash))]).await?;
-            return Ok((!exists[0]).then_some(plan.blob_hash).into_iter().collect());
-        }
-        BlobLayout::Inline => {}
         BlobLayout::SingleChunk { chunk_hash } => {
             collect_chunk_lookup_candidate(*chunk_hash, transaction_chunk_keys, &mut candidates);
         }
@@ -1937,32 +1118,12 @@ async fn chunk_keys_exist(
     Ok(exists)
 }
 
-async fn manifest_keys_exist(
-    store: &(impl StorageAdapterRead + ?Sized),
-    keys: Vec<StorageKey>,
-) -> Result<Vec<bool>, LixError> {
-    let result = PointReadPlan::from_unique_keys(BINARY_CAS_MANIFEST_SPACE, keys)
-        .materialize(
-            store,
-            StorageGetOptions {
-                projection: StorageCoreProjection::KeyOnly,
-            },
-        )
-        .await?;
-    let exists = result
-        .value
-        .into_iter()
-        .map(|value| value.is_some())
-        .collect::<Vec<_>>();
-    Ok(exists)
-}
-
 fn metadata_from_manifest(
     hash: BlobHash,
     manifest: BinaryCasManifest,
 ) -> Result<BlobMetadata, LixError> {
     let size_bytes = manifest.size_bytes();
-    let (layout, inline_blob) = match manifest {
+    let layout = match manifest {
         BinaryCasManifest::Empty { size_bytes } => {
             if size_bytes != 0 {
                 return Err(LixError::new(
@@ -1973,131 +1134,17 @@ fn metadata_from_manifest(
                     ),
                 ));
             }
-            (BlobLayout::Empty, None)
+            BlobLayout::Empty
         }
-        BinaryCasManifest::Inline {
-            size_bytes,
-            codec,
-            payload,
-        } => {
-            if size_bytes == 0 || size_bytes > INLINE_BINARY_CAS_MAX_BYTES as u64 {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "binary CAS inline blob '{}' has invalid size {size_bytes}",
-                        hash.to_hex()
-                    ),
-                ));
-            }
-            (
-                BlobLayout::Inline,
-                Some(InlineBlob::Full {
-                    codec,
-                    dictionary_hash: None,
-                    payload,
-                }),
-            )
-        }
-        BinaryCasManifest::InlineDelta {
-            size_bytes,
-            base_blob_hash,
-            prefix_len,
-            suffix_len,
-            middle_len,
-            codec,
-            payload,
-        } => {
-            if size_bytes == 0 || size_bytes > INLINE_BINARY_CAS_MAX_BYTES as u64 {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "binary CAS inline delta blob '{}' has invalid size {size_bytes}",
-                        hash.to_hex()
-                    ),
-                ));
-            }
-            (
-                BlobLayout::Inline,
-                Some(InlineBlob::Delta {
-                    base_blob_hash: BlobHash::from_bytes(base_blob_hash),
-                    prefix_len,
-                    suffix_len,
-                    middle_len,
-                    codec,
-                    dictionary_hash: None,
-                    payload,
-                }),
-            )
-        }
-        BinaryCasManifest::InlineDictionary {
-            size_bytes,
-            dictionary_hash,
-            payload,
-        } => {
-            if size_bytes == 0 || size_bytes > INLINE_BINARY_CAS_MAX_BYTES as u64 {
-                return Err(LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!(
-                        "binary CAS dictionary inline blob '{}' has invalid size {size_bytes}",
-                        hash.to_hex()
-                    ),
-                ));
-            }
-            (
-                BlobLayout::Inline,
-                Some(InlineBlob::Full {
-                    codec: BinaryChunkCodec::Zstd,
-                    dictionary_hash: Some(BlobHash::from_bytes(dictionary_hash)),
-                    payload,
-                }),
-            )
-        }
-        BinaryCasManifest::InlineDictionaryDelta {
-            size_bytes,
-            base_blob_hash,
-            prefix_len,
-            suffix_len,
-            middle_len,
-            dictionary_hash,
-            payload,
-        } => {
-            if size_bytes == 0 || size_bytes > INLINE_BINARY_CAS_MAX_BYTES as u64 {
-                return Err(LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!(
-                        "binary CAS dictionary inline delta '{}' has invalid size {size_bytes}",
-                        hash.to_hex()
-                    ),
-                ));
-            }
-            (
-                BlobLayout::Inline,
-                Some(InlineBlob::Delta {
-                    base_blob_hash: BlobHash::from_bytes(base_blob_hash),
-                    prefix_len,
-                    suffix_len,
-                    middle_len,
-                    codec: BinaryChunkCodec::Zstd,
-                    dictionary_hash: Some(BlobHash::from_bytes(dictionary_hash)),
-                    payload,
-                }),
-            )
-        }
-        BinaryCasManifest::SingleChunk { chunk_hash, .. } => (
-            BlobLayout::SingleChunk {
-                chunk_hash: BlobHash::from_bytes(chunk_hash),
-            },
-            None,
-        ),
-        BinaryCasManifest::Chunked { chunk_count, .. } => {
-            (BlobLayout::Chunked { chunk_count }, None)
-        }
+        BinaryCasManifest::SingleChunk { chunk_hash, .. } => BlobLayout::SingleChunk {
+            chunk_hash: BlobHash::from_bytes(chunk_hash),
+        },
+        BinaryCasManifest::Chunked { chunk_count, .. } => BlobLayout::Chunked { chunk_count },
     };
     Ok(BlobMetadata {
         hash,
         size_bytes,
         layout,
-        inline_blob,
     })
 }
 
@@ -2143,17 +1190,6 @@ mod tests {
         (0..5_000_000)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>()
-    }
-
-    fn deterministic_high_entropy_bytes(len: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(len);
-        let mut counter = 0u64;
-        while out.len() < len {
-            out.extend_from_slice(blake3::hash(&counter.to_le_bytes()).as_bytes());
-            counter += 1;
-        }
-        out.truncate(len);
-        out
     }
 
     use crate::binary_cas::BinaryCasContext;
@@ -2380,11 +1416,7 @@ mod tests {
             .expect("test blob read should open");
         BinaryCasContext::new()
             .writer_skipping_existing_chunks(&store, writes)
-            .stage_file_payload(
-                payload,
-                same_length_splice.map(|splice| splice.base_blob_hash),
-                same_length_splice,
-            )
+            .stage_file_payload(payload, same_length_splice)
             .await
             .expect("test file payload should stage");
     }
@@ -2792,38 +1824,18 @@ mod tests {
     }
 
     #[test]
-    fn inline_layout_stops_at_the_128kib_boundary() {
-        let at_boundary = vec![b'a'; INLINE_BINARY_CAS_MAX_BYTES];
-        let above_boundary = vec![b'a'; INLINE_BINARY_CAS_MAX_BYTES + 1];
-
-        let inline = prepare_blob_write(BinaryCasChunking::default(), &at_boundary, None)
-            .expect("boundary blob should plan");
-        let out_of_line = prepare_blob_write(BinaryCasChunking::default(), &above_boundary, None)
-            .expect("above-boundary blob should plan");
-
-        assert_eq!(inline.layout, BlobLayout::Inline);
-        assert!(inline.chunk_ranges.is_empty());
-        assert!(matches!(out_of_line.layout, BlobLayout::SingleChunk { .. }));
-        assert_eq!(out_of_line.chunk_ranges, vec![(0, above_boundary.len())]);
-    }
-
-    #[test]
-    fn inline_manifest_rejects_sizes_outside_the_format_boundary() {
-        let hash = BlobHash::from_content(b"invalid inline");
-        for size_bytes in [0, INLINE_BINARY_CAS_MAX_BYTES as u64 + 1] {
-            let error = metadata_from_manifest(
-                hash,
-                BinaryCasManifest::Inline {
-                    size_bytes,
-                    codec: BinaryChunkCodec::Raw,
-                    payload: Vec::new(),
-                },
-            )
-            .expect_err("invalid inline size should be rejected");
-            assert!(error.message.contains("invalid size"));
+    fn every_non_empty_blob_is_out_of_line() {
+        for size in [1, 32 * 1024, 128 * 1024] {
+            let bytes = vec![b'a'; size];
+            let plan = prepare_blob_write(BinaryCasChunking::default(), &bytes, None)
+                .expect("non-empty blob should plan");
+            assert!(!plan.chunk_ranges.is_empty());
+            assert!(matches!(
+                plan.layout,
+                BlobLayout::SingleChunk { .. } | BlobLayout::Chunked { .. }
+            ));
         }
     }
-
     #[tokio::test]
     async fn public_kv_api_roundtrips_blob_bytes() {
         let storage = StorageAdapter::new(Memory::new());
@@ -2858,10 +1870,9 @@ mod tests {
             load_manifest(&store, blob_hash)
                 .await
                 .expect("manifest should load"),
-            Some(BinaryCasManifest::Inline {
+            Some(BinaryCasManifest::SingleChunk {
                 size_bytes: data.len() as u64,
-                codec: BinaryChunkCodec::Raw,
-                payload: data.to_vec(),
+                chunk_hash: blob_hash.into_bytes(),
             })
         );
         let store = storage
@@ -2871,618 +1882,10 @@ mod tests {
         assert_eq!(
             scan_manifest_chunks(&store, blob_hash)
                 .await
-                .expect("inline blob should not spill manifest chunks"),
+                .expect("single-chunk blob should not spill manifest chunks"),
             Vec::<KvBlobManifestChunk>::new()
         );
     }
-
-    #[tokio::test]
-    async fn public_kv_api_compresses_repetitive_inline_blob() {
-        let storage = StorageAdapter::new(Memory::new());
-        let data = b"component-section:function-signature\n".repeat(512);
-        let blob_hash = BlobHash::from_content(&data);
-
-        {
-            let mut writes = storage.new_write_set();
-            stage_test_bytes(&storage, &mut writes, &data).await;
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("blob write should commit");
-        }
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let stored = load_manifest(&store, blob_hash)
-            .await
-            .expect("manifest should load")
-            .expect("manifest should exist");
-        let BinaryCasManifest::Inline {
-            size_bytes,
-            codec,
-            payload,
-        } = stored
-        else {
-            panic!("small blob should be inline");
-        };
-        assert_eq!(codec, BinaryChunkCodec::Zstd);
-        assert_eq!(size_bytes, data.len() as u64);
-        assert!(payload.len() < data.len() / 4);
-
-        assert_eq!(
-            load_bytes_many(&store, &[blob_hash])
-                .await
-                .expect("blob should load")
-                .into_vec(),
-            vec![Some(data)]
-        );
-    }
-
-    #[tokio::test]
-    async fn inline_updates_use_one_hop_prefix_suffix_deltas() {
-        let storage = StorageAdapter::new(Memory::new());
-        let base = deterministic_high_entropy_bytes(24 * 1024);
-        let mut updated = base.clone();
-        let edit = updated.len() / 2;
-        updated[edit..edit + 32].copy_from_slice(&[0x5a; 32]);
-        let base_hash = BlobHash::from_content(&base);
-        let updated_hash = BlobHash::from_content(&updated);
-
-        {
-            let mut writes = storage.new_write_set();
-            stage_test_bytes(&storage, &mut writes, &base).await;
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("base blob should commit");
-        }
-        {
-            let store = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("delta staging read should open");
-            let mut writes = storage.new_write_set();
-            BinaryCasContext::new()
-                .writer_skipping_existing_chunks(&store, &mut writes)
-                .stage_file_payload(
-                    &BlobPayload::from_bytes(updated.clone()),
-                    Some(base_hash),
-                    None,
-                )
-                .await
-                .expect("delta blob should stage");
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("delta blob should commit");
-        }
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("delta read should open");
-        let manifest = load_manifest(&store, updated_hash)
-            .await
-            .expect("delta manifest should load")
-            .expect("delta manifest should exist");
-        assert!(matches!(
-            manifest,
-            BinaryCasManifest::InlineDelta {
-                base_blob_hash: stored_base,
-                ..
-            } if stored_base == base_hash.into_bytes()
-        ));
-        assert_eq!(
-            load_bytes_many(&store, &[updated_hash])
-                .await
-                .expect("delta blob should load")
-                .into_vec(),
-            vec![Some(updated)]
-        );
-    }
-
-    #[tokio::test]
-    async fn inline_delta_loads_the_base_dictionary_when_another_is_current() {
-        let storage = StorageAdapter::new(Memory::new());
-        let base = deterministic_high_entropy_bytes(24 * 1024);
-        let mut updated = base.clone();
-        let edit = updated.len() / 2;
-        updated[edit..edit + 32].copy_from_slice(&[b'x'; 32]);
-        let first_dictionary = base[..8 * 1024].to_vec();
-        let mut second_dictionary = deterministic_high_entropy_bytes(8 * 1024);
-        for byte in &mut second_dictionary {
-            *byte ^= 0xa5;
-        }
-        let first_hash = BlobHash::from_content(&first_dictionary);
-        let second_hash = BlobHash::from_content(&second_dictionary);
-        assert_ne!(first_hash, second_hash);
-
-        let base_hash = BlobHash::from_content(&base);
-        let updated_hash = BlobHash::from_content(&updated);
-        let compressed_base = crate::compression::ZstdDictionaryCompressor::new(&first_dictionary)
-            .expect("first dictionary compressor should open")
-            .compress(&base)
-            .expect("base should compress");
-
-        let mut writes = storage.new_write_set();
-        writes.put(
-            BINARY_CAS_DICTIONARY_SPACE,
-            key(first_hash.as_bytes().to_vec()),
-            value(first_dictionary),
-        );
-        writes.put(
-            BINARY_CAS_DICTIONARY_SPACE,
-            key(second_hash.as_bytes().to_vec()),
-            value(second_dictionary),
-        );
-        writes.put(
-            BINARY_CAS_DICTIONARY_CONTROL_SPACE,
-            key(BINARY_CAS_DICTIONARY_CONTROL_KEY.to_vec()),
-            value(second_hash.as_bytes().to_vec()),
-        );
-        writes.put(
-            BINARY_CAS_MANIFEST_SPACE,
-            key(manifest_key(base_hash)),
-            value(encode_inline_dictionary_binary_cas_manifest(
-                base.len() as u64,
-                first_hash.into_bytes(),
-                &compressed_base,
-            )),
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("concurrent dictionary fixture should commit");
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("delta staging read should open");
-        let mut writes = storage.new_write_set();
-        BinaryCasContext::new()
-            .writer_skipping_existing_chunks(&store, &mut writes)
-            .stage_file_payload(
-                &BlobPayload::from_bytes(updated.clone()),
-                Some(base_hash),
-                None,
-            )
-            .await
-            .expect("a non-current base dictionary should remain delta eligible");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("delta should commit");
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("delta read should open");
-        assert!(matches!(
-            load_manifest(&store, updated_hash)
-                .await
-                .expect("updated manifest should load"),
-            Some(BinaryCasManifest::InlineDelta { .. })
-                | Some(BinaryCasManifest::InlineDictionaryDelta { .. })
-        ));
-        assert_eq!(
-            load_bytes_many(&store, &[updated_hash])
-                .await
-                .expect("delta should read through its historical base dictionary")
-                .into_vec(),
-            vec![Some(updated)]
-        );
-    }
-
-    #[tokio::test]
-    async fn dictionary_training_consumes_a_bounded_sample_set_once() {
-        let storage = StorageAdapter::new(Memory::new());
-        let mut staged_sample_slots = HashSet::new();
-        let mut writes = storage.new_write_set();
-        let mut ordinal = 0;
-        while staged_sample_slots.len() < BINARY_CAS_DICTIONARY_SAMPLE_SLOTS {
-            let sample = format!(
-                "component-{ordinal:04}: {}\n",
-                "shared repository vocabulary with a distinct field ".repeat(64)
-            )
-            .into_bytes();
-            let hash = BlobHash::from_content(&sample);
-            writes.put(
-                BINARY_CAS_MANIFEST_SPACE,
-                key(manifest_key(hash)),
-                value(encode_inline_binary_cas_manifest(
-                    sample.len() as u64,
-                    BinaryChunkCodec::Raw,
-                    &sample,
-                )),
-            );
-            stage_dictionary_sample(&mut writes, &mut staged_sample_slots, &sample, Some(hash));
-            ordinal += 1;
-            assert!(ordinal < 10_000, "test samples should fill every slot");
-        }
-        assert_eq!(
-            staged_sample_slots.len(),
-            BINARY_CAS_DICTIONARY_SAMPLE_SLOTS
-        );
-        assert_eq!(
-            writes.stats().staged_puts,
-            ordinal as u64 + BINARY_CAS_DICTIONARY_SAMPLE_SLOTS as u64
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("dictionary samples should commit");
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("dictionary training read should open");
-        let mut writes = storage.new_write_set();
-        let trained = load_or_train_dictionary(&store, &mut writes)
-            .await
-            .expect("dictionary should train")
-            .expect("enough samples should produce a dictionary");
-        assert!(!trained.bytes.is_empty());
-        assert!(trained.bytes.len() <= BINARY_CAS_DICTIONARY_BYTES);
-        assert_eq!(writes.stats().staged_puts, 2);
-        assert_eq!(
-            writes.stats().staged_deletes,
-            BINARY_CAS_DICTIONARY_SAMPLE_SLOTS as u64
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("trained dictionary should commit");
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("dictionary reuse read should open");
-        let mut writes = storage.new_write_set();
-        let reused = load_or_train_dictionary(&store, &mut writes)
-            .await
-            .expect("dictionary should load")
-            .expect("dictionary control should remain active");
-        assert_eq!(reused.hash, trained.hash);
-        assert_eq!(reused.bytes, trained.bytes);
-        assert_eq!(writes.stats().staged_puts, 0);
-        assert_eq!(writes.stats().staged_deletes, 0);
-        assert!(
-            scan_all_values(&store, BINARY_CAS_DICTIONARY_SAMPLE_SPACE, Vec::new())
-                .await
-                .expect("dictionary sample scan should complete")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn dictionary_inline_delta_roundtrips_and_authenticates_the_dictionary() {
-        let storage = StorageAdapter::new(Memory::new());
-        let training_samples = (0..128)
-            .map(|ordinal| {
-                format!(
-                    "section-{ordinal:04}: {}\n",
-                    "shared markdown vocabulary and stable document structure ".repeat(32)
-                )
-                .into_bytes()
-            })
-            .collect::<Vec<_>>();
-        let sample_refs = training_samples
-            .iter()
-            .map(Vec::as_slice)
-            .collect::<Vec<_>>();
-        let dictionary = zstd::dict::from_samples(&sample_refs, BINARY_CAS_DICTIONARY_BYTES)
-            .expect("test dictionary should train");
-        let dictionary_hash = BlobHash::from_content(&dictionary);
-
-        let base = [
-            b"stable-prefix\n".repeat(256),
-            b"old middle section\n".repeat(32),
-            b"stable-suffix\n".repeat(256),
-        ]
-        .concat();
-        let middle = b"shared markdown vocabulary and stable document structure\n".repeat(32);
-        let updated = [
-            b"stable-prefix\n".repeat(256),
-            middle.clone(),
-            b"stable-suffix\n".repeat(256),
-        ]
-        .concat();
-        let base_hash = BlobHash::from_content(&base);
-        let updated_hash = BlobHash::from_content(&updated);
-        let compressed_middle = crate::compression::ZstdDictionaryCompressor::new(&dictionary)
-            .expect("dictionary compressor should open")
-            .compress(&middle)
-            .expect("dictionary middle should compress");
-
-        let mut writes = storage.new_write_set();
-        writes.put(
-            BINARY_CAS_DICTIONARY_SPACE,
-            key(dictionary_hash.as_bytes().to_vec()),
-            value(dictionary),
-        );
-        writes.put(
-            BINARY_CAS_MANIFEST_SPACE,
-            key(manifest_key(base_hash)),
-            value(encode_inline_binary_cas_manifest(
-                base.len() as u64,
-                BinaryChunkCodec::Raw,
-                &base,
-            )),
-        );
-        writes.put(
-            BINARY_CAS_MANIFEST_SPACE,
-            key(manifest_key(updated_hash)),
-            value(encode_inline_dictionary_delta_binary_cas_manifest(
-                updated.len() as u64,
-                base_hash.into_bytes(),
-                (b"stable-prefix\n".len() * 256) as u64,
-                (b"stable-suffix\n".len() * 256) as u64,
-                middle.len() as u64,
-                dictionary_hash.into_bytes(),
-                &compressed_middle,
-            )),
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("dictionary delta fixture should commit");
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("dictionary delta read should open");
-        assert_eq!(
-            load_bytes_many(&store, &[updated_hash])
-                .await
-                .expect("dictionary delta should load")
-                .into_vec(),
-            vec![Some(updated)]
-        );
-
-        let missing_dictionary = BlobHash::from_content(b"missing dictionary");
-        let broken_hash = BlobHash::from_content(b"broken dictionary payload");
-        let mut writes = storage.new_write_set();
-        writes.put(
-            BINARY_CAS_MANIFEST_SPACE,
-            key(manifest_key(broken_hash)),
-            value(encode_inline_dictionary_binary_cas_manifest(
-                b"broken dictionary payload".len() as u64,
-                missing_dictionary.into_bytes(),
-                b"not a frame",
-            )),
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("broken dictionary fixture should commit");
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("broken dictionary read should open");
-        let error = load_bytes_many(&store, &[broken_hash])
-            .await
-            .expect_err("missing dictionary must be rejected");
-        assert!(error.message.contains("dictionary"));
-        assert!(error.message.contains("missing"));
-
-        let mut writes = storage.new_write_set();
-        writes.put(
-            BINARY_CAS_DICTIONARY_SPACE,
-            key(missing_dictionary.as_bytes().to_vec()),
-            value(b"wrong dictionary bytes".to_vec()),
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("corrupt dictionary fixture should commit");
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("corrupt dictionary read should open");
-        let error = load_bytes_many(&store, &[broken_hash])
-            .await
-            .expect_err("content-addressed dictionary must authenticate");
-        assert!(error.message.contains("content-address verification"));
-    }
-
-    #[tokio::test]
-    async fn public_kv_api_keeps_high_entropy_inline_blob_raw() {
-        let storage = StorageAdapter::new(Memory::new());
-        let data = deterministic_high_entropy_bytes(INLINE_BINARY_CAS_MAX_BYTES);
-        let blob_hash = BlobHash::from_content(&data);
-
-        {
-            let mut writes = storage.new_write_set();
-            stage_test_bytes(&storage, &mut writes, &data).await;
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("blob write should commit");
-        }
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let stored = load_manifest(&store, blob_hash)
-            .await
-            .expect("manifest should load")
-            .expect("manifest should exist");
-        assert_eq!(
-            stored,
-            BinaryCasManifest::Inline {
-                size_bytes: data.len() as u64,
-                codec: BinaryChunkCodec::Raw,
-                payload: data,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn inline_writer_stages_one_row_without_chunk_presence_reads() {
-        let storage = StorageAdapter::new(Memory::new());
-        let data = b"hello chunked kv cas";
-        let payload = BlobPayload::from_bytes(data.to_vec());
-        let blob_hash = payload.hash().expect("payload should have a hash");
-
-        {
-            let mut writes = storage.new_write_set();
-            stage_test_payload(&storage, &mut writes, &payload).await;
-            assert_eq!(writes.stats().staged_puts, 1);
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("initial blob write should commit");
-        }
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        assert_eq!(
-            get_one(
-                &store,
-                BINARY_CAS_CHUNK_PRESENCE_SPACE,
-                chunk_key(BlobHash::from_content(data)),
-            )
-            .await
-            .expect("chunk presence marker should load"),
-            None
-        );
-        assert_eq!(
-            get_one(
-                &store,
-                BINARY_CAS_CHUNK_SPACE,
-                chunk_key(BlobHash::from_content(data)),
-            )
-            .await
-            .expect("chunk row lookup should succeed"),
-            None
-        );
-        let counted = DelayedManifestScanRead::new(store, Duration::ZERO);
-        let mut writes = storage.new_write_set();
-        let mut writer =
-            BinaryCasContext::new().writer_skipping_existing_chunks(&counted, &mut writes);
-        writer
-            .stage_payload(&payload)
-            .await
-            .expect("repeat blob write should stage");
-
-        assert_eq!(
-            writes.stats().staged_puts,
-            0,
-            "an inline repeat write should reuse its existing manifest"
-        );
-        assert_eq!(
-            counted.presence_get_many_calls.load(Ordering::Relaxed),
-            0,
-            "inline blobs must not probe the out-of-line chunk presence space"
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("repeat blob write should commit");
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let counted = DelayedManifestScanRead::new(store, Duration::ZERO);
-        assert_eq!(
-            load_bytes_many(&counted, &[blob_hash])
-                .await
-                .expect("blob should load")
-                .into_vec(),
-            vec![Some(data.to_vec())]
-        );
-        assert_eq!(
-            counted.chunk_get_many_calls.load(Ordering::Relaxed),
-            0,
-            "inline blob reads must finish from the manifest point read"
-        );
-    }
-
-    #[tokio::test]
-    async fn extended_inline_writer_uses_manifest_probe_to_skip_repeat_payload_writes() {
-        let storage = StorageAdapter::new(Memory::new());
-        let data = deterministic_high_entropy_bytes(INLINE_BINARY_CAS_MAX_BYTES);
-        let payload = BlobPayload::from_bytes(data.clone());
-        let blob_hash = payload.hash().expect("payload should have a hash");
-
-        {
-            let mut writes = storage.new_write_set();
-            stage_test_payload(&storage, &mut writes, &payload).await;
-            assert_eq!(
-                writes.stats().staged_puts,
-                1,
-                "extended inline content stores only its manifest"
-            );
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("extended inline blob write should commit");
-        }
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        assert_eq!(
-            get_one(
-                &store,
-                BINARY_CAS_CHUNK_PRESENCE_SPACE,
-                chunk_key(blob_hash),
-            )
-            .await
-            .expect("chunk presence lookup should succeed"),
-            None,
-            "inline content must not occupy the chunk presence namespace"
-        );
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let counted = DelayedManifestScanRead::new(store, Duration::ZERO);
-        let mut writes = storage.new_write_set();
-        let mut writer =
-            BinaryCasContext::new().writer_skipping_existing_chunks(&counted, &mut writes);
-        writer
-            .stage_payload(&payload)
-            .await
-            .expect("repeat extended inline blob write should stage");
-
-        assert_eq!(
-            writes.stats().staged_puts,
-            0,
-            "an existing extended inline payload should not be rewritten"
-        );
-        assert_eq!(
-            counted.manifest_get_many_calls.load(Ordering::Relaxed),
-            1,
-            "extended inline dedupe should use one key-only manifest lookup"
-        );
-        assert_eq!(
-            counted.presence_get_many_calls.load(Ordering::Relaxed),
-            0,
-            "extended inline content must not probe chunk presence"
-        );
-        assert_eq!(
-            load_bytes_many(&counted, &[blob_hash])
-                .await
-                .expect("extended inline blob should load")
-                .into_vec(),
-            vec![Some(data)]
-        );
-        assert_eq!(
-            counted.chunk_get_many_calls.load(Ordering::Relaxed),
-            0,
-            "extended inline reads must finish from the manifest point read"
-        );
-    }
-
     #[tokio::test]
     async fn existing_chunk_aware_writer_batches_persisted_chunk_checks_without_a_hash() {
         let storage = StorageAdapter::new(Memory::new());
@@ -3777,10 +2180,9 @@ mod tests {
             load_manifest(&store, blob_hash)
                 .await
                 .expect("manifest should load"),
-            Some(BinaryCasManifest::Inline {
+            Some(BinaryCasManifest::SingleChunk {
                 size_bytes: data.len() as u64,
-                codec: BinaryChunkCodec::Raw,
-                payload: data.to_vec(),
+                chunk_hash: blob_hash.into_bytes(),
             })
         );
     }
@@ -3803,14 +2205,12 @@ mod tests {
 
         {
             let mut writes = storage.new_write_set();
-            writes.put(
-                BINARY_CAS_MANIFEST_SPACE,
-                key(manifest_key(blob_hash)),
-                value(encode_inline_binary_cas_manifest(
-                    corrupted.len() as u64,
-                    BinaryChunkCodec::Raw,
-                    corrupted,
-                )),
+            stage_chunk(
+                &mut writes,
+                blob_hash,
+                BinaryChunkCodec::Raw,
+                corrupted.len() as u64,
+                corrupted,
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
@@ -3831,53 +2231,6 @@ mod tests {
                 .contains("failed content-address verification")
         );
     }
-
-    #[tokio::test]
-    async fn read_rejects_truncated_zstd_inline_payload() {
-        let storage = StorageAdapter::new(Memory::new());
-        let data = b"compressible binary CAS bytes".repeat(1024);
-        let blob_hash = BlobHash::from_content(&data);
-
-        {
-            let mut writes = storage.new_write_set();
-            stage_test_bytes(&storage, &mut writes, &data).await;
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("blob write should commit");
-        }
-
-        let encoded = encode_chunk_payload(blob_hash, &data).expect("chunk should encode");
-        assert_eq!(encoded.codec, BinaryChunkCodec::Zstd);
-        let mut corrupted = encoded.data.into_owned();
-        corrupted.truncate(corrupted.len() / 2);
-        {
-            let mut writes = storage.new_write_set();
-            writes.put(
-                BINARY_CAS_MANIFEST_SPACE,
-                key(manifest_key(blob_hash)),
-                value(encode_inline_binary_cas_manifest(
-                    data.len() as u64,
-                    BinaryChunkCodec::Zstd,
-                    &corrupted,
-                )),
-            );
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("corrupt inline manifest should overwrite");
-        }
-
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = load_bytes_many(&store, &[blob_hash])
-            .await
-            .expect_err("corrupt chunk should be rejected");
-        assert!(error.message.contains("decompression failed"));
-    }
-
     #[test]
     fn decode_rejects_same_length_valid_zstd_frame_for_wrong_hash() {
         let expected = vec![b'a'; 128 * 1024];

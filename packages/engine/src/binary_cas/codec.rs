@@ -25,38 +25,6 @@ pub(crate) enum BinaryCasManifest {
         size_bytes: u64,
         chunk_count: u32,
     },
-    Inline {
-        size_bytes: u64,
-        codec: BinaryChunkCodec,
-        #[musli(bytes)]
-        payload: Vec<u8>,
-    },
-    InlineDelta {
-        size_bytes: u64,
-        base_blob_hash: [u8; HASH_BYTES],
-        prefix_len: u64,
-        suffix_len: u64,
-        middle_len: u64,
-        codec: BinaryChunkCodec,
-        #[musli(bytes)]
-        payload: Vec<u8>,
-    },
-    InlineDictionary {
-        size_bytes: u64,
-        dictionary_hash: [u8; HASH_BYTES],
-        #[musli(bytes)]
-        payload: Vec<u8>,
-    },
-    InlineDictionaryDelta {
-        size_bytes: u64,
-        base_blob_hash: [u8; HASH_BYTES],
-        prefix_len: u64,
-        suffix_len: u64,
-        middle_len: u64,
-        dictionary_hash: [u8; HASH_BYTES],
-        #[musli(bytes)]
-        payload: Vec<u8>,
-    },
 }
 
 #[derive(Encode, Decode)]
@@ -75,56 +43,12 @@ struct BinaryCasChunkRef<'a> {
     payload: &'a [u8],
 }
 
-#[derive(Encode)]
-enum InlineBinaryCasManifestRef<'a> {
-    #[musli(Binary, name = 3)]
-    Inline {
-        size_bytes: u64,
-        codec: BinaryChunkCodec,
-        #[musli(bytes)]
-        payload: &'a [u8],
-    },
-    #[musli(Binary, name = 5)]
-    InlineDictionary {
-        size_bytes: u64,
-        dictionary_hash: [u8; HASH_BYTES],
-        #[musli(bytes)]
-        payload: &'a [u8],
-    },
-    #[musli(Binary, name = 6)]
-    InlineDictionaryDelta {
-        size_bytes: u64,
-        base_blob_hash: [u8; HASH_BYTES],
-        prefix_len: u64,
-        suffix_len: u64,
-        middle_len: u64,
-        dictionary_hash: [u8; HASH_BYTES],
-        #[musli(bytes)]
-        payload: &'a [u8],
-    },
-    #[musli(Binary, name = 4)]
-    InlineDelta {
-        size_bytes: u64,
-        base_blob_hash: [u8; HASH_BYTES],
-        prefix_len: u64,
-        suffix_len: u64,
-        middle_len: u64,
-        codec: BinaryChunkCodec,
-        #[musli(bytes)]
-        payload: &'a [u8],
-    },
-}
-
 impl BinaryCasManifest {
     pub(crate) fn size_bytes(&self) -> u64 {
         match self {
             Self::Empty { size_bytes }
             | Self::SingleChunk { size_bytes, .. }
-            | Self::Chunked { size_bytes, .. }
-            | Self::Inline { size_bytes, .. }
-            | Self::InlineDelta { size_bytes, .. }
-            | Self::InlineDictionary { size_bytes, .. }
-            | Self::InlineDictionaryDelta { size_bytes, .. } => *size_bytes,
+            | Self::Chunked { size_bytes, .. } => *size_bytes,
         }
     }
 }
@@ -167,86 +91,6 @@ pub(crate) fn encode_binary_cas_manifest(manifest: &BinaryCasManifest) -> Vec<u8
 
 pub(crate) fn decode_binary_cas_manifest(bytes: &[u8]) -> Result<BinaryCasManifest, LixError> {
     storage_codec::decode("binary CAS manifest", bytes)
-}
-
-pub(crate) fn encode_inline_binary_cas_manifest(
-    size_bytes: u64,
-    codec: BinaryChunkCodec,
-    payload: &[u8],
-) -> Vec<u8> {
-    storage_codec::encode(
-        "inline binary CAS manifest",
-        &InlineBinaryCasManifestRef::Inline {
-            size_bytes,
-            codec,
-            payload,
-        },
-    )
-    .expect("inline binary CAS manifest storage encoding should not fail")
-}
-
-pub(crate) fn encode_inline_delta_binary_cas_manifest(
-    size_bytes: u64,
-    base_blob_hash: [u8; HASH_BYTES],
-    prefix_len: u64,
-    suffix_len: u64,
-    middle_len: u64,
-    codec: BinaryChunkCodec,
-    payload: &[u8],
-) -> Vec<u8> {
-    storage_codec::encode(
-        "inline delta binary CAS manifest",
-        &InlineBinaryCasManifestRef::InlineDelta {
-            size_bytes,
-            base_blob_hash,
-            prefix_len,
-            suffix_len,
-            middle_len,
-            codec,
-            payload,
-        },
-    )
-    .expect("inline delta binary CAS manifest storage encoding should not fail")
-}
-
-pub(crate) fn encode_inline_dictionary_binary_cas_manifest(
-    size_bytes: u64,
-    dictionary_hash: [u8; HASH_BYTES],
-    payload: &[u8],
-) -> Vec<u8> {
-    storage_codec::encode(
-        "inline dictionary binary CAS manifest",
-        &InlineBinaryCasManifestRef::InlineDictionary {
-            size_bytes,
-            dictionary_hash,
-            payload,
-        },
-    )
-    .expect("inline dictionary binary CAS manifest storage encoding should not fail")
-}
-
-pub(crate) fn encode_inline_dictionary_delta_binary_cas_manifest(
-    size_bytes: u64,
-    base_blob_hash: [u8; HASH_BYTES],
-    prefix_len: u64,
-    suffix_len: u64,
-    middle_len: u64,
-    dictionary_hash: [u8; HASH_BYTES],
-    payload: &[u8],
-) -> Vec<u8> {
-    storage_codec::encode(
-        "inline dictionary delta binary CAS manifest",
-        &InlineBinaryCasManifestRef::InlineDictionaryDelta {
-            size_bytes,
-            base_blob_hash,
-            prefix_len,
-            suffix_len,
-            middle_len,
-            dictionary_hash,
-            payload,
-        },
-    )
-    .expect("inline dictionary delta binary CAS manifest storage encoding should not fail")
 }
 
 pub(crate) fn encode_binary_cas_manifest_chunk(
@@ -320,7 +164,6 @@ mod tests {
     const EMPTY_MANIFEST_STORAGE_BYTES: usize = 4;
     const SINGLE_CHUNK_MANIFEST_STORAGE_BYTES: usize = 38;
     const CHUNKED_MANIFEST_STORAGE_BYTES: usize = 6;
-    const INLINE_MANIFEST_STORAGE_OVERHEAD_BYTES: usize = 8;
     const MANIFEST_CHUNK_STORAGE_BYTES: usize = 35;
     const CHUNK_STORAGE_OVERHEAD_BYTES: usize = 3;
 
@@ -350,86 +193,6 @@ mod tests {
         for (manifest, expected_len) in cases {
             let encoded = encode_binary_cas_manifest(&manifest);
             assert_eq!(encoded.len(), expected_len);
-            assert_eq!(decode_binary_cas_manifest(&encoded).unwrap(), manifest);
-        }
-    }
-
-    #[test]
-    fn inline_manifest_roundtrips_borrowed_payload_bytes() {
-        let manifest = BinaryCasManifest::Inline {
-            size_bytes: 5,
-            codec: BinaryChunkCodec::Raw,
-            payload: b"hello".to_vec(),
-        };
-
-        let encoded =
-            encode_inline_binary_cas_manifest(5, BinaryChunkCodec::Raw, b"hello".as_slice());
-
-        assert_eq!(encoded, encode_binary_cas_manifest(&manifest));
-        assert_eq!(
-            encoded.len(),
-            b"hello".len() + INLINE_MANIFEST_STORAGE_OVERHEAD_BYTES
-        );
-        assert_eq!(decode_binary_cas_manifest(&encoded).unwrap(), manifest);
-    }
-
-    #[test]
-    fn inline_delta_and_dictionary_manifests_roundtrip_borrowed_payload_bytes() {
-        let base_hash = binary_blob_hash_bytes(b"base");
-        let dictionary_hash = binary_blob_hash_bytes(b"dictionary");
-        let cases = [
-            (
-                BinaryCasManifest::InlineDelta {
-                    size_bytes: 9,
-                    base_blob_hash: base_hash,
-                    prefix_len: 3,
-                    suffix_len: 3,
-                    middle_len: 3,
-                    codec: BinaryChunkCodec::Raw,
-                    payload: b"new".to_vec(),
-                },
-                encode_inline_delta_binary_cas_manifest(
-                    9,
-                    base_hash,
-                    3,
-                    3,
-                    3,
-                    BinaryChunkCodec::Raw,
-                    b"new",
-                ),
-            ),
-            (
-                BinaryCasManifest::InlineDictionary {
-                    size_bytes: 5,
-                    dictionary_hash,
-                    payload: b"frame".to_vec(),
-                },
-                encode_inline_dictionary_binary_cas_manifest(5, dictionary_hash, b"frame"),
-            ),
-            (
-                BinaryCasManifest::InlineDictionaryDelta {
-                    size_bytes: 9,
-                    base_blob_hash: base_hash,
-                    prefix_len: 3,
-                    suffix_len: 3,
-                    middle_len: 3,
-                    dictionary_hash,
-                    payload: b"frame".to_vec(),
-                },
-                encode_inline_dictionary_delta_binary_cas_manifest(
-                    9,
-                    base_hash,
-                    3,
-                    3,
-                    3,
-                    dictionary_hash,
-                    b"frame",
-                ),
-            ),
-        ];
-
-        for (manifest, encoded) in cases {
-            assert_eq!(encoded, encode_binary_cas_manifest(&manifest));
             assert_eq!(decode_binary_cas_manifest(&encoded).unwrap(), manifest);
         }
     }
