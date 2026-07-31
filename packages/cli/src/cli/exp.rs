@@ -65,7 +65,8 @@ pub struct ExpGitReplayArgs {
     #[arg(long, default_value = "main")]
     pub branch: String,
 
-    /// Start replay from this commit (inclusive). Its parent tree is seeded before timed replay.
+    /// Start replay from this commit (inclusive). Before timed replay, seed only parent-tree
+    /// paths touched by the selected commit window; untouched parent files are omitted.
     #[arg(long)]
     pub from_commit: Option<String>,
 
