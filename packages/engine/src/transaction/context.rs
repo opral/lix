@@ -4119,29 +4119,32 @@ where
                                 cache.checkpoint(&actor_key, &visible_materialization.semantic_root)
                             });
                             let mut durable_checkpoint = if decoded_checkpoint.is_none() {
-                                crate::transaction::plugin_checkpoint::load_current_plugin_checkpoint(
-                                    &read,
-                                    &actor_key.branch_id,
-                                    &actor_key.file_id,
-                                    &actor_key.plugin_generation,
-                                    checkpoint_blob_hash
-                                        .expect("durable plugin checkpoints are blob-backed"),
-                                )
-                                .await
-                                .ok()
-                                .flatten()
-                                .and_then(|checkpoint| {
-                                    Some(DecodedDurablePluginCheckpoint {
-                                        runtime: WasmDurableDocumentCheckpoint::decode(
-                                            &checkpoint.runtime,
-                                        )
-                                        .ok()?,
-                                        authorities: PluginEntityAuthorities::decode_checkpoint(
-                                            &checkpoint.authority,
-                                        )
-                                        .ok()?,
+                                if let Some(checkpoint_blob_hash) = checkpoint_blob_hash {
+                                    crate::transaction::plugin_checkpoint::load_current_plugin_checkpoint(
+                                        &read,
+                                        &actor_key.branch_id,
+                                        &actor_key.file_id,
+                                        &actor_key.plugin_generation,
+                                        checkpoint_blob_hash,
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|checkpoint| {
+                                        Some(DecodedDurablePluginCheckpoint {
+                                            runtime: WasmDurableDocumentCheckpoint::decode(
+                                                &checkpoint.runtime,
+                                            )
+                                            .ok()?,
+                                            authorities: PluginEntityAuthorities::decode_checkpoint(
+                                                &checkpoint.authority,
+                                            )
+                                            .ok()?,
+                                        })
                                     })
-                                })
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
                             };
