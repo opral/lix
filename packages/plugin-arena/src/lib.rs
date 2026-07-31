@@ -758,6 +758,23 @@ impl Root {
     /// Encodes only opaque plugin state. Accepted file bytes are already
     /// durable in the engine's binary CAS and semantic entities remain in
     /// tracked state, so neither is duplicated in this checkpoint payload.
+    pub fn successor_checkpoint_encoded_len(&self) -> Result<usize, Error> {
+        let mut len = SUCCESSOR_CHECKPOINT_MAGIC
+            .len()
+            .checked_add(12)
+            .and_then(|len| len.checked_add(self.generation.len()))
+            .ok_or(Error::RangeOverflow)?;
+        for (key, value) in self.state.entries.iter() {
+            let value_len = usize::try_from(value.len()).map_err(|_| Error::RangeOverflow)?;
+            len = len
+                .checked_add(12)
+                .and_then(|len| len.checked_add(key.len()))
+                .and_then(|len| len.checked_add(value_len))
+                .ok_or(Error::RangeOverflow)?;
+        }
+        len.checked_add(32).ok_or(Error::RangeOverflow)
+    }
+
     pub fn encode_successor_checkpoint(&self) -> Result<Vec<u8>, Error> {
         let generation = self.generation.as_bytes();
         let generation_len = u32::try_from(generation.len()).map_err(|_| Error::RangeOverflow)?;
@@ -765,7 +782,7 @@ impl Root {
             u32::try_from(self.state.entries.len()).map_err(|_| Error::RangeOverflow)?;
         let page_bytes =
             u32::try_from(self.bytes.store.page_bytes()).map_err(|_| Error::RangeOverflow)?;
-        let mut encoded = Vec::new();
+        let mut encoded = Vec::with_capacity(self.successor_checkpoint_encoded_len()?);
         encoded.extend_from_slice(SUCCESSOR_CHECKPOINT_MAGIC);
         encoded.extend_from_slice(&page_bytes.to_le_bytes());
         encoded.extend_from_slice(&generation_len.to_le_bytes());
@@ -1332,6 +1349,10 @@ mod tests {
     fn encoded_successor_checkpoint_reopens_against_independent_bytes() {
         let (_store, root) = fixture();
         let encoded = root.encode_successor_checkpoint().unwrap();
+        assert_eq!(
+            encoded.len(),
+            root.successor_checkpoint_encoded_len().unwrap()
+        );
         let reopened = Root::decode_successor_checkpoint(b"abcdefghijkl", &encoded).unwrap();
 
         assert_eq!(reopened.generation, root.generation);

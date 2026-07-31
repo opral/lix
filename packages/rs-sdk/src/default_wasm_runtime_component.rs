@@ -3499,6 +3499,17 @@ struct V3Actor {
     next_document: u64,
 }
 
+fn encode_durable_document_checkpoint(
+    root: &ArenaRoot,
+    max_decoded_bytes: usize,
+) -> Option<WasmDurableDocumentCheckpoint> {
+    if root.successor_checkpoint_encoded_len().ok()? > max_decoded_bytes {
+        return None;
+    }
+    let bytes = root.encode_successor_checkpoint().ok()?.into();
+    WasmDurableDocumentCheckpoint::new(bytes).ok()
+}
+
 #[derive(Default)]
 struct ProspectiveDocuments(HashMap<u64, u64>);
 
@@ -3605,24 +3616,22 @@ impl WasmComponentActor for V3Actor {
         let retained_bytes = u64::try_from(root.retained_heap_bytes()).unwrap_or(u64::MAX);
         let state_id = root.state.id();
         let durable = if let Some(checkpoint) = self.durable_checkpoints.get(&state_id) {
-            checkpoint.clone()
+            Some(checkpoint.clone())
         } else {
-            let bytes: crate::Blob = root
-                .encode_successor_checkpoint()
-                .map_err(|error| {
-                    v3_error(format!("failed to encode v3 document checkpoint: {error}"))
-                })?
-                .into();
-            let checkpoint = WasmDurableDocumentCheckpoint::new(bytes)?;
-            self.durable_checkpoints
-                .insert(state_id, checkpoint.clone());
-            checkpoint
+            encode_durable_document_checkpoint(
+                &root,
+                WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES,
+            )
+            .inspect(|checkpoint| {
+                self.durable_checkpoints
+                    .insert(state_id, checkpoint.clone());
+            })
         };
-        Ok(Some(WasmDocumentCheckpoint::new_with_durable(
-            root,
-            retained_bytes,
-            durable,
-        )))
+        Ok(Some(if let Some(durable) = durable {
+            WasmDocumentCheckpoint::new_with_durable(root, retained_bytes, durable)
+        } else {
+            WasmDocumentCheckpoint::new(root, retained_bytes)
+        }))
     }
 
     async fn restore_document(
@@ -4377,6 +4386,22 @@ fn v3_transition_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_durable_checkpoint_is_omitted_without_rejecting_the_root() {
+        let root = ArenaRoot::import(
+            ArenaStore::default(),
+            "checkpoint-test",
+            b"accepted",
+            std::iter::empty(),
+            [(b"index".to_vec(), b"opaque-state".to_vec())],
+        )
+        .successor_checkpoint();
+        let encoded_len = root.successor_checkpoint_encoded_len().unwrap();
+
+        assert!(encode_durable_document_checkpoint(&root, encoded_len - 1).is_none());
+        assert!(encode_durable_document_checkpoint(&root, encoded_len).is_some());
+    }
 
     fn push_text(output: &mut Vec<u8>, value: &str) {
         output.extend_from_slice(&(value.len() as u32).to_le_bytes());

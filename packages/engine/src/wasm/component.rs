@@ -1321,7 +1321,7 @@ pub struct WasmDurableDocumentCheckpoint {
 
 impl WasmDurableDocumentCheckpoint {
     const MAGIC: &'static [u8; 8] = b"LIXDPR01";
-    const MAX_DECODED_BYTES: usize = 128 * 1024 * 1024;
+    pub const MAX_DECODED_BYTES: usize = 128 * 1024 * 1024;
 
     pub fn new(bytes: crate::Blob) -> Result<Self, LixError> {
         if bytes.len() > Self::MAX_DECODED_BYTES {
