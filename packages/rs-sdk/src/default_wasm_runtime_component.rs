@@ -2269,6 +2269,9 @@ fn validate_created_packet_page(
             }
             2 => {
                 let local_ref = record.u64()?;
+                if u32::try_from(local_ref).is_err() {
+                    return Err("packet create local ref exceeds u32".to_owned());
+                }
                 if previous_local_ref.is_some_and(|previous| previous >= local_ref) {
                     return Err("packet create local refs must be strictly increasing".to_owned());
                 }
@@ -4424,6 +4427,20 @@ mod tests {
             &mut component_boundaries,
         )
         .expect("component lengths must delimit the compact fingerprint");
+    }
+
+    #[test]
+    fn certified_packet_rejects_create_refs_outside_authority_format() {
+        let creates = WasmCreateContext {
+            high: 0x019a_0000_0000_7000,
+            low: 0x8000_0000,
+        };
+        let result =
+            validate_created_packet_page(1, &create_page("row", u64::from(u32::MAX) + 1), creates);
+        assert!(matches!(
+            result,
+            Err(message) if message == "packet create local ref exceeds u32"
+        ));
     }
 
     #[test]
