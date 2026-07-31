@@ -250,8 +250,13 @@ where
 
     fn observe_scope(&self) -> ObserveSessionScope {
         match &self.mode {
-            SessionMode::Workspace => ObserveSessionScope::Workspace,
-            SessionMode::Pinned { branch_id } => ObserveSessionScope::Pinned(branch_id.clone()),
+            SessionMode::Workspace { branch_id } => ObserveSessionScope::Branch(
+                branch_id
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            SessionMode::Pinned { branch_id } => ObserveSessionScope::Branch(branch_id.clone()),
         }
     }
 }

@@ -510,11 +510,26 @@ simulation_test!(
             workspace_b
                 .active_branch_id()
                 .await
-                .expect("other workspace session should observe selector"),
-            "01930000-0000-7000-8000-000000000001",
-            "workspace sessions resolve the shared selector on use"
+                .expect("existing workspace session should retain its branch"),
+            sim.main_branch_id(),
+            "workspace sessions pin the selector observed when they open"
         );
-        assert_key_value(&workspace_b, "workspace-draft-only", Some("\"draft\"")).await;
+        assert_key_value(&workspace_b, "workspace-draft-only", None).await;
+        let workspace_c = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("new workspace session should open"),
+            &engine,
+        );
+        assert_eq!(
+            workspace_c
+                .active_branch_id()
+                .await
+                .expect("new workspace session should observe selector"),
+            "01930000-0000-7000-8000-000000000001"
+        );
+        assert_key_value(&workspace_c, "workspace-draft-only", Some("\"draft\"")).await;
         assert_key_value(&main, "workspace-draft-only", None).await;
         assert_eq!(
             engine

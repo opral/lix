@@ -26,7 +26,7 @@ pub use crate::common::{
 };
 pub use checkpoint::CreateCheckpointReceipt;
 pub use context::SessionContext;
-pub(crate) use context::{SessionMode, load_workspace_branch_id_from_index};
+pub(crate) use context::SessionMode;
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{
     CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ExecutionDisposition,
