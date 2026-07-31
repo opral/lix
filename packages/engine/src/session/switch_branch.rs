@@ -31,8 +31,9 @@ where
     /// Switches the session's active branch selector.
     ///
     /// Pinned sessions switch in memory and return a new pinned session.
-    /// Workspace sessions update the shared workspace selector so other
-    /// workspace sessions observe the new active branch on their next use.
+    /// Workspace sessions update the shared workspace selector and return a
+    /// new session pinned to that selection. Existing sessions retain the
+    /// branch snapshot they opened with, like ordinary database connections.
     pub async fn switch_branch(
         &self,
         options: SwitchBranchOptions,
@@ -58,11 +59,13 @@ where
                         SessionMode::Pinned { .. } => Ok(SessionMode::Pinned {
                             branch_id: branch_id.clone(),
                         }),
-                        SessionMode::Workspace => {
+                        SessionMode::Workspace { .. } => {
                             let mut rows = RawWriteBatch::with_capacity(1);
                             rows.push(workspace_branch_stage_row(&branch_id)?);
                             transaction.stage_rows(rows).await?;
-                            Ok(SessionMode::Workspace)
+                            Ok(SessionMode::Workspace {
+                                branch_id: branch_id.clone(),
+                            })
                         }
                     }
                 })

@@ -250,7 +250,7 @@ where
 
     fn observe_scope(&self) -> ObserveSessionScope {
         match &self.mode {
-            SessionMode::Workspace => ObserveSessionScope::Workspace,
+            SessionMode::Workspace { .. } => ObserveSessionScope::Workspace,
             SessionMode::Pinned { branch_id } => ObserveSessionScope::Pinned(branch_id.clone()),
         }
     }

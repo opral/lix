@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;

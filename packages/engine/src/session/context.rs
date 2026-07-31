@@ -44,8 +44,7 @@ use super::transaction::{SessionOperationGuard, SessionTransactionManager, Sessi
 pub(crate) const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 
 /// Loads the workspace selector from its canonical untracked current-state
-/// member, then verifies that the selected branch still exists in the same
-/// storage snapshot.
+/// member when opening a workspace session.
 pub(crate) async fn load_workspace_branch_id_from_index(
     live_state: &LiveStateContext,
     branch_ctx: &BranchContext,
@@ -109,13 +108,18 @@ pub(crate) async fn load_workspace_branch_id_from_index(
         )
         .await?;
 
+    // The selector is a constrained engine-owned reference: initialization,
+    // branch switching, and branch deletion enforce its target lifecycle at
+    // mutation time. Revalidating the same branch ref on every statement made
+    // workspace sessions pay a second point read for an invariant that no
+    // successful commit can violate.
     Ok(branch_id)
 }
 
 #[derive(Clone)]
 pub(crate) enum SessionMode {
     Pinned { branch_id: String },
-    Workspace,
+    Workspace { branch_id: String },
 }
 
 /// Session-context state for engine execution.
@@ -165,8 +169,14 @@ where
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Result<Self, LixError> {
-        let session = Self::new(
-            SessionMode::Workspace,
+        let read =
+            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+        let branch_id =
+            load_workspace_branch_id_from_index(live_state.as_ref(), branch_ctx.as_ref(), &read)
+                .await?;
+        drop(read);
+        Ok(Self::new(
+            SessionMode::Workspace { branch_id },
             storage,
             live_state,
             tracked_state,
@@ -180,9 +190,7 @@ where
             observe_invalidation,
             plugin_host,
             telemetry,
-        );
-        session.active_branch_id().await?;
-        Ok(session)
+        ))
     }
 
     pub(crate) async fn open(
@@ -453,7 +461,7 @@ where
 
     pub(super) async fn active_branch_id_from_reader<S>(
         &self,
-        reader: &S,
+        _reader: &S,
     ) -> Result<String, LixError>
     where
         S: StorageAdapterRead + ?Sized,
@@ -461,20 +469,8 @@ where
         self.ensure_open()?;
         match &self.mode {
             SessionMode::Pinned { branch_id } => Ok(branch_id.clone()),
-            SessionMode::Workspace => self.load_workspace_branch_id(reader).await,
+            SessionMode::Workspace { branch_id } => Ok(branch_id.clone()),
         }
-    }
-
-    async fn load_workspace_branch_id<S>(&self, reader: &S) -> Result<String, LixError>
-    where
-        S: StorageAdapterRead + ?Sized,
-    {
-        load_workspace_branch_id_from_index(
-            self.live_state.as_ref(),
-            self.branch_ctx.as_ref(),
-            reader,
-        )
-        .await
     }
 
     pub(crate) async fn with_write_transaction<T, F>(&self, f: F) -> Result<T, LixError>

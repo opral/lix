@@ -21,8 +21,8 @@ use tracing::Instrument as _;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{
-    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchRefReader,
-    branch_ref_stage_row,
+    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchLifecycle,
+    BranchOperation, BranchRefReader, BranchReferenceRole, branch_ref_stage_row,
 };
 use crate::catalog::{
     CatalogContext, CatalogFingerprint, CatalogSnapshot, SchemaPlanId, load_catalog_revision,
@@ -83,7 +83,7 @@ use crate::plugin::{
 };
 use crate::session::{
     EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionMode,
-    encode_receipt, load_workspace_branch_id_from_index,
+    encode_receipt,
 };
 use crate::sql2::{
     CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
@@ -10021,14 +10021,22 @@ fn require_valid_storage_scope(branch_id: &str, global: bool) -> Result<(), LixE
 
 async fn resolve_active_branch_id(
     mode: &SessionMode,
-    live_state: &LiveStateContext,
+    _live_state: &LiveStateContext,
     branch_ctx: &BranchContext,
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
     match mode {
         SessionMode::Pinned { branch_id } => Ok(branch_id.clone()),
-        SessionMode::Workspace => {
-            load_workspace_branch_id_from_index(live_state, branch_ctx, read).await
+        SessionMode::Workspace { branch_id } => {
+            let branch_ref = branch_ctx.ref_reader(read);
+            BranchLifecycle::new(&branch_ref)
+                .require_existing_ref(
+                    branch_id,
+                    BranchOperation::LoadWorkspaceSelector,
+                    BranchReferenceRole::WorkspaceSelector,
+                )
+                .await?;
+            Ok(branch_id.clone())
         }
     }
 }

@@ -285,7 +285,7 @@ fn join_thread<T>(handle: thread::JoinHandle<T>, description: &str) -> T {
 }
 
 #[tokio::test]
-async fn read_sql_does_not_open_write_when_pre_plan_setup_fails() {
+async fn existing_workspace_session_ignores_later_selector_corruption() {
     let storage = RecordingStorage::new();
     let _receipt = Engine::initialize(storage.clone())
         .await
@@ -308,27 +308,23 @@ async fn read_sql_does_not_open_write_when_pre_plan_setup_fails() {
         .expect("test should corrupt workspace selector");
 
     let before = storage.stats();
-    let error = session
+    session
         .execute("SELECT 1", &[])
         .await
-        .expect_err("missing active branch should fail read pre-plan");
-    assert!(
-        error
-            .message
-            .contains("6d697373-696e-872d-8272-616e63680000"),
-        "unexpected error: {error:?}"
-    );
+        .expect("an existing session should retain its valid pinned branch");
 
     let delta = storage.stats().delta_since(&before);
     assert_eq!(delta.read_opened, 1, "read SQL should open one read tx");
-    assert_eq!(
-        delta.write_opened, 0,
-        "failed read SQL must not open writes"
-    );
+    assert_eq!(delta.write_opened, 0, "read SQL must not open writes");
+    engine
+        .open_workspace_session()
+        .await
+        .err()
+        .expect("a new workspace session should reject the corrupt selector");
 }
 
 #[tokio::test]
-async fn write_setup_failure_does_not_open_storage_write() {
+async fn existing_workspace_session_writes_to_its_pinned_branch() {
     let storage = RecordingStorage::new();
     let _receipt = Engine::initialize(storage.clone())
         .await
@@ -351,24 +347,28 @@ async fn write_setup_failure_does_not_open_storage_write() {
         .expect("test should corrupt workspace selector");
 
     let before = storage.stats();
-    let error = session
+    session
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('after-corrupt-selector', 'value')",
             &[],
         )
         .await
-        .expect_err("missing active branch should fail write open");
-    assert_eq!(error.code, "LIX_BRANCH_NOT_FOUND");
+        .expect("an existing session should write to its valid pinned branch");
 
     let delta = storage.stats().delta_since(&before);
     assert_eq!(
-        delta.write_opened, 0,
-        "write setup failure should not open a storage write"
+        delta.write_opened, 1,
+        "the pinned-session write should open one storage write"
     );
     assert_eq!(
-        delta.write_committed, 0,
-        "failed write setup must not commit"
+        delta.write_committed, 1,
+        "the pinned-session write should commit"
     );
+    engine
+        .open_workspace_session()
+        .await
+        .err()
+        .expect("a new workspace session should reject the corrupt selector");
 }
 
 #[tokio::test]
