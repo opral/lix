@@ -444,10 +444,19 @@ pub(crate) struct RawWriteBatch {
     expected_rows: usize,
     origins: Vec<TransactionWriteOrigin>,
     origin_index: Option<HashMap<TransactionWriteOrigin, u32>>,
+    /// Exact homogeneous row-normalization proof produced by a typed
+    /// frontend. Any operation that changes row contents clears this proof.
+    certified_preparation: Option<CertifiedRawWriteBatchPreparation>,
     #[cfg(test)]
     string_promotions: usize,
     #[cfg(test)]
     origin_promotions: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CertifiedRawWriteBatchPreparation {
+    pub(crate) schema_plan_id: SchemaPlanId,
+    pub(crate) facts: PreparedRowFacts,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -502,6 +511,7 @@ impl RawWriteBatch {
             expected_rows: row_capacity,
             origins: Vec::with_capacity(row_capacity.min(INLINE_DICTIONARY_LIMIT)),
             origin_index: None,
+            certified_preparation: None,
             #[cfg(test)]
             string_promotions: 0,
             #[cfg(test)]
@@ -558,6 +568,7 @@ impl RawWriteBatch {
     }
 
     pub(crate) fn push(&mut self, row: TransactionWriteRow) {
+        self.certified_preparation = None;
         self.push_parts(
             row.entity_pk,
             row.schema_key,
@@ -592,6 +603,7 @@ impl RawWriteBatch {
         untracked: bool,
         branch_id: SharedStr,
     ) {
+        self.certified_preparation = None;
         assert!(
             self.slots.len() < RAW_WRITE_NONE as usize,
             "raw write row count must fit a non-null u32 ordinal"
@@ -624,6 +636,7 @@ impl RawWriteBatch {
     }
 
     pub(crate) fn append(&mut self, mut other: Self) {
+        self.certified_preparation = None;
         self.reserve(other.len());
         for index in 0..other.len() {
             other.move_row_into(index, self);
@@ -635,7 +648,16 @@ impl RawWriteBatch {
     /// The caller owns source ordinal selection, so the moved source slot is
     /// intentionally left as a hole and must not be read again.
     pub(crate) fn append_taken_row(&mut self, source: &mut Self, index: usize) {
+        self.certified_preparation = None;
         source.move_row_into(index, self);
+    }
+
+    pub(crate) fn certify_preparation(&mut self, certificate: CertifiedRawWriteBatchPreparation) {
+        self.certified_preparation = Some(certificate);
+    }
+
+    pub(crate) fn certified_preparation(&self) -> Option<CertifiedRawWriteBatchPreparation> {
+        self.certified_preparation
     }
 
     pub(crate) fn reserve(&mut self, additional: usize) {
@@ -665,6 +687,7 @@ impl RawWriteBatch {
     }
 
     pub(crate) fn entity_pk_mut(&mut self, index: usize) -> &mut Option<EntityPk> {
+        self.certified_preparation = None;
         &mut self.entity_pks[index]
     }
 
@@ -677,6 +700,7 @@ impl RawWriteBatch {
     }
 
     pub(crate) fn set_snapshot(&mut self, index: usize, value: Option<TransactionJson>) {
+        self.certified_preparation = None;
         self.snapshots[index] = value;
     }
 
@@ -697,16 +721,19 @@ impl RawWriteBatch {
     }
 
     pub(crate) fn set_origin(&mut self, index: usize, origin: Option<TransactionWriteOrigin>) {
+        self.certified_preparation = None;
         let ordinal = self.intern_optional_origin(origin);
         self.slots[index].origin = ordinal;
     }
 
     pub(crate) fn set_change_id(&mut self, index: usize, change_id: Option<SharedStr>) {
+        self.certified_preparation = None;
         let ordinal = self.intern_optional_string(change_id);
         self.slots[index].change_id = ordinal;
     }
 
     pub(crate) fn set_file_id(&mut self, index: usize, file_id: Option<SharedStr>) {
+        self.certified_preparation = None;
         let ordinal = self.intern_optional_string(file_id);
         self.slots[index].file_id = ordinal;
     }
@@ -716,6 +743,7 @@ impl RawWriteBatch {
     /// Dictionaries remain shared until more than half their slots are dead;
     /// the uncommon compaction rebuild keeps repeated metadata interned.
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(RawWriteRowRef<'_>) -> bool) {
+        self.certified_preparation = None;
         let mut destination = 0usize;
         for source in 0..self.len() {
             if !keep(self.row(source)) {
@@ -1509,7 +1537,8 @@ impl StageJson {
 
 impl PartialEq for StageJson {
     fn eq(&self, other: &Self) -> bool {
-        self.json_ref == other.json_ref && self.normalized() == other.normalized()
+        self.normalized() == other.normalized()
+            && (self.is_inline() || other.is_inline() || self.json_ref == other.json_ref)
     }
 }
 
@@ -1520,7 +1549,15 @@ pub(crate) fn stage_json_from_value(
     value: TransactionJson,
     _context: &str,
 ) -> Result<StageJson, LixError> {
-    let json_ref = JsonRef::for_content(value.normalized().as_bytes());
+    // Inline values carry their bytes as the authoritative durable payload.
+    // Computing and retaining a content hash for every small row only to
+    // discard it at `JsonSlotRef::Inline` doubled the canonical-byte walk on
+    // bulk inserts. Out-of-band values still require the exact content ref.
+    let json_ref = if value.normalized().len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
+        JsonRef::default()
+    } else {
+        JsonRef::for_content(value.normalized().as_bytes())
+    };
     let storage = match value.storage {
         TransactionJsonStorage::Decoded { value, normalized } => StageJsonStorage::Owned {
             value: OnceLock::from(value),
@@ -3612,6 +3649,28 @@ mod tests {
             staged.value(),
             &serde_json::json!({"path": "/a", "value": {"nested": true}})
         );
+        assert_eq!(
+            staged.json_ref,
+            JsonRef::default(),
+            "inline JSON must not pay for an unused content hash"
+        );
+    }
+
+    #[test]
+    fn out_of_band_json_retains_its_content_hash() {
+        let normalized = format!(
+            r#"{{"value":"{}"}}"#,
+            "x".repeat(crate::json_store::JSON_INLINE_MAX_BYTES)
+        );
+        let expected = JsonRef::for_content(normalized.as_bytes());
+        let staged = stage_json_from_value(
+            TransactionJson::from_certified_normalized_row_content(normalized.into()),
+            "large certified test row",
+        )
+        .expect("large certified JSON should prepare");
+
+        assert!(!staged.is_inline());
+        assert_eq!(staged.json_ref, expected);
     }
 
     #[test]

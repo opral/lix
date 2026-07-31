@@ -5074,7 +5074,7 @@ where
 
     async fn prepare_transaction_rows_with_homogeneous(
         &mut self,
-        rows: RawWriteBatch,
+        mut rows: RawWriteBatch,
         allow_homogeneous: bool,
     ) -> Result<PreparedStateBatch, LixError> {
         let row_count = rows.len();
@@ -5084,6 +5084,51 @@ where
         // sample lazy so normalization errors retain precedence over scalar
         // provider calls.
         let mut default_timestamp = None;
+        if allow_homogeneous && let Some(certificate) = rows.certified_preparation() {
+            let timestamp = self.functions.call_timestamp();
+            let mut prepared_rows = PreparedStateBatch::with_dense_capacity(row_count, row_count);
+            for index in 0..row_count {
+                let row = rows.row(index);
+                let entity_pk = row.entity_pk.cloned().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "certified transaction row is missing entity_pk",
+                    )
+                })?;
+                let schema_key = row.schema_key.clone();
+                let branch_id = row.branch_id.clone();
+                let snapshot = rows
+                    .take_snapshot(index)
+                    .map(|value| {
+                        stage_json_from_value(value, "certified prepared row snapshot_content")
+                    })
+                    .transpose()?;
+                prepared_rows.push_parts_with_change_addressability(
+                    certificate.schema_plan_id,
+                    certificate.facts,
+                    entity_pk,
+                    schema_key,
+                    None,
+                    snapshot,
+                    None,
+                    None,
+                    self.origin_key.as_ref(),
+                    timestamp,
+                    timestamp,
+                    false,
+                    // Addressable tracked rows receive their durable change id
+                    // from the sorted commit-delta location. A nil placeholder
+                    // satisfies staging's presence invariant without sampling
+                    // and retaining one throwaway UUID per row.
+                    Some(ChangeId::default()),
+                    true,
+                    None,
+                    false,
+                    branch_id,
+                );
+            }
+            return Ok(prepared_rows);
+        }
         let staged = self.staged_writes.staging_overlay()?;
         let read = SharedStorageAdapterRead::new(
             self.storage
@@ -5098,7 +5143,6 @@ where
                 .catalog_for_row_normalization(&live_state, &staged, &domain)
                 .await?;
             let mut scalar_facts = PreparedScalarBatch::with_capacity(rows.len());
-            let mut rows = rows;
             for index in 0..rows.len() {
                 let normalized =
                     normalize_raw_write_row_in_place(&mut rows, index, catalog, functions.clone())?;
