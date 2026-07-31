@@ -2990,6 +2990,9 @@ struct StagedCommitChangeColumns {
 #[derive(Debug, Clone)]
 pub(crate) struct StagedCommitChangeBatch {
     columns: Arc<StagedCommitChangeColumns>,
+    /// Every `(source_commit_id, change_id, identity)` tuple was produced by
+    /// the tracked diff reader from immutable commit authority.
+    source_membership_certified: bool,
     /// Present only when duplicate identities were filtered while combining
     /// independently supplied batches. The normal merge/checkpoint path views
     /// every row directly and allocates no selection column.
@@ -3045,6 +3048,21 @@ impl StagedCommitChangeBatchBuilder {
     pub(crate) fn finish(self) -> StagedCommitChangeBatch {
         StagedCommitChangeBatch {
             columns: Arc::new(self.columns),
+            source_membership_certified: false,
+            selection: None,
+        }
+    }
+
+    /// Finishes rows materialized directly from a tracked-state diff.
+    ///
+    /// The diff reader binds every direct change address to the decoded source
+    /// identity before exposing the row. Checkpoint lowering may therefore
+    /// prove a complete dense source selection from coordinates alone instead
+    /// of hashing all identity bytes again.
+    pub(crate) fn finish_source_certified(self) -> StagedCommitChangeBatch {
+        StagedCommitChangeBatch {
+            columns: Arc::new(self.columns),
+            source_membership_certified: true,
             selection: None,
         }
     }
@@ -3100,9 +3118,14 @@ impl StagedCommitChangeBatch {
         } else {
             Self {
                 columns: self.columns,
+                source_membership_certified: self.source_membership_certified,
                 selection: Some(selection.into()),
             }
         }
+    }
+
+    pub(crate) fn source_membership_certified(&self) -> bool {
+        self.source_membership_certified
     }
 
     #[cfg(test)]

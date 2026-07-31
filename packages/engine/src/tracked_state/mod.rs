@@ -31,7 +31,7 @@ pub(crate) use row_materialization::{
 pub(crate) use storage::load_commit_delta_change_ids;
 pub(crate) use storage::{
     CommitDeltaChangeLocator, CommitDeltaMember, commit_delta_contains_schema,
-    load_change_record_by_id, load_commit_delta_change_records,
+    direct_change_locator, load_change_record_by_id, load_commit_delta_change_records,
     load_commit_delta_members_with_payloads, load_commit_delta_selection_certificate,
     load_owned_commit_delta_entries, scan_change_records_from_commit_deltas,
     scan_commit_delta_inventory, scan_commit_delta_values, selected_change_selection_fingerprint,
@@ -44,7 +44,7 @@ pub(crate) use storage::{
 pub(crate) use storage::{
     TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
     TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_SPACE,
-    TRACKED_STATE_TREE_CHUNK_SPACE, decode_change_locator, direct_change_locator,
+    TRACKED_STATE_TREE_CHUNK_SPACE, decode_change_locator,
 };
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateDeltaRef,

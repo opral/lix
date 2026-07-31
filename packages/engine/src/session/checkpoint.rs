@@ -128,7 +128,7 @@ where
                             })?;
                             push_selected_change(&mut selected_changes, row, entry.kind);
                         }
-                        selected_changes.finish()
+                        selected_changes.finish_source_certified()
                     };
                     gc_state.checkpoint_sequence = gc_state
                         .checkpoint_sequence

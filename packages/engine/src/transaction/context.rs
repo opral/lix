@@ -6000,8 +6000,8 @@ where
                 push_checkpoint_selected_change(&mut unselected, target, entry.kind);
             }
         }
-        let selected = selected.finish();
-        let unselected = unselected.finish();
+        let selected = selected.finish_source_certified();
+        let unselected = unselected.finish_source_certified();
         if matched != requested {
             return Err(stale_or_unknown_diff_id());
         }

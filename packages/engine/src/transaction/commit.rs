@@ -561,6 +561,60 @@ fn selected_change_count(batches: &[StagedCommitChangeBatch]) -> usize {
     batches.iter().map(StagedCommitChangeBatch::len).sum()
 }
 
+fn dense_selected_source_is_exact<'a>(
+    source_commit_id: CommitId,
+    segment_row_counts: &[u16],
+    source_membership_certified: bool,
+    selected: impl Iterator<Item = StagedCommitChangeRef<'a>>,
+) -> bool {
+    if !source_membership_certified {
+        return false;
+    }
+    let expected_count = segment_row_counts
+        .iter()
+        .map(|&count| usize::from(count))
+        .sum::<usize>();
+    let mut members = Vec::with_capacity(expected_count);
+    for change_ref in selected {
+        if change_ref.source_commit_id != source_commit_id {
+            return false;
+        }
+        let Some(locator) = crate::tracked_state::direct_change_locator(change_ref.change_id)
+        else {
+            return false;
+        };
+        if locator.commit_id != source_commit_id {
+            return false;
+        }
+        members.push((locator.segment_index, locator.ordinal));
+    }
+    if members.len() != expected_count {
+        return false;
+    }
+    if !members
+        .windows(2)
+        .all(|pair| (pair[0].0, pair[0].1) < (pair[1].0, pair[1].1))
+    {
+        members.sort_unstable_by_key(|member| (member.0, member.1));
+    }
+    let mut member_index = 0usize;
+    for (segment_index, &row_count) in segment_row_counts.iter().enumerate() {
+        let Ok(segment_index) = u32::try_from(segment_index) else {
+            return false;
+        };
+        for ordinal in 0..row_count {
+            if members
+                .get(member_index)
+                .is_none_or(|member| (member.0, member.1) != (segment_index, ordinal))
+            {
+                return false;
+            }
+            member_index += 1;
+        }
+    }
+    member_index == members.len()
+}
+
 async fn stage_changelog_commits(
     read: &mut impl StorageAdapterRead,
     writes: &mut StorageWriteSet,
@@ -1256,35 +1310,6 @@ async fn stage_tracked_commit_delta_index(
                 .first_key_value()
                 .expect("one selected source exists")
                 .0;
-            let selected = selected_changes(&staged.selected_change_batches)
-                .map(|change_ref| {
-                    (
-                        encode_key_ref(TrackedStateKeyRef {
-                            schema_key: change_ref.schema_key(),
-                            file_id: change_ref.file_id(),
-                            entity_pk: change_ref.entity_pk(),
-                        }),
-                        (
-                            change_ref.change_id,
-                            change_ref.deleted,
-                            change_ref.created_at,
-                            change_ref.updated_at,
-                        ),
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            let selected_fingerprint =
-                crate::tracked_state::selected_change_selection_fingerprint(selected.iter().map(
-                    |(key, (change_id, deleted, created_at, updated_at))| {
-                        (
-                            key.as_slice(),
-                            *change_id,
-                            *deleted,
-                            *created_at,
-                            *updated_at,
-                        )
-                    },
-                ));
             let source = crate::tracked_state::load_commit_delta_selection_certificate(
                 read,
                 source_commit_id,
@@ -1292,9 +1317,55 @@ async fn stage_tracked_commit_delta_index(
             .await?;
             source
                 .is_some_and(|source| {
-                    source.selected_source_commit_id.is_none()
-                        && usize::try_from(source.member_count).ok() == Some(selected.len())
-                        && source.selection_fingerprint == selected_fingerprint
+                    if source.selected_source_commit_id.is_some()
+                        || usize::try_from(source.member_count).ok()
+                            != Some(selected_change_count(&staged.selected_change_batches))
+                    {
+                        return false;
+                    }
+                    if source.direct_segment_row_counts.is_empty() {
+                        let selected = selected_changes(&staged.selected_change_batches)
+                            .map(|change_ref| {
+                                (
+                                    encode_key_ref(TrackedStateKeyRef {
+                                        schema_key: change_ref.schema_key(),
+                                        file_id: change_ref.file_id(),
+                                        entity_pk: change_ref.entity_pk(),
+                                    }),
+                                    (
+                                        change_ref.change_id,
+                                        change_ref.deleted,
+                                        change_ref.created_at,
+                                        change_ref.updated_at,
+                                    ),
+                                )
+                            })
+                            .collect::<HashMap<_, _>>();
+                        return usize::try_from(source.member_count).ok() == Some(selected.len())
+                            && source.selection_fingerprint
+                                == crate::tracked_state::selected_change_selection_fingerprint(
+                                    selected.iter().map(
+                                        |(key, (change_id, deleted, created_at, updated_at))| {
+                                            (
+                                                key.as_slice(),
+                                                *change_id,
+                                                *deleted,
+                                                *created_at,
+                                                *updated_at,
+                                            )
+                                        },
+                                    ),
+                                );
+                    }
+                    dense_selected_source_is_exact(
+                        source_commit_id,
+                        &source.direct_segment_row_counts,
+                        staged
+                            .selected_change_batches
+                            .iter()
+                            .all(StagedCommitChangeBatch::source_membership_certified),
+                        selected_changes(&staged.selected_change_batches),
+                    )
                 })
                 .then_some(source_commit_id)
         } else {
@@ -3903,6 +3974,86 @@ mod tests {
 
     fn ts(value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse("timestamp", value)
+    }
+
+    #[test]
+    fn dense_checkpoint_certificate_requires_provenance_and_exact_coordinates() {
+        let source_commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1234_0000_0000,
+        ));
+        let direct_change_id = |packed: u32| {
+            let mut bytes = *source_commit_id.as_uuid().as_bytes();
+            bytes[12..].copy_from_slice(&packed.to_be_bytes());
+            ChangeId::new(uuid::Uuid::from_bytes(bytes))
+        };
+        let created_at = ts("2026-01-01T00:00:00Z");
+        let identities = ["a", "b"].map(|entity_pk| TrackedStateKey {
+            schema_key: "test_schema".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::single(entity_pk),
+        });
+        let change_ids = [direct_change_id(1), direct_change_id(2)];
+        let row_counts = [2_u16];
+        let mut selected = StagedCommitChangeBatchBuilder::with_capacity(2);
+        for (identity, change_id) in identities.iter().cloned().zip(change_ids) {
+            selected.push(
+                crate::tracked_state::TrackedStateDiffIdentity::from_key(identity),
+                source_commit_id,
+                change_id,
+                false,
+                created_at,
+                created_at,
+            );
+        }
+        let selected = selected.finish_source_certified();
+        assert!(dense_selected_source_is_exact(
+            source_commit_id,
+            &row_counts,
+            selected.source_membership_certified(),
+            selected.iter(),
+        ));
+
+        let mut uncertified = StagedCommitChangeBatchBuilder::with_capacity(2);
+        for (identity, change_id) in identities.iter().cloned().zip(change_ids) {
+            uncertified.push(
+                crate::tracked_state::TrackedStateDiffIdentity::from_key(identity),
+                source_commit_id,
+                change_id,
+                false,
+                created_at,
+                created_at,
+            );
+        }
+        let uncertified = uncertified.finish();
+        assert!(!dense_selected_source_is_exact(
+            source_commit_id,
+            &row_counts,
+            uncertified.source_membership_certified(),
+            uncertified.iter(),
+        ));
+
+        let mut duplicate_coordinate = StagedCommitChangeBatchBuilder::with_capacity(2);
+        for identity in identities {
+            duplicate_coordinate.push(
+                crate::tracked_state::TrackedStateDiffIdentity::from_key(TrackedStateKey {
+                    schema_key: identity.schema_key,
+                    file_id: identity.file_id,
+                    entity_pk: identity.entity_pk,
+                }),
+                source_commit_id,
+                change_ids[0],
+                false,
+                created_at,
+                created_at,
+            );
+        }
+        let duplicate_coordinate = duplicate_coordinate.finish_source_certified();
+        assert!(!dense_selected_source_is_exact(
+            source_commit_id,
+            &row_counts,
+            duplicate_coordinate.source_membership_certified(),
+            duplicate_coordinate.iter(),
+        ));
     }
 
     #[test]

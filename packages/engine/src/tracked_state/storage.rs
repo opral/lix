@@ -71,7 +71,7 @@ const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
 const GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const GENERIC_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
 const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
-const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD8";
+const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD9";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -396,6 +396,9 @@ struct CommitDeltaManifest {
     selected_source_commit_id: Option<[u8; 16]>,
     member_count: u32,
     selection_fingerprint: [u8; 32],
+    /// Exact dense address inventory for ordered, fully addressable commits.
+    /// An empty column denotes the generic unordered/mixed-address layout.
+    direct_segment_row_counts: Vec<u16>,
     /// A complete leaf payload for a commit that fits in one segment. Keeping
     /// it in the directory preserves the one-record shape of tiny commits;
     /// larger commits use the indexed segment list below.
@@ -404,10 +407,11 @@ struct CommitDeltaManifest {
     segments: Vec<CommitDeltaSegmentBounds>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommitDeltaSelectionCertificate {
     pub(crate) member_count: u32,
     pub(crate) selection_fingerprint: [u8; 32],
+    pub(crate) direct_segment_row_counts: Vec<u16>,
     pub(crate) selected_source_commit_id: Option<CommitId>,
 }
 
@@ -865,6 +869,9 @@ where
             )
         })?,
         selection_fingerprint: [0; 32],
+        direct_segment_row_counts: Vec::with_capacity(
+            row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
+        ),
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS)),
     };
@@ -880,7 +887,7 @@ where
         }
         let segment_index = segment_row_counts.len();
         let mut candidate_len = pending.len();
-        let (bounds, encoded, segment_fingerprint) = loop {
+        let (bounds, encoded) = loop {
             match encode_ordered_addressable_commit_delta_segment(
                 commit_id,
                 segment_index,
@@ -888,11 +895,11 @@ where
                 candidate_len,
                 &mut compressor,
             ) {
-                Ok((bounds, encoded, segment_fingerprint))
+                Ok((bounds, encoded))
                     if encoded.len() <= ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES
                         || candidate_len == 1 =>
                 {
-                    break (bounds, encoded, segment_fingerprint);
+                    break (bounds, encoded);
                 }
                 Ok(_) | Err(CommitDeltaSegmentEncodeError::SidecarTooLarge)
                     if candidate_len > 1 =>
@@ -903,15 +910,9 @@ where
                 Ok(_) => unreachable!("single-row segment exits through the guarded success arm"),
             }
         };
-        for (target, source) in manifest
-            .selection_fingerprint
-            .iter_mut()
-            .zip(segment_fingerprint)
-        {
-            *target ^= source;
-        }
         let row_count_u16 =
             u16::try_from(candidate_len).expect("commit-delta segment row count fits u16");
+        manifest.direct_segment_row_counts.push(row_count_u16);
         segment_row_counts.push(row_count_u16);
         for _ in 0..candidate_len {
             pending.pop_front();
@@ -979,7 +980,7 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
     deltas: impl Iterator<Item = TrackedStateCommitDeltaRef<'a>>,
     row_count: usize,
     compressor: &mut crate::compression::ZstdLevel1Compressor,
-) -> Result<(CommitDeltaSegmentBounds, Vec<u8>, [u8; 32]), CommitDeltaSegmentEncodeError> {
+) -> Result<(CommitDeltaSegmentBounds, Vec<u8>), CommitDeltaSegmentEncodeError> {
     let mut entries = TrackedStateMutationBatchBuilder::with_row_capacity(row_count);
     let mut payloads = Vec::with_capacity(row_count);
     for (ordinal, delta) in deltas.enumerate() {
@@ -1028,19 +1029,8 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
             .key
             .to_vec(),
     };
-    let selection_fingerprint = selection_fingerprint(entries.iter().map(|entry| {
-        let value = decode_value(&entry.value)
-            .expect("ordered commit-delta values were encoded by the trusted builder");
-        (
-            entry.key.as_ref(),
-            value.change_id,
-            value.deleted,
-            value.created_at,
-            value.updated_at,
-        )
-    }));
     let encoded = try_encode_commit_delta_segment_with_payloads(&entries, &payloads, compressor)?;
-    Ok((bounds, encoded, selection_fingerprint))
+    Ok((bounds, encoded))
 }
 
 fn stage_commit_deltas_inner(
@@ -1223,6 +1213,7 @@ fn stage_commit_deltas_inner(
                     .map(|commit_id| *commit_id.as_uuid().as_bytes()),
                 member_count,
                 selection_fingerprint,
+                direct_segment_row_counts: Vec::new(),
                 inline_segment,
                 segments: Vec::new(),
             })?),
@@ -1243,6 +1234,7 @@ fn stage_commit_deltas_inner(
             .map(|commit_id| *commit_id.as_uuid().as_bytes()),
         member_count,
         selection_fingerprint,
+        direct_segment_row_counts: Vec::new(),
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(segment_count),
     };
@@ -3569,6 +3561,7 @@ pub(crate) async fn load_commit_delta_selection_certificate(
             member_count: manifest.member_count,
             selection_fingerprint: manifest.selection_fingerprint,
             selected_source_commit_id: manifest.selected_source_commit_id(),
+            direct_segment_row_counts: manifest.direct_segment_row_counts,
         }))
 }
 
@@ -3601,6 +3594,36 @@ async fn load_commit_delta_manifest(
 }
 
 fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), LixError> {
+    if !manifest.direct_segment_row_counts.is_empty() {
+        if manifest.selected_source_commit_id.is_some()
+            || manifest
+                .direct_segment_row_counts
+                .iter()
+                .any(|&count| count == 0 || usize::from(count) > COMMIT_DELTA_SEGMENT_MAX_ROWS)
+            || manifest
+                .direct_segment_row_counts
+                .iter()
+                .map(|&count| u64::from(count))
+                .sum::<u64>()
+                != u64::from(manifest.member_count)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta manifest has an invalid dense address inventory",
+            ));
+        }
+        let expected_segment_count = if manifest.inline_segment.is_empty() {
+            manifest.segments.len()
+        } else {
+            1
+        };
+        if manifest.direct_segment_row_counts.len() != expected_segment_count {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta dense address inventory does not match its segments",
+            ));
+        }
+    }
     if !manifest.inline_segment.is_empty() {
         if !manifest.segments.is_empty() {
             return Err(LixError::new(
@@ -4804,6 +4827,20 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("streamed addressable read should open");
+        let certificate = super::load_commit_delta_selection_certificate(&read, commit_id)
+            .await
+            .expect("dense selection certificate should load")
+            .expect("ordered commit should have a selection certificate");
+        assert!(!certificate.direct_segment_row_counts.is_empty());
+        assert_eq!(
+            certificate
+                .direct_segment_row_counts
+                .iter()
+                .map(|&count| usize::from(count))
+                .sum::<usize>(),
+            fixtures.len()
+        );
+        assert_eq!(certificate.selection_fingerprint, [0; 32]);
         let generic_read = generic_storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -5824,6 +5861,7 @@ mod tests {
                     selected_source_commit_id: None,
                     member_count: 0,
                     selection_fingerprint: [0; 32],
+                    direct_segment_row_counts: Vec::new(),
                     inline_segment: segment,
                     segments: Vec::new(),
                 })
@@ -6303,9 +6341,9 @@ mod tests {
         );
 
         let mut old = encoded.clone();
-        old[..COMMIT_DELTA_FORMAT_MAGIC.len()].copy_from_slice(b"LXCD5");
+        old[..COMMIT_DELTA_FORMAT_MAGIC.len()].copy_from_slice(b"LXCD8");
         let error = decode_commit_delta_with_payloads(&old, None)
-            .expect_err("LXCD5 segments must be rejected");
+            .expect_err("LXCD8 segments must be rejected");
         assert!(
             error
                 .to_string()
@@ -6562,6 +6600,7 @@ mod tests {
                     selected_source_commit_id: None,
                     member_count: 0,
                     selection_fingerprint: [0; 32],
+                    direct_segment_row_counts: Vec::new(),
                     inline_segment: encode_commit_delta_segment(&entries),
                     segments: Vec::new(),
                 })
@@ -6791,7 +6830,7 @@ mod tests {
 
     #[test]
     fn packed_commit_delta_manifest_rejects_unknown_format() {
-        let error = decode_commit_delta_manifest(b"LXCD1not-a-v2-manifest")
+        let error = decode_commit_delta_manifest(b"LXCD8not-an-lxcd9-manifest")
             .expect_err("old packed manifests must fail loudly");
         assert!(
             error
