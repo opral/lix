@@ -4,7 +4,19 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
 use crate::core::{Document, InputSplice, LINE_SCHEMA_KEY, Line};
-use crate::{STATE_PAGE_BYTES, decode_identities, decode_identity_manifest, encode_identities};
+use crate::{
+    PACKET_PAGE_INITIAL_CAPACITY, STATE_PAGE_BYTES, decode_identities, decode_identity_manifest,
+    encode_identities, packet_page_buffer,
+};
+
+#[test]
+fn packet_page_buffer_does_not_preallocate_the_record_ceiling() {
+    assert_eq!(
+        packet_page_buffer(16 * 1024 * 1024).capacity(),
+        PACKET_PAGE_INITIAL_CAPACITY
+    );
+    assert_eq!(packet_page_buffer(1024).capacity(), 1024);
+}
 
 fn open(bytes: &[u8]) -> (Document, Vec<lix::EntityChange>) {
     let (document, changes) =
