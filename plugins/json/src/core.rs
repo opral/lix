@@ -1110,9 +1110,30 @@ impl Document {
         _path: Option<&str>,
         namespace: IdNamespace,
     ) -> Result<(Self, InitialChanges), String> {
+        Self::open_parsed_file(bytes, namespace, true)
+    }
+
+    pub fn open_fresh_file(
+        bytes: Vec<u8>,
+        _path: Option<&str>,
+        namespace: IdNamespace,
+    ) -> Result<(Self, InitialChanges), String> {
+        Self::open_parsed_file(bytes, namespace, false)
+    }
+
+    fn open_parsed_file(
+        bytes: Vec<u8>,
+        namespace: IdNamespace,
+        build_lookup: bool,
+    ) -> Result<(Self, InitialChanges), String> {
         let shared = Arc::new(bytes);
         let nodes = JsonParser::parse(shared.as_slice(), namespace)?;
-        let document = Self::from_parts(PersistentBlob::from_shared(shared)?, nodes, 0)?;
+        let document = Self::from_parts_with_lookup(
+            PersistentBlob::from_shared(shared)?,
+            nodes,
+            0,
+            build_lookup,
+        )?;
         let changes = document.initial_changes();
         Ok((document, changes))
     }
@@ -1122,25 +1143,39 @@ impl Document {
         nodes: Vec<Node>,
         sparse_nodes_touched: usize,
     ) -> Result<Self, String> {
+        Self::from_parts_with_lookup(blob, nodes, sparse_nodes_touched, true)
+    }
+
+    fn from_parts_with_lookup(
+        blob: PersistentBlob,
+        nodes: Vec<Node>,
+        sparse_nodes_touched: usize,
+        build_lookup: bool,
+    ) -> Result<Self, String> {
         if nodes.is_empty() {
             return Err("JSON semantic graph has no root".to_owned());
         }
-        let mut lookup = HashMap::with_capacity(nodes.len());
-        for (ordinal, node) in nodes.iter().enumerate() {
-            let fingerprint = identity_fingerprint_node(node);
-            if lookup
-                .insert(
-                    fingerprint,
-                    u32::try_from(ordinal).map_err(|_| "JSON has too many entities")?,
-                )
-                .is_some()
-            {
-                return Err(format!(
-                    "duplicate or colliding JSON entity identity {:?}",
-                    node.identity()
-                ));
+        let lookup = if build_lookup {
+            let mut lookup = HashMap::with_capacity(nodes.len());
+            for (ordinal, node) in nodes.iter().enumerate() {
+                let fingerprint = identity_fingerprint_node(node);
+                if lookup
+                    .insert(
+                        fingerprint,
+                        u32::try_from(ordinal).map_err(|_| "JSON has too many entities")?,
+                    )
+                    .is_some()
+                {
+                    return Err(format!(
+                        "duplicate or colliding JSON entity identity {:?}",
+                        node.identity()
+                    ));
+                }
             }
-        }
+            lookup
+        } else {
+            HashMap::new()
+        };
         let spans = SpanIndex::from_nodes(&nodes)?;
         Ok(Self(Arc::new(DocumentInner {
             blob,
@@ -3242,4 +3277,22 @@ fn add_signed(value: u32, delta: i64) -> Result<u32, String> {
         .checked_add(delta)
         .ok_or_else(|| "JSON span arithmetic overflow".to_owned())?;
     u32::try_from(value).map_err(|_| "JSON span exceeds the supported range".to_owned())
+}
+
+#[cfg(test)]
+mod fresh_import_tests {
+    use super::{Document, IdNamespace};
+
+    #[test]
+    fn fresh_import_skips_the_transient_identity_lookup() {
+        let bytes = br#"{"items":[{"name":"one"},{"name":"two"}]}"#.to_vec();
+        let (fresh, _) = Document::open_fresh_file(bytes.clone(), None, IdNamespace([1; 16]))
+            .expect("fresh JSON");
+        let (reconcilable, _) =
+            Document::open_file(bytes, None, IdNamespace([1; 16])).expect("reconcilable JSON");
+
+        assert!(fresh.0.lookup.is_empty());
+        assert!(!reconcilable.0.lookup.is_empty());
+        assert_eq!(fresh.bytes(), reconcilable.bytes());
+    }
 }
