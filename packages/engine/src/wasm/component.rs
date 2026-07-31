@@ -1336,7 +1336,7 @@ impl WasmDurableDocumentCheckpoint {
                 "plugin runtime checkpoint exceeds u64",
             )
         })?;
-        let compressed = zstd::bulk::compress(&bytes, 1).map_err(|error| {
+        let compressed = crate::compression::compress_zstd_level_1(&bytes).map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("failed to compress plugin runtime checkpoint: {error}"),
@@ -1383,7 +1383,7 @@ impl WasmDurableDocumentCheckpoint {
                 "plugin runtime checkpoint exceeds the 128 MiB decode limit",
             ));
         }
-        zstd::bulk::decompress(&bytes[16..], decoded_len)
+        crate::compression::decompress_zstd(&bytes[16..], decoded_len)
             .map(crate::Blob::from)
             .map_err(|error| {
                 LixError::new(
