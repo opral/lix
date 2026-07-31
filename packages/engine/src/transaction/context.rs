@@ -10713,14 +10713,8 @@ mod tests {
         )
         .expect("explicit row timestamps should plan");
 
-        assert_eq!(
-            planned.created_at.to_string(),
-            "2026-04-23T00:00:00.123Z"
-        );
-        assert_eq!(
-            planned.updated_at.to_string(),
-            "2026-04-24T00:00:00.456Z"
-        );
+        assert_eq!(planned.created_at.to_string(), "2026-04-23T00:00:00.123Z");
+        assert_eq!(planned.updated_at.to_string(), "2026-04-24T00:00:00.456Z");
         assert_eq!(default_timestamp, None);
         assert_eq!(
             functions.deterministic_sequence_persist_highest_seen(),

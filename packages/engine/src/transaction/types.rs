@@ -3820,11 +3820,13 @@ mod tests {
     fn certified_row_content_remains_decodable_until_validation_release() {
         let normalized = br#"{"id":"entity-1"}"#.to_vec();
         let normalized_len = normalized.len();
-        let snapshot =
-            TransactionJson::from_certified_row_content_arena(normalized, vec![(0, normalized_len)])
-                .expect("certified transaction arena")
-                .pop()
-                .expect("certified row");
+        let snapshot = TransactionJson::from_certified_row_content_arena(
+            normalized,
+            vec![(0, normalized_len)],
+        )
+        .expect("certified transaction arena")
+        .pop()
+        .expect("certified row");
         let mut staged =
             stage_json_from_value(snapshot, "certified transaction arena").expect("staged JSON");
 
