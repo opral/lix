@@ -1864,8 +1864,20 @@ fn validate_typed_csv_quote_layout(quote_layout: &[u8], field_count: u16) -> Res
 }
 
 struct ValidatedCreatedPacketPage {
-    schemas: std::collections::BTreeSet<String>,
-    identities: Vec<CreatedPacketIdentity>,
+    schemas: Vec<String>,
+    identities: Vec<ValidatedPacketIdentity>,
+}
+
+enum ValidatedPacketIdentity {
+    Explicit {
+        schema_index: u32,
+        fingerprint: [u8; 32],
+        generated_local_ref: Option<u64>,
+    },
+    Create {
+        schema_index: u32,
+        local_ref: u64,
+    },
 }
 
 enum CreatedPacketIdentity {
@@ -1875,9 +1887,9 @@ enum CreatedPacketIdentity {
 
 #[derive(Debug, Default)]
 struct CertifiedPacketSchemaKeys {
-    create_refs: std::collections::BTreeSet<u64>,
-    explicit_keys: std::collections::BTreeSet<Vec<String>>,
-    explicit_create_refs: std::collections::BTreeSet<u64>,
+    create_refs: std::collections::HashSet<u64>,
+    explicit_keys: std::collections::HashSet<[u8; 32]>,
+    explicit_create_refs: std::collections::HashSet<u64>,
     create_ref_ranges: Vec<(u64, u64)>,
 }
 
@@ -1899,15 +1911,45 @@ impl CertifiedPacketEntityKeys {
         let [component] = components else {
             return None;
         };
-        let id = uuid::Uuid::parse_str(component).ok()?;
-        if id.to_string() != *component {
+        Self::generated_local_ref_component(component, creates)
+    }
+
+    fn generated_local_ref_component(component: &str, creates: WasmCreateContext) -> Option<u64> {
+        if component.len() != 36
+            || component
+                .as_bytes()
+                .iter()
+                .enumerate()
+                .any(|(index, byte)| {
+                    if matches!(index, 8 | 13 | 18 | 23) {
+                        *byte != b'-'
+                    } else {
+                        !byte.is_ascii_digit() && !(b'a'..=b'f').contains(byte)
+                    }
+                })
+        {
             return None;
         }
+        let id = uuid::Uuid::parse_str(component).ok()?;
         let bytes = id.into_bytes();
         if bytes[..8] != creates.high.to_be_bytes() || bytes[8..12] != creates.low.to_be_bytes() {
             return None;
         }
         Some(u64::from(u32::from_be_bytes(bytes[12..].try_into().ok()?)))
+    }
+
+    fn explicit_key_fingerprint<'a>(components: impl IntoIterator<Item = &'a [u8]>) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"lix-certified-packet-explicit-key-v1\0");
+        for component in components {
+            hasher.update(
+                &u64::try_from(component.len())
+                    .expect("packet key component length fits u64")
+                    .to_be_bytes(),
+            );
+            hasher.update(component);
+        }
+        *hasher.finalize().as_bytes()
     }
 
     fn insert(
@@ -1926,7 +1968,9 @@ impl CertifiedPacketEntityKeys {
                 let create_ref = Self::generated_local_ref(&components, creates);
                 (
                     key.schema_key.as_str().to_owned(),
-                    Some(components),
+                    Some(Self::explicit_key_fingerprint(
+                        components.iter().map(String::as_bytes),
+                    )),
                     create_ref,
                 )
             }
@@ -1935,12 +1979,22 @@ impl CertifiedPacketEntityKeys {
                 local_ref,
             } => (schema_key, None, Some(local_ref)),
         };
+        self.insert_compact(schema_key, explicit_key, create_ref, existing)
+    }
+
+    fn insert_compact(
+        &mut self,
+        schema_key: String,
+        explicit_key: Option<[u8; 32]>,
+        create_ref: Option<u64>,
+        existing: &Self,
+    ) -> Result<(), LixError> {
         let existing = existing.schemas.get(&schema_key);
         let page = self.schemas.entry(schema_key).or_default();
         match explicit_key {
-            Some(key) => {
-                if existing.is_some_and(|keys| keys.explicit_keys.contains(&key))
-                    || !page.explicit_keys.insert(key)
+            Some(fingerprint) => {
+                if existing.is_some_and(|keys| keys.explicit_keys.contains(&fingerprint))
+                    || !page.explicit_keys.insert(fingerprint)
                     || create_ref.is_some_and(|local_ref| {
                         existing.is_some_and(|keys| Self::contains_create_ref(keys, local_ref))
                             || Self::contains_create_ref(page, local_ref)
@@ -1971,6 +2025,30 @@ impl CertifiedPacketEntityKeys {
         Ok(())
     }
 
+    fn insert_validated(
+        &mut self,
+        identity: ValidatedPacketIdentity,
+        schemas: &[String],
+        existing: &Self,
+    ) -> Result<(), LixError> {
+        let (schema_index, fingerprint, create_ref, explicit) = match identity {
+            ValidatedPacketIdentity::Explicit {
+                schema_index,
+                fingerprint,
+                generated_local_ref,
+            } => (schema_index, Some(fingerprint), generated_local_ref, true),
+            ValidatedPacketIdentity::Create {
+                schema_index,
+                local_ref,
+            } => (schema_index, None, Some(local_ref), false),
+        };
+        let schema_key = schemas
+            .get(usize::try_from(schema_index).expect("schema index fits usize"))
+            .expect("validated packet identity has a known schema");
+        debug_assert_eq!(explicit, fingerprint.is_some());
+        self.insert_compact(schema_key.clone(), fingerprint, create_ref, existing)
+    }
+
     fn insert_create_ref_range(
         &mut self,
         schema_key: &str,
@@ -1979,12 +2057,13 @@ impl CertifiedPacketEntityKeys {
         existing: &Self,
     ) -> Result<(), LixError> {
         let collides = |keys: &CertifiedPacketSchemaKeys| {
-            keys.create_refs.range(first..=last).next().is_some()
+            keys.create_refs
+                .iter()
+                .any(|local_ref| first <= *local_ref && *local_ref <= last)
                 || keys
                     .explicit_create_refs
-                    .range(first..=last)
-                    .next()
-                    .is_some()
+                    .iter()
+                    .any(|local_ref| first <= *local_ref && *local_ref <= last)
                 || keys
                     .create_ref_ranges
                     .iter()
@@ -2018,7 +2097,6 @@ fn duplicate_certified_packet_key() -> LixError {
 
 fn validate_new_certified_packet_keys(
     page: ValidatedCreatedPacketPage,
-    creates: WasmCreateContext,
     existing: &CertifiedPacketEntityKeys,
 ) -> Result<
     (
@@ -2027,11 +2105,15 @@ fn validate_new_certified_packet_keys(
     ),
     LixError,
 > {
+    let ValidatedCreatedPacketPage {
+        schemas,
+        identities,
+    } = page;
     let mut page_keys = CertifiedPacketEntityKeys::default();
-    for identity in page.identities {
-        page_keys.insert(identity, creates, existing)?;
+    for identity in identities {
+        page_keys.insert_validated(identity, &schemas, existing)?;
     }
-    Ok((page.schemas, page_keys))
+    Ok((schemas.into_iter().collect(), page_keys))
 }
 
 fn validate_ordinary_packet_page_keys(
@@ -2066,12 +2148,13 @@ fn validate_ordinary_packet_page_keys(
 fn validate_created_packet_page(
     record_count: u32,
     payload: &[u8],
+    creates: WasmCreateContext,
 ) -> Result<Option<ValidatedCreatedPacketPage>, String> {
     if record_count == 0 {
         return Err("packet page is empty".to_owned());
     }
     let mut input = TypedCsvReader { payload, offset: 0 };
-    let mut schemas = std::collections::BTreeSet::new();
+    let mut schemas = Vec::<String>::new();
     let mut identities = Vec::with_capacity(record_count as usize);
     let mut previous_local_ref = None;
     for _ in 0..record_count {
@@ -2088,28 +2171,49 @@ fn validate_created_packet_page(
         if schema.is_empty() {
             return Err("packet create schema is empty".to_owned());
         }
-        schemas.insert(schema.to_owned());
+        let schema_index = match schemas.iter().position(|candidate| candidate == schema) {
+            Some(index) => index,
+            None => {
+                schemas.push(schema.to_owned());
+                schemas.len() - 1
+            }
+        };
+        let schema_index =
+            u32::try_from(schema_index).map_err(|_| "packet has too many schemas")?;
         match tag {
             0 => {
                 let component_count = record.u32()?;
                 if component_count == 0 {
                     return Err("packet upsert key has no components".to_owned());
                 }
-                let mut components = Vec::with_capacity(component_count as usize);
+                let mut fingerprint = blake3::Hasher::new();
+                fingerprint.update(b"lix-certified-packet-explicit-key-v1\0");
+                let mut only_component = None;
                 for _ in 0..component_count {
                     let component_len = record.u32()? as usize;
-                    components.push(
-                        std::str::from_utf8(record.bytes(component_len)?)
-                            .map_err(|error| format!("packet key component is not UTF-8: {error}"))?
-                            .to_owned(),
+                    let component = record.bytes(component_len)?;
+                    let component = std::str::from_utf8(component)
+                        .map_err(|error| format!("packet key component is not UTF-8: {error}"))?;
+                    fingerprint.update(
+                        &u64::try_from(component.len())
+                            .expect("packet key component length fits u64")
+                            .to_be_bytes(),
                     );
+                    fingerprint.update(component.as_bytes());
+                    if component_count == 1 {
+                        only_component = Some(component);
+                    }
                 }
                 if record.u8()? > 1 {
                     return Err("packet upsert has an invalid effect".to_owned());
                 }
-                identities.push(CreatedPacketIdentity::Explicit(
-                    WasmEntityKey::from_owned_parts(schema, components),
-                ));
+                identities.push(ValidatedPacketIdentity::Explicit {
+                    schema_index,
+                    fingerprint: *fingerprint.finalize().as_bytes(),
+                    generated_local_ref: only_component.and_then(|component| {
+                        CertifiedPacketEntityKeys::generated_local_ref_component(component, creates)
+                    }),
+                });
             }
             2 => {
                 let local_ref = record.u64()?;
@@ -2117,8 +2221,8 @@ fn validate_created_packet_page(
                     return Err("packet create local refs must be strictly increasing".to_owned());
                 }
                 previous_local_ref = Some(local_ref);
-                identities.push(CreatedPacketIdentity::Create {
-                    schema_key: schema.to_owned(),
+                identities.push(ValidatedPacketIdentity::Create {
+                    schema_index,
                     local_ref,
                 });
             }
@@ -2140,7 +2244,7 @@ fn validate_created_packet_page(
     // Dense Git-text rows have a valid generic schema but no storage-native
     // streaming validator yet. Keep them on the ordinary bounded packet path
     // instead of falsely certifying a segment the engine cannot consume.
-    if schemas.contains("git_text_line_v2") {
+    if schemas.iter().any(|schema| schema == "git_text_line_v2") {
         return Ok(None);
     }
     Ok(Some(ValidatedCreatedPacketPage {
@@ -3863,7 +3967,8 @@ impl WasmComponentActor for V3Actor {
                         unreachable!("matched packet page")
                     };
                     if let Some(validated_page) =
-                        validate_created_packet_page(record_count, &payload).map_err(v3_error)?
+                        validate_created_packet_page(record_count, &payload, creates)
+                            .map_err(v3_error)?
                     {
                         // Certified immutable segments are the ownership unit
                         // for complete bulk state. Sparse successors stay as
@@ -3897,7 +4002,6 @@ impl WasmComponentActor for V3Actor {
                         }
                         let (schema_keys, page_keys) = validate_new_certified_packet_keys(
                             validated_page,
-                            creates,
                             &cursor.certified_packet_entity_keys,
                         )?;
                         cursor.certified_packet_creates = Some(creates);
@@ -4166,9 +4270,15 @@ mod tests {
     }
 
     fn upsert_page(schema: &str, component: &str) -> Vec<u8> {
+        upsert_components_page(schema, &[component])
+    }
+
+    fn upsert_components_page(schema: &str, components: &[&str]) -> Vec<u8> {
         packet_page(0, schema, |record| {
-            record.extend_from_slice(&1_u32.to_le_bytes());
-            push_text(record, component);
+            record.extend_from_slice(&(components.len() as u32).to_le_bytes());
+            for component in components {
+                push_text(record, component);
+            }
             record.push(0);
         })
     }
@@ -4178,10 +4288,10 @@ mod tests {
         creates: WasmCreateContext,
         existing: &mut CertifiedPacketEntityKeys,
     ) -> Result<(), LixError> {
-        let page = validate_created_packet_page(1, payload)
+        let page = validate_created_packet_page(1, payload, creates)
             .expect("well-framed packet")
             .expect("certifiable packet");
-        let (_, keys) = validate_new_certified_packet_keys(page, creates, existing)?;
+        let (_, keys) = validate_new_certified_packet_keys(page, existing)?;
         existing.extend(keys);
         Ok(())
     }
@@ -4228,6 +4338,30 @@ mod tests {
             duplicate_explicit.message,
             "a component entity key may occur only once across certified packet pages"
         );
+
+        let mut canonical_keys = CertifiedPacketEntityKeys::default();
+        accept_page(&create_page("row", 7), creates, &mut canonical_keys)
+            .expect("canonical generated key");
+        accept_page(
+            &upsert_page("row", &generated_id.to_uppercase()),
+            creates,
+            &mut canonical_keys,
+        )
+        .expect("noncanonical UUID spelling is a distinct explicit key");
+
+        let mut component_boundaries = CertifiedPacketEntityKeys::default();
+        accept_page(
+            &upsert_components_page("row", &["ab", "c"]),
+            creates,
+            &mut component_boundaries,
+        )
+        .expect("first compound key");
+        accept_page(
+            &upsert_components_page("row", &["a", "bc"]),
+            creates,
+            &mut component_boundaries,
+        )
+        .expect("component lengths must delimit the compact fingerprint");
     }
 
     #[test]
