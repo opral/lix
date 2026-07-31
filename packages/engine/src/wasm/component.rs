@@ -1706,11 +1706,22 @@ pub struct WasmFileTransition {
 /// id selects a registered engine codec; pages retain the guest's bounded
 /// framing and share their backing buffers through transaction commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmCertifiedCreateRange {
+    pub schema_key: String,
+    pub first_local_ref: u32,
+    pub last_local_ref: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmCertifiedEntityBatch {
     pub format: u16,
     pub schema_keys: Vec<String>,
     pub row_count: u64,
     pub creates: WasmCreateContext,
+    /// Host-validated compact identities created by this batch. Keeping ranges
+    /// here avoids reparsing or expanding certified packet payloads merely to
+    /// establish successor authority.
+    pub create_ranges: Vec<WasmCertifiedCreateRange>,
     /// True when this batch replaces every prior segment for the file.
     /// Incremental transitions emit sparse overlays instead.
     pub complete_file_state: bool,

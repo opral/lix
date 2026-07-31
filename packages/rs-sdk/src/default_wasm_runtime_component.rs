@@ -17,15 +17,16 @@ use lix_engine::wasm::v3::{
     Transaction as ArenaTransaction,
 };
 use lix_engine::wasm::{
-    PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmCertifiedEntityBatch, WasmChangeCursorHandle,
-    WasmChangeEffect, WasmChangePage, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
-    WasmConflictResolution, WasmConflictResolutionPage, WasmConflictTake, WasmConflictTransition,
-    WasmConflictUpdate, WasmCreateContext, WasmDocumentCheckpoint, WasmDocumentHandle,
-    WasmEditCursorHandle, WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChanges,
-    WasmEntityKey, WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
-    WasmGuestBytes, WasmGuestEntityChanges, WasmHostBytes, WasmHostEntityConflict, WasmInputBytes,
-    WasmOpenEntitiesInput, WasmOpenFileInput, WasmOutputRange, WasmOutputSplice,
-    WasmResolutionCursorHandle, WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
+    PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmCertifiedCreateRange, WasmCertifiedEntityBatch,
+    WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage, WasmColdFileUpdate,
+    WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictResolutionPage,
+    WasmConflictTake, WasmConflictTransition, WasmConflictUpdate, WasmCreateContext,
+    WasmDocumentCheckpoint, WasmDocumentHandle, WasmEditCursorHandle, WasmEditPage, WasmEntity,
+    WasmEntityChange, WasmEntityChanges, WasmEntityKey, WasmEntityTransition, WasmEntityUpdate,
+    WasmFileTransition, WasmFileUpdate, WasmGuestBytes, WasmGuestEntityChanges, WasmHostBytes,
+    WasmHostEntityConflict, WasmInputBytes, WasmOpenEntitiesInput, WasmOpenFileInput,
+    WasmOutputRange, WasmOutputSplice, WasmResolutionCursorHandle, WasmTransitionCounters,
+    WasmTransitionHandle, WasmTransitionLimits,
 };
 use lix_engine::{LixError, SharedStr};
 use wasmtime::Store;
@@ -1797,11 +1798,16 @@ fn validate_typed_csv_rows(row_count: u32, payload: &[u8]) -> Result<(u32, u32),
     }
     let mut input = TypedCsvReader { payload, offset: 0 };
     let mut first_local_ref = None;
-    let mut previous_local_ref = None;
+    let mut previous_local_ref: Option<u32> = None;
     for _ in 0..row_count {
         let local_ref = input.u32()?;
-        if previous_local_ref.is_some_and(|previous| previous >= local_ref) {
-            return Err("typed CSV local refs must be strictly increasing".to_owned());
+        if let Some(previous) = previous_local_ref {
+            if previous >= local_ref {
+                return Err("typed CSV local refs must be strictly increasing".to_owned());
+            }
+            if previous.checked_add(1) != Some(local_ref) {
+                return Err("typed CSV local refs must be contiguous within a page".to_owned());
+            }
         }
         first_local_ref.get_or_insert(local_ref);
         previous_local_ref = Some(local_ref);
@@ -2089,6 +2095,65 @@ impl CertifiedPacketEntityKeys {
             keys.create_ref_ranges.extend(page.create_ref_ranges);
         }
     }
+
+    fn extend_ref(&mut self, page: &Self) {
+        for (schema_key, page) in &page.schemas {
+            let keys = self.schemas.entry(schema_key.clone()).or_default();
+            keys.create_refs.extend(page.create_refs.iter().copied());
+            keys.explicit_keys
+                .extend(page.explicit_keys.iter().copied());
+            keys.explicit_create_refs
+                .extend(page.explicit_create_refs.iter().copied());
+            keys.create_ref_ranges
+                .extend(page.create_ref_ranges.iter().copied());
+        }
+    }
+
+    fn take_create_ranges_for(&mut self, schema_keys: &[String]) -> Vec<WasmCertifiedCreateRange> {
+        let mut output = Vec::new();
+        for schema_key in schema_keys {
+            let Some(keys) = self.schemas.remove(schema_key) else {
+                continue;
+            };
+            let mut ranges = keys
+                .create_ref_ranges
+                .into_iter()
+                .chain(
+                    keys.create_refs
+                        .into_iter()
+                        .map(|local_ref| (local_ref, local_ref)),
+                )
+                .chain(
+                    keys.explicit_create_refs
+                        .into_iter()
+                        .map(|local_ref| (local_ref, local_ref)),
+                )
+                .collect::<Vec<_>>();
+            ranges.sort_unstable();
+            let mut compact = Vec::<(u64, u64)>::with_capacity(ranges.len());
+            for (first, last) in ranges {
+                if let Some((_, compact_last)) = compact.last_mut()
+                    && first <= compact_last.saturating_add(1)
+                {
+                    *compact_last = (*compact_last).max(last);
+                    continue;
+                }
+                compact.push((first, last));
+            }
+            output.extend(
+                compact
+                    .into_iter()
+                    .map(|(first, last)| WasmCertifiedCreateRange {
+                        schema_key: schema_key.clone(),
+                        first_local_ref: u32::try_from(first)
+                            .expect("validated create local ref fits u32"),
+                        last_local_ref: u32::try_from(last)
+                            .expect("validated create local ref fits u32"),
+                    }),
+            );
+        }
+        output
+    }
 }
 
 fn duplicate_certified_packet_key() -> LixError {
@@ -2217,6 +2282,9 @@ fn validate_created_packet_page(
             }
             2 => {
                 let local_ref = record.u64()?;
+                if u32::try_from(local_ref).is_err() {
+                    return Err("packet create local ref exceeds u32".to_owned());
+                }
                 if previous_local_ref.is_some_and(|previous| previous >= local_ref) {
                     return Err("packet create local refs must be strictly increasing".to_owned());
                 }
@@ -3385,6 +3453,8 @@ struct CursorState {
     certified_csv_rows: u64,
     certified_csv_creates: Option<WasmCreateContext>,
     certified_csv_last_local_ref: Option<u32>,
+    certified_all_entity_keys: CertifiedPacketEntityKeys,
+    certified_csv_entity_keys: CertifiedPacketEntityKeys,
     certified_packet_pages: Vec<Bytes>,
     certified_packet_rows: u64,
     certified_packet_creates: Option<WasmCreateContext>,
@@ -3579,6 +3649,8 @@ impl WasmComponentActor for V3Actor {
                 certified_csv_rows: 0,
                 certified_csv_creates: None,
                 certified_csv_last_local_ref: None,
+                certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_csv_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
@@ -3683,6 +3755,8 @@ impl WasmComponentActor for V3Actor {
                 certified_csv_rows: 0,
                 certified_csv_creates: None,
                 certified_csv_last_local_ref: None,
+                certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_csv_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
@@ -3733,6 +3807,8 @@ impl WasmComponentActor for V3Actor {
                 certified_csv_rows: 0,
                 certified_csv_creates: None,
                 certified_csv_last_local_ref: None,
+                certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_csv_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
@@ -3944,7 +4020,7 @@ impl WasmComponentActor for V3Actor {
                         "csv_v2_row",
                         u64::from(first_local_ref),
                         u64::from(last_local_ref),
-                        &cursor.certified_packet_entity_keys,
+                        &cursor.certified_all_entity_keys,
                     )?;
                     cursor.certified_csv_creates = Some(creates);
                     cursor.certified_csv_rows = cursor
@@ -3953,7 +4029,8 @@ impl WasmComponentActor for V3Actor {
                         .ok_or_else(|| v3_error("certified CSV row count overflowed"))?;
                     cursor.certified_csv_last_local_ref = Some(last_local_ref);
                     cursor.certified_csv_pages.push(Bytes::from(payload));
-                    cursor.certified_packet_entity_keys.extend(page_keys);
+                    cursor.certified_all_entity_keys.extend_ref(&page_keys);
+                    cursor.certified_csv_entity_keys.extend(page_keys);
                 }
                 Some(page @ PendingChangePage::Packet { .. }) => {
                     let PendingChangePage::Packet {
@@ -3987,9 +4064,9 @@ impl WasmComponentActor for V3Actor {
                             let page_keys = validate_ordinary_packet_page_keys(
                                 &decoded,
                                 creates,
-                                &cursor.certified_packet_entity_keys,
+                                &cursor.certified_all_entity_keys,
                             )?;
-                            cursor.certified_packet_entity_keys.extend(page_keys);
+                            cursor.certified_all_entity_keys.extend(page_keys);
                             return Ok(Some(decoded));
                         }
                         if cursor
@@ -4002,7 +4079,7 @@ impl WasmComponentActor for V3Actor {
                         }
                         let (schema_keys, page_keys) = validate_new_certified_packet_keys(
                             validated_page,
-                            &cursor.certified_packet_entity_keys,
+                            &cursor.certified_all_entity_keys,
                         )?;
                         cursor.certified_packet_creates = Some(creates);
                         cursor.certified_packet_rows = cursor
@@ -4010,6 +4087,7 @@ impl WasmComponentActor for V3Actor {
                             .checked_add(u64::from(record_count))
                             .ok_or_else(|| v3_error("certified packet row count overflowed"))?;
                         cursor.certified_packet_schema_keys.extend(schema_keys);
+                        cursor.certified_all_entity_keys.extend_ref(&page_keys);
                         cursor.certified_packet_entity_keys.extend(page_keys);
                         cursor.certified_packet_pages.push(Bytes::from(payload));
                     } else {
@@ -4024,9 +4102,9 @@ impl WasmComponentActor for V3Actor {
                         let page_keys = validate_ordinary_packet_page_keys(
                             &decoded,
                             creates,
-                            &cursor.certified_packet_entity_keys,
+                            &cursor.certified_all_entity_keys,
                         )?;
-                        cursor.certified_packet_entity_keys.extend(page_keys);
+                        cursor.certified_all_entity_keys.extend(page_keys);
                         return Ok(Some(decoded));
                     }
                 }
@@ -4066,28 +4144,40 @@ impl WasmComponentActor for V3Actor {
         };
         let mut batches = Vec::with_capacity(2);
         if let Some(creates) = cursor.certified_csv_creates.take() {
+            let schema_keys = vec!["csv_v2_row".to_owned()];
+            let create_ranges = cursor
+                .certified_csv_entity_keys
+                .take_create_ranges_for(&schema_keys);
             batches.push(WasmCertifiedEntityBatch {
                 format: CERTIFIED_TYPED_CSV_V1,
-                schema_keys: vec!["csv_v2_row".to_owned()],
+                schema_keys,
                 row_count: std::mem::take(&mut cursor.certified_csv_rows),
                 creates,
+                create_ranges,
                 complete_file_state: cursor.complete_file_state,
                 pages: std::mem::take(&mut cursor.certified_csv_pages),
             });
         }
         if let Some(creates) = cursor.certified_packet_creates.take() {
+            let schema_keys = std::mem::take(&mut cursor.certified_packet_schema_keys)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let create_ranges = cursor
+                .certified_packet_entity_keys
+                .take_create_ranges_for(&schema_keys);
             cursor.certified_packet_entity_keys = CertifiedPacketEntityKeys::default();
             batches.push(WasmCertifiedEntityBatch {
                 format: CERTIFIED_CREATED_PACKET_V1,
-                schema_keys: std::mem::take(&mut cursor.certified_packet_schema_keys)
-                    .into_iter()
-                    .collect(),
+                schema_keys,
                 row_count: std::mem::take(&mut cursor.certified_packet_rows),
                 creates,
+                create_ranges,
                 complete_file_state: cursor.complete_file_state,
                 pages: std::mem::take(&mut cursor.certified_packet_pages),
             });
         }
+        cursor.certified_all_entity_keys = CertifiedPacketEntityKeys::default();
+        cursor.certified_csv_entity_keys = CertifiedPacketEntityKeys::default();
         batches
     }
 
@@ -4365,6 +4455,20 @@ mod tests {
     }
 
     #[test]
+    fn certified_packet_rejects_create_refs_outside_authority_format() {
+        let creates = WasmCreateContext {
+            high: 0x019a_0000_0000_7000,
+            low: 0x8000_0000,
+        };
+        let result =
+            validate_created_packet_page(1, &create_page("row", u64::from(u32::MAX) + 1), creates);
+        assert!(matches!(
+            result,
+            Err(message) if message == "packet create local ref exceeds u32"
+        ));
+    }
+
+    #[test]
     fn certified_packet_rejects_keys_repeated_by_ordinary_pages() {
         let creates = WasmCreateContext {
             high: 0x019a_0000_0000_7000,
@@ -4440,6 +4544,75 @@ mod tests {
             duplicate_csv.message,
             "a component entity key may occur only once across certified packet pages"
         );
+    }
+
+    #[test]
+    fn certified_authority_ranges_stay_partitioned_by_batch_context() {
+        let mut csv_keys = CertifiedPacketEntityKeys::default();
+        csv_keys
+            .insert_create_ref_range("csv_v2_row", 1, 1, &CertifiedPacketEntityKeys::default())
+            .expect("CSV identity is unique");
+        let mut packet_keys = CertifiedPacketEntityKeys::default();
+        packet_keys
+            .insert(
+                CreatedPacketIdentity::Create {
+                    schema_key: "csv_v2_row".to_owned(),
+                    local_ref: 2,
+                },
+                WasmCreateContext {
+                    high: 0x019b_0000_0000_7000,
+                    low: 0x8000_0000,
+                },
+                &csv_keys,
+            )
+            .expect("packet identity is unique across the transition");
+
+        assert_eq!(
+            csv_keys.take_create_ranges_for(&["csv_v2_row".to_owned()]),
+            vec![WasmCertifiedCreateRange {
+                schema_key: "csv_v2_row".to_owned(),
+                first_local_ref: 1,
+                last_local_ref: 1,
+            }]
+        );
+        assert_eq!(
+            packet_keys.take_create_ranges_for(&["csv_v2_row".to_owned()]),
+            vec![WasmCertifiedCreateRange {
+                schema_key: "csv_v2_row".to_owned(),
+                first_local_ref: 2,
+                last_local_ref: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn certified_create_authorities_are_exported_as_compact_ranges() {
+        let creates = WasmCreateContext {
+            high: 0x019a_0000_0000_7000,
+            low: 0x8000_0000,
+        };
+        let mut keys = CertifiedPacketEntityKeys::default();
+        for local_ref in [7, 8, 9, 12] {
+            accept_page(&create_page("row", local_ref), creates, &mut keys)
+                .expect("create identity is unique");
+        }
+
+        assert_eq!(
+            keys.take_create_ranges_for(&["row".to_owned()]),
+            vec![
+                WasmCertifiedCreateRange {
+                    schema_key: "row".to_owned(),
+                    first_local_ref: 7,
+                    last_local_ref: 9,
+                },
+                WasmCertifiedCreateRange {
+                    schema_key: "row".to_owned(),
+                    first_local_ref: 12,
+                    last_local_ref: 12,
+                },
+            ]
+        );
+        assert!(keys.schemas.is_empty());
     }
 
     #[test]
@@ -4525,6 +4698,26 @@ mod tests {
         assert_eq!(
             validate_typed_csv_rows(1, &row(&[1, 2], 9)).unwrap_err(),
             "typed CSV quote layout has bits beyond the final field"
+        );
+    }
+
+    #[test]
+    fn typed_csv_certification_rejects_authority_holes() {
+        fn append_row(payload: &mut Vec<u8>, local_ref: u32) {
+            payload.extend_from_slice(&local_ref.to_le_bytes());
+            payload.extend_from_slice(&1_u64.to_le_bytes());
+            payload.push(0);
+            payload.extend_from_slice(&0_u32.to_le_bytes());
+            payload.extend_from_slice(&1_u16.to_le_bytes());
+            payload.extend_from_slice(&0_u32.to_le_bytes());
+        }
+
+        let mut payload = Vec::new();
+        append_row(&mut payload, 1);
+        append_row(&mut payload, 3);
+        assert_eq!(
+            validate_typed_csv_rows(2, &payload).unwrap_err(),
+            "typed CSV local refs must be contiguous within a page"
         );
     }
 
