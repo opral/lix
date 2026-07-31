@@ -2467,50 +2467,8 @@ async fn load_packed_current_base_exact(
             Vec::new(),
         );
     }
-    let base_refs = packed_current_base_refs(store, branch_id, generation).await?;
-    if base_refs.is_empty() {
-        return MaterializedLiveStateExactBatch::new(
-            MaterializedLiveStateBatch::default(),
-            vec![None; keys.len()],
-        );
-    }
-    let owned_keys = keys
-        .iter()
-        .map(|key| TrackedStateKey {
-            schema_key: key.schema_key.to_owned(),
-            file_id: key.file_id.map(str::to_owned),
-            entity_pk: key.entity_pk.clone(),
-        })
-        .collect::<Vec<_>>();
-    let mut requests = Vec::with_capacity(base_refs.len().saturating_mul(keys.len()));
-    for base_ref in &base_refs {
-        requests.extend(
-            owned_keys
-                .iter()
-                .cloned()
-                .map(|key| (base_ref.commit_id, key)),
-        );
-    }
-    let loaded = crate::tracked_state::load_owned_commit_delta_entries(store, &requests).await?;
-    let mut winners = (0..keys.len()).map(|_| None).collect::<Vec<
-        Option<(
-            crate::tracked_state::TrackedStateIndexValue,
-            crate::changelog::ChangeRecord,
-        )>,
-    >>();
-    for entries in loaded.chunks(keys.len()) {
-        for (slot, entry) in winners.iter_mut().zip(entries) {
-            let Some(entry) = entry else {
-                continue;
-            };
-            if slot
-                .as_ref()
-                .is_none_or(|(previous, _)| previous.commit_id < entry.value.commit_id)
-            {
-                *slot = Some((entry.value.clone(), entry.change_record.clone()));
-            }
-        }
-    }
+    let winners =
+        load_packed_current_base_exact_entries(store, branch_id, generation, keys).await?;
 
     let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
     let mut slots = Vec::with_capacity(keys.len());
@@ -2587,6 +2545,67 @@ async fn load_packed_current_base_exact(
         }
     }
     MaterializedLiveStateExactBatch::new(rows.finish(), slots)
+}
+
+async fn load_packed_current_base_exact_entries(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    keys: &[TrackedStateKeyRef<'_>],
+) -> Result<
+    Vec<
+        Option<(
+            crate::tracked_state::TrackedStateIndexValue,
+            crate::changelog::ChangeRecord,
+        )>,
+    >,
+    LixError,
+> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let base_refs = packed_current_base_refs(store, branch_id, generation).await?;
+    if base_refs.is_empty() {
+        return Ok((0..keys.len()).map(|_| None).collect());
+    }
+    let owned_keys = keys
+        .iter()
+        .map(|key| TrackedStateKey {
+            schema_key: key.schema_key.to_owned(),
+            file_id: key.file_id.map(str::to_owned),
+            entity_pk: key.entity_pk.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut requests = Vec::with_capacity(base_refs.len().saturating_mul(keys.len()));
+    for base_ref in &base_refs {
+        requests.extend(
+            owned_keys
+                .iter()
+                .cloned()
+                .map(|key| (base_ref.commit_id, key)),
+        );
+    }
+    let loaded = crate::tracked_state::load_owned_commit_delta_entries(store, &requests).await?;
+    let mut winners = (0..keys.len()).map(|_| None).collect::<Vec<
+        Option<(
+            crate::tracked_state::TrackedStateIndexValue,
+            crate::changelog::ChangeRecord,
+        )>,
+    >>();
+    for entries in loaded.chunks(keys.len()) {
+        for (slot, entry) in winners.iter_mut().zip(entries) {
+            let Some(entry) = entry else {
+                continue;
+            };
+            if slot
+                .as_ref()
+                .is_none_or(|(previous, _)| previous.commit_id < entry.value.commit_id)
+            {
+                *slot = Some((entry.value.clone(), entry.change_record.clone()));
+            }
+        }
+    }
+    Ok(winners)
 }
 
 /// Direct reader for one published hot generation.
@@ -2674,17 +2693,17 @@ where
         if !page.value.entries.is_empty() {
             return Ok(true);
         }
-        // Format plugins cannot publish engine-owned schemas. Avoid probing
-        // certified plugin segments when validation asks about a missing
-        // system schema; durable-function setup relies on this point-read-only
-        // path staying free of unrelated storage scans.
-        if schema_key.starts_with("lix_") {
-            return Ok(false);
-        }
         if packed_current_base_has_schema(&self.store, branch_id, control.generation, schema_key)
             .await?
         {
             return Ok(true);
+        }
+        // Format plugins cannot publish engine-owned schemas. Avoid probing
+        // certified plugin segments when validation asks about a missing
+        // system schema. Engine-owned packed bases are checked above because
+        // they carry ordinary transaction-authored system rows.
+        if schema_key.starts_with("lix_") {
+            return Ok(false);
         }
         let certified = scan_certified_entity_batch_rows(
             &self.store,
@@ -3875,21 +3894,20 @@ where
                 file_id: delta.file_id,
             })
             .collect::<Vec<_>>();
-        let packed_previous = load_packed_current_base_exact(
+        let packed_previous = load_packed_current_base_exact_entries(
             self.store,
             branch_id,
             generation,
             &previous_keys,
-            ChangeRecordProjection::full(),
         )
         .await?;
         for (index, previous) in previous_values.iter_mut().enumerate() {
-            let Some(packed) = packed_previous.row(index) else {
+            let Some((packed_value, packed_change)) = &packed_previous[index] else {
                 continue;
             };
             let packed_is_newer = match (
                 previous.as_deref().map(decode_head_value).transpose()?,
-                packed.commit_id(),
+                Some(packed_value.commit_id),
             ) {
                 (None, Some(_)) => true,
                 (Some(previous), Some(packed)) => {
@@ -3901,23 +3919,15 @@ where
                 continue;
             }
             *previous = Some(Bytes::from(encode_head_value(&HeadValueRef {
-                change_id: packed.change_id(),
-                commit_id: packed.commit_id(),
-                untracked: packed.untracked(),
-                deleted: packed.deleted(),
-                created_at: packed.created_at(),
-                updated_at: packed.updated_at(),
-                snapshot: packed
-                    .snapshot_content()
-                    .map_or(JsonSlotRef::None, |snapshot| {
-                        JsonSlotRef::Inline(snapshot.as_str())
-                    }),
-                metadata: packed.metadata().map_or(JsonSlotRef::None, |metadata| {
-                    JsonSlotRef::Inline(metadata.as_str())
-                }),
-                working_diff_baseline: if working_diff_capture_checkpoint_commit_id.is_some()
-                    && !packed.untracked()
-                {
+                change_id: Some(packed_value.change_id),
+                commit_id: Some(packed_value.commit_id),
+                untracked: false,
+                deleted: packed_value.deleted,
+                created_at: packed_value.created_at,
+                updated_at: packed_value.updated_at,
+                snapshot: packed_change.snapshot.as_ref_slot(),
+                metadata: packed_change.metadata.as_ref_slot(),
+                working_diff_baseline: if working_diff_capture_checkpoint_commit_id.is_some() {
                     // Checkpoints publish complete HOT rows. Therefore a
                     // packed base in an active checkpoint generation was
                     // created after that checkpoint and has an absent before
@@ -7351,6 +7361,24 @@ where
         &mut stale_untracked_refs,
     )
     .await?;
+    stage_collect_stale_hot_space(
+        store,
+        writes,
+        PACKED_CURRENT_BASE_SPACE,
+        decode_hot_collection_control_scope,
+        &active,
+        &mut stale_untracked_refs,
+    )
+    .await?;
+    stage_collect_stale_hot_space(
+        store,
+        writes,
+        PACKED_CURRENT_BASE_CONTROL_SPACE,
+        decode_hot_collection_control_scope,
+        &active,
+        &mut stale_untracked_refs,
+    )
+    .await?;
     stage_collect_stale_hot_collection_controls(store, writes, &active).await?;
     Ok(stale_untracked_refs
         .into_iter()
@@ -7610,8 +7638,265 @@ mod tests {
         }
     }
 
+    struct JsonCountingRead<R> {
+        inner: R,
+        json_get_many_calls: Arc<AtomicUsize>,
+    }
+
+    impl<R: StorageAdapterRead> StorageAdapterRead for JsonCountingRead<R> {
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+
+        async fn get_many(
+            &self,
+            requests: &[StorageGetManyRequest<'_>],
+        ) -> Result<StorageGetManyResult, crate::storage_adapter::StorageError> {
+            if requests
+                .iter()
+                .any(|request| request.space == crate::json_store::store::JSON_SPACE.id)
+            {
+                self.json_get_many_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.get_many(requests).await
+        }
+
+        async fn scan(
+            &self,
+            space: StorageSpaceId,
+            range: StorageKeyRange,
+            opts: StorageScanOptions,
+        ) -> Result<StorageScanChunk, crate::storage_adapter::StorageError> {
+            self.inner.scan(space, range, opts).await
+        }
+    }
+
     fn timestamp() -> LixTimestamp {
         LixTimestamp::expect_parse("hot working-diff test timestamp", "2026-01-01T00:00:00Z")
+    }
+
+    #[tokio::test]
+    async fn packed_mutation_lookup_retains_large_refs_and_finds_system_schemas() {
+        const COMMIT_LABEL: &str = "packed-system-schema-base";
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label(COMMIT_LABEL);
+        let entity_pk = EntityPk::single("packed-system-row");
+        let snapshot = serde_json::json!({
+            "key": "packed-system-row",
+            "value": "x".repeat(crate::json_store::JSON_INLINE_MAX_BYTES + 1),
+        })
+        .to_string();
+        crate::test_support::seed_branch_head_with_rows(
+            storage.clone(),
+            crate::GLOBAL_BRANCH_ID,
+            COMMIT_LABEL,
+            &[MaterializedTrackedStateRow {
+                entity_pk: entity_pk.clone(),
+                schema_key: "lix_key_value".to_owned(),
+                file_id: None,
+                snapshot_content: Some(snapshot.into()),
+                metadata: None,
+                deleted: false,
+                created_at: timestamp().to_string(),
+                updated_at: timestamp().to_string(),
+                change_id: ChangeId::for_test_label("packed-system-change"),
+                commit_id: generation,
+            }],
+        )
+        .await;
+
+        let mut manifest_key = hot_scope_prefix(crate::GLOBAL_BRANCH_ID, generation);
+        manifest_key.extend_from_slice(generation.as_uuid().as_bytes());
+        let mut writes = StorageWriteSet::new();
+        writes.delete(
+            HOT_ROW_SPACE,
+            StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
+                branch_id: crate::GLOBAL_BRANCH_ID.to_owned(),
+                generation,
+                schema_key: "lix_key_value".to_owned(),
+                entity_pk: entity_pk.clone(),
+                file_id: None,
+            }))),
+        );
+        writes.put(
+            PACKED_CURRENT_BASE_SPACE,
+            StorageKey(Bytes::from(manifest_key)),
+            StorageValue {
+                bytes: Bytes::from_static(&[0; 16]),
+            },
+        );
+        writes.put(
+            PACKED_CURRENT_BASE_CONTROL_SPACE,
+            StorageKey(Bytes::from(hot_scope_prefix(
+                crate::GLOBAL_BRANCH_ID,
+                generation,
+            ))),
+            StorageValue {
+                bytes: Bytes::from_static(&[1]),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("publish packed system-schema fixture");
+
+        let json_get_many_calls = Arc::new(AtomicUsize::new(0));
+        let read = JsonCountingRead {
+            inner: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("open packed fixture read"),
+            json_get_many_calls: Arc::clone(&json_get_many_calls),
+        };
+        let entries = load_packed_current_base_exact_entries(
+            &read,
+            crate::GLOBAL_BRANCH_ID,
+            generation,
+            &[TrackedStateKeyRef {
+                schema_key: "lix_key_value",
+                entity_pk: &entity_pk,
+                file_id: None,
+            }],
+        )
+        .await
+        .expect("load packed mutation predecessor");
+        let (_, change) = entries[0].as_ref().expect("packed predecessor exists");
+        assert!(
+            matches!(change.snapshot, JsonSlot::Ref(_)),
+            "mutation lookup must retain the out-of-band slot instead of materializing its payload"
+        );
+        assert_eq!(
+            json_get_many_calls.load(Ordering::Relaxed),
+            0,
+            "mutation predecessor lookup must not read large JSON payloads"
+        );
+
+        let reader = HotStateStoreReader { store: read };
+        assert!(
+            reader
+                .has_schema_rows(
+                    crate::GLOBAL_BRANCH_ID,
+                    BranchHeadControl {
+                        head_commit_id: generation,
+                        generation,
+                        current_state_revision: 0,
+                        schema_presence_bloom: [u64::MAX; 4],
+                        working_diff_checkpoint_commit_id: None,
+                        created_at: timestamp(),
+                        updated_at: timestamp(),
+                        ref_change_id: ChangeId::for_test_label("packed-system-ref"),
+                    },
+                    "lix_key_value",
+                )
+                .await
+                .expect("probe packed system schema"),
+            "engine-owned schemas must probe packed bases before skipping plugin segments"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_state_gc_sweeps_stale_packed_generations() {
+        let storage = StorageAdapter::new(Memory::new());
+        let active_generation = CommitId::for_test_label("active-packed-generation");
+        let stale_generation = CommitId::for_test_label("stale-packed-generation");
+        let mut active_manifest = hot_scope_prefix("active-packed", active_generation);
+        active_manifest.extend_from_slice(active_generation.as_uuid().as_bytes());
+        let active_control = hot_scope_prefix("active-packed", active_generation);
+        let mut stale_manifest = hot_scope_prefix("stale-packed", stale_generation);
+        stale_manifest.extend_from_slice(stale_generation.as_uuid().as_bytes());
+        let stale_control = hot_scope_prefix("stale-packed", stale_generation);
+        let mut writes = StorageWriteSet::new();
+        for (space, key, value) in [
+            (
+                PACKED_CURRENT_BASE_SPACE,
+                active_manifest.clone(),
+                Bytes::from_static(&[0; 16]),
+            ),
+            (
+                PACKED_CURRENT_BASE_CONTROL_SPACE,
+                active_control.clone(),
+                Bytes::from_static(&[1]),
+            ),
+            (
+                PACKED_CURRENT_BASE_SPACE,
+                stale_manifest.clone(),
+                Bytes::from_static(&[0; 16]),
+            ),
+            (
+                PACKED_CURRENT_BASE_CONTROL_SPACE,
+                stale_control.clone(),
+                Bytes::from_static(&[1]),
+            ),
+        ] {
+            writes.put(
+                space,
+                StorageKey(Bytes::from(key)),
+                StorageValue { bytes: value },
+            );
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit packed GC fixture");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open packed GC read");
+        let active_branch_control = BranchHeadControl {
+            head_commit_id: active_generation,
+            generation: active_generation,
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at: timestamp(),
+            updated_at: timestamp(),
+            ref_change_id: ChangeId::for_test_label("active-packed-ref"),
+        };
+        let mut gc_writes = StorageWriteSet::new();
+        stage_collect_stale_hot_generations(
+            &read,
+            &mut gc_writes,
+            &[("active-packed".to_owned(), active_branch_control)],
+        )
+        .await
+        .expect("collect stale packed generations");
+        drop(read);
+        storage
+            .commit_write_set(gc_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit packed generation GC");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verify packed generation GC");
+        let manifests = PointReadPlan::new(
+            PACKED_CURRENT_BASE_SPACE,
+            &[
+                StorageKey(Bytes::from(active_manifest)),
+                StorageKey(Bytes::from(stale_manifest)),
+            ],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("read packed manifests")
+        .value;
+        let controls = PointReadPlan::new(
+            PACKED_CURRENT_BASE_CONTROL_SPACE,
+            &[
+                StorageKey(Bytes::from(active_control)),
+                StorageKey(Bytes::from(stale_control)),
+            ],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("read packed controls")
+        .value;
+        assert!(manifests[0].is_some());
+        assert!(manifests[1].is_none());
+        assert!(controls[0].is_some());
+        assert!(controls[1].is_none());
     }
 
     #[tokio::test]
