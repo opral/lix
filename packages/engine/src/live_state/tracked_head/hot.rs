@@ -8844,6 +8844,7 @@ mod tests {
             schema_keys: vec![SCHEMA_KEY.to_owned()],
             row_count: 1,
             creates,
+            create_ranges: Vec::new(),
             complete_file_state: true,
             pages: vec![Bytes::from(page)],
         };

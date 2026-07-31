@@ -1985,6 +1985,7 @@ pub(crate) fn certify_dense_fresh_file(
         schema_keys: vec![schema_key.to_owned()],
         row_count: transition.changes.changes.len() as u64,
         creates,
+        create_ranges: Vec::new(),
         complete_file_state: true,
         pages,
     };

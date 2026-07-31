@@ -65,9 +65,10 @@ use crate::plugin::{
     LiveBatchEntitySource, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorCache,
     PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
     PluginActorStagedCheckpoint, PluginActorStore, PluginActorStorePermit,
-    PluginArchiveInstallPlan, PluginContentType, PluginFileOwner, PluginMaterialization,
-    PluginObservation, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
-    PluginRuntimeHost, SchemaAllowlist, ValidatedConflictTransition, ValidatedFileTransition,
+    PluginArchiveInstallPlan, PluginContentType, PluginEntityAuthorities,
+    PluginEntityAuthorityRange, PluginFileOwner, PluginMaterialization, PluginObservation,
+    PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntimeHost,
+    SchemaAllowlist, ValidatedConflictTransition, ValidatedFileTransition,
     ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
     VecEntitySource, build_file_update_splices, canonicalize_snapshot,
     drain_conflict_transition_resolutions, drain_entity_transition_edits,
@@ -168,11 +169,11 @@ use crate::transaction::validation::{
     validate_certified_tracked_insert_identities, validate_prepared_writes,
 };
 use crate::wasm::{
-    WasmChangeEffect, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
-    WasmConflictUpdate, WasmDocumentCheckpoint, WasmDocumentHandle, WasmEntityChange,
-    WasmEntityConflict, WasmEntityKey, WasmEntityUpdate, WasmFileDescriptor, WasmFileUpdate,
-    WasmHostBytes, WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput, WasmOpenFileInput,
-    WasmPluginSelection, WasmTransitionLimits,
+    WasmCertifiedEntityBatch, WasmChangeEffect, WasmColdFileUpdate, WasmComponentActor,
+    WasmComponentFactory, WasmConflictUpdate, WasmDocumentCheckpoint, WasmDocumentHandle,
+    WasmEntityChange, WasmEntityConflict, WasmEntityKey, WasmEntityUpdate, WasmFileDescriptor,
+    WasmFileUpdate, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput,
+    WasmOpenFileInput, WasmPluginSelection, WasmTransitionLimits,
 };
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
@@ -1494,6 +1495,8 @@ where
         };
         let entity_ordinals =
             v2_host_entity_ordinals_from_live_batch(&rows, &file_key, plugin.schema_keys())?;
+        let entity_authorities =
+            plugin_entity_authorities_from_live_batch(plugin, &rows, &entity_ordinals);
         let entity_count = entity_ordinals.len();
         if let VisibleMaterializationBytes::Derived { path, .. } = &materialization.bytes
             && descriptor.path.as_deref() != Some(path.as_str())
@@ -1643,7 +1646,7 @@ where
             u64::from(derived_materialization || !cold_open_hydrates_without_render);
         self.plugin_host.record_transition_counters(counters);
         cache
-            .install_cold_if_absent(
+            .install_cold_if_absent_with_authorities(
                 cold_install,
                 actor_key.clone(),
                 PluginActorStore::new(actor, store_permit),
@@ -1651,6 +1654,7 @@ where
                 materialized_bytes,
                 materialized_bytes_sha256,
                 Arc::<str>::from(semantic_root),
+                entity_authorities,
             )
             .await
     }
@@ -1779,7 +1783,7 @@ where
         bound: BoundCreateContext,
         file_key: &PluginFileWriteKey,
         existing_reservation: Option<&MaterializedLiveStateRow>,
-        known_existing_authorities: Option<&BTreeSet<WasmEntityKey>>,
+        known_existing_authorities: Option<&PluginEntityAuthorities>,
     ) -> Result<RawWriteBatch, LixError> {
         let mut validation = validate_create_changes(plugin, changes)?;
         if let Some(known) = known_existing_authorities {
@@ -3578,8 +3582,6 @@ where
                     .iter()
                     .map(|batch| batch.row_count)
                     .sum::<u64>();
-                file_data[pending.file_index]
-                    .set_certified_entity_batches(validated.certified_batches);
                 let mut changes = validated.changes;
                 let create_rows = self
                     .v2_create_rows(
@@ -3591,6 +3593,13 @@ where
                         None,
                     )
                     .await?;
+                let entity_authorities = plugin_entity_authorities_from_transition(
+                    &pending.selected,
+                    &changes,
+                    &validated.certified_batches,
+                )?;
+                file_data[pending.file_index]
+                    .set_certified_entity_batches(validated.certified_batches);
                 let mut counters = validated.counters;
                 counters.host_content_classification_bytes = content_classification_bytes
                     .get(&pending.file_key)
@@ -3649,6 +3658,7 @@ where
                         document: validated.document,
                         bytes: pending.submitted_bytes,
                         semantic_root: Arc::from(pending.materialization_version),
+                        entity_authorities,
                         view: pending.view,
                     });
                 reconciled_file_keys.insert(pending.file_key);
@@ -3989,6 +3999,8 @@ where
                                     "lix.perf.plugin_actor_instantiate"
                                 ))
                                 .await?;
+                            let mut cold_base_authorities: PluginEntityAuthorities =
+                                PluginEntityAuthorities::empty();
                             let transition_result = if let Some(checkpoint) = decoded_checkpoint {
                                 drop(base);
                                 drop(read);
@@ -4041,6 +4053,11 @@ where
                                     selected.schema_keys(),
                                 )?;
                                 let entity_count = entity_ordinals.len();
+                                cold_base_authorities = plugin_entity_authorities_from_live_batch(
+                                    selected,
+                                    &entity_rows,
+                                    &entity_ordinals,
+                                );
                                 let entity_source = LiveBatchEntitySource::new(
                                     entity_rows,
                                     entity_ordinals,
@@ -4106,6 +4123,8 @@ where
                                 .suppress_format_only_noops(selected, changes, &file_key)
                                 .await?;
                             changes = filtered;
+                            let observed_existing_authorities =
+                                PluginEntityAuthorities::from_keys(observed_existing_authorities);
                             let create_rows = self
                                 .v2_create_rows(
                                     selected,
@@ -4116,6 +4135,11 @@ where
                                     Some(&observed_existing_authorities),
                                 )
                                 .await?;
+                            let entity_authorities = plugin_entity_authorities_after_changes(
+                                selected,
+                                &cold_base_authorities,
+                                &changes,
+                            );
                             let mut counters = validated.counters;
                             counters.host_full_diff_bytes_compared = host_full_diff_bytes_compared;
                             counters.host_content_classification_bytes =
@@ -4150,6 +4174,7 @@ where
                                     document: validated.document,
                                     bytes: submitted_bytes.clone(),
                                     semantic_root: Arc::from(materialization_version.clone()),
+                                    entity_authorities,
                                     view,
                                 },
                                 submitted_bytes.clone(),
@@ -4310,7 +4335,8 @@ where
                     );
                     let detection_document = detected_transition.document;
                     let mut counters = detected_transition.counters;
-                    let (mut changes, observed_existing_authorities) = match self
+                    let accepted_entity_authorities = lease.accepted_entity_authorities().clone();
+                    let (mut changes, _observed_existing_authorities) = match self
                         .suppress_format_only_noops(
                             selected,
                             detected_transition.changes,
@@ -4339,7 +4365,7 @@ where
                             create_context,
                             &file_key,
                             existing_create_reservation.as_ref(),
-                            Some(&observed_existing_authorities),
+                            Some(&accepted_entity_authorities),
                         )
                         .instrument(tracing::debug_span!(
                             target: "lix_perf",
@@ -4357,6 +4383,11 @@ where
                             return Err(lease.handle_guest_call_error(error));
                         }
                     };
+                    let successor_entity_authorities = plugin_entity_authorities_after_changes(
+                        selected,
+                        &accepted_entity_authorities,
+                        &changes,
+                    );
                     let (successor_document, materialized_bytes, materialized_bytes_sha256) =
                         if observation_is_current {
                             // The actor lease serializes this file and the durable
@@ -4470,6 +4501,7 @@ where
                         materialized_bytes_sha256,
                         materialization_version.clone(),
                     )?;
+                    lease.set_successor_entity_authorities(successor_entity_authorities)?;
                     (
                         changes,
                         PendingPluginActorPublication::Existing {
@@ -4527,7 +4559,6 @@ where
                     .iter()
                     .map(|batch| batch.row_count)
                     .sum::<u64>();
-                write.set_certified_entity_batches(validated.certified_batches);
                 let mut changes = validated.changes;
                 let create_rows = self
                     .v2_create_rows(
@@ -4543,6 +4574,12 @@ where
                         "lix.perf.plugin_create_rows"
                     ))
                     .await?;
+                let entity_authorities = plugin_entity_authorities_from_transition(
+                    selected,
+                    &changes,
+                    &validated.certified_batches,
+                )?;
+                write.set_certified_entity_batches(validated.certified_batches);
                 let mut counters = validated.counters;
                 counters.host_content_classification_bytes = content_classification_bytes
                     .get(&file_key)
@@ -4563,6 +4600,7 @@ where
                         document: validated.document,
                         bytes: submitted_bytes.clone(),
                         semantic_root: Arc::from(materialization_version.clone()),
+                        entity_authorities,
                         view,
                     },
                     submitted_bytes.clone(),
@@ -4847,6 +4885,7 @@ where
             let materialization_version = self.functions.call_uuid_v7().to_string();
             let transition = render_semantic_changes_with_lease(
                 lease,
+                &group.plugin,
                 successor_key,
                 publication_view,
                 descriptor,
@@ -7157,6 +7196,93 @@ fn plugin_entity_pk(
     })
 }
 
+fn plugin_schema_is_creatable(plugin: &PluginRegistryEntry, schema_key: &str) -> bool {
+    plugin
+        .create_schema_keys()
+        .binary_search_by(|candidate| candidate.as_str().cmp(schema_key))
+        .is_ok()
+}
+
+fn plugin_entity_authorities_after_changes(
+    plugin: &PluginRegistryEntry,
+    base: &PluginEntityAuthorities,
+    changes: &WasmHostEntityChanges,
+) -> PluginEntityAuthorities {
+    let mut inserted = BTreeSet::new();
+    let mut removed = BTreeSet::new();
+    for change in &changes.changes {
+        match change {
+            WasmEntityChange::Upsert { entity, .. }
+                if plugin_schema_is_creatable(plugin, &entity.key.schema_key) =>
+            {
+                removed.remove(&entity.key);
+                inserted.insert(entity.key.clone());
+            }
+            WasmEntityChange::Delete(key)
+                if plugin_schema_is_creatable(plugin, &key.schema_key) =>
+            {
+                inserted.remove(key);
+                removed.insert(key.clone());
+            }
+            WasmEntityChange::Create { .. }
+            | WasmEntityChange::Upsert { .. }
+            | WasmEntityChange::Delete(_) => {}
+        }
+    }
+    base.with_delta(inserted, removed)
+}
+
+fn plugin_entity_authorities_from_changes(
+    plugin: &PluginRegistryEntry,
+    changes: &WasmHostEntityChanges,
+) -> PluginEntityAuthorities {
+    plugin_entity_authorities_after_changes(plugin, &PluginEntityAuthorities::empty(), changes)
+}
+
+fn plugin_entity_authorities_from_transition(
+    plugin: &PluginRegistryEntry,
+    changes: &WasmHostEntityChanges,
+    certified_batches: &[WasmCertifiedEntityBatch],
+) -> Result<PluginEntityAuthorities, LixError> {
+    let base = plugin_entity_authorities_from_changes(plugin, changes);
+    let mut ranges = Vec::new();
+    for batch in certified_batches {
+        for range in &batch.create_ranges {
+            if !plugin_schema_is_creatable(plugin, &range.schema_key) {
+                continue;
+            }
+            ranges.push(PluginEntityAuthorityRange::new(
+                range.schema_key.clone(),
+                batch.creates,
+                range.first_local_ref,
+                range.last_local_ref,
+            ));
+        }
+    }
+    Ok(base.with_ranges(ranges))
+}
+
+fn plugin_entity_authorities_from_live_batch(
+    plugin: &PluginRegistryEntry,
+    rows: &MaterializedLiveStateBatch,
+    ordinals: &[u32],
+) -> PluginEntityAuthorities {
+    PluginEntityAuthorities::from_keys(
+        ordinals
+            .iter()
+            .filter_map(|ordinal| {
+                let row = rows.row(*ordinal as usize);
+                plugin_schema_is_creatable(plugin, row.schema_key()).then(|| {
+                    WasmEntityKey::from_owned_parts(
+                        row.schema_key().to_owned(),
+                        row.entity_pk().clone().into_parts(),
+                    )
+                })
+            })
+            .collect(),
+    )
+}
+
 fn v2_host_entities_from_live_batch_ordinals(
     rows: &MaterializedLiveStateBatch,
     ordinals: &[u32],
@@ -7739,6 +7865,7 @@ enum PendingPluginActorPublication {
         checkpoint: Option<WasmDocumentCheckpoint>,
         bytes: crate::Blob,
         semantic_root: Arc<str>,
+        entity_authorities: PluginEntityAuthorities,
         view: PendingPluginActorView,
     },
     /// The plugin transition has already produced its durable rows, but the
@@ -7835,12 +7962,20 @@ impl PendingPluginActorPublication {
                 checkpoint,
                 bytes,
                 semantic_root,
+                entity_authorities,
                 view,
             } => {
                 let path = key.path.clone();
                 cache.remember_checkpoint(&key, &semantic_root, checkpoint);
                 (
-                    Some(cache.install(key, store, document, bytes, semantic_root)),
+                    Some(cache.install_with_authorities(
+                        key,
+                        store,
+                        document,
+                        bytes,
+                        semantic_root,
+                        entity_authorities,
+                    )),
                     view,
                     path,
                 )
@@ -7944,6 +8079,7 @@ fn semantic_rendered_file_data(
 
 async fn render_semantic_changes_with_lease(
     mut lease: PluginActorLease,
+    plugin: &PluginRegistryEntry,
     successor_key: PluginActorKey,
     view: PendingPluginActorView,
     descriptor: WasmFileDescriptor,
@@ -7973,10 +8109,6 @@ async fn render_semantic_changes_with_lease(
         },
     };
     let change_count = u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);
-    let change_source = match VecEntityChangeSource::new(changes, limits) {
-        Ok(source) => source,
-        Err(error) => return Err((error, publication(lease))),
-    };
     let call = match lease.begin_pending_guest_call() {
         Ok(call) => call,
         Err(error) => return Err((error, publication(lease))),
@@ -7989,6 +8121,15 @@ async fn render_semantic_changes_with_lease(
         let error = lease.handle_pending_guest_call_error(call, error);
         return Err((error, publication(lease)));
     }
+    let successor_entity_authorities =
+        plugin_entity_authorities_after_changes(plugin, call.entity_authorities(), &changes);
+    let change_source = match VecEntityChangeSource::new(changes, limits) {
+        Ok(source) => source,
+        Err(error) => {
+            let error = lease.handle_pending_guest_call_error(call, error);
+            return Err((error, publication(lease)));
+        }
+    };
     let base_document = call.document();
     let base_bytes = call.bytes();
     let renderer_input = match lease.actor_mut().fork_document(base_document).await {
@@ -8065,6 +8206,9 @@ async fn render_semantic_changes_with_lease(
         )
         .await
     {
+        return Err((error, publication(lease)));
+    }
+    if let Err(error) = lease.set_successor_entity_authorities(successor_entity_authorities) {
         return Err((error, publication(lease)));
     }
     Ok((
