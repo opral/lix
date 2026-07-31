@@ -197,7 +197,7 @@ fn writes_large_values_to_blob_files() {
 }
 
 #[test]
-fn uses_fast_zstd_compression_for_sst_files() {
+fn uses_fast_zstd_compression_for_sst_and_blob_files() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
     let storage = RocksDB::open(&path).expect("open storage");
@@ -215,6 +215,10 @@ fn uses_fast_zstd_compression_for_sst_files() {
     assert!(
         options.contains("compression=kZSTD"),
         "SST compression should use Zstd"
+    );
+    assert!(
+        options.contains("blob_compression_type=kZSTD"),
+        "blob compression should use Zstd"
     );
     assert!(
         options.contains("compression_opts={")

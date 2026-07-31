@@ -703,6 +703,7 @@ fn open_rocksdb(path: &Path) -> Result<DB, StorageError> {
     options.set_enable_blob_files(true);
     options.set_min_blob_size(DEFAULT_BLOB_MIN_SIZE);
     options.set_blob_file_size(DEFAULT_BLOB_FILE_SIZE);
+    options.set_blob_compression_type(rocksdb::DBCompressionType::Zstd);
     options.set_enable_blob_gc(true);
     options.set_blob_gc_age_cutoff(DEFAULT_BLOB_GC_AGE_CUTOFF);
     DB::open(&options, path).map_err(|error| rocksdb_open_error(error, path))
