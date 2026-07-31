@@ -1845,6 +1845,7 @@ impl TransactionWriteBuffer {
             let row = rows.row(source_index);
             let is_insert = row_is_insert(mode, row);
             let existing_slot = by_identity.get(&identity).copied();
+            let mut requires_transaction_validation = row.facts.requires_transaction_validation;
             if let Some(RowSlot::State(index)) = existing_slot {
                 let previous = if let Some(previous_source) =
                     latest_incoming_source_by_destination.get(&index)
@@ -1853,8 +1854,13 @@ impl TransactionWriteBuffer {
                 } else {
                     staged_rows.row(index)
                 };
+                requires_transaction_validation |= previous.facts.requires_transaction_validation;
                 remove_row_from_commit_change_refs(&mut commit_change_refs_guard, previous);
             }
+            if requires_transaction_validation != row.facts.requires_transaction_validation {
+                rows.set_requires_transaction_validation(source_index, true);
+            }
+            let row = rows.row(source_index);
             let commit_id =
                 add_row_to_commit_change_refs(&mut commit_change_refs_guard, row, &self.functions);
             let identity = PreparedStateRowIdentity::from(row);
@@ -3344,6 +3350,33 @@ mod tests {
                 && row.snapshot.as_ref().map(|snapshot| snapshot.normalized())
                     == Some("{\"key\":\"sql2-key-b\",\"value\":\"only\"}")
         }));
+    }
+
+    #[tokio::test]
+    async fn coalesced_replacement_preserves_prior_validation_requirement() {
+        let staged_writes = test_staged_writes();
+        let mut first = prepared_rows![state_row("validation-key", "constraint-change")];
+        first.set_requires_transaction_validation(0, true);
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: first,
+            })
+            .expect("constraint-changing row should stage");
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows![state_row("validation-key", "unrelated-change")],
+            })
+            .expect("later replacement should stage");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+        assert_eq!(drained.state_rows.len(), 1);
+        let row = drained.state_rows.row(0);
+        assert!(
+            row.facts.requires_transaction_validation,
+            "a later neutral replacement must not erase an earlier validation requirement"
+        );
     }
 
     #[tokio::test]

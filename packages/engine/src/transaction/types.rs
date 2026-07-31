@@ -2724,7 +2724,6 @@ impl PreparedStateBatch {
         self.origins.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn set_requires_transaction_validation(
         &mut self,
         index: usize,
