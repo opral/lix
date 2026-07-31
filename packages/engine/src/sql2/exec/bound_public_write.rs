@@ -505,6 +505,9 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
         let mut candidates = candidates.iter().peekable();
         let primary_key_param_index = direct_primary_key_param
             .expect("ordered direct replacement has one primary-key parameter");
+        let mut normalized = Vec::with_capacity(parameter_rows.len().saturating_mul(64));
+        let mut offsets = Vec::with_capacity(parameter_rows.len());
+        let mut matched_candidates = Vec::with_capacity(parameter_rows.len());
         for (row_index, params) in parameter_rows.iter().enumerate() {
             let expected_entity_pk = match params.get(primary_key_param_index) {
                 Some(Value::Text(value)) => value,
@@ -520,20 +523,34 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
                 {
                     break;
                 }
-                let candidate = candidates
-                    .next()
-                    .expect("peeked exact entity candidate remains available");
-                append_direct_path_value_replacement_row(
-                    &mut write_rows,
-                    &spec,
+                let candidate = EntityLiveRowRef::from(
+                    candidates
+                        .next()
+                        .expect("peeked exact entity candidate remains available"),
+                );
+                let start = normalized.len();
+                append_direct_path_value_replacement_json(
+                    &mut normalized,
                     candidate,
                     params,
                     replacement,
                 )
                 .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
+                offsets.push((start, normalized.len()));
+                matched_candidates.push((row_index, candidate));
                 affected += 1;
             }
             affected_by_statement.push(affected);
+        }
+        let snapshots = TransactionJson::from_certified_row_content_arena(normalized, offsets)?;
+        for ((row_index, candidate), snapshot) in matched_candidates.into_iter().zip(snapshots) {
+            append_direct_path_value_replacement_prepared_row(
+                &mut write_rows,
+                &spec,
+                candidate,
+                snapshot,
+            )
+            .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
         }
     } else {
         let mut candidates_by_pk = std::collections::BTreeMap::<EntityPk, Vec<_>>::new();
@@ -683,6 +700,15 @@ impl<'a> EntityLiveRowRef<'a> {
         }
     }
 
+    fn durable_predecessor(
+        self,
+    ) -> Option<&'a crate::live_state::CertifiedCurrentStatePredecessor> {
+        match self {
+            Self::Owned(_) => None,
+            Self::Batch(row) => row.durable_predecessor(),
+        }
+    }
+
     fn branch_id(self) -> &'a str {
         match self {
             Self::Owned(row) => row.branch_id.as_ref(),
@@ -742,6 +768,28 @@ fn append_direct_path_value_replacement_row<'a>(
     replacement: &DirectPathValueReplacement,
 ) -> Result<(), LixError> {
     let candidate = candidate.into();
+    let mut normalized = Vec::new();
+    append_direct_path_value_replacement_json(&mut normalized, candidate, params, replacement)?;
+    let normalized = SharedStr::from_utf8(bytes::Bytes::from(normalized)).map_err(|error| {
+        LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!("certified replacement row is not UTF-8: {error}"),
+        )
+    })?;
+    append_direct_path_value_replacement_prepared_row(
+        rows,
+        spec,
+        candidate,
+        TransactionJson::from_certified_shared_normalized_row_content(normalized),
+    )
+}
+
+fn append_direct_path_value_replacement_json(
+    normalized: &mut Vec<u8>,
+    candidate: EntityLiveRowRef<'_>,
+    params: &[Value],
+    replacement: &DirectPathValueReplacement,
+) -> Result<(), LixError> {
     let value = match params.get(replacement.value_param_index) {
         Some(Value::Null) => JsonValue::Null,
         Some(Value::Text(raw)) => serde_json::from_str(raw).map_err(|error| {
@@ -766,28 +814,31 @@ fn append_direct_path_value_replacement_row<'a>(
             ));
         }
     };
-    let value = serde_json::to_string(&value).map_err(|error| {
+    normalized.extend_from_slice(br#"{"path":"#);
+    append_canonical_json_string(normalized, candidate.entity_pk().as_single_string()?)?;
+    normalized.extend_from_slice(br#","value":"#);
+    serde_json::to_writer(&mut *normalized, &value).map_err(|error| {
         LixError::new(
             LixError::CODE_UNKNOWN,
             format!("certified replacement value failed to serialize: {error}"),
         )
     })?;
-    let path =
-        serde_json::to_string(candidate.entity_pk().as_single_string()?).map_err(|error| {
-            LixError::new(
-                LixError::CODE_UNKNOWN,
-                format!("certified replacement identity failed to serialize: {error}"),
-            )
-        })?;
-    let normalized = format!(r#"{{"path":{path},"value":{value}}}"#);
+    normalized.push(b'}');
+    Ok(())
+}
+
+fn append_direct_path_value_replacement_prepared_row(
+    rows: &mut RawWriteBatch,
+    spec: &EntitySurfaceSpec,
+    candidate: EntityLiveRowRef<'_>,
+    snapshot: TransactionJson,
+) -> Result<(), LixError> {
     let metadata = inherited_metadata(candidate, spec)?;
     rows.push_parts(
         Some(candidate.entity_pk().clone()),
         spec.schema_key.as_str().into(),
         candidate.file_id().map(Into::into),
-        Some(TransactionJson::from_certified_normalized_row_content(
-            normalized.into(),
-        )),
+        Some(snapshot),
         metadata,
         None,
         None,
@@ -802,6 +853,8 @@ fn append_direct_path_value_replacement_row<'a>(
             candidate.branch_id().into()
         },
     );
+    let row_index = rows.len() - 1;
+    rows.set_durable_predecessor(row_index, candidate.durable_predecessor().cloned());
     Ok(())
 }
 

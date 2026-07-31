@@ -8,6 +8,7 @@ use std::sync::Arc;
 use ahash::RandomState;
 use bytes::Bytes;
 
+use super::tracked_head::CertifiedCurrentStatePredecessor;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
@@ -112,6 +113,12 @@ pub(crate) struct MaterializedLiveStateBatch {
     change_id: Vec<Option<ChangeId>>,
     commit_id: Vec<Option<CommitId>>,
     untracked: Vec<bool>,
+    /// Encoded authoritative HOT predecessor resolved by a durable exact read.
+    ///
+    /// This is intentionally internal transaction evidence, not a public
+    /// projection column. SQL UPDATE can carry it into commit materialization
+    /// and avoid reading the same current row a second time.
+    durable_predecessor: Vec<Option<CertifiedCurrentStatePredecessor>>,
 }
 
 impl MaterializedLiveStateBatch {
@@ -355,6 +362,10 @@ impl<'a> MaterializedLiveStateRowRef<'a> {
 
     pub(crate) fn untracked(self) -> bool {
         self.batch.untracked[self.index]
+    }
+
+    pub(crate) fn durable_predecessor(self) -> Option<&'a CertifiedCurrentStatePredecessor> {
+        self.batch.durable_predecessor[self.index].as_ref()
     }
 
     pub(crate) fn branch_id(self) -> &'a str {
@@ -813,6 +824,7 @@ pub(crate) struct MaterializedLiveStateBatchBuilder {
     change_id: Vec<Option<ChangeId>>,
     commit_id: Vec<Option<CommitId>>,
     untracked: Vec<bool>,
+    durable_predecessor: Vec<Option<CertifiedCurrentStatePredecessor>>,
 }
 
 impl MaterializedLiveStateBatchBuilder {
@@ -864,6 +876,7 @@ impl MaterializedLiveStateBatchBuilder {
             change_id: Vec::with_capacity(capacity),
             commit_id: Vec::with_capacity(capacity),
             untracked: Vec::with_capacity(capacity),
+            durable_predecessor: Vec::with_capacity(capacity),
         }
     }
 
@@ -1007,6 +1020,10 @@ impl MaterializedLiveStateBatchBuilder {
             row.commit_id(),
             row.untracked(),
         );
+        self.durable_predecessor
+            .last_mut()
+            .expect("pushed live-state row has a predecessor slot")
+            .clone_from(&row.durable_predecessor().cloned());
         ordinal
     }
 
@@ -1040,6 +1057,7 @@ impl MaterializedLiveStateBatchBuilder {
         self.change_id.push(change_id);
         self.commit_id.push(commit_id);
         self.untracked.push(untracked);
+        self.durable_predecessor.push(None);
     }
 
     pub(crate) fn set_snapshot_content(&mut self, row: usize, value: SharedStr) {
@@ -1048,6 +1066,14 @@ impl MaterializedLiveStateBatchBuilder {
 
     pub(crate) fn set_metadata(&mut self, row: usize, value: SharedStr) {
         self.metadata[row] = Some(value);
+    }
+
+    pub(crate) fn set_durable_predecessor(
+        &mut self,
+        row: usize,
+        value: CertifiedCurrentStatePredecessor,
+    ) {
+        self.durable_predecessor[row] = Some(value);
     }
 
     pub(crate) fn finish(self) -> MaterializedLiveStateBatch {
@@ -1066,6 +1092,7 @@ impl MaterializedLiveStateBatchBuilder {
             change_id: self.change_id,
             commit_id: self.commit_id,
             untracked: self.untracked,
+            durable_predecessor: self.durable_predecessor,
         }
     }
 }

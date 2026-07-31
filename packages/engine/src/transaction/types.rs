@@ -13,9 +13,10 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
-use crate::live_state::MaterializedLiveStateRow;
+use crate::live_state::{CertifiedCurrentStatePredecessor, MaterializedLiveStateRow};
 use crate::tracked_state::TrackedStateDiffIdentity;
 use crate::wasm::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
+use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 
@@ -30,6 +31,7 @@ enum TransactionJsonStorage {
         value: Arc<JsonValue>,
         normalized: OnceLock<Arc<str>>,
     },
+    #[cfg_attr(not(test), allow(dead_code))]
     Certified {
         normalized: Arc<str>,
     },
@@ -102,6 +104,7 @@ impl TransactionJson {
     /// placement only consume canonical bytes. Callers may issue this
     /// certificate only for complete replacement rows whose unchanged
     /// identity and row-local schema constraints were already established.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_certified_normalized_row_content(normalized: Arc<str>) -> Self {
         Self {
             storage: TransactionJsonStorage::Certified { normalized },
@@ -133,7 +136,7 @@ impl TransactionJson {
         offsets: Vec<(usize, usize)>,
     ) -> Result<Vec<Self>, LixError> {
         let invalid_arena = |message| LixError::new(LixError::CODE_INVALID_PARAM, message);
-        let arena = SharedStr::from_utf8(bytes::Bytes::from(normalized))
+        let arena = SharedStr::from_utf8(Bytes::from(normalized))
             .map_err(|_| invalid_arena("certified transaction JSON arena is not UTF-8"))?;
         let arena_len = u32::try_from(arena.len())
             .map_err(|_| invalid_arena("certified transaction JSON arena exceeds u32"))?;
@@ -458,6 +461,7 @@ pub(crate) struct RawWriteBatch {
     entity_pks: Vec<Option<EntityPk>>,
     snapshots: Vec<Option<TransactionJson>>,
     metadata: Vec<Option<TransactionJson>>,
+    durable_predecessors: Vec<Option<CertifiedCurrentStatePredecessor>>,
     strings: Vec<SharedStr>,
     string_index: Option<HashMap<SharedStr, u32>>,
     expected_rows: usize,
@@ -523,6 +527,7 @@ impl RawWriteBatch {
             entity_pks: Vec::with_capacity(row_capacity),
             snapshots: Vec::with_capacity(row_capacity),
             metadata: Vec::with_capacity(row_capacity),
+            durable_predecessors: Vec::with_capacity(row_capacity),
             // File ids are the only commonly row-cardinal strings. Schema,
             // branch, timestamp, and origin metadata normally collapse to a
             // handful of dictionary entries.
@@ -583,6 +588,7 @@ impl RawWriteBatch {
             entity_pks: entity_pks.into_iter().map(Some).collect(),
             snapshots: snapshots.into_iter().map(Some).collect(),
             metadata: std::iter::repeat_with(|| None).take(row_count).collect(),
+            durable_predecessors: std::iter::repeat_with(|| None).take(row_count).collect(),
             strings,
             string_index: None,
             expected_rows: row_count,
@@ -709,6 +715,7 @@ impl RawWriteBatch {
         self.entity_pks.push(entity_pk);
         self.snapshots.push(snapshot);
         self.metadata.push(metadata);
+        self.durable_predecessors.push(None);
         self.debug_assert_aligned();
     }
 
@@ -759,6 +766,7 @@ impl RawWriteBatch {
             entity_pks,
             snapshots,
             metadata,
+            durable_predecessors,
             mut strings,
             string_index: _,
             expected_rows: _,
@@ -774,6 +782,7 @@ impl RawWriteBatch {
         if entity_pks.len() != row_count
             || snapshots.len() != row_count
             || metadata.len() != row_count
+            || durable_predecessors.len() != row_count
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -784,6 +793,12 @@ impl RawWriteBatch {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "certified transaction batch unexpectedly contains logical origins",
+            ));
+        }
+        if durable_predecessors.iter().any(Option::is_some) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified INSERT batch unexpectedly contains durable predecessors",
             ));
         }
 
@@ -868,6 +883,7 @@ impl RawWriteBatch {
                 commit_id: None,
                 untracked: false,
                 branch_id: slot.branch_id,
+                durable_predecessor: None,
             });
         }
         Ok(PreparedStateBatch {
@@ -876,6 +892,7 @@ impl RawWriteBatch {
             strings,
             string_index,
             json,
+            durable_predecessors: Vec::new(),
             origins: Vec::new(),
             origin_index: HashMap::new(),
             origin_column_sets: Vec::new(),
@@ -904,6 +921,7 @@ impl RawWriteBatch {
         self.entity_pks.reserve(additional);
         self.snapshots.reserve(additional);
         self.metadata.reserve(additional);
+        self.durable_predecessors.reserve(additional);
         if let Some(index) = &mut self.string_index {
             // One row-cardinal file id plus the inline schema/branch/timestamp
             // set is the bulk-write happy path. Preserve headroom for those
@@ -941,6 +959,21 @@ impl RawWriteBatch {
 
     pub(crate) fn take_metadata(&mut self, index: usize) -> Option<TransactionJson> {
         self.metadata[index].take()
+    }
+
+    pub(crate) fn take_durable_predecessor(
+        &mut self,
+        index: usize,
+    ) -> Option<CertifiedCurrentStatePredecessor> {
+        self.durable_predecessors[index].take()
+    }
+
+    pub(crate) fn set_durable_predecessor(
+        &mut self,
+        index: usize,
+        value: Option<CertifiedCurrentStatePredecessor>,
+    ) {
+        self.durable_predecessors[index] = value;
     }
 
     pub(crate) fn snapshot_slots_mut(
@@ -989,6 +1022,7 @@ impl RawWriteBatch {
                 self.entity_pks.swap(destination, source);
                 self.snapshots.swap(destination, source);
                 self.metadata.swap(destination, source);
+                self.durable_predecessors.swap(destination, source);
             }
             destination += 1;
         }
@@ -996,6 +1030,7 @@ impl RawWriteBatch {
         self.entity_pks.truncate(destination);
         self.snapshots.truncate(destination);
         self.metadata.truncate(destination);
+        self.durable_predecessors.truncate(destination);
         self.debug_assert_aligned();
     }
 
@@ -1052,6 +1087,7 @@ impl RawWriteBatch {
 
     fn move_row_into(&mut self, index: usize, destination: &mut Self) {
         let slot = self.slots[index];
+        let durable_predecessor = self.durable_predecessors[index].take();
         destination.push_parts(
             self.entity_pks[index].take(),
             self.strings[slot.schema_key as usize].clone(),
@@ -1067,6 +1103,8 @@ impl RawWriteBatch {
             slot.flags & RAW_WRITE_UNTRACKED != 0,
             self.strings[slot.branch_id as usize].clone(),
         );
+        let destination_index = destination.len() - 1;
+        destination.set_durable_predecessor(destination_index, durable_predecessor);
     }
 
     fn intern_optional_string(&mut self, value: Option<SharedStr>) -> u32 {
@@ -1183,6 +1221,7 @@ impl RawWriteBatch {
         debug_assert_eq!(self.entity_pks.len(), self.slots.len());
         debug_assert_eq!(self.snapshots.len(), self.slots.len());
         debug_assert_eq!(self.metadata.len(), self.slots.len());
+        debug_assert_eq!(self.durable_predecessors.len(), self.slots.len());
     }
 
     #[cfg(test)]
@@ -2150,6 +2189,7 @@ impl TestPreparedStateRow {
             commit_id: self.commit_id,
             untracked: self.untracked,
             branch_id: &self.branch_id,
+            durable_predecessor: None,
         }
     }
 }
@@ -2168,6 +2208,7 @@ pub(crate) struct PreparedStateBatch {
     strings: Vec<SharedStr>,
     string_index: HashMap<SharedStr, u32>,
     json: Vec<StageJson>,
+    durable_predecessors: Vec<CertifiedCurrentStatePredecessor>,
     origins: Vec<TransactionWriteOrigin>,
     origin_index: HashMap<TransactionWriteOrigin, u32>,
     origin_column_sets: Vec<Arc<[String]>>,
@@ -2198,6 +2239,7 @@ struct PreparedStateSlot {
     commit_id: Option<CommitId>,
     untracked: bool,
     branch_id: u32,
+    durable_predecessor: Option<u32>,
 }
 
 /// Borrowed row projection over a [`PreparedStateBatch`].
@@ -2223,6 +2265,7 @@ pub(crate) struct PreparedStateRowRef<'a> {
     pub(crate) commit_id: Option<CommitId>,
     pub(crate) untracked: bool,
     pub(crate) branch_id: &'a SharedStr,
+    pub(crate) durable_predecessor: Option<&'a CertifiedCurrentStatePredecessor>,
 }
 
 pub(crate) struct PreparedStateRows<'a> {
@@ -2267,6 +2310,7 @@ impl PreparedStateBatch {
             strings: Vec::with_capacity(string_capacity),
             string_index: HashMap::with_capacity(string_capacity),
             json: Vec::with_capacity(json_capacity),
+            durable_predecessors: Vec::new(),
             // Origin dictionaries are absent for ordinary SQL/direct writes
             // and typically contain only a few shared descriptors. Allocate
             // them lazily instead of paying two N-sized buffers up front.
@@ -2322,6 +2366,9 @@ impl PreparedStateBatch {
             commit_id: slot.commit_id,
             untracked: slot.untracked,
             branch_id: &self.strings[slot.branch_id as usize],
+            durable_predecessor: slot
+                .durable_predecessor
+                .map(|index| &self.durable_predecessors[index as usize]),
         })
     }
 
@@ -2453,6 +2500,20 @@ impl PreparedStateBatch {
             commit_id,
             untracked,
             branch_id,
+            durable_predecessor: None,
+        });
+    }
+
+    pub(crate) fn set_durable_predecessor(
+        &mut self,
+        row: usize,
+        value: Option<CertifiedCurrentStatePredecessor>,
+    ) {
+        self.slots[row].durable_predecessor = value.map(|value| {
+            let index = u32::try_from(self.durable_predecessors.len())
+                .expect("prepared durable predecessor column must fit u32");
+            self.durable_predecessors.push(value);
+            index
         });
     }
 
@@ -2469,9 +2530,13 @@ impl PreparedStateBatch {
         let entity_base =
             u32::try_from(self.entity_pks.len()).expect("prepared entity column must fit u32");
         let json_base = u32::try_from(self.json.len()).expect("prepared JSON column must fit u32");
+        let predecessor_base = u32::try_from(self.durable_predecessors.len())
+            .expect("prepared predecessor column must fit u32");
         self.slots.reserve(other.slots.len());
         self.entity_pks.reserve(other.entity_pks.len());
         self.json.reserve(other.json.len());
+        self.durable_predecessors
+            .reserve(other.durable_predecessors.len());
         self.strings.reserve(other.strings.len());
         self.string_index.reserve(other.strings.len());
         self.origins.reserve(other.origins.len());
@@ -2492,6 +2557,8 @@ impl PreparedStateBatch {
             .collect::<Vec<_>>();
         self.entity_pks.append(&mut other.entity_pks);
         self.json.append(&mut other.json);
+        self.durable_predecessors
+            .append(&mut other.durable_predecessors);
         self.slots.extend(other.slots.into_iter().map(|slot| {
             let remap_string = |index: u32| string_remap[index as usize];
             PreparedStateSlot {
@@ -2510,6 +2577,11 @@ impl PreparedStateBatch {
                     index
                         .checked_add(json_base)
                         .expect("prepared JSON ordinal overflowed")
+                }),
+                durable_predecessor: slot.durable_predecessor.map(|index| {
+                    index
+                        .checked_add(predecessor_base)
+                        .expect("prepared predecessor ordinal overflowed")
                 }),
                 origin: slot.origin.map(|index| origin_remap[index as usize]),
                 origin_key: slot.origin_key.map(remap_string),
@@ -2679,7 +2751,7 @@ impl PreparedStateBatch {
             for (_, value) in &normalized {
                 arena.extend_from_slice(value.as_bytes());
             }
-            let arena = SharedStr::from_utf8(bytes::Bytes::from(arena))
+            let arena = SharedStr::from_utf8(Bytes::from(arena))
                 .expect("validated canonical JSON arena remains UTF-8");
             let mut offset = 0usize;
             for (_, value) in &mut normalized {
@@ -2818,6 +2890,8 @@ impl PreparedStateBatch {
             row.untracked,
             row.branch_id.clone(),
         );
+        let index = self.len() - 1;
+        self.set_durable_predecessor(index, row.durable_predecessor.cloned());
     }
 }
 

@@ -2419,6 +2419,29 @@ async fn stage_tracked_head(
                     }),
             );
         }
+        let durable_predecessors = state_row_indices
+            .iter()
+            .filter_map(|&row_index| {
+                let row = state_rows.row(row_index);
+                (!host_certified_batch_owns_live_row(
+                    row,
+                    &root.branch_id,
+                    root.commit_id,
+                    host_certified_file_schemas,
+                ))
+                .then_some(row)
+            })
+            .filter_map(|row| {
+                row.durable_predecessor.map(|value| {
+                    crate::live_state::CertifiedCurrentStatePredecessorRef {
+                        schema_key: row.schema_key.as_str(),
+                        file_id: row.file_id.map(crate::common::SharedStr::as_str),
+                        entity_pk: row.entity_pk,
+                        value,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
         let packed_schema_keys = tracked_deltas
             .iter()
             .map(|delta| delta.schema_key)
@@ -2455,6 +2478,7 @@ async fn stage_tracked_head(
             has_certified_file = certified_fresh_plugin_file_id.is_some(),
             has_certified_counts = host_certified_live_increments.contains_key(&root.branch_id),
             has_selected_batches = !staged.selected_change_batches.is_empty(),
+            durable_predecessor_count = durable_predecessors.len(),
             "packed current-base route decision"
         );
         let mut deltas = tracked_deltas.clone();
@@ -2562,23 +2586,23 @@ async fn stage_tracked_head(
                 .await?
         } else {
             let owned_absence_guards = owned_absence_guards(&absence_guards);
-            writer
-                .stage_current_state_with_working_diff(
-                    &root.branch_id,
-                    Some(parent_generation),
-                    root.commit_id,
-                    &deltas,
-                    &owned_absence_guards,
-                    None,
-                    None,
-                    working_diff_capture_checkpoint_commit_id,
-                    &mut coverage,
-                )
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.materialization.tracked_head.stage_current_state"
-                ))
-                .await?
+            Box::pin(writer.stage_current_state_with_certified_predecessors(
+                &root.branch_id,
+                Some(parent_generation),
+                root.commit_id,
+                &deltas,
+                &durable_predecessors,
+                &owned_absence_guards,
+                None,
+                None,
+                working_diff_capture_checkpoint_commit_id,
+                &mut coverage,
+            ))
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.materialization.tracked_head.stage_current_state"
+            ))
+            .await?
         };
         if let Some(epoch) = working_diff_epoch {
             let next_epoch = TrackedWorkingDiffEpoch {

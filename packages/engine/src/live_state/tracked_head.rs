@@ -38,7 +38,7 @@ use crate::json_store::{
 };
 use crate::live_state::{
     MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
-    MaterializedLiveStateRow,
+    MaterializedLiveStateRow, MaterializedLiveStateRowRef,
 };
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
@@ -311,6 +311,35 @@ pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
     pub(crate) snapshot: JsonSlotRef<'a>,
     pub(crate) metadata: JsonSlotRef<'a>,
+}
+
+/// Durable exact-read evidence aligned with a transaction delta.
+///
+/// The branch-control CAS protects this predecessor through publication. A
+/// writer may therefore reuse its encoded HOT value instead of issuing the
+/// same primary and packed-base reads again during commit materialization.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CertifiedCurrentStatePredecessorRef<'a> {
+    pub(crate) schema_key: &'a str,
+    pub(crate) file_id: Option<&'a str>,
+    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) value: &'a CertifiedCurrentStatePredecessor,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum CertifiedCurrentStatePredecessor {
+    Encoded(Bytes),
+    Packed(PackedHeadValue),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PackedHeadValue {
+    change_id: ChangeId,
+    commit_id: CommitId,
+    deleted: bool,
+    created_at: LixTimestamp,
+    updated_at: LixTimestamp,
+    checkpoint_commit_id: Option<CommitId>,
 }
 
 impl<'a> CurrentStateDeltaRef<'a> {
@@ -1298,6 +1327,33 @@ struct HeadValueView<'a> {
     working_diff_baseline: WorkingDiffBaseline,
 }
 
+impl CertifiedCurrentStatePredecessor {
+    fn view(&self) -> Result<HeadValueView<'_>, LixError> {
+        match self {
+            Self::Encoded(bytes) => decode_head_value(bytes),
+            Self::Packed(value) => Ok(HeadValueView {
+                change_id: Some(value.change_id),
+                commit_id: Some(value.commit_id),
+                untracked: false,
+                deleted: value.deleted,
+                created_at: value.created_at,
+                updated_at: value.updated_at,
+                // Packed current bases are immutable post-checkpoint inserts.
+                // Their active-epoch before image is therefore absent; no
+                // payload fingerprint is needed to preserve that baseline.
+                snapshot: HeadSlotView::None,
+                metadata: HeadSlotView::None,
+                working_diff_baseline: value.checkpoint_commit_id.map_or(
+                    WorkingDiffBaseline::Disabled,
+                    |checkpoint_commit_id| WorkingDiffBaseline::BeforeAbsent {
+                        checkpoint_commit_id,
+                    },
+                ),
+            }),
+        }
+    }
+}
+
 impl HeadValueView<'_> {
     fn working_diff_version(self) -> Option<WorkingDiffVersion> {
         Some(WorkingDiffVersion {
@@ -1968,6 +2024,7 @@ where
             value.untracked,
             branch_id,
         );
+        rows.set_durable_predecessor(row_index, CertifiedCurrentStatePredecessor::Encoded(bytes));
     }
     if json_refs.is_empty() {
         return Ok(rows.finish());
