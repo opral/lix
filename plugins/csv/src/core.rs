@@ -2800,9 +2800,25 @@ impl Document {
 #[allow(dead_code)]
 pub struct ColdInitialImport {
     bytes: Vec<u8>,
-    rows: Vec<RowDraft>,
+    rows: Vec<ColdRowDraft>,
+    fields: Vec<FieldRange>,
     dialect: Dialect,
     next_row: usize,
+    next_order_rank: u64,
+    order_remainder: u64,
+    order_step: u64,
+    order_remainder_step: u64,
+    order_denominator: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ColdRowDraft {
+    start: u32,
+    byte_len: u32,
+    ending: Option<Terminator>,
+    first_field: u32,
+    field_count: u16,
+    has_quoted_fields: bool,
 }
 
 #[allow(dead_code)]
@@ -2813,14 +2829,21 @@ impl ColdInitialImport {
         }
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(path);
-        let mut rows = scan_rows(&bytes, 0, bytes.len(), dialect)?;
-        dialect.terminator = preferred_terminator(&rows);
-        assign_initial_rows(&mut rows);
+        let (rows, fields) = scan_cold_rows(&bytes, dialect)?;
+        dialect.terminator = preferred_cold_terminator(&rows);
+        let order_denominator =
+            u64::try_from(rows.len() + 1).map_err(|_| "CSV has too many rows".to_owned())?;
         Ok(Self {
             bytes,
             rows,
+            fields,
             dialect,
             next_row: 0,
+            next_order_rank: 0,
+            order_remainder: 0,
+            order_step: u64::MAX / order_denominator,
+            order_remainder_step: u64::MAX % order_denominator,
+            order_denominator,
         })
     }
 
@@ -2881,15 +2904,21 @@ impl ColdInitialImport {
             encoded_row.clear();
             force_quote.clear();
             encoded_row.extend_from_slice(
-                &row.id_slot
-                    .expect("cold import rows have assigned identities")
+                &u32::try_from(self.next_row)
+                    .expect("validated CSV row count")
                     .to_le_bytes(),
             );
-            encoded_row.extend_from_slice(
-                &row.order_rank
-                    .expect("cold import rows have assigned order")
-                    .to_le_bytes(),
-            );
+            let mut next_order_rank = self
+                .next_order_rank
+                .checked_add(self.order_step)
+                .expect("CSV order rank stays below u64::MAX");
+            let mut order_remainder = self.order_remainder + self.order_remainder_step;
+            if order_remainder >= self.order_denominator {
+                next_order_rank += 1;
+                order_remainder -= self.order_denominator;
+            }
+            let order_rank = next_order_rank | 1;
+            encoded_row.extend_from_slice(&order_rank.to_le_bytes());
             let exceptional_ending =
                 (row.ending != Some(self.dialect.terminator)).then_some(row.ending);
             encoded_row.push(match exceptional_ending {
@@ -2902,12 +2931,16 @@ impl ColdInitialImport {
             let row_start = row.start as usize;
             let row_end = row_start + row.byte_len as usize;
             let row_bytes = &self.bytes[row_start..row_end];
-            for (index, field) in row.fields.iter().copied().enumerate() {
-                if field_has_unnecessary_quotes(row_bytes, 0, field, self.dialect)? {
-                    if force_quote.len() <= index / 8 {
-                        force_quote.resize(index / 8 + 1, 0);
+            let first_field = usize::try_from(row.first_field).expect("u32 fits usize");
+            let fields = &self.fields[first_field..first_field + usize::from(row.field_count)];
+            if row.has_quoted_fields {
+                for (index, field) in fields.iter().copied().enumerate() {
+                    if field_has_unnecessary_quotes(row_bytes, 0, field, self.dialect)? {
+                        if force_quote.len() <= index / 8 {
+                            force_quote.resize(index / 8 + 1, 0);
+                        }
+                        force_quote[index / 8] |= 1 << (index % 8);
                     }
-                    force_quote[index / 8] |= 1 << (index % 8);
                 }
             }
             encoded_row.extend_from_slice(
@@ -2916,10 +2949,8 @@ impl ColdInitialImport {
                     .to_le_bytes(),
             );
             encoded_row.extend_from_slice(&force_quote);
-            let field_count = u16::try_from(row.fields.len())
-                .map_err(|_| "CSV row has too many fields".to_owned())?;
-            encoded_row.extend_from_slice(&field_count.to_le_bytes());
-            for field in row.fields.iter().copied() {
+            encoded_row.extend_from_slice(&row.field_count.to_le_bytes());
+            for field in fields.iter().copied() {
                 let length_offset = encoded_row.len();
                 encoded_row.extend_from_slice(&0u32.to_le_bytes());
                 let value_start = encoded_row.len();
@@ -2936,6 +2967,8 @@ impl ColdInitialImport {
                 break;
             }
             payload.extend_from_slice(&encoded_row);
+            self.next_order_rank = next_order_rank;
+            self.order_remainder = order_remainder;
             row_count = row_count
                 .checked_add(1)
                 .ok_or_else(|| "typed CSV row count overflowed".to_owned())?;
@@ -3237,6 +3270,177 @@ fn preferred_terminator_for_document(rows: &[RowDraft], fallback: Terminator) ->
     }
 }
 
+fn preferred_cold_terminator(rows: &[ColdRowDraft]) -> Terminator {
+    let mut counts = [0usize; 3];
+    for row in rows {
+        match row.ending {
+            Some(Terminator::Lf) => counts[0] += 1,
+            Some(Terminator::CrLf) => counts[1] += 1,
+            Some(Terminator::Cr) => counts[2] += 1,
+            None => {}
+        }
+    }
+    match counts.iter().enumerate().max_by_key(|(_, count)| *count) {
+        Some((0, count)) if *count > 0 => Terminator::Lf,
+        Some((1, count)) if *count > 0 => Terminator::CrLf,
+        Some((2, count)) if *count > 0 => Terminator::Cr,
+        _ => Terminator::Lf,
+    }
+}
+
+fn scan_cold_rows(
+    bytes: &[u8],
+    dialect: Dialect,
+) -> Result<(Vec<ColdRowDraft>, Vec<FieldRange>), String> {
+    if bytes.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut rows = Vec::new();
+    let mut fields = Vec::new();
+    let mut row_start = 0usize;
+    let mut field_start = 0usize;
+    let mut row_first_field = 0usize;
+    let mut row_has_quoted_fields = false;
+    let mut quoted = false;
+    let mut field_was_quoted = false;
+    let mut just_closed_quote = false;
+    let mut cursor = 0usize;
+
+    let push_row = |rows: &mut Vec<ColdRowDraft>,
+                    fields: &Vec<FieldRange>,
+                    row_start: usize,
+                    row_end: usize,
+                    ending: Option<Terminator>,
+                    row_first_field: usize,
+                    has_quoted_fields: bool|
+     -> Result<(), String> {
+        let field_count = fields
+            .len()
+            .checked_sub(row_first_field)
+            .ok_or_else(|| "CSV field index underflow".to_owned())?;
+        rows.push(ColdRowDraft {
+            start: u32::try_from(row_start).map_err(|_| "CSV offset exceeds 4GiB".to_owned())?,
+            byte_len: u32::try_from(row_end - row_start)
+                .map_err(|_| "CSV row exceeds 4GiB".to_owned())?,
+            ending,
+            first_field: u32::try_from(row_first_field)
+                .map_err(|_| "CSV has too many fields".to_owned())?,
+            field_count: u16::try_from(field_count)
+                .map_err(|_| "CSV row has too many fields".to_owned())?,
+            has_quoted_fields,
+        });
+        Ok(())
+    };
+
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if quoted {
+            if Some(byte) == dialect.quote {
+                if cursor + 1 < bytes.len() && bytes[cursor + 1] == byte {
+                    cursor += 2;
+                    continue;
+                }
+                quoted = false;
+                just_closed_quote = true;
+            }
+            cursor += 1;
+            continue;
+        }
+        if just_closed_quote {
+            let is_terminator = byte == b'\r' || byte == b'\n';
+            if byte != dialect.delimiter && !is_terminator {
+                return Err(format!(
+                    "unexpected byte after closing quote at offset {cursor}"
+                ));
+            }
+        }
+        if Some(byte) == dialect.quote && cursor == field_start {
+            quoted = true;
+            field_was_quoted = true;
+            row_has_quoted_fields = true;
+            just_closed_quote = false;
+            cursor += 1;
+            continue;
+        }
+        if byte == dialect.delimiter {
+            fields.push(FieldRange::new(
+                field_start - row_start,
+                cursor - field_start,
+                field_was_quoted,
+            )?);
+            field_start = cursor + 1;
+            field_was_quoted = false;
+            just_closed_quote = false;
+            cursor += 1;
+            continue;
+        }
+        let ending = if byte == b'\r' {
+            Some((
+                if cursor + 1 < bytes.len() && bytes[cursor + 1] == b'\n' {
+                    Terminator::CrLf
+                } else {
+                    Terminator::Cr
+                },
+                if cursor + 1 < bytes.len() && bytes[cursor + 1] == b'\n' {
+                    2
+                } else {
+                    1
+                },
+            ))
+        } else if byte == b'\n' {
+            Some((Terminator::Lf, 1))
+        } else {
+            None
+        };
+        if let Some((terminator, ending_len)) = ending {
+            fields.push(FieldRange::new(
+                field_start - row_start,
+                cursor - field_start,
+                field_was_quoted,
+            )?);
+            push_row(
+                &mut rows,
+                &fields,
+                row_start,
+                cursor + ending_len,
+                Some(terminator),
+                row_first_field,
+                row_has_quoted_fields,
+            )?;
+            cursor += ending_len;
+            row_start = cursor;
+            field_start = cursor;
+            row_first_field = fields.len();
+            row_has_quoted_fields = false;
+            field_was_quoted = false;
+            just_closed_quote = false;
+            continue;
+        }
+        just_closed_quote = false;
+        cursor += 1;
+    }
+    if quoted {
+        return Err(format!("unterminated quoted field at offset {field_start}"));
+    }
+    if row_start < bytes.len() {
+        fields.push(FieldRange::new(
+            field_start - row_start,
+            bytes.len() - field_start,
+            field_was_quoted,
+        )?);
+        push_row(
+            &mut rows,
+            &fields,
+            row_start,
+            bytes.len(),
+            None,
+            row_first_field,
+            row_has_quoted_fields,
+        )?;
+    }
+    Ok((rows, fields))
+}
+
 fn scan_rows(
     bytes: &[u8],
     start: usize,
@@ -3361,6 +3565,47 @@ fn scan_rows(
         });
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod cold_scan_tests {
+    use super::{ColdInitialImport, Dialect, scan_cold_rows, scan_rows};
+
+    #[test]
+    fn flat_cold_scan_matches_general_row_and_field_layout() {
+        let bytes = b"a,b\r\n\"quoted,field\",\"escaped\"\"quote\"\nlast,row\r";
+        let dialect = Dialect::for_path(Some("/fixture.csv"));
+        let general = scan_rows(bytes, 0, bytes.len(), dialect).expect("general scan");
+        let (cold, cold_fields) = scan_cold_rows(bytes, dialect).expect("cold scan");
+
+        assert_eq!(cold.len(), general.len());
+        for (cold_row, general_row) in cold.iter().zip(&general) {
+            assert_eq!(cold_row.start, general_row.start);
+            assert_eq!(cold_row.byte_len, general_row.byte_len);
+            assert_eq!(cold_row.ending, general_row.ending);
+            let start = cold_row.first_field as usize;
+            let fields = &cold_fields[start..start + usize::from(cold_row.field_count)];
+            assert_eq!(fields.len(), general_row.fields.len());
+            for (cold_field, general_field) in fields.iter().zip(&general_row.fields) {
+                assert_eq!(cold_field.start, general_field.start);
+                assert_eq!(cold_field.length_and_flags, general_field.length_and_flags);
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_order_ranks_encode_a_large_import_without_overflow() {
+        let mut bytes = Vec::new();
+        for _ in 0..220_001 {
+            bytes.extend_from_slice(b"a,b\n");
+        }
+        let mut import = ColdInitialImport::open(bytes, Some("/fixture.csv")).expect("cold import");
+        let mut rows = 0u32;
+        while let Some((_, count)) = import.next_typed_batch(256 * 1024).expect("typed page") {
+            rows += count;
+        }
+        assert_eq!(rows, 220_001);
+    }
 }
 
 fn validate_splices(file_len: usize, splices: &[InputSplice<'_>]) -> Result<(), String> {
