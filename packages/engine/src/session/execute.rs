@@ -5084,7 +5084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_certifies_complete_path_value_replacements() {
+    async fn execute_batch_certifies_out_of_order_complete_path_value_replacements() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "x-lix-key": "certified_replacement_probe",
@@ -5124,15 +5124,15 @@ mod tests {
                 ExecuteBatchStatement {
                     sql: sql.to_string(),
                     params: vec![
-                        Value::Text("null".to_string()),
-                        Value::Text("/a".to_string()),
+                        Value::Text(r#"{"nested":[1,true,"x"]}"#.to_string()),
+                        Value::Text("/b".to_string()),
                     ],
                 },
                 ExecuteBatchStatement {
                     sql: sql.to_string(),
                     params: vec![
-                        Value::Text(r#"{"nested":[1,true,"x"]}"#.to_string()),
-                        Value::Text("/b".to_string()),
+                        Value::Text("null".to_string()),
+                        Value::Text("/a".to_string()),
                     ],
                 },
             ])

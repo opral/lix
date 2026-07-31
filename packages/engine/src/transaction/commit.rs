@@ -2419,7 +2419,7 @@ async fn stage_tracked_head(
                     }),
             );
         }
-        let durable_predecessors = state_row_indices
+        let mut durable_predecessors = state_row_indices
             .iter()
             .filter_map(|&row_index| {
                 let row = state_rows.row(row_index);
@@ -2442,6 +2442,12 @@ async fn stage_tracked_head(
                 })
             })
             .collect::<Vec<_>>();
+        durable_predecessors.sort_unstable_by(|left, right| {
+            left.schema_key
+                .cmp(right.schema_key)
+                .then_with(|| left.entity_pk.cmp(right.entity_pk))
+                .then_with(|| left.file_id.cmp(&right.file_id))
+        });
         let packed_schema_keys = tracked_deltas
             .iter()
             .map(|delta| delta.schema_key)
