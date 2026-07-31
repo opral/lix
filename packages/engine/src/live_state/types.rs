@@ -166,6 +166,48 @@ impl MaterializedLiveStateBatch {
             .collect()
     }
 
+    /// Consumes the batch into snapshot buffers ordered by logical identity.
+    ///
+    /// Native public reads need only the snapshot payload after visibility has
+    /// been resolved. Move each [`SharedStr`] backing buffer into the result
+    /// instead of copying its JSON bytes into a second allocation. HOT scans
+    /// are already identity ordered in the common case; the permutation below
+    /// preserves the previous defensive ordering for mixed serving layouts.
+    pub(crate) fn into_identity_ordered_snapshots(mut self) -> Vec<Option<Bytes>> {
+        let mut ordinals = (0..self.len()).collect::<Vec<_>>();
+        if !ordinals.is_sorted_by(|left, right| {
+            let left = self.row(*left);
+            let right = self.row(*right);
+            left.entity_pk() < right.entity_pk()
+                || (left.entity_pk() == right.entity_pk() && left.file_id() <= right.file_id())
+        }) {
+            ordinals.sort_unstable_by(|left, right| {
+                let left = self.row(*left);
+                let right = self.row(*right);
+                left.entity_pk()
+                    .cmp(right.entity_pk())
+                    .then_with(|| left.file_id().cmp(&right.file_id()))
+            });
+        }
+
+        if ordinals.iter().copied().eq(0..self.len()) {
+            return self
+                .snapshot_content
+                .into_iter()
+                .map(|snapshot| snapshot.map(SharedStr::into_bytes))
+                .collect();
+        }
+
+        ordinals
+            .into_iter()
+            .map(|ordinal| {
+                self.snapshot_content[ordinal]
+                    .take()
+                    .map(SharedStr::into_bytes)
+            })
+            .collect()
+    }
+
     fn terminal_branch_owners(&self) -> Vec<Option<Arc<str>>> {
         let mut owners = vec![None; self.strings.ranges.len()];
         for branch_id in &self.branch_ids {
@@ -1263,6 +1305,36 @@ mod batch_tests {
             batch.large_column_allocation_count(32 * 1024) <= 13,
             "a 10k batch has a constant number of large column buffers"
         );
+    }
+
+    #[test]
+    fn identity_ordered_snapshots_transfer_shared_payload_buffers() {
+        let payload = Bytes::from_static(br#"{"path":"a"}"#);
+        let payload_ptr = payload.as_ptr();
+        let mut source = row(EntityPk::single("a"));
+        source.snapshot_content = Some(
+            SharedStr::from_utf8(payload).expect("snapshot fixture should contain valid UTF-8"),
+        );
+        let snapshots =
+            MaterializedLiveStateBatch::from_rows(vec![source]).into_identity_ordered_snapshots();
+
+        let snapshot = snapshots[0].as_ref().expect("snapshot should be present");
+        assert_eq!(snapshot.as_ptr(), payload_ptr);
+        assert_eq!(snapshot.as_ref(), br#"{"path":"a"}"#);
+    }
+
+    #[test]
+    fn unordered_snapshots_restore_logical_identity_order() {
+        let mut second = row(EntityPk::single("b"));
+        second.snapshot_content = Some(SharedStr::from_static(r#"{"path":"b"}"#));
+        let mut first = row(EntityPk::single("a"));
+        first.snapshot_content = Some(SharedStr::from_static(r#"{"path":"a"}"#));
+
+        let snapshots = MaterializedLiveStateBatch::from_rows(vec![second, first])
+            .into_identity_ordered_snapshots();
+
+        assert_eq!(snapshots[0].as_deref(), Some(br#"{"path":"a"}"#.as_slice()));
+        assert_eq!(snapshots[1].as_deref(), Some(br#"{"path":"b"}"#.as_slice()));
     }
 
     #[test]

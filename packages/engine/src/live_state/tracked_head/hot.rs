@@ -3546,29 +3546,7 @@ where
                 },
             )
             .await?;
-        let mut ordinals = (0..rows.len()).collect::<Vec<_>>();
-        if !ordinals.is_sorted_by(|left, right| {
-            let left = rows.row(*left);
-            let right = rows.row(*right);
-            left.entity_pk() < right.entity_pk()
-                || (left.entity_pk() == right.entity_pk() && left.file_id() <= right.file_id())
-        }) {
-            ordinals.sort_unstable_by(|left, right| {
-                let left = rows.row(*left);
-                let right = rows.row(*right);
-                left.entity_pk()
-                    .cmp(right.entity_pk())
-                    .then_with(|| left.file_id().cmp(&right.file_id()))
-            });
-        }
-        Ok(ordinals
-            .into_iter()
-            .map(|ordinal| {
-                let row = rows.row(ordinal);
-                row.snapshot_content()
-                    .map(|snapshot| Bytes::copy_from_slice(snapshot.as_bytes()))
-            })
-            .collect())
+        Ok(rows.into_identity_ordered_snapshots())
     }
 }
 
