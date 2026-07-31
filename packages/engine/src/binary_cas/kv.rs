@@ -1265,6 +1265,29 @@ pub(in crate::binary_cas) async fn stage_blob_write_skipping_existing_chunks<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
+    if let Some(hash) = precomputed_hash
+        && let Some(metadata) = load_metadata_many(store, &[hash])
+            .await?
+            .into_vec()
+            .into_iter()
+            .next()
+            .flatten()
+    {
+        let size_bytes = u64::try_from(bytes.len())
+            .map_err(|_| LixError::new(LixError::CODE_UNKNOWN, "binary CAS payload exceeds u64"))?;
+        if metadata.size_bytes != size_bytes {
+            return Err(LixError::new(
+                LixError::CODE_UNKNOWN,
+                "precomputed binary CAS hash names an existing blob with a different size",
+            ));
+        }
+        blob_hashes.insert(hash.into_bytes());
+        return Ok(BlobWriteReceipt {
+            hash,
+            size_bytes,
+            layout: metadata.layout,
+        });
+    }
     let plan = prepare_blob_write(chunking, bytes, precomputed_hash)?;
     let receipt = plan.receipt.clone();
     if !blob_hashes.insert(plan.blob_hash.into_bytes()) {
@@ -2375,6 +2398,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prehashed_existing_blob_reuses_manifest_without_staging_chunks() {
+        let storage = StorageAdapter::new(Memory::new());
+        let bytes = definitely_multi_chunk_blob_bytes();
+        let payload = BlobPayload::from_bytes(bytes.clone());
+        let expected_hash = BlobHash::from_content(&bytes);
+
+        let mut initial = storage.new_write_set();
+        let initial_receipt = stage_test_payload(&storage, &mut initial, &payload).await;
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("initial blob write should commit");
+
+        let mut repeated = storage.new_write_set();
+        let repeated_receipt = stage_test_payload(&storage, &mut repeated, &payload).await;
+
+        assert_eq!(initial_receipt, repeated_receipt);
+        assert_eq!(repeated_receipt.hash, expected_hash);
+        assert!(
+            repeated.is_empty(),
+            "an existing prehashed blob must not restage its manifest or chunks"
+        );
+    }
+
+    #[tokio::test]
     async fn stores_manifest_chunks_in_scan_order() {
         let storage = StorageAdapter::new(Memory::new());
         let blob_hash = BlobHash::from_content(b"blob-a");
@@ -3324,8 +3372,8 @@ mod tests {
 
         assert_eq!(
             writes.stats().staged_puts,
-            1,
-            "an inline repeat write should deterministically replace one manifest"
+            0,
+            "an inline repeat write should reuse its existing manifest"
         );
         assert_eq!(
             counted.presence_get_many_calls.load(Ordering::Relaxed),
@@ -3436,7 +3484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_chunk_aware_writer_batches_persisted_chunk_checks() {
+    async fn existing_chunk_aware_writer_batches_persisted_chunk_checks_without_a_hash() {
         let storage = StorageAdapter::new(Memory::new());
         let data = definitely_multi_chunk_blob_bytes();
         let payload = BlobPayload::from_bytes(data.clone());
@@ -3463,21 +3511,23 @@ mod tests {
             .await
             .expect("read should open");
         let mut writes = storage.new_write_set();
-        let mut writer =
-            BinaryCasContext::new().writer_skipping_existing_chunks(&store, &mut writes);
-        writer
-            .stage_payload(&payload)
-            .await
-            .expect("repeat blob write should stage");
+        stage_blob_write_skipping_existing_chunks(
+            BinaryCasChunking::default(),
+            &store,
+            &mut writes,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &data,
+            None,
+        )
+        .await
+        .expect("repeat blob write should stage");
 
         assert_eq!(
             writes.stats().staged_puts,
             1 + u64::try_from(chunk_ranges.len()).expect("chunk count should fit in u64")
         );
         let metrics = crate::binary_cas::metrics::binary_cas_write_metrics_snapshot();
-        // These counters are process-global test metrics. Other tests in this
-        // binary can run concurrently, so assert this test's contribution
-        // instead of requiring exclusive ownership of the counters.
         assert!(metrics.chunk_lookup_count >= chunk_hashes.len() as u64);
         assert!(metrics.chunk_lookup_batch_count >= 1);
         assert!(metrics.chunk_lookup_hit_count >= chunk_hashes.len() as u64);
