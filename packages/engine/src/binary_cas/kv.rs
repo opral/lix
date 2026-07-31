@@ -3,14 +3,15 @@
 use crate::LixError;
 use crate::binary_cas::chunking::{MAX_BINARY_CAS_CHUNK_BYTES, fastcdc_chunk_ranges_with_chunking};
 use crate::binary_cas::codec::{
-    BinaryCasManifest, BinaryChunkCodec, decode_binary_cas_chunk, decode_binary_cas_manifest,
+    BinaryCasManifest, BinaryChunkCodec, StorageBinaryCasDeltaBaseLayout,
+    StorageBinaryCasDeltaSegment, decode_binary_cas_chunk, decode_binary_cas_manifest,
     decode_binary_cas_manifest_chunk, encode_binary_cas_chunk, encode_binary_cas_manifest,
     encode_binary_cas_manifest_chunk,
 };
 use crate::binary_cas::compression::{decode_zstd_chunk, encode_chunk_payload};
 use crate::binary_cas::{
-    BinaryCasChunking, BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
-    BlobSameLengthSplice, BlobWriteReceipt,
+    BinaryCasChunking, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,
+    BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobSameLengthSplice, BlobWriteReceipt,
 };
 #[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
@@ -32,6 +33,9 @@ use web_time::Instant;
 // unbounded backend pressure. Eight matches the engine's other remote scan
 // fan-out and is enough to hide storage latency without a large request burst.
 const MANIFEST_SCAN_CONCURRENCY: usize = 8;
+const MAX_DELTA_SEGMENTS: usize = 32;
+const MAX_DELTA_INSERT_BYTES: usize = 64 * 1024;
+const MAX_DELTA_INSERT_FRACTION_DIVISOR: usize = 8;
 
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
@@ -339,11 +343,72 @@ pub(crate) async fn load_bytes_many(
     hashes: &[BlobHash],
 ) -> Result<BlobBytesBatch, LixError> {
     let metadata = load_metadata_many(store, hashes).await?.into_vec();
+    let mut delta_bases = HashMap::<BlobHash, BlobMetadata>::new();
+    let mut delta_base_order = Vec::<BlobHash>::new();
+    for entry in metadata.iter().flatten() {
+        if let BlobLayout::Delta {
+            base_blob_hash,
+            base_size_bytes,
+            base_layout,
+            ..
+        } = &entry.layout
+        {
+            let layout = match base_layout {
+                BlobDeltaBaseLayout::SingleChunk { chunk_hash } => BlobLayout::SingleChunk {
+                    chunk_hash: *chunk_hash,
+                },
+                BlobDeltaBaseLayout::Chunked { chunk_count } => BlobLayout::Chunked {
+                    chunk_count: *chunk_count,
+                },
+            };
+            let base = BlobMetadata {
+                hash: *base_blob_hash,
+                size_bytes: *base_size_bytes,
+                layout,
+            };
+            match delta_bases.entry(*base_blob_hash) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    delta_base_order.push(*base_blob_hash);
+                    entry.insert(base);
+                }
+                std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &base => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "binary CAS deltas disagree about base '{}' layout",
+                            base_blob_hash.to_hex()
+                        ),
+                    ));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+    let mut seen_physical_hashes = HashSet::new();
+    let mut physical_metadata = metadata
+        .iter()
+        .flatten()
+        .filter(|entry| {
+            !matches!(entry.layout, BlobLayout::Delta { .. })
+                && seen_physical_hashes.insert(entry.hash)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    physical_metadata.extend(
+        delta_base_order
+            .into_iter()
+            .filter(|hash| seen_physical_hashes.insert(*hash))
+            .map(|hash| {
+                delta_bases
+                    .remove(&hash)
+                    .expect("ordered delta base exists")
+            }),
+    );
+
     let mut seen_manifest_hashes = HashSet::new();
-    let chunked_blobs = metadata
+    let chunked_blobs = physical_metadata
         .iter()
         .filter_map(|metadata| {
-            let metadata = metadata.as_ref()?;
             let BlobLayout::Chunked { chunk_count } = &metadata.layout else {
                 return None;
             };
@@ -396,10 +461,7 @@ pub(crate) async fn load_bytes_many(
     let mut requested_chunks = Vec::new();
     let mut seen_chunks = HashSet::new();
 
-    for metadata in &metadata {
-        let Some(metadata) = metadata else {
-            continue;
-        };
+    for metadata in &physical_metadata {
         match &metadata.layout {
             BlobLayout::Empty => {}
             BlobLayout::SingleChunk { chunk_hash } => {
@@ -427,6 +489,7 @@ pub(crate) async fn load_bytes_many(
                     }
                 }
             }
+            BlobLayout::Delta { .. } => unreachable!("delta bases are flattened"),
         }
     }
 
@@ -436,22 +499,129 @@ pub(crate) async fn load_bytes_many(
         .zip(chunk_rows)
         .collect::<HashMap<_, _>>();
 
+    let mut full_bytes_by_hash = HashMap::<BlobHash, Vec<u8>>::new();
+    for metadata in physical_metadata {
+        let hash = metadata.hash;
+        let bytes = assemble_blob_bytes(
+            metadata,
+            &chunk_rows_by_hash,
+            chunked_manifests_by_hash.get(&hash),
+        )?;
+        full_bytes_by_hash.insert(hash, bytes);
+    }
+
     let entries = metadata
         .into_iter()
         .map(|metadata| {
             metadata
-                .map(|metadata| {
-                    let hash = metadata.hash;
-                    assemble_blob_bytes(
-                        metadata,
-                        &chunk_rows_by_hash,
-                        chunked_manifests_by_hash.get(&hash),
-                    )
+                .map(|metadata| match metadata.layout {
+                    BlobLayout::Delta {
+                        base_blob_hash,
+                        segments,
+                        ..
+                    } => apply_flat_delta(
+                        metadata.hash,
+                        metadata.size_bytes,
+                        base_blob_hash,
+                        &segments,
+                        &full_bytes_by_hash,
+                    ),
+                    _ => full_bytes_by_hash
+                        .get(&metadata.hash)
+                        .cloned()
+                        .ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                format!(
+                                    "binary CAS blob '{}' was not assembled",
+                                    metadata.hash.to_hex()
+                                ),
+                            )
+                        }),
                 })
                 .transpose()
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BlobBytesBatch::new(entries))
+}
+
+fn apply_flat_delta(
+    blob_hash: BlobHash,
+    size_bytes: u64,
+    base_blob_hash: BlobHash,
+    segments: &[BlobDeltaSegment],
+    full_bytes_by_hash: &HashMap<BlobHash, Vec<u8>>,
+) -> Result<Vec<u8>, LixError> {
+    let expected_size = persisted_size_to_usize(size_bytes, "binary CAS delta")?;
+    let Some(base) = full_bytes_by_hash.get(&base_blob_hash) else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "binary CAS delta '{}' is missing base '{}'",
+                blob_hash.to_hex(),
+                base_blob_hash.to_hex()
+            ),
+        ));
+    };
+    let mut out = Vec::with_capacity(expected_size);
+    for segment in segments {
+        match segment {
+            BlobDeltaSegment::Copy { offset, length } => {
+                let start = persisted_size_to_usize(*offset, "binary CAS delta copy offset")?;
+                let length = persisted_size_to_usize(*length, "binary CAS delta copy length")?;
+                let Some(end) = start.checked_add(length) else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "binary CAS delta '{}' copy range overflowed",
+                            blob_hash.to_hex()
+                        ),
+                    ));
+                };
+                let Some(slice) = base.get(start..end) else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "binary CAS delta '{}' has invalid copy ranges",
+                            blob_hash.to_hex()
+                        ),
+                    ));
+                };
+                out.extend_from_slice(slice);
+            }
+            BlobDeltaSegment::Insert { bytes } => out.extend_from_slice(bytes),
+        }
+        if out.len() > expected_size {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "binary CAS delta '{}' exceeds its declared size",
+                    blob_hash.to_hex()
+                ),
+            ));
+        }
+    }
+    if out.len() != expected_size {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "binary CAS delta '{}' expected {} bytes, decoded {}",
+                blob_hash.to_hex(),
+                expected_size,
+                out.len()
+            ),
+        ));
+    }
+    if BlobHash::from_content(&out) != blob_hash {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "binary CAS delta '{}' failed content-address verification",
+                blob_hash.to_hex()
+            ),
+        ));
+    }
+    Ok(out)
 }
 
 async fn load_chunk_rows(
@@ -600,6 +770,9 @@ fn assemble_blob_bytes(
                 ));
             }
             out
+        }
+        BlobLayout::Delta { .. } => {
+            unreachable!("flat deltas are applied after their full bases are assembled")
         }
     };
     Ok(bytes)
@@ -885,6 +1058,228 @@ where
     Ok(true)
 }
 
+/// Stores a bounded, one-level edit delta against a canonical full blob.
+///
+/// A delta never references another delta: repeated edits compose into the
+/// prior copy/insert program while retaining its full ancestor. This borrows
+/// Git packfiles' delta-reuse idea without introducing read chains. Once the
+/// segment or inserted-byte budget is exhausted, the caller falls back to a
+/// normal full CAS write, which becomes the next delta base.
+pub(in crate::binary_cas) async fn try_stage_blob_write_as_flat_delta<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    blob_hashes: &mut HashSet<[u8; 32]>,
+    bytes: &[u8],
+    precomputed_hash: Option<BlobHash>,
+    splice: BlobEditSplice,
+) -> Result<bool, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let Some(blob_hash) = precomputed_hash else {
+        return Ok(false);
+    };
+    let Some(delete_end) = splice.offset.checked_add(splice.delete_len) else {
+        return Ok(false);
+    };
+    let Some(insert_end) = splice.offset.checked_add(splice.insert_len) else {
+        return Ok(false);
+    };
+    if (splice.delete_len == 0 && splice.insert_len == 0)
+        || insert_end > bytes.len()
+        || bytes.len() < 512
+    {
+        return Ok(false);
+    }
+    if blob_hashes.contains(&blob_hash.into_bytes()) {
+        return Ok(true);
+    }
+
+    let Some(base_metadata) = load_metadata_many(store, &[splice.base_blob_hash])
+        .await?
+        .into_vec()
+        .into_iter()
+        .next()
+        .flatten()
+    else {
+        return Ok(false);
+    };
+    let Ok(current_size) = usize::try_from(base_metadata.size_bytes) else {
+        return Ok(false);
+    };
+    if delete_end > current_size
+        || current_size
+            .checked_sub(splice.delete_len)
+            .and_then(|size| size.checked_add(splice.insert_len))
+            != Some(bytes.len())
+    {
+        return Ok(false);
+    }
+
+    let (full_base_hash, full_base_size, full_base_layout, segments) = match base_metadata.layout {
+        BlobLayout::Empty => return Ok(false),
+        BlobLayout::SingleChunk { chunk_hash } => (
+            splice.base_blob_hash,
+            base_metadata.size_bytes,
+            BlobDeltaBaseLayout::SingleChunk { chunk_hash },
+            vec![BlobDeltaSegment::Copy {
+                offset: 0,
+                length: base_metadata.size_bytes,
+            }],
+        ),
+        BlobLayout::Chunked { chunk_count } => (
+            splice.base_blob_hash,
+            base_metadata.size_bytes,
+            BlobDeltaBaseLayout::Chunked { chunk_count },
+            vec![BlobDeltaSegment::Copy {
+                offset: 0,
+                length: base_metadata.size_bytes,
+            }],
+        ),
+        BlobLayout::Delta {
+            base_blob_hash,
+            base_size_bytes,
+            base_layout,
+            segments,
+        } => (base_blob_hash, base_size_bytes, base_layout, segments),
+    };
+    let Some(mut next_segments) = slice_delta_segments(&segments, 0, splice.offset) else {
+        return Ok(false);
+    };
+    if splice.insert_len != 0 {
+        next_segments.push(BlobDeltaSegment::Insert {
+            bytes: bytes[splice.offset..insert_end].to_vec(),
+        });
+    }
+    let Some(suffix) = slice_delta_segments(&segments, delete_end, current_size) else {
+        return Ok(false);
+    };
+    next_segments.extend(suffix);
+    let next_segments = normalize_delta_segments(next_segments);
+    let insert_bytes = next_segments.iter().try_fold(0usize, |total, segment| {
+        total.checked_add(match segment {
+            BlobDeltaSegment::Copy { .. } => 0,
+            BlobDeltaSegment::Insert { bytes } => bytes.len(),
+        })
+    });
+    let Some(insert_bytes) = insert_bytes else {
+        return Ok(false);
+    };
+    let relative_budget = bytes.len().div_ceil(MAX_DELTA_INSERT_FRACTION_DIVISOR);
+    if next_segments.len() > MAX_DELTA_SEGMENTS
+        || insert_bytes > MAX_DELTA_INSERT_BYTES.min(relative_budget)
+    {
+        return Ok(false);
+    }
+
+    let segments = next_segments
+        .into_iter()
+        .map(|segment| match segment {
+            BlobDeltaSegment::Copy { offset, length } => {
+                StorageBinaryCasDeltaSegment::Copy { offset, length }
+            }
+            BlobDeltaSegment::Insert { bytes } => StorageBinaryCasDeltaSegment::Insert { bytes },
+        })
+        .collect::<Vec<_>>();
+    if !blob_hashes.insert(blob_hash.into_bytes()) {
+        return Ok(true);
+    }
+    stage_manifest(
+        writes,
+        blob_hash,
+        &BinaryCasManifest::Delta {
+            size_bytes: bytes.len() as u64,
+            base_blob_hash: full_base_hash.into_bytes(),
+            base_size_bytes: full_base_size,
+            base_layout: match full_base_layout {
+                BlobDeltaBaseLayout::SingleChunk { chunk_hash } => {
+                    StorageBinaryCasDeltaBaseLayout::SingleChunk {
+                        chunk_hash: chunk_hash.into_bytes(),
+                    }
+                }
+                BlobDeltaBaseLayout::Chunked { chunk_count } => {
+                    StorageBinaryCasDeltaBaseLayout::Chunked { chunk_count }
+                }
+            },
+            segments,
+        },
+    );
+    Ok(true)
+}
+
+fn delta_segment_len(segment: &BlobDeltaSegment) -> Option<usize> {
+    match segment {
+        BlobDeltaSegment::Copy { length, .. } => usize::try_from(*length).ok(),
+        BlobDeltaSegment::Insert { bytes } => Some(bytes.len()),
+    }
+}
+
+fn slice_delta_segments(
+    segments: &[BlobDeltaSegment],
+    start: usize,
+    end: usize,
+) -> Option<Vec<BlobDeltaSegment>> {
+    if start > end {
+        return None;
+    }
+    let mut logical = 0usize;
+    let mut out = Vec::new();
+    for segment in segments {
+        let length = delta_segment_len(segment)?;
+        let segment_end = logical.checked_add(length)?;
+        let take_start = start.max(logical);
+        let take_end = end.min(segment_end);
+        if take_start < take_end {
+            let local_start = take_start - logical;
+            let local_end = take_end - logical;
+            out.push(match segment {
+                BlobDeltaSegment::Copy { offset, .. } => BlobDeltaSegment::Copy {
+                    offset: offset.checked_add(local_start as u64)?,
+                    length: (local_end - local_start) as u64,
+                },
+                BlobDeltaSegment::Insert { bytes } => BlobDeltaSegment::Insert {
+                    bytes: bytes[local_start..local_end].to_vec(),
+                },
+            });
+        }
+        logical = segment_end;
+        if logical >= end {
+            break;
+        }
+    }
+    (logical >= end).then_some(out)
+}
+
+fn normalize_delta_segments(segments: Vec<BlobDeltaSegment>) -> Vec<BlobDeltaSegment> {
+    let mut out = Vec::<BlobDeltaSegment>::with_capacity(segments.len());
+    for segment in segments {
+        if delta_segment_len(&segment) == Some(0) {
+            continue;
+        }
+        match (out.last_mut(), segment) {
+            (
+                Some(BlobDeltaSegment::Copy { offset, length }),
+                BlobDeltaSegment::Copy {
+                    offset: next_offset,
+                    length: next_length,
+                },
+            ) if offset.checked_add(*length) == Some(next_offset)
+                && length.checked_add(next_length).is_some() =>
+            {
+                *length = length
+                    .checked_add(next_length)
+                    .expect("delta copy length was checked")
+            }
+            (
+                Some(BlobDeltaSegment::Insert { bytes }),
+                BlobDeltaSegment::Insert { bytes: next },
+            ) => bytes.extend_from_slice(&next),
+            (_, segment) => out.push(segment),
+        }
+    }
+    out
+}
+
 fn prepare_blob_write(
     chunking: BinaryCasChunking,
     bytes: &[u8],
@@ -986,6 +1381,9 @@ fn stage_prepared_blob_write(
                 stage_content_chunk(writes, chunk_hash, bytes)?;
             }
         }
+        BlobLayout::Delta { .. } => {
+            unreachable!("ordinary blob plans never construct delta layouts")
+        }
         BlobLayout::Chunked { chunk_count } => {
             stage_manifest(
                 writes,
@@ -1034,6 +1432,9 @@ async fn missing_chunk_hashes(
             for chunk in chunks {
                 collect_chunk_lookup_candidate(chunk.hash, transaction_chunk_keys, &mut candidates);
             }
+        }
+        BlobLayout::Delta { .. } => {
+            unreachable!("ordinary blob plans never construct delta layouts")
         }
     }
 
@@ -1140,12 +1541,122 @@ fn metadata_from_manifest(
             chunk_hash: BlobHash::from_bytes(chunk_hash),
         },
         BinaryCasManifest::Chunked { chunk_count, .. } => BlobLayout::Chunked { chunk_count },
+        BinaryCasManifest::Delta {
+            base_blob_hash,
+            base_size_bytes,
+            base_layout,
+            segments,
+            ..
+        } => {
+            validate_storage_delta_manifest(hash, size_bytes, base_size_bytes, &segments)?;
+            BlobLayout::Delta {
+                base_blob_hash: BlobHash::from_bytes(base_blob_hash),
+                base_size_bytes,
+                base_layout: match base_layout {
+                    StorageBinaryCasDeltaBaseLayout::SingleChunk { chunk_hash } => {
+                        BlobDeltaBaseLayout::SingleChunk {
+                            chunk_hash: BlobHash::from_bytes(chunk_hash),
+                        }
+                    }
+                    StorageBinaryCasDeltaBaseLayout::Chunked { chunk_count } => {
+                        BlobDeltaBaseLayout::Chunked { chunk_count }
+                    }
+                },
+                segments: segments
+                    .into_iter()
+                    .map(|segment| match segment {
+                        StorageBinaryCasDeltaSegment::Copy { offset, length } => {
+                            BlobDeltaSegment::Copy { offset, length }
+                        }
+                        StorageBinaryCasDeltaSegment::Insert { bytes } => {
+                            BlobDeltaSegment::Insert { bytes }
+                        }
+                    })
+                    .collect(),
+            }
+        }
     };
     Ok(BlobMetadata {
         hash,
         size_bytes,
         layout,
     })
+}
+
+fn validate_storage_delta_manifest(
+    hash: BlobHash,
+    size_bytes: u64,
+    base_size_bytes: u64,
+    segments: &[StorageBinaryCasDeltaSegment],
+) -> Result<(), LixError> {
+    if base_size_bytes == 0 || segments.is_empty() || segments.len() > MAX_DELTA_SEGMENTS {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "binary CAS delta '{}' has invalid segment metadata",
+                hash.to_hex()
+            ),
+        ));
+    }
+    let mut output_size = 0u64;
+    let mut inserted_bytes = 0u64;
+    for segment in segments {
+        let length = match segment {
+            StorageBinaryCasDeltaSegment::Copy { offset, length } => {
+                if *length == 0
+                    || offset
+                        .checked_add(*length)
+                        .is_none_or(|end| end > base_size_bytes)
+                {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "binary CAS delta '{}' has invalid copy ranges",
+                            hash.to_hex()
+                        ),
+                    ));
+                }
+                *length
+            }
+            StorageBinaryCasDeltaSegment::Insert { bytes } => {
+                if bytes.is_empty() {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("binary CAS delta '{}' has an empty insert", hash.to_hex()),
+                    ));
+                }
+                let length = u64::try_from(bytes.len()).map_err(|_| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "binary CAS delta insert is too large")
+                })?;
+                inserted_bytes = inserted_bytes.checked_add(length).ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "binary CAS delta insert size overflowed",
+                    )
+                })?;
+                length
+            }
+        };
+        output_size = output_size.checked_add(length).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "binary CAS delta output size overflowed",
+            )
+        })?;
+    }
+    let relative_budget = size_bytes.div_ceil(MAX_DELTA_INSERT_FRACTION_DIVISOR as u64);
+    if output_size != size_bytes
+        || inserted_bytes > (MAX_DELTA_INSERT_BYTES as u64).min(relative_budget)
+    {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "binary CAS delta '{}' exceeds its format budget",
+                hash.to_hex()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn manifest_key(blob_hash: BlobHash) -> Vec<u8> {
@@ -1416,7 +1927,7 @@ mod tests {
             .expect("test blob read should open");
         BinaryCasContext::new()
             .writer_skipping_existing_chunks(&store, writes)
-            .stage_file_payload(payload, same_length_splice)
+            .stage_file_payload(payload, same_length_splice, None)
             .await
             .expect("test file payload should stage");
     }
@@ -1824,6 +2335,29 @@ mod tests {
     }
 
     #[test]
+    fn delta_manifest_rejects_out_of_bounds_copy_program() {
+        let hash = BlobHash::from_content(b"invalid delta result");
+        let error = metadata_from_manifest(
+            hash,
+            BinaryCasManifest::Delta {
+                size_bytes: 10,
+                base_blob_hash: BlobHash::from_content(b"base").into_bytes(),
+                base_size_bytes: 4,
+                base_layout: StorageBinaryCasDeltaBaseLayout::SingleChunk {
+                    chunk_hash: BlobHash::from_content(b"base").into_bytes(),
+                },
+                segments: vec![StorageBinaryCasDeltaSegment::Copy {
+                    offset: 0,
+                    length: 10,
+                }],
+            },
+        )
+        .expect_err("out-of-bounds delta copy must fail");
+
+        assert!(error.message.contains("invalid copy ranges"));
+    }
+
+    #[test]
     fn every_non_empty_blob_is_out_of_line() {
         for size in [1, 32 * 1024, 128 * 1024] {
             let bytes = vec![b'a'; size];
@@ -2041,6 +2575,147 @@ mod tests {
                 .expect("replacement bytes should load")
                 .into_vec(),
             vec![Some(after)],
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_delta_writer_merges_edits_against_one_full_base_and_roundtrips() {
+        let storage = StorageAdapter::new(Memory::new());
+        let before = b"a representative text line with stable compression boundaries\n".repeat(512);
+        let full_base_hash = BlobHash::from_content(&before);
+        {
+            let mut writes = storage.new_write_set();
+            stage_test_bytes(&storage, &mut writes, &before).await;
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("full delta base should commit");
+        }
+
+        let first_offset = before.len() / 3;
+        let mut first = before.clone();
+        first[first_offset] ^= 1;
+        let first_hash = BlobHash::from_content(&first);
+        {
+            let payload = BlobPayload::from_bytes(first.clone());
+            let store = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("first delta read should open");
+            let mut writes = storage.new_write_set();
+            BinaryCasContext::new()
+                .writer_skipping_existing_chunks(&store, &mut writes)
+                .stage_file_payload(
+                    &payload,
+                    Some(BlobSameLengthSplice::new(full_base_hash, first_offset, 1)),
+                    Some(BlobEditSplice {
+                        base_blob_hash: full_base_hash,
+                        offset: first_offset,
+                        delete_len: 1,
+                        insert_len: 1,
+                    }),
+                )
+                .await
+                .expect("first delta should stage");
+            assert_eq!(writes.stats().staged_puts, 1, "a delta is one manifest row");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("first delta should commit");
+        }
+
+        let second_offset = before.len() * 2 / 3;
+        let mut second = first.clone();
+        second[second_offset] ^= 1;
+        let second_hash = BlobHash::from_content(&second);
+        {
+            let payload = BlobPayload::from_bytes(second.clone());
+            let store = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("second delta read should open");
+            let mut writes = storage.new_write_set();
+            BinaryCasContext::new()
+                .writer_skipping_existing_chunks(&store, &mut writes)
+                .stage_file_payload(
+                    &payload,
+                    Some(BlobSameLengthSplice::new(first_hash, second_offset, 1)),
+                    Some(BlobEditSplice {
+                        base_blob_hash: first_hash,
+                        offset: second_offset,
+                        delete_len: 1,
+                        insert_len: 1,
+                    }),
+                )
+                .await
+                .expect("second delta should stage");
+            assert_eq!(writes.stats().staged_puts, 1);
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("second delta should commit");
+        }
+
+        let third_offset = before.len() / 2;
+        let inserted = b"inserted";
+        let mut third = second.clone();
+        third.splice(third_offset..third_offset, inserted.iter().copied());
+        let third_hash = BlobHash::from_content(&third);
+        {
+            let payload = BlobPayload::from_bytes(third.clone());
+            let store = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("length-changing delta read should open");
+            let mut writes = storage.new_write_set();
+            BinaryCasContext::new()
+                .writer_skipping_existing_chunks(&store, &mut writes)
+                .stage_file_payload(
+                    &payload,
+                    None,
+                    Some(BlobEditSplice {
+                        base_blob_hash: second_hash,
+                        offset: third_offset,
+                        delete_len: 0,
+                        insert_len: inserted.len(),
+                    }),
+                )
+                .await
+                .expect("length-changing delta should stage");
+            assert_eq!(writes.stats().staged_puts, 1);
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("length-changing delta should commit");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("delta result read should open");
+        let metadata = load_metadata_many(&store, &[second_hash])
+            .await
+            .expect("delta metadata should load")
+            .into_vec()
+            .pop()
+            .flatten()
+            .expect("delta metadata should exist");
+        let BlobLayout::Delta {
+            base_blob_hash,
+            segments,
+            ..
+        } = metadata.layout
+        else {
+            panic!("repeated edit should retain a flat delta")
+        };
+        assert_eq!(base_blob_hash, full_base_hash);
+        assert_eq!(segments.len(), 5);
+        assert_eq!(
+            load_bytes_many(&store, &[first_hash, second_hash, third_hash, third_hash])
+                .await
+                .expect("flat deltas should load")
+                .into_vec(),
+            vec![Some(first), Some(second), Some(third.clone()), Some(third),],
         );
     }
 

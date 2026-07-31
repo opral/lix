@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::LixError;
 use crate::binary_cas::BinaryCasChunking;
 use crate::binary_cas::{
-    BlobBytesBatch, BlobHash, BlobPayload, BlobSameLengthSplice, BlobWriteReceipt,
+    BlobBytesBatch, BlobEditSplice, BlobHash, BlobPayload, BlobSameLengthSplice, BlobWriteReceipt,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use std::collections::HashSet;
@@ -135,7 +135,21 @@ where
         &mut self,
         payload: &BlobPayload,
         same_length_splice: Option<BlobSameLengthSplice>,
+        edit_splice: Option<BlobEditSplice>,
     ) -> Result<(), LixError> {
+        if let Some(splice) = edit_splice
+            && crate::binary_cas::kv::try_stage_blob_write_as_flat_delta(
+                self.store,
+                self.writes,
+                &mut self.blob_hashes,
+                payload.bytes(),
+                payload.hash(),
+                splice,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         if let Some(splice) = same_length_splice
             && crate::binary_cas::kv::try_stage_blob_write_reusing_same_length_splice(
                 self.store,
