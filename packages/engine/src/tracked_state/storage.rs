@@ -2108,32 +2108,89 @@ pub(crate) async fn load_commit_delta_members_with_payloads(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
+    Ok(
+        load_commit_delta_members_with_payloads_for_schemas(store, commit_id, &[], usize::MAX)
+            .await?
+            .expect("unbounded commit-delta payload scan cannot exceed its segment limit"),
+    )
+}
+
+/// Loads tracked members and payloads for only the requested schemas.
+///
+/// Segment bounds route around unrelated schema ranges before payload-sidecar
+/// decoding. An empty schema list retains the full inventory behavior used by
+/// history, rebuild, and lifecycle callers.
+pub(crate) async fn load_commit_delta_members_with_payloads_for_schemas(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+    max_segment_count: usize,
+) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
     let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     };
-    let mut local = load_commit_delta_members_from_manifest(store, commit_id, &manifest).await?;
-    let Some(source_commit_id) = manifest.selected_source_commit_id() else {
-        return Ok(local);
+    let requested_schemas = schema_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let local_segment_count = if manifest.inline_segment().is_some() {
+        1
+    } else {
+        commit_delta_segment_count_for_schemas_up_to(
+            &manifest,
+            &requested_schemas,
+            max_segment_count,
+        )
     };
-    let source_manifest = load_commit_delta_manifest(store, source_commit_id)
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "selected-source commit delta '{}' references missing source '{}'",
-                    commit_id, source_commit_id
-                ),
+    if local_segment_count > max_segment_count {
+        return Ok(None);
+    }
+    let source = if let Some(source_commit_id) = manifest.selected_source_commit_id() {
+        let source_manifest = load_commit_delta_manifest(store, source_commit_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "selected-source commit delta '{}' references missing source '{}'",
+                        commit_id, source_commit_id
+                    ),
+                )
+            })?;
+        let source_segment_count = if source_manifest.inline_segment().is_some() {
+            1
+        } else {
+            commit_delta_segment_count_for_schemas_up_to(
+                &source_manifest,
+                &requested_schemas,
+                max_segment_count.saturating_sub(local_segment_count),
             )
-        })?;
+        };
+        if local_segment_count.saturating_add(source_segment_count) > max_segment_count {
+            return Ok(None);
+        }
+        Some((source_commit_id, source_manifest))
+    } else {
+        None
+    };
+    let mut local =
+        load_commit_delta_members_from_manifest(store, commit_id, &manifest, schema_keys).await?;
+    let Some((source_commit_id, source_manifest)) = source else {
+        return Ok(Some(local));
+    };
     if source_manifest.selected_source_commit_id().is_some() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "selected-source commit delta chains are unsupported",
         ));
     }
-    let mut members =
-        load_commit_delta_members_from_manifest(store, source_commit_id, &source_manifest).await?;
+    let mut members = load_commit_delta_members_from_manifest(
+        store,
+        source_commit_id,
+        &source_manifest,
+        schema_keys,
+    )
+    .await?;
     for member in &mut members {
         member.value.commit_id = commit_id;
         member.authored = false;
@@ -2148,20 +2205,27 @@ pub(crate) async fn load_commit_delta_members_with_payloads(
             format!("selected-source commit delta '{commit_id}' has overlapping local rows"),
         ));
     }
-    Ok(members)
+    Ok(Some(members))
 }
 
 async fn load_commit_delta_members_from_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     manifest: &CommitDeltaManifest,
+    schema_keys: &[String],
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
+    let requested_schemas = schema_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     let mut members = Vec::new();
     if let Some(inline_segment) = manifest.inline_segment() {
         collect_strict_commit_delta_members(inline_segment, None, commit_id, 0, &mut members)?;
     } else {
-        let segment_keys = (0..manifest.segments.len())
-            .map(|segment_index| {
+        let segment_indices = commit_delta_segments_for_schemas(manifest, &requested_schemas);
+        let segment_keys = segment_indices
+            .iter()
+            .map(|&segment_index| {
                 commit_delta_segment_key(commit_id, segment_index)
                     .map(|key| StorageKey(Bytes::from(key)))
             })
@@ -2169,7 +2233,7 @@ async fn load_commit_delta_members_from_manifest(
         let segments = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &segment_keys)
             .materialize(store, StorageGetOptions::default())
             .await?;
-        for (segment_index, value) in segments.value.into_iter().enumerate() {
+        for (segment_index, value) in segment_indices.into_iter().zip(segments.value) {
             let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -2186,6 +2250,9 @@ async fn load_commit_delta_members_from_manifest(
                 &mut members,
             )?;
         }
+    }
+    if !requested_schemas.is_empty() {
+        members.retain(|member| requested_schemas.contains(member.key.schema_key.as_str()));
     }
     hydrate_selected_members(store, &mut members).await?;
     validate_commit_delta_member_order_and_ids(commit_id, &members)?;
@@ -2944,7 +3011,7 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
             let commit_id = commit_id_from_delta_key(&entry.key)?;
             let manifest = decode_commit_delta_manifest(bytes)?;
             let members =
-                load_commit_delta_members_from_manifest(store, commit_id, &manifest).await?;
+                load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[]).await?;
             for member in members {
                 if member.authored {
                     visit(member.change)?;
@@ -3717,6 +3784,27 @@ fn commit_delta_segments_for_schemas(
                 .then_some(segment_index)
         })
         .collect()
+}
+
+fn commit_delta_segment_count_for_schemas_up_to(
+    manifest: &CommitDeltaManifest,
+    schema_keys: &BTreeSet<&str>,
+    limit: usize,
+) -> usize {
+    if schema_keys.is_empty() {
+        return manifest.segments.len().min(limit.saturating_add(1));
+    }
+    manifest
+        .segments
+        .iter()
+        .filter(|bounds| {
+            schema_keys
+                .iter()
+                .copied()
+                .any(|schema_key| commit_delta_segment_overlaps_schema(bounds, schema_key))
+        })
+        .take(limit.saturating_add(1))
+        .count()
 }
 
 fn commit_delta_segment_overlaps_schema(
@@ -5681,6 +5769,39 @@ mod tests {
         assert_eq!(all.len(), fixtures.len());
         let all_keys = all.iter().map(|row| row.encoded_key()).collect::<Vec<_>>();
         assert!(all_keys.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let alpha_members = super::load_commit_delta_members_with_payloads_for_schemas(
+            &read,
+            commit_id,
+            &["alpha".to_string()],
+            usize::MAX,
+        )
+        .await
+        .expect("schema-routed payload scan should load packed deltas")
+        .expect("unbounded schema-routed payload scan should be accepted");
+        assert_eq!(alpha_members.len(), 150);
+        assert!(
+            alpha_members
+                .iter()
+                .all(|member| member.key.schema_key == "alpha")
+        );
+        assert!(
+            alpha_members
+                .windows(2)
+                .all(|pair| pair[0].key < pair[1].key)
+        );
+        assert!(
+            super::load_commit_delta_members_with_payloads_for_schemas(
+                &read,
+                commit_id,
+                &["alpha".to_string()],
+                0,
+            )
+            .await
+            .expect("bounded payload scan should remain valid")
+            .is_none(),
+            "payload scans above the segment budget must defer to the streaming path"
+        );
     }
 
     #[tokio::test]
