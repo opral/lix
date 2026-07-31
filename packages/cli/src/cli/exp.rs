@@ -81,6 +81,10 @@ pub struct ExpGitReplayArgs {
     #[arg(long, default_value_t = false)]
     pub verify_state: bool,
 
+    /// Materialize Git LFS pointers from locally fetched LFS objects.
+    #[arg(long, default_value_t = false)]
+    pub git_lfs: bool,
+
     /// Replace an existing RocksDB output directory and output files.
     #[arg(long, default_value_t = false)]
     pub force: bool,
