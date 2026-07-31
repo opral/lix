@@ -61,6 +61,22 @@ test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 	await lix.close();
 });
 
+test("native telemetry preserves its receiver and cannot fail commands", async () => {
+	const telemetry = {
+		calls: 0,
+		onSpan() {
+			this.calls += 1;
+			throw new Error("telemetry failure");
+		},
+	};
+	const lix = await openLix({ telemetry });
+
+	await expect(lix.execute("SELECT 1 AS value")).resolves.toBeDefined();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	expect(telemetry.calls).toBeGreaterThan(0);
+	await lix.close();
+});
+
 test("openLix opens native storage without telemetry", async () => {
 	const lix = await openLix();
 	const result = await lix.execute("SELECT 1 AS value");
