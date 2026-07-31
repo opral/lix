@@ -55,6 +55,16 @@ type RowIndex = usize;
 // amplification dominates the cost of retaining one immutable manifest.
 const PACKED_CURRENT_BASE_MIN_ROWS: usize = 1_024;
 
+fn compare_certified_predecessors(
+    left: &crate::live_state::CertifiedCurrentStatePredecessorRef<'_>,
+    right: &crate::live_state::CertifiedCurrentStatePredecessorRef<'_>,
+) -> std::cmp::Ordering {
+    left.schema_key
+        .cmp(right.schema_key)
+        .then_with(|| left.entity_pk.cmp(right.entity_pk))
+        .then_with(|| left.file_id.cmp(&right.file_id))
+}
+
 #[cfg(test)]
 std::thread_local! {
     static ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS: std::cell::Cell<usize> =
@@ -2442,12 +2452,12 @@ async fn stage_tracked_head(
                 })
             })
             .collect::<Vec<_>>();
-        durable_predecessors.sort_unstable_by(|left, right| {
-            left.schema_key
-                .cmp(right.schema_key)
-                .then_with(|| left.entity_pk.cmp(right.entity_pk))
-                .then_with(|| left.file_id.cmp(&right.file_id))
-        });
+        if !durable_predecessors
+            .windows(2)
+            .all(|pair| compare_certified_predecessors(&pair[0], &pair[1]).is_lt())
+        {
+            durable_predecessors.sort_unstable_by(compare_certified_predecessors);
+        }
         let packed_schema_keys = tracked_deltas
             .iter()
             .map(|delta| delta.schema_key)
