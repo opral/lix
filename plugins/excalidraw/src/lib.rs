@@ -19,6 +19,7 @@ const ELEMENT_INDEX_HEADER_BYTES: u32 = 16;
 const ELEMENT_INDEX_ENTRY_BYTES: u32 = 32;
 const ELEMENT_INDEX_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_ELEMENT_SHIFT_RECORDS: usize = 4096;
+const PACKET_PAGE_INITIAL_CAPACITY: usize = 64 * 1024;
 
 impl sdk::FormatPlugin for ExcalidrawPlugin {
     fn cold_file_changed(
@@ -679,6 +680,10 @@ where
     encoder.flush(sink)
 }
 
+fn packet_page_buffer(max_bytes: usize) -> Vec<u8> {
+    Vec::with_capacity(max_bytes.min(PACKET_PAGE_INITIAL_CAPACITY))
+}
+
 struct BatchEncoder {
     max_bytes: usize,
     payload: Vec<u8>,
@@ -689,7 +694,7 @@ impl BatchEncoder {
     fn new(max_bytes: u32) -> Self {
         Self {
             max_bytes: max_bytes as usize,
-            payload: Vec::with_capacity(max_bytes as usize),
+            payload: packet_page_buffer(max_bytes as usize),
             records: 0,
         }
     }
@@ -717,7 +722,7 @@ impl BatchEncoder {
         if self.records == 0 {
             return Ok(());
         }
-        let payload = std::mem::replace(&mut self.payload, Vec::with_capacity(self.max_bytes));
+        let payload = std::mem::replace(&mut self.payload, packet_page_buffer(self.max_bytes));
         let records = std::mem::take(&mut self.records);
         sink.emit_changes(records, payload)
     }
@@ -791,6 +796,15 @@ lix_plugin_api::export_plugin!(ExcalidrawPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packet_page_buffer_does_not_preallocate_the_record_ceiling() {
+        assert_eq!(
+            packet_page_buffer(16 * 1024 * 1024).capacity(),
+            PACKET_PAGE_INITIAL_CAPACITY
+        );
+        assert_eq!(packet_page_buffer(1024).capacity(), 1024);
+    }
 
     #[test]
     fn large_element_index_is_split_into_bounded_pages() {
