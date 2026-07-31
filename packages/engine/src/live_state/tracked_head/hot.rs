@@ -4217,9 +4217,11 @@ where
         // only changes the row-local dirty marker and commit ownership, even
         // though the checkpoint delta already records historical membership.
         //
-        // Retain only this provably identical case. A squashed selection has
-        // a new change ID and must still be written so canonical timestamps
-        // and payload ownership match historical rebuilds.
+        // Retain only a provably identical row whose baseline is already
+        // clean. A dirty identical row still needs one compacting rewrite to
+        // discard its stale before-image; a squashed selection has a new
+        // change ID and must likewise be written so canonical timestamps and
+        // payload ownership match historical rebuilds.
         let (sorted, previous_values, created_ats) = if reset_working_diff_baselines {
             let mut retained_deltas = Vec::with_capacity(sorted.len());
             let mut retained_previous = Vec::with_capacity(previous_values.len());
@@ -4243,6 +4245,7 @@ where
                                 && value.deleted == delta.deleted
                                 && value.created_at == delta.created_at
                                 && value.updated_at == delta.updated_at
+                                && value.working_diff_baseline == WorkingDiffBaseline::Clean
                         });
                 if identical_immutable_change {
                     continue;

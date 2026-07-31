@@ -2979,9 +2979,9 @@ mod tests {
         );
 
         // A checkpoint that selects the already-authoritative immutable
-        // change must not rewrite the HOT row just to clear its dirty
-        // baseline. The checkpoint owner on that baseline makes it stale for
-        // the next interval without touching the value.
+        // change still has to clear its row-local dirty baseline. Leaving the
+        // stale before-image physically attached would make retained current
+        // state grow with every checkpoint interval.
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3015,7 +3015,7 @@ mod tests {
             .expect("stage no-op checkpoint publication");
         assert_eq!(no_op_coverage, WorkingDiffIndexCoverage::default());
         assert!(
-            !writes.contains_put(
+            writes.contains_put(
                 HOT_ROW_SPACE,
                 &hot::encode_hot_row_key(&HeadIdentity {
                     branch_id: branch_id.to_owned(),
@@ -3025,11 +3025,7 @@ mod tests {
                     file_id: None,
                 }),
             ),
-            "an identical selected change must not rewrite its HOT row"
-        );
-        assert!(
-            writes.is_empty(),
-            "an identical selection must not rewrite unchanged collection controls"
+            "an identical dirty selected change must be rewritten clean"
         );
         stage_tracked_working_diff_epoch(
             &mut writes,
@@ -3057,6 +3053,31 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open no-op checkpoint epoch read");
+        let hot_key = hot::encode_hot_row_key(&HeadIdentity {
+            branch_id: branch_id.to_owned(),
+            generation: checkpoint,
+            schema_key: "schema".to_owned(),
+            entity_pk: entity_pk.clone(),
+            file_id: None,
+        });
+        let value = PointReadPlan::new(HOT_ROW_SPACE, &[StorageKey(Bytes::from(hot_key))])
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .expect("read cleaned checkpoint HOT row")
+            .value
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("cleaned checkpoint HOT row exists");
+        let StorageProjectedValue::FullValue(value) = value else {
+            panic!("cleaned checkpoint HOT row unexpectedly omitted its value");
+        };
+        assert_eq!(
+            decode_head_value(&value)
+                .expect("cleaned checkpoint HOT value decodes")
+                .working_diff_baseline,
+            WorkingDiffBaseline::Clean,
+        );
         assert_eq!(
             TrackedHeadContext::new()
                 .reader(read)
