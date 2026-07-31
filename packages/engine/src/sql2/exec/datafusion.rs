@@ -4572,6 +4572,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_insert_default_values_uses_the_native_entity_writer() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![json!({
+                "x-lix-key": "default_values_probe",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "x-lix-default": "lix_uuid_v7()"
+                    },
+                    "label": { "type": "string", "default": "untitled" }
+                },
+                "required": ["id", "label"],
+                "additionalProperties": false
+            })],
+        };
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO default_values_probe DEFAULT VALUES",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("DEFAULT VALUES should not require the DataFusion writer");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "default_values_probe");
+        assert_eq!(rows.len(), 1);
+        let snapshot = serde_json::from_str::<JsonValue>(
+            rows[0]
+                .snapshot_content
+                .as_deref()
+                .expect("inserted entity should have a snapshot"),
+        )
+        .expect("defaulted snapshot should be JSON");
+        let id = snapshot["id"]
+            .as_str()
+            .expect("UUID default should materialize a string");
+        assert_eq!(
+            uuid::Uuid::parse_str(id)
+                .expect("UUID default should be parseable")
+                .get_version_num(),
+            7
+        );
+        assert_eq!(snapshot["label"], "untitled");
+    }
+
+    #[tokio::test]
     async fn execute_sql_insert_into_active_entity_does_not_probe_active_head_during_lowering() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
