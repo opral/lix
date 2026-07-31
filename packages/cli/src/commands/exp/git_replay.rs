@@ -220,6 +220,8 @@ struct ReplayProfileReport {
     from_commit: Option<String>,
     num_commits_requested: Option<u32>,
     checkpoint_every: Option<u32>,
+    history_scope: String,
+    scoped_paths: usize,
     git_lfs_objects_materialized: u64,
     git_lfs_bytes_materialized: u64,
     plugin_install_ms: f64,
@@ -335,6 +337,15 @@ fn run_with_storage<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    let replay_scope = collect_replay_scope(&repo_path, &commits)?;
+    let history_scope = if commits
+        .first()
+        .is_some_and(|commit| commit.first_parent.is_none())
+    {
+        "complete"
+    } else {
+        "window"
+    };
     let lix = db::block_on(open_lix_with_storage(storage.clone()))
         .map_err(|error| CliError::msg(format!("failed to open replay Lix: {error}")))?;
     db::block_on(lix.execute(
@@ -360,7 +371,14 @@ where
     let seeded_blob_reader = if let Some(parent) = baseline_seed_parent.as_deref() {
         let seed_started = Instant::now();
         let mut blob_reader = GitBlobReader::spawn(&repo_path)?;
-        let seeded = seed_parent_tree(&repo_path, parent, &mut blob_reader, &mut state, &lix)?;
+        let seeded = seed_parent_tree(
+            &repo_path,
+            parent,
+            &replay_scope,
+            &mut blob_reader,
+            &mut state,
+            &lix,
+        )?;
         baseline_seed_files = seeded.files;
         baseline_seed_batches = seeded.batches;
         baseline_seed_ms = duration_to_ms(seed_started.elapsed());
@@ -385,8 +403,9 @@ where
     let checkpoint_every = args.checkpoint_every.map(|interval| interval as usize);
 
     println!(
-        "[git-replay] replaying {} commits from {} into {}",
+        "[git-replay] replaying {} commits over {} scoped paths from {} into {}",
         commits.len(),
+        replay_scope.len(),
         repo_path.display(),
         args.storage.as_str()
     );
@@ -495,6 +514,7 @@ where
             .last()
             .expect("non-empty replay commits were validated above")
             .sha,
+        &replay_scope,
         &mut blob_reader,
         &lix,
     )?;
@@ -522,6 +542,10 @@ where
     println!("[git-replay] commits applied: {applied}");
     println!("[git-replay] commits with marker only: {marker_only}");
     println!("[git-replay] changed paths total: {changed_paths}");
+    println!(
+        "[git-replay] history scope: {history_scope} ({} paths)",
+        replay_scope.len()
+    );
     println!("[git-replay] plugins: {}", args.plugins.as_str());
     println!(
         "[git-replay] materialized {git_lfs_objects_materialized} unique Git LFS objects ({git_lfs_bytes_materialized} bytes)"
@@ -533,11 +557,11 @@ where
     }
     if let Some(parent) = &baseline_seed_parent {
         println!(
-            "[git-replay] parent-tree bootstrap excluded from replay timing: {baseline_seed_ms:.3}ms ({baseline_seed_files} files in {baseline_seed_batches} transactions from {parent})"
+            "[git-replay] scoped parent bootstrap excluded from replay timing: {baseline_seed_ms:.3}ms ({baseline_seed_files} files in {baseline_seed_batches} transactions from {parent})"
         );
     }
     println!("[git-replay] replay elapsed: {replay_elapsed_ms:.3}ms");
-    println!("[git-replay] final Git tree manifest verified in {final_tree_verify_ms:.3}ms");
+    println!("[git-replay] scoped final Git tree manifest verified in {final_tree_verify_ms:.3}ms");
     if let Some(profile_path) = &profile_json_path {
         write_profile_report(
             profile_path,
@@ -550,6 +574,8 @@ where
                 from_commit: args.from_commit.clone(),
                 num_commits_requested: args.num_commits,
                 checkpoint_every: args.checkpoint_every,
+                history_scope: history_scope.to_string(),
+                scoped_paths: replay_scope.len(),
                 git_lfs_objects_materialized,
                 git_lfs_bytes_materialized,
                 plugin_install_ms,
@@ -773,9 +799,30 @@ struct SeedResult {
     batches: usize,
 }
 
+fn collect_replay_scope(
+    repo_path: &Path,
+    commits: &[ReplayCommit],
+) -> Result<HashSet<GitPath>, CliError> {
+    let mut reader = GitDiffTreeReader::spawn(repo_path, commits)?;
+    let mut scope = HashSet::new();
+    for commit in commits {
+        for change in reader.read_commit(&commit.sha)? {
+            if let Some(path) = change.old_path {
+                scope.insert(path);
+            }
+            if let Some(path) = change.new_path {
+                scope.insert(path);
+            }
+        }
+    }
+    reader.finish()?;
+    Ok(scope)
+}
+
 fn seed_parent_tree<StorageImpl>(
     repo_path: &Path,
     parent_commit: &str,
+    replay_scope: &HashSet<GitPath>,
     blob_reader: &mut GitBlobReader,
     state: &mut ReplayState,
     lix: &Lix<StorageImpl>,
@@ -783,7 +830,15 @@ fn seed_parent_tree<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let changes = read_tree_snapshot_changes(repo_path, parent_commit)?;
+    let changes = read_tree_snapshot_changes(repo_path, parent_commit)?
+        .into_iter()
+        .filter(|change| {
+            change
+                .new_path
+                .as_ref()
+                .is_some_and(|path| replay_scope.contains(path))
+        })
+        .collect::<Vec<_>>();
     let mut pending = PreparedBatch::default();
     let mut result = SeedResult::default();
     for change_batch in changes.chunks(TREE_BLOB_READ_BATCH_ROWS) {
@@ -1834,13 +1889,22 @@ fn git_file_metadata_value(row: &WriteRow) -> Value {
 fn verify_final_git_tree<StorageImpl>(
     repo_path: &Path,
     commit_sha: &str,
+    replay_scope: &HashSet<GitPath>,
     blob_reader: &mut GitBlobReader,
     lix: &Lix<StorageImpl>,
 ) -> Result<(), CliError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let tree_changes = read_tree_snapshot_changes(repo_path, commit_sha)?;
+    let tree_changes = read_tree_snapshot_changes(repo_path, commit_sha)?
+        .into_iter()
+        .filter(|change| {
+            change
+                .new_path
+                .as_ref()
+                .is_some_and(|path| replay_scope.contains(path))
+        })
+        .collect::<Vec<_>>();
     let mut expected_by_path = HashMap::<String, ExpectedFile>::with_capacity(tree_changes.len());
     for change_batch in tree_changes.chunks(TREE_BLOB_READ_BATCH_ROWS) {
         let blob_by_oid = blob_reader.read_blobs(&collect_wanted_blob_ids(change_batch))?;
@@ -2679,6 +2743,44 @@ mod tests {
     }
 
     #[test]
+    fn replay_scope_contains_rename_history_but_not_untouched_parent_paths() {
+        let fixture = unique_temp_dir();
+        let repo = fixture.join("repo");
+        fs::create_dir_all(&repo).expect("fixture repository should be created");
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        git_ok(&repo, &["config", "user.email", "replay@example.test"]);
+        git_ok(&repo, &["config", "user.name", "Replay Test"]);
+        fs::write(repo.join("renamed-before.txt"), b"before\n").expect("fixture should write");
+        fs::write(repo.join("untouched.txt"), b"untouched\n").expect("fixture should write");
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "root"]);
+
+        fs::rename(
+            repo.join("renamed-before.txt"),
+            repo.join("renamed-after.txt"),
+        )
+        .expect("fixture should rename");
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "rename"]);
+        let rename_commit =
+            run_git_text(&repo, &["rev-parse".to_string(), "HEAD".to_string()], None)
+                .expect("rename commit should resolve");
+        let commits = list_linear_commits(&repo, "main", Some(rename_commit.trim()), None)
+            .expect("rename window should select");
+        let scope = collect_replay_scope(&repo, &commits).expect("scope should collect");
+
+        assert_eq!(
+            scope,
+            HashSet::from([
+                git_path(b"renamed-before.txt"),
+                git_path(b"renamed-after.txt"),
+            ])
+        );
+        assert!(!scope.contains(&git_path(b"untouched.txt")));
+        fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
+    }
+
+    #[test]
     fn select_replay_commits_applies_limit_after_from_commit() {
         let commits = replay_commits(&["a", "b", "c", "d"]);
         let selected = select_replay_commits(commits, Some("b"), Some(2))
@@ -3297,6 +3399,8 @@ mod tests {
                 assert_eq!(profile_json["storage"], storage.as_str());
                 assert_eq!(profile_json["plugins"], plugins.as_str());
                 assert_eq!(profile_json["commits_replayed"], 1);
+                assert_eq!(profile_json["history_scope"], "complete");
+                assert_eq!(profile_json["scoped_paths"], 1);
 
                 if plugins == GitReplayPlugins::All {
                     match storage {
