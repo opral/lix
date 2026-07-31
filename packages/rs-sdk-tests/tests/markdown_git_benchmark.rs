@@ -231,7 +231,7 @@ async fn markdown_git_semantic_entities_benchmark() {
     for sample in 0..merge_samples {
         let source = lix
             .create_branch(CreateBranchOptions {
-                id: Some(format!("markdown-merge-source-{sample}")),
+                id: Some(format!("01920000-0000-7000-8000-{:012x}", 0x600 + sample)),
                 name: format!("Markdown merge source {sample}"),
                 from_commit_id: None,
             })
