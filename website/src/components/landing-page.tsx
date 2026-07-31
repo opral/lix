@@ -391,7 +391,7 @@ function LandingPage({
               </svg>
             </a>
             <h1 className="text-gray-900 font-bold leading-[1.1] text-4xl sm:text-5xl md:text-6xl tracking-tight">
-              Database + filesystem + version control in one
+              Database + filesystem + version control in one system
             </h1>
 
             <p className="text-gray-500 text-lg sm:text-xl max-w-4xl mx-auto mt-8">
