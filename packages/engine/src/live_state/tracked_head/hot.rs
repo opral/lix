@@ -3894,12 +3894,12 @@ where
                 file_id: delta.file_id,
             })
             .collect::<Vec<_>>();
-        let packed_previous = load_packed_current_base_exact_entries(
+        let packed_previous = Box::pin(load_packed_current_base_exact_entries(
             self.store,
             branch_id,
             generation,
             &previous_keys,
-        )
+        ))
         .await?;
         for (index, previous) in previous_values.iter_mut().enumerate() {
             let Some((packed_value, packed_change)) = &packed_previous[index] else {
