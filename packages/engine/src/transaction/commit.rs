@@ -194,7 +194,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                 continue;
             }
             blob_writer
-                .stage_file_payload(write.payload(), write.same_length_blob_splice(), None)
+                .stage_file_payload(
+                    write.payload(),
+                    write.same_length_blob_splice(),
+                    write.edit_blob_splice(),
+                )
                 .instrument(tracing::debug_span!(
                     target: "lix_perf",
                     "lix.perf.binary_cas_stage_payload"

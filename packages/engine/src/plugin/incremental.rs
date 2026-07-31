@@ -280,10 +280,12 @@ pub(crate) struct BuiltInputSplices {
 }
 
 impl BuiltInputSplices {
-    /// Returns the one fixed-width base-relative replacement, if this update
-    /// can retain its prior binary-CAS chunk boundaries. This is private host
-    /// staging information; the WIT input remains the ordinary splice vector.
-    pub(crate) fn same_length_replacement(&self) -> Option<(usize, usize)> {
+    /// Returns one host-verified base-relative replacement for storage reuse.
+    ///
+    /// This is format-neutral transition evidence. The WIT input remains the
+    /// ordinary splice vector, and callers still retain the complete accepted
+    /// output bytes as authority.
+    pub(crate) fn replacement(&self) -> Option<(usize, usize, usize)> {
         let [splice] = self.edits.as_slice() else {
             return None;
         };
@@ -291,8 +293,18 @@ impl BuiltInputSplices {
             WasmInputBytes::Inline(bytes) => bytes.len(),
             WasmInputBytes::AfterRange(range) => usize::try_from(range.length).ok()?,
         };
-        let offset = usize::try_from(splice.offset).ok()?;
-        let delete_len = usize::try_from(splice.delete_len).ok()?;
+        Some((
+            usize::try_from(splice.offset).ok()?,
+            usize::try_from(splice.delete_len).ok()?,
+            insert_len,
+        ))
+    }
+
+    /// Returns the one fixed-width base-relative replacement, if this update
+    /// can retain its prior binary-CAS chunk boundaries. This is private host
+    /// staging information; the WIT input remains the ordinary splice vector.
+    pub(crate) fn same_length_replacement(&self) -> Option<(usize, usize)> {
+        let (offset, delete_len, insert_len) = self.replacement()?;
         (delete_len == insert_len && delete_len != 0).then_some((offset, delete_len))
     }
 }
@@ -3465,6 +3477,7 @@ mod tests {
         assert!(from_transport.used_transport_provenance);
         assert_eq!(from_transport.full_diff_bytes_compared, 0);
         assert_eq!(from_transport.after_sha256, Some(after_sha256));
+        assert_eq!(from_transport.replacement(), Some((2, 2, 2)));
         assert_eq!(from_transport.same_length_replacement(), Some((2, 2)));
         assert_eq!(
             from_transport.edits,
@@ -3528,6 +3541,7 @@ mod tests {
         )
         .expect("length-changing splice should still build");
         assert_eq!(length_changing.same_length_replacement(), None);
+        assert_eq!(length_changing.replacement(), Some((2, 2, 3)));
     }
 
     #[test]

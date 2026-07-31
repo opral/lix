@@ -3980,6 +3980,7 @@ where
                 u64::try_from(submitted_bytes.len()).unwrap_or(u64::MAX),
             );
             let mut verified_same_length_blob_splice = None;
+            let mut verified_blob_edit_splice = None;
 
             let (changes, publication, materialized_bytes, create_rows) = if same_plugin_owner {
                 'same_owner: {
@@ -4045,6 +4046,7 @@ where
                                 cold_edits,
                                 host_full_diff_bytes_compared,
                                 same_length_blob_splice,
+                                blob_edit_splice,
                             ) = match (selected.materialization(), visible_materialization.bytes) {
                                 (
                                     PluginMaterialization::Blob,
@@ -4091,6 +4093,11 @@ where
                                     let same_length_blob_splice = built_splices
                                         .same_length_replacement()
                                         .map(|(offset, length)| (hash, offset, length));
+                                    let blob_edit_splice = built_splices.replacement().map(
+                                        |(offset, delete_len, insert_len)| {
+                                            (hash, offset, delete_len, insert_len)
+                                        },
+                                    );
                                     let before_source: Arc<dyn crate::wasm::WasmByteSource> =
                                         Arc::new(ArcByteSource::new(before_bytes.clone()));
                                     (
@@ -4100,6 +4107,7 @@ where
                                         built_splices.edits,
                                         built_splices.full_diff_bytes_compared,
                                         same_length_blob_splice,
+                                        blob_edit_splice,
                                     )
                                 }
                                 (
@@ -4117,7 +4125,7 @@ where
                                             ),
                                         ));
                                     }
-                                    (None, None, None, Vec::new(), 0, None)
+                                    (None, None, None, Vec::new(), 0, None, None)
                                 }
                                 _ => {
                                     return Err(LixError::new(
@@ -4427,6 +4435,7 @@ where
                                     .saturating_add(certified_row_count);
                             self.plugin_host.record_transition_counters(counters);
                             verified_same_length_blob_splice = same_length_blob_splice;
+                            verified_blob_edit_splice = blob_edit_splice;
                             drop(cold_open_guard);
                             break 'same_owner (
                                 changes,
@@ -4540,6 +4549,7 @@ where
                     let submitted_bytes_sha256 = built_splices.after_sha256;
                     let host_full_diff_bytes_compared = built_splices.full_diff_bytes_compared;
                     let same_length_blob_splice = built_splices.same_length_replacement();
+                    let blob_edit_splice = built_splices.replacement();
                     let observed_source = ArcByteSource::new(observed_bytes.clone());
                     let submitted_source = ArcByteSource::new(submitted_bytes.clone());
                     let observed_document = lease.observed_document();
@@ -4662,11 +4672,19 @@ where
                             // validated file successor is therefore already the
                             // exact merge result; rendering the same sparse change
                             // onto the same base would only repeat guest work.
-                            verified_same_length_blob_splice = match visible_materialization.bytes {
+                            verified_same_length_blob_splice = match &visible_materialization.bytes
+                            {
                                 VisibleMaterializationBytes::Blob { hash, .. } => {
                                     same_length_blob_splice
-                                        .map(|(offset, length)| (hash, offset, length))
+                                        .map(|(offset, length)| (*hash, offset, length))
                                 }
+                                VisibleMaterializationBytes::Derived { .. } => None,
+                            };
+                            verified_blob_edit_splice = match &visible_materialization.bytes {
+                                VisibleMaterializationBytes::Blob { hash, .. } => blob_edit_splice
+                                    .map(|(offset, delete_len, insert_len)| {
+                                        (*hash, offset, delete_len, insert_len)
+                                    }),
                                 VisibleMaterializationBytes::Derived { .. } => None,
                             };
                             (
@@ -4894,14 +4912,26 @@ where
                 PluginMaterialization::Blob => {
                     if materialized_bytes.as_ref() != write.data() {
                         write.replace_data(materialized_bytes);
-                    } else if let Some((visible_base_blob_hash, offset, length)) =
-                        verified_same_length_blob_splice
-                    {
-                        write.set_verified_same_length_blob_splice(
-                            visible_base_blob_hash,
-                            offset,
-                            length,
-                        );
+                    } else {
+                        if let Some((visible_base_blob_hash, offset, length)) =
+                            verified_same_length_blob_splice
+                        {
+                            write.set_verified_same_length_blob_splice(
+                                visible_base_blob_hash,
+                                offset,
+                                length,
+                            );
+                        }
+                        if let Some((visible_base_blob_hash, offset, delete_len, insert_len)) =
+                            verified_blob_edit_splice
+                        {
+                            write.set_verified_blob_edit_splice(
+                                visible_base_blob_hash,
+                                offset,
+                                delete_len,
+                                insert_len,
+                            );
+                        }
                     }
                     reconciliation
                         .materialized_file_keys

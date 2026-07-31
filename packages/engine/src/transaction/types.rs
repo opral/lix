@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::LixError;
-use crate::binary_cas::{BlobHash, BlobPayload, BlobSameLengthSplice};
+use crate::binary_cas::{BlobEditSplice, BlobHash, BlobPayload, BlobSameLengthSplice};
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
@@ -1422,6 +1422,7 @@ pub(crate) struct TransactionFileData {
     /// exact accepted document. The complete output bytes remain authoritative;
     /// this only permits an internal CAS staging fast path.
     same_length_blob_splice: Option<BlobSameLengthSplice>,
+    edit_blob_splice: Option<BlobEditSplice>,
     /// Validated transport splice that produced `payload`, when the ordinary
     /// SQL blob parameter arrived through the remote splice optimization.
     /// This is transient execution provenance and is never persisted as file
@@ -1467,6 +1468,7 @@ impl TransactionFileData {
             had_blob_ref: false,
             base_blob_hash: None,
             same_length_blob_splice: None,
+            edit_blob_splice: None,
             splice_provenance: None,
             mutation_identity: None,
             payload: BlobPayload::from_bytes(data),
@@ -1559,6 +1561,7 @@ impl TransactionFileData {
         self.splice_provenance = None;
         self.base_blob_hash = None;
         self.same_length_blob_splice = None;
+        self.edit_blob_splice = None;
     }
 
     /// Marks a single fixed-width replacement that was independently verified
@@ -1587,6 +1590,32 @@ impl TransactionFileData {
             Some(BlobSameLengthSplice::new(base_blob_hash, offset, length));
     }
 
+    pub(crate) fn set_verified_blob_edit_splice(
+        &mut self,
+        visible_base_blob_hash: BlobHash,
+        offset: usize,
+        delete_len: usize,
+        insert_len: usize,
+    ) {
+        let Some(base_blob_hash) = self.base_blob_hash else {
+            return;
+        };
+        if base_blob_hash != visible_base_blob_hash
+            || (delete_len == 0 && insert_len == 0)
+            || offset
+                .checked_add(insert_len)
+                .is_none_or(|end| end > self.payload.len())
+        {
+            return;
+        }
+        self.edit_blob_splice = Some(BlobEditSplice {
+            base_blob_hash,
+            offset,
+            delete_len,
+            insert_len,
+        });
+    }
+
     pub(crate) fn blob_hash(&self) -> Option<BlobHash> {
         self.payload.hash()
     }
@@ -1601,6 +1630,10 @@ impl TransactionFileData {
 
     pub(crate) fn same_length_blob_splice(&self) -> Option<BlobSameLengthSplice> {
         self.same_length_blob_splice
+    }
+
+    pub(crate) fn edit_blob_splice(&self) -> Option<BlobEditSplice> {
+        self.edit_blob_splice
     }
 
     #[cfg(test)]
@@ -4471,6 +4504,43 @@ mod tests {
         assert_eq!(
             write.same_length_blob_splice(),
             Some(BlobSameLengthSplice::new(base, 2, 1))
+        );
+    }
+
+    #[test]
+    fn verified_edit_splice_is_format_neutral_and_cleared_by_rematerialization() {
+        let base = BlobHash::from_content(b"before");
+        let wrong_base = BlobHash::from_content(b"other!");
+        let mut write = TransactionFileData::new(
+            "file".to_string(),
+            None,
+            None,
+            "main".to_string(),
+            false,
+            false,
+            b"after-more".to_vec(),
+        )
+        .with_base_blob_hash(Some(base));
+
+        write.set_verified_blob_edit_splice(wrong_base, 2, 1, 5);
+        assert_eq!(write.edit_blob_splice(), None);
+
+        write.set_verified_blob_edit_splice(base, 2, 1, 5);
+        assert_eq!(
+            write.edit_blob_splice(),
+            Some(BlobEditSplice {
+                base_blob_hash: base,
+                offset: 2,
+                delete_len: 1,
+                insert_len: 5,
+            })
+        );
+
+        write.replace_data(b"plugin-rendered".to_vec());
+        assert_eq!(
+            write.edit_blob_splice(),
+            None,
+            "a plugin-rendered replacement invalidates the submitted-byte proof"
         );
     }
 }
