@@ -1021,7 +1021,13 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
     let selection_fingerprint = selection_fingerprint(entries.iter().map(|entry| {
         let value = decode_value(&entry.value)
             .expect("ordered commit-delta values were encoded by the trusted builder");
-        (entry.key.as_ref(), value.change_id)
+        (
+            entry.key.as_ref(),
+            value.change_id,
+            value.deleted,
+            value.created_at,
+            value.updated_at,
+        )
     }));
     let encoded = try_encode_commit_delta_segment_with_payloads(&entries, &payloads, compressor)?;
     Ok((bounds, encoded, selection_fingerprint))
@@ -1184,7 +1190,13 @@ fn stage_commit_deltas_inner(
     let selection_fingerprint = selection_fingerprint(entries.iter().map(|entry| {
         let value = decode_value(&entry.value)
             .expect("staged commit-delta values were encoded by the trusted builder");
-        (entry.key.as_ref(), value.change_id)
+        (
+            entry.key.as_ref(),
+            value.change_id,
+            value.deleted,
+            value.created_at,
+            value.updated_at,
+        )
     }));
     let segment_count = encoded_segments.len();
     writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, 1, 0);
@@ -3439,15 +3451,26 @@ fn encode_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<Vec<u8
 }
 
 fn selection_fingerprint<'a>(
-    members: impl IntoIterator<Item = (&'a [u8], crate::changelog::ChangeId)>,
+    members: impl IntoIterator<
+        Item = (
+            &'a [u8],
+            crate::changelog::ChangeId,
+            bool,
+            crate::common::LixTimestamp,
+            crate::common::LixTimestamp,
+        ),
+    >,
 ) -> [u8; 32] {
     let mut fingerprint = [0_u8; 32];
-    for (key, change_id) in members {
+    for (key, change_id, deleted, created_at, updated_at) in members {
         let mut member = blake3::Hasher::new();
-        member.update(b"lix.commit_delta.selection.v1");
+        member.update(b"lix.commit_delta.selection.v2");
         member.update(&(key.len() as u64).to_be_bytes());
         member.update(key);
         member.update(change_id.as_uuid().as_bytes());
+        member.update(&[u8::from(deleted)]);
+        member.update(&created_at.packed().to_be_bytes());
+        member.update(&updated_at.packed().to_be_bytes());
         for (target, source) in fingerprint.iter_mut().zip(member.finalize().as_bytes()) {
             *target ^= source;
         }
@@ -3456,7 +3479,15 @@ fn selection_fingerprint<'a>(
 }
 
 pub(crate) fn selected_change_selection_fingerprint<'a>(
-    members: impl IntoIterator<Item = (&'a [u8], crate::changelog::ChangeId)>,
+    members: impl IntoIterator<
+        Item = (
+            &'a [u8],
+            crate::changelog::ChangeId,
+            bool,
+            crate::common::LixTimestamp,
+            crate::common::LixTimestamp,
+        ),
+    >,
 ) -> [u8; 32] {
     selection_fingerprint(members)
 }

@@ -16,6 +16,7 @@ use crate::changelog::{
     ChangelogWriter, CommitId, CommitLoadRequest as ChangelogCommitLoadRequest, CommitRecord,
     TransactionChangeRecordRef, TransactionChangelogAppend,
 };
+use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::stage_path_index_revision;
@@ -1226,7 +1227,11 @@ async fn stage_tracked_commit_delta_index(
                 "lix.perf.commit_delta_selected_sources"
             );
         }
-        let selected_source_alias = if selected_members_by_source.len() == 1 {
+        let is_checkpoint_commit = state_row_indices.iter().any(|&row_index| {
+            state_rows.row(row_index).schema_key.as_str() == CHECKPOINT_MARKER_SCHEMA_KEY
+        });
+        let selected_source_alias = if is_checkpoint_commit && selected_members_by_source.len() == 1
+        {
             let source_commit_id = *selected_members_by_source
                 .first_key_value()
                 .expect("one selected source exists")
@@ -1239,15 +1244,27 @@ async fn stage_tracked_commit_delta_index(
                             file_id: change_ref.file_id(),
                             entity_pk: change_ref.entity_pk(),
                         }),
-                        change_ref.change_id,
+                        (
+                            change_ref.change_id,
+                            change_ref.deleted,
+                            change_ref.created_at,
+                            change_ref.updated_at,
+                        ),
                     )
                 })
                 .collect::<HashMap<_, _>>();
-            let selected_fingerprint = crate::tracked_state::selected_change_selection_fingerprint(
-                selected
-                    .iter()
-                    .map(|(key, change_id)| (key.as_slice(), *change_id)),
-            );
+            let selected_fingerprint =
+                crate::tracked_state::selected_change_selection_fingerprint(selected.iter().map(
+                    |(key, (change_id, deleted, created_at, updated_at))| {
+                        (
+                            key.as_slice(),
+                            *change_id,
+                            *deleted,
+                            *created_at,
+                            *updated_at,
+                        )
+                    },
+                ));
             let source = crate::tracked_state::load_commit_delta_selection_certificate(
                 read,
                 source_commit_id,
