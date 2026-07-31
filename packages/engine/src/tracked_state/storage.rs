@@ -353,6 +353,10 @@ impl CommitDeltaMember {
         !self.authored && !self.selected_tombstone
     }
 
+    pub(crate) fn is_selected_tombstone(&self) -> bool {
+        self.selected_tombstone
+    }
+
     pub(crate) fn is_certified_payload_ref(&self) -> bool {
         self.certified_ref
     }

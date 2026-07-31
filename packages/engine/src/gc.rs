@@ -735,7 +735,7 @@ where
                 metadata: member.change.metadata.as_ref_slot(),
                 origin_key: member.change.origin_key.as_deref(),
                 authored: member.authored
-                    || borrowed_source_is_swept
+                    || (borrowed_source_is_swept && !member.is_selected_tombstone())
                     || (dead_packed_change_ids.contains(&member.value.change_id)
                         && member.is_selected_payload_ref()),
                 certified: member.is_certified_payload_ref(),
@@ -1464,6 +1464,18 @@ mod tests {
         assert_eq!(alias.selected_source_commit_id, None);
         assert_eq!(alias.members.len(), 2);
         assert!(alias.members.iter().all(|member| member.value.deleted));
+        assert_eq!(
+            alias
+                .members
+                .iter()
+                .filter(|member| member.authored)
+                .count(),
+            1,
+            "the local marker stays authored while the borrowed cascade tombstone does not"
+        );
+        scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect("materialized cascade tombstone must preserve canonical history");
     }
 
     #[tokio::test]
