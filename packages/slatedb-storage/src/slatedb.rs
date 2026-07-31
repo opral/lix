@@ -271,10 +271,17 @@ struct ImmutableChunkCache {
 impl ImmutableChunkCache {
     fn new(options: &SlateDBCacheOptions) -> Self {
         let root = options.root_folder.join(IMMUTABLE_BINARY_CAS_CACHE_PATH);
+        let (_, immutable_max_bytes) = disk_cache_budgets(options.max_disk_cache_bytes);
+        let current_bytes = if root.is_dir() {
+            prune_immutable_chunk_cache(&root, immutable_max_bytes)
+                .unwrap_or_else(|_| immutable_chunk_cache_bytes(&root))
+        } else {
+            0
+        };
         Self {
-            current_bytes: Arc::new(AtomicU64::new(immutable_chunk_cache_bytes(&root))),
+            current_bytes: Arc::new(AtomicU64::new(current_bytes)),
             root,
-            max_bytes: options.max_disk_cache_bytes,
+            max_bytes: immutable_max_bytes,
         }
     }
 
@@ -3472,9 +3479,10 @@ fn open_slatedb(
         }
         let mut settings = slatedb_settings();
         if let Some(cache) = options.cache {
+            let (slatedb_max_bytes, _) = disk_cache_budgets(cache.max_disk_cache_bytes);
             settings.object_store_cache_options = ObjectStoreCacheOptions {
                 root_folder: Some(cache.root_folder),
-                max_cache_size_bytes: Some(cache.max_disk_cache_bytes),
+                max_cache_size_bytes: Some(slatedb_max_bytes),
                 part_size_bytes: OBJECT_STORE_CACHE_PART_SIZE_BYTES,
                 cache_puts: true,
                 preload_disk_cache_on_startup: None,
@@ -3497,6 +3505,11 @@ fn open_slatedb(
         }
         builder.build().await.map_err(slatedb_error)
     })
+}
+
+fn disk_cache_budgets(total_bytes: usize) -> (usize, usize) {
+    let immutable_bytes = total_bytes / 2;
+    (total_bytes.saturating_sub(immutable_bytes), immutable_bytes)
 }
 
 fn join_db_path(db_path: &str, child: &str) -> String {
@@ -4364,6 +4377,15 @@ mod tests {
     }
 
     #[test]
+    fn disk_cache_budget_is_shared_without_exceeding_the_configured_total() {
+        for total in [1, 2, 3, 1024, 8 * 1024 * 1024] {
+            let (slatedb, immutable) = disk_cache_budgets(total);
+            assert_eq!(slatedb.saturating_add(immutable), total);
+            assert!(slatedb >= immutable);
+        }
+    }
+
+    #[test]
     fn encoded_bounds_normalize_to_half_open_ranges() {
         let key = Key(Bytes::from_static(b"key"));
         let bounds = EncodedBounds::new(
@@ -4652,13 +4674,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("create bounded immutable chunk cache");
         let cache = ImmutableChunkCache::new(&SlateDBCacheOptions {
             root_folder: directory.path().to_path_buf(),
-            max_disk_cache_bytes: 1024,
+            max_disk_cache_bytes: 2048,
             block_cache_bytes: 0,
             metadata_cache_bytes: 0,
         });
         block_on(cache.put(&Key(Bytes::from(vec![0x11; 32])), Bytes::from(vec![1; 700])));
         block_on(cache.put(&Key(Bytes::from(vec![0x22; 32])), Bytes::from(vec![2; 700])));
-        assert!(immutable_chunk_cache_bytes(&cache.root) <= 1024);
+        assert!(immutable_chunk_cache_bytes(&cache.root) <= cache.max_bytes as u64);
     }
 
     #[test]
