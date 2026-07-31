@@ -129,7 +129,6 @@ struct ReplayProfilePhaseTotals {
     build_sql_ms: f64,
     execute_ms: f64,
     checkpoint_ms: f64,
-    verify_ms: f64,
     total_ms: f64,
 }
 
@@ -208,7 +207,6 @@ struct ReplayCommitProfile {
     execute_ms: f64,
     checkpoint_ms: Option<f64>,
     plugin_counters: ReplayPluginCounters,
-    verify_ms: Option<f64>,
     total_ms: f64,
 }
 
@@ -222,16 +220,14 @@ struct ReplayProfileReport {
     from_commit: Option<String>,
     num_commits_requested: Option<u32>,
     checkpoint_every: Option<u32>,
-    verify_state: bool,
-    git_lfs: bool,
-    git_lfs_files_materialized: u64,
+    git_lfs_objects_materialized: u64,
     git_lfs_bytes_materialized: u64,
     plugin_install_ms: f64,
     baseline_seed_parent: Option<String>,
     baseline_seed_ms: f64,
     baseline_seed_files: usize,
     baseline_seed_batches: usize,
-    final_tree_verify_ms: Option<f64>,
+    final_tree_verify_ms: f64,
     replay_elapsed_ms: f64,
     storage_flush_ms: f64,
     commits_replayed: usize,
@@ -355,7 +351,6 @@ where
     let plugin_install_ms = duration_to_ms(plugin_install_started.elapsed());
 
     let mut state = ReplayState::default();
-    let mut expected_state_by_id = HashMap::<String, ExpectedFile>::new();
     let baseline_seed_parent = commits
         .first()
         .and_then(|commit| commit.first_parent.clone());
@@ -364,16 +359,8 @@ where
     let mut baseline_seed_batches = 0usize;
     let seeded_blob_reader = if let Some(parent) = baseline_seed_parent.as_deref() {
         let seed_started = Instant::now();
-        let mut blob_reader = GitBlobReader::spawn(&repo_path, args.git_lfs)?;
-        let seeded = seed_parent_tree(
-            &repo_path,
-            parent,
-            &mut blob_reader,
-            &mut state,
-            &mut expected_state_by_id,
-            args.verify_state,
-            &lix,
-        )?;
+        let mut blob_reader = GitBlobReader::spawn(&repo_path)?;
+        let seeded = seed_parent_tree(&repo_path, parent, &mut blob_reader, &mut state, &lix)?;
         baseline_seed_files = seeded.files;
         baseline_seed_batches = seeded.batches;
         baseline_seed_ms = duration_to_ms(seed_started.elapsed());
@@ -388,12 +375,11 @@ where
     let mut diff_reader = GitDiffTreeReader::spawn(&repo_path, &commits)?;
     let mut blob_reader = match seeded_blob_reader {
         Some(reader) => reader,
-        None => GitBlobReader::spawn(&repo_path, args.git_lfs)?,
+        None => GitBlobReader::spawn(&repo_path)?,
     };
     let mut applied = 0usize;
     let mut marker_only = 0usize;
     let mut changed_paths = 0usize;
-    let mut verified = 0usize;
     let mut phase_totals = ReplayProfilePhaseTotals::default();
     let mut commit_profiles = Vec::<ReplayCommitProfile>::with_capacity(commits.len());
     let checkpoint_every = args.checkpoint_every.map(|interval| interval as usize);
@@ -438,8 +424,6 @@ where
         let inserts = prepared.inserts.len();
         let updates = prepared.updates.len();
         let deletes = prepared.deletes.len();
-        let mut verify_ms = None;
-
         if prepared.deletes.is_empty() && prepared.inserts.is_empty() && prepared.updates.is_empty()
         {
             marker_only += 1;
@@ -466,16 +450,6 @@ where
             None
         };
 
-        if args.verify_state {
-            let verify_started = Instant::now();
-            apply_prepared_to_expected_state(&mut expected_state_by_id, &prepared);
-            verify_commit_changes(&lix, &expected_state_by_id, &prepared, commit_sha)?;
-            let verify_elapsed_ms = duration_to_ms(verify_started.elapsed());
-            phase_totals.verify_ms += verify_elapsed_ms;
-            verify_ms = Some(verify_elapsed_ms);
-            verified += 1;
-        }
-
         let total_ms = duration_to_ms(commit_started.elapsed());
         phase_totals.total_ms += total_ms;
         commit_profiles.push(ReplayCommitProfile {
@@ -497,7 +471,6 @@ where
             execute_ms,
             checkpoint_ms,
             plugin_counters,
-            verify_ms,
             total_ms,
         });
 
@@ -515,23 +488,19 @@ where
 
     diff_reader.finish()?;
     let replay_before_final_verification = replay_started.elapsed();
-    let final_tree_verify_ms = if args.verify_state {
-        let verify_started = Instant::now();
-        verify_final_git_tree(
-            &repo_path,
-            &commits
-                .last()
-                .expect("non-empty replay commits were validated above")
-                .sha,
-            &mut blob_reader,
-            &lix,
-        )?;
-        Some(duration_to_ms(verify_started.elapsed()))
-    } else {
-        None
-    };
+    let verify_started = Instant::now();
+    verify_final_git_tree(
+        &repo_path,
+        &commits
+            .last()
+            .expect("non-empty replay commits were validated above")
+            .sha,
+        &mut blob_reader,
+        &lix,
+    )?;
+    let final_tree_verify_ms = duration_to_ms(verify_started.elapsed());
     let replay_cleanup_started = Instant::now();
-    let git_lfs_files_materialized = blob_reader.git_lfs_files_materialized;
+    let git_lfs_objects_materialized = blob_reader.git_lfs_objects_materialized;
     let git_lfs_bytes_materialized = blob_reader.git_lfs_bytes_materialized;
     blob_reader.finish()?;
     let replay_elapsed_ms =
@@ -554,11 +523,9 @@ where
     println!("[git-replay] commits with marker only: {marker_only}");
     println!("[git-replay] changed paths total: {changed_paths}");
     println!("[git-replay] plugins: {}", args.plugins.as_str());
-    if args.git_lfs {
-        println!(
-            "[git-replay] materialized {git_lfs_files_materialized} Git LFS blobs ({git_lfs_bytes_materialized} bytes)"
-        );
-    }
+    println!(
+        "[git-replay] materialized {git_lfs_objects_materialized} unique Git LFS objects ({git_lfs_bytes_materialized} bytes)"
+    );
     if args.plugins == GitReplayPlugins::All {
         println!(
             "[git-replay] text/CSV/Markdown/Excalidraw plugin setup excluded from replay timing: {plugin_install_ms:.3}ms"
@@ -570,16 +537,7 @@ where
         );
     }
     println!("[git-replay] replay elapsed: {replay_elapsed_ms:.3}ms");
-    if args.verify_state {
-        println!(
-            "[git-replay] verified commits: {verified}/{}",
-            commits.len()
-        );
-        println!(
-            "[git-replay] final Git tree manifest verified in {:.3}ms",
-            final_tree_verify_ms.expect("verification timing should exist")
-        );
-    }
+    println!("[git-replay] final Git tree manifest verified in {final_tree_verify_ms:.3}ms");
     if let Some(profile_path) = &profile_json_path {
         write_profile_report(
             profile_path,
@@ -592,9 +550,7 @@ where
                 from_commit: args.from_commit.clone(),
                 num_commits_requested: args.num_commits,
                 checkpoint_every: args.checkpoint_every,
-                verify_state: args.verify_state,
-                git_lfs: args.git_lfs,
-                git_lfs_files_materialized,
+                git_lfs_objects_materialized,
                 git_lfs_bytes_materialized,
                 plugin_install_ms,
                 baseline_seed_parent,
@@ -822,8 +778,6 @@ fn seed_parent_tree<StorageImpl>(
     parent_commit: &str,
     blob_reader: &mut GitBlobReader,
     state: &mut ReplayState,
-    expected_state_by_id: &mut HashMap<String, ExpectedFile>,
-    verify_state: bool,
     lix: &Lix<StorageImpl>,
 ) -> Result<SeedResult, CliError>
 where
@@ -841,36 +795,18 @@ where
         if pending_bytes > 0
             && pending_bytes.saturating_add(prepared_bytes) > TREE_TRANSACTION_TARGET_BYTES
         {
-            let inserted = flush_seed_batch(
-                &mut pending,
-                expected_state_by_id,
-                verify_state,
-                lix,
-                parent_commit,
-            )?;
+            let inserted = flush_seed_batch(&mut pending, lix, parent_commit)?;
             result.files += inserted;
             result.batches += usize::from(inserted > 0);
         }
         append_prepared_batch(&mut pending, prepared);
         if prepared_blob_bytes(&pending) >= TREE_TRANSACTION_TARGET_BYTES {
-            let inserted = flush_seed_batch(
-                &mut pending,
-                expected_state_by_id,
-                verify_state,
-                lix,
-                parent_commit,
-            )?;
+            let inserted = flush_seed_batch(&mut pending, lix, parent_commit)?;
             result.files += inserted;
             result.batches += usize::from(inserted > 0);
         }
     }
-    let inserted = flush_seed_batch(
-        &mut pending,
-        expected_state_by_id,
-        verify_state,
-        lix,
-        parent_commit,
-    )?;
+    let inserted = flush_seed_batch(&mut pending, lix, parent_commit)?;
     result.files += inserted;
     result.batches += usize::from(inserted > 0);
     Ok(result)
@@ -884,8 +820,6 @@ fn append_prepared_batch(target: &mut PreparedBatch, mut source: PreparedBatch) 
 
 fn flush_seed_batch<StorageImpl>(
     pending: &mut PreparedBatch,
-    expected_state_by_id: &mut HashMap<String, ExpectedFile>,
-    verify_state: bool,
     lix: &Lix<StorageImpl>,
     parent_commit: &str,
 ) -> Result<usize, CliError>
@@ -898,10 +832,6 @@ where
     let prepared = std::mem::take(pending);
     let statements = build_replay_commit_statements(&prepared, DEFAULT_INSERT_BATCH_ROWS);
     execute_statements_as_transaction(lix, &statements, parent_commit)?;
-    if verify_state {
-        apply_prepared_to_expected_state(expected_state_by_id, &prepared);
-        verify_commit_changes(lix, expected_state_by_id, &prepared, parent_commit)?;
-    }
     Ok(prepared.inserts.len())
 }
 
@@ -1213,7 +1143,7 @@ struct GitBlobReader {
     repo_path: PathBuf,
     git_lfs_objects_path: Option<PathBuf>,
     git_lfs_oids_materialized: HashSet<String>,
-    git_lfs_files_materialized: u64,
+    git_lfs_objects_materialized: u64,
     git_lfs_bytes_materialized: u64,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
@@ -1280,10 +1210,8 @@ fn parse_git_lfs_pointer(bytes: &[u8]) -> Result<Option<GitLfsPointer>, CliError
 }
 
 impl GitBlobReader {
-    fn spawn(repo_path: &Path, git_lfs: bool) -> Result<Self, CliError> {
-        let git_lfs_objects_path = git_lfs
-            .then(|| git_lfs_objects_path(repo_path))
-            .transpose()?;
+    fn spawn(repo_path: &Path) -> Result<Self, CliError> {
+        let git_lfs_objects_path = Some(git_lfs_objects_path(repo_path)?);
         let mut command = Command::new("git");
         command
             .arg("-C")
@@ -1317,7 +1245,7 @@ impl GitBlobReader {
             repo_path: repo_path.to_path_buf(),
             git_lfs_objects_path,
             git_lfs_oids_materialized: HashSet::new(),
-            git_lfs_files_materialized: 0,
+            git_lfs_objects_materialized: 0,
             git_lfs_bytes_materialized: 0,
             child: Some(child),
             stdin: Some(stdin),
@@ -1432,7 +1360,7 @@ impl GitBlobReader {
             .join(&pointer.oid);
         let materialized = fs::read(&object_path).map_err(|source| {
             CliError::msg(format!(
-                "Git LFS object {} is unavailable ({source}); run `git -C {} lfs fetch` before replay",
+                "Git LFS object {} is unavailable ({source}); fetch every historical object before replay with `git -C {} lfs fetch --all`",
                 pointer.oid,
                 self.repo_path.display()
             ))
@@ -1453,7 +1381,7 @@ impl GitBlobReader {
             )));
         }
         if self.git_lfs_oids_materialized.insert(pointer.oid) {
-            self.git_lfs_files_materialized = self.git_lfs_files_materialized.saturating_add(1);
+            self.git_lfs_objects_materialized = self.git_lfs_objects_materialized.saturating_add(1);
             self.git_lfs_bytes_materialized =
                 self.git_lfs_bytes_materialized.saturating_add(pointer.size);
         }
@@ -1859,14 +1787,29 @@ fn build_replay_commit_statements(
         statements.push(SqlStatement { sql, params });
     }
 
-    for row in &batch.updates {
+    for update_chunk in batch.updates.chunks(insert_batch_size) {
+        if update_chunk.is_empty() {
+            continue;
+        }
+        let mut params = Vec::<Value>::with_capacity(update_chunk.len() * 4);
+        let values_sql = update_chunk
+            .iter()
+            .map(|row| {
+                params.push(Value::Text(row.id.clone()));
+                params.push(Value::Text(row.path.clone()));
+                params.push(value_from_optional_blob(row.data.as_ref()));
+                params.push(git_file_metadata_value(row));
+                "(?, ?, ?, ?)"
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         statements.push(SqlStatement {
-            sql: "UPDATE lix_file SET data = ?, lixcol_metadata = ? WHERE id = ?".to_string(),
-            params: vec![
-                value_from_optional_blob(row.data.as_ref()),
-                git_file_metadata_value(row),
-                Value::Text(row.id.clone()),
-            ],
+            sql: format!(
+                "INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES {values_sql} \
+                 ON CONFLICT(id) DO UPDATE SET data = excluded.data, \
+                 lixcol_metadata = excluded.lixcol_metadata"
+            ),
+            params,
         });
     }
 
@@ -1886,118 +1829,6 @@ fn git_file_metadata_value(row: &WriteRow) -> Value {
         "git_mode": row.git_mode,
         "git_oid": row.git_oid,
     }))
-}
-
-fn apply_prepared_to_expected_state(
-    expected_state_by_id: &mut HashMap<String, ExpectedFile>,
-    prepared: &PreparedBatch,
-) {
-    for id in &prepared.deletes {
-        expected_state_by_id.remove(id);
-    }
-
-    for row in prepared.inserts.iter().chain(prepared.updates.iter()) {
-        expected_state_by_id.insert(
-            row.id.clone(),
-            ExpectedFile {
-                path: row.path.clone(),
-                sha256: row.data.as_deref().map(sha256_hex),
-                size_bytes: row.data.as_ref().map(Vec::len),
-                git_mode: row.git_mode.clone(),
-                git_oid: row.git_oid.clone(),
-            },
-        );
-    }
-}
-
-fn verify_commit_changes<StorageImpl>(
-    lix: &Lix<StorageImpl>,
-    expected_state_by_id: &HashMap<String, ExpectedFile>,
-    prepared: &PreparedBatch,
-    commit_sha: &str,
-) -> Result<(), CliError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    let affected_ids = prepared
-        .deletes
-        .iter()
-        .chain(prepared.inserts.iter().map(|row| &row.id))
-        .chain(prepared.updates.iter().map(|row| &row.id))
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-
-    for affected_chunk in affected_ids.chunks(500) {
-        let placeholders = vec!["?"; affected_chunk.len()].join(", ");
-        let sql = format!(
-            "SELECT id, path, data, lixcol_metadata FROM lix_file \
-             WHERE id IN ({placeholders})"
-        );
-        let params = affected_chunk
-            .iter()
-            .cloned()
-            .map(Value::Text)
-            .collect::<Vec<_>>();
-        let result = db::block_on(lix.execute(&sql, &params)).map_err(|err| {
-            CliError::msg(format!(
-                "failed to query changed replay state for verification: {err}"
-            ))
-        })?;
-        let mut seen = HashSet::<String>::new();
-        for (index, row) in result.rows().iter().enumerate() {
-            if row.values().len() < 4 {
-                return Err(CliError::msg(format!(
-                    "state mismatch at {commit_sha}: changed row {index} has fewer than 4 columns"
-                )));
-            }
-
-            let id = value_to_string(
-                row.get_index(0)
-                    .ok_or_else(|| CliError::msg(format!("missing verify.id[{index}]")))?,
-                &format!("verify.id[{index}]"),
-            )?;
-            let path = value_to_string(
-                row.get_index(1)
-                    .ok_or_else(|| CliError::msg(format!("missing verify.path[{index}]")))?,
-                &format!("verify.path[{index}]"),
-            )?;
-            let data = value_to_optional_blob(
-                row.get_index(2)
-                    .ok_or_else(|| CliError::msg(format!("missing verify.data[{index}]")))?,
-                &format!("verify.data[{index}]"),
-            )?;
-            let metadata = value_to_json(
-                row.get_index(3)
-                    .ok_or_else(|| CliError::msg(format!("missing verify.metadata[{index}]")))?,
-                &format!("verify.metadata[{index}]"),
-            )?;
-
-            let expected = expected_state_by_id.get(&id).ok_or_else(|| {
-                CliError::msg(format!(
-                    "state mismatch at {commit_sha}: deleted file id remains in Lix state: {id}"
-                ))
-            })?;
-            if expected.path != path {
-                return Err(CliError::msg(format!(
-                    "state mismatch at {commit_sha}: path differs for id {id} (lix={path}, expected={})",
-                    expected.path
-                )));
-            }
-            verify_file_manifest_entry(&path, data, &metadata, expected, commit_sha)?;
-            seen.insert(id);
-        }
-        for id in affected_chunk {
-            if expected_state_by_id.contains_key(id) && !seen.contains(id) {
-                return Err(CliError::msg(format!(
-                    "state mismatch at {commit_sha}: changed file id is missing from Lix state: {id}"
-                )));
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn verify_final_git_tree<StorageImpl>(
@@ -2675,8 +2506,7 @@ mod tests {
             .expect("LFS object directory should be created");
         fs::write(&object, content).expect("LFS object should write");
 
-        let mut reader =
-            GitBlobReader::spawn(&repo, true).expect("persistent blob reader should start");
+        let mut reader = GitBlobReader::spawn(&repo).expect("persistent blob reader should start");
         let blobs = reader
             .read_blobs(&[git_oid.to_string()])
             .expect("LFS pointer should materialize");
@@ -2684,21 +2514,132 @@ mod tests {
             blobs.get(git_oid).map(Vec::as_slice),
             Some(content.as_slice())
         );
-        assert_eq!(reader.git_lfs_files_materialized, 1);
+        assert_eq!(reader.git_lfs_objects_materialized, 1);
         assert_eq!(reader.git_lfs_bytes_materialized, content.len() as u64);
         reader
             .finish()
             .expect("persistent blob reader should finish");
 
         fs::write(&object, vec![b'x'; content.len()]).expect("corrupt LFS object should write");
-        let mut reader =
-            GitBlobReader::spawn(&repo, true).expect("corrupt-object reader should start");
+        let mut reader = GitBlobReader::spawn(&repo).expect("corrupt-object reader should start");
         let error = reader
             .read_blobs(&[git_oid.to_string()])
             .expect_err("same-size corrupt LFS content must fail its SHA-256 check");
         assert!(error.to_string().contains("SHA-256 verification"));
         drop(reader);
         fs::remove_dir_all(&repo).expect("fixture repository should be removable");
+    }
+
+    #[test]
+    fn replayed_lfs_history_survives_without_git_or_lfs_storage() {
+        let fixture = unique_temp_dir();
+        let repo = fixture.join("repo");
+        let output = fixture.join("replay.rocksdb");
+        fs::create_dir_all(&repo).expect("fixture repository should be created");
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        git_ok(&repo, &["config", "user.email", "replay@example.test"]);
+        git_ok(&repo, &["config", "user.name", "Replay Test"]);
+
+        let versions = [
+            b"materialized LFS version A".as_slice(),
+            b"materialized LFS version B".as_slice(),
+        ];
+        let mut git_commits = Vec::new();
+        for (index, content) in versions.iter().enumerate() {
+            let lfs_oid = sha256_hex(content);
+            let pointer = format!(
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{lfs_oid}\nsize {}\n",
+                content.len()
+            );
+            fs::write(repo.join("asset.bin"), pointer).expect("pointer fixture should write");
+            let object = repo
+                .join(".git/lfs/objects")
+                .join(&lfs_oid[..2])
+                .join(&lfs_oid[2..4])
+                .join(&lfs_oid);
+            fs::create_dir_all(object.parent().expect("LFS object has parent"))
+                .expect("LFS object directory should be created");
+            fs::write(object, content).expect("LFS object should write");
+            git_ok(&repo, &["add", "asset.bin"]);
+            git_ok(&repo, &["commit", "-qm", &format!("LFS version {index}")]);
+            git_commits.push(
+                run_git_text(&repo, &["rev-parse".to_string(), "HEAD".to_string()], None)
+                    .expect("commit id should resolve")
+                    .trim()
+                    .to_string(),
+            );
+        }
+
+        run(ExpGitReplayArgs {
+            repo_path: repo.clone(),
+            output_path: output.clone(),
+            storage: GitReplayStorage::Rocksdb,
+            plugins: GitReplayPlugins::None,
+            branch: "main".to_string(),
+            from_commit: None,
+            num_commits: None,
+            checkpoint_every: None,
+            force: false,
+            profile_json: None,
+        })
+        .expect("LFS history replay should complete");
+
+        fs::remove_dir_all(&repo).expect("Git and LFS source should be removable");
+        let storage = RocksDB::open(&output).expect("replay RocksDB should reopen without Git");
+        let lix = db::block_on(open_lix_with_storage(storage))
+            .expect("replay Lix should reopen without Git");
+        let marker_rows = db::block_on(lix.execute(
+            "SELECT value, lixcol_observed_commit_id \
+             FROM lix_key_value_history() \
+             WHERE key = ? AND NOT lixcol_is_deleted",
+            &[Value::Text(GIT_REPLAY_MARKER_KEY.to_string())],
+        ))
+        .expect("replay markers should be queryable without Git");
+        let mut lix_commit_by_git_sha = HashMap::new();
+        for (index, row) in marker_rows.rows().iter().enumerate() {
+            let marker = value_to_json(
+                row.get_index(0)
+                    .unwrap_or_else(|| panic!("missing marker value at row {index}")),
+                "historical replay marker",
+            )
+            .expect("historical replay marker should be JSON");
+            let git_sha = marker
+                .get("sha")
+                .and_then(serde_json::Value::as_str)
+                .expect("historical replay marker should contain Git SHA");
+            let lix_commit = value_to_string(
+                row.get_index(1)
+                    .unwrap_or_else(|| panic!("missing observed commit at row {index}")),
+                "historical replay commit",
+            )
+            .expect("historical replay commit should be text");
+            lix_commit_by_git_sha.insert(git_sha.to_string(), lix_commit);
+        }
+
+        for ((git_sha, expected), version_index) in
+            git_commits.iter().zip(versions.iter()).zip(0usize..)
+        {
+            let lix_commit = lix_commit_by_git_sha
+                .get(git_sha)
+                .unwrap_or_else(|| panic!("missing Lix commit for Git version {version_index}"));
+            let historical = db::block_on(lix.execute(
+                "SELECT data FROM lix_file_history(?) \
+                 WHERE path = '/asset.bin' AND lixcol_depth = 0 AND NOT lixcol_is_deleted",
+                &[Value::Text(lix_commit.clone())],
+            ))
+            .expect("historical LFS bytes should query without Git");
+            assert_eq!(historical.rows().len(), 1);
+            let actual = value_to_optional_blob(
+                historical.rows()[0]
+                    .get_index(0)
+                    .expect("historical LFS row should contain data"),
+                "historical LFS bytes",
+            )
+            .expect("historical LFS data should be a blob");
+            assert_eq!(actual, Some(*expected));
+        }
+        db::block_on(lix.close()).expect("reopened Lix should close");
+        fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
     }
 
     #[test]
@@ -2927,8 +2868,6 @@ mod tests {
             from_commit: None,
             num_commits: None,
             checkpoint_every: None,
-            verify_state: false,
-            git_lfs: false,
             force: true,
             profile_json: None,
         });
@@ -2963,7 +2902,7 @@ mod tests {
     }
 
     #[test]
-    fn build_replay_commit_statements_omits_path_for_stable_updates() {
+    fn build_replay_commit_statements_batches_stable_id_upserts() {
         let batch = PreparedBatch {
             deletes: Vec::new(),
             inserts: Vec::new(),
@@ -2981,14 +2920,15 @@ mod tests {
         assert_eq!(statements.len(), 1);
         assert_eq!(
             statements[0].sql,
-            "UPDATE lix_file SET data = ?, lixcol_metadata = ? WHERE id = ?"
+            "INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data, lixcol_metadata = excluded.lixcol_metadata"
         );
         assert_eq!(
             statements[0].params,
             vec![
+                Value::Text("/src/main.ts".to_string()),
+                Value::Text("/src/main.ts".to_string()),
                 Value::Blob(b"hello".to_vec().into()),
                 Value::Json(json!({"git_mode": "100755", "git_oid": "a".repeat(40)})),
-                Value::Text("/src/main.ts".to_string())
             ]
         );
     }
@@ -3172,8 +3112,7 @@ mod tests {
             "fixture must exercise a second request batch"
         );
 
-        let mut reader =
-            GitBlobReader::spawn(&repo, false).expect("persistent blob reader should start");
+        let mut reader = GitBlobReader::spawn(&repo).expect("persistent blob reader should start");
         let blobs = reader
             .read_blobs(&blob_ids)
             .expect("batched blob requests should preserve every response");
@@ -3231,8 +3170,6 @@ mod tests {
             from_commit: None,
             num_commits: None,
             checkpoint_every: Some(1),
-            verify_state: true,
-            git_lfs: false,
             force: false,
             profile_json: Some(profile.clone()),
         })
@@ -3348,8 +3285,6 @@ mod tests {
                     from_commit: None,
                     num_commits: Some(1),
                     checkpoint_every: None,
-                    verify_state: true,
-                    git_lfs: false,
                     force: false,
                     profile_json: Some(profile.clone()),
                 })
@@ -3449,8 +3384,6 @@ mod tests {
             from_commit: None,
             num_commits: Some(100),
             checkpoint_every: None,
-            verify_state: true,
-            git_lfs: false,
             force: false,
             profile_json: Some(profile.clone()),
         })
@@ -3523,7 +3456,7 @@ mod tests {
             commits[1]
                 .get("statement_count")
                 .and_then(serde_json::Value::as_u64),
-            Some(TEXT_FILES as u64 + 1),
+            Some(2),
             "bulk updates and the replay marker must share one atomic batch"
         );
 
@@ -3597,8 +3530,6 @@ mod tests {
             from_commit: None,
             num_commits: Some(2),
             checkpoint_every: None,
-            verify_state: true,
-            git_lfs: false,
             force: false,
             profile_json: Some(profile.clone()),
         })

@@ -1344,21 +1344,20 @@ fn fast_file_path_write_shape(
         None => crate::sql2::providers::FastLixFilePathWriteConflict::None,
         Some(conflict) => fast_file_path_conflict_shape(conflict)?,
     };
-    if conflict == crate::sql2::providers::FastLixFilePathWriteConflict::UpdateDataAndMetadata
-        && metadata_index.is_none()
-    {
+    if conflict.updates_metadata() && metadata_index.is_none() {
         return None;
     }
-    if conflict == crate::sql2::providers::FastLixFilePathWriteConflict::UpdateData
-        && metadata_index.is_some()
-    {
+    if conflict.updates_data_only() && metadata_index.is_some() {
         return None;
     }
     // DataFusion ignores insert values for rows skipped by DO NOTHING. Keep
     // metadata-bearing variants there so invalid metadata on an existing row
     // retains that behavior without complicating the hot upsert path.
-    if conflict == crate::sql2::providers::FastLixFilePathWriteConflict::DoNothing
-        && metadata_index.is_some()
+    if matches!(
+        conflict,
+        crate::sql2::providers::FastLixFilePathWriteConflict::DoNothing
+            | crate::sql2::providers::FastLixFilePathWriteConflict::IdDoNothing
+    ) && metadata_index.is_some()
     {
         return None;
     }
@@ -1374,13 +1373,19 @@ fn fast_file_path_write_shape(
 fn fast_file_path_conflict_shape(
     conflict: &BoundInsertConflict,
 ) -> Option<crate::sql2::providers::FastLixFilePathWriteConflict> {
-    if conflict.target_columns.len() != 1 || conflict.target_columns[0].name != "path" {
+    if conflict.target_columns.len() != 1 {
+        return None;
+    }
+    let by_id = conflict.target_columns[0].name == "id";
+    if !by_id && conflict.target_columns[0].name != "path" {
         return None;
     }
     match &conflict.action {
-        BoundConflictAction::DoNothing => {
-            Some(crate::sql2::providers::FastLixFilePathWriteConflict::DoNothing)
-        }
+        BoundConflictAction::DoNothing => Some(if by_id {
+            crate::sql2::providers::FastLixFilePathWriteConflict::IdDoNothing
+        } else {
+            crate::sql2::providers::FastLixFilePathWriteConflict::DoNothing
+        }),
         BoundConflictAction::DoUpdate { assignments } => {
             let assigns_excluded_column = |assignment: &BoundAssignment, name: &str| {
                 assignment.column.name == name
@@ -1390,7 +1395,11 @@ fn fast_file_path_conflict_shape(
                     )
             };
             if assignments.len() == 1 && assigns_excluded_column(&assignments[0], "data") {
-                return Some(crate::sql2::providers::FastLixFilePathWriteConflict::UpdateData);
+                return Some(if by_id {
+                    crate::sql2::providers::FastLixFilePathWriteConflict::IdUpdateData
+                } else {
+                    crate::sql2::providers::FastLixFilePathWriteConflict::UpdateData
+                });
             }
             if assignments.len() == 2
                 && assignments
@@ -1400,9 +1409,11 @@ fn fast_file_path_conflict_shape(
                     .iter()
                     .any(|assignment| assigns_excluded_column(assignment, "lixcol_metadata"))
             {
-                return Some(
-                    crate::sql2::providers::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
-                );
+                return Some(if by_id {
+                    crate::sql2::providers::FastLixFilePathWriteConflict::IdUpdateDataAndMetadata
+                } else {
+                    crate::sql2::providers::FastLixFilePathWriteConflict::UpdateDataAndMetadata
+                });
             }
             None
         }
