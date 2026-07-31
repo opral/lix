@@ -1998,18 +1998,6 @@ fn stage_incremental_collection_controls(
     for (delta, previous) in deltas.iter().zip(previous_values) {
         if delta.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
             let scope = collection_scope_from_entity_pk(delta.entity_pk)?;
-            let control = controls
-                .get_mut(&scope)
-                .expect("collection marker target was loaded above");
-            if delta.deleted {
-                return Err(head_value_error(
-                    "collection-generation controls cannot be tombstoned",
-                ));
-            }
-            control.active_generation = delta.commit_id.ok_or_else(|| {
-                head_value_error("tracked collection-generation row lacks commit_id")
-            })?;
-            control.live_count = 0;
             dirty_scopes.insert(scope);
             continue;
         }
@@ -2018,14 +2006,23 @@ fn stage_incremental_collection_controls(
             .as_deref()
             .map(decode_head_value)
             .transpose()?
-            .is_some_and(|value| !value.deleted);
-        let schema_control = controls
-            .get(&(delta.schema_key.to_string(), None))
-            .expect("row schema collection scope was loaded above");
-        let belongs_to_active_generation = schema_control.active_generation == branch_generation
-            || delta
-                .commit_id
-                .is_some_and(|commit_id| commit_id > schema_control.active_generation);
+            .is_some_and(|value| {
+                !value.deleted
+                    && row_belongs_to_active_collection_generation(
+                        &controls,
+                        branch_generation,
+                        delta.schema_key,
+                        delta.file_id,
+                        value.commit_id,
+                    )
+            });
+        let belongs_to_active_generation = row_belongs_to_active_collection_generation(
+            &controls,
+            branch_generation,
+            delta.schema_key,
+            delta.file_id,
+            delta.commit_id,
+        );
         let next_live = !delta.deleted && belongs_to_active_generation;
         if previous_live == next_live {
             continue;
@@ -2084,6 +2081,57 @@ fn stage_incremental_collection_controls(
         )?;
     }
     Ok(())
+}
+
+fn apply_incremental_collection_generation_deltas(
+    controls: &mut BTreeMap<(String, Option<String>), HotCollectionControl>,
+    deltas: &[&CurrentStateDeltaRef<'_>],
+) -> Result<(), LixError> {
+    use crate::collection_generation::{
+        COLLECTION_GENERATION_SCHEMA_KEY, collection_scope_from_entity_pk,
+    };
+
+    for delta in deltas {
+        if delta.schema_key != COLLECTION_GENERATION_SCHEMA_KEY {
+            continue;
+        }
+        if delta.deleted {
+            return Err(head_value_error(
+                "collection-generation controls cannot be tombstoned",
+            ));
+        }
+        let scope = collection_scope_from_entity_pk(delta.entity_pk)?;
+        let control = controls
+            .get_mut(&scope)
+            .expect("collection marker target was loaded above");
+        control.active_generation = delta
+            .commit_id
+            .ok_or_else(|| head_value_error("tracked collection-generation row lacks commit_id"))?;
+        control.live_count = 0;
+    }
+    Ok(())
+}
+
+fn row_belongs_to_active_collection_generation(
+    controls: &BTreeMap<(String, Option<String>), HotCollectionControl>,
+    branch_generation: CommitId,
+    schema_key: &str,
+    file_id: Option<&str>,
+    commit_id: Option<CommitId>,
+) -> bool {
+    [
+        Some((schema_key.to_string(), None)),
+        file_id.map(|file_id| (schema_key.to_string(), Some(file_id.to_string()))),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|scope| {
+        let control = controls
+            .get(&scope)
+            .expect("row collection scope was loaded above");
+        control.active_generation == branch_generation
+            || commit_id.is_some_and(|commit_id| commit_id > control.active_generation)
+    })
 }
 
 fn stage_complete_collection_controls(
@@ -4230,23 +4278,28 @@ where
                     )
                 }),
         );
+        // Collection-generation markers retire every older member in their
+        // scope atomically. Apply them before interpreting previous row values
+        // so checkpoint-expanded tombstones do not decrement the freshly reset
+        // live count.
+        apply_incremental_collection_generation_deltas(&mut collection_controls, &sorted)?;
         for (delta, previous) in sorted.iter().zip(&mut previous_values) {
             if delta.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
-                continue;
-            }
-            let Some(control) = collection_controls.get(&(delta.schema_key.to_string(), None))
-            else {
-                continue;
-            };
-            if control.active_generation == generation {
                 continue;
             }
             let belongs_to_retired_generation = previous
                 .as_deref()
                 .map(decode_head_value)
                 .transpose()?
-                .and_then(|value| value.commit_id)
-                .is_none_or(|commit_id| commit_id <= control.active_generation);
+                .is_some_and(|value| {
+                    !row_belongs_to_active_collection_generation(
+                        &collection_controls,
+                        generation,
+                        delta.schema_key,
+                        delta.file_id,
+                        value.commit_id,
+                    )
+                });
             if belongs_to_retired_generation {
                 *previous = None;
             }
