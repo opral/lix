@@ -5,7 +5,7 @@
 )]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Bound, Range};
 
 use crate::changelog::CommitId;
@@ -302,6 +302,38 @@ pub(crate) struct AddressableCommitDeltaStage {
     /// Final ids by input delta ordinal. Non-addressable entries retain the
     /// nil sentinel and never require a second per-row index.
     pub(crate) assigned_change_ids: Vec<crate::changelog::ChangeId>,
+}
+
+/// Compact assignment map for an already ordered, fully addressable commit.
+///
+/// Segment lengths reconstruct every direct change id in source order. This
+/// avoids retaining one UUID per row while the prepared batch and backend
+/// write batch are simultaneously live.
+pub(crate) struct OrderedAddressableCommitDeltaStage {
+    commit_id: CommitId,
+    segment_row_counts: Vec<u8>,
+    row_count: usize,
+}
+
+impl OrderedAddressableCommitDeltaStage {
+    pub(crate) fn assigned_change_ids(
+        &self,
+    ) -> impl Iterator<Item = crate::changelog::ChangeId> + '_ {
+        let commit_id = self.commit_id;
+        self.segment_row_counts
+            .iter()
+            .enumerate()
+            .flat_map(move |(segment_index, &row_count)| {
+                (0..row_count).map(move |ordinal| {
+                    addressable_change_id(commit_id, segment_index, usize::from(ordinal))
+                        .expect("staged ordered address is inside the direct change-id space")
+                })
+            })
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.row_count
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -721,6 +753,224 @@ pub(crate) fn stage_addressable_commit_deltas(
         ));
     }
     stage_commit_deltas_inner(writes, deltas, Some(addressable))
+}
+
+/// Streams an already ordered, fully addressable commit into bounded segments.
+///
+/// The generic path below supports arbitrary input order and mixed locator
+/// policies, so it must retain transaction-wide encoded arenas, payload
+/// descriptors, sort tuples, and UUID assignments. Certified SQL creates are
+/// already strictly ordered and every row receives a direct address. For that
+/// shape, keeping only one candidate segment plus the compact manifest removes
+/// the dominant peak-memory overlap before backend commit.
+pub(crate) fn stage_ordered_addressable_commit_deltas<'a, I>(
+    writes: &mut StorageWriteSet,
+    deltas: I,
+) -> Result<Option<OrderedAddressableCommitDeltaStage>, LixError>
+where
+    I: ExactSizeIterator<Item = Result<TrackedStateCommitDeltaRef<'a>, LixError>> + Clone,
+{
+    let row_count = deltas.len();
+    let mut probe = deltas.clone();
+    let Some(first) = probe.next().transpose()? else {
+        return Ok(Some(OrderedAddressableCommitDeltaStage {
+            commit_id: CommitId::default(),
+            segment_row_counts: Vec::new(),
+            row_count: 0,
+        }));
+    };
+    let commit_id = first.delta.commit_id;
+    let mut previous_key = TrackedStateKeyRef {
+        schema_key: first.delta.schema_key,
+        file_id: first.delta.file_id,
+        entity_pk: first.delta.entity_pk,
+    };
+    for delta in probe {
+        let delta = delta?;
+        if delta.delta.commit_id != commit_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state cannot pack deltas from different commits together",
+            ));
+        }
+        let key = TrackedStateKeyRef {
+            schema_key: delta.delta.schema_key,
+            file_id: delta.delta.file_id,
+            entity_pk: delta.delta.entity_pk,
+        };
+        if compare_tracked_state_key_refs(previous_key, key) != std::cmp::Ordering::Less {
+            return Ok(None);
+        }
+        previous_key = key;
+    }
+
+    let mut compressor = crate::compression::ZstdLevel1Compressor::new().map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("tracked_state commit_delta compressor initialization failed: {error}"),
+        )
+    })?;
+    let mut source = deltas;
+    let mut pending = VecDeque::with_capacity(COMMIT_DELTA_SEGMENT_MAX_ROWS);
+    let mut first_segment = None::<(CommitDeltaSegmentBounds, Vec<u8>)>;
+    let mut manifest = CommitDeltaManifest {
+        inline_segment: Vec::new(),
+        segments: Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS)),
+    };
+    let mut segment_row_counts = Vec::with_capacity(manifest.segments.capacity());
+    writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, 1, 0);
+
+    while !pending.is_empty() || source.len() > 0 {
+        while pending.len() < COMMIT_DELTA_SEGMENT_MAX_ROWS {
+            let Some(delta) = source.next() else {
+                break;
+            };
+            pending.push_back(delta?);
+        }
+        let segment_index = segment_row_counts.len();
+        let mut candidate_len = pending.len();
+        let (bounds, encoded) = loop {
+            match encode_ordered_addressable_commit_delta_segment(
+                commit_id,
+                segment_index,
+                pending.iter().take(candidate_len).copied(),
+                candidate_len,
+                &mut compressor,
+            ) {
+                Ok((bounds, encoded))
+                    if encoded.len() <= COMMIT_DELTA_SEGMENT_TARGET_BYTES || candidate_len == 1 =>
+                {
+                    break (bounds, encoded);
+                }
+                Ok(_) | Err(CommitDeltaSegmentEncodeError::SidecarTooLarge)
+                    if candidate_len > 1 =>
+                {
+                    candidate_len = candidate_len.div_ceil(2);
+                }
+                Err(error) => return Err(error.into_lix_error()),
+                Ok(_) => unreachable!("single-row segment exits through the guarded success arm"),
+            }
+        };
+        let row_count_u8 =
+            u8::try_from(candidate_len).expect("commit-delta segment row count fits u8");
+        segment_row_counts.push(row_count_u8);
+        for _ in 0..candidate_len {
+            pending.pop_front();
+        }
+
+        if segment_index == 0 {
+            first_segment = Some((bounds, encoded));
+            continue;
+        }
+        if segment_index == 1 {
+            writes.reserve_space(
+                TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+                row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
+                0,
+            );
+            let (first_bounds, first_encoded) = first_segment
+                .take()
+                .expect("the second segment follows one retained first segment");
+            manifest.segments.push(first_bounds);
+            writes.put(
+                TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+                key(commit_delta_segment_key(commit_id, 0)?),
+                value(first_encoded),
+            );
+        }
+        manifest.segments.push(bounds);
+        writes.put(
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+            key(commit_delta_segment_key(commit_id, segment_index)?),
+            value(encoded),
+        );
+    }
+
+    if segment_row_counts.len() == 1 {
+        let (_, inline_segment) = first_segment
+            .take()
+            .expect("one ordered segment remains inline in its manifest");
+        manifest.inline_segment = inline_segment;
+    }
+    writes.put(
+        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        key(commit_delta_manifest_key(commit_id)),
+        value(encode_commit_delta_manifest(&manifest)?),
+    );
+    Ok(Some(OrderedAddressableCommitDeltaStage {
+        commit_id,
+        segment_row_counts,
+        row_count,
+    }))
+}
+
+fn compare_tracked_state_key_refs(
+    left: TrackedStateKeyRef<'_>,
+    right: TrackedStateKeyRef<'_>,
+) -> std::cmp::Ordering {
+    left.schema_key
+        .cmp(right.schema_key)
+        .then_with(|| left.file_id.cmp(&right.file_id))
+        .then_with(|| left.entity_pk.cmp(right.entity_pk))
+}
+
+fn encode_ordered_addressable_commit_delta_segment<'a>(
+    commit_id: CommitId,
+    segment_index: usize,
+    deltas: impl Iterator<Item = TrackedStateCommitDeltaRef<'a>>,
+    row_count: usize,
+    compressor: &mut crate::compression::ZstdLevel1Compressor,
+) -> Result<(CommitDeltaSegmentBounds, Vec<u8>), CommitDeltaSegmentEncodeError> {
+    let mut entries = TrackedStateMutationBatchBuilder::with_row_capacity(row_count);
+    let mut payloads = Vec::with_capacity(row_count);
+    for (ordinal, delta) in deltas.enumerate() {
+        let change_id = addressable_change_id(commit_id, segment_index, ordinal)
+            .map_err(CommitDeltaSegmentEncodeError::Codec)?;
+        entries.push(
+            TrackedStateKeyRef {
+                schema_key: delta.delta.schema_key,
+                file_id: delta.delta.file_id,
+                entity_pk: delta.delta.entity_pk,
+            },
+            TrackedStateIndexValueRef {
+                change_id,
+                commit_id,
+                deleted: delta.delta.deleted,
+                created_at: delta.delta.created_at,
+                updated_at: delta.delta.updated_at,
+            },
+        );
+        payloads.push(CommitDeltaPayloadRef {
+            snapshot: delta.snapshot,
+            metadata: delta.metadata,
+            origin_key: delta.origin_key,
+            authored: delta.authored,
+            certified: delta.certified,
+        });
+    }
+    let entries = entries
+        .finish()
+        .into_mutations()
+        .into_iter()
+        .map(|mutation| EncodedLeafEntry {
+            key: mutation.encoded_key,
+            value: mutation.encoded_value,
+        })
+        .collect::<Vec<_>>();
+    let bounds = CommitDeltaSegmentBounds {
+        first_key: entries
+            .first()
+            .expect("ordered commit-delta segment is nonempty")
+            .key
+            .to_vec(),
+        last_key: entries
+            .last()
+            .expect("ordered commit-delta segment is nonempty")
+            .key
+            .to_vec(),
+    };
+    let encoded = try_encode_commit_delta_segment_with_payloads(&entries, &payloads, compressor)?;
+    Ok((bounds, encoded))
 }
 
 fn stage_commit_deltas_inner(
@@ -3020,15 +3270,14 @@ fn encode_commit_delta_segment_layout(
             debug_assert!(payload.authored);
             payload_bytes.push(COMMIT_DELTA_PAYLOAD_CERTIFIED_REF);
             if payload.origin_key.is_some() {
-                payload_bytes.extend_from_slice(
-                    &storage_codec::encode(
-                        "tracked_state indexed certified commit_delta payload",
-                        &CommitDeltaCertifiedPayloadRef {
-                            origin_key: payload.origin_key,
-                        },
-                    )
-                    .expect("certified commit-delta payload refs are infallible to encode"),
-                );
+                storage_codec::append(
+                    "tracked_state indexed certified commit_delta payload",
+                    &mut payload_bytes,
+                    &CommitDeltaCertifiedPayloadRef {
+                        origin_key: payload.origin_key,
+                    },
+                )
+                .map_err(CommitDeltaSegmentEncodeError::Codec)?;
             }
         } else if payload.authored {
             payload_bytes.push(COMMIT_DELTA_PAYLOAD_AUTHORED);
@@ -3037,13 +3286,12 @@ fn encode_commit_delta_segment_layout(
                 metadata: payload.metadata,
                 origin_key: payload.origin_key,
             };
-            payload_bytes.extend_from_slice(
-                &storage_codec::encode(
-                    "tracked_state indexed authored commit_delta payload",
-                    &authored,
-                )
-                .expect("commit-delta payload refs are infallible to encode"),
-            );
+            storage_codec::append(
+                "tracked_state indexed authored commit_delta payload",
+                &mut payload_bytes,
+                &authored,
+            )
+            .map_err(CommitDeltaSegmentEncodeError::Codec)?;
         } else {
             let value = decode_value(&entry.value)
                 .expect("commit-delta entries were encoded by the mutation builder");
@@ -4001,6 +4249,93 @@ mod tests {
             .expect("direct address batch should read");
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0], loaded);
+    }
+
+    #[tokio::test]
+    async fn ordered_addressable_commit_delta_streams_segment_assignments() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generic_storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_5678_0000_0000,
+        ));
+        let mut fixtures = packed_commit_delta_fixtures();
+        fixtures.sort_unstable_by_key(CommitDeltaFixture::key);
+        let deltas = fixtures
+            .iter()
+            .map(|fixture| {
+                commit_delta_ref(
+                    commit_id,
+                    fixture,
+                    if fixture.deleted {
+                        crate::json_store::JsonSlotRef::None
+                    } else {
+                        crate::json_store::JsonSlotRef::Inline(r#"{"streamed":true}"#)
+                    },
+                    crate::json_store::JsonSlotRef::None,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_ordered_addressable_commit_deltas(
+            &mut writes,
+            deltas.iter().copied().map(Ok::<_, LixError>),
+        )
+        .expect("ordered addressable deltas should stage")
+        .expect("sorted deltas should use the streaming route");
+        assert_eq!(staged.row_count(), fixtures.len());
+        let assigned = staged.assigned_change_ids().collect::<Vec<_>>();
+        assert_eq!(assigned.len(), fixtures.len());
+        assert!(
+            assigned
+                .iter()
+                .all(|change_id| *change_id != ChangeId::default())
+        );
+        let mut generic_writes = generic_storage.new_write_set();
+        let generic = super::stage_addressable_commit_deltas(
+            &mut generic_writes,
+            &deltas,
+            &vec![true; deltas.len()],
+        )
+        .expect("generic addressable deltas should stage");
+        assert_eq!(assigned, generic.assigned_change_ids);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("streamed addressable deltas should commit");
+        generic_storage
+            .commit_write_set(generic_writes, StorageWriteOptions::default())
+            .await
+            .expect("generic addressable deltas should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("streamed addressable read should open");
+        let generic_read = generic_storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("generic addressable read should open");
+        for space in [
+            TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+        ] {
+            assert_eq!(
+                super::scan_full_space(&read, space).await.unwrap(),
+                super::scan_full_space(&generic_read, space).await.unwrap(),
+                "streaming must preserve the exact packed history bytes"
+            );
+        }
+        for source_index in [0, 127, 128, fixtures.len() - 1] {
+            let loaded = load_change_record_by_id(&read, assigned[source_index])
+                .await
+                .expect("direct streamed address should read")
+                .expect("direct streamed address should resolve");
+            assert_eq!(loaded.change_id, assigned[source_index]);
+            assert_eq!(loaded.schema_key, fixtures[source_index].schema_key);
+            assert_eq!(loaded.entity_pk, fixtures[source_index].entity_pk);
+            assert_eq!(loaded.snapshot.is_none(), fixtures[source_index].deleted);
+        }
     }
 
     #[tokio::test]

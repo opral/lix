@@ -32,6 +32,7 @@ use crate::tracked_state::{
     TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef,
     TrackedStateReadColumns, TrackedStateRootMutationRef, TrackedStateScanRequest, encode_key_ref,
     load_commit_delta_change_records, stage_addressable_commit_deltas, stage_change_locators,
+    stage_ordered_addressable_commit_deltas,
 };
 use crate::transaction::staging::{PreparedInsertSelection, PreparedWriteSet};
 #[cfg(test)]
@@ -1129,6 +1130,50 @@ fn stage_tracked_commit_delta_index(
                 ),
             )
         })?;
+        let can_stream_ordered_addressable = !state_row_indices.is_empty()
+            && staged.selected_change_batches.is_empty()
+            && state_row_indices
+                .iter()
+                .all(|&row_index| state_rows.row(row_index).addressable_change_id);
+        if can_stream_ordered_addressable {
+            let ordered_stage = {
+                let _span = tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.commit_delta.ordered_stream",
+                    row_count = state_row_indices.len()
+                )
+                .entered();
+                let state_rows = &*state_rows;
+                let deltas = state_row_indices.iter().map(|&row_index| {
+                    let row = state_rows.row(row_index);
+                    let mut delta = tracked_commit_delta_from_state_row(row)?;
+                    delta.certified = root.publish_head
+                        && host_certified_batch_owns_live_row(
+                            row,
+                            &root.branch_id,
+                            root.commit_id,
+                            host_certified_file_schemas,
+                        );
+                    Ok(delta)
+                });
+                stage_ordered_addressable_commit_deltas(writes, deltas)?
+            };
+            if let Some(ordered_stage) = ordered_stage {
+                if ordered_stage.row_count() != state_row_indices.len() {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "ordered commit-delta assignment count changed during staging",
+                    ));
+                }
+                for (&row_index, change_id) in state_row_indices
+                    .iter()
+                    .zip(ordered_stage.assigned_change_ids())
+                {
+                    state_rows.set_change_id(row_index, Some(change_id));
+                }
+                continue;
+            }
+        }
         let mut deltas = Vec::with_capacity(
             state_row_indices.len() + selected_change_count(&staged.selected_change_batches),
         );
