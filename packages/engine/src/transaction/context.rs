@@ -3787,7 +3787,6 @@ where
                 .with_hint("combine the byte edits into one file update"));
             }
             let descriptor = v2_file_descriptor(write, selected);
-            let limits = WasmTransitionLimits::default();
             let schemas = SchemaAllowlist::from_catalog(
                 selected.schema_keys(),
                 Arc::clone(&self.sql_schema_snapshot),
@@ -3810,6 +3809,9 @@ where
                 };
             let materialization_version = self.functions.call_uuid_v7().to_string();
             let submitted_bytes = write.payload().shared_bytes();
+            let limits = WasmTransitionLimits::for_file_bytes(
+                u64::try_from(submitted_bytes.len()).unwrap_or(u64::MAX),
+            );
             let mut verified_same_length_blob_splice = None;
 
             let (changes, publication, materialized_bytes, create_rows) = if same_plugin_owner {

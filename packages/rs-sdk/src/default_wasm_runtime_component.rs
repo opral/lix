@@ -36,7 +36,10 @@ use super::{
     add_to_linker_sync, create_store, reset_store_limits, wasm_runtime_error,
 };
 
-const V3_MAX_BATCH_BYTES: u32 = 2 * 1024 * 1024;
+// Warm transitions normally retain the engine's 2 MiB fixed page schedule.
+// Cold admission may scale as high as 16 MiB so a valid single text entity
+// (for example a one-line source map) can cross the fused push sink.
+const V3_MAX_BATCH_BYTES: u32 = 16 * 1024 * 1024;
 // Admit one fused export per compiled plugin component before allocating its
 // Wasmtime Store. This bounds both actor and pushed-page residency without
 // creating an executor thread or serializing different plugin types.
@@ -4433,6 +4436,16 @@ mod tests {
         limits.max_total_bytes = 10;
         assert!(validate_source_admission(10, limits).is_ok());
         assert!(validate_source_admission(11, limits).is_err());
+    }
+
+    #[test]
+    fn v3_binding_preserves_scaled_cold_pages() {
+        let cold = WasmTransitionLimits::for_cold_file_bytes(5_298_078);
+        let admitted = v3_transition_limits(cold).expect("scaled cold page should be admitted");
+
+        assert!(admitted.max_page_bytes > 7 * 1024 * 1024);
+        assert_eq!(admitted.max_record_bytes, admitted.max_page_bytes);
+        assert!(admitted.max_page_bytes <= V3_MAX_BATCH_BYTES);
     }
 
     #[test]
