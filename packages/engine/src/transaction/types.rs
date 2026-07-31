@@ -1534,11 +1534,8 @@ pub(crate) fn stage_json_from_value(
         },
         TransactionJsonStorage::CertifiedShared {
             normalized,
-            certificate: TransactionJsonCertificate::RowContent,
-        } => StageJsonStorage::ValidatedShared { normalized },
-        TransactionJsonStorage::CertifiedShared {
-            normalized,
-            certificate: TransactionJsonCertificate::Metadata,
+            certificate:
+                TransactionJsonCertificate::RowContent | TransactionJsonCertificate::Metadata,
         } => StageJsonStorage::CertifiedShared {
             value: OnceLock::new(),
             normalized,
@@ -3817,6 +3814,26 @@ mod tests {
                 .expect("snapshot")
                 .retains_decoded_value_for_tests()
         }));
+    }
+
+    #[test]
+    fn certified_row_content_remains_decodable_until_validation_release() {
+        let normalized = br#"{"id":"entity-1"}"#.to_vec();
+        let normalized_len = normalized.len();
+        let snapshot =
+            TransactionJson::from_certified_row_content_arena(normalized, vec![(0, normalized_len)])
+                .expect("certified transaction arena")
+                .pop()
+                .expect("certified row");
+        let mut staged =
+            stage_json_from_value(snapshot, "certified transaction arena").expect("staged JSON");
+
+        assert!(!staged.retains_decoded_value_for_tests());
+        assert_eq!(staged.value()["id"], "entity-1");
+        assert!(staged.retains_decoded_value_for_tests());
+        assert!(staged.release_validated_canonical_value_column());
+        assert!(!staged.retains_decoded_value_for_tests());
+        assert_eq!(staged.normalized(), r#"{"id":"entity-1"}"#);
     }
 
     #[test]
