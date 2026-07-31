@@ -791,6 +791,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn predecessor_v33_commit_delta_coordinates_are_rejected() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let mut writes = storage_adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            &b"checkpoint-source-delta.v33"[..],
+        );
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("V33 protocol marker should commit");
+
+        let Err(error) = Engine::new(storage).await else {
+            panic!("V33 repositories must fail closed before LXCD7 locators are decoded");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
     async fn tracked_entity_fast_path_serves_broad_sql_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
