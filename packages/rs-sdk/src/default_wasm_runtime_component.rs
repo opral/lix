@@ -2096,6 +2096,19 @@ impl CertifiedPacketEntityKeys {
         }
     }
 
+    fn extend_ref(&mut self, page: &Self) {
+        for (schema_key, page) in &page.schemas {
+            let keys = self.schemas.entry(schema_key.clone()).or_default();
+            keys.create_refs.extend(page.create_refs.iter().copied());
+            keys.explicit_keys
+                .extend(page.explicit_keys.iter().copied());
+            keys.explicit_create_refs
+                .extend(page.explicit_create_refs.iter().copied());
+            keys.create_ref_ranges
+                .extend(page.create_ref_ranges.iter().copied());
+        }
+    }
+
     fn take_create_ranges_for(&mut self, schema_keys: &[String]) -> Vec<WasmCertifiedCreateRange> {
         let mut output = Vec::new();
         for schema_key in schema_keys {
@@ -3440,6 +3453,8 @@ struct CursorState {
     certified_csv_rows: u64,
     certified_csv_creates: Option<WasmCreateContext>,
     certified_csv_last_local_ref: Option<u32>,
+    certified_all_entity_keys: CertifiedPacketEntityKeys,
+    certified_csv_entity_keys: CertifiedPacketEntityKeys,
     certified_packet_pages: Vec<Bytes>,
     certified_packet_rows: u64,
     certified_packet_creates: Option<WasmCreateContext>,
@@ -3634,6 +3649,8 @@ impl WasmComponentActor for V3Actor {
                 certified_csv_rows: 0,
                 certified_csv_creates: None,
                 certified_csv_last_local_ref: None,
+                certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_csv_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
@@ -3738,6 +3755,8 @@ impl WasmComponentActor for V3Actor {
                 certified_csv_rows: 0,
                 certified_csv_creates: None,
                 certified_csv_last_local_ref: None,
+                certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_csv_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
@@ -3788,6 +3807,8 @@ impl WasmComponentActor for V3Actor {
                 certified_csv_rows: 0,
                 certified_csv_creates: None,
                 certified_csv_last_local_ref: None,
+                certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
+                certified_csv_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
@@ -3999,7 +4020,7 @@ impl WasmComponentActor for V3Actor {
                         "csv_v2_row",
                         u64::from(first_local_ref),
                         u64::from(last_local_ref),
-                        &cursor.certified_packet_entity_keys,
+                        &cursor.certified_all_entity_keys,
                     )?;
                     cursor.certified_csv_creates = Some(creates);
                     cursor.certified_csv_rows = cursor
@@ -4008,7 +4029,8 @@ impl WasmComponentActor for V3Actor {
                         .ok_or_else(|| v3_error("certified CSV row count overflowed"))?;
                     cursor.certified_csv_last_local_ref = Some(last_local_ref);
                     cursor.certified_csv_pages.push(Bytes::from(payload));
-                    cursor.certified_packet_entity_keys.extend(page_keys);
+                    cursor.certified_all_entity_keys.extend_ref(&page_keys);
+                    cursor.certified_csv_entity_keys.extend(page_keys);
                 }
                 Some(page @ PendingChangePage::Packet { .. }) => {
                     let PendingChangePage::Packet {
@@ -4042,9 +4064,9 @@ impl WasmComponentActor for V3Actor {
                             let page_keys = validate_ordinary_packet_page_keys(
                                 &decoded,
                                 creates,
-                                &cursor.certified_packet_entity_keys,
+                                &cursor.certified_all_entity_keys,
                             )?;
-                            cursor.certified_packet_entity_keys.extend(page_keys);
+                            cursor.certified_all_entity_keys.extend(page_keys);
                             return Ok(Some(decoded));
                         }
                         if cursor
@@ -4057,7 +4079,7 @@ impl WasmComponentActor for V3Actor {
                         }
                         let (schema_keys, page_keys) = validate_new_certified_packet_keys(
                             validated_page,
-                            &cursor.certified_packet_entity_keys,
+                            &cursor.certified_all_entity_keys,
                         )?;
                         cursor.certified_packet_creates = Some(creates);
                         cursor.certified_packet_rows = cursor
@@ -4065,6 +4087,7 @@ impl WasmComponentActor for V3Actor {
                             .checked_add(u64::from(record_count))
                             .ok_or_else(|| v3_error("certified packet row count overflowed"))?;
                         cursor.certified_packet_schema_keys.extend(schema_keys);
+                        cursor.certified_all_entity_keys.extend_ref(&page_keys);
                         cursor.certified_packet_entity_keys.extend(page_keys);
                         cursor.certified_packet_pages.push(Bytes::from(payload));
                     } else {
@@ -4079,9 +4102,9 @@ impl WasmComponentActor for V3Actor {
                         let page_keys = validate_ordinary_packet_page_keys(
                             &decoded,
                             creates,
-                            &cursor.certified_packet_entity_keys,
+                            &cursor.certified_all_entity_keys,
                         )?;
-                        cursor.certified_packet_entity_keys.extend(page_keys);
+                        cursor.certified_all_entity_keys.extend(page_keys);
                         return Ok(Some(decoded));
                     }
                 }
@@ -4123,7 +4146,7 @@ impl WasmComponentActor for V3Actor {
         if let Some(creates) = cursor.certified_csv_creates.take() {
             let schema_keys = vec!["csv_v2_row".to_owned()];
             let create_ranges = cursor
-                .certified_packet_entity_keys
+                .certified_csv_entity_keys
                 .take_create_ranges_for(&schema_keys);
             batches.push(WasmCertifiedEntityBatch {
                 format: CERTIFIED_TYPED_CSV_V1,
@@ -4153,6 +4176,8 @@ impl WasmComponentActor for V3Actor {
                 pages: std::mem::take(&mut cursor.certified_packet_pages),
             });
         }
+        cursor.certified_all_entity_keys = CertifiedPacketEntityKeys::default();
+        cursor.certified_csv_entity_keys = CertifiedPacketEntityKeys::default();
         batches
     }
 
@@ -4518,6 +4543,45 @@ mod tests {
         assert_eq!(
             duplicate_csv.message,
             "a component entity key may occur only once across certified packet pages"
+        );
+    }
+
+    #[test]
+    fn certified_authority_ranges_stay_partitioned_by_batch_context() {
+        let mut csv_keys = CertifiedPacketEntityKeys::default();
+        csv_keys
+            .insert_create_ref_range("csv_v2_row", 1, 1, &CertifiedPacketEntityKeys::default())
+            .expect("CSV identity is unique");
+        let mut packet_keys = CertifiedPacketEntityKeys::default();
+        packet_keys
+            .insert(
+                CreatedPacketIdentity::Create {
+                    schema_key: "csv_v2_row".to_owned(),
+                    local_ref: 2,
+                },
+                WasmCreateContext {
+                    high: 0x019b_0000_0000_7000,
+                    low: 0x8000_0000,
+                },
+                &csv_keys,
+            )
+            .expect("packet identity is unique across the transition");
+
+        assert_eq!(
+            csv_keys.take_create_ranges_for(&["csv_v2_row".to_owned()]),
+            vec![WasmCertifiedCreateRange {
+                schema_key: "csv_v2_row".to_owned(),
+                first_local_ref: 1,
+                last_local_ref: 1,
+            }]
+        );
+        assert_eq!(
+            packet_keys.take_create_ranges_for(&["csv_v2_row".to_owned()]),
+            vec![WasmCertifiedCreateRange {
+                schema_key: "csv_v2_row".to_owned(),
+                first_local_ref: 2,
+                last_local_ref: 2,
+            }]
         );
     }
 
