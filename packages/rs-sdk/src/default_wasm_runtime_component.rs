@@ -13,7 +13,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use lix_engine::wasm::WasmLimits;
 use lix_engine::wasm::v3::{
-    ByteEdit as ArenaByteEdit, Root as ArenaRoot, Store as ArenaStore,
+    ByteEdit as ArenaByteEdit, Digest as ArenaDigest, Root as ArenaRoot, Store as ArenaStore,
     Transaction as ArenaTransaction,
 };
 use lix_engine::wasm::{
@@ -21,12 +21,12 @@ use lix_engine::wasm::{
     WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage, WasmColdFileUpdate,
     WasmComponentActor, WasmComponentFactory, WasmConflictResolution, WasmConflictResolutionPage,
     WasmConflictTake, WasmConflictTransition, WasmConflictUpdate, WasmCreateContext,
-    WasmDocumentCheckpoint, WasmDocumentHandle, WasmEditCursorHandle, WasmEditPage, WasmEntity,
-    WasmEntityChange, WasmEntityChanges, WasmEntityKey, WasmEntityTransition, WasmEntityUpdate,
-    WasmFileTransition, WasmFileUpdate, WasmGuestBytes, WasmGuestEntityChanges, WasmHostBytes,
-    WasmHostEntityConflict, WasmInputBytes, WasmOpenEntitiesInput, WasmOpenFileInput,
-    WasmOutputRange, WasmOutputSplice, WasmResolutionCursorHandle, WasmTransitionCounters,
-    WasmTransitionHandle, WasmTransitionLimits,
+    WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
+    WasmEditCursorHandle, WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChanges,
+    WasmEntityKey, WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
+    WasmGuestBytes, WasmGuestEntityChanges, WasmHostBytes, WasmHostEntityConflict, WasmInputBytes,
+    WasmOpenEntitiesInput, WasmOpenFileInput, WasmOutputRange, WasmOutputSplice,
+    WasmResolutionCursorHandle, WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
 };
 use lix_engine::{LixError, SharedStr};
 use wasmtime::Store;
@@ -2517,6 +2517,7 @@ impl WasmComponentFactory for V3Factory {
             transitions: HashMap::new(),
             transition_permits: HashMap::new(),
             prospective_documents: ProspectiveDocuments::default(),
+            durable_checkpoints: HashMap::new(),
             retired: false,
             next_document: 1,
         }))
@@ -3490,6 +3491,7 @@ struct V3Actor {
     transitions: HashMap<u64, WasmTransitionCounters>,
     transition_permits: HashMap<u64, tokio::sync::OwnedSemaphorePermit>,
     prospective_documents: ProspectiveDocuments,
+    durable_checkpoints: HashMap<ArenaDigest, WasmDurableDocumentCheckpoint>,
     retired: bool,
     next_document: u64,
 }
@@ -3596,9 +3598,28 @@ impl WasmComponentActor for V3Actor {
             .get(&document.0)
             .ok_or_else(|| v3_error("unknown v3 document handle"))?
             .root
-            .clone();
+            .successor_checkpoint();
         let retained_bytes = u64::try_from(root.retained_heap_bytes()).unwrap_or(u64::MAX);
-        Ok(Some(WasmDocumentCheckpoint::new(root, retained_bytes)))
+        let state_id = root.state.id();
+        let durable = if let Some(checkpoint) = self.durable_checkpoints.get(&state_id) {
+            checkpoint.clone()
+        } else {
+            let bytes: crate::Blob = root
+                .encode_successor_checkpoint()
+                .map_err(|error| {
+                    v3_error(format!("failed to encode v3 document checkpoint: {error}"))
+                })?
+                .into();
+            let checkpoint = WasmDurableDocumentCheckpoint::new(bytes)?;
+            self.durable_checkpoints
+                .insert(state_id, checkpoint.clone());
+            checkpoint
+        };
+        Ok(Some(WasmDocumentCheckpoint::new_with_durable(
+            root,
+            retained_bytes,
+            durable,
+        )))
     }
 
     async fn restore_document(
@@ -3610,6 +3631,26 @@ impl WasmComponentActor for V3Actor {
             .downcast_ref::<ArenaRoot>()
             .ok_or_else(|| v3_error("v3 document checkpoint belongs to another runtime"))?
             .clone();
+        let document = self.allocate_document()?;
+        self.worker.documents.insert(document, V3Document { root });
+        self.worker.next_document = self.worker.next_document.max(document.saturating_add(1));
+        Ok(WasmDocumentHandle(document))
+    }
+
+    async fn restore_durable_document(
+        &mut self,
+        checkpoint: &[u8],
+        accepted: &[u8],
+    ) -> Result<WasmDocumentHandle, LixError> {
+        self.ensure_active()?;
+        let root =
+            ArenaRoot::decode_successor_checkpoint(accepted, checkpoint).map_err(|error| {
+                v3_error(format!("failed to decode v3 document checkpoint: {error}"))
+            })?;
+        self.durable_checkpoints.insert(
+            root.state.id(),
+            WasmDurableDocumentCheckpoint::new(checkpoint.to_vec().into())?,
+        );
         let document = self.allocate_document()?;
         self.worker.documents.insert(document, V3Document { root });
         self.worker.next_document = self.worker.next_document.max(document.saturating_add(1));

@@ -245,6 +245,151 @@ impl PluginEntityAuthorities {
             }
         }
     }
+
+    pub(crate) fn encode_checkpoint(&self) -> Result<Vec<u8>, LixError> {
+        let (ranges, inserted, removed) = self.flatten();
+        let mut output = Vec::new();
+        output.extend_from_slice(b"LIXAUT01");
+        push_authority_len(&mut output, ranges.len())?;
+        push_authority_len(&mut output, inserted.len())?;
+        push_authority_len(&mut output, removed.len())?;
+        for range in ranges {
+            push_authority_text(&mut output, &range.schema_key)?;
+            output.extend_from_slice(&range.namespace);
+            output.extend_from_slice(&range.first_local_ref.to_le_bytes());
+            output.extend_from_slice(&range.last_local_ref.to_le_bytes());
+        }
+        for key in inserted.iter().chain(removed.iter()) {
+            push_authority_text(&mut output, key.schema_key.as_str())?;
+            push_authority_len(&mut output, key.entity_pk.len())?;
+            for component in &key.entity_pk {
+                push_authority_text(&mut output, component.as_str())?;
+            }
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn decode_checkpoint(bytes: &[u8]) -> Result<Self, LixError> {
+        let mut reader = AuthorityCheckpointReader::new(bytes);
+        if reader.take(8)? != b"LIXAUT01" {
+            return Err(invalid_authority_checkpoint());
+        }
+        let range_count = reader.len()?;
+        let inserted_count = reader.len()?;
+        let removed_count = reader.len()?;
+        let mut ranges = Vec::new();
+        for _ in 0..range_count {
+            let schema_key = reader.text()?;
+            let namespace: [u8; 12] = reader
+                .take(12)?
+                .try_into()
+                .map_err(|_| invalid_authority_checkpoint())?;
+            let first_local_ref = reader.u32()?;
+            let last_local_ref = reader.u32()?;
+            if first_local_ref > last_local_ref {
+                return Err(invalid_authority_checkpoint());
+            }
+            ranges.push(PluginEntityAuthorityRange {
+                schema_key,
+                namespace,
+                first_local_ref,
+                last_local_ref,
+            });
+        }
+        let mut read_keys = |count: usize| -> Result<BTreeSet<WasmEntityKey>, LixError> {
+            let mut keys = BTreeSet::new();
+            for _ in 0..count {
+                let schema_key = reader.text()?;
+                let component_count = reader.len()?;
+                let mut entity_pk = Vec::new();
+                for _ in 0..component_count {
+                    entity_pk.push(reader.text()?);
+                }
+                if !keys.insert(WasmEntityKey::from_owned_parts(schema_key, entity_pk)) {
+                    return Err(invalid_authority_checkpoint());
+                }
+            }
+            Ok(keys)
+        };
+        let inserted = read_keys(inserted_count)?;
+        let removed = read_keys(removed_count)?;
+        if !reader.is_empty() || inserted.iter().any(|key| removed.contains(key)) {
+            return Err(invalid_authority_checkpoint());
+        }
+        Ok(Self {
+            node: Arc::new(PluginEntityAuthorityNode::Base {
+                ranges,
+                inserted,
+                removed,
+            }),
+        })
+    }
+}
+
+fn push_authority_len(output: &mut Vec<u8>, value: usize) -> Result<(), LixError> {
+    let value = u32::try_from(value).map_err(|_| invalid_authority_checkpoint())?;
+    output.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn push_authority_text(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
+    push_authority_len(output, value.len())?;
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn invalid_authority_checkpoint() -> LixError {
+    LixError::new(
+        LixError::CODE_INVALID_PLUGIN,
+        "plugin entity authority checkpoint is corrupt",
+    )
+}
+
+struct AuthorityCheckpointReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> AuthorityCheckpointReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], LixError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(invalid_authority_checkpoint)?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(invalid_authority_checkpoint)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u32(&mut self) -> Result<u32, LixError> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| invalid_authority_checkpoint())?,
+        ))
+    }
+
+    fn len(&mut self) -> Result<usize, LixError> {
+        usize::try_from(self.u32()?).map_err(|_| invalid_authority_checkpoint())
+    }
+
+    fn text(&mut self) -> Result<String, LixError> {
+        let len = self.len()?;
+        std::str::from_utf8(self.take(len)?)
+            .map(str::to_owned)
+            .map_err(|_| invalid_authority_checkpoint())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
 }
 
 /// Complete authority identity for one mutable guest instance.
@@ -1583,6 +1728,12 @@ impl PluginActorLease {
         })
     }
 
+    pub(crate) fn successor_entity_authorities(&self) -> Option<&PluginEntityAuthorities> {
+        self.successor
+            .as_ref()
+            .map(|successor| &successor.entity_authorities)
+    }
+
     /// Publishes the successor only after durable commit. A failure here is a
     /// cache failure: the caller must keep the commit successful and cold-open.
     #[cfg(test)]
@@ -2064,6 +2215,39 @@ mod tests {
         assert!(!authorities.contains(&removed));
         assert!(authorities.contains(&outside));
         assert!(!authorities.contains(&key(9)));
+    }
+
+    #[test]
+    fn entity_authority_checkpoint_roundtrips_ranges_and_sparse_overrides() {
+        let creates = WasmCreateContext {
+            high: 0x0123_4567_89ab_cdef,
+            low: 0xfedc_ba98,
+        };
+        let key = |local_ref| {
+            WasmEntityKey::from_owned_parts(
+                "row".to_owned(),
+                creates.entity_pk(local_ref).expect("local ref should fit"),
+            )
+        };
+        let retained = key(2);
+        let removed = key(3);
+        let inserted = key(9);
+        let authorities = PluginEntityAuthorities::empty()
+            .with_ranges(vec![PluginEntityAuthorityRange::new(
+                "row".to_owned(),
+                creates,
+                1,
+                4,
+            )])
+            .with_delta(BTreeSet::new(), BTreeSet::from([removed.clone()]))
+            .with_delta(BTreeSet::from([inserted.clone()]), BTreeSet::new());
+
+        let decoded =
+            PluginEntityAuthorities::decode_checkpoint(&authorities.encode_checkpoint().unwrap())
+                .unwrap();
+        assert!(decoded.contains(&retained));
+        assert!(!decoded.contains(&removed));
+        assert!(decoded.contains(&inserted));
     }
 
     #[tokio::test]

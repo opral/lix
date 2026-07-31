@@ -1314,10 +1314,91 @@ handle_type!(WasmDocumentHandle);
 /// The engine treats the payload as opaque. A compatible component runtime
 /// may restore it into a fresh Store after actor eviction, avoiding durable
 /// entity hydration while preserving the same semantic authority checks.
+#[derive(Debug, Clone)]
+pub struct WasmDurableDocumentCheckpoint {
+    bytes: crate::Blob,
+}
+
+impl WasmDurableDocumentCheckpoint {
+    const MAGIC: &'static [u8; 8] = b"LIXDPR01";
+    const MAX_DECODED_BYTES: usize = 128 * 1024 * 1024;
+
+    pub fn new(bytes: crate::Blob) -> Result<Self, LixError> {
+        if bytes.len() > Self::MAX_DECODED_BYTES {
+            return Err(LixError::new(
+                LixError::CODE_PLUGIN_RESOURCE_LIMIT,
+                "plugin runtime checkpoint exceeds the 128 MiB encode limit",
+            ));
+        }
+        let decoded_len = u64::try_from(bytes.len()).map_err(|_| {
+            LixError::new(
+                LixError::CODE_PLUGIN_RESOURCE_LIMIT,
+                "plugin runtime checkpoint exceeds u64",
+            )
+        })?;
+        let compressed = zstd::bulk::compress(&bytes, 1).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to compress plugin runtime checkpoint: {error}"),
+            )
+        })?;
+        let mut encoded = Vec::with_capacity(16 + compressed.len());
+        encoded.extend_from_slice(Self::MAGIC);
+        encoded.extend_from_slice(&decoded_len.to_le_bytes());
+        encoded.extend_from_slice(&compressed);
+        Ok(Self {
+            bytes: encoded.into(),
+        })
+    }
+
+    pub fn bytes(&self) -> crate::Blob {
+        self.bytes.clone()
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<crate::Blob, LixError> {
+        let header = bytes.get(..16).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                "plugin runtime checkpoint is truncated",
+            )
+        })?;
+        if &header[..8] != Self::MAGIC {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                "plugin runtime checkpoint has an unsupported format",
+            ));
+        }
+        let decoded_len = usize::try_from(u64::from_le_bytes(
+            header[8..16].try_into().expect("fixed checkpoint length"),
+        ))
+        .map_err(|_| {
+            LixError::new(
+                LixError::CODE_PLUGIN_RESOURCE_LIMIT,
+                "plugin runtime checkpoint exceeds host address space",
+            )
+        })?;
+        if decoded_len > Self::MAX_DECODED_BYTES {
+            return Err(LixError::new(
+                LixError::CODE_PLUGIN_RESOURCE_LIMIT,
+                "plugin runtime checkpoint exceeds the 128 MiB decode limit",
+            ));
+        }
+        zstd::bulk::decompress(&bytes[16..], decoded_len)
+            .map(crate::Blob::from)
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!("plugin runtime checkpoint failed decompression: {error}"),
+                )
+            })
+    }
+}
+
 #[derive(Clone)]
 pub struct WasmDocumentCheckpoint {
     payload: Arc<dyn Any + Send + Sync>,
     retained_bytes: u64,
+    durable: Option<WasmDurableDocumentCheckpoint>,
 }
 
 impl fmt::Debug for WasmDocumentCheckpoint {
@@ -1337,6 +1418,22 @@ impl WasmDocumentCheckpoint {
         Self {
             payload: Arc::new(payload),
             retained_bytes,
+            durable: None,
+        }
+    }
+
+    pub fn new_with_durable<T>(
+        payload: T,
+        retained_bytes: u64,
+        durable: WasmDurableDocumentCheckpoint,
+    ) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            payload: Arc::new(payload),
+            retained_bytes,
+            durable: Some(durable),
         }
     }
 
@@ -1346,6 +1443,10 @@ impl WasmDocumentCheckpoint {
 
     pub fn retained_bytes(&self) -> u64 {
         self.retained_bytes
+    }
+
+    pub fn durable_checkpoint(&self) -> Option<WasmDurableDocumentCheckpoint> {
+        self.durable.clone()
     }
 }
 handle_type!(WasmChangeCursorHandle);
@@ -1799,6 +1900,19 @@ pub trait WasmComponentActor: Send {
         ))
     }
 
+    /// Restores a process-independent runtime checkpoint against the exact
+    /// accepted file bytes named by the visible materialization.
+    async fn restore_durable_document(
+        &mut self,
+        _checkpoint: &[u8],
+        _accepted: &[u8],
+    ) -> Result<WasmDocumentHandle, LixError> {
+        Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            "this component actor does not support durable document checkpoints",
+        ))
+    }
+
     async fn open_file(
         &mut self,
         limits: WasmTransitionLimits,
@@ -1982,6 +2096,29 @@ mod tests {
                 generation: generation.to_owned(),
             },
         }
+    }
+
+    #[test]
+    fn durable_document_checkpoint_roundtrips_and_bounds_decompression() {
+        let original: crate::Blob = b"repeated plugin state".repeat(4_096).into();
+        let checkpoint = WasmDurableDocumentCheckpoint::new(original.clone()).unwrap();
+        assert_eq!(
+            WasmDurableDocumentCheckpoint::decode(&checkpoint.bytes()).unwrap(),
+            original
+        );
+
+        let mut oversized = Vec::from(WasmDurableDocumentCheckpoint::MAGIC.as_slice());
+        oversized.extend_from_slice(
+            &u64::try_from(WasmDurableDocumentCheckpoint::MAX_DECODED_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert_eq!(
+            WasmDurableDocumentCheckpoint::decode(&oversized)
+                .expect_err("oversized checkpoint must fail before decompression")
+                .code,
+            LixError::CODE_PLUGIN_RESOURCE_LIMIT
+        );
     }
 
     #[test]

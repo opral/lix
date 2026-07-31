@@ -72,6 +72,15 @@ impl BlobPayload {
         Self { bytes, hash }
     }
 
+    pub(crate) fn from_hashed_bytes(bytes: impl Into<crate::Blob>, hash: BlobHash) -> Self {
+        let bytes = bytes.into();
+        debug_assert_eq!(BlobHash::from_content(&bytes), hash);
+        Self {
+            bytes,
+            hash: Some(hash),
+        }
+    }
+
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }

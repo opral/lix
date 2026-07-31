@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 pub const DEFAULT_PAGE_BYTES: usize = 64 * 1024;
+const SUCCESSOR_CHECKPOINT_MAGIC: &[u8; 8] = b"LIXPSC01";
+const SUCCESSOR_CHECKPOINT_HASH_DOMAIN: &[u8] = b"lix-plugin-v3/successor-checkpoint\0";
 pub const REQUIRED_V3_SPEEDUP: u64 = 2;
 pub const REQUIRED_V3_MEMORY_REDUCTION: u64 = 3;
 
@@ -736,6 +738,102 @@ impl Root {
         self.retained_heap_bytes
     }
 
+    /// Returns the byte-and-state view needed to resume an accepted file
+    /// transition after its Wasm Store is evicted.
+    ///
+    /// Durable entities remain the engine's semantic authority; production
+    /// plugins keep their incremental indexes in `state` and do not consult
+    /// the entity arena while applying a byte successor. Retaining entity
+    /// snapshots here would therefore keep a second complete semantic copy
+    /// solely as a cache optimization.
+    pub fn successor_checkpoint(&self) -> Self {
+        Self::new(
+            self.generation.clone(),
+            self.bytes.clone(),
+            MapArena::empty(self.bytes.store.clone()),
+            self.state.clone(),
+        )
+    }
+
+    /// Encodes only opaque plugin state. Accepted file bytes are already
+    /// durable in the engine's binary CAS and semantic entities remain in
+    /// tracked state, so neither is duplicated in this checkpoint payload.
+    pub fn encode_successor_checkpoint(&self) -> Result<Vec<u8>, Error> {
+        let generation = self.generation.as_bytes();
+        let generation_len = u32::try_from(generation.len()).map_err(|_| Error::RangeOverflow)?;
+        let state_count =
+            u32::try_from(self.state.entries.len()).map_err(|_| Error::RangeOverflow)?;
+        let page_bytes =
+            u32::try_from(self.bytes.store.page_bytes()).map_err(|_| Error::RangeOverflow)?;
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(SUCCESSOR_CHECKPOINT_MAGIC);
+        encoded.extend_from_slice(&page_bytes.to_le_bytes());
+        encoded.extend_from_slice(&generation_len.to_le_bytes());
+        encoded.extend_from_slice(&state_count.to_le_bytes());
+        encoded.extend_from_slice(generation);
+        for (key, value) in self.state.entries.iter() {
+            let key_len = u32::try_from(key.len()).map_err(|_| Error::RangeOverflow)?;
+            encoded.extend_from_slice(&key_len.to_le_bytes());
+            encoded.extend_from_slice(&value.len().to_le_bytes());
+            encoded.extend_from_slice(key);
+            encoded.extend_from_slice(&value.read(0, value.len())?);
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(SUCCESSOR_CHECKPOINT_HASH_DOMAIN);
+        hasher.update(&encoded);
+        encoded.extend_from_slice(hasher.finalize().as_bytes());
+        Ok(encoded)
+    }
+
+    /// Reopens a successor checkpoint against independently loaded accepted
+    /// bytes. The entity arena intentionally starts empty; tracked-state
+    /// authority is validated by the engine before publication.
+    pub fn decode_successor_checkpoint(accepted: &[u8], encoded: &[u8]) -> Result<Self, Error> {
+        let payload_len = encoded
+            .len()
+            .checked_sub(32)
+            .ok_or(Error::CorruptCheckpoint)?;
+        let (payload, checksum) = encoded.split_at(payload_len);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(SUCCESSOR_CHECKPOINT_HASH_DOMAIN);
+        hasher.update(payload);
+        if hasher.finalize().as_bytes() != checksum {
+            return Err(Error::CorruptCheckpoint);
+        }
+        let mut cursor = CheckpointCursor::new(payload);
+        if cursor.take(SUCCESSOR_CHECKPOINT_MAGIC.len())? != SUCCESSOR_CHECKPOINT_MAGIC {
+            return Err(Error::CorruptCheckpoint);
+        }
+        let page_bytes = usize::try_from(cursor.u32()?).map_err(|_| Error::CorruptCheckpoint)?;
+        if page_bytes == 0 {
+            return Err(Error::CorruptCheckpoint);
+        }
+        let generation_len =
+            usize::try_from(cursor.u32()?).map_err(|_| Error::CorruptCheckpoint)?;
+        let state_count = usize::try_from(cursor.u32()?).map_err(|_| Error::CorruptCheckpoint)?;
+        let generation = std::str::from_utf8(cursor.take(generation_len)?)
+            .map_err(|_| Error::CorruptCheckpoint)?;
+        let mut state = Vec::new();
+        for _ in 0..state_count {
+            let key_len = usize::try_from(cursor.u32()?).map_err(|_| Error::CorruptCheckpoint)?;
+            let value_len = usize::try_from(cursor.u64()?).map_err(|_| Error::CorruptCheckpoint)?;
+            state.push((
+                cursor.take(key_len)?.to_vec(),
+                cursor.take(value_len)?.to_vec(),
+            ));
+        }
+        if !cursor.is_empty() {
+            return Err(Error::CorruptCheckpoint);
+        }
+        Ok(Self::import(
+            Store::new(page_bytes),
+            Arc::<str>::from(generation),
+            accepted,
+            std::iter::empty(),
+            state,
+        ))
+    }
+
     pub fn transaction(&self) -> Transaction {
         Transaction {
             base: self.clone(),
@@ -976,12 +1074,57 @@ impl Transaction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     CorruptArchive,
+    CorruptCheckpoint,
     DifferentStores,
     InvalidEdits,
     InvalidPageRange,
     MissingPage(Digest),
     RangeOutOfBounds,
     RangeOverflow,
+}
+
+struct CheckpointCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CheckpointCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], Error> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(Error::CorruptCheckpoint)?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(Error::CorruptCheckpoint)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u32(&mut self) -> Result<u32, Error> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| Error::CorruptCheckpoint)?,
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, Error> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| Error::CorruptCheckpoint)?,
+        ))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
 }
 
 impl fmt::Display for Error {
@@ -1167,6 +1310,47 @@ mod tests {
             populated.retained_heap_bytes() > 100_000,
             "small entity snapshots still retain map, key, arena, and allocation metadata"
         );
+    }
+
+    #[test]
+    fn successor_checkpoint_retains_bytes_and_state_without_entities() {
+        let (_store, root) = fixture();
+        let checkpoint = root.successor_checkpoint();
+
+        assert_eq!(checkpoint.generation, root.generation);
+        assert_eq!(checkpoint.bytes.id(), root.bytes.id());
+        assert_eq!(checkpoint.state.id(), root.state.id());
+        assert!(checkpoint.entities.is_empty());
+        assert_eq!(
+            checkpoint.state.get(b"index/0").unwrap(),
+            Some(b"row/1".to_vec())
+        );
+        assert!(checkpoint.retained_heap_bytes() < root.retained_heap_bytes());
+    }
+
+    #[test]
+    fn encoded_successor_checkpoint_reopens_against_independent_bytes() {
+        let (_store, root) = fixture();
+        let encoded = root.encode_successor_checkpoint().unwrap();
+        let reopened = Root::decode_successor_checkpoint(b"abcdefghijkl", &encoded).unwrap();
+
+        assert_eq!(reopened.generation, root.generation);
+        assert_eq!(
+            reopened.bytes.read(0, reopened.bytes.len()).unwrap(),
+            b"abcdefghijkl"
+        );
+        assert_eq!(
+            reopened.state.get(b"index/0").unwrap(),
+            Some(b"row/1".to_vec())
+        );
+        assert!(reopened.entities.is_empty());
+
+        let mut corrupt = encoded;
+        corrupt[8] ^= 1;
+        assert!(matches!(
+            Root::decode_successor_checkpoint(b"abcdefghijkl", &corrupt),
+            Err(Error::CorruptCheckpoint)
+        ));
     }
 
     #[test]
