@@ -1,4 +1,4 @@
-import { createWorkerConnection } from "#worker-factory";
+import { createWorkerConnection, openDirectLixBinding } from "#worker-factory";
 import type {
 	LixBinding,
 	LixStorageConfig,
@@ -56,6 +56,38 @@ export async function openLixWorkerBinding(
 	onDisposed?: () => void,
 	telemetry?: LixTelemetryOptions,
 ): Promise<LixBinding> {
+	if (openDirectLixBinding) {
+		const telemetryDispatch = telemetry
+			? (span: Parameters<LixTelemetryOptions["onSpan"]>[0]) => {
+					try {
+						telemetry.onSpan(span);
+					} catch {
+						// Telemetry is observational and must not fail engine commands.
+					}
+				}
+			: undefined;
+		const binding = await openDirectLixBinding(storage, telemetryDispatch);
+		if (!onDisposed) return binding;
+		let disposed = false;
+		return new Proxy(binding, {
+			get(target, property, receiver) {
+				if (property === "close") {
+					return async () => {
+						try {
+							await target.close();
+						} finally {
+							if (!disposed) {
+								disposed = true;
+								onDisposed();
+							}
+						}
+					};
+				}
+				const value = Reflect.get(target, property, receiver) as unknown;
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+	}
 	const client = await openLixWorker(storage, onDisposed, telemetry);
 	return workerBinding(client);
 }

@@ -1,10 +1,21 @@
 /// <reference lib="webworker" />
 
 import type {
+	LixBinding,
+	LixStorageConfig,
+	TelemetryDispatch,
+} from "../binding-types.js";
+import type {
 	WorkerConnection,
 	WorkerInput,
 	WorkerResponse,
 } from "./protocol.js";
+
+// Browser/Wasm execution stays off the main thread.
+export const openDirectLixBinding: undefined | ((
+	storage: LixStorageConfig,
+	telemetry?: TelemetryDispatch,
+) => Promise<LixBinding>) = undefined;
 
 export function createWorkerConnection(): WorkerConnection {
 	const worker = new Worker(new URL("./entry.browser.js", import.meta.url), {
