@@ -121,6 +121,50 @@ impl TransactionJson {
         }
     }
 
+    /// Constructs certified row content as zero-copy views over one canonical
+    /// UTF-8 arena.
+    ///
+    /// Typed engine producers have already proven row identity and schema
+    /// semantics before reaching this boundary. Retaining those rows directly
+    /// avoids constructing a decoded/certificate transport batch only for
+    /// transaction normalization to immediately dismantle it again.
+    pub(crate) fn from_certified_row_content_arena(
+        normalized: Vec<u8>,
+        offsets: Vec<(usize, usize)>,
+    ) -> Result<Vec<Self>, LixError> {
+        let invalid_arena = |message| LixError::new(LixError::CODE_INVALID_PARAM, message);
+        let arena = SharedStr::from_utf8(bytes::Bytes::from(normalized))
+            .map_err(|_| invalid_arena("certified transaction JSON arena is not UTF-8"))?;
+        let arena_len = u32::try_from(arena.len())
+            .map_err(|_| invalid_arena("certified transaction JSON arena exceeds u32"))?;
+        let mut previous_end = 0_u32;
+        let mut rows = Vec::with_capacity(offsets.len());
+        for (start, end) in offsets {
+            let start = u32::try_from(start)
+                .map_err(|_| invalid_arena("certified transaction JSON row offset exceeds u32"))?;
+            let end = u32::try_from(end)
+                .map_err(|_| invalid_arena("certified transaction JSON row offset exceeds u32"))?;
+            if start != previous_end || end < start || end > arena_len {
+                return Err(invalid_arena(
+                    "certified transaction JSON arena offsets are invalid or non-contiguous",
+                ));
+            }
+            let normalized = arena.slice(start as usize..end as usize).ok_or_else(|| {
+                invalid_arena("certified transaction JSON arena offsets split a UTF-8 scalar")
+            })?;
+            rows.push(Self::from_certified_shared_normalized_row_content(
+                normalized,
+            ));
+            previous_end = end;
+        }
+        if previous_end != arena_len {
+            return Err(invalid_arena(
+                "certified transaction JSON arena offsets do not cover the arena",
+            ));
+        }
+        Ok(rows)
+    }
+
     /// Retains canonical engine-owned metadata whose semantic validity is
     /// established by the typed producer.
     pub(crate) fn from_certified_shared_normalized_metadata(normalized: SharedStr) -> Self {
@@ -1488,12 +1532,14 @@ pub(crate) fn stage_json_from_value(
             value: OnceLock::new(),
             normalized,
         },
-        TransactionJsonStorage::CertifiedShared { normalized, .. } => {
-            StageJsonStorage::CertifiedShared {
-                value: OnceLock::new(),
-                normalized,
-            }
-        }
+        TransactionJsonStorage::CertifiedShared {
+            normalized,
+            certificate:
+                TransactionJsonCertificate::RowContent | TransactionJsonCertificate::Metadata,
+        } => StageJsonStorage::CertifiedShared {
+            value: OnceLock::new(),
+            normalized,
+        },
         TransactionJsonStorage::CanonicalShared { value, normalized } => {
             StageJsonStorage::CertifiedShared { value, normalized }
         }
@@ -2238,26 +2284,45 @@ impl PreparedStateBatch {
     }
 
     pub(crate) fn release_validated_canonical_value_columns(&mut self) {
-        let old_json = std::mem::take(&mut self.json);
-        let mut ordinal_remap = vec![u32::MAX; old_json.len()];
-        let mut live_json = Vec::with_capacity(self.slots.len().saturating_mul(2));
-        for slot in &mut self.slots {
-            for ordinal in [&mut slot.snapshot, &mut slot.metadata] {
-                let Some(old_ordinal) = *ordinal else {
-                    continue;
-                };
-                let remapped = &mut ordinal_remap[old_ordinal as usize];
-                if *remapped == u32::MAX {
-                    *remapped = u32::try_from(live_json.len())
-                        .expect("prepared live JSON ordinal must fit u32");
-                    live_json.push(old_json[old_ordinal as usize].clone());
-                }
-                *ordinal = Some(*remapped);
+        let live_json_count = self
+            .slots
+            .iter()
+            .map(|slot| usize::from(slot.snapshot.is_some()) + usize::from(slot.metadata.is_some()))
+            .sum::<usize>();
+        #[cfg(debug_assertions)]
+        if live_json_count == self.json.len() {
+            let mut referenced = vec![false; self.json.len()];
+            for ordinal in self
+                .slots
+                .iter()
+                .flat_map(|slot| [slot.snapshot, slot.metadata].into_iter().flatten())
+            {
+                assert!(
+                    !std::mem::replace(&mut referenced[ordinal as usize], true),
+                    "prepared JSON ordinals must remain unique"
+                );
             }
         }
-        self.json = live_json;
-        drop(old_json);
-        drop(ordinal_remap);
+        if live_json_count != self.json.len() {
+            let old_json = std::mem::take(&mut self.json);
+            let mut ordinal_remap = vec![u32::MAX; old_json.len()];
+            let mut live_json = Vec::with_capacity(live_json_count);
+            for slot in &mut self.slots {
+                for ordinal in [&mut slot.snapshot, &mut slot.metadata] {
+                    let Some(old_ordinal) = *ordinal else {
+                        continue;
+                    };
+                    let remapped = &mut ordinal_remap[old_ordinal as usize];
+                    if *remapped == u32::MAX {
+                        *remapped = u32::try_from(live_json.len())
+                            .expect("prepared live JSON ordinal must fit u32");
+                        live_json.push(old_json[old_ordinal as usize].clone());
+                    }
+                    *ordinal = Some(*remapped);
+                }
+            }
+            self.json = live_json;
+        }
         if self.json.is_empty() {
             return;
         }
@@ -3690,6 +3755,87 @@ mod tests {
             .is_err(),
             "validated owned JSON must not retain or reparse a decoded value"
         );
+    }
+
+    #[test]
+    fn dense_certified_transaction_arena_releases_in_place() {
+        const ROW_COUNT: usize = 32;
+        let mut normalized = Vec::new();
+        let mut offsets = Vec::with_capacity(ROW_COUNT);
+        for index in 0..ROW_COUNT {
+            let start = normalized.len();
+            serde_json::to_writer(
+                &mut normalized,
+                &serde_json::json!({"id": format!("entity-{index}")}),
+            )
+            .expect("fixture should serialize");
+            offsets.push((start, normalized.len()));
+        }
+        let snapshots = TransactionJson::from_certified_row_content_arena(normalized, offsets)
+            .expect("certified transaction arena");
+        assert!(snapshots.iter().all(TransactionJson::row_content_certified));
+        let origin_key: SharedStr = "dense-certified-arena".into();
+        let mut batch = PreparedStateBatch::from_test_rows(
+            snapshots
+                .into_iter()
+                .enumerate()
+                .map(|(index, snapshot)| {
+                    prepared_fixture_row(
+                        &format!("entity-{index}"),
+                        Some(
+                            stage_json_from_value(snapshot, "certified transaction arena")
+                                .expect("certified JSON should stage"),
+                        ),
+                        TransactionWriteOperation::Insert,
+                        &origin_key,
+                    )
+                })
+                .collect(),
+        );
+        let json_allocation = batch.json.as_ptr();
+        let first = batch
+            .row(0)
+            .snapshot
+            .expect("first snapshot")
+            .materialize_shared();
+        assert!(batch.iter().skip(1).all(|row| {
+            first.shares_buffer_with(&row.snapshot.expect("snapshot").materialize_shared())
+        }));
+
+        batch.release_validated_canonical_value_columns();
+
+        assert_eq!(
+            batch.json.as_ptr(),
+            json_allocation,
+            "a dense JSON owner column must not be cloned during validation release"
+        );
+        assert!(batch.iter().all(|row| {
+            !row.snapshot
+                .expect("snapshot")
+                .retains_decoded_value_for_tests()
+        }));
+    }
+
+    #[test]
+    fn certified_row_content_remains_decodable_until_validation_release() {
+        let normalized = br#"{"id":"entity-1"}"#.to_vec();
+        let normalized_len = normalized.len();
+        let snapshot = TransactionJson::from_certified_row_content_arena(
+            normalized,
+            vec![(0, normalized_len)],
+        )
+        .expect("certified transaction arena")
+        .pop()
+        .expect("certified row");
+        let mut staged =
+            stage_json_from_value(snapshot, "certified transaction arena").expect("staged JSON");
+
+        assert!(!staged.retains_decoded_value_for_tests());
+        assert_eq!(staged.value()["id"], "entity-1");
+        assert!(staged.retains_decoded_value_for_tests());
+        assert!(staged.release_validated_canonical_value_column());
+        assert!(!staged.retains_decoded_value_for_tests());
+        assert_eq!(staged.normalized(), r#"{"id":"entity-1"}"#);
     }
 
     #[test]

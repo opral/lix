@@ -31,7 +31,7 @@ use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::transaction::types::{
     RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
-use crate::wasm::{WasmCanonicalJson, WasmEntityKey};
+use crate::wasm::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 
 use super::SqlWriteResult;
@@ -2714,14 +2714,7 @@ fn certified_direct_parameter_insert_batch(
         }
     }
 
-    let snapshots = WasmCanonicalJson::from_certified_arena_parts(
-        normalized,
-        offsets,
-        entity_pks.clone(),
-        vec![schema_plan.shared_fingerprint()],
-        vec![0; row_count],
-        row_count,
-    )?;
+    let snapshots = TransactionJson::from_certified_row_content_arena(normalized, offsets)?;
     let schema_key: SharedStr = layout.schema_key.as_str().into();
     let branch_id: SharedStr = ctx.active_branch_id().into();
     let mut rows = RawWriteBatch::with_capacity(row_count);
@@ -2730,7 +2723,7 @@ fn certified_direct_parameter_insert_batch(
             Some(entity_pk),
             schema_key.clone(),
             None,
-            Some(TransactionJson::from_canonical_batch(snapshot)),
+            Some(snapshot),
             None,
             None,
             None,
@@ -3056,21 +3049,14 @@ fn certified_entity_insert_rows<'a>(
     }
 
     let row_count = offsets.len();
-    let snapshots = WasmCanonicalJson::from_certified_arena_parts(
-        normalized,
-        offsets,
-        entity_pks.clone(),
-        vec![schema_plan.shared_fingerprint()],
-        vec![0; row_count],
-        row_count,
-    )?;
+    let snapshots = TransactionJson::from_certified_row_content_arena(normalized, offsets)?;
     let mut rows = RawWriteBatch::with_capacity(row_count);
     for ((entity_pk, snapshot), row) in entity_pks.into_iter().zip(snapshots).zip(row_parts) {
         rows.push_parts(
             Some(entity_pk),
             layout.schema_key.as_str().into(),
             row.file_id,
-            Some(TransactionJson::from_canonical_batch(snapshot)),
+            Some(snapshot),
             row.metadata,
             None,
             None,

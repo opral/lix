@@ -368,14 +368,6 @@ enum WasmCanonicalJsonStorage {
         normalized: Box<[SharedStr]>,
         normalized_len: u32,
     },
-    CertifiedArena {
-        decoded_values: OnceLock<Box<[OnceLock<JsonValue>]>>,
-        entity_pks: Box<[EntityPk]>,
-        schema_fingerprints: Box<[Arc<SchemaPlanFingerprint>]>,
-        schema_fingerprint_indices: Box<[u32]>,
-        normalized: SharedStr,
-        offsets: Box<[WasmCanonicalJsonOffset]>,
-    },
 }
 
 /// Schema and identity facts proven while streaming one exact canonical guest
@@ -580,76 +572,6 @@ impl WasmCanonicalJson {
         })
     }
 
-    pub(crate) fn from_certified_arena_parts(
-        normalized: Vec<u8>,
-        offsets: Vec<(usize, usize)>,
-        entity_pks: Vec<EntityPk>,
-        schema_fingerprints: Vec<Arc<SchemaPlanFingerprint>>,
-        schema_fingerprint_indices: Vec<u32>,
-        parse_count: usize,
-    ) -> Result<Vec<Self>, LixError> {
-        if offsets.len() != entity_pks.len() || offsets.len() != schema_fingerprint_indices.len() {
-            return Err(invalid_param(
-                "certified canonical JSON arena row and metadata counts differ",
-            ));
-        }
-        if schema_fingerprint_indices
-            .iter()
-            .any(|index| *index as usize >= schema_fingerprints.len())
-        {
-            return Err(invalid_param(
-                "certified canonical JSON arena schema index is invalid",
-            ));
-        }
-
-        let arena_allocation_count = u8::from(normalized.capacity() != 0);
-        let normalized = SharedStr::from_utf8(Bytes::from(normalized))
-            .map_err(|_| invalid_param("certified canonical JSON arena is not UTF-8"))?;
-        let arena_len = u32::try_from(normalized.len())
-            .map_err(|_| invalid_param("certified canonical JSON arena exceeds u32"))?;
-        let mut previous_end = 0_u32;
-        let mut validated_offsets = Vec::with_capacity(offsets.len());
-        for (start, end) in offsets {
-            let start = u32::try_from(start)
-                .map_err(|_| invalid_param("certified canonical JSON row offset exceeds u32"))?;
-            let end = u32::try_from(end)
-                .map_err(|_| invalid_param("certified canonical JSON row offset exceeds u32"))?;
-            if start != previous_end || end < start || end > arena_len {
-                return Err(invalid_param(
-                    "certified canonical JSON arena offsets are invalid or non-contiguous",
-                ));
-            }
-            if !normalized.as_str().is_char_boundary(start as usize)
-                || !normalized.as_str().is_char_boundary(end as usize)
-            {
-                return Err(invalid_param(
-                    "certified canonical JSON arena offsets split a UTF-8 scalar",
-                ));
-            }
-            previous_end = end;
-            validated_offsets.push(WasmCanonicalJsonOffset { start, end });
-        }
-        if previous_end != arena_len {
-            return Err(invalid_param(
-                "certified canonical JSON arena offsets do not cover the arena",
-            ));
-        }
-
-        Self::from_validated_batch(WasmCanonicalJsonBatch {
-            storage: WasmCanonicalJsonStorage::CertifiedArena {
-                decoded_values: OnceLock::new(),
-                entity_pks: entity_pks.into_boxed_slice(),
-                schema_fingerprints: schema_fingerprints.into_boxed_slice(),
-                schema_fingerprint_indices: schema_fingerprint_indices.into_boxed_slice(),
-                normalized,
-                offsets: validated_offsets.into_boxed_slice(),
-            },
-            parse_count,
-            serialize_count: 0,
-            arena_allocation_count,
-        })
-    }
-
     fn from_validated_batch(batch: WasmCanonicalJsonBatch) -> Result<Vec<Self>, LixError> {
         let batch = Arc::new(batch);
         let mut rows = Vec::with_capacity(batch.row_count());
@@ -679,23 +601,6 @@ impl WasmCanonicalJson {
                 serde_json::from_str(normalized[self.row_index()].as_str())
                     .expect("certified canonical JSON must parse")
             }),
-            WasmCanonicalJsonStorage::CertifiedArena {
-                decoded_values,
-                normalized,
-                offsets,
-                ..
-            } => decoded_values
-                .get_or_init(|| (0..offsets.len()).map(|_| OnceLock::new()).collect())
-                [self.row_index()]
-            .get_or_init(|| {
-                serde_json::from_str(
-                    normalized
-                        .as_str()
-                        .get(offset_range(offsets[self.row_index()]))
-                        .expect("certified canonical JSON row offsets were validated"),
-                )
-                .expect("certified canonical JSON must parse")
-            }),
         }
     }
 
@@ -705,12 +610,6 @@ impl WasmCanonicalJson {
                 .as_ref()
                 .map(WasmCanonicalJsonCertificate::borrowed),
             WasmCanonicalJsonStorage::CertifiedRows {
-                entity_pks,
-                schema_fingerprints,
-                schema_fingerprint_indices,
-                ..
-            }
-            | WasmCanonicalJsonStorage::CertifiedArena {
                 entity_pks,
                 schema_fingerprints,
                 schema_fingerprint_indices,
@@ -736,14 +635,6 @@ impl WasmCanonicalJson {
             WasmCanonicalJsonStorage::CertifiedRows { normalized, .. } => {
                 normalized[self.row_index()].as_str()
             }
-            WasmCanonicalJsonStorage::CertifiedArena {
-                normalized,
-                offsets,
-                ..
-            } => normalized
-                .as_str()
-                .get(offset_range(offsets[self.row_index()]))
-                .expect("certified canonical JSON row offsets were validated"),
         }
     }
 
@@ -759,13 +650,6 @@ impl WasmCanonicalJson {
             WasmCanonicalJsonStorage::CertifiedRows { normalized, .. } => {
                 normalized[self.row_index()].clone()
             }
-            WasmCanonicalJsonStorage::CertifiedArena {
-                normalized,
-                offsets,
-                ..
-            } => normalized
-                .slice(offset_range(offsets[self.row_index()]))
-                .expect("certified canonical JSON row offsets were validated"),
         }
     }
 
@@ -783,7 +667,6 @@ impl WasmCanonicalJson {
             WasmCanonicalJsonStorage::CertifiedRows { normalized_len, .. } => {
                 *normalized_len as usize
             }
-            WasmCanonicalJsonStorage::CertifiedArena { normalized, .. } => normalized.len(),
         }
     }
 
@@ -809,10 +692,6 @@ impl WasmCanonicalJson {
                 .get()
                 .map(|values| values.iter().filter(|value| value.get().is_some()).count())
                 .unwrap_or(0),
-            WasmCanonicalJsonStorage::CertifiedArena { decoded_values, .. } => decoded_values
-                .get()
-                .map(|values| values.iter().filter(|value| value.get().is_some()).count())
-                .unwrap_or(0),
         }
     }
 
@@ -821,10 +700,6 @@ impl WasmCanonicalJson {
         match &self.batch.storage {
             WasmCanonicalJsonStorage::Arena { .. } => 0,
             WasmCanonicalJsonStorage::CertifiedRows {
-                schema_fingerprints,
-                ..
-            }
-            | WasmCanonicalJsonStorage::CertifiedArena {
                 schema_fingerprints,
                 ..
             } => schema_fingerprints.len(),
@@ -837,7 +712,6 @@ impl WasmCanonicalJsonBatch {
         match &self.storage {
             WasmCanonicalJsonStorage::Arena { offsets, .. } => offsets.len(),
             WasmCanonicalJsonStorage::CertifiedRows { normalized, .. } => normalized.len(),
-            WasmCanonicalJsonStorage::CertifiedArena { offsets, .. } => offsets.len(),
         }
     }
 }
