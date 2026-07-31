@@ -2315,22 +2315,23 @@ fn packed_exact_keys_for_filter(filter: &TrackedStateFilter) -> Option<Vec<Track
     if !includes_unfiled {
         return Some(Vec::new());
     }
-    Some(
-        filter
-            .schema_keys
-            .iter()
-            .flat_map(|schema_key| {
-                filter
-                    .entity_pks
-                    .iter()
-                    .map(move |entity_pk| TrackedStateKey {
-                        schema_key: schema_key.clone(),
-                        file_id: None,
-                        entity_pk: entity_pk.clone(),
-                    })
-            })
-            .collect(),
-    )
+    let mut keys = filter
+        .schema_keys
+        .iter()
+        .flat_map(|schema_key| {
+            filter
+                .entity_pks
+                .iter()
+                .map(move |entity_pk| TrackedStateKey {
+                    schema_key: schema_key.clone(),
+                    file_id: None,
+                    entity_pk: entity_pk.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys.dedup();
+    Some(keys)
 }
 
 fn materialize_packed_slot(
@@ -6390,7 +6391,7 @@ fn choose_hot_or_packed_working_diff(
     packed: Option<WorkingDiffVersion>,
 ) -> Option<(Option<WorkingDiffVersion>, WorkingDiffVersion)> {
     match (hot, packed) {
-        (Some(hot), Some(packed)) if hot.1.commit_id < packed.commit_id => Some((None, packed)),
+        (Some(hot), Some(packed)) if hot.1.commit_id < packed.commit_id => Some((hot.0, packed)),
         (Some(hot), _) => Some(hot),
         (None, Some(packed)) => Some((None, packed)),
         (None, None) => None,
@@ -8497,6 +8498,7 @@ mod tests {
 
     #[test]
     fn packed_recreate_wins_over_older_hot_working_diff_tombstone() {
+        let baseline = working_diff_version("checkpoint-baseline");
         let mut hot = working_diff_version("hot-tombstone");
         hot.commit_id = CommitId::new(uuid::Uuid::from_u128(1));
         hot.deleted = true;
@@ -8504,12 +8506,56 @@ mod tests {
         packed.commit_id = CommitId::new(uuid::Uuid::from_u128(2));
 
         let (before, after) =
-            choose_hot_or_packed_working_diff(Some((Some(hot), hot)), Some(packed))
+            choose_hot_or_packed_working_diff(Some((Some(baseline), hot)), Some(packed))
                 .expect("one current version must win");
 
-        assert_eq!(before, None);
+        assert_eq!(before, Some(baseline));
         assert_eq!(after, packed);
         assert!(!after.deleted);
+    }
+
+    #[test]
+    fn packed_exact_keys_are_ordered_and_deduplicated() {
+        let filter = TrackedStateFilter {
+            schema_keys: vec![
+                "schema-b".to_owned(),
+                "schema-a".to_owned(),
+                "schema-a".to_owned(),
+            ],
+            entity_pks: vec![
+                EntityPk::single("second"),
+                EntityPk::single("first"),
+                EntityPk::single("first"),
+            ],
+            ..TrackedStateFilter::default()
+        };
+
+        let keys = packed_exact_keys_for_filter(&filter).expect("filter is finite");
+        assert_eq!(
+            keys,
+            vec![
+                TrackedStateKey {
+                    schema_key: "schema-a".to_owned(),
+                    file_id: None,
+                    entity_pk: EntityPk::single("first"),
+                },
+                TrackedStateKey {
+                    schema_key: "schema-a".to_owned(),
+                    file_id: None,
+                    entity_pk: EntityPk::single("second"),
+                },
+                TrackedStateKey {
+                    schema_key: "schema-b".to_owned(),
+                    file_id: None,
+                    entity_pk: EntityPk::single("first"),
+                },
+                TrackedStateKey {
+                    schema_key: "schema-b".to_owned(),
+                    file_id: None,
+                    entity_pk: EntityPk::single("second"),
+                },
+            ]
+        );
     }
 
     fn single_hot_diff_segment(
