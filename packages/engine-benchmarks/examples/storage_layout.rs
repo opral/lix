@@ -12,6 +12,7 @@ use object_store::local::LocalFileSystem;
 use slatedb::{SstReader, ValueDeletable};
 
 const HOT_SPACE: &str = "live_state.hot_row.v20";
+const IMMUTABLE_BINARY_CAS_CHUNK_DIR: &str = "db/lix-immutable-binary-cas-chunk-v2";
 
 #[derive(Default)]
 struct HotGroup {
@@ -44,7 +45,12 @@ async fn main() {
     let physical_only = mode.as_deref().is_some_and(|arg| arg == "--physical-only");
     if physical_only {
         let space_names = layout_space_catalog().into_iter().collect();
-        inspect_ssts_fast(Path::new(&path), &space_names).await;
+        let sst_bytes = inspect_ssts_fast(Path::new(&path), &space_names).await;
+        let immutable_bytes = inspect_immutable_chunks(Path::new(&path));
+        println!(
+            "PHYSICAL_TOTAL_FAST\tbytes={}",
+            sst_bytes.saturating_add(immutable_bytes)
+        );
         return;
     }
     let storage = StorageAdapter::new(SlateDB::open(&path).expect("open SlateDB"));
@@ -241,7 +247,7 @@ struct PhysicalSpace {
     hot_versions: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>)>>,
 }
 
-async fn inspect_ssts_fast(path: &Path, space_names: &BTreeMap<u32, &'static str>) {
+async fn inspect_ssts_fast(path: &Path, space_names: &BTreeMap<u32, &'static str>) -> u64 {
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(path.join("db")).expect("local object store"));
     let reader = SstReader::new("lix-space-segments-v2", object_store, None, None);
@@ -295,6 +301,27 @@ async fn inspect_ssts_fast(path: &Path, space_names: &BTreeMap<u32, &'static str
             space_names.get(&space_id).copied().unwrap_or("<unknown>"),
         );
     }
+    total_file_bytes
+}
+
+fn inspect_immutable_chunks(path: &Path) -> u64 {
+    let directory = path.join(IMMUTABLE_BINARY_CAS_CHUNK_DIR);
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        println!("IMMUTABLE_CHUNKS_FAST\tobjects=0\tbytes=0");
+        return 0;
+    };
+    let mut objects = 0_u64;
+    let mut bytes = 0_u64;
+    for entry in entries {
+        let entry = entry.expect("read immutable chunk entry");
+        let metadata = entry.metadata().expect("read immutable chunk metadata");
+        if metadata.is_file() {
+            objects += 1;
+            bytes = bytes.saturating_add(metadata.len());
+        }
+    }
+    println!("IMMUTABLE_CHUNKS_FAST\tobjects={objects}\tbytes={bytes}");
+    bytes
 }
 
 fn physical_space_id(key: &[u8]) -> u32 {
