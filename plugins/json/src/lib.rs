@@ -172,8 +172,9 @@ impl sdk::FormatPlugin for JsonPlugin {
     fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
         let bytes = input.accepted.read_all()?;
         let namespace = IdNamespace::from_halves(input.creates.high, u64::from(input.creates.low));
-        let (document, changes) = Document::open_file(bytes, input.file.path.as_deref(), namespace)
-            .map_err(sdk::Error::invalid_input)?;
+        let (document, changes) =
+            Document::open_fresh_file(bytes, input.file.path.as_deref(), namespace)
+                .map_err(sdk::Error::invalid_input)?;
         input
             .successor
             .put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
