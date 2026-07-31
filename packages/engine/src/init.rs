@@ -39,14 +39,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V32 adds source-addressed checkpoint deltas and their selection certificate
-/// to the packed history plane.
-/// Older manifests have a different packed field layout and must fail closed
-/// before they can be decoded as source aliases.
+/// V34 widens certified commit-delta segment coordinates for the LXCD8 packed
+/// history format. Older manifests and locators must fail closed before their
+/// LXCD7 coordinates can be decoded with the wider layout.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"checkpoint-source-delta.v33";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"wide-commit-delta-coordinates.v34";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
