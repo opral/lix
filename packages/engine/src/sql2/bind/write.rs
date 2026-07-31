@@ -12,10 +12,11 @@ pub(crate) struct BoundWrite {
     pub(crate) predicate: BoundPredicate,
     pub(crate) assignments: Vec<BoundAssignment>,
     pub(crate) conflict: Option<BoundInsertConflict>,
-    /// The pre-change projection requested by `DELETE … RETURNING`.
+    /// The row projection requested by a DML `RETURNING` clause.
     ///
-    /// This remains part of the bound write rather than a post-hoc read so
-    /// execution can project directly from the exact batch being deleted.
+    /// It remains part of the bound write so execution can project the exact
+    /// affected image: the pre-image for DELETE and the final post-image for
+    /// INSERT, UPDATE, and UPSERT.
     pub(crate) returning: Option<BoundReturning>,
     pub(crate) params: BoundParamMap,
     pub(crate) branch_scope: BranchScope,

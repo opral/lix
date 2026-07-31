@@ -61,6 +61,13 @@ test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 	await lix.close();
 });
 
+test("openLix opens native storage without telemetry", async () => {
+	const lix = await openLix();
+	const result = await lix.execute("SELECT 1 AS value");
+	expect(get(result, "value")).toBe(1);
+	await lix.close();
+});
+
 test("openLix exposes the lix-sdk e2e flow", async () => {
 	const lix = await openLix();
 	const mainBranchId = await lix.activeBranchId();
@@ -172,6 +179,46 @@ test("createCheckpoint returns the new active head through the local worker", as
 
 	expect(checkpoint.commitId).not.toBe(before);
 	expect(checkpoint.commitId).toBe(await activeHeadCommitId(lix));
+	await lix.close();
+});
+
+test("execute and executeBatch expose registered-entity RETURNING postimages", async () => {
+	const lix = await openLix();
+	await registerCrmTaskSchema(lix);
+
+	const inserted = await lix.execute(
+		"INSERT INTO crm_task (title, done) VALUES ($1, $2) RETURNING id, title",
+		["Created through SDK RETURNING", false],
+	);
+	expect(inserted.rowsAffected).toBe(1);
+	expect(inserted.columns).toEqual(["id", "title"]);
+	expect(inserted.rows).toHaveLength(1);
+	const id = get(inserted, "id");
+	expect(typeof id).toBe("string");
+	expect(id).not.toBe("");
+	expect(get(inserted, "title")).toBe("Created through SDK RETURNING");
+	const taskId = String(id);
+
+	const updated = await lix.execute(
+		"UPDATE crm_task SET title = $1 WHERE id = $2 RETURNING id, title",
+		["Updated through SDK RETURNING", taskId],
+	);
+	expect(updated.rowsAffected).toBe(1);
+	expect(updated.columns).toEqual(["id", "title"]);
+	expect(get(updated, "id")).toBe(taskId);
+	expect(get(updated, "title")).toBe("Updated through SDK RETURNING");
+
+	const [batched] = await lix.executeBatch([
+		{
+			sql: "INSERT INTO crm_task (title, done) VALUES ($1, $2) RETURNING id, title",
+			params: ["Batched SDK RETURNING", true],
+		},
+	]);
+	expect(batched?.rowsAffected).toBe(1);
+	expect(batched?.columns).toEqual(["id", "title"]);
+	expect(get(batched!, "title")).toBe("Batched SDK RETURNING");
+	expect(typeof get(batched!, "id")).toBe("string");
+
 	await lix.close();
 });
 
@@ -1880,7 +1927,7 @@ async function registerCrmTaskSchema(lix: Lix): Promise<void> {
 		type: "object",
 		required: ["id", "title", "done"],
 		properties: {
-			id: { type: "string" },
+			id: { type: "string", "x-lix-default": "lix_uuid_v7()" },
 			title: { type: "string" },
 			done: { type: "boolean" },
 			meta: { type: "object" },

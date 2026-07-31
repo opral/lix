@@ -876,6 +876,7 @@ fn fast_file_data_update_shape(
         || plan.bound.op != BoundWriteOp::Update
         || !matches!(plan.bound.input, BoundWriteInput::None)
         || plan.bound.conflict.is_some()
+        || plan.bound.returning.is_some()
         || !matches!(plan.bound.branch_scope, BranchScope::Active { .. })
         || !(1..=2).contains(&plan.bound.assignments.len())
     {
@@ -988,29 +989,23 @@ async fn execute_entity_write(
         BoundWriteOp::Insert => {
             if no_op {
                 entity_insert_batch(ctx, plan, &spec, params, active_branch_commit_id.as_ref())?;
-                return Ok(SqlWriteResult::affected(0));
+                return Ok(empty_entity_returning_result(plan));
             }
             if plan.bound.conflict.is_some() {
-                entity_upsert(ctx, plan, &spec, params, active_branch_commit_id.as_ref())
-                    .await
-                    .map(SqlWriteResult::affected)
+                entity_upsert(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
             } else {
-                entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_ref())
-                    .await
-                    .map(SqlWriteResult::affected)
+                entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
             }
         }
         BoundWriteOp::Update => {
             if no_op {
-                return Ok(SqlWriteResult::affected(0));
+                return Ok(empty_entity_returning_result(plan));
             }
-            entity_update(ctx, plan, &spec, params, active_branch_commit_id.as_ref())
-                .await
-                .map(SqlWriteResult::affected)
+            entity_update(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
         }
         BoundWriteOp::Delete => {
             if no_op {
-                return Ok(empty_entity_delete_returning_result(plan));
+                return Ok(empty_entity_returning_result(plan));
             }
             if matches!(surface, EntityWriteSurface::Base { .. })
                 && matches!(plan.bound.predicate, BoundPredicate::True)
@@ -1313,7 +1308,10 @@ fn fast_file_path_write_shape(
     plan: &LogicalWritePlan,
     surface: &FileWriteSurface,
 ) -> Option<FastFilePathWriteShape> {
-    if !matches!(surface, FileWriteSurface::Base) || plan.bound.op != BoundWriteOp::Insert {
+    if !matches!(surface, FileWriteSurface::Base)
+        || plan.bound.op != BoundWriteOp::Insert
+        || plan.bound.returning.is_some()
+    {
         return None;
     }
     let BoundWriteInput::Values(values) = &plan.bound.input else {
@@ -1542,9 +1540,18 @@ async fn entity_insert(
     spec: &EntitySurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<u64, LixError> {
+) -> Result<SqlWriteResult, LixError> {
     let write_rows = entity_insert_batch(ctx, plan, spec, params, active_branch_commit_id)?;
-    stage_rows(ctx, TransactionWriteMode::Insert, write_rows).await
+    stage_entity_rows_with_postimage_returning(
+        ctx,
+        plan,
+        spec,
+        params,
+        active_branch_commit_id,
+        TransactionWriteMode::Insert,
+        write_rows,
+    )
+    .await
 }
 
 async fn entity_upsert(
@@ -1553,7 +1560,7 @@ async fn entity_upsert(
     spec: &EntitySurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<u64, LixError> {
+) -> Result<SqlWriteResult, LixError> {
     let conflict = plan.bound.conflict.as_ref().ok_or_else(|| {
         LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -1590,7 +1597,16 @@ async fn entity_upsert(
         }
     }
 
-    stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await
+    stage_entity_rows_with_postimage_returning(
+        ctx,
+        plan,
+        spec,
+        params,
+        active_branch_commit_id,
+        TransactionWriteMode::Replace,
+        write_rows,
+    )
+    .await
 }
 
 fn entity_insert_batch(
@@ -1640,7 +1656,7 @@ async fn entity_update(
     spec: &EntitySurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<u64, LixError> {
+) -> Result<SqlWriteResult, LixError> {
     let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
     let mut write_rows = RawWriteBatch::with_capacity(candidates.len());
     for candidate in candidates.iter() {
@@ -1654,7 +1670,234 @@ async fn entity_update(
             active_branch_commit_id,
         )?;
     }
-    stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await
+    stage_entity_rows_with_postimage_returning(
+        ctx,
+        plan,
+        spec,
+        params,
+        active_branch_commit_id,
+        TransactionWriteMode::Replace,
+        write_rows,
+    )
+    .await
+}
+
+/// Stage entity INSERT/UPDATE rows and, when requested, retain their final
+/// write images for `RETURNING`.  The post-image is evaluated from the
+/// normalized write row rather than the input expression so schema defaults
+/// (including generated IDs) and conflict updates are visible to callers.
+///
+/// Evaluation happens before staging because staging consumes the batch, but
+/// the query result is only constructed after the write is accepted. This
+/// matches the existing DELETE path's all-or-error behavior while avoiding a
+/// second lookup through the transaction overlay.
+async fn stage_entity_rows_with_postimage_returning(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+    mode: TransactionWriteMode,
+    write_rows: RawWriteBatch,
+) -> Result<SqlWriteResult, LixError> {
+    let returning_requires_staged_postimage =
+        plan.bound.returning.as_ref().is_some_and(|returning| {
+            returning
+                .items
+                .iter()
+                .any(|item| returning_expr_requires_staged_postimage(&item.expr))
+        });
+    let returning_rows = if returning_requires_staged_postimage {
+        None
+    } else {
+        entity_postimage_returning_rows(
+            plan,
+            spec,
+            ctx,
+            params,
+            active_branch_commit_id,
+            &write_rows,
+        )?
+    };
+    // Transaction staging materializes audit fields such as the change and
+    // commit IDs. Keep the direct write rows only for projections that need
+    // those fields, then read their exact transaction-overlay post-images in
+    // source order after staging succeeds.
+    let staged_postimage_rows = returning_requires_staged_postimage.then(|| write_rows.clone());
+    let rows_affected = stage_rows(ctx, mode, write_rows).await?;
+    let returning_rows = match staged_postimage_rows {
+        Some(write_rows) => {
+            entity_staged_postimage_returning_rows(
+                plan,
+                spec,
+                ctx,
+                params,
+                active_branch_commit_id,
+                &write_rows,
+            )
+            .await?
+        }
+        None => returning_rows,
+    };
+    Ok(entity_returning_result(plan, rows_affected, returning_rows))
+}
+
+fn entity_postimage_returning_rows(
+    plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
+    ctx: &mut dyn SqlWriteExecutionContext,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+    write_rows: &RawWriteBatch,
+) -> Result<Option<Vec<Vec<Value>>>, LixError> {
+    let Some(returning) = plan.bound.returning.as_ref() else {
+        return Ok(None);
+    };
+    let mut rows = Vec::with_capacity(write_rows.len());
+    for row in write_rows.iter() {
+        // Certified parameter batches intentionally retain only canonical
+        // bytes. Decoding through `TransactionJson::value()` would panic for
+        // those rows, so materialize the normalized representation here.
+        let snapshot = row
+            .snapshot
+            .map(|snapshot| transaction_json_returning_value(snapshot, "entity post-image"))
+            .transpose()?
+            .unwrap_or(JsonValue::Null);
+        let context = EntityEvalContext::staged(&snapshot, row, spec);
+        rows.push(entity_returning_row(
+            returning,
+            &context,
+            spec,
+            ctx,
+            params,
+            active_branch_commit_id,
+        )?);
+    }
+    Ok(Some(rows))
+}
+
+fn transaction_json_returning_value(
+    value: &TransactionJson,
+    context: &str,
+) -> Result<JsonValue, LixError> {
+    serde_json::from_str(value.normalized()).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("{context} contains invalid normalized JSON: {error}"),
+        )
+    })
+}
+
+async fn entity_staged_postimage_returning_rows(
+    plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
+    ctx: &mut dyn SqlWriteExecutionContext,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+    write_rows: &RawWriteBatch,
+) -> Result<Option<Vec<Vec<Value>>>, LixError> {
+    let Some(returning) = plan.bound.returning.as_ref() else {
+        return Ok(None);
+    };
+    if write_rows.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let candidates = scan_entity_conflict_candidates(ctx, spec, write_rows).await?;
+    // A staged audit projection needs the transaction-visible row, but it
+    // must not look through every candidate again for every write row. Aside
+    // from making large `RETURNING *` writes quadratic, that repeated search
+    // hid the fact that the match is a stable physical identity. Index once
+    // and retain the previous ambiguity check.
+    let mut candidates_by_identity = std::collections::HashMap::with_capacity(candidates.len());
+    for candidate in candidates.iter() {
+        let identity = entity_live_returning_identity(candidate);
+        if candidates_by_identity.insert(identity, candidate).is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "staged entity post-image for schema '{}' is ambiguous in the transaction overlay",
+                    spec.schema_key
+                ),
+            ));
+        }
+    }
+    let mut rows = Vec::with_capacity(write_rows.len());
+    for write_row in write_rows.iter() {
+        let identity = entity_staged_returning_identity(write_row, spec)?;
+        let candidate = candidates_by_identity.get(&identity).copied().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "staged entity post-image for schema '{}' is missing from the transaction overlay",
+                    spec.schema_key
+                ),
+            )
+        })?;
+        let snapshot = candidate_snapshot(candidate)?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "staged entity post-image for schema '{}' is unexpectedly a tombstone",
+                    spec.schema_key
+                ),
+            )
+        })?;
+        let context = EntityEvalContext::live(&snapshot, candidate, spec);
+        rows.push(entity_returning_row(
+            returning,
+            &context,
+            spec,
+            ctx,
+            params,
+            active_branch_commit_id,
+        )?);
+    }
+    Ok(Some(rows))
+}
+
+type EntityReturningIdentity = (EntityPk, Option<String>, String, bool);
+
+fn entity_staged_returning_identity(
+    row: RawWriteRowRef<'_>,
+    spec: &EntitySurfaceSpec,
+) -> Result<EntityReturningIdentity, LixError> {
+    Ok((
+        insert_row_entity_pk(row, spec)?,
+        row.file_id.map(|file_id| file_id.as_str().to_owned()),
+        row.branch_id.as_str().to_owned(),
+        row.global,
+    ))
+}
+
+fn entity_live_returning_identity(row: MaterializedLiveStateRowRef<'_>) -> EntityReturningIdentity {
+    (
+        row.entity_pk().clone(),
+        row.file_id().map(ToOwned::to_owned),
+        row.branch_id().to_owned(),
+        row.global(),
+    )
+}
+
+fn entity_returning_result(
+    plan: &LogicalWritePlan,
+    rows_affected: u64,
+    rows: Option<Vec<Vec<Value>>>,
+) -> SqlWriteResult {
+    match (plan.bound.returning.as_ref(), rows) {
+        (Some(returning), Some(rows)) => SqlWriteResult::returning(
+            rows_affected,
+            crate::SqlQueryResult {
+                columns: returning
+                    .items
+                    .iter()
+                    .map(|item| item.output_name.clone())
+                    .collect(),
+                rows,
+                notices: Vec::new(),
+            },
+        ),
+        _ => SqlWriteResult::affected(rows_affected),
+    }
 }
 
 fn append_entity_update_row<'a>(
@@ -1798,24 +2041,8 @@ async fn entity_delete(
     }
 }
 
-fn empty_entity_delete_returning_result(plan: &LogicalWritePlan) -> SqlWriteResult {
-    plan.bound.returning.as_ref().map_or_else(
-        || SqlWriteResult::affected(0),
-        |returning| {
-            SqlWriteResult::returning(
-                0,
-                crate::SqlQueryResult {
-                    columns: returning
-                        .items
-                        .iter()
-                        .map(|item| item.output_name.clone())
-                        .collect(),
-                    rows: Vec::new(),
-                    notices: Vec::new(),
-                },
-            )
-        },
-    )
+fn empty_entity_returning_result(plan: &LogicalWritePlan) -> SqlWriteResult {
+    entity_returning_result(plan, 0, plan.bound.returning.as_ref().map(|_| Vec::new()))
 }
 
 fn entity_returning_row(
@@ -3535,10 +3762,101 @@ fn inherited_metadata<'a>(
 
 struct EntityEvalContext<'a> {
     snapshot: &'a JsonValue,
-    row: Option<EntityLiveRowRef<'a>>,
+    row: Option<EntityEvalRowRef<'a>>,
     excluded_snapshot: Option<&'a JsonValue>,
     excluded_row: Option<RawWriteRowRef<'a>>,
     visible_columns: &'a [EntitySurfaceColumn],
+}
+
+#[derive(Clone, Copy)]
+enum EntityEvalRowRef<'a> {
+    Live(EntityLiveRowRef<'a>),
+    Staged(RawWriteRowRef<'a>),
+}
+
+impl<'a> EntityEvalRowRef<'a> {
+    fn entity_pk(self) -> Option<&'a EntityPk> {
+        match self {
+            Self::Live(row) => Some(row.entity_pk()),
+            Self::Staged(row) => row.entity_pk,
+        }
+    }
+
+    fn schema_key(self) -> &'a str {
+        match self {
+            Self::Live(row) => row.schema_key(),
+            Self::Staged(row) => row.schema_key.as_str(),
+        }
+    }
+
+    fn file_id(self) -> Option<&'a str> {
+        match self {
+            Self::Live(row) => row.file_id(),
+            Self::Staged(row) => row.file_id.map(SharedStr::as_str),
+        }
+    }
+
+    fn metadata(self) -> Result<Option<JsonValue>, LixError> {
+        match self {
+            Self::Live(row) => row
+                .metadata()
+                .map(|metadata| parse_row_metadata_value(metadata, row.schema_key()))
+                .transpose(),
+            Self::Staged(row) => row
+                .metadata
+                .map(|metadata| transaction_json_returning_value(metadata, "entity metadata"))
+                .transpose(),
+        }
+    }
+
+    fn created_at(self) -> Option<String> {
+        match self {
+            Self::Live(row) => Some(row.created_at().to_string()),
+            Self::Staged(row) => row.created_at.map(str::to_owned),
+        }
+    }
+
+    fn updated_at(self) -> Option<String> {
+        match self {
+            Self::Live(row) => Some(row.updated_at().to_string()),
+            Self::Staged(row) => row.updated_at.map(str::to_owned),
+        }
+    }
+
+    fn change_id(self) -> Option<String> {
+        match self {
+            Self::Live(row) => row.change_id().map(|value| value.to_string()),
+            Self::Staged(row) => row.change_id.map(str::to_owned),
+        }
+    }
+
+    fn commit_id(self) -> Option<String> {
+        match self {
+            Self::Live(row) => row.commit_id().map(|value| value.to_string()),
+            Self::Staged(row) => row.commit_id.map(str::to_owned),
+        }
+    }
+
+    fn global(self) -> bool {
+        match self {
+            Self::Live(row) => row.global(),
+            Self::Staged(row) => row.global,
+        }
+    }
+
+    fn untracked(self) -> bool {
+        match self {
+            Self::Live(row) => row.untracked(),
+            Self::Staged(row) => row.untracked,
+        }
+    }
+
+    fn branch_id(self) -> &'a str {
+        match self {
+            Self::Live(row) => row.branch_id(),
+            Self::Staged(row) => row.branch_id.as_str(),
+        }
+    }
 }
 
 impl<'a> EntityEvalContext<'a> {
@@ -3559,7 +3877,21 @@ impl<'a> EntityEvalContext<'a> {
     ) -> Self {
         Self {
             snapshot,
-            row: Some(row.into()),
+            row: Some(EntityEvalRowRef::Live(row.into())),
+            excluded_snapshot: None,
+            excluded_row: None,
+            visible_columns: &spec.columns,
+        }
+    }
+
+    fn staged(
+        snapshot: &'a JsonValue,
+        row: RawWriteRowRef<'a>,
+        spec: &'a EntitySurfaceSpec,
+    ) -> Self {
+        Self {
+            snapshot,
+            row: Some(EntityEvalRowRef::Staged(row)),
             excluded_snapshot: None,
             excluded_row: None,
             visible_columns: &spec.columns,
@@ -3575,7 +3907,7 @@ impl<'a> EntityEvalContext<'a> {
     ) -> Self {
         Self {
             snapshot,
-            row: Some(row.into()),
+            row: Some(EntityEvalRowRef::Live(row.into())),
             excluded_snapshot: Some(excluded_snapshot),
             excluded_row: Some(excluded_row),
             visible_columns: &spec.columns,
@@ -4097,21 +4429,52 @@ fn validate_bound_write_supported(
             validate_expr_supported(&item.expr)?;
         }
     }
-    if plan.bound.returning.is_some() && plan.bound.op != BoundWriteOp::Delete {
-        let action = match plan.bound.op {
-            BoundWriteOp::Insert => "INSERT",
-            BoundWriteOp::Update => "UPDATE",
-            BoundWriteOp::Delete => unreachable!("DELETE RETURNING is supported"),
-        };
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            format!("{action} RETURNING is not supported for registered entity surfaces"),
-        )
-        .with_hint(format!(
-            "Run the {action} without RETURNING, then SELECT the row explicitly."
-        )));
-    }
     Ok(())
+}
+
+/// Whether a direct entity `RETURNING` projection is fully evaluated before
+/// staging. The explicit-transaction boundary uses this to avoid snapshotting
+/// a large journal for the common `RETURNING id, ...` case; audit fields still
+/// require a rollback checkpoint because they are populated by staging.
+pub(crate) fn entity_returning_projects_before_stage(plan: &LogicalWritePlan) -> bool {
+    if !matches!(plan.bound.target, BoundWriteTarget::Entity(_))
+        || !bound_public_write_shape_supported(plan)
+    {
+        return false;
+    }
+    match plan.bound.op {
+        // Entity DELETE captures the preimage before it stages tombstones.
+        BoundWriteOp::Delete => true,
+        BoundWriteOp::Insert | BoundWriteOp::Update => {
+            plan.bound.returning.as_ref().is_some_and(|returning| {
+                returning
+                    .items
+                    .iter()
+                    .all(|item| !returning_expr_requires_staged_postimage(&item.expr))
+            })
+        }
+    }
+}
+
+fn returning_expr_requires_staged_postimage(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Column(column)
+            if matches!(
+                column.name.as_str(),
+                "lixcol_created_at" | "lixcol_updated_at" | "lixcol_change_id" | "lixcol_commit_id"
+            ) =>
+        {
+            true
+        }
+        BoundExpr::Cast { expr, .. } => returning_expr_requires_staged_postimage(expr),
+        BoundExpr::Function { args, .. } => {
+            args.iter().any(returning_expr_requires_staged_postimage)
+        }
+        BoundExpr::Column(_)
+        | BoundExpr::ExcludedColumn(_)
+        | BoundExpr::Param(_)
+        | BoundExpr::Literal(_) => false,
+    }
 }
 
 fn bound_public_write_shape_supported(plan: &LogicalWritePlan) -> bool {
@@ -4663,8 +5026,13 @@ fn column_eval_value(
     match column_name {
         "lixcol_entity_pk" => row
             .entity_pk()
-            .as_json_array_value()
-            .map(EntityEvalValue::Json),
+            .map(EntityPk::as_json_array_value)
+            .transpose()
+            .map(|value| {
+                value
+                    .map(EntityEvalValue::Json)
+                    .unwrap_or(EntityEvalValue::SqlNull)
+            }),
         "lixcol_schema_key" => Ok(EntityEvalValue::Json(JsonValue::String(
             row.schema_key().to_string(),
         ))),
@@ -4672,25 +5040,23 @@ fn column_eval_value(
             .file_id()
             .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
             .unwrap_or(EntityEvalValue::SqlNull)),
-        "lixcol_metadata" => row
-            .metadata()
-            .map(|metadata| parse_row_metadata_value(metadata, row.schema_key()))
-            .transpose()
-            .map(|metadata| {
-                metadata
-                    .map(EntityEvalValue::Json)
-                    .unwrap_or(EntityEvalValue::SqlNull)
-            }),
+        "lixcol_metadata" => row.metadata().map(|metadata| {
+            metadata
+                .map(EntityEvalValue::Json)
+                .unwrap_or(EntityEvalValue::SqlNull)
+        }),
         "lixcol_change_id" => Ok(row
             .change_id()
             .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
             .unwrap_or(EntityEvalValue::SqlNull)),
-        "lixcol_created_at" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.created_at().to_string(),
-        ))),
-        "lixcol_updated_at" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.updated_at().to_string(),
-        ))),
+        "lixcol_created_at" => Ok(row
+            .created_at()
+            .map(|value| EntityEvalValue::Json(JsonValue::String(value)))
+            .unwrap_or(EntityEvalValue::SqlNull)),
+        "lixcol_updated_at" => Ok(row
+            .updated_at()
+            .map(|value| EntityEvalValue::Json(JsonValue::String(value)))
+            .unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_commit_id" => Ok(row
             .commit_id()
             .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
