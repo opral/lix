@@ -706,10 +706,15 @@ where
         let Some(entry) = packed.commits.get(commit_id) else {
             continue;
         };
-        if !entry.members.iter().any(|member| {
-            dead_packed_change_ids.contains(&member.value.change_id)
-                && member.is_selected_payload_ref()
-        }) {
+        let borrowed_source_is_swept = entry
+            .selected_source_commit_id
+            .is_some_and(|source_commit_id| sweep_commits.contains(&source_commit_id));
+        if !borrowed_source_is_swept
+            && !entry.members.iter().any(|member| {
+                dead_packed_change_ids.contains(&member.value.change_id)
+                    && member.is_selected_payload_ref()
+            })
+        {
             continue;
         }
         let deltas = entry
@@ -730,6 +735,7 @@ where
                 metadata: member.change.metadata.as_ref_slot(),
                 origin_key: member.change.origin_key.as_deref(),
                 authored: member.authored
+                    || (borrowed_source_is_swept && !member.is_selected_tombstone())
                     || (dead_packed_change_ids.contains(&member.value.change_id)
                         && member.is_selected_payload_ref()),
                 certified: member.is_certified_payload_ref(),
@@ -1011,7 +1017,8 @@ mod tests {
     use crate::tracked_state::{
         TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef,
         load_change_record_by_id, scan_change_records_from_commit_deltas,
-        scan_commit_delta_inventory, stage_change_locators, stage_commit_deltas,
+        scan_commit_delta_inventory, stage_addressable_commit_deltas_with_selected_source,
+        stage_change_locators, stage_commit_deltas,
     };
     use crate::{Engine, GLOBAL_BRANCH_ID, Value};
     use bytes::Bytes;
@@ -1327,6 +1334,148 @@ mod tests {
             .await
             .expect("tracked owner should remain readable");
         assert_eq!(tracked.rows()[0].values(), &[Value::Json(shared_value)]);
+    }
+
+    #[tokio::test]
+    async fn authority_gc_materializes_tombstone_only_checkpoint_alias_before_source_sweep() {
+        let storage = Memory::new();
+        let storage_adapter = StorageAdapter::new(storage);
+        let source_commit = CommitId::for_test_label("gc-tombstone-alias-source");
+        let alias_commit = CommitId::for_test_label("gc-tombstone-alias-live");
+        let authority_commit = CommitId::for_test_label("gc-tombstone-alias-authority");
+        let live_head = CommitId::for_test_label("gc-tombstone-alias-head");
+        let source_change = packed_change(
+            "gc-tombstone-alias-source-change",
+            "deleted-source-member",
+            JsonSlot::None,
+        );
+        let marker_change = packed_change(
+            "gc-tombstone-alias-marker-change",
+            "deleted-local-marker",
+            JsonSlot::None,
+        );
+        let timestamp =
+            LixTimestamp::expect_parse("tombstone alias timestamp", "2026-01-01T00:00:00Z");
+        let commits = [
+            CommitRecord {
+                format_version: 1,
+                commit_id: source_commit,
+                parent_commit_ids: Vec::new(),
+                tracked_state_rootless: true,
+                change_id: ChangeId::for_test_label("gc-tombstone-alias-source-header"),
+                author_account_ids: Vec::new(),
+                created_at: timestamp,
+            },
+            CommitRecord {
+                format_version: 1,
+                commit_id: alias_commit,
+                parent_commit_ids: Vec::new(),
+                tracked_state_rootless: true,
+                change_id: ChangeId::for_test_label("gc-tombstone-alias-live-header"),
+                author_account_ids: Vec::new(),
+                created_at: timestamp,
+            },
+            CommitRecord {
+                format_version: 1,
+                commit_id: authority_commit,
+                parent_commit_ids: Vec::new(),
+                tracked_state_rootless: true,
+                change_id: ChangeId::for_test_label("gc-tombstone-alias-authority-header"),
+                author_account_ids: Vec::new(),
+                created_at: timestamp,
+            },
+            CommitRecord {
+                format_version: 1,
+                commit_id: live_head,
+                parent_commit_ids: vec![alias_commit, authority_commit],
+                tracked_state_rootless: true,
+                change_id: ChangeId::for_test_label("gc-tombstone-alias-head-header"),
+                author_account_ids: Vec::new(),
+                created_at: timestamp,
+            },
+        ];
+
+        let mut read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("tombstone alias fixture read should open");
+        let mut writes = storage_adapter.new_write_set();
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(ChangelogAppend {
+                commits: commits.to_vec(),
+                changes: Vec::new(),
+            })
+            .await
+            .expect("tombstone alias headers should stage");
+        let source_deltas = commit_delta_refs(source_commit, std::slice::from_ref(&source_change));
+        let source_locators = stage_commit_deltas(&mut writes, &source_deltas)
+            .expect("source tombstone should stage");
+        stage_change_locators(&mut writes, &source_locators);
+        let authority_deltas =
+            commit_delta_refs(authority_commit, std::slice::from_ref(&source_change));
+        stage_commit_deltas(&mut writes, &authority_deltas)
+            .expect("surviving tombstone authority should stage");
+        let alias_local = commit_delta_refs(alias_commit, std::slice::from_ref(&marker_change));
+        stage_addressable_commit_deltas_with_selected_source(
+            &mut writes,
+            &alias_local,
+            &[false],
+            source_commit,
+        )
+        .expect("tombstone-only alias should stage");
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("tombstone alias fixture should commit");
+
+        let read = SharedStorageAdapterRead::new(
+            storage_adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("tombstone alias GC read should open"),
+        );
+        let mut writes = storage_adapter.new_write_set();
+        let plan = super::plan_and_stage_authority_gc(
+            &read,
+            &mut writes,
+            &[GcRoot::BranchHead(live_head)],
+        )
+        .await
+        .expect("tombstone alias GC should plan");
+        assert!(plan.sweep.commits.contains(&source_commit));
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("tombstone alias GC should commit");
+
+        let read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("tombstone alias verification read should open");
+        let inventory = scan_commit_delta_inventory(&read)
+            .await
+            .expect("materialized tombstone alias inventory should load");
+        assert!(!inventory.commits.contains_key(&source_commit));
+        let alias = inventory
+            .commits
+            .get(&alias_commit)
+            .expect("live alias should remain materialized");
+        assert_eq!(alias.selected_source_commit_id, None);
+        assert_eq!(alias.members.len(), 2);
+        assert!(alias.members.iter().all(|member| member.value.deleted));
+        assert_eq!(
+            alias
+                .members
+                .iter()
+                .filter(|member| member.authored)
+                .count(),
+            1,
+            "the local marker stays authored while the borrowed cascade tombstone does not"
+        );
+        scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect("materialized cascade tombstone must preserve canonical history");
     }
 
     #[tokio::test]
