@@ -56,14 +56,17 @@ use std::io::{Read, Seek, SeekFrom};
 
 const DB_PATH: &str = "db";
 const SEGMENTED_FORMAT_PATH: &str = "lix-space-segments-v2";
-const IMMUTABLE_BINARY_CAS_CHUNK_PATH: &str = "lix-immutable-binary-cas-chunk-v3";
-const IMMUTABLE_BINARY_CAS_CACHE_PATH: &str = "lix-immutable-binary-cas-chunk-v3";
+const IMMUTABLE_BINARY_CAS_CHUNK_PATH: &str = "lix-immutable-binary-cas-segment-v4";
+const IMMUTABLE_BINARY_CAS_CACHE_PATH: &str = "lix-immutable-binary-cas-segment-v4";
+const IMMUTABLE_CACHE_VALUE_MAGIC: &[u8; 8] = b"LIXICV5\0";
 const IMMUTABLE_VALUE_MAGIC: &[u8; 8] = b"LIXICV3\0";
 const IMMUTABLE_VALUE_RAW: u8 = 0;
 const IMMUTABLE_VALUE_ZSTD: u8 = 1;
+const IMMUTABLE_LOCATOR_MAGIC: &[u8; 8] = b"LIXILV4\0";
 const IMMUTABLE_VALUE_ZSTD_LEVEL: i32 = 3;
 const IMMUTABLE_VALUE_MIN_SAVINGS_BYTES: usize = 128;
 const IMMUTABLE_VALUE_MAX_ENCODED_BYTES: usize = 4 * 1024 * 1024 + 1024;
+const IMMUTABLE_SEGMENT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const BINARY_CAS_CHUNK_SPACE_ID: SpaceId = SpaceId(0x0005_0003);
 const IMMUTABLE_CHUNK_IO_CONCURRENCY: usize = 32;
 const SPACE_PREFIX_LEN: usize = 4;
@@ -140,6 +143,18 @@ struct ImmutableChunkStore {
     cache: Option<ImmutableChunkCache>,
 }
 
+#[derive(Debug)]
+struct ImmutableSegment {
+    key: Key,
+    payload: PutPayload,
+}
+
+#[derive(Debug)]
+struct ImmutableLocator {
+    segment_key: Key,
+    range: Range<usize>,
+}
+
 impl ImmutableChunkStore {
     fn new(
         db_path: &str,
@@ -165,18 +180,17 @@ impl ImmutableChunkStore {
             .join(blake3::Hash::from_bytes(hash).to_hex().as_str()))
     }
 
-    async fn put_many(&self, entries: Vec<(Key, Bytes)>) -> Result<(), StorageError> {
-        let results = stream::iter(entries)
-            .map(|(key, value)| {
+    async fn put_segments(&self, segments: Vec<ImmutableSegment>) -> Result<(), StorageError> {
+        let results = stream::iter(segments)
+            .map(|segment| {
                 let store = Arc::clone(&self.object_store);
-                let location = self.location(&key);
+                let location = self.location(&segment.key);
                 async move {
                     let location = location?;
-                    let value = encode_immutable_value(value)?;
                     match store
                         .put_opts(
                             &location,
-                            PutPayload::from_bytes(value),
+                            segment.payload,
                             PutOptions {
                                 mode: PutMode::Create,
                                 ..PutOptions::default()
@@ -218,40 +232,280 @@ impl ImmutableChunkStore {
         Err(error)
     }
 
-    async fn get_many(&self, keys: Vec<Key>) -> Result<Vec<Bytes>, StorageError> {
-        stream::iter(keys)
-            .map(|key| {
+    async fn get_many(&self, markers: Vec<Bytes>) -> Result<Vec<Bytes>, StorageError> {
+        let mut requests_by_segment = BTreeMap::<Key, Vec<(usize, Range<usize>)>>::new();
+        for (index, marker) in markers.into_iter().enumerate() {
+            let locator = decode_immutable_locator(&marker)?;
+            requests_by_segment
+                .entry(locator.segment_key)
+                .or_default()
+                .push((index, locator.range));
+        }
+        let request_count = requests_by_segment.values().map(Vec::len).sum::<usize>();
+        let batches = stream::iter(requests_by_segment)
+            .map(|(segment_key, requests)| {
                 let store = Arc::clone(&self.object_store);
-                let location = self.location(&key);
+                let location = self.location(&segment_key);
                 let cache = self.cache.clone();
                 async move {
                     let location = location?;
-                    if let Some(cache) = &cache
-                        && let Some(value) = cache.get(&key).await
-                    {
-                        match decode_immutable_value(value) {
-                            Ok(value) => return Ok(value),
-                            Err(_) => cache.remove(&key).await,
+                    let mut values = Vec::with_capacity(requests.len());
+                    let mut misses = Vec::new();
+                    let probes = stream::iter(requests)
+                        .map(|(index, range)| {
+                            let cache = cache.clone();
+                            let segment_key = segment_key.clone();
+                            async move {
+                                let cache_key = immutable_range_cache_key(&segment_key, &range)?;
+                                if let Some(cache) = &cache
+                                    && let Some(value) = cache.get(&cache_key).await
+                                {
+                                    if decode_immutable_value(value.clone()).is_ok() {
+                                        return Ok::<_, StorageError>((
+                                            index,
+                                            range,
+                                            cache_key,
+                                            Some(value),
+                                        ));
+                                    }
+                                    cache.remove(&cache_key).await;
+                                }
+                                Ok((index, range, cache_key, None))
+                            }
+                        })
+                        .buffer_unordered(IMMUTABLE_CHUNK_IO_CONCURRENCY)
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                    for (index, range, cache_key, value) in probes {
+                        match value {
+                            Some(value) => values.push((index, value)),
+                            None => misses.push((index, range, cache_key)),
                         }
                     }
-                    let encoded = store
-                        .get(&location)
-                        .await
-                        .map_err(object_store_error)?
-                        .bytes()
+                    if misses.is_empty() {
+                        return Ok(values);
+                    }
+                    let (ranges, placements) = coalesce_immutable_ranges(
+                        &misses
+                            .iter()
+                            .map(|(_, range, _)| range.clone())
+                            .collect::<Vec<_>>(),
+                    )?;
+                    let remote_spans = store
+                        .get_ranges(&location, &ranges)
                         .await
                         .map_err(object_store_error)?;
-                    let value = decode_immutable_value(encoded.clone())?;
-                    if let Some(cache) = &cache {
-                        cache.put(&key, encoded).await;
+                    let mut cache_writes = Vec::with_capacity(misses.len());
+                    for ((index, _, cache_key), (span_index, range)) in
+                        misses.into_iter().zip(placements)
+                    {
+                        let span = remote_spans.get(span_index).ok_or_else(|| {
+                            StorageError::Corruption(
+                                "immutable segment read omitted a coalesced span".to_string(),
+                            )
+                        })?;
+                        if range.end > span.len() {
+                            return Err(StorageError::Corruption(
+                                "immutable segment coalesced span is truncated".to_string(),
+                            ));
+                        }
+                        let value = span.slice(range.start..range.end);
+                        cache_writes.push((cache_key, value.clone()));
+                        values.push((index, value));
                     }
-                    Ok(value)
+                    if let Some(cache) = cache {
+                        stream::iter(cache_writes)
+                            .for_each_concurrent(
+                                IMMUTABLE_CHUNK_IO_CONCURRENCY,
+                                |(cache_key, value)| {
+                                    let cache = cache.clone();
+                                    async move { cache.put(&cache_key, value).await }
+                                },
+                            )
+                            .await;
+                    }
+                    Ok(values)
                 }
             })
-            .buffered(IMMUTABLE_CHUNK_IO_CONCURRENCY)
-            .try_collect()
-            .await
+            .buffer_unordered(IMMUTABLE_CHUNK_IO_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut encoded = vec![None; request_count];
+        for (index, value) in batches.into_iter().flatten() {
+            let slot = encoded.get_mut(index).ok_or_else(|| {
+                StorageError::Corruption("immutable segment result index is invalid".to_string())
+            })?;
+            *slot = Some(value);
+        }
+        encoded
+            .into_iter()
+            .map(|value| {
+                value
+                    .ok_or_else(|| {
+                        StorageError::Corruption(
+                            "immutable segment read omitted a requested value".to_string(),
+                        )
+                    })
+                    .and_then(decode_immutable_value)
+            })
+            .collect()
     }
+}
+
+fn coalesce_immutable_ranges(
+    ranges: &[Range<usize>],
+) -> Result<(Vec<Range<u64>>, Vec<(usize, Range<usize>)>), StorageError> {
+    let mut order = (0..ranges.len()).collect::<Vec<_>>();
+    order.sort_unstable_by_key(|index| (ranges[*index].start, ranges[*index].end));
+    let mut spans = Vec::<Range<usize>>::new();
+    let mut placements = vec![(0, 0..0); ranges.len()];
+    for index in order {
+        let range = &ranges[index];
+        let span_index = match spans.last_mut() {
+            Some(span) if range.start <= span.end => {
+                span.end = span.end.max(range.end);
+                spans.len() - 1
+            }
+            _ => {
+                spans.push(range.clone());
+                spans.len() - 1
+            }
+        };
+        let span = &spans[span_index];
+        placements[index] = (
+            span_index,
+            range.start.saturating_sub(span.start)..range.end.saturating_sub(span.start),
+        );
+    }
+    let spans = spans
+        .into_iter()
+        .map(|range| {
+            Ok(u64::try_from(range.start).map_err(|_| {
+                StorageError::Corruption("immutable segment range start exceeds u64".to_string())
+            })?..u64::try_from(range.end).map_err(|_| {
+                StorageError::Corruption("immutable segment range end exceeds u64".to_string())
+            })?)
+        })
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    Ok((spans, placements))
+}
+
+fn prepare_immutable_segments(
+    entries: Vec<(Key, Bytes)>,
+) -> Result<(Vec<ImmutableSegment>, BTreeMap<Key, Bytes>), StorageError> {
+    let mut segments = Vec::new();
+    let mut locators = BTreeMap::new();
+    let mut segment = Vec::<Bytes>::new();
+    let mut segment_bytes = 0usize;
+    let mut segment_entries = Vec::new();
+    for (key, value) in entries {
+        let encoded = encode_immutable_value(value)?;
+        if !segment.is_empty()
+            && segment_bytes.saturating_add(encoded.len()) > IMMUTABLE_SEGMENT_MAX_BYTES
+        {
+            finish_immutable_segment(
+                std::mem::take(&mut segment),
+                std::mem::take(&mut segment_entries),
+                &mut segments,
+                &mut locators,
+            )?;
+            segment_bytes = 0;
+        }
+        let start = segment_bytes;
+        segment_bytes = segment_bytes.saturating_add(encoded.len());
+        segment.push(encoded);
+        segment_entries.push((key, start..segment_bytes));
+    }
+    if !segment.is_empty() {
+        finish_immutable_segment(segment, segment_entries, &mut segments, &mut locators)?;
+    }
+    Ok((segments, locators))
+}
+
+fn finish_immutable_segment(
+    segment: Vec<Bytes>,
+    entries: Vec<(Key, Range<usize>)>,
+    segments: &mut Vec<ImmutableSegment>,
+    locators: &mut BTreeMap<Key, Bytes>,
+) -> Result<(), StorageError> {
+    let mut hash = blake3::Hasher::new();
+    for bytes in &segment {
+        hash.update(bytes);
+    }
+    let segment_key = Key(Bytes::copy_from_slice(hash.finalize().as_bytes()));
+    for (key, range) in entries {
+        locators.insert(key, encode_immutable_locator(&segment_key, range)?);
+    }
+    segments.push(ImmutableSegment {
+        key: segment_key,
+        payload: segment.into_iter().collect(),
+    });
+    Ok(())
+}
+
+fn encode_immutable_locator(segment_key: &Key, range: Range<usize>) -> Result<Bytes, StorageError> {
+    let segment_hash: [u8; 32] = segment_key
+        .0
+        .as_ref()
+        .try_into()
+        .map_err(|_| StorageError::InvalidKey)?;
+    let offset = u64::try_from(range.start)
+        .map_err(|_| StorageError::Io("immutable segment offset exceeds u64".to_string()))?;
+    let length = u32::try_from(range.len())
+        .map_err(|_| StorageError::Io("immutable segment value exceeds u32".to_string()))?;
+    let mut locator = Vec::with_capacity(IMMUTABLE_LOCATOR_MAGIC.len() + 32 + 8 + 4);
+    locator.extend_from_slice(IMMUTABLE_LOCATOR_MAGIC);
+    locator.extend_from_slice(&segment_hash);
+    locator.extend_from_slice(&offset.to_le_bytes());
+    locator.extend_from_slice(&length.to_le_bytes());
+    Ok(Bytes::from(locator))
+}
+
+fn decode_immutable_locator(marker: &[u8]) -> Result<ImmutableLocator, StorageError> {
+    const HASH_BYTES: usize = 32;
+    const OFFSET_BYTES: usize = size_of::<u64>();
+    const LENGTH_BYTES: usize = size_of::<u32>();
+    let expected_len = IMMUTABLE_LOCATOR_MAGIC.len() + HASH_BYTES + OFFSET_BYTES + LENGTH_BYTES;
+    if marker.len() != expected_len || !marker.starts_with(IMMUTABLE_LOCATOR_MAGIC) {
+        return Err(StorageError::Corruption(
+            "immutable segment locator is invalid".to_string(),
+        ));
+    }
+    let hash_start = IMMUTABLE_LOCATOR_MAGIC.len();
+    let offset_start = hash_start + HASH_BYTES;
+    let length_start = offset_start + OFFSET_BYTES;
+    let offset = usize::try_from(u64::from_le_bytes(
+        marker[offset_start..length_start]
+            .try_into()
+            .expect("fixed immutable locator offset"),
+    ))
+    .map_err(|_| StorageError::Corruption("immutable segment offset exceeds usize".to_string()))?;
+    let length = u32::from_le_bytes(
+        marker[length_start..]
+            .try_into()
+            .expect("fixed immutable locator length"),
+    ) as usize;
+    let end = offset.checked_add(length).ok_or_else(|| {
+        StorageError::Corruption("immutable segment range overflows usize".to_string())
+    })?;
+    Ok(ImmutableLocator {
+        segment_key: Key(Bytes::copy_from_slice(&marker[hash_start..offset_start])),
+        range: offset..end,
+    })
+}
+
+fn immutable_range_cache_key(segment_key: &Key, range: &Range<usize>) -> Result<Key, StorageError> {
+    let start = u64::try_from(range.start).map_err(|_| {
+        StorageError::Corruption("immutable cache range start exceeds u64".to_string())
+    })?;
+    let end = u64::try_from(range.end).map_err(|_| {
+        StorageError::Corruption("immutable cache range end exceeds u64".to_string())
+    })?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(&segment_key.0);
+    hash.update(&start.to_le_bytes());
+    hash.update(&end.to_le_bytes());
+    Ok(Key(Bytes::copy_from_slice(hash.finalize().as_bytes())))
 }
 
 /// Bounded whole-object cache for the immutable sidecar namespace.
@@ -295,13 +549,19 @@ impl ImmutableChunkCache {
 
     async fn get(&self, key: &Key) -> Option<Bytes> {
         let path = self.path(key)?;
-        tokio::task::spawn_blocking(move || std::fs::read(path).ok().map(Bytes::from))
+        let cached = tokio::task::spawn_blocking(move || std::fs::read(path).ok().map(Bytes::from))
             .await
             .ok()
-            .flatten()
+            .flatten()?;
+        if let Some(value) = decode_immutable_cache_value(cached) {
+            return Some(value);
+        }
+        self.remove(key).await;
+        None
     }
 
     async fn put(&self, key: &Key, value: Bytes) {
+        let value = encode_immutable_cache_value(value);
         if value.len() > self.max_bytes {
             return;
         }
@@ -355,6 +615,25 @@ impl ImmutableChunkCache {
         })
         .await;
     }
+}
+
+fn encode_immutable_cache_value(value: Bytes) -> Bytes {
+    let mut encoded = Vec::with_capacity(IMMUTABLE_CACHE_VALUE_MAGIC.len() + 32 + value.len());
+    encoded.extend_from_slice(IMMUTABLE_CACHE_VALUE_MAGIC);
+    encoded.extend_from_slice(blake3::hash(&value).as_bytes());
+    encoded.extend_from_slice(&value);
+    Bytes::from(encoded)
+}
+
+fn decode_immutable_cache_value(encoded: Bytes) -> Option<Bytes> {
+    let digest_start = IMMUTABLE_CACHE_VALUE_MAGIC.len();
+    let value_start = digest_start.checked_add(32)?;
+    if encoded.get(..digest_start)? != IMMUTABLE_CACHE_VALUE_MAGIC {
+        return None;
+    }
+    let expected = encoded.get(digest_start..value_start)?;
+    let value = encoded.slice(value_start..);
+    (blake3::hash(&value).as_bytes() == expected).then_some(value)
 }
 
 fn immutable_chunk_cache_bytes(root: &Path) -> u64 {
@@ -1265,7 +1544,8 @@ pub struct SlateDBWrite {
     await_durable: bool,
     base: Option<Arc<DbSnapshot>>,
     overlay: BTreeMap<Key, Option<Bytes>>,
-    immutable_values: BTreeMap<Key, Bytes>,
+    immutable_values: BTreeMap<Key, (u64, Bytes)>,
+    next_immutable_value_order: u64,
     stats: WriteStats,
 }
 
@@ -2082,6 +2362,7 @@ impl Storage for SlateDB {
                 base: None,
                 overlay: BTreeMap::new(),
                 immutable_values: BTreeMap::new(),
+                next_immutable_value_order: 0,
                 stats: WriteStats::default(),
             })
         }
@@ -2150,12 +2431,13 @@ async fn check_preconditions(
                         .iter()
                         .enumerate()
                         .filter_map(|(offset, precondition)| match precondition {
-                            Precondition::KeyValueHashEquals { space, key, .. }
-                            | Precondition::KeyValueEquals { space, key, .. }
-                                if *space == BINARY_CAS_CHUNK_SPACE_ID
-                                    && values[offset].is_some() =>
+                            Precondition::KeyValueHashEquals { space, .. }
+                            | Precondition::KeyValueEquals { space, .. }
+                                if *space == BINARY_CAS_CHUNK_SPACE_ID =>
                             {
-                                Some((offset, key.clone()))
+                                values[offset]
+                                    .as_ref()
+                                    .map(|marker| (offset, marker.clone()))
                             }
                             _ => None,
                         })
@@ -2165,7 +2447,7 @@ async fn check_preconditions(
                             .get_many(
                                 immutable_targets
                                     .iter()
-                                    .map(|(_, key)| key.clone())
+                                    .map(|(_, marker)| marker.clone())
                                     .collect(),
                             )
                             .await?;
@@ -2619,12 +2901,12 @@ async fn hydrate_immutable_chunk_gets(
     let mut targets = Vec::new();
     let mut result_index = 0usize;
     for request in requests {
-        for key in request.keys {
+        for _ in request.keys {
             if request.space == BINARY_CAS_CHUNK_SPACE_ID
                 && request.opts.projection == CoreProjection::FullValue
-                && results.get(result_index).is_some_and(Option::is_some)
+                && let Some(Some(ProjectedValue::FullValue(marker))) = results.get(result_index)
             {
-                targets.push((result_index, key.clone()));
+                targets.push((result_index, marker.clone()));
             }
             result_index += 1;
         }
@@ -2633,7 +2915,7 @@ async fn hydrate_immutable_chunk_gets(
         return Ok(());
     }
     let values = immutable_chunks
-        .get_many(targets.iter().map(|(_, key)| key.clone()).collect())
+        .get_many(targets.iter().map(|(_, marker)| marker.clone()).collect())
         .await?;
     for ((result_index, _), value) in targets.into_iter().zip(values) {
         results[result_index] = Some(ProjectedValue::FullValue(value));
@@ -2655,8 +2937,13 @@ async fn hydrate_immutable_chunk_scan(
             chunk
                 .entries
                 .iter()
-                .map(|entry| entry.key.clone())
-                .collect(),
+                .map(|entry| match &entry.value {
+                    ProjectedValue::FullValue(marker) => Ok(marker.clone()),
+                    ProjectedValue::KeyOnly => Err(StorageError::Corruption(
+                        "immutable full-value scan returned a key-only marker".to_string(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         )
         .await?;
     for (entry, value) in chunk.entries.iter_mut().zip(values) {
@@ -2691,7 +2978,13 @@ impl StorageWrite for SlateDBWrite {
                     physical_key.extend_from_slice(&logical_key.0);
                     self.overlay
                         .insert(Key(Bytes::from(physical_key)), Some(Bytes::new()));
-                    self.immutable_values.insert(logical_key, value);
+                    if let Some((_, existing)) = self.immutable_values.get_mut(&logical_key) {
+                        *existing = value;
+                    } else {
+                        let order = self.next_immutable_value_order;
+                        self.next_immutable_value_order = order.saturating_add(1);
+                        self.immutable_values.insert(logical_key, (order, value));
+                    }
                 }
                 self.stats.put_entries += upload_count;
                 self.stats.written_bytes += written_bytes;
@@ -2830,7 +3123,7 @@ impl StorageWrite for SlateDBWrite {
                 point_cache,
                 _writer_permit: writer_permit,
                 await_durable,
-                overlay,
+                mut overlay,
                 immutable_values,
                 stats,
                 ..
@@ -2844,7 +3137,7 @@ impl StorageWrite for SlateDBWrite {
 
             worker.check_open()?;
             write_pipeline.terminal_error()?;
-            let immutable_uploads = immutable_values
+            let mut immutable_uploads = immutable_values
                 .into_iter()
                 .filter(|(logical_key, _)| {
                     let mut physical_key =
@@ -2855,8 +3148,25 @@ impl StorageWrite for SlateDBWrite {
                         .get(&Key(Bytes::from(physical_key)))
                         .is_some_and(Option::is_some)
                 })
+                .map(|(key, (order, value))| (order, key, value))
+                .collect::<Vec<_>>();
+            immutable_uploads.sort_unstable_by_key(|(order, _, _)| *order);
+            let immutable_uploads = immutable_uploads
+                .into_iter()
+                .map(|(_, key, value)| (key, value))
                 .collect();
-            immutable_chunks.put_many(immutable_uploads).await?;
+            let (immutable_segments, immutable_locators) =
+                prepare_immutable_segments(immutable_uploads)?;
+            immutable_chunks.put_segments(immutable_segments).await?;
+            for (logical_key, locator) in immutable_locators {
+                let mut physical_key = Vec::with_capacity(SPACE_PREFIX_LEN + logical_key.0.len());
+                physical_key.extend_from_slice(&BINARY_CAS_CHUNK_SPACE_ID.0.to_be_bytes());
+                physical_key.extend_from_slice(&logical_key.0);
+                let physical_key = Key(Bytes::from(physical_key));
+                if overlay.get(&physical_key).is_some_and(Option::is_some) {
+                    overlay.insert(physical_key, Some(locator));
+                }
+            }
             let overlay_entries = overlay.len();
             let overlay_bytes = overlay
                 .iter()
@@ -4178,6 +4488,46 @@ mod tests {
         assert!(matches!(error, StorageError::Corruption(_)));
     }
 
+    #[test]
+    fn immutable_values_pack_into_one_segment_with_exact_locators() {
+        let values = [
+            (Key(Bytes::from(vec![0x31; 32])), Bytes::from_static(b"one")),
+            (Key(Bytes::from(vec![0x12; 32])), Bytes::from_static(b"two")),
+            (
+                Key(Bytes::from(vec![0x23; 32])),
+                Bytes::from_static(b"three"),
+            ),
+        ];
+        let (segments, locators) = prepare_immutable_segments(values.to_vec())
+            .expect("pack immutable values into a segment");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(locators.len(), values.len());
+        let segment_key = segments[0].key.clone();
+        let segment_bytes = Bytes::from(segments[0].payload.clone());
+        for (key, expected) in values {
+            let locator = decode_immutable_locator(
+                locators
+                    .get(&key)
+                    .expect("packed value has an exact locator"),
+            )
+            .expect("decode packed value locator");
+            assert_eq!(locator.segment_key, segment_key);
+            let encoded = segment_bytes.slice(locator.range);
+            assert_eq!(
+                decode_immutable_value(encoded).expect("decode packed value"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_segment_reads_coalesce_adjacent_ranges_and_preserve_request_order() {
+        let (spans, placements) = coalesce_immutable_ranges(&[8..12, 0..4, 4..8, 20..24])
+            .expect("coalesce immutable ranges");
+        assert_eq!(spans, [0..12, 20..24]);
+        assert_eq!(placements, [(0, 8..12), (0, 0..4), (0, 4..8), (1, 0..4)]);
+    }
+
     #[tokio::test]
     async fn diagnostic_object_store_counters_measure_completed_io() {
         let counters = SlateDBIoCounters::default();
@@ -4500,8 +4850,9 @@ mod tests {
             .path()
             .join(DB_PATH)
             .join(IMMUTABLE_BINARY_CAS_CHUNK_PATH);
-        let stored_path =
-            immutable_directory.join(blake3::Hash::from_bytes([0x2a; 32]).to_hex().as_str());
+        let encoded_value = encode_immutable_value(value.clone()).expect("encode expected segment");
+        let segment_hash = blake3::hash(&encoded_value);
+        let stored_path = immutable_directory.join(segment_hash.to_hex().as_str());
         let stored_bytes = std::fs::read(&stored_path).expect("read immutable chunk object");
         assert!(stored_bytes.starts_with(IMMUTABLE_VALUE_MAGIC));
         assert_eq!(
@@ -4509,9 +4860,15 @@ mod tests {
             IMMUTABLE_VALUE_ZSTD
         );
         assert!(stored_bytes.len() < value.len());
-        let rolled_back_path =
-            immutable_directory.join(blake3::Hash::from_bytes([0x19; 32]).to_hex().as_str());
-        assert!(!rolled_back_path.exists());
+        assert_eq!(
+            std::fs::read_dir(&immutable_directory)
+                .expect("list immutable segments")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_file())
+                .count(),
+            1,
+            "rollback must not publish a second immutable segment"
+        );
 
         let storage = SlateDB::open(directory.path()).expect("reopen immutable chunk storage");
         let read = block_on(storage.begin_read(ReadOptions::default()))
@@ -4647,13 +5004,29 @@ mod tests {
             first.values,
             vec![Some(ProjectedValue::FullValue(value.clone()))]
         );
-        let cache_path = cache_root
-            .join(IMMUTABLE_BINARY_CAS_CACHE_PATH)
-            .join(blake3::Hash::from_bytes([0x37; 32]).to_hex().as_str());
+        let encoded_value = encode_immutable_value(value.clone()).expect("encode cached segment");
+        let segment_hash = blake3::hash(&encoded_value);
+        let segment_key = Key(Bytes::copy_from_slice(segment_hash.as_bytes()));
+        let cache_key = immutable_range_cache_key(&segment_key, &(0..encoded_value.len()))
+            .expect("derive immutable range cache key");
+        let cache_path = cache_root.join(IMMUTABLE_BINARY_CAS_CACHE_PATH).join(
+            blake3::Hash::from_bytes(
+                cache_key
+                    .0
+                    .as_ref()
+                    .try_into()
+                    .expect("range cache key is a hash"),
+            )
+            .to_hex()
+            .as_str(),
+        );
         assert!(cache_path.is_file());
 
-        std::fs::write(&cache_path, b"corrupt cache entry")
-            .expect("corrupt immutable disk cache entry");
+        let mut corrupt = std::fs::read(&cache_path).expect("read immutable disk cache entry");
+        *corrupt
+            .last_mut()
+            .expect("cached immutable value should not be empty") ^= 0x80;
+        std::fs::write(&cache_path, corrupt).expect("corrupt cached payload without truncating it");
         let repaired = block_on(read.get_many(&request))
             .expect("replace corrupt immutable cache entry from remote");
         assert_eq!(
@@ -4662,7 +5035,7 @@ mod tests {
         );
 
         let remote_path = ObjectPath::from(join_db_path(db_path, IMMUTABLE_BINARY_CAS_CHUNK_PATH))
-            .join(blake3::Hash::from_bytes([0x37; 32]).to_hex().as_str());
+            .join(segment_hash.to_hex().as_str());
         block_on(object_store.delete(&remote_path)).expect("remove remote immutable chunk");
         let cached = block_on(read.get_many(&request))
             .expect("serve immutable chunk from configured disk cache");
