@@ -2704,7 +2704,10 @@ impl V3Worker {
             .data_mut()
             .table
             .push(SnapshotResource {
-                root: root.clone(),
+                // Byte-successor parsing is defined over accepted bytes plus
+                // opaque plugin state. Semantic entities are outputs and host
+                // authority, not an additional warm-only input dependency.
+                root: root.successor_checkpoint(),
                 state: state.clone(),
             })
             .map_err(|error| v3_error(format!("failed to register v3 before root: {error}")))?;

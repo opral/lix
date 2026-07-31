@@ -147,6 +147,11 @@ impl Root<'_> {
         Ok(output)
     }
 
+    /// Reads a semantic record when the transition supplies an entity view.
+    ///
+    /// Byte `file_changed` transitions intentionally expose accepted bytes
+    /// and opaque state only. Their entity map is empty so warm execution and
+    /// process-cold checkpoint restoration have the same input contract.
     pub fn get_entity(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.read_record_all(MapSpace::Entity, key)
     }

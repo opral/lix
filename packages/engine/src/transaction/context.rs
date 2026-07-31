@@ -4080,6 +4080,10 @@ where
                                         .flatten()
                                         .zip(values.next().flatten())
                                         .and_then(|(runtime, authority)| {
+                                            let runtime = decode_bound_plugin_checkpoint(
+                                                &runtime,
+                                                &actor_key.plugin_generation,
+                                            )?;
                                             Some(DecodedDurablePluginCheckpoint {
                                                 runtime: WasmDurableDocumentCheckpoint::decode(
                                                     &runtime,
@@ -7994,6 +7998,43 @@ struct DecodedDurablePluginCheckpoint {
     authorities: PluginEntityAuthorities,
 }
 
+const BOUND_PLUGIN_CHECKPOINT_MAGIC: &[u8; 8] = b"LIXDPB01";
+
+fn encode_bound_plugin_checkpoint(
+    generation: &str,
+    checkpoint: &WasmDurableDocumentCheckpoint,
+) -> Result<crate::Blob, LixError> {
+    let generation_len = u32::try_from(generation.len()).map_err(|_| {
+        LixError::new(
+            LixError::CODE_PLUGIN_RESOURCE_LIMIT,
+            "plugin generation exceeds the checkpoint format limit",
+        )
+    })?;
+    let checkpoint = checkpoint.bytes();
+    let mut encoded = Vec::with_capacity(12 + generation.len() + checkpoint.len());
+    encoded.extend_from_slice(BOUND_PLUGIN_CHECKPOINT_MAGIC);
+    encoded.extend_from_slice(&generation_len.to_le_bytes());
+    encoded.extend_from_slice(generation.as_bytes());
+    encoded.extend_from_slice(&checkpoint);
+    Ok(encoded.into())
+}
+
+fn decode_bound_plugin_checkpoint(
+    encoded: &[u8],
+    expected_generation: &str,
+) -> Option<crate::Blob> {
+    if encoded.get(..8)? != BOUND_PLUGIN_CHECKPOINT_MAGIC {
+        return None;
+    }
+    let generation_len =
+        usize::try_from(u32::from_le_bytes(encoded.get(8..12)?.try_into().ok()?)).ok()?;
+    let generation_end = 12_usize.checked_add(generation_len)?;
+    if encoded.get(12..generation_end)? != expected_generation.as_bytes() {
+        return None;
+    }
+    Some(encoded.get(generation_end..)?.to_vec().into())
+}
+
 impl PluginWriteReconciliation {
     fn attach_durable_checkpoints(
         &self,
@@ -8001,20 +8042,24 @@ impl PluginWriteReconciliation {
     ) -> Result<(), LixError> {
         let mut checkpoints = BTreeMap::<
             (String, String),
-            (WasmDurableDocumentCheckpoint, PluginEntityAuthorities),
+            (
+                WasmDurableDocumentCheckpoint,
+                PluginEntityAuthorities,
+                String,
+            ),
         >::new();
         for publication in &self.actor_publications {
-            let Some((branch_id, file_id, checkpoint, authorities)) =
+            let Some((branch_id, file_id, generation, checkpoint, authorities)) =
                 publication.durable_checkpoint()
             else {
                 continue;
             };
             checkpoints.insert(
                 (branch_id.to_owned(), file_id.to_owned()),
-                (checkpoint, authorities.clone()),
+                (checkpoint, authorities.clone(), generation.to_owned()),
             );
         }
-        for ((branch_id, file_id), (checkpoint, authorities)) in checkpoints {
+        for ((branch_id, file_id), (checkpoint, authorities, generation)) in checkpoints {
             if self
                 .derived_materializations
                 .keys()
@@ -8033,7 +8078,7 @@ impl PluginWriteReconciliation {
                         ),
                     )
                 })?;
-            let state = checkpoint.bytes();
+            let state = encode_bound_plugin_checkpoint(&generation, &checkpoint)?;
             let state_hash = BlobHash::from_content(&state);
             let authority: crate::Blob = authorities.encode_checkpoint()?.into();
             let authority_hash = BlobHash::from_content(&authority);
@@ -8249,6 +8294,7 @@ impl PendingPluginActorPublication {
     ) -> Option<(
         &str,
         &str,
+        &str,
         WasmDurableDocumentCheckpoint,
         &PluginEntityAuthorities,
     )> {
@@ -8266,6 +8312,7 @@ impl PendingPluginActorPublication {
                     (
                         successor_key.branch_id.as_str(),
                         successor_key.file_id.as_str(),
+                        successor_key.plugin_generation.as_str(),
                         bytes,
                         authorities,
                     )
@@ -8282,6 +8329,7 @@ impl PendingPluginActorPublication {
                     (
                         key.branch_id.as_str(),
                         key.file_id.as_str(),
+                        key.plugin_generation.as_str(),
                         bytes,
                         entity_authorities,
                     )
@@ -8295,6 +8343,7 @@ impl PendingPluginActorPublication {
                 (
                     key.branch_id.as_str(),
                     key.file_id.as_str(),
+                    key.plugin_generation.as_str(),
                     bytes,
                     entity_authorities,
                 )
@@ -10190,6 +10239,20 @@ mod tests {
         assert!(prepared_writes_require_filesystem_index_rebuild(
             &prepared_writes
         ));
+    }
+
+    #[test]
+    fn durable_plugin_checkpoint_is_bound_to_one_generation() {
+        let checkpoint =
+            WasmDurableDocumentCheckpoint::new(crate::Blob::from(&b"opaque-state"[..])).unwrap();
+        let encoded = encode_bound_plugin_checkpoint("generation-a", &checkpoint).unwrap();
+        let decoded = decode_bound_plugin_checkpoint(&encoded, "generation-a")
+            .expect("matching generation should restore");
+        assert_eq!(
+            WasmDurableDocumentCheckpoint::decode(&decoded).unwrap(),
+            crate::Blob::from(&b"opaque-state"[..])
+        );
+        assert!(decode_bound_plugin_checkpoint(&encoded, "generation-b").is_none());
     }
 
     #[test]
