@@ -109,7 +109,10 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
         cold_counters.guest_export_calls, 1,
         "cold Git-text reconciliation must not hydrate and re-enter the guest"
     );
-    assert_eq!(cold_counters.full_state_semantic_rows_materialized, 2);
+    assert_eq!(
+        cold_counters.full_state_semantic_rows_materialized, 0,
+        "the durable checkpoint avoids materializing both line entities"
+    );
     let reopened_rows = git_text_rows(&reopened, &text_file_id).await;
     assert_eq!(reopened_rows[0].id, text_rows[0].id);
     assert_eq!(reopened_rows[1].id, text_rows[1].id);
