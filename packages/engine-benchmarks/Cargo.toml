@@ -191,3 +191,8 @@ required-features = ["lix_engine/storage-benches", "rocksdb", "slatedb"]
 name = "entity_pk_layout"
 path = "benches/entity_pk_layout.rs"
 harness = false
+
+[[bench]]
+name = "registered_entity_returning"
+path = "benches/registered_entity_returning.rs"
+harness = false

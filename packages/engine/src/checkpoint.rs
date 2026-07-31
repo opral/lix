@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use serde_json::json;
 
 use crate::LixError;
-use crate::changelog::{
-    ChangeRecordProjection, ChangelogContext, ChangelogReader, CommitId, CommitScanRequest,
-};
+use crate::changelog::{ChangeRecordProjection, CommitId};
+#[cfg(any(test, feature = "storage-benches"))]
+use crate::changelog::{ChangelogContext, ChangelogReader, CommitScanRequest};
 use crate::commit_graph::{
     CommitGraphChangeHistoryRequest, CommitGraphCommitRecord, CommitGraphReader,
 };
@@ -15,6 +15,7 @@ use crate::tracked_state::{TrackedStateKey, TrackedStateStoreReader};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 
 pub(crate) const CHECKPOINT_MARKER_SCHEMA_KEY: &str = "lix_checkpoint_marker";
+#[cfg(any(test, feature = "storage-benches"))]
 const CHECKPOINT_RECORD_SCAN_PAGE_SIZE: usize = 1_024;
 
 /// Record-only index used while materializing an unbounded checkpoint history.
@@ -57,6 +58,7 @@ pub(crate) fn checkpoint_marker_stage_row(branch_id: &str) -> TransactionWriteRo
 /// The SQL provider constructs this once for an unbounded checkpoint query and
 /// shares it between branch heads. Bounded `LIMIT` queries retain the smaller
 /// point-walk path below.
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn scan_checkpoint_commit_records<S>(
     store: S,
 ) -> Result<CheckpointCommitRecords, LixError>

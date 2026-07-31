@@ -60,6 +60,22 @@ pub(crate) struct TransactionWriteBuffer {
     file_data_writes: Mutex<Vec<TransactionFileData>>,
 }
 
+/// A transaction-local statement checkpoint.
+///
+/// SQL writes coalesce rows, update their commit membership, and can attach
+/// file payloads, so a row-count marker cannot restore the previous journal.
+/// This owns the prepared-row owners and transaction control structures needed
+/// to restore an explicit transaction after a post-stage SQL error.
+pub(crate) struct TransactionWriteBufferCheckpoint {
+    rows: StagedPreparedRows,
+    commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
+    first_commit_parent_override_by_branch: BTreeMap<String, CommitId>,
+    checkpoint_publications: Vec<CheckpointPublication>,
+    extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
+    intermediate_commits: Vec<StagedIntermediateCommit>,
+    file_data_writes: Vec<TransactionFileData>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StagedIntermediateCommit {
     pub(crate) branch_id: String,
@@ -72,7 +88,7 @@ pub(crate) enum RowSlot {
     State(usize),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StagedScanFileCandidates {
     slots_by_value: HashMap<SharedStr, SmallVec<[RowSlot; 1]>>,
     null_slots: SmallVec<[RowSlot; 1]>,
@@ -82,7 +98,7 @@ struct StagedScanFileCandidates {
 /// overlay without changing the journal's identity/coalescing semantics.
 /// Branch and durability remain post-filter checks because one indexed
 /// candidate can legitimately have multiple such physical rows while staged.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StagedScanCandidateIndex {
     slots_by_schema: HashMap<SharedStr, SmallVec<[RowSlot; 1]>>,
     slots_by_schema_and_entity: HashMap<SharedStr, HashMap<EntityPk, SmallVec<[RowSlot; 1]>>>,
@@ -233,6 +249,7 @@ impl StagedScanCandidateIndex {
 /// The normal write path is an ordered journal. It becomes an indexed overlay
 /// only if a later write overlaps it or a transaction-local read actually
 /// needs read-your-writes semantics.
+#[derive(Clone)]
 enum StagedPreparedRows {
     AppendOnly {
         rows: PreparedStateBatch,
@@ -316,7 +333,7 @@ pub(crate) struct PreparedWriteValidationIndex<'a> {
 /// stays in one contiguous parallel column so an INSERT followed by an UPDATE
 /// retains the original primary-key error surface without cloning the row's
 /// schema, file, branch, or entity identity.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct PreparedInsertSelection {
     row_count: usize,
     count: usize,
@@ -791,6 +808,144 @@ impl TransactionWriteBuffer {
             intermediate_commits: Mutex::new(Vec::new()),
             file_data_writes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Captures every mutable staging structure before a statement that may
+    /// need post-stage SQL projection. Restoring this checkpoint preserves
+    /// earlier explicit-transaction statements even when the current one
+    /// fails after it has staged rows.
+    pub(crate) fn checkpoint(&self) -> Result<TransactionWriteBufferCheckpoint, LixError> {
+        let rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let file_data_writes = self.file_data_writes.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged file data lock",
+            )
+        })?;
+        let commit_change_refs_by_branch =
+            self.commit_change_refs_by_branch.lock().map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged commit change refs lock",
+                )
+            })?;
+        let extra_commit_parents_by_branch =
+            self.extra_commit_parents_by_branch.lock().map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged extra commit parents lock",
+                )
+            })?;
+        let intermediate_commits = self.intermediate_commits.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged intermediate commits lock",
+            )
+        })?;
+        let first_commit_parent_override_by_branch = self
+            .first_commit_parent_override_by_branch
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged first commit parent overrides lock",
+                )
+            })?;
+        let checkpoint_publications = self.checkpoint_publications.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged checkpoint publications lock",
+            )
+        })?;
+
+        Ok(TransactionWriteBufferCheckpoint {
+            rows: rows.clone(),
+            commit_change_refs_by_branch: commit_change_refs_by_branch.clone(),
+            first_commit_parent_override_by_branch: first_commit_parent_override_by_branch.clone(),
+            checkpoint_publications: checkpoint_publications.clone(),
+            extra_commit_parents_by_branch: extra_commit_parents_by_branch.clone(),
+            intermediate_commits: intermediate_commits.clone(),
+            file_data_writes: file_data_writes.clone(),
+        })
+    }
+
+    /// Restores a complete journal checkpoint. The lock order matches
+    /// [`Self::drain`] so rollback cannot observe a partially restored write
+    /// set through another staging operation.
+    pub(crate) fn restore(
+        &self,
+        checkpoint: TransactionWriteBufferCheckpoint,
+    ) -> Result<(), LixError> {
+        let TransactionWriteBufferCheckpoint {
+            rows,
+            commit_change_refs_by_branch,
+            first_commit_parent_override_by_branch,
+            checkpoint_publications,
+            extra_commit_parents_by_branch,
+            intermediate_commits,
+            file_data_writes,
+        } = checkpoint;
+        let mut rows_guard = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let mut file_data_guard = self.file_data_writes.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged file data lock",
+            )
+        })?;
+        let mut commit_change_refs_guard =
+            self.commit_change_refs_by_branch.lock().map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged commit change refs lock",
+                )
+            })?;
+        let mut extra_parents_guard = self.extra_commit_parents_by_branch.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged extra commit parents lock",
+            )
+        })?;
+        let mut intermediate_commits_guard = self.intermediate_commits.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged intermediate commits lock",
+            )
+        })?;
+        let mut first_parent_overrides_guard = self
+            .first_commit_parent_override_by_branch
+            .lock()
+            .map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged first commit parent overrides lock",
+            )
+        })?;
+        let mut checkpoint_publications_guard =
+            self.checkpoint_publications.lock().map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged checkpoint publications lock",
+                )
+            })?;
+
+        *rows_guard = rows;
+        *file_data_guard = file_data_writes;
+        *commit_change_refs_guard = commit_change_refs_by_branch;
+        *extra_parents_guard = extra_commit_parents_by_branch;
+        *intermediate_commits_guard = intermediate_commits;
+        *first_parent_overrides_guard = first_commit_parent_override_by_branch;
+        *checkpoint_publications_guard = checkpoint_publications;
+        Ok(())
     }
 
     /// Returns whether this transaction has changed the schema catalog used
@@ -1960,13 +2115,27 @@ impl PreparedStateRowOverlay {
 
         let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(staged_rows.len());
         if let Some(slots) = by_candidate.slots_for_filter(&request.filter) {
-            append_matching_staged_rows(&mut rows, slots.iter().copied(), staged_rows, request);
+            // `slots_for_filter` already selected these rows by schema and,
+            // when present, entity primary key. Rechecking a large entity-PK
+            // predicate here turns a keyed transaction-overlay read into an
+            // O(candidates * entity_pks) scan. The remaining branch,
+            // retention, and file filters still need their established final
+            // matching because candidate slots intentionally retain their
+            // possible global fallbacks.
+            append_matching_staged_rows(
+                &mut rows,
+                slots.iter().copied(),
+                staged_rows,
+                request,
+                true,
+            );
         } else {
             append_matching_staged_rows(
                 &mut rows,
                 by_identity.values().copied(),
                 staged_rows,
                 request,
+                false,
             );
         }
         Ok(rows.finish())
@@ -2443,13 +2612,15 @@ fn append_matching_staged_rows(
     slots: impl IntoIterator<Item = RowSlot>,
     staged_rows: &PreparedStateBatch,
     request: &LiveStateScanRequest,
+    candidate_index_matched_schema_and_entity: bool,
 ) {
     for slot in slots {
         let RowSlot::State(index) = slot;
         let Some(row) = staged_rows.get(index) else {
             continue;
         };
-        if staged_row_identity_matches_scan(row, request) {
+        if staged_row_identity_matches_scan(row, request, candidate_index_matched_schema_and_entity)
+        {
             push_prepared_materialized(output, row);
         }
     }
@@ -2481,8 +2652,10 @@ fn push_prepared_materialized(
 fn staged_row_identity_matches_scan(
     row: PreparedStateRowRef<'_>,
     request: &LiveStateScanRequest,
+    candidate_index_matched_schema_and_entity: bool,
 ) -> bool {
-    if !request.filter.schema_keys.is_empty()
+    if !candidate_index_matched_schema_and_entity
+        && !request.filter.schema_keys.is_empty()
         && !request
             .filter
             .schema_keys
@@ -2491,7 +2664,10 @@ fn staged_row_identity_matches_scan(
     {
         return false;
     }
-    if !request.filter.entity_pks.is_empty() && !request.filter.entity_pks.contains(row.entity_pk) {
+    if !candidate_index_matched_schema_and_entity
+        && !request.filter.entity_pks.is_empty()
+        && !request.filter.entity_pks.contains(row.entity_pk)
+    {
         return false;
     }
     if !staged_branch_matches_scan(row.branch_id, request) {

@@ -12,7 +12,9 @@ mod types;
 
 pub(crate) use context::FunctionContext;
 pub(crate) use deterministic::DeterministicFunctionProvider;
-pub(crate) use provider::{FunctionProvider, FunctionProviderHandle, SystemFunctionProvider};
+pub(crate) use provider::{
+    FunctionProvider, FunctionProviderCheckpoint, FunctionProviderHandle, SystemFunctionProvider,
+};
 #[cfg(feature = "storage-benches")]
 pub(crate) use state::DETERMINISTIC_MODE_KEY;
 pub(crate) use state::DETERMINISTIC_SEQUENCE_KEY;

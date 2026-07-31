@@ -62,6 +62,18 @@ pub(crate) fn diff_command_query(
     ))
 }
 
+/// Returns whether an explicit transaction needs a statement checkpoint
+/// before executing this `RETURNING` write. Generic providers construct their
+/// result from a staged postimage. Direct entity writes are the one fast path
+/// that can safely evaluate ordinary visible columns before staging.
+pub(crate) fn write_plan_requires_post_stage_returning_checkpoint(plan: &SqlLogicalPlan) -> bool {
+    let SqlLogicalPlan::Write(write) = plan else {
+        return false;
+    };
+    write.plan.bound.returning.is_some()
+        && !super::bound_public_write::entity_returning_projects_before_stage(&write.plan)
+}
+
 #[cfg(test)]
 pub(crate) async fn create_write_logical_plan(
     ctx: &mut dyn SqlWriteExecutionContext,

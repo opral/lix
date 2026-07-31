@@ -185,6 +185,7 @@ pub(super) fn bind_update_bound(
         });
     }
     let predicate = bind_optional_predicate(&table, update.selection.as_ref(), &mut params)?;
+    let returning = bind_returning(&table, update.returning.as_ref(), &mut params, "UPDATE")?;
     let branch_scope = bind_write_branch_scope(
         &table.surface.kind,
         &BoundWriteInput::None,
@@ -198,7 +199,7 @@ pub(super) fn bind_update_bound(
         predicate,
         assignments,
         conflict: None,
-        returning: None,
+        returning,
         params: params.into_map(),
         branch_scope,
     })
@@ -214,7 +215,7 @@ pub(super) fn bind_delete_bound(
     let table = bind_delete_target(catalog, &delete.from)?;
     require_write_capability(&table.surface, BoundWriteOp::Delete)?;
     let predicate = bind_optional_predicate(&table, delete.selection.as_ref(), &mut params)?;
-    let returning = bind_delete_returning(&table, delete.returning.as_ref(), &mut params)?;
+    let returning = bind_returning(&table, delete.returning.as_ref(), &mut params, "DELETE")?;
     let branch_scope = bind_write_branch_scope(
         &table.surface.kind,
         &BoundWriteInput::None,
@@ -234,13 +235,14 @@ pub(super) fn bind_delete_bound(
     })
 }
 
-/// Bind the `RETURNING` list against the target surface itself.  It is not a
-/// nested SELECT: expressions are evaluated from the exact pre-delete row
-/// batch at execution time, before that batch is staged as tombstones.
-fn bind_delete_returning(
+/// Bind a normal DML `RETURNING` list against the target surface itself. It
+/// is not a nested SELECT: execution chooses the appropriate before/after
+/// row image for the write operation.
+fn bind_returning(
     table: &BoundTable,
     returning: Option<&Vec<SelectItem>>,
     params: &mut ParamBinder,
+    action: &str,
 ) -> Result<Option<BoundReturning>, LixError> {
     let Some(returning) = returning else {
         return Ok(None);
@@ -250,7 +252,7 @@ fn bind_delete_returning(
     for item in returning {
         match item {
             SelectItem::Wildcard(options) => {
-                reject_returning_wildcard_options(options)?;
+                reject_returning_wildcard_options(options, action)?;
                 for column in table
                     .surface
                     .columns
@@ -264,9 +266,9 @@ fn bind_delete_returning(
                 }
             }
             SelectItem::QualifiedWildcard(_, _) => {
-                return Err(super::error::unsupported(
-                    "qualified wildcards in DELETE RETURNING are not supported",
-                ));
+                return Err(super::error::unsupported(format!(
+                    "qualified wildcards in {action} RETURNING are not supported"
+                )));
             }
             SelectItem::UnnamedExpr(sql_expr) => {
                 let expr = bind_expr(table, sql_expr, params)?;
@@ -286,9 +288,9 @@ fn bind_delete_returning(
     }
 
     if items.is_empty() {
-        return Err(super::error::unsupported(
-            "DELETE RETURNING requires at least one result expression",
-        ));
+        return Err(super::error::unsupported(format!(
+            "{action} RETURNING requires at least one result expression"
+        )));
     }
 
     Ok(Some(BoundReturning { items }))
@@ -302,13 +304,12 @@ fn bind_insert_returning(
     let Some(returning) = returning else {
         return Ok(None);
     };
+
     if !matches!(
         table.surface.kind,
         PublicSurfaceKind::Revert | PublicSurfaceKind::Apply | PublicSurfaceKind::CreateCheckpoint
     ) {
-        return Err(super::error::unsupported(
-            "INSERT RETURNING is only supported for diff command sinks",
-        ));
+        return bind_returning(table, Some(returning), params, "INSERT");
     }
 
     let mut items = Vec::with_capacity(returning.len());
@@ -338,16 +339,19 @@ fn bind_insert_returning(
     Ok(Some(BoundReturning { items }))
 }
 
-fn reject_returning_wildcard_options(options: &WildcardAdditionalOptions) -> Result<(), LixError> {
+fn reject_returning_wildcard_options(
+    options: &WildcardAdditionalOptions,
+    action: &str,
+) -> Result<(), LixError> {
     if options.opt_ilike.is_some()
         || options.opt_exclude.is_some()
         || options.opt_except.is_some()
         || options.opt_replace.is_some()
         || options.opt_rename.is_some()
     {
-        return Err(super::error::unsupported(
-            "DELETE RETURNING wildcard modifiers are not supported",
-        ));
+        return Err(super::error::unsupported(format!(
+            "{action} RETURNING wildcard modifiers are not supported"
+        )));
     }
     Ok(())
 }
@@ -471,11 +475,6 @@ fn reject_unsupported_update_clauses(update: &Update) -> Result<(), LixError> {
     }
     if update.from.is_some() {
         return Err(super::error::unsupported("UPDATE FROM is not supported"));
-    }
-    if update.returning.is_some() {
-        return Err(super::error::unsupported(
-            "UPDATE RETURNING is not supported",
-        ));
     }
     if update.or.is_some() {
         return Err(super::error::unsupported(
@@ -2330,11 +2329,98 @@ mod tests {
         for sql in [
             "INSERT INTO lix_revert (diff_id) SELECT diff_id FROM lix_working_diff RETURNING diff_id",
             "INSERT INTO lix_revert (diff_id) SELECT diff_id FROM lix_working_diff RETURNING *",
-            "INSERT INTO lix_file (path) VALUES ('readme.md') RETURNING id",
         ] {
             let error = bind_statement(&parse_statement(sql), &[], "branch1")
                 .expect_err("unsupported INSERT RETURNING shape should fail");
             assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{sql}");
+        }
+    }
+
+    #[test]
+    fn bind_statement_binds_returning_for_registered_entity_writes() {
+        let schema = serde_json::json!({
+            "x-lix-key": "project_task",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false,
+        });
+        let inserted = bind_statement(
+            &parse_statement(
+                "INSERT INTO project_task (id, title) VALUES ($1, $2) \
+                 RETURNING id, title AS inserted_title",
+            ),
+            std::slice::from_ref(&schema),
+            "branch1",
+        )
+        .expect("registered entity INSERT RETURNING should bind");
+        assert_eq!(
+            inserted
+                .returning
+                .expect("INSERT RETURNING should be bound")
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "inserted_title"]
+        );
+        assert_eq!(
+            inserted.params.params.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let updated = bind_statement(
+            &parse_statement(
+                "UPDATE project_task SET title = $1 WHERE id = $2 \
+                 RETURNING id, title AS updated_title, $3 AS marker",
+            ),
+            std::slice::from_ref(&schema),
+            "branch1",
+        )
+        .expect("registered entity UPDATE RETURNING should bind");
+        assert_eq!(
+            updated
+                .returning
+                .expect("UPDATE RETURNING should be bound")
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "updated_title", "marker"]
+        );
+        assert_eq!(
+            updated.params.params.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn bind_statement_binds_returning_on_every_writable_surface() {
+        for sql in [
+            "INSERT INTO lix_file (path) VALUES ('readme.md') RETURNING id",
+            "INSERT INTO lix_directory (path) VALUES ('/docs/') RETURNING id",
+            "UPDATE lix_file SET name = 'readme.md' RETURNING id",
+            "INSERT INTO lix_branch (id, name) VALUES ('draft', 'Draft') RETURNING id",
+        ] {
+            let bound =
+                bind_statement(&parse_statement(sql), &[], "branch1").unwrap_or_else(|error| {
+                    panic!("writable surface RETURNING should bind for {sql}: {error:?}")
+                });
+            assert_eq!(
+                bound
+                    .returning
+                    .expect("RETURNING should be bound")
+                    .items
+                    .iter()
+                    .map(|item| item.output_name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["id"],
+                "{sql}"
+            );
         }
     }
 

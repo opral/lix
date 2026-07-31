@@ -957,15 +957,20 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
         .map_err(datafusion_error_to_lix_error)?;
     let table_schema = table.schema();
     let state = session.state();
-    let returning = if plan.bound.op == BoundWriteOp::Delete {
-        datafusion_delete_returning(
+    // Diff command sinks own their dedicated RETURNING contract. Every
+    // registered table surface takes the normal DML path below, where a
+    // provider must explicitly capture the relevant image (pre-delete or
+    // post-insert/update) rather than silently returning only an affected
+    // count.
+    let returning = if matches!(plan.bound.target, BoundWriteTarget::DiffCommand(_)) {
+        None
+    } else {
+        datafusion_dml_returning(
             &session,
             table_schema.as_ref(),
             plan.bound.returning.as_ref(),
             params,
         )?
-    } else {
-        None
     };
 
     let exec = match plan.bound.op {
@@ -974,7 +979,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                 insert_input_plan(&session, std::sync::Arc::clone(&table_schema), plan, params)
                     .await?;
             if plan.bound.branch_scope == BranchScope::Empty {
-                return Ok(SqlWriteResult::affected(0));
+                return sql_write_empty_returning_result(returning.as_ref());
             }
             if let Some(conflict) = &plan.bound.conflict {
                 let target_columns: Vec<String> = conflict
@@ -1005,32 +1010,75 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                         }
                     }
                 };
-                let rows_affected = crate::sql2::providers::execute_spec_upsert(
-                    &table,
-                    &input,
-                    proposed_batches,
-                    &target_columns,
-                    &action,
-                )
-                .await?;
-                return Ok(SqlWriteResult::affected(rows_affected));
+                let rows_affected = match &returning {
+                    Some(returning) => {
+                        crate::sql2::providers::execute_spec_upsert_with_returning(
+                            &table,
+                            &input,
+                            proposed_batches,
+                            &target_columns,
+                            &action,
+                            returning.clone(),
+                        )
+                        .await?
+                    }
+                    None => {
+                        crate::sql2::providers::execute_spec_upsert(
+                            &table,
+                            &input,
+                            proposed_batches,
+                            &target_columns,
+                            &action,
+                        )
+                        .await?
+                    }
+                };
+                return match returning.as_ref() {
+                    Some(returning) => {
+                        sql_write_captured_returning_result(rows_affected, returning)
+                    }
+                    None => Ok(SqlWriteResult::affected(rows_affected)),
+                };
             }
-            table
-                .insert_into(&state, input, InsertOp::Append)
-                .await
-                .map_err(datafusion_error_to_lix_error)
+            match &returning {
+                Some(returning) => {
+                    crate::sql2::providers::execute_spec_insert_with_returning(
+                        &table,
+                        &state,
+                        input,
+                        returning.clone(),
+                    )
+                    .await
+                }
+                None => table
+                    .insert_into(&state, input, InsertOp::Append)
+                    .await
+                    .map_err(datafusion_error_to_lix_error),
+            }
         }
         BoundWriteOp::Update => {
             let assignments =
                 datafusion_assignments(&session, table_schema.as_ref(), plan, params)?;
             let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
             if plan.bound.branch_scope == BranchScope::Empty {
-                return Ok(SqlWriteResult::affected(0));
+                return sql_write_empty_returning_result(returning.as_ref());
             }
-            table
-                .update(&state, assignments, filters)
-                .await
-                .map_err(datafusion_error_to_lix_error)
+            match &returning {
+                Some(returning) => {
+                    crate::sql2::providers::execute_spec_update_with_returning(
+                        &table,
+                        &state,
+                        assignments,
+                        filters,
+                        returning.clone(),
+                    )
+                    .await
+                }
+                None => table
+                    .update(&state, assignments, filters)
+                    .await
+                    .map_err(datafusion_error_to_lix_error),
+            }
         }
         BoundWriteOp::Delete => {
             let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
@@ -1073,19 +1121,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
         return SqlWriteResult::diff_command(outcome, plan.bound.returning.as_ref());
     }
     match returning {
-        Some(returning) => {
-            let batch = returning
-                .take_captured()
-                .map_err(datafusion_error_to_lix_error)?;
-            let fields = returning
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.as_ref().clone())
-                .collect::<Vec<_>>();
-            let result = query_result_from_batches(&fields, &[batch])?;
-            Ok(SqlWriteResult::returning(rows_affected, result))
-        }
+        Some(returning) => sql_write_captured_returning_result(rows_affected, &returning),
         None => Ok(SqlWriteResult::affected(rows_affected)),
     }
 }
@@ -1421,7 +1457,7 @@ fn write_provider_selection(plan: &LogicalWritePlan, target_table_name: &str) ->
     }
 }
 
-fn datafusion_delete_returning(
+fn datafusion_dml_returning(
     session: &SessionContext,
     table_schema: &Schema,
     returning: Option<&BoundReturning>,
@@ -1495,6 +1531,23 @@ fn sql_write_empty_returning_result(
         0,
         query_result_from_batches(&fields, &[])?,
     ))
+}
+
+fn sql_write_captured_returning_result(
+    rows_affected: u64,
+    returning: &crate::sql2::providers::DmlReturning,
+) -> Result<SqlWriteResult, LixError> {
+    let batch = returning
+        .take_captured()
+        .map_err(datafusion_error_to_lix_error)?;
+    let fields = returning
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let result = query_result_from_batches(&fields, &[batch])?;
+    Ok(SqlWriteResult::returning(rows_affected, result))
 }
 
 fn insert_field_expr(
