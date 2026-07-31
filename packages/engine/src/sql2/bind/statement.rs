@@ -214,7 +214,7 @@ pub(super) fn bind_delete_bound(
     let table = bind_delete_target(catalog, &delete.from)?;
     require_write_capability(&table.surface, BoundWriteOp::Delete)?;
     let predicate = bind_optional_predicate(&table, delete.selection.as_ref(), &mut params)?;
-    let returning = bind_delete_returning(&table, delete.returning.as_ref(), &mut params)?;
+    let returning = bind_row_returning(&table, delete.returning.as_ref(), &mut params, "DELETE")?;
     let branch_scope = bind_write_branch_scope(
         &table.surface.kind,
         &BoundWriteInput::None,
@@ -237,10 +237,11 @@ pub(super) fn bind_delete_bound(
 /// Bind the `RETURNING` list against the target surface itself.  It is not a
 /// nested SELECT: expressions are evaluated from the exact pre-delete row
 /// batch at execution time, before that batch is staged as tombstones.
-fn bind_delete_returning(
+fn bind_row_returning(
     table: &BoundTable,
     returning: Option<&Vec<SelectItem>>,
     params: &mut ParamBinder,
+    action: &str,
 ) -> Result<Option<BoundReturning>, LixError> {
     let Some(returning) = returning else {
         return Ok(None);
@@ -264,9 +265,9 @@ fn bind_delete_returning(
                 }
             }
             SelectItem::QualifiedWildcard(_, _) => {
-                return Err(super::error::unsupported(
-                    "qualified wildcards in DELETE RETURNING are not supported",
-                ));
+                return Err(super::error::unsupported(format!(
+                    "qualified wildcards in {action} RETURNING are not supported"
+                )));
             }
             SelectItem::UnnamedExpr(sql_expr) => {
                 let expr = bind_expr(table, sql_expr, params)?;
@@ -286,9 +287,9 @@ fn bind_delete_returning(
     }
 
     if items.is_empty() {
-        return Err(super::error::unsupported(
-            "DELETE RETURNING requires at least one result expression",
-        ));
+        return Err(super::error::unsupported(format!(
+            "{action} RETURNING requires at least one result expression"
+        )));
     }
 
     Ok(Some(BoundReturning { items }))
@@ -302,6 +303,12 @@ fn bind_insert_returning(
     let Some(returning) = returning else {
         return Ok(None);
     };
+    if matches!(
+        table.surface.kind,
+        PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByBranch { .. }
+    ) {
+        return bind_row_returning(table, Some(returning), params, "INSERT");
+    }
     if !matches!(
         table.surface.kind,
         PublicSurfaceKind::Revert | PublicSurfaceKind::Apply | PublicSurfaceKind::CreateCheckpoint

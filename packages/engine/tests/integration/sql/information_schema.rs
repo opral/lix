@@ -1257,30 +1257,28 @@ simulation_test!(
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
         }
 
-        for sql in [
-            "INSERT INTO engine_excluded_typed_default (id, status) \
-             VALUES ('unsupported-returning-insert', 'x') RETURNING id",
-            "UPDATE engine_excluded_typed_default SET status = 'changed' \
-             WHERE id = 'same' RETURNING id",
-        ] {
-            let error = session
-                .execute(sql, &[])
-                .await
-                .expect_err("unsupported entity RETURNING must not be silently ignored");
-            assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{sql}");
-            assert!(error.message.contains("RETURNING"), "{error:?}");
-        }
         assert_rows_eq(
             session
                 .execute(
-                    "SELECT id FROM engine_excluded_typed_default \
-                     WHERE id = 'unsupported-returning-insert'",
+                    "INSERT INTO engine_excluded_typed_default (id, status) \
+                     VALUES ('insert-returning', 'x') RETURNING id, status AS inserted_status",
                     &[],
                 )
                 .await
-                .expect("rejected INSERT RETURNING must not write"),
-            vec![],
+                .expect("entity INSERT RETURNING should expose the staged row"),
+            vec![vec![
+                Value::Text("insert-returning".to_string()),
+                Value::Text("x".to_string()),
+            ]],
         );
+        let update_sql = "UPDATE engine_excluded_typed_default SET status = 'changed' \
+                          WHERE id = 'same' RETURNING id";
+        let error = session
+            .execute(update_sql, &[])
+            .await
+            .expect_err("unsupported UPDATE RETURNING must not be silently ignored");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error.message.contains("RETURNING"), "{error:?}");
         assert_rows_eq(
             session
                 .execute(

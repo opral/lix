@@ -988,16 +988,14 @@ async fn execute_entity_write(
         BoundWriteOp::Insert => {
             if no_op {
                 entity_insert_batch(ctx, plan, &spec, params, active_branch_commit_id.as_ref())?;
-                return Ok(SqlWriteResult::affected(0));
+                return Ok(empty_entity_returning_result(plan));
             }
             if plan.bound.conflict.is_some() {
                 entity_upsert(ctx, plan, &spec, params, active_branch_commit_id.as_ref())
                     .await
                     .map(SqlWriteResult::affected)
             } else {
-                entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_ref())
-                    .await
-                    .map(SqlWriteResult::affected)
+                entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
             }
         }
         BoundWriteOp::Update => {
@@ -1010,7 +1008,7 @@ async fn execute_entity_write(
         }
         BoundWriteOp::Delete => {
             if no_op {
-                return Ok(empty_entity_delete_returning_result(plan));
+                return Ok(empty_entity_returning_result(plan));
             }
             if matches!(surface, EntityWriteSurface::Base { .. })
                 && matches!(plan.bound.predicate, BoundPredicate::True)
@@ -1542,9 +1540,50 @@ async fn entity_insert(
     spec: &EntitySurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<u64, LixError> {
+) -> Result<SqlWriteResult, LixError> {
     let write_rows = entity_insert_batch(ctx, plan, spec, params, active_branch_commit_id)?;
-    stage_rows(ctx, TransactionWriteMode::Insert, write_rows).await
+    let returning_rows = plan
+        .bound
+        .returning
+        .as_ref()
+        .map(|returning| {
+            write_rows
+                .iter()
+                .map(|row| {
+                    let snapshot = row.snapshot.ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "entity INSERT RETURNING requires snapshot_content",
+                        )
+                    })?;
+                    entity_returning_row(
+                        returning,
+                        &EntityEvalContext::insert(snapshot.value(), &spec.columns),
+                        spec,
+                        ctx,
+                        params,
+                        active_branch_commit_id,
+                    )
+                })
+                .collect::<Result<Vec<_>, LixError>>()
+        })
+        .transpose()?;
+    let rows_affected = stage_rows(ctx, TransactionWriteMode::Insert, write_rows).await?;
+    Ok(match (plan.bound.returning.as_ref(), returning_rows) {
+        (Some(returning), Some(rows)) => SqlWriteResult::returning(
+            rows_affected,
+            crate::SqlQueryResult {
+                columns: returning
+                    .items
+                    .iter()
+                    .map(|item| item.output_name.clone())
+                    .collect(),
+                rows,
+                notices: Vec::new(),
+            },
+        ),
+        _ => SqlWriteResult::affected(rows_affected),
+    })
 }
 
 async fn entity_upsert(
@@ -1798,7 +1837,7 @@ async fn entity_delete(
     }
 }
 
-fn empty_entity_delete_returning_result(plan: &LogicalWritePlan) -> SqlWriteResult {
+fn empty_entity_returning_result(plan: &LogicalWritePlan) -> SqlWriteResult {
     plan.bound.returning.as_ref().map_or_else(
         || SqlWriteResult::affected(0),
         |returning| {
@@ -4097,19 +4136,12 @@ fn validate_bound_write_supported(
             validate_expr_supported(&item.expr)?;
         }
     }
-    if plan.bound.returning.is_some() && plan.bound.op != BoundWriteOp::Delete {
-        let action = match plan.bound.op {
-            BoundWriteOp::Insert => "INSERT",
-            BoundWriteOp::Update => "UPDATE",
-            BoundWriteOp::Delete => unreachable!("DELETE RETURNING is supported"),
-        };
+    if plan.bound.returning.is_some() && plan.bound.op == BoundWriteOp::Update {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            format!("{action} RETURNING is not supported for registered entity surfaces"),
+            "UPDATE RETURNING is not supported for registered entity surfaces",
         )
-        .with_hint(format!(
-            "Run the {action} without RETURNING, then SELECT the row explicitly."
-        )));
+        .with_hint("Run the UPDATE without RETURNING, then SELECT the row explicitly."));
     }
     Ok(())
 }
