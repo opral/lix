@@ -2280,9 +2280,6 @@ where
         .iter()
         .map(|statement| statement.params.as_slice())
         .collect::<Vec<_>>();
-    let Some(parameter_batch) = sql2::parameter_record_batch(&parameter_rows)? else {
-        return Ok(None);
-    };
 
     let previous_origin_key = transaction.replace_origin_key(options.origin_key.clone());
     let execution = async {
@@ -2292,6 +2289,15 @@ where
                 .first()
                 .expect("non-empty transaction batch has a parsed statement"),
         )?;
+        if let Some(results) =
+            sql2::execute_write_logical_plan_value_batch(transaction, &plan, &parameter_rows)
+                .await?
+        {
+            return Ok(Some(results));
+        }
+        let Some(parameter_batch) = sql2::parameter_record_batch(&parameter_rows)? else {
+            return Ok(None);
+        };
         sql2::execute_write_logical_plan_parameter_batch(transaction, plan, &parameter_batch).await
     }
     .await;
@@ -4118,6 +4124,71 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "b");
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "updated-b");
+    }
+
+    #[tokio::test]
+    async fn large_ordered_parameter_insert_reuses_commit_delta_as_current_base() {
+        const ROW_COUNT: usize = 1_024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "ordered_packed_insert_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        crate::transaction::take_ordered_packed_current_base_publications();
+        let sql = "INSERT INTO ordered_packed_insert_probe (id, value) VALUES ($1, $2)";
+        let statements = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text(format!("{row_index:04}")),
+                    Value::Text(format!("value-{row_index:04}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let affected = session
+            .execute_batch(&statements)
+            .await
+            .unwrap()
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
+        assert_eq!(affected, ROW_COUNT as u64);
+        assert_eq!(
+            crate::transaction::take_ordered_packed_current_base_publications(),
+            1,
+            "the certified ordered batch must publish its commit delta directly as current state"
+        );
+
+        let rows = session
+            .execute(
+                "SELECT id, value FROM ordered_packed_insert_probe WHERE id IN ('0000', '1023') ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "value-0000");
+        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "value-1023");
+        session
+            .create_checkpoint()
+            .await
+            .expect("ordered packed current base should remain checkpointable");
     }
 
     #[tokio::test]
