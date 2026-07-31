@@ -196,7 +196,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
             .snapshot()
             .delete_plan_for_key(&row.schema_key)
             .has_committed_checks()
-    };
+    } && !row.constraints_unchanged;
 
     if row.schema_key == REGISTERED_SCHEMA_KEY {
         if row.file_id.is_some() {

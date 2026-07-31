@@ -426,6 +426,7 @@ pub(crate) struct TransactionWriteRow {
 const RAW_WRITE_NONE: u32 = u32::MAX;
 const RAW_WRITE_GLOBAL: u8 = 1;
 const RAW_WRITE_UNTRACKED: u8 = 1 << 1;
+const RAW_WRITE_CONSTRAINTS_UNCHANGED: u8 = 1 << 2;
 
 /// Compact row topology for an incoming transaction write batch.
 ///
@@ -493,6 +494,7 @@ pub(crate) struct RawWriteRowRef<'a> {
     pub(crate) change_id: Option<&'a str>,
     pub(crate) commit_id: Option<&'a str>,
     pub(crate) untracked: bool,
+    pub(crate) constraints_unchanged: bool,
     pub(crate) branch_id: &'a SharedStr,
 }
 
@@ -633,6 +635,7 @@ impl RawWriteBatch {
             change_id: self.optional_string(slot.change_id).map(SharedStr::as_str),
             commit_id: self.optional_string(slot.commit_id).map(SharedStr::as_str),
             untracked: slot.flags & RAW_WRITE_UNTRACKED != 0,
+            constraints_unchanged: slot.flags & RAW_WRITE_CONSTRAINTS_UNCHANGED != 0,
             branch_id: &self.strings[slot.branch_id as usize],
         })
     }
@@ -661,6 +664,16 @@ impl RawWriteBatch {
             row.untracked,
             row.branch_id,
         );
+    }
+
+    /// Certifies that the row just appended is a replacement whose primary
+    /// key, unique-key, and foreign-key source properties are unchanged.
+    pub(crate) fn mark_last_constraints_unchanged(&mut self) {
+        let slot = self
+            .slots
+            .last_mut()
+            .expect("constraint certificate requires an appended row");
+        slot.flags |= RAW_WRITE_CONSTRAINTS_UNCHANGED;
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1300,6 +1313,7 @@ impl PartialEq for RawWriteRowRef<'_> {
             && self.change_id == other.change_id
             && self.commit_id == other.commit_id
             && self.untracked == other.untracked
+            && self.constraints_unchanged == other.constraints_unchanged
             && self.branch_id == other.branch_id
     }
 }
@@ -2710,7 +2724,6 @@ impl PreparedStateBatch {
         self.origins.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn set_requires_transaction_validation(
         &mut self,
         index: usize,
