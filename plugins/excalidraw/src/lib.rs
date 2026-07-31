@@ -1,4 +1,4 @@
-//! Excalidraw support for the fused Component API v3.
+//! Excalidraw support for the fused Component API v1.
 #![allow(dead_code)]
 
 mod core;
@@ -704,7 +704,7 @@ impl BatchEncoder {
         encode_change(change, &mut record)?;
         if record.len() > self.max_bytes {
             return Err(sdk::Error::limit_exceeded(
-                "one Excalidraw entity exceeds the v3 batch limit",
+                "one Excalidraw entity exceeds the plugin batch limit",
             ));
         }
         if self.records > 0 && self.payload.len() + record.len() > self.max_bytes {

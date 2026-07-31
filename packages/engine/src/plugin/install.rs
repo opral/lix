@@ -253,7 +253,7 @@ mod tests {
             r#"{{
                 "key":"{plugin_key}",
                 "runtime":"wasm-component",
-                "api_version":"4.0.0",
+                "api_version":"1.0.0",
                 "materialization":"blob",
                 "match":{{"path_glob":"{path_glob}"{content_type}}},
                 "entry":"plugin.wasm",

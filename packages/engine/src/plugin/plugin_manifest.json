@@ -24,7 +24,7 @@
     },
     "api_version": {
       "type": "string",
-      "const": "4.0.0"
+      "const": "1.0.0"
     },
     "materialization": {
       "type": "string",

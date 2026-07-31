@@ -1,8 +1,8 @@
-# Plugin API v3: host-owned persistent arenas
+# Plugin API v1: host-owned persistent arenas
 
 ## Status
 
-Accepted hard cut. API v3 is the only plugin ABI and runtime path. Total-memory
+Accepted hard cut. API v1 is the only plugin ABI and runtime path. Total-memory
 measurements include host-owned live bytes, guest linear-memory high water, and
 transition materialization. The implementation retains no v2 adapter, runtime,
 WIT, SDK, or format plugin.
@@ -64,7 +64,7 @@ entity value identities, deterministic successor roots, constant-time
 branching, rollback on invalid output, cache-independent roots, generation
 upgrades without arena rewrites, and sparse three-arena commits. End-to-end
 plugin tests must additionally retain the existing v2 corpus, identity,
-conflict, and merge assertions after the four format adapters move to v3.
+conflict, and merge assertions after the four format adapters move to v1.
 
 ## Benchmark gates
 

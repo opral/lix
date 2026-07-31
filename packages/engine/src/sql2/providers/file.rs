@@ -9126,7 +9126,7 @@ mod tests {
         wasm: &[u8],
     ) -> PluginRegistryEntry {
         let mut manifest = serde_json::json!({
-            "api_version":"4.0.0",
+            "api_version":"1.0.0",
             "entry": "plugin.wasm",
             "key": key,
             "match": { "path_glob": path_glob },
@@ -9142,7 +9142,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "4.0.0".to_string(),
+            api_version: "1.0.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type,
             entry: "plugin.wasm".to_string(),
@@ -9202,7 +9202,7 @@ mod tests {
             r#"{{
                 "key": "plugin_sentinel",
                 "runtime": "wasm-component",
-                "api_version":"4.0.0",
+                "api_version":"1.0.0",
                 "materialization": "blob",
                 "match": {{ "path_glob": "{path_glob}" }},
                 "entry": "plugin.wasm",

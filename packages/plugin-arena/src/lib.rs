@@ -1,4 +1,4 @@
-//! Host-owned immutable arenas for the Lix plugin API v3.
+//! Host-owned immutable arenas for the Lix plugin API v1.
 //!
 //! A [`Root`] names three independently persistent values:
 //!
@@ -21,8 +21,8 @@ use std::sync::{Arc, Weak};
 pub const DEFAULT_PAGE_BYTES: usize = 64 * 1024;
 const SUCCESSOR_CHECKPOINT_MAGIC: &[u8; 8] = b"LIXPSC01";
 const SUCCESSOR_CHECKPOINT_HASH_DOMAIN: &[u8] = b"lix-plugin-v3/successor-checkpoint\0";
-pub const REQUIRED_V3_SPEEDUP: u64 = 2;
-pub const REQUIRED_V3_MEMORY_REDUCTION: u64 = 3;
+pub const REQUIRED_V1_SPEEDUP: u64 = 2;
+pub const REQUIRED_V1_MEMORY_REDUCTION: u64 = 3;
 
 /// One end-to-end benchmark lane. `peak_total_bytes` must include host live
 /// ownership, guest linear-memory high water, and transient materialization.
@@ -44,20 +44,23 @@ impl Acceptance {
     }
 }
 
-/// Applies the non-negotiable API v3 performance gate without floating-point
-/// rounding: v3 must be at least 2× faster and consume at least 3× less total
-/// peak memory than the matching v2 lane.
-pub const fn compare_to_v2(v2: PerformanceMeasurement, v3: PerformanceMeasurement) -> Acceptance {
+/// Applies the non-negotiable API v1 performance gate without floating-point
+/// rounding: the candidate must be at least 2× faster and consume at least 3×
+/// less total peak memory than its matching baseline.
+pub const fn compare_to_baseline(
+    baseline: PerformanceMeasurement,
+    candidate: PerformanceMeasurement,
+) -> Acceptance {
     Acceptance {
-        latency_passes: match v3.p95_nanoseconds.checked_mul(REQUIRED_V3_SPEEDUP) {
-            Some(scaled) => scaled <= v2.p95_nanoseconds,
+        latency_passes: match candidate.p95_nanoseconds.checked_mul(REQUIRED_V1_SPEEDUP) {
+            Some(scaled) => scaled <= baseline.p95_nanoseconds,
             None => false,
         },
-        memory_passes: match v3
+        memory_passes: match candidate
             .peak_total_bytes
-            .checked_mul(REQUIRED_V3_MEMORY_REDUCTION)
+            .checked_mul(REQUIRED_V1_MEMORY_REDUCTION)
         {
-            Some(scaled) => scaled <= v2.peak_total_bytes,
+            Some(scaled) => scaled <= baseline.peak_total_bytes,
             None => false,
         },
     }
@@ -1450,7 +1453,7 @@ mod tests {
             peak_total_bytes: 30_000_000,
         };
         assert!(
-            compare_to_v2(
+            compare_to_baseline(
                 v2,
                 PerformanceMeasurement {
                     p95_nanoseconds: 3_000_000,
@@ -1460,7 +1463,7 @@ mod tests {
             .passes()
         );
         assert_eq!(
-            compare_to_v2(
+            compare_to_baseline(
                 v2,
                 PerformanceMeasurement {
                     p95_nanoseconds: 3_000_001,
@@ -1473,7 +1476,7 @@ mod tests {
             }
         );
         assert_eq!(
-            compare_to_v2(
+            compare_to_baseline(
                 v2,
                 PerformanceMeasurement {
                     p95_nanoseconds: 2_999_999,

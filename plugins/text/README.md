@@ -12,7 +12,7 @@ that row only, an insertion adds one row, and a reorder updates only the rows
 whose order must move.
 
 Selected Git-text files retain exact source bytes and durable line rows. The
-blob-backed policy lets a cold v3 actor reopen directly from accepted bytes
+blob-backed policy lets a cold v1 actor reopen directly from accepted bytes
 without reconstructing a complete document from semantic rows. NUL-bearing
 input inside Git's first-8-KiB window never selects this plugin and remains an
 ordinary raw binary file.

@@ -1,4 +1,4 @@
-//! Authoring layer for Lix's fused, host-owned Component API v3.
+//! Authoring layer for Lix's fused, host-owned Component API v1.
 
 #![allow(clippy::missing_errors_doc)]
 
@@ -324,12 +324,12 @@ impl Sink<'_> {
     fn validate_page(&self, record_count: u32, payload_len: usize, kind: &str) -> Result<()> {
         if record_count == 0 {
             return Err(Error::invalid_input(format!(
-                "v3 {kind} pages cannot be empty"
+                "v1 {kind} pages cannot be empty"
             )));
         }
         if payload_len > self.max_batch_bytes as usize {
             return Err(Error::limit_exceeded(format!(
-                "v3 {kind} page exceeds max-batch-bytes"
+                "v1 {kind} page exceeds max-batch-bytes"
             )));
         }
         Ok(())

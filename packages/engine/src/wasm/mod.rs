@@ -12,11 +12,11 @@ pub use component::*;
 ///
 /// These values are independent of a Wasm Store and remain valid across branch
 /// switches, actor eviction, and cold reopen.
-pub mod v3 {
+pub mod v1 {
     pub use lix_plugin_arena::{
         Acceptance, Archive, ByteArena, ByteEdit, Digest, Error, FormatLayout, MapArena, Metrics,
-        PerformanceMeasurement, REQUIRED_V3_MEMORY_REDUCTION, REQUIRED_V3_SPEEDUP, Root,
-        StatePageLayout, Store, Transaction, compare_to_v2,
+        PerformanceMeasurement, REQUIRED_V1_MEMORY_REDUCTION, REQUIRED_V1_SPEEDUP, Root,
+        StatePageLayout, Store, Transaction, compare_to_baseline,
     };
 }
 

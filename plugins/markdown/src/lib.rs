@@ -1,4 +1,4 @@
-//! Markdown support for the fused Component API v3.
+//! Markdown support for the fused Component API v1.
 #![allow(dead_code)]
 
 mod core;
@@ -811,7 +811,7 @@ impl BatchEncoder {
         let is_create = encode_change(change, creates, create_from_ordinal, &mut record)?;
         if record.len() > self.max_bytes {
             return Err(sdk::Error::limit_exceeded(
-                "one Markdown entity exceeds the v3 batch limit",
+                "one Markdown entity exceeds the plugin batch limit",
             ));
         }
         if self.records > 0

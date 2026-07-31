@@ -1,4 +1,4 @@
-# Lix plugin API v3
+# Lix plugin API v1
 
 The canonical, intentionally incompatible Component API for Lix plugins. It
 uses fused guest transitions with host-owned sources and push sinks.
@@ -37,14 +37,14 @@ published unless the export, complete drain, and subsequent commit all succeed.
 
 Cold-successor is not ordinary hydration. A cache miss during replay must not
 rebuild and render the predecessor merely to parse the successor. Warm apply,
-cold successor, and explicit hydration are separate v3 operations so the host
+cold successor, and explicit hydration are separate v1 operations so the host
 cannot accidentally reintroduce that work through an adapter.
 
 Measured on the 10.68 MiB / 220,001-entity CSV fixture:
 
 | lane | p50 | peak live host allocation |
 | --- | ---: | ---: |
-| matched v2 | 5.169 s | 929.7 MB |
+| returned-cursor prototype | 5.169 s | 929.7 MB |
 | A, fused packet-v1 | 5.042 s | 929.7 MB |
 | B, typed CSV batch | 4.576 s | 927.8 MB |
 | B + certified import/storage-retention cuts | 2.325 s | 448.4 MB |
@@ -52,7 +52,7 @@ Measured on the 10.68 MiB / 220,001-entity CSV fixture:
 | C + streamed sink + one-shot cold CSV view | 2.066 s | 282.4 MB |
 
 The final measured lane is 2.50x faster and uses 3.29x less peak live host
-allocation than matched v2. It retains the compact prepared row owner through
+allocation than the returned-cursor prototype. It retains the compact prepared row owner through
 validation and expands hot row, file, and working-diff keys in 4,096-row pages
 only while lowering the atomic backend transaction. Exact file bytes, all
 220,000 CSV rows, the active checkpoint baseline and coverage proof, and
@@ -60,7 +60,7 @@ INSERT absence validation remain unchanged.
 
 The history-replay lane has a different multiplier. With only 16 cached actors,
 cache misses can materialize and render the predecessor before parsing the
-successor. v3 treats `apply-cold-successor(durable-entities, new-source, sink)`
+successor. v1 treats `apply-cold-successor(durable-entities, new-source, sink)`
 as a first-class operation rather than implementing it as `hydrate` followed
 by warm `apply`. The cache is an acceleration layer; correctness and replay
 complexity do not depend on keeping every file actor resident. Durable entities
@@ -77,8 +77,8 @@ change per sample.
 
 | lane | p50 | p95 | guest transition exports | peak live host allocation |
 | --- | ---: | ---: | ---: | ---: |
-| v2 returned change cursor | 1.939 ms | 3.524 ms | 3 | 1.090 MB |
-| v3 imported push sink | 1.343 ms | 1.558 ms | 1 | 1.090 MB |
+| returned-cursor prototype | 1.939 ms | 3.524 ms | 3 | 1.090 MB |
+| v1 imported push sink | 1.343 ms | 1.558 ms | 1 | 1.090 MB |
 
 The push path is 1.44x faster at p50. The completed storage-native path
 validates host-owned pages into transaction batches and avoids a complete
@@ -92,15 +92,15 @@ therefore isolated the API/runtime change:
 
 | lane | p50 | p95 | guest exports | host imports | peak live host allocation |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| v2 returned cursor | 675.7 ms | 767.0 ms | 17 | 10 | 85.7 MB |
-| v3 push sink | 600.4 ms | 652.1 ms | 1 | 9 | 85.6 MB |
+| returned-cursor prototype | 675.7 ms | 767.0 ms | 17 | 10 | 85.7 MB |
+| v1 push sink | 600.4 ms | 652.1 ms | 1 | 9 | 85.6 MB |
 
 Bulk JSON is 1.13x faster at p50. The fused call plus 2 MiB bounded pages
 replace sixteen `cursor.next` exports with eight sink imports.
 
 The source side now returns any ABI-addressable complete file in one bounded
 host import instead of copying eleven 1 MiB results into a second guest vector.
-Together with the bounded producer/consumer sink, this changes v3 import-call
+Together with the bounded producer/consumer sink, this changes v1 import-call
 counts from 26 to 9 for JSON and from 29 to 11 for CSV. Seven post-cut CSV
 samples have a 2.066 s p50 and 282.4 MB peak live host allocation.
 

@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use lix_engine::wasm::WasmLimits;
-use lix_engine::wasm::v3::{
+use lix_engine::wasm::v1::{
     ByteEdit as ArenaByteEdit, Digest as ArenaDigest, Root as ArenaRoot, Store as ArenaStore,
     Transaction as ArenaTransaction,
 };
