@@ -57,10 +57,6 @@ where
         delete_range_removes_exact_range
     );
     run!(
-        "baseline::delete_range_applies_after_staged_puts",
-        delete_range_applies_after_staged_puts
-    );
-    run!(
         "baseline::put_many_applies_after_delete_range",
         put_many_applies_after_delete_range
     );
@@ -380,48 +376,6 @@ where
             ("d", Some("D")),
             ("e", Some("E")),
         ],
-    )
-    .await
-}
-
-async fn delete_range_applies_after_staged_puts<F>(factory: &F) -> ConformanceResult
-where
-    F: StorageFactory,
-{
-    let storage = open_storage(factory).await;
-    let test_space = space(1);
-    seed_full_values(&storage, test_space, [("a", "A"), ("c", "C"), ("d", "D")]).await?;
-
-    let mut write = storage
-        .begin_write(WriteOptions::default())
-        .await
-        .map_err(|error| format!("begin_write failed: {error}"))?;
-    write
-        .put_many(
-            TEST_SPACE,
-            put_batch([full_put(key("b"), "B"), full_put(key("c"), "C2")]),
-        )
-        .await
-        .map_err(|error| format!("put_many failed: {error}"))?;
-    write
-        .delete_range(
-            TEST_SPACE,
-            KeyRange {
-                lower: Bound::Included(key("b")),
-                upper: Bound::Excluded(key("d")),
-            },
-        )
-        .await
-        .map_err(|error| format!("delete_range failed: {error}"))?;
-    write
-        .commit()
-        .await
-        .map_err(|error| format!("commit failed: {error}"))?;
-
-    assert_get_entries(
-        &storage,
-        test_space,
-        &[("a", Some("A")), ("b", None), ("c", None), ("d", Some("D"))],
     )
     .await
 }

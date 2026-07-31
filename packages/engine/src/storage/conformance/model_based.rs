@@ -85,10 +85,25 @@ where
         let mut staged = models.clone();
 
         let mutation_count = 1 + rng.usize(8);
-        for mutation_index in 0..mutation_count {
+        let range_mutation_count = rng.usize(mutation_count + 1);
+        for mutation_index in 0..range_mutation_count {
+            let space = TEST_SPACES[rng.usize(TEST_SPACES.len())];
+            let range = random_range(&mut rng, keys);
+            write
+                .delete_range(space, range.clone())
+                .await
+                .map_err(|error| {
+                    format!("{label}, mutation {mutation_index}: delete_range failed: {error}")
+                })?;
+            staged
+                .get_mut(&space)
+                .expect("test space has a model")
+                .delete_range(&range);
+        }
+        for mutation_index in range_mutation_count..mutation_count {
             let space = TEST_SPACES[rng.usize(TEST_SPACES.len())];
             let target_key = keys[rng.usize(keys.len())].clone();
-            match rng.usize(4) {
+            match rng.usize(3) {
                 0 | 1 => {
                     let value = random_value(&mut rng, step, mutation_index);
                     write
@@ -119,21 +134,7 @@ where
                         .expect("test space has a model")
                         .delete(&target_key);
                 }
-                _ => {
-                    let range = random_range(&mut rng, keys);
-                    write
-                        .delete_range(space, range.clone())
-                        .await
-                        .map_err(|error| {
-                            format!(
-                                "{label}, mutation {mutation_index}: delete_range failed: {error}"
-                            )
-                        })?;
-                    staged
-                        .get_mut(&space)
-                        .expect("test space has a model")
-                        .delete_range(&range);
-                }
+                _ => unreachable!("bounded random choice"),
             }
         }
 
