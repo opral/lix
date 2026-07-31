@@ -57,7 +57,16 @@ export async function openLixWorkerBinding(
 	telemetry?: LixTelemetryOptions,
 ): Promise<LixBinding> {
 	if (openDirectLixBinding) {
-		const binding = await openDirectLixBinding(storage, telemetry?.onSpan);
+		const telemetryDispatch = telemetry
+			? (span: Parameters<LixTelemetryOptions["onSpan"]>[0]) => {
+					try {
+						telemetry.onSpan(span);
+					} catch {
+						// Telemetry is observational and must not fail engine commands.
+					}
+				}
+			: undefined;
+		const binding = await openDirectLixBinding(storage, telemetryDispatch);
 		if (!onDisposed) return binding;
 		let disposed = false;
 		return new Proxy(binding, {
