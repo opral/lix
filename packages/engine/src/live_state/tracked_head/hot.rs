@@ -3598,6 +3598,63 @@ impl<S> HotStateWriter<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    /// Publishes a transaction-certified ordered insert batch as an immutable
+    /// current-state base without rebuilding row-shaped deltas or absence
+    /// guards.
+    ///
+    /// The commit-delta writer has already proven strict physical-key order
+    /// and assigned every row its direct address. Transaction validation has
+    /// proven that the same complete batch is absent under the branch-control
+    /// snapshot. Walking the prepared identity columns once for schema counts
+    /// is therefore sufficient to publish the existing commit as current
+    /// state.
+    pub(crate) async fn stage_ordered_insert_current_base<'a, I>(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        new_head: CommitId,
+        rows: I,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<CommitId, LixError>
+    where
+        I: ExactSizeIterator<Item = (&'a str, &'a EntityPk)> + Clone,
+    {
+        if rows.len() == 0 {
+            return Err(head_value_error(
+                "ordered packed current base requires at least one inserted row",
+            ));
+        }
+        let mut previous = None::<(&str, &EntityPk)>;
+        let mut schema_increments = BTreeMap::<&str, u64>::new();
+        for (schema_key, entity_pk) in rows {
+            if previous.is_some_and(|(previous_schema, previous_entity_pk)| {
+                previous_schema
+                    .cmp(schema_key)
+                    .then_with(|| previous_entity_pk.cmp(entity_pk))
+                    != Ordering::Less
+            }) {
+                return Err(head_value_error(
+                    "ordered packed current-base identities are not strictly increasing",
+                ));
+            }
+            previous = Some((schema_key, entity_pk));
+            let increment = schema_increments.entry(schema_key).or_default();
+            *increment = increment
+                .checked_add(1)
+                .ok_or_else(|| head_value_error("packed current-base row count exceeds u64"))?;
+        }
+        self.stage_packed_insert_current_base_manifest(
+            branch_id,
+            generation,
+            new_head,
+            schema_increments,
+            working_diff_capture_checkpoint_commit_id,
+            coverage,
+        )
+        .await
+    }
+
     /// Publishes validated, tracked, unfiled creates as an immutable base.
     ///
     /// The commit-delta plane already owns the sorted identities and payloads,
@@ -3656,6 +3713,33 @@ where
             ));
         }
 
+        let mut schema_increments = BTreeMap::<&str, u64>::new();
+        for delta in &sorted {
+            let increment = schema_increments.entry(delta.schema_key).or_default();
+            *increment = increment
+                .checked_add(1)
+                .ok_or_else(|| head_value_error("packed current-base row count exceeds u64"))?;
+        }
+        self.stage_packed_insert_current_base_manifest(
+            branch_id,
+            generation,
+            new_head,
+            schema_increments,
+            working_diff_capture_checkpoint_commit_id,
+            coverage,
+        )
+        .await
+    }
+
+    async fn stage_packed_insert_current_base_manifest(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        new_head: CommitId,
+        schema_increments: BTreeMap<&str, u64>,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<CommitId, LixError> {
         let mut manifest_key = hot_scope_prefix(branch_id, generation);
         manifest_key.reserve(16);
         manifest_key.extend_from_slice(new_head.as_uuid().as_bytes());
@@ -3665,13 +3749,6 @@ where
                 .ok_or_else(|| head_value_error("packed current-base diff count exceeds u64"))?;
         }
 
-        let mut schema_increments = BTreeMap::<&str, u64>::new();
-        for delta in &sorted {
-            let increment = schema_increments.entry(delta.schema_key).or_default();
-            *increment = increment
-                .checked_add(1)
-                .ok_or_else(|| head_value_error("packed current-base row count exceeds u64"))?;
-        }
         let scopes = schema_increments
             .keys()
             .map(

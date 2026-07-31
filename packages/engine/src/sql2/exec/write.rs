@@ -346,6 +346,30 @@ pub(crate) async fn execute_write_logical_plan_parameter_batch(
     .map_err(normalize_bound_public_write_error)
 }
 
+pub(crate) async fn execute_write_logical_plan_value_batch<'a>(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &SqlLogicalPlan,
+    parameter_rows: &'a [&'a [Value]],
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    let SqlLogicalPlan::Write(write_plan) = plan else {
+        return Ok(None);
+    };
+    let Some(first) = parameter_rows.first() else {
+        return Ok(None);
+    };
+    if parameter_rows.iter().any(|row| row.len() != first.len()) {
+        return Ok(None);
+    }
+    validate_write_parameter_count(&write_plan.plan, first.len())?;
+    super::bound_public_write::try_execute_entity_insert_value_batch(
+        ctx,
+        &write_plan.plan,
+        parameter_rows,
+    )
+    .await
+    .map_err(normalize_bound_public_write_error)
+}
+
 #[cfg(test)]
 pub(crate) async fn execute_write_logical_plan_with_mode(
     ctx: &mut dyn SqlWriteExecutionContext,

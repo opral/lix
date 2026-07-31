@@ -86,6 +86,89 @@ pub(crate) enum BoundPublicWriteExecution {
     Unsupported,
 }
 
+#[derive(Clone, Copy)]
+enum EntityInsertParameterBatch<'a> {
+    Arrow(&'a RecordBatch),
+    Values(&'a [&'a [Value]]),
+}
+
+#[derive(Clone, Copy)]
+enum DirectParameterValue<'a> {
+    Null,
+    String(&'a str),
+    Boolean(bool),
+}
+
+impl<'a> EntityInsertParameterBatch<'a> {
+    fn num_rows(self) -> usize {
+        match self {
+            Self::Arrow(batch) => batch.num_rows(),
+            Self::Values(rows) => rows.len(),
+        }
+    }
+
+    fn num_columns(self) -> usize {
+        match self {
+            Self::Arrow(batch) => batch.num_columns(),
+            Self::Values(rows) => rows.first().map_or(0, |row| row.len()),
+        }
+    }
+
+    fn column_matches(self, parameter_index: usize, column_type: EntityColumnType) -> bool {
+        match self {
+            Self::Arrow(batch) => {
+                let Some(array) = batch.columns().get(parameter_index) else {
+                    return false;
+                };
+                if crate::sql2::result_metadata::field_is_json(
+                    batch.schema().field(parameter_index),
+                ) {
+                    return false;
+                }
+                match column_type {
+                    EntityColumnType::String => array.as_any().is::<StringArray>(),
+                    EntityColumnType::Boolean => array.as_any().is::<BooleanArray>(),
+                    _ => false,
+                }
+            }
+            Self::Values(rows) => rows.iter().all(|row| {
+                matches!(
+                    (column_type, row.get(parameter_index)),
+                    (EntityColumnType::String, Some(Value::Text(_) | Value::Null))
+                        | (
+                            EntityColumnType::Boolean,
+                            Some(Value::Boolean(_) | Value::Null)
+                        )
+                )
+            }),
+        }
+    }
+
+    fn value(self, parameter_index: usize, row_index: usize) -> DirectParameterValue<'a> {
+        match self {
+            Self::Arrow(batch) => {
+                let array = &batch.columns()[parameter_index];
+                if array.is_null(row_index) {
+                    return DirectParameterValue::Null;
+                }
+                if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+                    DirectParameterValue::String(array.value(row_index))
+                } else if let Some(array) = array.as_any().downcast_ref::<BooleanArray>() {
+                    DirectParameterValue::Boolean(array.value(row_index))
+                } else {
+                    unreachable!("direct parameter column type was certified")
+                }
+            }
+            Self::Values(rows) => match &rows[row_index][parameter_index] {
+                Value::Null => DirectParameterValue::Null,
+                Value::Text(value) => DirectParameterValue::String(value),
+                Value::Boolean(value) => DirectParameterValue::Boolean(*value),
+                _ => unreachable!("direct parameter value type was certified"),
+            },
+        }
+    }
+}
+
 /// Executes independent parameterized entity INSERT statements as one dense
 /// transaction write. The public batch still returns one affected-row result
 /// per logical statement, while parsing, binding, and transaction staging
@@ -94,6 +177,35 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: &RecordBatch,
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    try_execute_entity_insert_batch(
+        ctx,
+        plan,
+        EntityInsertParameterBatch::Arrow(parameter_batch),
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn try_execute_entity_insert_value_batch<'a>(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    parameter_rows: &'a [&'a [Value]],
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    try_execute_entity_insert_batch(
+        ctx,
+        plan,
+        EntityInsertParameterBatch::Values(parameter_rows),
+        false,
+    )
+    .await
+}
+
+async fn try_execute_entity_insert_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    parameter_batch: EntityInsertParameterBatch<'_>,
+    allow_generic_fallback: bool,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
     let BoundWriteTarget::Entity(EntityWriteSurface::Base { schema_key }) = &plan.bound.target
     else {
@@ -141,6 +253,7 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
         &layout,
         values,
         parameter_batch,
+        allow_generic_fallback,
         active_branch_commit_id.as_ref(),
     )?
     else {
@@ -2423,7 +2536,8 @@ fn certified_entity_insert_parameter_batch(
     spec: &EntitySurfaceSpec,
     layout: &InsertRowLayout,
     values: &BoundInsertValues,
-    parameter_batch: &RecordBatch,
+    parameter_batch: EntityInsertParameterBatch<'_>,
+    allow_generic_fallback: bool,
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<Option<RawWriteBatch>, LixError> {
     let [row] = values.rows.as_slice() else {
@@ -2434,6 +2548,12 @@ fn certified_entity_insert_parameter_batch(
     {
         return Ok(Some(rows));
     }
+    if !allow_generic_fallback {
+        return Ok(None);
+    }
+    let EntityInsertParameterBatch::Arrow(parameter_batch) = parameter_batch else {
+        unreachable!("generic parameter fallback is only available for Arrow batches")
+    };
     certified_entity_insert_rows(
         ctx,
         plan,
@@ -2468,7 +2588,7 @@ fn certified_direct_parameter_insert_batch(
     spec: &EntitySurfaceSpec,
     layout: &InsertRowLayout,
     row: &[BoundExpr],
-    parameter_batch: &RecordBatch,
+    parameter_batch: EntityInsertParameterBatch<'_>,
 ) -> Result<Option<RawWriteBatch>, LixError> {
     if plan.bound.conflict.is_some()
         || !spec.defaults.is_empty()
@@ -2507,27 +2627,14 @@ fn certified_direct_parameter_insert_batch(
             return Ok(None);
         }
         let parameter_index = param.index.saturating_sub(1);
-        let Some(array) = parameter_batch.columns().get(parameter_index) else {
+        if parameter_index >= parameter_batch.num_columns() {
             return Err(LixError::unknown(format!(
                 "SQL parameter ${} is outside a {} column batch",
                 param.index,
                 parameter_batch.num_columns()
             )));
-        };
-        if crate::sql2::result_metadata::field_is_json(
-            parameter_batch.schema().field(parameter_index),
-        ) {
-            // Utf8 is also the physical carrier for public JSON parameters.
-            // Direct decoding as text would turn JSON objects/arrays into
-            // string literals and diverge from sequential type validation.
-            return Ok(None);
         }
-        let type_matches = match column_type {
-            EntityColumnType::String => array.as_any().is::<StringArray>(),
-            EntityColumnType::Boolean => array.as_any().is::<BooleanArray>(),
-            _ => false,
-        };
-        if !type_matches {
+        if !parameter_batch.column_matches(parameter_index, *column_type) {
             return Ok(None);
         }
         let mut name_prefix = serde_json::to_vec(name).map_err(|error| {
@@ -2592,6 +2699,23 @@ fn certified_direct_parameter_insert_batch(
         })?);
     let mut offsets = Vec::with_capacity(row_count);
     let mut entity_pks = Vec::with_capacity(row_count);
+    let shared_string_primary_keys =
+        spec.primary_key_component_types
+            .iter()
+            .all(|component_type| {
+                matches!(
+                    component_type,
+                    crate::entity_pk::EntityPkComponentType::String
+                )
+            });
+    let mut primary_key_arena = Vec::with_capacity(
+        row_count
+            .saturating_mul(primary_key_columns.len())
+            .saturating_mul(16),
+    );
+    let mut primary_key_ranges =
+        Vec::<(u32, u32)>::with_capacity(row_count.saturating_mul(primary_key_columns.len()));
+    let mut previous_primary_key_row = None;
     let mut unordered_entity_pks = None::<std::collections::HashSet<EntityPk>>;
     let mut primary_key_parts = Vec::with_capacity(primary_key_columns.len());
     let mut typed_fields = Vec::with_capacity(columns.len());
@@ -2606,8 +2730,9 @@ fn certified_direct_parameter_insert_batch(
                     normalized.push(b',');
                 }
                 normalized.extend_from_slice(&column.name_prefix);
-                let array = &parameter_batch.columns()[column.parameter_index];
-                if array.is_null(statement_index) {
+                let parameter_value =
+                    parameter_batch.value(column.parameter_index, statement_index);
+                if matches!(parameter_value, DirectParameterValue::Null) {
                     if !column.read_nullable {
                         let InsertColumnTarget::Visible { name, .. } =
                             &layout.columns[column.layout_index]
@@ -2629,29 +2754,20 @@ fn certified_direct_parameter_insert_batch(
                     });
                     continue;
                 }
-                match column.column_type {
-                    EntityColumnType::String => {
-                        let array = array
-                            .as_any()
-                            .downcast_ref::<StringArray>()
-                            .expect("direct string parameter type was certified");
-                        serde_json::to_writer(&mut normalized, array.value(statement_index))
-                            .map_err(|error| {
-                                LixError::unknown(format!(
-                                    "certified INSERT value serialization failed: {error}"
-                                ))
-                            })?;
+                match (column.column_type, parameter_value) {
+                    (EntityColumnType::String, DirectParameterValue::String(value)) => {
+                        serde_json::to_writer(&mut normalized, value).map_err(|error| {
+                            LixError::unknown(format!(
+                                "certified INSERT value serialization failed: {error}"
+                            ))
+                        })?;
                         typed_fields.push(TypedJsonObjectFieldRef {
                             name: &column.name,
-                            value: TypedJsonScalarRef::String(array.value(statement_index)),
+                            value: TypedJsonScalarRef::String(value),
                         });
                     }
-                    EntityColumnType::Boolean => {
-                        let array = array
-                            .as_any()
-                            .downcast_ref::<BooleanArray>()
-                            .expect("direct boolean parameter type was certified");
-                        normalized.extend_from_slice(if array.value(statement_index) {
+                    (EntityColumnType::Boolean, DirectParameterValue::Boolean(value)) => {
+                        normalized.extend_from_slice(if value {
                             b"true".as_slice()
                         } else {
                             b"false".as_slice()
@@ -2669,59 +2785,120 @@ fn certified_direct_parameter_insert_batch(
             primary_key_parts.clear();
             for &column_index in &primary_key_columns {
                 let column = &columns[column_index];
-                let array = parameter_batch.columns()[column.parameter_index]
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("direct primary-key parameter is a string");
-                if array.is_null(statement_index) {
-                    return Err(LixError::new(
+                match parameter_batch.value(column.parameter_index, statement_index) {
+                    DirectParameterValue::String(value) => primary_key_parts.push(value),
+                    DirectParameterValue::Null => {
+                        return Err(LixError::new(
+                            LixError::CODE_SCHEMA_VALIDATION,
+                            format!(
+                                "INSERT failed to derive entity primary key for schema '{}': missing primary-key value",
+                                layout.schema_key
+                            ),
+                        ));
+                    }
+                    DirectParameterValue::Boolean(_) => {
+                        unreachable!("direct primary-key parameter is a string")
+                    }
+                }
+            }
+            let derived_entity_pk = if shared_string_primary_keys {
+                EntityPk::validate_external_parts(
+                    &primary_key_parts,
+                    &spec.primary_key_component_types,
+                )
+                .map_err(|error| {
+                    LixError::new(
                         LixError::CODE_SCHEMA_VALIDATION,
                         format!(
-                            "INSERT failed to derive entity primary key for schema '{}': missing primary-key value",
+                            "INSERT failed to derive entity primary key for schema '{}': {error}",
                             layout.schema_key
                         ),
-                    ));
-                }
-                primary_key_parts.push(array.value(statement_index));
-            }
-            let entity_pk = EntityPk::from_shared_external_parts(
-                primary_key_parts.iter().map(|part| SharedStr::from(*part)),
-                &spec.primary_key_component_types,
-            )
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_VALIDATION,
-                    format!(
-                        "INSERT failed to derive entity primary key for schema '{}': {error}",
-                        layout.schema_key
-                    ),
+                    )
+                })?;
+                None
+            } else {
+                Some(
+                    EntityPk::from_shared_external_parts(
+                        primary_key_parts.iter().map(|part| SharedStr::from(*part)),
+                        &spec.primary_key_component_types,
+                    )
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_SCHEMA_VALIDATION,
+                            format!(
+                                "INSERT failed to derive entity primary key for schema '{}': {error}",
+                                layout.schema_key
+                            ),
+                        )
+                    })?,
                 )
-            })?;
+            };
             schema_plan.certify_typed_object_row(
                 &layout.schema_key,
                 &typed_fields,
                 &primary_key_parts,
             )?;
-            if let Some(unique) = &mut unordered_entity_pks {
-                if !unique.insert(entity_pk.clone()) {
-                    return Ok(false);
+            if shared_string_primary_keys {
+                if let Some(previous_row) = previous_primary_key_row {
+                    let ordering = primary_key_columns
+                        .iter()
+                        .zip(&primary_key_parts)
+                        .map(|(&column_index, current)| {
+                            let column = &columns[column_index];
+                            let DirectParameterValue::String(previous) =
+                                parameter_batch.value(column.parameter_index, previous_row)
+                            else {
+                                unreachable!("direct primary-key parameter is a string")
+                            };
+                            previous.cmp(current)
+                        })
+                        .find(|ordering| !ordering.is_eq())
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if ordering != std::cmp::Ordering::Less {
+                        // The common bulk producer is already ordered. Keep
+                        // this arena route allocation-free and let the
+                        // established generic certified path preserve
+                        // statement-attributed duplicate handling for the
+                        // uncommon unordered batch.
+                        return Ok(false);
+                    }
                 }
-            } else if let Some(previous) = entity_pks.last()
-                && previous >= &entity_pk
-            {
-                // Ordered parameter batches prove uniqueness by adjacency and
-                // need no hash table. On the first disorder, seed the fallback
-                // index with exactly the already accepted prefix so duplicate
-                // detection and later validation retain statement order.
-                let mut unique = std::collections::HashSet::with_capacity(row_count);
-                unique.extend(entity_pks.iter().cloned());
-                if !unique.insert(entity_pk.clone()) {
-                    return Ok(false);
+                previous_primary_key_row = Some(statement_index);
+                for part in &primary_key_parts {
+                    let start = u32::try_from(primary_key_arena.len()).map_err(|_| {
+                        LixError::unknown("certified primary-key arena exceeds u32")
+                    })?;
+                    primary_key_arena.extend_from_slice(part.as_bytes());
+                    let end = u32::try_from(primary_key_arena.len()).map_err(|_| {
+                        LixError::unknown("certified primary-key arena exceeds u32")
+                    })?;
+                    primary_key_ranges.push((start, end));
                 }
-                unordered_entity_pks = Some(unique);
+            } else {
+                let entity_pk =
+                    derived_entity_pk.expect("non-string primary key was materialized above");
+                if let Some(unique) = &mut unordered_entity_pks {
+                    if !unique.insert(entity_pk.clone()) {
+                        return Ok(false);
+                    }
+                } else if let Some(previous) = entity_pks.last()
+                    && previous >= &entity_pk
+                {
+                    // Ordered parameter batches prove uniqueness by adjacency
+                    // and need no hash table. On the first disorder, seed the
+                    // fallback index with exactly the already accepted prefix
+                    // so duplicate detection and later validation retain
+                    // statement order.
+                    let mut unique = std::collections::HashSet::with_capacity(row_count);
+                    unique.extend(entity_pks.iter().cloned());
+                    if !unique.insert(entity_pk.clone()) {
+                        return Ok(false);
+                    }
+                    unordered_entity_pks = Some(unique);
+                }
+                entity_pks.push(entity_pk);
             }
             offsets.push((start, normalized.len()));
-            entity_pks.push(entity_pk);
             Ok(true)
         })();
         if !row_result
@@ -2731,6 +2908,32 @@ fn certified_direct_parameter_insert_batch(
         }
     }
 
+    if shared_string_primary_keys {
+        let primary_key_arena = SharedStr::from_utf8(bytes::Bytes::from(primary_key_arena))
+            .map_err(|_| LixError::unknown("certified primary-key arena is not valid UTF-8"))?;
+        entity_pks.reserve(row_count);
+        for ranges in primary_key_ranges.chunks_exact(primary_key_columns.len()) {
+            entity_pks.push(
+                EntityPk::from_shared_external_parts(
+                    ranges.iter().map(|&(start, end)| {
+                        primary_key_arena
+                            .slice(start as usize..end as usize)
+                            .expect("certified primary-key ranges preserve UTF-8 boundaries")
+                    }),
+                    &spec.primary_key_component_types,
+                )
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!(
+                            "INSERT failed to derive entity primary key for schema '{}': {error}",
+                            layout.schema_key
+                        ),
+                    )
+                })?,
+            );
+        }
+    }
     let snapshots = TransactionJson::from_certified_row_content_arena(normalized, offsets)?;
     let schema_key: SharedStr = layout.schema_key.as_str().into();
     let branch_id: SharedStr = ctx.active_branch_id().into();

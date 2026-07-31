@@ -472,7 +472,7 @@ pub(crate) struct RawWriteBatch {
     origin_promotions: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CertifiedRawWriteBatchPreparation {
     pub(crate) schema_plan_id: SchemaPlanId,
     pub(crate) facts: PreparedRowFacts,
@@ -677,6 +677,156 @@ impl RawWriteBatch {
 
     pub(crate) fn certified_preparation(&self) -> Option<CertifiedRawWriteBatchPreparation> {
         self.certified_preparation
+    }
+
+    /// Consumes a homogeneous certified ingress batch into its commit-ready
+    /// typed columns.
+    ///
+    /// A certified producer has already established row shape, identity, and
+    /// current-plan semantics. Re-reading every row through the generic
+    /// preparation API only clones identities, re-interns the same schema and
+    /// branch strings, and keeps both dense batches live at once. This lowering
+    /// transfers the ingress dictionaries and aligned owners directly while
+    /// constructing only the final fixed-width slots and staged JSON handles.
+    pub(crate) fn into_certified_prepared(
+        self,
+        certificate: CertifiedRawWriteBatchPreparation,
+        origin_key: Option<&SharedStr>,
+        timestamp: LixTimestamp,
+    ) -> Result<PreparedStateBatch, LixError> {
+        if self.certified_preparation != Some(certificate) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified transaction batch proof changed before direct preparation",
+            ));
+        }
+        let RawWriteBatch {
+            slots,
+            entity_pks,
+            snapshots,
+            metadata,
+            mut strings,
+            string_index: _,
+            expected_rows: _,
+            origins,
+            origin_index: _,
+            certified_preparation: _,
+            #[cfg(test)]
+                string_promotions: _,
+            #[cfg(test)]
+                origin_promotions: _,
+        } = self;
+        let row_count = slots.len();
+        if entity_pks.len() != row_count
+            || snapshots.len() != row_count
+            || metadata.len() != row_count
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified transaction batch columns are not aligned",
+            ));
+        }
+        if !origins.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified transaction batch unexpectedly contains logical origins",
+            ));
+        }
+
+        let mut string_index = HashMap::with_capacity(strings.len().saturating_add(1));
+        for (ordinal, value) in strings.iter().cloned().enumerate() {
+            string_index.insert(
+                value,
+                u32::try_from(ordinal)
+                    .expect("certified transaction string dictionary must fit u32"),
+            );
+        }
+        let origin_key = origin_key.map(|value| {
+            if let Some(&ordinal) = string_index.get(value) {
+                return ordinal;
+            }
+            let ordinal = u32::try_from(strings.len())
+                .expect("certified transaction string dictionary must fit u32");
+            strings.push(value.clone());
+            string_index.insert(value.clone(), ordinal);
+            ordinal
+        });
+
+        let mut prepared_slots = Vec::with_capacity(row_count);
+        let mut prepared_entity_pks = Vec::with_capacity(row_count);
+        let mut json = Vec::with_capacity(row_count);
+        for (row_index, (((slot, entity_pk), snapshot), metadata)) in slots
+            .into_iter()
+            .zip(entity_pks)
+            .zip(snapshots)
+            .zip(metadata)
+            .enumerate()
+        {
+            if slot.file_id != RAW_WRITE_NONE
+                || slot.origin != RAW_WRITE_NONE
+                || slot.created_at != RAW_WRITE_NONE
+                || slot.updated_at != RAW_WRITE_NONE
+                || slot.change_id != RAW_WRITE_NONE
+                || slot.commit_id != RAW_WRITE_NONE
+                || slot.flags != 0
+                || metadata.is_some()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified transaction batch contains unsupported system columns",
+                ));
+            }
+            let entity_pk = entity_pk.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified transaction row is missing entity_pk",
+                )
+            })?;
+            let snapshot = snapshot.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified transaction row is missing snapshot_content",
+                )
+            })?;
+            let snapshot =
+                stage_json_from_value(snapshot, "certified prepared row snapshot_content")?;
+            prepared_entity_pks.push(entity_pk);
+            json.push(snapshot);
+            prepared_slots.push(PreparedStateSlot {
+                schema_plan_id: certificate.schema_plan_id,
+                facts: certificate.facts,
+                entity_pk: u32::try_from(row_index)
+                    .expect("certified transaction row ordinal must fit u32"),
+                schema_key: slot.schema_key,
+                file_id: None,
+                snapshot: Some(
+                    u32::try_from(row_index)
+                        .expect("certified transaction JSON ordinal must fit u32"),
+                ),
+                metadata: None,
+                origin: None,
+                origin_key,
+                created_at: timestamp,
+                updated_at: timestamp,
+                global: false,
+                change_id: Some(ChangeId::default()),
+                addressable_change_id: true,
+                commit_id: None,
+                untracked: false,
+                branch_id: slot.branch_id,
+            });
+        }
+        Ok(PreparedStateBatch {
+            slots: prepared_slots,
+            entity_pks: prepared_entity_pks,
+            strings,
+            string_index,
+            json,
+            origins: Vec::new(),
+            origin_index: HashMap::new(),
+            origin_column_sets: Vec::new(),
+            origin_column_index: HashMap::new(),
+        })
     }
 
     /// Downgrades a batch proof to canonical transport after its schema plan

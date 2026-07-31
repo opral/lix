@@ -765,8 +765,8 @@ where
                         change_id: member.value.change_id,
                         commit_id,
                         segment_index: member.segment_index,
-                        ordinal: u8::try_from(member.ordinal)
-                            .expect("commit-delta segment row count fits u8"),
+                        ordinal: u16::try_from(member.ordinal)
+                            .expect("commit-delta segment row count fits u16"),
                     })
             })
         })

@@ -36,7 +36,7 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_MANIFEST_NAMESPACE: &str =
     "tracked_state.commit_delta_manifest.v3";
 pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE: &str =
     "tracked_state.commit_delta_segment.v3";
-pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE: &str = "tracked_state.change_locator.v1";
+pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE: &str = "tracked_state.change_locator.v2";
 pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_0001),
     TRACKED_STATE_TREE_CHUNK_NAMESPACE,
@@ -67,9 +67,11 @@ pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace
     TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE,
 );
 
-const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
-const COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
-const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD7";
+const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
+const GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
+const GENERIC_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
+const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
+const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD8";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -294,7 +296,7 @@ pub(crate) struct CommitDeltaChangeLocator {
     pub(crate) change_id: crate::changelog::ChangeId,
     pub(crate) commit_id: CommitId,
     pub(crate) segment_index: u32,
-    pub(crate) ordinal: u8,
+    pub(crate) ordinal: u16,
 }
 
 pub(crate) struct AddressableCommitDeltaStage {
@@ -311,7 +313,7 @@ pub(crate) struct AddressableCommitDeltaStage {
 /// write batch are simultaneously live.
 pub(crate) struct OrderedAddressableCommitDeltaStage {
     commit_id: CommitId,
-    segment_row_counts: Vec<u8>,
+    segment_row_counts: Vec<u16>,
     row_count: usize,
 }
 
@@ -884,7 +886,8 @@ where
                 &mut compressor,
             ) {
                 Ok((bounds, encoded, segment_fingerprint))
-                    if encoded.len() <= COMMIT_DELTA_SEGMENT_TARGET_BYTES || candidate_len == 1 =>
+                    if encoded.len() <= ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES
+                        || candidate_len == 1 =>
                 {
                     break (bounds, encoded, segment_fingerprint);
                 }
@@ -904,9 +907,9 @@ where
         {
             *target ^= source;
         }
-        let row_count_u8 =
-            u8::try_from(candidate_len).expect("commit-delta segment row count fits u8");
-        segment_row_counts.push(row_count_u8);
+        let row_count_u16 =
+            u16::try_from(candidate_len).expect("commit-delta segment row count fits u16");
+        segment_row_counts.push(row_count_u16);
         for _ in 0..candidate_len {
             pending.pop_front();
         }
@@ -1137,7 +1140,8 @@ fn stage_commit_deltas_inner(
             )
         })?;
     while segment_start < entries.len() {
-        let mut segment_end = (segment_start + COMMIT_DELTA_SEGMENT_MAX_ROWS).min(entries.len());
+        let mut segment_end =
+            (segment_start + GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS).min(entries.len());
         let segment_index = encoded_segments.len();
         let (encoded, assigned_entries, segment_assignments) = loop {
             let mut candidate = entries[segment_start..segment_end].to_vec();
@@ -1164,7 +1168,7 @@ fn stage_commit_deltas_inner(
                 &mut sidecar_compressor,
             ) {
                 Ok(encoded)
-                    if encoded.len() <= COMMIT_DELTA_SEGMENT_TARGET_BYTES
+                    if encoded.len() <= GENERIC_COMMIT_DELTA_SEGMENT_TARGET_BYTES
                         || segment_end - segment_start == 1 =>
                 {
                     break (encoded, candidate, candidate_assignments);
@@ -1299,9 +1303,11 @@ fn addressable_change_id(
             "tracked_state commit_delta segment index exceeds direct address space",
         )
     })?;
-    let ordinal = u8::try_from(ordinal).expect("commit-delta segment row count fits u8");
+    let ordinal = u16::try_from(ordinal).expect("commit-delta segment row count fits u16");
     let packed = segment
-        .checked_mul(256)
+        .checked_mul(
+            u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("segment row limit fits u32"),
+        )
         .and_then(|value| value.checked_add(u32::from(ordinal)))
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| {
@@ -1332,7 +1338,7 @@ fn commit_delta_change_locators(
         .iter()
         .enumerate()
         .map(|(ordinal, entry)| {
-            let ordinal = u8::try_from(ordinal).expect("commit-delta segment row count fits u8");
+            let ordinal = u16::try_from(ordinal).expect("commit-delta segment row count fits u16");
             let change_id = decode_value(&entry.value)?.change_id;
             Ok(CommitDeltaChangeLocator {
                 change_id,
@@ -1419,7 +1425,9 @@ pub(crate) fn direct_change_locator(
     let mut commit_bytes = *change_id.as_uuid().as_bytes();
     let packed = u32::from_be_bytes(commit_bytes[12..].try_into().expect("four address bytes"));
     let packed = packed.checked_sub(1)?;
-    let ordinal = u8::try_from(packed % 256).ok()?;
+    let segment_row_limit =
+        u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("segment row limit fits u32");
+    let ordinal = u16::try_from(packed % segment_row_limit).ok()?;
     if usize::from(ordinal) >= COMMIT_DELTA_SEGMENT_MAX_ROWS {
         return None;
     }
@@ -1427,7 +1435,7 @@ pub(crate) fn direct_change_locator(
     Some(CommitDeltaChangeLocator {
         change_id,
         commit_id: CommitId::new(uuid::Uuid::from_bytes(commit_bytes)),
-        segment_index: packed / 256,
+        segment_index: packed / segment_row_limit,
         ordinal,
     })
 }
@@ -1465,6 +1473,22 @@ async fn load_change_records_by_ids(
     // intentionally have no locator rows. Keep the legacy locator batch below
     // for wholly explicit IDs; mixed/direct batches must validate the direct
     // candidate and retain the existing explicit-locator fallback.
+    if let Some(direct_locators) = change_ids
+        .iter()
+        .copied()
+        .map(direct_change_locator)
+        .collect::<Option<Vec<_>>>()
+    {
+        // Certified commits encode their authoritative coordinates directly
+        // in every change ID. Resolve the whole selection as one physical
+        // batch so a large segment is read and decoded once rather than once
+        // per selected change. Address-shaped explicit IDs are rare and keep
+        // the established locator fallback below if candidate validation
+        // rejects the direct route.
+        if let Ok(records) = load_change_records_at_locators(store, &direct_locators).await {
+            return Ok(records);
+        }
+    }
     if change_ids
         .iter()
         .copied()
@@ -1510,7 +1534,13 @@ async fn load_change_records_by_ids(
             decode_change_locator(change_id, &bytes)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    load_change_records_at_locators(store, &locators).await
+}
 
+async fn load_change_records_at_locators(
+    store: &(impl StorageAdapterRead + ?Sized),
+    locators: &[CommitDeltaChangeLocator],
+) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
     let commit_ids = locators
         .iter()
         .map(|locator| locator.commit_id)
@@ -1583,35 +1613,44 @@ async fn load_change_records_by_ids(
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-    let loaded = locators
-        .into_iter()
-        .map(|locator| {
-            let manifest = &manifests[&locator.commit_id];
-            let segment_index = usize::try_from(locator.segment_index).expect("u32 fits usize");
-            let (bytes, bounds) = if let Some(inline) = manifest.inline_segment() {
-                if segment_index != 0 {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state selected change references a nonzero inline segment",
-                    ));
-                }
-                (inline, None)
-            } else {
-                let bounds = manifest.segments.get(segment_index).ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state selected change references an undeclared segment",
-                    )
-                })?;
-                (
-                    segments[&(locator.commit_id, segment_index)].as_ref(),
-                    Some(bounds),
+    let mut locator_groups = BTreeMap::<(CommitId, usize), Vec<usize>>::new();
+    for (locator_index, locator) in locators.iter().enumerate() {
+        locator_groups
+            .entry((
+                locator.commit_id,
+                usize::try_from(locator.segment_index).expect("u32 fits usize"),
+            ))
+            .or_default()
+            .push(locator_index);
+    }
+    let mut loaded = (0..locators.len()).map(|_| None).collect::<Vec<_>>();
+    for ((commit_id, segment_index), locator_indices) in locator_groups {
+        let manifest = &manifests[&commit_id];
+        let (bytes, bounds) = if let Some(inline) = manifest.inline_segment() {
+            if segment_index != 0 {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state selected change references a nonzero inline segment",
+                ));
+            }
+            (inline, None)
+        } else {
+            let bounds = manifest.segments.get(segment_index).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state selected change references an undeclared segment",
                 )
-            };
-            decode_change_at_locator(bytes, bounds, locator).map(Some)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut loaded = loaded;
+            })?;
+            (segments[&(commit_id, segment_index)].as_ref(), Some(bounds))
+        };
+        let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, bounds)?;
+        for locator_index in locator_indices {
+            let locator = locators[locator_index];
+            loaded[locator_index] = Some(decode_change_at_locator_from_decoded(
+                &leaf, &payloads, locator,
+            )?);
+        }
+    }
     hydrate_certified_loaded_entries(store, &mut loaded).await?;
     loaded
         .into_iter()
@@ -1631,8 +1670,16 @@ fn decode_change_at_locator(
     bounds: Option<&CommitDeltaSegmentBounds>,
     locator: CommitDeltaChangeLocator,
 ) -> Result<LoadedCommitDeltaEntry, LixError> {
-    let change_id = locator.change_id;
     let (leaf, payloads) = decode_commit_delta_with_payloads(segment, bounds)?;
+    decode_change_at_locator_from_decoded(&leaf, &payloads, locator)
+}
+
+fn decode_change_at_locator_from_decoded(
+    leaf: &DecodedLeafNodeRef,
+    payloads: &CommitDeltaPayloadIndexRef<'_>,
+    locator: CommitDeltaChangeLocator,
+) -> Result<LoadedCommitDeltaEntry, LixError> {
+    let change_id = locator.change_id;
     let ordinal = usize::from(locator.ordinal);
     let entry = leaf.entry(ordinal)?.ok_or_else(|| {
         LixError::new(
@@ -1846,8 +1893,8 @@ pub(crate) fn decode_change_locator(
         .ok_or_else(|| invalid_change_locator(change_id, "has an invalid ordinal"))?;
     let segment_index = u32::try_from(packed_ordinal / COMMIT_DELTA_SEGMENT_MAX_ROWS as u64)
         .map_err(|_| invalid_change_locator(change_id, "has an invalid segment"))?;
-    let ordinal = u8::try_from(packed_ordinal % COMMIT_DELTA_SEGMENT_MAX_ROWS as u64)
-        .expect("segment remainder fits u8");
+    let ordinal = u16::try_from(packed_ordinal % COMMIT_DELTA_SEGMENT_MAX_ROWS as u64)
+        .expect("segment remainder fits u16");
     Ok(CommitDeltaChangeLocator {
         change_id,
         commit_id: CommitId::new(commit_id),
@@ -4453,8 +4500,8 @@ mod tests {
     };
 
     use super::{
-        COMMIT_DELTA_FORMAT_MAGIC, COMMIT_DELTA_SEGMENT_MAX_ROWS, CommitDeltaChangeLocator,
-        CommitDeltaManifest, CommitDeltaPayloadRef, DecodedCommitDeltaBatch,
+        COMMIT_DELTA_FORMAT_MAGIC, CommitDeltaChangeLocator, CommitDeltaManifest,
+        CommitDeltaPayloadRef, DecodedCommitDeltaBatch, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
         TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
         TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_MAGIC,
         TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay,
@@ -4740,7 +4787,6 @@ mod tests {
             &vec![true; deltas.len()],
         )
         .expect("generic addressable deltas should stage");
-        assert_eq!(assigned, generic.assigned_change_ids);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -4758,16 +4804,6 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("generic addressable read should open");
-        for space in [
-            TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
-            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        ] {
-            assert_eq!(
-                super::scan_full_space(&read, space).await.unwrap(),
-                super::scan_full_space(&generic_read, space).await.unwrap(),
-                "streaming must preserve the exact packed history bytes"
-            );
-        }
         for source_index in [0, 127, 128, fixtures.len() - 1] {
             let loaded = load_change_record_by_id(&read, assigned[source_index])
                 .await
@@ -4777,6 +4813,18 @@ mod tests {
             assert_eq!(loaded.schema_key, fixtures[source_index].schema_key);
             assert_eq!(loaded.entity_pk, fixtures[source_index].entity_pk);
             assert_eq!(loaded.snapshot.is_none(), fixtures[source_index].deleted);
+            let generic_loaded =
+                load_change_record_by_id(&generic_read, generic.assigned_change_ids[source_index])
+                    .await
+                    .expect("direct generic address should read")
+                    .expect("direct generic address should resolve");
+            assert_eq!(generic_loaded.schema_key, loaded.schema_key);
+            assert_eq!(generic_loaded.entity_pk, loaded.entity_pk);
+            assert_eq!(generic_loaded.file_id, loaded.file_id);
+            assert_eq!(generic_loaded.snapshot, loaded.snapshot);
+            assert_eq!(generic_loaded.metadata, loaded.metadata);
+            assert_eq!(generic_loaded.created_at, loaded.created_at);
+            assert_eq!(generic_loaded.origin_key, loaded.origin_key);
         }
     }
 
@@ -5541,7 +5589,7 @@ mod tests {
         assert_eq!(
             writes.stats().staged_puts,
             4,
-            "300 payload-bearing rows should use one manifest and three byte-bounded segments"
+            "generic history keeps 300 compact rows in three read-friendly segments plus its manifest"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -6621,14 +6669,14 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let inline_commit_id = CommitId::for_test_label("packed-delta-inline-boundary");
         let indexed_commit_id = CommitId::for_test_label("packed-delta-indexed-boundary");
-        let fixtures = (0..257)
+        let fixtures = (0..129)
             .map(|index| CommitDeltaFixture {
                 schema_key: match index {
-                    255 => "sparse".to_string(),
-                    256 => "zeta".to_string(),
+                    127 => "sparse".to_string(),
+                    128 => "zeta".to_string(),
                     _ => "alpha".to_string(),
                 },
-                file_id: (index == 255).then(|| "sparse-file".to_string()),
+                file_id: (index == 127).then(|| "sparse-file".to_string()),
                 entity_pk: EntityPk::single(format!("boundary-{index:04}")),
                 change_id: ChangeId::for_test_label(&format!("boundary-change-{index}")),
                 deleted: false,
@@ -6638,10 +6686,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         let mut inline_writes = storage.new_write_set();
-        let inline_deltas = commit_delta_refs(inline_commit_id, &fixtures[..256]);
+        let inline_deltas = commit_delta_refs(inline_commit_id, &fixtures[..128]);
         stage_commit_deltas(&mut inline_writes, &inline_deltas)
-            .expect("256 deltas should split at the byte boundary");
-        assert_eq!(inline_writes.stats().staged_puts, 3);
+            .expect("128 generic deltas should fit the history read boundary");
+        assert_eq!(inline_writes.stats().staged_puts, 1);
         storage
             .commit_write_set(inline_writes, StorageWriteOptions::default())
             .await
@@ -6650,8 +6698,8 @@ mod tests {
         let mut indexed_writes = storage.new_write_set();
         let indexed_deltas = commit_delta_refs(indexed_commit_id, &fixtures);
         stage_commit_deltas(&mut indexed_writes, &indexed_deltas)
-            .expect("257 deltas should use indexed segments");
-        assert_eq!(indexed_writes.stats().staged_puts, 4);
+            .expect("129 generic deltas should use indexed segments");
+        assert_eq!(indexed_writes.stats().staged_puts, 3);
         storage
             .commit_write_set(indexed_writes, StorageWriteOptions::default())
             .await
@@ -6661,7 +6709,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let sparse = &fixtures[255];
+        let sparse = &fixtures[127];
         assert_eq!(
             load_commit_delta_values_for_test(&read, indexed_commit_id, &[sparse.key()])
                 .await
@@ -6713,11 +6761,13 @@ mod tests {
         assert_eq!(batch.file_dictionary_len(), 1);
         assert_eq!(
             batch.arena_count(),
-            fixtures.len().div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
+            fixtures
+                .len()
+                .div_ceil(GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS),
             "the batch retains one decoded arena per packed segment, never one owner per row"
         );
         assert!(
-            batch.arena_count() * COMMIT_DELTA_SEGMENT_MAX_ROWS >= batch.len(),
+            batch.arena_count() * GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS >= batch.len(),
             "segment arena ownership must stay bounded independently of row metadata"
         );
         let first = batch.iter().next().expect("large batch has a first row");

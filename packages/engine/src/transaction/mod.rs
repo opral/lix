@@ -13,6 +13,8 @@ pub mod bench {
     pub use super::bench_support::*;
 }
 
+#[cfg(test)]
+pub(crate) use commit::take_ordered_packed_current_base_publications;
 pub(crate) use context::CertifiedHistoryStoreReader;
 #[cfg(test)]
 pub(crate) use context::CommitBoundaryGuard;

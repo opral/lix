@@ -55,6 +55,17 @@ type RowIndex = usize;
 // amplification dominates the cost of retaining one immutable manifest.
 const PACKED_CURRENT_BASE_MIN_ROWS: usize = 1_024;
 
+#[cfg(test)]
+std::thread_local! {
+    static ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_ordered_packed_current_base_publications() -> usize {
+    ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| publications.replace(0))
+}
+
 /// Commits prepared transaction rows into tracked history and unified current
 /// live state.
 ///
@@ -265,7 +276,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
 
     let selected_change_records = load_selected_change_records(read, &commit_rows).await?;
 
-    stage_tracked_commit_delta_index(
+    let ordered_addressable_commits = stage_tracked_commit_delta_index(
         read,
         &mut writes,
         &mut state_rows,
@@ -349,6 +360,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &explicit_branch_targets,
         &branch_control_observations,
         &checkpoint_epochs,
+        &ordered_addressable_commits,
     ))
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -1119,7 +1131,8 @@ async fn stage_tracked_commit_delta_index(
     commit_rows: &[FinalizedCommitRow],
     selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
     host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
-) -> Result<(), LixError> {
+) -> Result<BTreeSet<CommitId>, LixError> {
+    let mut ordered_addressable_commits = BTreeSet::new();
     let commit_rows = commit_rows
         .iter()
         .map(|commit| (commit.commit_id, commit))
@@ -1179,6 +1192,7 @@ async fn stage_tracked_commit_delta_index(
                 {
                     state_rows.set_change_id(row_index, Some(change_id));
                 }
+                ordered_addressable_commits.insert(root.commit_id);
                 continue;
             }
         }
@@ -1322,7 +1336,7 @@ async fn stage_tracked_commit_delta_index(
             .collect::<Vec<_>>();
         stage_change_locators(writes, &authored_locators);
     }
-    Ok(())
+    Ok(ordered_addressable_commits)
 }
 
 struct StagedHotHeads {
@@ -1944,6 +1958,7 @@ async fn stage_tracked_head(
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     checkpoint_epochs: &BTreeMap<String, CommitId>,
+    ordered_addressable_commits: &BTreeSet<CommitId>,
 ) -> Result<StagedHotHeads, LixError> {
     let lifecycle_ids = lifecycle_snapshot_commit_ids(
         tracked_roots,
@@ -2055,7 +2070,39 @@ async fn stage_tracked_head(
                 .filter(|row| row.branch_id == root.branch_id)
                 .map(current_state_delta_from_engine_row),
         );
-        let absence_guards = {
+        let checkpoint_commit_id = checkpoint_epochs.get(&root.branch_id).copied();
+        let is_checkpoint_publication = checkpoint_commit_id == Some(root.commit_id);
+        let can_publish_ordered_packed_current_base = ordered_addressable_commits
+            .contains(&root.commit_id)
+            && !is_checkpoint_publication
+            && state_row_indices.len() >= PACKED_CURRENT_BASE_MIN_ROWS
+            && certified_fresh_plugin_file_id.is_none()
+            && !host_certified_live_increments.contains_key(&root.branch_id)
+            && staged.selected_change_batches.is_empty()
+            && selected_materialization.is_none()
+            && untracked_deltas.is_empty()
+            && engine_rows.is_empty()
+            && explicit_branch_targets.is_empty()
+            && state_row_indices.len() == state_rows.len()
+            && insert_selection.len() == state_rows.len()
+            && state_row_indices.iter().all(|&row_index| {
+                let row = state_rows.row(row_index);
+                insert_selection.contains(row_index)
+                    && row.branch_id.as_str() == root.branch_id
+                    && !row.untracked
+                    && row.snapshot.is_some()
+                    && row.file_id.is_none()
+                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                    && row.schema_key
+                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    && row.commit_id == Some(root.commit_id)
+                    && row
+                        .change_id
+                        .is_some_and(|change_id| change_id != ChangeId::default())
+            });
+        let absence_guards = if can_publish_ordered_packed_current_base {
+            Vec::new()
+        } else {
             let _span = tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.materialization.tracked_head.absence_guards"
@@ -2068,8 +2115,6 @@ async fn stage_tracked_head(
                 certified_fresh_plugin_file_id,
             )
         };
-        let checkpoint_commit_id = checkpoint_epochs.get(&root.branch_id).copied();
-        let is_checkpoint_publication = checkpoint_commit_id == Some(root.commit_id);
         let parent_generation = match (root.parent_commit_id, parent_control) {
             (_, Some(control)) if is_checkpoint_publication => Some(control.generation),
             (Some(parent_commit_id), Some(control))
@@ -2163,6 +2208,53 @@ async fn stage_tracked_head(
             .as_ref()
             .map(|epoch| epoch.coverage)
             .unwrap_or_default();
+        if can_publish_ordered_packed_current_base {
+            #[cfg(test)]
+            ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| {
+                publications.set(publications.get().saturating_add(1));
+            });
+            let generation = tracked_head
+                .writer(read, writes)
+                .stage_ordered_insert_current_base(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    state_row_indices
+                        .iter()
+                        .map(|&row_index| state_rows.row(row_index))
+                        .map(|row| (row.schema_key.as_str(), row.entity_pk)),
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_ordered_packed_current_base"
+                ))
+                .await?;
+            if let Some(epoch) = working_diff_epoch {
+                let next_epoch = TrackedWorkingDiffEpoch {
+                    checkpoint_commit_id: epoch.checkpoint_commit_id,
+                    generation,
+                    coverage,
+                };
+                if next_epoch != epoch {
+                    stage_tracked_working_diff_epoch(writes, &root.branch_id, next_epoch)?;
+                }
+            }
+            let mut control = normal_branch_head_control(
+                root,
+                parent_control,
+                generation,
+                working_diff_checkpoint_commit_id,
+            )?;
+            control.note_schemas(
+                state_row_indices
+                    .iter()
+                    .map(|&row_index| state_rows.row(row_index).schema_key.as_str()),
+            );
+            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+            continue;
+        }
         let can_defer_fresh_hot = certified_fresh_plugin_file_id.is_some()
             && !host_certified_live_increments.contains_key(&root.branch_id)
             && tracked_roots.len() == 1
