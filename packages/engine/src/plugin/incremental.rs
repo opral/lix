@@ -1554,12 +1554,10 @@ impl VecSourceState {
                 "component packet source page size must be positive",
             ));
         }
-        if requested > self.limits.max_page_bytes {
-            return Err(invalid_input(
-                "component packet source page request exceeds max_page_bytes",
-            ));
-        }
-        Ok(u64::from(requested))
+        // `max-bytes` is an upper bound supplied by the consumer, not an
+        // exact-size demand. A source with a smaller fixed schedule remains
+        // valid and must simply return a smaller page.
+        Ok(u64::from(requested.min(self.limits.max_page_bytes)))
     }
 
     fn accept_page(&mut self, inline_bytes: u64, refs: u32) -> Result<(), LixError> {
@@ -4118,6 +4116,19 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn vec_entity_source_clamps_a_larger_consumer_page_hint() {
+        let limits = WasmTransitionLimits::default();
+        let mut source = VecEntitySource::new(vec![host_entity("a")], limits).unwrap();
+
+        let page = source
+            .next_page(limits.max_page_bytes.saturating_mul(4))
+            .expect("larger consumer hint should be clamped")
+            .expect("one entity page");
+
+        assert_eq!(page.entities.len(), 1);
     }
 
     #[test]

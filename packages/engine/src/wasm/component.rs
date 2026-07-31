@@ -28,6 +28,8 @@ pub const EDIT_SPLICE_METADATA_BYTES: u64 = 24;
 const MIB: u64 = 1024 * 1024;
 const MIB_U32: u32 = 1024 * 1024;
 const TRANSITION_PAGE_BYTES: u32 = 2 * MIB_U32;
+const COLD_TRANSITION_MAX_PAGE_BYTES: u64 = 16 * MIB;
+const COLD_TRANSITION_RECORD_OVERHEAD_BYTES: u64 = 64 * 1024;
 const COLD_FILE_MAX_DEADLINE_NANOSECONDS: u64 = 60_000_000_000;
 const COLD_FILE_EXTRA_DEADLINE_NANOSECONDS_PER_MIB: u64 = 1_000_000_000;
 
@@ -68,6 +70,14 @@ impl Default for WasmTransitionLimits {
 }
 
 impl WasmTransitionLimits {
+    /// Returns the normal transition budget with enough bounded page space for
+    /// one semantic record derived from the supplied file bytes.
+    pub fn for_file_bytes(file_bytes: u64) -> Self {
+        let mut limits = Self::default();
+        limits.scale_page_for_file_bytes(file_bytes);
+        limits
+    }
+
     /// Returns a bounded budget for a first cold parse of one submitted file.
     ///
     /// A fresh `open-file` must legitimately examine all input bytes, unlike a
@@ -77,6 +87,7 @@ impl WasmTransitionLimits {
     /// for a plugin to make the hot path proportional to file size.
     pub fn for_cold_file_bytes(file_bytes: u64) -> Self {
         let mut limits = Self::default();
+        limits.scale_page_for_file_bytes(file_bytes);
         let extra = file_bytes
             .div_ceil(MIB)
             .saturating_mul(COLD_FILE_EXTRA_DEADLINE_NANOSECONDS_PER_MIB);
@@ -85,6 +96,24 @@ impl WasmTransitionLimits {
             .saturating_add(extra)
             .min(COLD_FILE_MAX_DEADLINE_NANOSECONDS);
         limits
+    }
+
+    fn scale_page_for_file_bytes(&mut self, file_bytes: u64) {
+        // Text entities encode their byte-exact content as unpadded base64.
+        // A generated/source-map file may legitimately be one long line, so
+        // its single semantic record can be larger than the normal 2 MiB
+        // scheduling page. Retain a hard 16 MiB page bound; small files and
+        // ordinary sparse transitions keep the fixed 2 MiB schedule.
+        let encoded_record_bytes = file_bytes
+            .saturating_mul(4)
+            .div_ceil(3)
+            .saturating_add(COLD_TRANSITION_RECORD_OVERHEAD_BYTES);
+        let cold_page_bytes = encoded_record_bytes
+            .max(u64::from(TRANSITION_PAGE_BYTES))
+            .min(COLD_TRANSITION_MAX_PAGE_BYTES)
+            .min(self.max_total_bytes);
+        self.max_page_bytes = u32::try_from(cold_page_bytes).unwrap_or(u32::MAX);
+        self.max_record_bytes = self.max_page_bytes;
     }
 
     pub fn validate(self) -> Result<Self, LixError> {
@@ -2205,6 +2234,36 @@ mod tests {
             WasmTransitionLimits::for_cold_file_bytes(128 * MIB).total_deadline_nanoseconds,
             COLD_FILE_MAX_DEADLINE_NANOSECONDS
         );
+    }
+
+    #[test]
+    fn cold_file_page_fits_one_base64_encoded_source_map_line() {
+        const OPENCLAW_SOURCE_MAP_BYTES: u64 = 5_298_078;
+        let limits = WasmTransitionLimits::for_cold_file_bytes(OPENCLAW_SOURCE_MAP_BYTES);
+        let encoded_line_bytes = OPENCLAW_SOURCE_MAP_BYTES.saturating_mul(4).div_ceil(3);
+
+        assert!(u64::from(limits.max_record_bytes) > encoded_line_bytes);
+        assert_eq!(limits.max_record_bytes, limits.max_page_bytes);
+        assert!(u64::from(limits.max_page_bytes) <= COLD_TRANSITION_MAX_PAGE_BYTES);
+        limits
+            .validate()
+            .expect("scaled cold limits should validate");
+    }
+
+    #[test]
+    fn warm_file_page_also_fits_one_base64_encoded_source_map_line() {
+        const OPENCLAW_SOURCE_MAP_BYTES: u64 = 5_298_078;
+        let limits = WasmTransitionLimits::for_file_bytes(OPENCLAW_SOURCE_MAP_BYTES);
+        let encoded_line_bytes = OPENCLAW_SOURCE_MAP_BYTES.saturating_mul(4).div_ceil(3);
+
+        assert!(u64::from(limits.max_record_bytes) > encoded_line_bytes);
+        assert_eq!(
+            limits.total_deadline_nanoseconds,
+            WasmTransitionLimits::default().total_deadline_nanoseconds
+        );
+        limits
+            .validate()
+            .expect("scaled warm limits should validate");
     }
 
     #[test]
