@@ -5978,6 +5978,8 @@ where
         let mut matched = BTreeSet::new();
         let mut selected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
         let mut unselected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
+        let mut selected_source_membership_exact = true;
+        let mut unselected_source_membership_exact = true;
         for entry in diff
             .entries
             .into_iter()
@@ -5995,13 +5997,23 @@ where
             })?;
             if requested.contains(&diff_id) {
                 matched.insert(diff_id);
-                push_checkpoint_selected_change(&mut selected, target, entry.kind);
+                selected_source_membership_exact &=
+                    push_checkpoint_selected_change(&mut selected, target, entry.kind);
             } else {
-                push_checkpoint_selected_change(&mut unselected, target, entry.kind);
+                unselected_source_membership_exact &=
+                    push_checkpoint_selected_change(&mut unselected, target, entry.kind);
             }
         }
-        let selected = selected.finish_source_certified();
-        let unselected = unselected.finish_source_certified();
+        let selected = if selected_source_membership_exact {
+            selected.finish_source_certified()
+        } else {
+            selected.finish()
+        };
+        let unselected = if unselected_source_membership_exact {
+            unselected.finish_source_certified()
+        } else {
+            unselected.finish()
+        };
         if matched != requested {
             return Err(stale_or_unknown_diff_id());
         }
@@ -6148,11 +6160,12 @@ fn push_checkpoint_selected_change(
     selected: &mut StagedCommitChangeBatchBuilder,
     row: crate::tracked_state::TrackedStateDiffRow,
     kind: TrackedStateDiffKind,
-) {
+) -> bool {
     let created_at = match kind {
         TrackedStateDiffKind::Added => row.updated_at,
         TrackedStateDiffKind::Modified | TrackedStateDiffKind::Removed => row.created_at,
     };
+    let source_membership_exact = created_at == row.created_at;
     selected.push(
         row.identity,
         row.commit_id,
@@ -6161,6 +6174,7 @@ fn push_checkpoint_selected_change(
         created_at,
         row.updated_at,
     );
+    source_membership_exact
 }
 
 fn incremental_filesystem_index_enabled() -> bool {
