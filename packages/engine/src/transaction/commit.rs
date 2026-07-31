@@ -321,7 +321,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         "lix.perf.materialization.tracked_roots"
     ))
     .await?;
-    let mut staged_hot_heads = stage_tracked_head(
+    // HOT publication has adapter-specific checkpoint, packed-base, and
+    // point-row futures. Keep their combined async state out of the parent
+    // commit future so an inactive bulk branch cannot inflate every ordinary
+    // SlateDB transaction's native stack.
+    let mut staged_hot_heads = Box::pin(stage_tracked_head(
         read,
         &mut writes,
         &state_rows,
@@ -337,7 +341,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &explicit_branch_targets,
         &branch_control_observations,
         &checkpoint_epochs,
-    )
+    ))
     .instrument(tracing::debug_span!(
         target: "lix_perf",
         "lix.perf.materialization.tracked_head"
