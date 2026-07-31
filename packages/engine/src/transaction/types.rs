@@ -1438,8 +1438,7 @@ pub(crate) struct TransactionFileData {
     /// Plugin installation uses this for the extracted WASM component so
     /// steady-state reads can load it directly without reopening the archive.
     auxiliary_payloads: Vec<BlobPayload>,
-    plugin_state_checkpoint_hash: Option<BlobHash>,
-    plugin_authority_checkpoint_hash: Option<BlobHash>,
+    plugin_checkpoint: Option<PluginCheckpointWrite>,
     /// Reconciliation may retain this record only as the owner of certified
     /// semantic batches after its file payload has already been materialized
     /// through the ordinary plugin path.
@@ -1473,8 +1472,7 @@ impl TransactionFileData {
             mutation_identity: None,
             payload: BlobPayload::from_bytes(data),
             auxiliary_payloads: Vec::new(),
-            plugin_state_checkpoint_hash: None,
-            plugin_authority_checkpoint_hash: None,
+            plugin_checkpoint: None,
             stage_payload_at_commit: true,
             certified_entity_batches: Vec::new(),
         }
@@ -1516,22 +1514,19 @@ impl TransactionFileData {
 
     pub(crate) fn set_plugin_checkpoint(
         &mut self,
-        state: impl Into<crate::Blob>,
-        state_hash: BlobHash,
+        generation: String,
+        runtime: impl Into<crate::Blob>,
         authority: impl Into<crate::Blob>,
-        authority_hash: BlobHash,
     ) {
-        let state = BlobPayload::from_hashed_bytes(state, state_hash);
-        let authority = BlobPayload::from_hashed_bytes(authority, authority_hash);
-        self.plugin_state_checkpoint_hash = Some(state_hash);
-        self.plugin_authority_checkpoint_hash = Some(authority_hash);
-        self.auxiliary_payloads.push(state);
-        self.auxiliary_payloads.push(authority);
+        self.plugin_checkpoint = Some(PluginCheckpointWrite {
+            generation,
+            runtime: runtime.into(),
+            authority: authority.into(),
+        });
     }
 
-    pub(crate) fn plugin_checkpoint_hashes(&self) -> Option<(BlobHash, BlobHash)> {
-        self.plugin_state_checkpoint_hash
-            .zip(self.plugin_authority_checkpoint_hash)
+    pub(crate) fn plugin_checkpoint(&self) -> Option<&PluginCheckpointWrite> {
+        self.plugin_checkpoint.as_ref()
     }
 
     pub(crate) fn set_certified_entity_batches(&mut self, batches: Vec<WasmCertifiedEntityBatch>) {
@@ -1648,6 +1643,13 @@ impl TransactionFileData {
     pub(crate) fn is_empty(&self) -> bool {
         self.payload.is_empty()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PluginCheckpointWrite {
+    pub(crate) generation: String,
+    pub(crate) runtime: crate::Blob,
+    pub(crate) authority: crate::Blob,
 }
 
 /// One decoded write batch accepted by the transaction boundary.

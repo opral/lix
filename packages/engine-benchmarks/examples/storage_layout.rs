@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use lix_engine::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix_engine::storage_bench::{
-    binary_manifest_layout_accounting, commit_delta_layout_accounting, layout_accounting,
-    layout_space_catalog, space_inventory,
+    binary_cas_owner_layout_accounting, binary_manifest_layout_accounting,
+    commit_delta_layout_accounting, layout_accounting, layout_space_catalog, space_inventory,
 };
 use lix_slatedb_storage::SlateDB;
 use object_store::local::LocalFileSystem;
@@ -92,6 +92,8 @@ async fn main() {
     println!("SPACE\tTOTAL\tTOTAL\t{total_rows}\t{total_keys}\t{total_values}");
     print_commit_delta_inventory(&read).await;
     print_binary_manifest_layout(&read).await;
+    print_binary_cas_owners(&read).await;
+    print_plugin_checkpoint_layout(&read).await;
 
     let inventory = space_inventory(&read, HOT_SPACE).await;
     let mut groups = BTreeMap::<Vec<u8>, HotGroup>::new();
@@ -178,6 +180,69 @@ async fn main() {
     if !logical_only {
         inspect_ssts(Path::new(&path), &space_names).await;
     }
+}
+
+async fn print_binary_cas_owners(read: &impl lix_engine::storage_adapter::StorageAdapterRead) {
+    for owner in binary_cas_owner_layout_accounting(read)
+        .await
+        .expect("decode binary CAS owners")
+    {
+        println!(
+            "BINARY_OWNER\towner={}\treferences={}\tmanifests={}\tlogical_bytes={}\tencoded_manifest_bytes={}\tempty={}\tsingle_chunk={}\tchunked={}\tdelta={}\tchunk_values={}\tencoded_chunk_bytes={}",
+            owner.owner,
+            owner.references,
+            owner.manifests,
+            owner.logical_bytes,
+            owner.encoded_manifest_bytes,
+            owner.empty_manifests,
+            owner.single_chunk_manifests,
+            owner.chunked_manifests,
+            owner.delta_manifests,
+            owner.chunk_values,
+            owner.encoded_chunk_bytes,
+        );
+    }
+}
+
+async fn print_plugin_checkpoint_layout(
+    read: &impl lix_engine::storage_adapter::StorageAdapterRead,
+) {
+    const HEADER_BYTES: usize = 76;
+
+    let inventory = space_inventory(read, "plugin.current_checkpoint.v1").await;
+    let mut runtime_bytes = 0_u64;
+    let mut authority_bytes = 0_u64;
+    let mut unique_runtime = BTreeSet::new();
+    let mut unique_authority = BTreeSet::new();
+    for (_key, value) in &inventory {
+        let runtime_len = u32::from_le_bytes(
+            value[68..72]
+                .try_into()
+                .expect("plugin checkpoint runtime length"),
+        ) as usize;
+        let authority_len = u32::from_le_bytes(
+            value[72..76]
+                .try_into()
+                .expect("plugin checkpoint authority length"),
+        ) as usize;
+        let runtime_end = HEADER_BYTES + runtime_len;
+        let authority_end = runtime_end + authority_len;
+        assert_eq!(authority_end, value.len(), "plugin checkpoint value length");
+        runtime_bytes += runtime_len as u64;
+        authority_bytes += authority_len as u64;
+        unique_runtime.insert(value[HEADER_BYTES..runtime_end].to_vec());
+        unique_authority.insert(value[runtime_end..authority_end].to_vec());
+    }
+    println!(
+        "PLUGIN_CHECKPOINT\trows={}\truntime_bytes={}\tauthority_bytes={}\tunique_runtimes={}\tunique_runtime_bytes={}\tunique_authorities={}\tunique_authority_bytes={}",
+        inventory.len(),
+        runtime_bytes,
+        authority_bytes,
+        unique_runtime.len(),
+        unique_runtime.iter().map(Vec::len).sum::<usize>(),
+        unique_authority.len(),
+        unique_authority.iter().map(Vec::len).sum::<usize>(),
+    );
 }
 
 async fn print_binary_manifest_layout(read: &impl lix_engine::storage_adapter::StorageAdapterRead) {

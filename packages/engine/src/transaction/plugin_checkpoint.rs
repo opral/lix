@@ -1,0 +1,395 @@
+use bytes::Bytes;
+
+use crate::binary_cas::BlobHash;
+use crate::storage_adapter::{
+    PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
+    StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
+    StorageSpaceId, StorageValue, StorageWriteSet,
+};
+use crate::{Blob, LixError};
+
+pub(crate) const PLUGIN_CHECKPOINT_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0004_0026), "plugin.current_checkpoint.v1");
+
+const MAGIC: &[u8; 4] = b"LPC1";
+const HEADER_BYTES: usize = 4 + 32 + 32 + 4 + 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentPluginCheckpoint {
+    pub(crate) runtime: Blob,
+    pub(crate) authority: Blob,
+}
+
+pub(crate) fn stage_current_plugin_checkpoint(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    file_id: &str,
+    generation: &str,
+    blob_hash: BlobHash,
+    runtime: &[u8],
+    authority: &[u8],
+) -> Result<(), LixError> {
+    let generation = BlobHash::from_hex(generation)?;
+    let runtime_len = u32::try_from(runtime.len()).map_err(|_| checkpoint_too_large())?;
+    let authority_len = u32::try_from(authority.len()).map_err(|_| checkpoint_too_large())?;
+    let capacity = HEADER_BYTES
+        .checked_add(runtime.len())
+        .and_then(|length| length.checked_add(authority.len()))
+        .ok_or_else(checkpoint_too_large)?;
+    let mut value = Vec::with_capacity(capacity);
+    value.extend_from_slice(MAGIC);
+    value.extend_from_slice(generation.as_bytes());
+    value.extend_from_slice(blob_hash.as_bytes());
+    value.extend_from_slice(&runtime_len.to_le_bytes());
+    value.extend_from_slice(&authority_len.to_le_bytes());
+    value.extend_from_slice(runtime);
+    value.extend_from_slice(authority);
+    writes.put(
+        PLUGIN_CHECKPOINT_SPACE,
+        checkpoint_key(branch_id, file_id)?,
+        StorageValue {
+            bytes: Bytes::from(value),
+        },
+    );
+    Ok(())
+}
+
+pub(crate) async fn stage_delete_current_plugin_checkpoints(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    owners: &[(String, String)],
+) -> Result<(), LixError> {
+    let keys = owners
+        .iter()
+        .map(|(branch_id, file_id)| checkpoint_key(branch_id, file_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let existing = PointReadPlan::new(PLUGIN_CHECKPOINT_SPACE, &keys)
+        .materialize(
+            read,
+            StorageGetOptions {
+                projection: StorageCoreProjection::KeyOnly,
+            },
+        )
+        .await?
+        .value;
+    writes.delete_batch(
+        PLUGIN_CHECKPOINT_SPACE,
+        keys.into_iter()
+            .zip(existing)
+            .filter_map(|(key, value)| value.is_some().then_some(key)),
+    );
+    Ok(())
+}
+
+/// Deletes every derived checkpoint owned by a branch lifecycle record.
+///
+/// Checkpoints are a current-state accelerator, not repository history. Like
+/// an index maintained beside an MVCC log, their lifetime follows the current
+/// owner and a branch deletion removes the entire UUID-prefixed key range.
+pub(crate) async fn stage_delete_branch_plugin_checkpoints(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+) -> Result<(), LixError> {
+    let branch_id = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("plugin checkpoint branch id is not a UUID: {error}"),
+        )
+    })?;
+    let plan = ScanPlan::prefix(
+        PLUGIN_CHECKPOINT_SPACE,
+        StoragePrefix {
+            bytes: Bytes::copy_from_slice(branch_id.as_bytes()),
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let chunk = plan
+            .collect(
+                read,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?
+            .value;
+        if chunk.entries.is_empty() {
+            break;
+        }
+        resume_after = chunk.entries.last().map(|entry| entry.key.clone());
+        writes.delete_batch(
+            PLUGIN_CHECKPOINT_SPACE,
+            chunk.entries.into_iter().map(|entry| entry.key),
+        );
+        if !chunk.has_more {
+            break;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn load_current_plugin_checkpoint(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    file_id: &str,
+    generation: &str,
+    blob_hash: BlobHash,
+) -> Result<Option<CurrentPluginCheckpoint>, LixError> {
+    let expected_generation = BlobHash::from_hex(generation)?;
+    let values = PointReadPlan::new(
+        PLUGIN_CHECKPOINT_SPACE,
+        &[checkpoint_key(branch_id, file_id)?],
+    )
+    .materialize(
+        read,
+        StorageGetOptions {
+            projection: StorageCoreProjection::FullValue,
+        },
+    )
+    .await?
+    .value;
+    let Some(StorageProjectedValue::FullValue(value)) = values.into_iter().next().flatten() else {
+        return Ok(None);
+    };
+    let Some(header) = value.get(..HEADER_BYTES) else {
+        return Ok(None);
+    };
+    if &header[..4] != MAGIC
+        || header[4..36] != expected_generation.as_bytes()[..]
+        || header[36..68] != blob_hash.as_bytes()[..]
+    {
+        return Ok(None);
+    }
+    let runtime_len = u32::from_le_bytes(header[68..72].try_into().expect("runtime length"));
+    let authority_len = u32::from_le_bytes(header[72..76].try_into().expect("authority length"));
+    let runtime_len = runtime_len as usize;
+    let authority_len = authority_len as usize;
+    let runtime_end = HEADER_BYTES
+        .checked_add(runtime_len)
+        .filter(|end| *end <= value.len());
+    let value_end = runtime_end
+        .and_then(|end| end.checked_add(authority_len))
+        .filter(|end| *end == value.len());
+    let (Some(runtime_end), Some(value_end)) = (runtime_end, value_end) else {
+        return Ok(None);
+    };
+    Ok(Some(CurrentPluginCheckpoint {
+        runtime: value.slice(HEADER_BYTES..runtime_end).into(),
+        authority: value.slice(runtime_end..value_end).into(),
+    }))
+}
+
+fn checkpoint_key(branch_id: &str, file_id: &str) -> Result<StorageKey, LixError> {
+    let branch_id = uuid::Uuid::parse_str(branch_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("plugin checkpoint branch id is not a UUID: {error}"),
+        )
+    })?;
+    let file_id = uuid::Uuid::parse_str(file_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("plugin checkpoint file id is not a UUID: {error}"),
+        )
+    })?;
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(branch_id.as_bytes());
+    key.extend_from_slice(file_id.as_bytes());
+    Ok(StorageKey(Bytes::from(key)))
+}
+
+fn checkpoint_too_large() -> LixError {
+    LixError::new(
+        LixError::CODE_PLUGIN_RESOURCE_LIMIT,
+        "plugin checkpoint exceeds the current-checkpoint storage limit",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+
+    const BRANCH_ID: &str = "01920000-0000-7000-8000-000000000001";
+    const OTHER_BRANCH_ID: &str = "01920000-0000-7000-8000-000000000003";
+    const FILE_ID: &str = "01920000-0000-7000-8000-000000000002";
+
+    #[tokio::test]
+    async fn current_checkpoint_overwrites_and_is_bound_to_generation_and_blob() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = BlobHash::from_content(b"generation");
+        let first_blob = BlobHash::from_content(b"first");
+        let second_blob = BlobHash::from_content(b"second");
+
+        for (blob_hash, runtime, authority) in [
+            (
+                first_blob,
+                b"runtime-one".as_slice(),
+                b"authority-one".as_slice(),
+            ),
+            (
+                second_blob,
+                b"runtime-two".as_slice(),
+                b"authority-two".as_slice(),
+            ),
+        ] {
+            let mut writes = storage.new_write_set();
+            stage_current_plugin_checkpoint(
+                &mut writes,
+                BRANCH_ID,
+                FILE_ID,
+                &generation.to_hex(),
+                blob_hash,
+                runtime,
+                authority,
+            )
+            .unwrap();
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .unwrap();
+        }
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            load_current_plugin_checkpoint(
+                &read,
+                BRANCH_ID,
+                FILE_ID,
+                &generation.to_hex(),
+                first_blob,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            load_current_plugin_checkpoint(
+                &read,
+                BRANCH_ID,
+                FILE_ID,
+                &BlobHash::from_content(b"other-generation").to_hex(),
+                second_blob,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let checkpoint = load_current_plugin_checkpoint(
+            &read,
+            BRANCH_ID,
+            FILE_ID,
+            &generation.to_hex(),
+            second_blob,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(checkpoint.runtime.as_ref(), b"runtime-two");
+        assert_eq!(checkpoint.authority.as_ref(), b"authority-two");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_cleanup_follows_file_and_branch_lifetimes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = BlobHash::from_content(b"generation");
+        let blob_hash = BlobHash::from_content(b"file");
+        let mut writes = storage.new_write_set();
+        for branch_id in [BRANCH_ID, OTHER_BRANCH_ID] {
+            stage_current_plugin_checkpoint(
+                &mut writes,
+                branch_id,
+                FILE_ID,
+                &generation.to_hex(),
+                blob_hash,
+                b"runtime",
+                b"authority",
+            )
+            .unwrap();
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = storage.new_write_set();
+        stage_delete_branch_plugin_checkpoints(&read, &mut writes, BRANCH_ID)
+            .await
+            .unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            load_current_plugin_checkpoint(
+                &read,
+                BRANCH_ID,
+                FILE_ID,
+                &generation.to_hex(),
+                blob_hash,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            load_current_plugin_checkpoint(
+                &read,
+                OTHER_BRANCH_ID,
+                FILE_ID,
+                &generation.to_hex(),
+                blob_hash,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        let mut writes = storage.new_write_set();
+        stage_delete_current_plugin_checkpoints(
+            &read,
+            &mut writes,
+            &[(OTHER_BRANCH_ID.to_owned(), FILE_ID.to_owned())],
+        )
+        .await
+        .unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            load_current_plugin_checkpoint(
+                &read,
+                OTHER_BRANCH_ID,
+                FILE_ID,
+                &generation.to_hex(),
+                blob_hash,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+}

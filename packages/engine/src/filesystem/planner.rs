@@ -358,7 +358,6 @@ pub(crate) struct BlobRefRowInput {
     pub(crate) file_id: String,
     pub(crate) blob_hash: BlobHash,
     pub(crate) size_bytes: usize,
-    pub(crate) plugin_checkpoint_hashes: Option<(BlobHash, BlobHash)>,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -373,24 +372,11 @@ impl BlobRefRowInput {
                 ),
             )
         })?;
-        let mut snapshot = json!({
+        let snapshot = json!({
             "id": self.file_id,
             "blob_hash": self.blob_hash.to_hex(),
             "size_bytes": size_bytes,
         });
-        if let Some((state_hash, authority_hash)) = self.plugin_checkpoint_hashes {
-            let snapshot = snapshot
-                .as_object_mut()
-                .expect("blob reference snapshot is an object");
-            snapshot.insert(
-                "plugin_state_checkpoint_hash".to_owned(),
-                JsonValue::String(state_hash.to_hex()),
-            );
-            snapshot.insert(
-                "plugin_authority_checkpoint_hash".to_owned(),
-                JsonValue::String(authority_hash.to_hex()),
-            );
-        }
         let file_id = self.file_id;
         append_state_row(
             rows,
@@ -1207,7 +1193,6 @@ fn plan_parsed_file_path_write_with_fallback(
                     .blob_hash()
                     .expect("non-empty payload should have blob hash"),
                 size_bytes: file_payload.len(),
-                plugin_checkpoint_hashes: None,
                 context: FilesystemRowContext {
                     file_id: None,
                     metadata: None,
@@ -1266,7 +1251,6 @@ pub(crate) fn plan_file_descriptor_write(
                     .blob_hash()
                     .expect("non-empty payload should have blob hash"),
                 size_bytes: file_payload.len(),
-                plugin_checkpoint_hashes: None,
                 context: FilesystemRowContext {
                     file_id: None,
                     metadata: None,
@@ -2033,7 +2017,6 @@ mod tests {
             file_id: "01920000-0000-7000-8000-0000000000d2".to_string(),
             blob_hash: BlobHash::from_content(b"Hello"),
             size_bytes: 5,
-            plugin_checkpoint_hashes: None,
             context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         })
         .expect("blob ref row should build");

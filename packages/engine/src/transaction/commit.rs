@@ -185,6 +185,33 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     // shared parsed column; every later materialization stage consumes this
     // map plus canonical arena slices.
     let explicit_branch_targets = explicit_branch_head_targets(&state_rows)?;
+    let deleted_checkpoint_branches = explicit_branch_targets
+        .iter()
+        .filter_map(|(branch_id, target)| target.head_commit_id.is_none().then_some(branch_id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut deleted_checkpoint_files = state_rows
+        .iter()
+        .filter(|row| row.schema_key == "lix_binary_blob_ref" && row.snapshot.is_none())
+        .filter_map(|row| {
+            row.file_id
+                .map(|file_id| (row.branch_id.to_string(), file_id.to_string()))
+        })
+        .collect::<BTreeSet<_>>();
+    deleted_checkpoint_files.extend(
+        prepared_writes
+            .file_data_writes
+            .iter()
+            .filter(|write| write.plugin_checkpoint().is_none())
+            .map(|write| (write.branch_id.clone(), write.file_id.clone())),
+    );
+    for write in prepared_writes
+        .file_data_writes
+        .iter()
+        .filter(|write| write.plugin_checkpoint().is_some())
+    {
+        deleted_checkpoint_files.remove(&(write.branch_id.clone(), write.file_id.clone()));
+    }
     release_validated_canonical_value_columns(&mut state_rows);
     if !prepared_writes.file_data_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
@@ -208,6 +235,40 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                 blob_writer.stage_payload(payload).await?;
             }
         }
+        drop(blob_writer);
+        for write in &prepared_writes.file_data_writes {
+            if let Some(checkpoint) = write.plugin_checkpoint() {
+                crate::transaction::plugin_checkpoint::stage_current_plugin_checkpoint(
+                    &mut writes,
+                    &write.branch_id,
+                    &write.file_id,
+                    &checkpoint.generation,
+                    write
+                        .blob_hash()
+                        .unwrap_or_else(|| crate::binary_cas::BlobHash::from_content(write.data())),
+                    &checkpoint.runtime,
+                    &checkpoint.authority,
+                )?;
+            }
+        }
+    }
+    let deleted_checkpoint_files = deleted_checkpoint_files
+        .into_iter()
+        .filter(|(branch_id, _)| !deleted_checkpoint_branches.contains(branch_id))
+        .collect::<Vec<_>>();
+    crate::transaction::plugin_checkpoint::stage_delete_current_plugin_checkpoints(
+        &*read,
+        &mut writes,
+        &deleted_checkpoint_files,
+    )
+    .await?;
+    for branch_id in &deleted_checkpoint_branches {
+        crate::transaction::plugin_checkpoint::stage_delete_branch_plugin_checkpoints(
+            &*read,
+            &mut writes,
+            branch_id,
+        )
+        .await?;
     }
     let mut insert_selection = prepared_writes.insert_selection;
     let finalized = finalize_commit_rows(
