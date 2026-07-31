@@ -434,6 +434,17 @@ where
         .collect()
 }
 
+/// Physical storage-space IDs and names without scanning their contents.
+///
+/// Offline SST profiling uses this catalog to attribute blocks from databases
+/// that may predate the current logical codecs.
+pub fn layout_space_catalog() -> Vec<(u32, &'static str)> {
+    native_storage_spaces()
+        .iter()
+        .map(|space| (space.id.0, space.name))
+        .collect()
+}
+
 fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
     &[
         crate::init::REPOSITORY_PROTOCOL_SPACE,

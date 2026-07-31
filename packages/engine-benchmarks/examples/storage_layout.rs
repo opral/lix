@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use lix_engine::storage_adapter::{StorageAdapter, StorageReadOptions};
 use lix_engine::storage_bench::{
-    commit_delta_layout_accounting, layout_accounting, space_inventory,
+    commit_delta_layout_accounting, layout_accounting, layout_space_catalog, space_inventory,
 };
 use lix_slatedb_storage::SlateDB;
 use object_store::local::LocalFileSystem;
@@ -38,14 +38,26 @@ async fn main() {
     let path = std::env::args_os()
         .nth(1)
         .expect("usage: storage_layout <slatedb-path>");
-    let logical_only = std::env::args_os()
-        .nth(2)
-        .is_some_and(|arg| arg == "--logical-only");
+    let mode = std::env::args_os().nth(2);
+    let logical_only = mode.as_deref().is_some_and(|arg| arg == "--logical-only");
+    let physical_only = mode.as_deref().is_some_and(|arg| arg == "--physical-only");
+    if physical_only {
+        let space_names = layout_space_catalog().into_iter().collect();
+        inspect_ssts_fast(Path::new(&path), &space_names).await;
+        return;
+    }
     let storage = StorageAdapter::new(SlateDB::open(&path).expect("open SlateDB"));
     let read = storage
         .begin_read(StorageReadOptions::default())
         .await
         .expect("open storage snapshot");
+    if mode
+        .as_deref()
+        .is_some_and(|arg| arg == "--commit-delta-only")
+    {
+        print_commit_delta_inventory(&read).await;
+        return;
+    }
     let mut total_rows = 0_u64;
     let mut total_keys = 0_u64;
     let mut total_values = 0_u64;
@@ -64,22 +76,7 @@ async fn main() {
         total_values += entry.value_bytes;
     }
     println!("SPACE\tTOTAL\tTOTAL\t{total_rows}\t{total_keys}\t{total_values}");
-    for entry in commit_delta_layout_accounting(&read)
-        .await
-        .expect("decode commit-delta inventory")
-    {
-        println!(
-            "COMMIT_DELTA\tcommit={}\tsegments={}\tmembers={}\tauthored={}\tselected={}\tselected_tombstones={}\tcertified={}\tselected_certified={}",
-            entry.commit_id,
-            entry.segment_count,
-            entry.members,
-            entry.authored_members,
-            entry.selected_members,
-            entry.selected_tombstones,
-            entry.certified_members,
-            entry.selected_certified_members,
-        );
-    }
+    print_commit_delta_inventory(&read).await;
 
     let inventory = space_inventory(&read, HOT_SPACE).await;
     let mut groups = BTreeMap::<Vec<u8>, HotGroup>::new();
@@ -168,6 +165,25 @@ async fn main() {
     }
 }
 
+async fn print_commit_delta_inventory(read: &impl lix_engine::storage_adapter::StorageAdapterRead) {
+    for entry in commit_delta_layout_accounting(read)
+        .await
+        .expect("decode commit-delta inventory")
+    {
+        println!(
+            "COMMIT_DELTA\tcommit={}\tsegments={}\tmembers={}\tauthored={}\tselected={}\tselected_tombstones={}\tcertified={}\tselected_certified={}",
+            entry.commit_id,
+            entry.segment_count,
+            entry.members,
+            entry.authored_members,
+            entry.selected_members,
+            entry.selected_tombstones,
+            entry.certified_members,
+            entry.selected_certified_members,
+        );
+    }
+}
+
 #[derive(Default)]
 struct PhysicalSpace {
     blocks: usize,
@@ -183,6 +199,71 @@ struct PhysicalSpace {
     max_seq: u64,
     seq_rows: BTreeMap<u64, (u64, u64, u64)>,
     hot_versions: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>)>>,
+}
+
+async fn inspect_ssts_fast(path: &Path, space_names: &BTreeMap<u32, &'static str>) {
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(path.join("db")).expect("local object store"));
+    let reader = SstReader::new("lix-space-segments-v2", object_store, None, None);
+    let compacted = path.join("db/lix-space-segments-v2/compacted");
+    let mut files = std::fs::read_dir(&compacted)
+        .expect("read compacted directory")
+        .map(|entry| entry.expect("read compacted entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "sst"))
+        .collect::<Vec<_>>();
+    files.sort();
+    let mut spaces = BTreeMap::<u32, (usize, u64)>::new();
+    let mut total_file_bytes = 0_u64;
+    let mut total_block_bytes = 0_u64;
+    for path in files {
+        let id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("UTF-8 SST stem")
+            .parse::<ulid::Ulid>()
+            .expect("ULID SST stem");
+        let file = reader.open(id).await.expect("open SST");
+        total_file_bytes += path.metadata().expect("SST metadata").len();
+        let index = file.index().await.expect("read SST index");
+        let data_end = file.info().filter_offset;
+        for (block_index, (offset, first_key)) in index.iter().enumerate() {
+            let end = index
+                .get(block_index + 1)
+                .map_or(data_end, |(next_offset, _)| *next_offset);
+            let compressed_bytes = end.saturating_sub(*offset);
+            total_block_bytes += compressed_bytes;
+            let space_id = if first_key.len() >= 4 {
+                physical_space_id(first_key)
+            } else {
+                let rows = file.read_block(block_index).await.expect("read SST block");
+                physical_space_id(&rows.first().expect("indexed SST block is not empty").key)
+            };
+            let entry = spaces.entry(space_id).or_default();
+            entry.0 += 1;
+            entry.1 += compressed_bytes;
+        }
+    }
+    println!(
+        "SST_SUMMARY_FAST\tfile_bytes={total_file_bytes}\tdata_block_bytes={total_block_bytes}\toverhead_bytes={}\tspace_attribution=first_key",
+        total_file_bytes.saturating_sub(total_block_bytes),
+    );
+    let mut spaces = spaces.into_iter().collect::<Vec<_>>();
+    spaces.sort_unstable_by(|left, right| right.1.1.cmp(&left.1.1));
+    for (space_id, (blocks, compressed_bytes)) in spaces {
+        println!(
+            "SST_SPACE_FAST\tspace_id={space_id}\tspace={}\tblocks={blocks}\tcompressed_bytes={compressed_bytes}",
+            space_names.get(&space_id).copied().unwrap_or("<unknown>"),
+        );
+    }
+}
+
+fn physical_space_id(key: &[u8]) -> u32 {
+    u32::from_be_bytes(
+        key.get(..4)
+            .expect("physical key has space prefix")
+            .try_into()
+            .expect("space prefix has fixed length"),
+    )
 }
 
 async fn inspect_ssts(path: &Path, space_names: &BTreeMap<u32, &'static str>) {
