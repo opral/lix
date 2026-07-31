@@ -74,9 +74,10 @@ impl TransactionSchemaResolver {
     pub(crate) async fn catalog_for_validation(
         &mut self,
         live_state: &dyn LiveStateReader,
+        staged: &PreparedStateRowOverlay,
         domain: &Domain,
     ) -> Result<&CatalogSnapshot, LixError> {
-        self.load_catalog_for_domain(live_state, None, domain)
+        self.load_catalog_for_domain(live_state, Some(staged), domain)
             .await?;
         let domain = domain.schema_catalog_domain();
         Ok(self
@@ -95,6 +96,14 @@ impl TransactionSchemaResolver {
             domain.schema_catalog_domain(),
             TransactionCatalog::Shared(catalog),
         );
+    }
+
+    /// Drops transaction-private compiled catalogs after a statement rollback.
+    /// The next normalization or validation lazily rebuilds from the restored
+    /// staging overlay, retaining registrations from earlier successful
+    /// statements without retaining a failed statement's copy-on-write plan.
+    pub(crate) fn clear_cached_catalogs(&mut self) {
+        self.catalogs_by_domain.clear();
     }
 
     #[cfg(test)]

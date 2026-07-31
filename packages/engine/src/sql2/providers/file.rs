@@ -106,12 +106,12 @@ use crate::transaction::types::{
 };
 
 use super::spec::{
-    DmlApply, DmlPlanOptions, InsertApply, PlannedDml, PlannedScan, RowSource, TableSpec,
-    finish_scan_batch, register_spec_table, row_source,
+    DmlApply, DmlPlanOptions, DmlReturning, InsertApply, PlannedDml, PlannedScan, RowSource,
+    TableSpec, finish_scan_batch, register_spec_table, row_source, take_record_batch_rows,
 };
 use super::upsert::{
-    StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertSupport,
-    materialize_omitted_column, validate_target_columns,
+    StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertReturningRow, UpsertSupport,
+    materialize_omitted_column, materialize_omitted_insert_default, validate_target_columns,
 };
 
 pub(super) async fn register_lix_file_active_provider(
@@ -212,6 +212,7 @@ pub(super) async fn register_active_write_provider(
     )
 }
 
+#[derive(Clone)]
 struct LixFileSpec {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
@@ -231,6 +232,15 @@ struct LixFileDmlSourceState {
     plugin_render: Option<PluginRenderContext>,
     path_resolvers: Option<BTreeMap<String, DirectoryPathResolver>>,
     path_index: Option<FilesystemPathSelection>,
+}
+
+/// Stable public identity for a file post-image. The by-branch surface needs
+/// both components; the active surface exposes one visible branch scope and
+/// uses an empty branch discriminator.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FileReturningKey {
+    id: String,
+    branch_id: String,
 }
 
 #[derive(Clone, Copy)]
@@ -531,6 +541,112 @@ impl LixFileSpec {
                 Ok(source_batch)
             },
         )
+    }
+
+    fn returning_key_from_batch(
+        &self,
+        batch: &RecordBatch,
+        row_index: usize,
+    ) -> Result<FileReturningKey> {
+        let id = required_string_value(batch, row_index, "id")?;
+        let branch_id = match self.branch_binding {
+            BranchBinding::Active { .. } => String::new(),
+            // This is a readback identity, not a new write context. A global
+            // row is projected into the requested explicit branch with
+            // `lixcol_global = true` and that branch in `lixcol_branch_id`.
+            // Normalizing it as a write would reject the valid projection.
+            BranchBinding::Explicit => required_string_value(batch, row_index, "lixcol_branch_id")?,
+        };
+        Ok(FileReturningKey { id, branch_id })
+    }
+
+    fn materialize_returning_insert_defaults(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        if !insert_column_is_omitted(batch, "id") {
+            return Ok(batch.clone());
+        }
+        let ids = (0..batch.num_rows())
+            .map(|row_index| {
+                let plugin_archive_id = optional_string_value(batch, row_index, "path")?
+                    .and_then(|path| plugin_key_from_archive_path(&path))
+                    .map(|plugin_key| plugin_storage_archive_file_id(&plugin_key));
+                Ok(Some(plugin_archive_id.unwrap_or_else(|| {
+                    self.functions.call_uuid_v7().to_string()
+                })))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let ids = StringArray::from(ids);
+        materialize_omitted_insert_default(batch, "id", Arc::new(ids))
+    }
+
+    /// Reload the just-staged rows from the transaction overlay. Filesystem
+    /// writes derive paths, blob references, and audit fields during staging;
+    /// projecting the pre-image with assignments applied would make
+    /// `RETURNING *` stale or incomplete.
+    async fn returning_post_image(
+        &self,
+        write_ctx: &SqlWriteContext,
+        keys: &[FileReturningKey],
+        needs_data: bool,
+    ) -> Result<RecordBatch> {
+        if keys.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
+        }
+        let mut request = lix_file_scan_request(
+            self.branch_binding.active_branch_id(),
+            Some(self.schema.as_ref()),
+            None,
+        );
+        if matches!(self.branch_binding, BranchBinding::Explicit) {
+            request.filter.branch_ids = keys
+                .iter()
+                .map(|key| key.branch_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+        let file_ids = keys
+            .iter()
+            .map(|key| key.id.clone())
+            .collect::<BTreeSet<_>>();
+        let captured: SharedLixFileDmlSourceState = Arc::new(Mutex::new(None));
+        let source = self.dml_source(
+            write_ctx,
+            request,
+            FileIdConstraint::Ids(file_ids),
+            None,
+            LixFileDmlSourceOptions {
+                needs_data,
+                needs_plugin_ownership: false,
+                capture_path_resolver_rows: false,
+            },
+            captured,
+        );
+        let batch = source().await?;
+        let mut post_rows = BTreeMap::new();
+        for row_index in 0..batch.num_rows() {
+            let key = self.returning_key_from_batch(&batch, row_index)?;
+            let index = u32::try_from(row_index).map_err(|_| {
+                DataFusionError::Execution("lix_file RETURNING row index overflow".into())
+            })?;
+            if post_rows.insert(key.clone(), index).is_some() {
+                return Err(DataFusionError::Execution(format!(
+                    "lix_file RETURNING post-image contains duplicate row for id '{}'",
+                    key.id
+                )));
+            }
+        }
+        let indices = keys
+            .iter()
+            .map(|key| {
+                post_rows.get(key).copied().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "lix_file RETURNING post-image is missing inserted or updated row '{}'",
+                        key.id
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        take_record_batch_rows(&batch, &indices)
     }
 }
 
@@ -1191,6 +1307,116 @@ impl TableSpec for LixFileSpec {
         Ok(Some(apply))
     }
 
+    async fn plan_insert_with_returning(
+        &self,
+        write_ctx: SqlWriteContext,
+        input: &Arc<dyn ExecutionPlan>,
+        returning: DmlReturning,
+    ) -> Result<InsertApply> {
+        let insert_intents = InsertColumnIntents::from_input(input);
+        let data_is_explicit = write_ctx.explicit_insert_columns().map_or_else(
+            || {
+                insert_intents.includes_column("data")
+                    && !self.options.omitted_insert_columns.contains("data")
+            },
+            |columns| columns.contains("data"),
+        );
+        let include_data_writes = self.schema.field_with_name("data").is_ok() && data_is_explicit;
+        let spec = self.clone();
+        Ok(Arc::new(move |batches| {
+            let write_ctx = write_ctx.clone();
+            let spec = spec.clone();
+            let returning = returning.clone();
+            async move {
+                let row_capacity = batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+                    .saturating_mul(3);
+                let mut staged = LixFileStagedBatch::with_row_capacity(row_capacity);
+                let mut path_resolvers = None;
+                let mut keys = Vec::new();
+                for batch in batches {
+                    let batch = spec.materialize_returning_insert_defaults(&batch)?;
+                    for row_index in 0..batch.num_rows() {
+                        keys.push(spec.returning_key_from_batch(&batch, row_index)?);
+                    }
+                    if path_resolvers.is_none() {
+                        path_resolvers = Some(
+                            directory_path_resolvers_from_live_state(
+                                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                                spec.branch_binding.active_branch_id(),
+                            )
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?,
+                        );
+                    }
+                    if record_batch_has_non_null_column(&batch, "path")? {
+                        staged
+                            .extend(lix_file_insert_stage_from_batch_with_path_resolvers(
+                                &batch,
+                                spec.branch_binding.active_branch_id(),
+                                lix_file_surface_name(&spec.branch_binding),
+                                path_resolvers
+                                    .as_mut()
+                                    .expect("path resolver should be initialized"),
+                                &mut || spec.functions.call_uuid_v7().to_string(),
+                                include_data_writes,
+                            )?)
+                            .map_err(lix_error_to_datafusion_error)?;
+                    } else {
+                        staged
+                            .extend(
+                                lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
+                                    &batch,
+                                    spec.branch_binding.active_branch_id(),
+                                    lix_file_surface_name(&spec.branch_binding),
+                                    path_resolvers
+                                        .as_mut()
+                                        .expect("path resolver should be initialized"),
+                                    &mut || spec.functions.call_uuid_v7().to_string(),
+                                    include_data_writes,
+                                )?,
+                            )
+                            .map_err(lix_error_to_datafusion_error)?;
+                    }
+                }
+
+                let count = staged.count;
+                if !staged.state_rows.is_empty() || !staged.file_data_writes.is_empty() {
+                    let intent = if staged.file_data_writes.is_empty() {
+                        TransactionWrite::Rows {
+                            mode: TransactionWriteMode::Insert,
+                            rows: staged.state_rows,
+                        }
+                    } else {
+                        TransactionWrite::RowsWithFileData {
+                            mode: TransactionWriteMode::Insert,
+                            rows: staged.state_rows,
+                            file_data: staged.file_data_writes,
+                            count,
+                        }
+                    };
+                    write_ctx
+                        .stage_write(intent)
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                }
+
+                let post_image = spec
+                    .returning_post_image(
+                        &write_ctx,
+                        &keys,
+                        returning.required_columns().contains("data"),
+                    )
+                    .await?;
+                returning.capture(returning.project(&post_image)?);
+                Ok(count)
+            }
+            .boxed()
+        }))
+    }
+
     fn validate_update_assignments(&self, assignments: &[(String, Expr)]) -> Result<()> {
         validate_lix_file_update_assignments(&self.schema, assignments)
     }
@@ -1287,10 +1513,37 @@ impl TableSpec for LixFileSpec {
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: &[Expr],
     ) -> Result<PlannedDml> {
+        self.plan_update_with_post_image(write_ctx, assignments, filters, None)
+            .await
+    }
+
+    async fn plan_update_with_returning(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        returning: DmlReturning,
+    ) -> Result<PlannedDml> {
+        self.plan_update_with_post_image(write_ctx, assignments, filters, Some(returning))
+            .await
+    }
+}
+
+impl LixFileSpec {
+    async fn plan_update_with_post_image(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        returning: Option<DmlReturning>,
+    ) -> Result<PlannedDml> {
         let needs_data = filters.iter().any(|filter| contains_column(filter, "data"))
             || assignments.iter().any(|(column_name, expr)| {
                 column_name == "path" || physical_expr_contains_column(expr, "data")
-            });
+            })
+            || returning
+                .as_ref()
+                .is_some_and(|returning| returning.required_columns().contains("data"));
         let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
         request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
@@ -1326,13 +1579,26 @@ impl TableSpec for LixFileSpec {
         );
         let branch_binding = self.branch_binding.clone();
         let functions = self.functions.clone();
+        let returning_spec = self.clone();
         let apply: DmlApply = Arc::new(move |matched_batch| {
             let write_ctx = write_ctx.clone();
             let branch_binding = branch_binding.clone();
             let functions = functions.clone();
             let assignments = assignments.clone();
             let captured = Arc::clone(&captured);
+            let returning = returning.clone();
+            let returning_spec = returning_spec.clone();
             async move {
+                let keys = returning
+                    .as_ref()
+                    .map(|_| {
+                        (0..matched_batch.num_rows())
+                            .map(|row_index| {
+                                returning_spec.returning_key_from_batch(&matched_batch, row_index)
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?;
                 let LixFileDmlSourceState {
                     blob_ref_keys,
                     derived_file_ref_keys,
@@ -1410,6 +1676,16 @@ impl TableSpec for LixFileSpec {
                         .map_err(lix_error_to_datafusion_error)?;
                 }
 
+                if let (Some(returning), Some(keys)) = (returning, keys) {
+                    let post_image = returning_spec
+                        .returning_post_image(
+                            &write_ctx,
+                            &keys,
+                            returning.required_columns().contains("data"),
+                        )
+                        .await?;
+                    returning.capture(returning.project(&post_image)?);
+                }
                 Ok(count)
             }
             .boxed()
@@ -1559,6 +1835,35 @@ impl UpsertSupport for LixFileSpec {
             "lixcol_untracked",
             Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
         )
+    }
+
+    async fn materialize_returning_insert_defaults(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        LixFileSpec::materialize_returning_insert_defaults(self, proposed)
+    }
+
+    async fn capture_upsert_returning(
+        &self,
+        write_ctx: &SqlWriteContext,
+        affected_rows: Vec<UpsertReturningRow>,
+        returning: DmlReturning,
+    ) -> Result<()> {
+        let keys = affected_rows
+            .iter()
+            .map(|row| self.returning_key_from_batch(row.batch(), row.row_index()))
+            .collect::<Result<Vec<_>>>()?;
+        let post_image = self
+            .returning_post_image(
+                write_ctx,
+                &keys,
+                returning.required_columns().contains("data"),
+            )
+            .await?;
+        returning.capture(returning.project(&post_image)?);
+        Ok(())
     }
 
     async fn scan_conflict_candidates(

@@ -85,6 +85,81 @@ pub(crate) async fn execute_spec_upsert(
         .map_err(crate::sql2::error::datafusion_error_to_lix_error)
 }
 
+/// Execute an `INSERT ... ON CONFLICT ... RETURNING` against a registered
+/// provider. The provider must capture an exact post-image; this helper does
+/// not permit a successful mutation to return only its affected count.
+pub(crate) async fn execute_spec_upsert_with_returning(
+    table: &Arc<dyn TableProvider>,
+    input: &Arc<dyn ExecutionPlan>,
+    proposed_batches: Vec<datafusion::arrow::record_batch::RecordBatch>,
+    target_columns: &[String],
+    action: &UpsertAction,
+    returning: DmlReturning,
+) -> Result<u64, LixError> {
+    let provider = table
+        .as_any()
+        .downcast_ref::<spec::SpecTableProvider>()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "INSERT ON CONFLICT RETURNING is not supported on this table",
+            )
+        })?;
+    provider
+        .execute_upsert_with_returning(input, proposed_batches, target_columns, action, returning)
+        .await
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)
+}
+
+/// Plan an `INSERT ... RETURNING` against a registered table provider. The
+/// provider must explicitly implement post-image capture; this helper does
+/// not fall back to a count-only insert plan.
+pub(crate) async fn execute_spec_insert_with_returning(
+    table: &Arc<dyn TableProvider>,
+    state: &dyn datafusion::catalog::Session,
+    input: Arc<dyn ExecutionPlan>,
+    returning: DmlReturning,
+) -> Result<Arc<dyn ExecutionPlan>, LixError> {
+    let provider = table
+        .as_any()
+        .downcast_ref::<spec::SpecTableProvider>()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "INSERT RETURNING is not supported on this table",
+            )
+        })?;
+    provider
+        .insert_with_returning(state, input, returning)
+        .await
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)
+}
+
+/// Plan an `UPDATE ... RETURNING` against a registered table provider. The
+/// provider must explicitly implement post-image capture; this helper does
+/// not fall back to a count-only update plan.
+pub(crate) async fn execute_spec_update_with_returning(
+    table: &Arc<dyn TableProvider>,
+    state: &dyn datafusion::catalog::Session,
+    assignments: Vec<(String, datafusion::logical_expr::Expr)>,
+    filters: Vec<datafusion::logical_expr::Expr>,
+    returning: DmlReturning,
+) -> Result<Arc<dyn ExecutionPlan>, LixError> {
+    let provider = table
+        .as_any()
+        .downcast_ref::<spec::SpecTableProvider>()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "UPDATE RETURNING is not supported on this table",
+            )
+        })?;
+    provider
+        .update_with_returning(state, assignments, filters, returning)
+        .await
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)
+}
+
 /// Validate an `INSERT ... ON CONFLICT` against a registered table provider.
 pub(crate) async fn validate_spec_upsert(
     table: &Arc<dyn TableProvider>,

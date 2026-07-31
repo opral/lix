@@ -52,7 +52,7 @@ pub(crate) use exec::{
     execute_read_statement_in_session_from_parsed, execute_transaction_read_statement_from_parsed,
     execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,
     execute_write_logical_plan_value_batch, parameter_record_batch, prepare_read_session,
-    prepare_read_session_at_head,
+    prepare_read_session_at_head, write_plan_requires_post_stage_returning_checkpoint,
 };
 #[cfg(test)]
 pub(crate) use exec::{

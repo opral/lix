@@ -73,12 +73,12 @@ use super::file::{
     file_path_predicate_from_filters, indexed_path_matches,
 };
 use super::spec::{
-    PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch, projected_schema,
-    register_spec_table, row_source,
+    DmlReturning, InsertApply, PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch,
+    projected_schema, register_spec_table, row_source, take_record_batch_rows,
 };
 use super::upsert::{
-    StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertSupport,
-    materialize_omitted_column, validate_target_columns,
+    StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertReturningRow, UpsertSupport,
+    materialize_omitted_column, materialize_omitted_insert_default, validate_target_columns,
 };
 use crate::entity_pk::EntityPk;
 
@@ -236,6 +236,7 @@ pub(super) async fn register_active_write_provider(
     )
 }
 
+#[derive(Clone)]
 struct LixDirectorySpec {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
@@ -243,6 +244,15 @@ struct LixDirectorySpec {
     branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
+}
+
+/// Stable public identity for a directory post-image. By-branch surfaces need
+/// both components; active surfaces operate on one visible branch scope and
+/// intentionally use an empty branch discriminator.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DirectoryReturningKey {
+    id: String,
+    branch_id: String,
 }
 
 impl LixDirectorySpec {
@@ -401,6 +411,91 @@ impl LixDirectorySpec {
                 Ok(source_batch)
             },
         )
+    }
+
+    fn returning_key_from_batch(
+        &self,
+        batch: &RecordBatch,
+        row_index: usize,
+    ) -> Result<DirectoryReturningKey> {
+        Ok(DirectoryReturningKey {
+            id: required_string_value(batch, row_index, "id")?,
+            branch_id: match self.branch_binding {
+                BranchBinding::Active { .. } => String::new(),
+                BranchBinding::Explicit => {
+                    required_string_value(batch, row_index, "lixcol_branch_id")?
+                }
+            },
+        })
+    }
+
+    fn materialize_returning_insert_defaults(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        if !insert_column_is_omitted(batch, "id") {
+            return Ok(batch.clone());
+        }
+        let ids = (0..batch.num_rows())
+            .map(|_| Some(self.functions.call_uuid_v7().to_string()))
+            .collect::<StringArray>();
+        materialize_omitted_insert_default(batch, "id", Arc::new(ids))
+    }
+
+    /// Reload the just-staged rows from the transaction overlay. Filesystem
+    /// paths and audit fields are derived during staging, so applying SQL
+    /// assignments to the pre-image would produce stale `RETURNING *` values.
+    /// Scan the complete directory graph for the relevant branch scope, then
+    /// select the requested identities in write-row order.
+    async fn returning_post_image(
+        &self,
+        write_ctx: &SqlWriteContext,
+        keys: &[DirectoryReturningKey],
+    ) -> Result<RecordBatch> {
+        if keys.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
+        }
+        let mut request = lix_directory_scan_request(
+            self.branch_binding.active_branch_id(),
+            Some(self.schema.as_ref()),
+            None,
+        );
+        if matches!(self.branch_binding, BranchBinding::Explicit) {
+            request.filter.branch_ids = keys
+                .iter()
+                .map(|key| key.branch_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+        let rows = write_ctx
+            .scan_live_state_batch(&request)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        let batch = lix_directory_record_batch(&self.schema, &rows)
+            .map_err(lix_error_to_datafusion_error)?;
+        let mut post_rows = BTreeMap::new();
+        for row_index in 0..batch.num_rows() {
+            let key = self.returning_key_from_batch(&batch, row_index)?;
+            let index = u32::try_from(row_index).map_err(|_| {
+                DataFusionError::Execution("lix_directory RETURNING row index overflow".into())
+            })?;
+            if post_rows.insert(key.clone(), index).is_some() {
+                return Err(DataFusionError::Execution(format!(
+                    "lix_directory RETURNING post-image contains duplicate row for id '{}'",
+                    key.id
+                )));
+            }
+        }
+        let indices = keys
+            .iter()
+            .map(|key| {
+                post_rows.get(key).copied().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "lix_directory RETURNING post-image is missing inserted or updated row '{}'",
+                        key.id
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        take_record_batch_rows(&batch, &indices)
     }
 }
 
@@ -607,6 +702,89 @@ impl TableSpec for LixDirectorySpec {
         Ok(count)
     }
 
+    async fn plan_insert_with_returning(
+        &self,
+        write_ctx: SqlWriteContext,
+        _input: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        returning: DmlReturning,
+    ) -> Result<InsertApply> {
+        let spec = self.clone();
+        Ok(Arc::new(move |batches| {
+            let write_ctx = write_ctx.clone();
+            let spec = spec.clone();
+            let returning = returning.clone();
+            async move {
+                let surface_name = lix_directory_surface_name(&spec.branch_binding);
+                let row_capacity = batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+                    .saturating_mul(3);
+                let mut rows = RawWriteBatch::with_capacity(row_capacity);
+                let mut path_resolvers = None;
+                let mut keys = Vec::new();
+                let mut count = 0_u64;
+                for batch in batches {
+                    let batch = spec.materialize_returning_insert_defaults(&batch)?;
+                    for row_index in 0..batch.num_rows() {
+                        keys.push(spec.returning_key_from_batch(&batch, row_index)?);
+                    }
+                    if path_resolvers.is_none() {
+                        path_resolvers = Some(spec.path_resolvers_for_write(&write_ctx).await?);
+                    }
+                    count = count
+                        .checked_add(u64::try_from(batch.num_rows()).map_err(|_| {
+                            DataFusionError::Execution(
+                                "lix_directory INSERT row count overflow".into(),
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "lix_directory INSERT row count overflow".into(),
+                            )
+                        })?;
+                    if record_batch_has_non_null_column(&batch, "path")? {
+                        rows.append(lix_directory_write_rows_from_batch_with_path_resolvers(
+                            &batch,
+                            spec.branch_binding.active_branch_id(),
+                            surface_name,
+                            path_resolvers
+                                .as_mut()
+                                .expect("path resolver should be initialized"),
+                            &mut || spec.functions.call_uuid_v7().to_string(),
+                        )?);
+                    } else {
+                        rows.append(
+                            lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
+                                &batch,
+                                spec.branch_binding.active_branch_id(),
+                                surface_name,
+                                true,
+                                path_resolvers.as_mut(),
+                                None,
+                            )?,
+                        );
+                    }
+                }
+
+                if !rows.is_empty() {
+                    write_ctx
+                        .stage_write(TransactionWrite::Rows {
+                            mode: TransactionWriteMode::Insert,
+                            rows,
+                        })
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                }
+
+                let post_image = spec.returning_post_image(&write_ctx, &keys).await?;
+                returning.capture(returning.project(&post_image)?);
+                Ok(count)
+            }
+            .boxed()
+        }))
+    }
+
     fn validate_update_assignments(&self, assignments: &[(String, Expr)]) -> Result<()> {
         validate_lix_directory_update_assignments(&self.schema, assignments)
     }
@@ -735,6 +913,72 @@ impl TableSpec for LixDirectorySpec {
             }),
         })
     }
+
+    async fn plan_update_with_returning(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        returning: DmlReturning,
+    ) -> Result<PlannedDml> {
+        let request = self.dml_scan_request(filters).await?;
+        let indexed_matches = self.indexed_path_matches(&request, filters).await?;
+        let captured: Arc<Mutex<Option<RecordBatch>>> = Arc::new(Mutex::new(None));
+        let branch_binding = self.branch_binding.clone();
+        let functions = self.functions.clone();
+        let returning_spec = self.clone();
+        Ok(PlannedDml {
+            source: self.dml_source(&write_ctx, request, indexed_matches, captured),
+            apply: Arc::new(move |matched_batch| {
+                let write_ctx = write_ctx.clone();
+                let branch_binding = branch_binding.clone();
+                let functions = functions.clone();
+                let assignments = assignments.clone();
+                let returning = returning.clone();
+                let returning_spec = returning_spec.clone();
+                async move {
+                    let keys = (0..matched_batch.num_rows())
+                        .map(|row_index| {
+                            returning_spec.returning_key_from_batch(&matched_batch, row_index)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let mut path_resolvers = directory_path_resolvers_from_live_state(
+                        Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                        branch_binding.active_branch_id(),
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                    let write_rows = lix_directory_update_write_rows_from_batch(
+                        &matched_batch,
+                        &assignments,
+                        branch_binding.active_branch_id(),
+                        &mut path_resolvers,
+                        &mut || functions.call_uuid_v7().to_string(),
+                    )?;
+                    let count = u64::try_from(write_rows.len()).map_err(|_| {
+                        DataFusionError::Execution("lix_directory UPDATE row count overflow".into())
+                    })?;
+
+                    if count > 0 {
+                        write_ctx
+                            .stage_write(TransactionWrite::Rows {
+                                mode: TransactionWriteMode::Replace,
+                                rows: write_rows,
+                            })
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                    }
+
+                    let post_image = returning_spec
+                        .returning_post_image(&write_ctx, &keys)
+                        .await?;
+                    returning.capture(returning.project(&post_image)?);
+                    Ok(count)
+                }
+                .boxed()
+            }),
+        })
+    }
 }
 
 #[async_trait]
@@ -849,6 +1093,29 @@ impl UpsertSupport for LixDirectorySpec {
             "lixcol_untracked",
             Arc::new(BooleanArray::from(vec![false; proposed.num_rows()])),
         )
+    }
+
+    async fn materialize_returning_insert_defaults(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        LixDirectorySpec::materialize_returning_insert_defaults(self, proposed)
+    }
+
+    async fn capture_upsert_returning(
+        &self,
+        write_ctx: &SqlWriteContext,
+        affected_rows: Vec<UpsertReturningRow>,
+        returning: DmlReturning,
+    ) -> Result<()> {
+        let keys = affected_rows
+            .iter()
+            .map(|row| self.returning_key_from_batch(row.batch(), row.row_index()))
+            .collect::<Result<Vec<_>>>()?;
+        let post_image = self.returning_post_image(write_ctx, &keys).await?;
+        returning.capture(returning.project(&post_image)?);
+        Ok(())
     }
 
     /// Scan the existing directories that could conflict with `proposed`,

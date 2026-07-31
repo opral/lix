@@ -26,10 +26,13 @@ use datafusion::physical_expr::PhysicalExpr;
 
 use crate::sql2::SqlWriteContext;
 use crate::sql2::error::lix_error_to_datafusion_error;
+use crate::sql2::exec::datafusion::LIX_INSERT_COLUMN_OMITTED_METADATA_KEY;
 use crate::sql2::write_normalization::{insert_column_is_omitted, mark_omitted_insert_columns};
 use crate::transaction::types::{
     RawWriteBatch, TransactionFileData, TransactionWrite, TransactionWriteMode,
 };
+
+use super::spec::DmlReturning;
 
 /// Which `ON CONFLICT` action to take on a conflicting row.
 pub(crate) enum UpsertAction {
@@ -110,6 +113,40 @@ impl StagedUpsert {
     }
 }
 
+/// One logical row affected by an upsert, retained solely to let a provider
+/// recover its exact post-image after the shared driver has staged all writes.
+/// The row comes from the proposed input for an insert and from the existing
+/// batch for a conflict update; either way it retains the stable row identity.
+#[derive(Clone)]
+pub(super) struct UpsertReturningRow {
+    batch: RecordBatch,
+    row_index: usize,
+}
+
+impl UpsertReturningRow {
+    fn proposed(batch: &RecordBatch, row_index: usize) -> Self {
+        Self {
+            batch: batch.clone(),
+            row_index,
+        }
+    }
+
+    fn existing(batch: &RecordBatch, row_index: usize) -> Self {
+        Self {
+            batch: batch.clone(),
+            row_index,
+        }
+    }
+
+    pub(super) fn batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+
+    pub(super) fn row_index(&self) -> usize {
+        self.row_index
+    }
+}
+
 /// The per-table capabilities the generic upsert driver composes. Every method
 /// reuses logic the spec already has for plain INSERT/UPDATE.
 #[async_trait]
@@ -162,6 +199,33 @@ pub(super) trait UpsertSupport: Send + Sync {
         proposed: &RecordBatch,
     ) -> Result<RecordBatch> {
         Ok(proposed.clone())
+    }
+
+    /// Materialize any generated insert identity needed to reload an upsert's
+    /// post-image. Implementations must make that value explicit to their
+    /// insert staging path. The default deliberately rejects so `RETURNING`
+    /// can never silently fall back to a count-only upsert.
+    async fn materialize_returning_insert_defaults(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        _proposed: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        Err(DataFusionError::Execution(
+            "INSERT ON CONFLICT RETURNING is not supported on this table".to_string(),
+        ))
+    }
+
+    /// Capture an upsert's post-image after shared staging has succeeded.
+    /// Filesystem providers reload derived and audit values from the overlay.
+    async fn capture_upsert_returning(
+        &self,
+        _write_ctx: &SqlWriteContext,
+        _affected_rows: Vec<UpsertReturningRow>,
+        _returning: DmlReturning,
+    ) -> Result<()> {
+        Err(DataFusionError::Execution(
+            "INSERT ON CONFLICT RETURNING is not supported on this table".to_string(),
+        ))
     }
 
     /// Scan existing rows whose identity matches a proposed row, returned as a
@@ -276,26 +340,152 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
         }
     }
 
-    if !staged.is_empty() {
-        let write = if staged.file_data.is_empty() {
-            TransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows: staged.rows,
-            }
-        } else {
-            TransactionWrite::RowsWithFileData {
-                mode: TransactionWriteMode::Replace,
-                rows: staged.rows,
-                file_data: staged.file_data,
-                count: affected,
-            }
-        };
-        write_ctx
-            .stage_write(write)
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-    }
+    stage_upsert(write_ctx, staged, affected).await?;
     Ok(affected)
+}
+
+/// Run an upsert that must produce an exact post-image. The shared conflict
+/// algorithm retains the stable identity for every logical insert/update in
+/// input-row order, then asks the provider to reload that post-image from the
+/// transaction overlay once all staged writes are visible.
+pub(super) async fn execute_upsert_with_returning<S: UpsertSupport + ?Sized>(
+    spec: &S,
+    write_ctx: &SqlWriteContext,
+    proposed_batches: Vec<RecordBatch>,
+    target: &UpsertConflictTarget,
+    action: &UpsertAction,
+    returning: DmlReturning,
+) -> Result<u64> {
+    let conflict_columns = target.columns();
+    let mut staged = StagedUpsert::default();
+    let mut affected = 0_u64;
+    let mut returning_rows = Vec::new();
+    let mut normalized_batches = Vec::with_capacity(proposed_batches.len());
+
+    for batch in proposed_batches {
+        let batch = if let Some(explicit_columns) = write_ctx.explicit_insert_columns() {
+            let omitted_columns = batch
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| !explicit_columns.contains(field.name().as_str()))
+                .map(|field| field.name().clone())
+                .collect::<BTreeSet<_>>();
+            mark_omitted_insert_columns(batch, &omitted_columns)?
+        } else {
+            batch
+        };
+        normalized_batches.push(
+            spec.materialize_returning_insert_defaults(write_ctx, &batch)
+                .await?,
+        );
+    }
+
+    for batch in &normalized_batches {
+        spec.validate_proposed_batch(batch)?;
+        let existing = spec
+            .scan_conflict_candidates(write_ctx, batch, target)
+            .await?;
+        let existing_by_identity = index_by_identity(&existing, conflict_columns)?;
+
+        let mut matched_proposed = Vec::new();
+        let mut matched_existing = Vec::new();
+        let mut unmatched_proposed = Vec::new();
+        let mut existing_for_proposed = vec![None; batch.num_rows()];
+        for row in 0..batch.num_rows() {
+            let key = identity_key(batch, row, conflict_columns)?;
+            if let Some(existing_rows) = existing_by_identity.get(&key) {
+                for &existing_row in existing_rows {
+                    spec.validate_conflict_pair(&existing, existing_row, batch, row, target)?;
+                }
+                let existing_row = existing_rows[0];
+                existing_for_proposed[row] = Some(existing_row);
+                matched_proposed.push(row as u64);
+                matched_existing.push(existing_row as u64);
+            } else {
+                unmatched_proposed.push(row as u64);
+            }
+        }
+
+        if !unmatched_proposed.is_empty() {
+            let insert_batch = take_rows(batch, &unmatched_proposed)?;
+            staged.extend(spec.insert_staged_rows(write_ctx, &insert_batch).await?);
+            affected = affected
+                .checked_add(u64::try_from(unmatched_proposed.len()).map_err(|_| {
+                    DataFusionError::Execution("UPSERT row count overflow".to_string())
+                })?)
+                .ok_or_else(|| {
+                    DataFusionError::Execution("UPSERT row count overflow".to_string())
+                })?;
+        }
+
+        if !matched_proposed.is_empty() {
+            if let UpsertAction::DoUpdate { assignments } = action {
+                let existing_matched = take_rows(&existing, &matched_existing)?;
+                let proposed_matched = take_rows(batch, &matched_proposed)?;
+                let proposed_matched = spec
+                    .materialize_excluded_defaults(write_ctx, &proposed_matched)
+                    .await?;
+                let augmented = augment_with_excluded(&existing_matched, &proposed_matched)?;
+                staged.extend(
+                    spec.apply_conflict_update(write_ctx, &augmented, assignments)
+                        .await?,
+                );
+                affected = affected
+                    .checked_add(u64::try_from(matched_proposed.len()).map_err(|_| {
+                        DataFusionError::Execution("UPSERT row count overflow".to_string())
+                    })?)
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("UPSERT row count overflow".to_string())
+                    })?;
+            }
+        }
+
+        // A conflict `DO NOTHING` emits no RETURNING row. All other rows are
+        // kept in SQL input order; the existing row owns an update identity.
+        for (row, existing_row) in existing_for_proposed.into_iter().enumerate() {
+            match (existing_row, action) {
+                (None, _) => returning_rows.push(UpsertReturningRow::proposed(batch, row)),
+                (Some(existing_row), UpsertAction::DoUpdate { .. }) => {
+                    returning_rows.push(UpsertReturningRow::existing(&existing, existing_row));
+                }
+                (Some(_), UpsertAction::DoNothing) => {}
+            }
+        }
+    }
+
+    stage_upsert(write_ctx, staged, affected).await?;
+    spec.capture_upsert_returning(write_ctx, returning_rows, returning)
+        .await?;
+    Ok(affected)
+}
+
+async fn stage_upsert(
+    write_ctx: &SqlWriteContext,
+    staged: StagedUpsert,
+    affected: u64,
+) -> Result<()> {
+    if staged.is_empty() {
+        return Ok(());
+    }
+    let write = if staged.file_data.is_empty() {
+        TransactionWrite::Rows {
+            mode: TransactionWriteMode::Replace,
+            rows: staged.rows,
+        }
+    } else {
+        TransactionWrite::RowsWithFileData {
+            mode: TransactionWriteMode::Replace,
+            rows: staged.rows,
+            file_data: staged.file_data,
+            count: affected,
+        }
+    };
+    write_ctx
+        .stage_write(write)
+        .await
+        .map_err(lix_error_to_datafusion_error)
+        .map(|_| ())
 }
 
 /// Replace one omitted INSERT placeholder with its provider-evaluated default.
@@ -318,6 +508,44 @@ where
     let mut columns = proposed.columns().to_vec();
     columns[column_index] = values;
     RecordBatch::try_new(proposed.schema(), columns).map_err(DataFusionError::from)
+}
+
+/// Materialize a provider default for a plain INSERT and make the column
+/// visible as an explicit value to the staging path. Unlike
+/// [`materialize_omitted_column`], this removes the omission marker: plain
+/// INSERT builders intentionally treat that marker as "generate later", but
+/// a `RETURNING` write needs one stable generated value it can both stage and
+/// read back by identity.
+pub(super) fn materialize_omitted_insert_default<A>(
+    proposed: &RecordBatch,
+    column_name: &str,
+    values: Arc<A>,
+) -> Result<RecordBatch>
+where
+    A: Array + 'static,
+{
+    if !insert_column_is_omitted(proposed, column_name) {
+        return Ok(proposed.clone());
+    }
+    let materialized = materialize_omitted_column(proposed, column_name, values)?;
+    let fields = materialized
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            if field.name() != column_name {
+                return field.as_ref().clone();
+            }
+            let mut metadata = field.metadata().clone();
+            metadata.remove(LIX_INSERT_COLUMN_OMITTED_METADATA_KEY);
+            field.as_ref().clone().with_metadata(metadata)
+        })
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        materialized.schema().metadata().clone(),
+    ));
+    RecordBatch::try_new(schema, materialized.columns().to_vec()).map_err(DataFusionError::from)
 }
 
 pub(super) fn validate_target_columns(

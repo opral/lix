@@ -113,6 +113,7 @@ mod metadata;
 mod read_only;
 mod udfs;
 mod untracked_current_state;
+mod write_returning;
 
 use lix_engine::ExecuteResult;
 use lix_engine::Value;

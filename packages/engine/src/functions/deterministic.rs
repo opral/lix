@@ -1,5 +1,5 @@
 use crate::common::LixTimestamp;
-use crate::functions::FunctionProvider;
+use crate::functions::{FunctionProvider, FunctionProviderCheckpoint};
 
 const DETERMINISTIC_UUID_COUNTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
@@ -56,6 +56,22 @@ impl FunctionProvider for DeterministicFunctionProvider {
 
     fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
         self.highest_seen()
+    }
+
+    fn statement_checkpoint(&self) -> Option<FunctionProviderCheckpoint> {
+        Some(FunctionProviderCheckpoint::DeterministicSequence {
+            next_sequence: self.next_sequence,
+            highest_seen: self.highest_seen,
+        })
+    }
+
+    fn restore_statement_checkpoint(&mut self, checkpoint: FunctionProviderCheckpoint) {
+        let FunctionProviderCheckpoint::DeterministicSequence {
+            next_sequence,
+            highest_seen,
+        } = checkpoint;
+        self.next_sequence = next_sequence;
+        self.highest_seen = highest_seen;
     }
 }
 
@@ -118,5 +134,29 @@ mod tests {
             "01920000-0000-7000-8000-00000000002a"
         );
         assert_eq!(provider.highest_seen(), Some(42));
+    }
+
+    #[test]
+    fn statement_checkpoint_restores_consumed_sequence() {
+        let mut provider = DeterministicFunctionProvider::new(0, false);
+        assert_eq!(
+            provider.uuid_v7().to_string(),
+            "01920000-0000-7000-8000-000000000000"
+        );
+
+        let checkpoint = provider
+            .statement_checkpoint()
+            .expect("deterministic provider should be checkpointable");
+        assert_eq!(
+            provider.uuid_v7().to_string(),
+            "01920000-0000-7000-8000-000000000001"
+        );
+
+        provider.restore_statement_checkpoint(checkpoint);
+        assert_eq!(
+            provider.uuid_v7().to_string(),
+            "01920000-0000-7000-8000-000000000001"
+        );
+        assert_eq!(provider.highest_seen(), Some(1));
     }
 }

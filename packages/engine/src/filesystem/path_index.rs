@@ -1187,6 +1187,16 @@ pub(crate) struct FilesystemPathIndexCache {
 }
 
 impl FilesystemPathIndexCache {
+    /// Evicts transaction-local cached views after restoring an earlier staged
+    /// write checkpoint. Rebuilding from the restored overlay is cheaper and
+    /// safer than cloning potentially large path indexes for an error path.
+    pub(crate) fn clear(&self) {
+        self.entries
+            .lock()
+            .expect("filesystem path cache lock poisoned")
+            .clear();
+    }
+
     pub(crate) fn get(
         &self,
         request: &FilesystemPathIndexRequest,

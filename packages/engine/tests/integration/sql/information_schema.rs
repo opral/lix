@@ -1257,29 +1257,52 @@ simulation_test!(
             assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
         }
 
-        for sql in [
-            "INSERT INTO engine_excluded_typed_default (id, status) \
-             VALUES ('unsupported-returning-insert', 'x') RETURNING id",
-            "UPDATE engine_excluded_typed_default SET status = 'changed' \
-             WHERE id = 'same' RETURNING id",
-        ] {
-            let error = session
-                .execute(sql, &[])
-                .await
-                .expect_err("unsupported entity RETURNING must not be silently ignored");
-            assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{sql}");
-            assert!(error.message.contains("RETURNING"), "{error:?}");
-        }
+        let inserted_returning = session
+            .execute(
+                "INSERT INTO engine_excluded_typed_default (id, status) \
+                 VALUES ('returning-insert', 'x') \
+                 RETURNING id, status AS inserted_status",
+                &[],
+            )
+            .await
+            .expect("entity INSERT RETURNING should expose its final snapshot");
+        assert_eq!(inserted_returning.rows_affected(), 1);
+        assert_eq!(inserted_returning.columns(), ["id", "inserted_status"]);
+        assert_rows_eq(
+            inserted_returning,
+            vec![vec![
+                Value::Text("returning-insert".to_string()),
+                Value::Text("x".to_string()),
+            ]],
+        );
+
+        let updated_returning = session
+            .execute(
+                "UPDATE engine_excluded_typed_default SET status = 'changed' \
+                 WHERE id = 'same' RETURNING id, status AS updated_status",
+                &[],
+            )
+            .await
+            .expect("entity UPDATE RETURNING should expose the post-update snapshot");
+        assert_eq!(updated_returning.rows_affected(), 1);
+        assert_eq!(updated_returning.columns(), ["id", "updated_status"]);
+        assert_rows_eq(
+            updated_returning,
+            vec![vec![
+                Value::Text("same".to_string()),
+                Value::Text("changed".to_string()),
+            ]],
+        );
         assert_rows_eq(
             session
                 .execute(
                     "SELECT id FROM engine_excluded_typed_default \
-                     WHERE id = 'unsupported-returning-insert'",
+                     WHERE id = 'returning-insert'",
                     &[],
                 )
                 .await
-                .expect("rejected INSERT RETURNING must not write"),
-            vec![],
+                .expect("INSERT RETURNING must write its row"),
+            vec![vec![Value::Text("returning-insert".to_string())]],
         );
         assert_rows_eq(
             session
@@ -1288,8 +1311,8 @@ simulation_test!(
                     &[],
                 )
                 .await
-                .expect("rejected UPDATE RETURNING must not write"),
-            vec![vec![Value::Text("old".to_string())]],
+                .expect("UPDATE RETURNING must write its row"),
+            vec![vec![Value::Text("changed".to_string())]],
         );
     }
 );

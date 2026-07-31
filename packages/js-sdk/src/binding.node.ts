@@ -83,15 +83,26 @@ export function openLixBinding(
 					"Memory snapshots are only available in the browser binding",
 				);
 			}
-			return addon.Lix.openMemory(nativeTelemetry);
+			if (nativeTelemetry) return addon.Lix.openMemory(nativeTelemetry);
+			return addon.Lix.openMemory();
 		case "sqlite":
-			return addon.Lix.openSQLite(storage.path, nativeTelemetry);
+			if (nativeTelemetry) {
+				return addon.Lix.openSQLite(storage.path, nativeTelemetry);
+			}
+			return addon.Lix.openSQLite(storage.path);
 		case "localFilesystem":
+			if (nativeTelemetry) {
+				return addon.Lix.openLocalFilesystem(
+					storage.path,
+					storage.lixDir,
+					storage.syncAllFiles,
+					nativeTelemetry,
+				);
+			}
 			return addon.Lix.openLocalFilesystem(
 				storage.path,
 				storage.lixDir,
 				storage.syncAllFiles,
-				nativeTelemetry,
 			);
 	}
 }

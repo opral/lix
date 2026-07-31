@@ -2155,23 +2155,52 @@ where
             if is_read {
                 transaction.ensure_opening_snapshot_is_current().await?;
             }
-            let result = execute_transaction_statement(
-                transaction,
-                sql,
-                statement,
-                params,
-                options,
-                ExecuteStatementMetadata::default(),
-            )
-            .await
-            .map_err(|error| normalize_sql_surface_error(error, sql))?;
-            if is_read {
-                // The query opens its own coherent storage read. Checking on both sides
-                // ensures a concurrent tracked commit cannot leak a newer snapshot
-                // through an older explicit transaction.
-                transaction.ensure_opening_snapshot_is_current().await?;
+            // A successful explicit transaction retains its function provider
+            // until commit. Rewind deterministic runtime state whenever this
+            // statement fails, including errors before a direct RETURNING
+            // write reaches staging.
+            let function_checkpoint = transaction.functions().statement_checkpoint();
+            let result = async {
+                let result = if is_read {
+                    execute_transaction_statement(
+                        transaction,
+                        sql,
+                        statement,
+                        params,
+                        options,
+                        ExecuteStatementMetadata::default(),
+                    )
+                    .await
+                } else {
+                    execute_transaction_write_auto(
+                        transaction,
+                        sql,
+                        statement,
+                        params,
+                        options,
+                        ExecuteStatementMetadata::default(),
+                        true,
+                    )
+                    .await
+                };
+                let result = result.map_err(|error| normalize_sql_surface_error(error, sql))?;
+                if is_read {
+                    // The query opens its own coherent storage read. Checking on both sides
+                    // ensures a concurrent tracked commit cannot leak a newer snapshot
+                    // through an older explicit transaction.
+                    transaction.ensure_opening_snapshot_is_current().await?;
+                }
+                Ok(result)
             }
-            Ok(result)
+            .await;
+            if result.is_err() {
+                if let Some(function_checkpoint) = function_checkpoint {
+                    transaction
+                        .functions()
+                        .restore_statement_checkpoint(function_checkpoint);
+                }
+            }
+            result
         };
         let result = match telemetry.as_ref() {
             Some(telemetry) => telemetry.instrument(operation).await,
@@ -2381,6 +2410,7 @@ async fn execute_transaction_write_auto<StorageImpl>(
     params: &[Value],
     options: ExecuteOptions,
     metadata: ExecuteStatementMetadata,
+    checkpoint_post_stage_returning: bool,
 ) -> Result<ExecuteResult, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -2388,8 +2418,20 @@ where
     let previous_origin_key = transaction.replace_origin_key(options.origin_key);
     let result = async {
         let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
+        let checkpoint = (checkpoint_post_stage_returning
+            && sql2::write_plan_requires_post_stage_returning_checkpoint(&tx_plan))
+        .then(|| transaction.begin_sql_statement_checkpoint())
+        .transpose()?;
         let result =
-            execute_prepared_transaction_write(transaction, tx_plan, params, &metadata).await?;
+            execute_prepared_transaction_write(transaction, tx_plan, params, &metadata).await;
+        if result.is_err() {
+            if let Some(checkpoint) = checkpoint {
+                transaction
+                    .rollback_sql_statement_checkpoint(checkpoint)
+                    .await?;
+            }
+        }
+        let result = result?;
         Ok(ExecuteResult::from_sql_write_result(result))
     }
     .await;
@@ -3301,8 +3343,16 @@ where
 {
     match sql2::bind_statement_route(&statement)? {
         sql2::BoundStatementRoute::Write => {
-            execute_transaction_write_auto(transaction, sql, statement, params, options, metadata)
-                .await
+            execute_transaction_write_auto(
+                transaction,
+                sql,
+                statement,
+                params,
+                options,
+                metadata,
+                false,
+            )
+            .await
         }
         sql2::BoundStatementRoute::Read => transaction
             .execute_read_sql_statement(sql.to_string(), statement, params.to_vec())
