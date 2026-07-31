@@ -48,6 +48,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+[[example]]
+name = "storage_layout"
+path = "examples/storage_layout.rs"
+required-features = ["storage-benches", "slatedb"]
+
 [[test]]
 name = "exact_file_read_benchmark"
 path = "tests/exact_file_read_benchmark.rs"

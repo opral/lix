@@ -20,6 +20,10 @@ use zip::write::SimpleFileOptions;
 
 const PROGRESS_EVERY: usize = 10;
 const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
+const TREE_BLOB_READ_BATCH_ROWS: usize = 8;
+const TREE_TRANSACTION_TARGET_BYTES: usize = 128 * 1024 * 1024;
+const FINAL_VERIFY_MAX_ROWS: usize = 512;
+const FINAL_VERIFY_TARGET_BYTES: usize = 128 * 1024 * 1024;
 // Four SHA-256 `<oid>\n` requests are 260 bytes, below POSIX `PIPE_BUF`.
 // Keeping each flush below that floor lets the caller enqueue a small request
 // window before draining responses without depending on a platform's larger
@@ -95,7 +99,7 @@ struct WriteRow {
     git_oid: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct PreparedBatch {
     deletes: Vec<String>,
     inserts: Vec<WriteRow>,
@@ -112,6 +116,7 @@ struct SqlStatement {
 struct ExpectedFile {
     path: String,
     sha256: Option<String>,
+    size_bytes: Option<usize>,
     git_mode: String,
     git_oid: String,
 }
@@ -225,6 +230,7 @@ struct ReplayProfileReport {
     baseline_seed_parent: Option<String>,
     baseline_seed_ms: f64,
     baseline_seed_files: usize,
+    baseline_seed_batches: usize,
     final_tree_verify_ms: Option<f64>,
     replay_elapsed_ms: f64,
     storage_flush_ms: f64,
@@ -355,6 +361,7 @@ where
         .and_then(|commit| commit.first_parent.clone());
     let mut baseline_seed_ms = 0.0;
     let mut baseline_seed_files = 0usize;
+    let mut baseline_seed_batches = 0usize;
     let seeded_blob_reader = if let Some(parent) = baseline_seed_parent.as_deref() {
         let seed_started = Instant::now();
         let mut blob_reader = GitBlobReader::spawn(&repo_path, args.git_lfs)?;
@@ -367,7 +374,8 @@ where
             args.verify_state,
             &lix,
         )?;
-        baseline_seed_files = seeded;
+        baseline_seed_files = seeded.files;
+        baseline_seed_batches = seeded.batches;
         baseline_seed_ms = duration_to_ms(seed_started.elapsed());
         Some(blob_reader)
     } else {
@@ -558,7 +566,7 @@ where
     }
     if let Some(parent) = &baseline_seed_parent {
         println!(
-            "[git-replay] parent-tree bootstrap excluded from replay timing: {baseline_seed_ms:.3}ms ({baseline_seed_files} files from {parent})"
+            "[git-replay] parent-tree bootstrap excluded from replay timing: {baseline_seed_ms:.3}ms ({baseline_seed_files} files in {baseline_seed_batches} transactions from {parent})"
         );
     }
     println!("[git-replay] replay elapsed: {replay_elapsed_ms:.3}ms");
@@ -592,6 +600,7 @@ where
                 baseline_seed_parent,
                 baseline_seed_ms,
                 baseline_seed_files,
+                baseline_seed_batches,
                 final_tree_verify_ms,
                 replay_elapsed_ms,
                 storage_flush_ms,
@@ -802,6 +811,12 @@ fn resolve_replay_ref_oid(repo_path: &Path, raw: &str) -> Result<String, CliErro
     Ok(oid.to_string())
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SeedResult {
+    files: usize,
+    batches: usize,
+}
+
 fn seed_parent_tree<StorageImpl>(
     repo_path: &Path,
     parent_commit: &str,
@@ -810,18 +825,79 @@ fn seed_parent_tree<StorageImpl>(
     expected_state_by_id: &mut HashMap<String, ExpectedFile>,
     verify_state: bool,
     lix: &Lix<StorageImpl>,
-) -> Result<usize, CliError>
+) -> Result<SeedResult, CliError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let changes = read_tree_snapshot_changes(repo_path, parent_commit)?;
-    let wanted_blob_ids = collect_wanted_blob_ids(&changes);
-    let blob_by_oid = blob_reader.read_blobs(&wanted_blob_ids)?;
-    let prepared = prepare_commit_changes(state, &changes, &blob_by_oid)?;
-    let statements = build_replay_commit_statements(&prepared, DEFAULT_INSERT_BATCH_ROWS);
-    if !statements.is_empty() {
-        execute_statements_as_transaction(lix, &statements, parent_commit)?;
+    let mut pending = PreparedBatch::default();
+    let mut result = SeedResult::default();
+    for change_batch in changes.chunks(TREE_BLOB_READ_BATCH_ROWS) {
+        let wanted_blob_ids = collect_wanted_blob_ids(change_batch);
+        let blob_by_oid = blob_reader.read_blobs(&wanted_blob_ids)?;
+        let prepared = prepare_commit_changes(state, change_batch, &blob_by_oid)?;
+        let pending_bytes = prepared_blob_bytes(&pending);
+        let prepared_bytes = prepared_blob_bytes(&prepared);
+        if pending_bytes > 0
+            && pending_bytes.saturating_add(prepared_bytes) > TREE_TRANSACTION_TARGET_BYTES
+        {
+            let inserted = flush_seed_batch(
+                &mut pending,
+                expected_state_by_id,
+                verify_state,
+                lix,
+                parent_commit,
+            )?;
+            result.files += inserted;
+            result.batches += usize::from(inserted > 0);
+        }
+        append_prepared_batch(&mut pending, prepared);
+        if prepared_blob_bytes(&pending) >= TREE_TRANSACTION_TARGET_BYTES {
+            let inserted = flush_seed_batch(
+                &mut pending,
+                expected_state_by_id,
+                verify_state,
+                lix,
+                parent_commit,
+            )?;
+            result.files += inserted;
+            result.batches += usize::from(inserted > 0);
+        }
     }
+    let inserted = flush_seed_batch(
+        &mut pending,
+        expected_state_by_id,
+        verify_state,
+        lix,
+        parent_commit,
+    )?;
+    result.files += inserted;
+    result.batches += usize::from(inserted > 0);
+    Ok(result)
+}
+
+fn append_prepared_batch(target: &mut PreparedBatch, mut source: PreparedBatch) {
+    target.deletes.append(&mut source.deletes);
+    target.inserts.append(&mut source.inserts);
+    target.updates.append(&mut source.updates);
+}
+
+fn flush_seed_batch<StorageImpl>(
+    pending: &mut PreparedBatch,
+    expected_state_by_id: &mut HashMap<String, ExpectedFile>,
+    verify_state: bool,
+    lix: &Lix<StorageImpl>,
+    parent_commit: &str,
+) -> Result<usize, CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    if pending.deletes.is_empty() && pending.inserts.is_empty() && pending.updates.is_empty() {
+        return Ok(0);
+    }
+    let prepared = std::mem::take(pending);
+    let statements = build_replay_commit_statements(&prepared, DEFAULT_INSERT_BATCH_ROWS);
+    execute_statements_as_transaction(lix, &statements, parent_commit)?;
     if verify_state {
         apply_prepared_to_expected_state(expected_state_by_id, &prepared);
         verify_commit_changes(lix, expected_state_by_id, &prepared, parent_commit)?;
@@ -1826,6 +1902,7 @@ fn apply_prepared_to_expected_state(
             ExpectedFile {
                 path: row.path.clone(),
                 sha256: row.data.as_deref().map(sha256_hex),
+                size_bytes: row.data.as_ref().map(Vec::len),
                 git_mode: row.git_mode.clone(),
                 git_oid: row.git_oid.clone(),
             },
@@ -1933,85 +2010,126 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let tree_changes = read_tree_snapshot_changes(repo_path, commit_sha)?;
-    let blob_by_oid = blob_reader.read_blobs(&collect_wanted_blob_ids(&tree_changes))?;
     let mut expected_by_path = HashMap::<String, ExpectedFile>::with_capacity(tree_changes.len());
-    for change in tree_changes {
-        let path = change
-            .new_path
-            .as_ref()
-            .ok_or_else(|| CliError::msg("Git tree snapshot entry has no path"))?
-            .lix_path();
-        let sha256 = if change.new_is_blob() {
-            let bytes = blob_by_oid.get(&change.new_oid).ok_or_else(|| {
-                CliError::msg(format!(
-                    "Git tree blob {} was not returned for {path}",
-                    change.new_oid
-                ))
-            })?;
-            Some(sha256_hex(bytes))
-        } else {
-            None
-        };
-        if expected_by_path.contains_key(&path) {
-            return Err(CliError::msg(format!(
-                "Git tree snapshot contains duplicate path {path}"
-            )));
+    for change_batch in tree_changes.chunks(TREE_BLOB_READ_BATCH_ROWS) {
+        let blob_by_oid = blob_reader.read_blobs(&collect_wanted_blob_ids(change_batch))?;
+        for change in change_batch {
+            let path = change
+                .new_path
+                .as_ref()
+                .ok_or_else(|| CliError::msg("Git tree snapshot entry has no path"))?
+                .lix_path();
+            let data = if change.new_is_blob() {
+                Some(blob_by_oid.get(&change.new_oid).ok_or_else(|| {
+                    CliError::msg(format!(
+                        "Git tree blob {} was not returned for {path}",
+                        change.new_oid
+                    ))
+                })?)
+            } else {
+                None
+            };
+            if expected_by_path.contains_key(&path) {
+                return Err(CliError::msg(format!(
+                    "Git tree snapshot contains duplicate path {path}"
+                )));
+            }
+            expected_by_path.insert(
+                path.clone(),
+                ExpectedFile {
+                    path,
+                    sha256: data.map(|bytes| sha256_hex(bytes)),
+                    size_bytes: data.map(|bytes| bytes.len()),
+                    git_mode: change.new_mode.clone(),
+                    git_oid: change.new_oid.clone(),
+                },
+            );
         }
-        expected_by_path.insert(
-            path.clone(),
-            ExpectedFile {
-                path,
-                sha256,
-                git_mode: change.new_mode,
-                git_oid: change.new_oid,
-            },
-        );
     }
 
-    let result = db::block_on(lix.execute(
-        "SELECT path, data, lixcol_metadata FROM lix_file \
+    let count = db::block_on(lix.execute(
+        "SELECT COUNT(*) FROM lix_file \
          WHERE path NOT LIKE '/.lix/plugins/%'",
         &[],
     ))
-    .map_err(|error| CliError::msg(format!("failed to query Lix final tree: {error}")))?;
-    let rows = result.rows();
-    if rows.len() != expected_by_path.len() {
+    .map_err(|error| CliError::msg(format!("failed to count Lix final tree: {error}")))?;
+    let lix_count = match count.rows().first().and_then(|row| row.get_index(0)) {
+        Some(Value::Integer(value)) => usize::try_from(*value)
+            .map_err(|_| CliError::msg("Lix final tree count does not fit usize"))?,
+        _ => return Err(CliError::msg("Lix final tree count is not an integer")),
+    };
+    if lix_count != expected_by_path.len() {
         return Err(CliError::msg(format!(
             "final tree mismatch at {commit_sha}: row count differs (lix={}, git={})",
-            rows.len(),
+            lix_count,
             expected_by_path.len()
         )));
     }
 
-    let mut seen = HashSet::with_capacity(rows.len());
-    for (index, row) in rows.iter().enumerate() {
-        let path = value_to_string(
-            row.get_index(0)
-                .ok_or_else(|| CliError::msg(format!("missing final.path[{index}]")))?,
-            &format!("final.path[{index}]"),
-        )?;
-        let data = value_to_optional_blob(
-            row.get_index(1)
-                .ok_or_else(|| CliError::msg(format!("missing final.data[{index}]")))?,
-            &format!("final.data[{index}]"),
-        )?;
-        let metadata = value_to_json(
-            row.get_index(2)
-                .ok_or_else(|| CliError::msg(format!("missing final.metadata[{index}]")))?,
-            &format!("final.metadata[{index}]"),
-        )?;
-        let expected = expected_by_path.get(&path).ok_or_else(|| {
-            CliError::msg(format!(
-                "final tree mismatch at {commit_sha}: unexpected Lix path {path}"
-            ))
-        })?;
-        verify_file_manifest_entry(&path, data, metadata, expected, commit_sha)?;
-        seen.insert(path);
-    }
-    if seen.len() != expected_by_path.len() {
-        return Err(CliError::msg(format!(
-            "final tree mismatch at {commit_sha}: Lix is missing Git paths"
-        )));
+    let mut expected = expected_by_path.values().collect::<Vec<_>>();
+    expected.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    let mut offset = 0usize;
+    while offset < expected.len() {
+        let mut end = offset;
+        let mut expected_bytes = 0usize;
+        while end < expected.len() && end - offset < FINAL_VERIFY_MAX_ROWS {
+            let row_bytes = expected[end].size_bytes.unwrap_or_default();
+            if end > offset && expected_bytes.saturating_add(row_bytes) > FINAL_VERIFY_TARGET_BYTES
+            {
+                break;
+            }
+            expected_bytes = expected_bytes.saturating_add(row_bytes);
+            end += 1;
+        }
+        let batch = &expected[offset..end];
+        let placeholders = vec!["?"; batch.len()].join(", ");
+        let sql = format!(
+            "SELECT path, data, lixcol_metadata FROM lix_file WHERE path IN ({placeholders})"
+        );
+        let params = batch
+            .iter()
+            .map(|expected| Value::Text(expected.path.clone()))
+            .collect::<Vec<_>>();
+        let result = db::block_on(lix.execute(&sql, &params))
+            .map_err(|error| CliError::msg(format!("failed to query Lix final tree: {error}")))?;
+        if result.rows().len() != batch.len() {
+            return Err(CliError::msg(format!(
+                "final tree mismatch at {commit_sha}: expected {} bounded rows, got {}",
+                batch.len(),
+                result.rows().len()
+            )));
+        }
+        let mut seen = HashSet::with_capacity(batch.len());
+        for (index, row) in result.rows().iter().enumerate() {
+            let path = value_to_string(
+                row.get_index(0)
+                    .ok_or_else(|| CliError::msg(format!("missing final.path[{index}]")))?,
+                &format!("final.path[{index}]"),
+            )?;
+            let data = value_to_optional_blob(
+                row.get_index(1)
+                    .ok_or_else(|| CliError::msg(format!("missing final.data[{index}]")))?,
+                &format!("final.data[{index}]"),
+            )?;
+            let metadata = value_to_json(
+                row.get_index(2)
+                    .ok_or_else(|| CliError::msg(format!("missing final.metadata[{index}]")))?,
+                &format!("final.metadata[{index}]"),
+            )?;
+            let expected = expected_by_path.get(&path).ok_or_else(|| {
+                CliError::msg(format!(
+                    "final tree mismatch at {commit_sha}: unexpected Lix path {path}"
+                ))
+            })?;
+            verify_file_manifest_entry(&path, data, metadata, expected, commit_sha)?;
+            seen.insert(path);
+        }
+        if batch.iter().any(|expected| !seen.contains(&expected.path)) {
+            return Err(CliError::msg(format!(
+                "final tree mismatch at {commit_sha}: Lix is missing a bounded Git path"
+            )));
+        }
+        offset = end;
     }
     Ok(())
 }
@@ -2030,6 +2148,11 @@ fn verify_file_manifest_entry(
             )));
         }
     } else {
+        if expected.size_bytes != data.map(<[u8]>::len) {
+            return Err(CliError::msg(format!(
+                "state mismatch at {commit_sha}: byte length differs for path {path}"
+            )));
+        }
         let hash = data.map(sha256_hex);
         if expected.sha256 != hash {
             return Err(CliError::msg(format!(
