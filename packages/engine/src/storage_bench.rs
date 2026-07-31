@@ -369,6 +369,8 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::live_state::HOT_ROW_SPACE,
         crate::live_state::HOT_FILE_SPACE,
         crate::live_state::HOT_DIFF_SPACE,
+        crate::live_state::PACKED_CURRENT_BASE_CONTROL_SPACE,
+        crate::live_state::PACKED_CURRENT_BASE_SPACE,
         crate::live_state::TRACKED_WORKING_DIFF_MARKER_SPACE,
         crate::live_state::CERTIFIED_ENTITY_BATCH_SPACE,
         crate::live_state::CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,

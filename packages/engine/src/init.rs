@@ -39,13 +39,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V26 replaces duplicated selected commit-delta payloads with canonical
-/// references. Opening an older store must fail closed before its differently
-/// framed payload sidecars are decoded as the current layout.
+/// V27 publishes validated creates as branch-scoped immutable current-state
+/// bases instead of manufacturing one mutable HOT row per entity. Opening an
+/// older store must fail closed before its generation-only current-state
+/// layout is interpreted as the branch-scoped layout.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"selected-payload-reference.v26";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"packed-current-base.v27";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately

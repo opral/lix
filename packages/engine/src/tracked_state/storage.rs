@@ -282,7 +282,6 @@ impl<'a> CommitDeltaPayloadIndexRef<'a> {
 }
 
 pub(crate) struct LoadedCommitDeltaEntry {
-    #[cfg(test)]
     pub(crate) value: TrackedStateIndexValue,
     pub(crate) change_record: crate::changelog::ChangeRecord,
     selected_ref: bool,
@@ -1323,7 +1322,6 @@ fn decode_change_at_locator(
     };
     let updated_at = value.updated_at;
     Ok(LoadedCommitDeltaEntry {
-        #[cfg(test)]
         value,
         change_record: crate::changelog::ChangeRecord {
             format_version: 2,
@@ -2217,6 +2215,36 @@ pub(crate) async fn scan_commit_delta_values(
         batch.push_leaf(leaf, commit_id, &requested_schemas)?;
     }
     Ok(batch.finish())
+}
+
+/// Answers schema membership from the packed commit directory.
+///
+/// Segmented commits are decided from manifest bounds without reading any
+/// payload page. Tiny inline commits inspect at most one bounded leaf.
+pub(crate) async fn commit_delta_contains_schema(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_key: &str,
+) -> Result<bool, LixError> {
+    let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
+        return Ok(false);
+    };
+    if let Some(inline_segment) = manifest.inline_segment() {
+        let leaf = decode_commit_delta_leaf(inline_segment, None)?;
+        let mut found = false;
+        visit_commit_delta_leaf(&leaf, commit_id, |entry_index, _, _| {
+            let key = decode_key_shared(
+                leaf.entry_owned(entry_index)
+                    .expect("visited commit-delta leaf entry exists")
+                    .key,
+            )?;
+            found |= key.schema_key.as_str() == schema_key;
+            Ok(())
+        })?;
+        return Ok(found);
+    }
+    let requested = BTreeSet::from([schema_key]);
+    Ok(!commit_delta_segments_for_schemas(&manifest, &requested).is_empty())
 }
 
 /// Scans every authoritative tracked change packed into immutable commit
@@ -3427,7 +3455,6 @@ fn find_loaded_commit_delta_entry(
         origin_key,
     };
     Ok(Some(LoadedCommitDeltaEntry {
-        #[cfg(test)]
         value,
         change_record,
         selected_ref,

@@ -4077,6 +4077,47 @@ mod tests {
             .expect_err("the later normalization error must precede the committed conflict");
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert_eq!(error.details.unwrap()["statementIndex"], 1);
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("packed insert base should checkpoint through its commit reference");
+        assert_eq!(
+            session
+                .execute(
+                    "UPDATE parameter_insert_batch_probe SET value = 'updated-b' WHERE id = 'b'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "DELETE FROM parameter_insert_batch_probe WHERE id = 'a'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        session
+            .create_checkpoint()
+            .await
+            .expect("sparse packed-base overlays should checkpoint");
+        let rows = session
+            .execute(
+                "SELECT id, value FROM parameter_insert_batch_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "b");
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "updated-b");
     }
 
     #[tokio::test]

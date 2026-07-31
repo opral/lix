@@ -2109,8 +2109,42 @@ async fn stage_tracked_head(
                     }),
             );
         }
-        let mut deltas = tracked_deltas;
-        deltas.extend(untracked_deltas);
+        let packed_schema_keys = tracked_deltas
+            .iter()
+            .map(|delta| delta.schema_key)
+            .collect::<BTreeSet<_>>();
+        let can_publish_packed_current_base = !is_checkpoint_publication
+            && certified_fresh_plugin_file_id.is_none()
+            && !host_certified_live_increments.contains_key(&root.branch_id)
+            && staged.selected_change_batches.is_empty()
+            && tracked_deltas.len() == absence_guards.len()
+            && !tracked_deltas.is_empty()
+            && tracked_deltas.iter().all(|delta| {
+                !delta.untracked
+                    && !delta.deleted
+                    && delta.file_id.is_none()
+                    && delta.schema_key
+                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    && delta.commit_id == Some(root.commit_id)
+                    && delta.change_id.is_some()
+            })
+            && untracked_deltas
+                .iter()
+                .all(|delta| !packed_schema_keys.contains(delta.schema_key));
+        tracing::debug!(
+            target: "lix_perf",
+            can_publish_packed_current_base,
+            tracked_delta_count = tracked_deltas.len(),
+            untracked_delta_count = untracked_deltas.len(),
+            absence_guard_count = absence_guards.len(),
+            is_checkpoint_publication,
+            has_certified_file = certified_fresh_plugin_file_id.is_some(),
+            has_certified_counts = host_certified_live_increments.contains_key(&root.branch_id),
+            has_selected_batches = !staged.selected_change_batches.is_empty(),
+            "packed current-base route decision"
+        );
+        let mut deltas = tracked_deltas.clone();
+        deltas.extend_from_slice(&untracked_deltas);
         // Every absence guard above is derived from one of these exact
         // transaction deltas. The fresh-file certificate likewise proves its
         // complete file-scoped namespace absent. The branch-control CAS
@@ -2137,6 +2171,42 @@ async fn stage_tracked_head(
                     "lix.perf.materialization.tracked_head.stage_checkpoint"
                 ))
                 .await?
+        } else if can_publish_packed_current_base {
+            let generation = writer
+                .stage_packed_insert_current_base(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    &tracked_deltas,
+                    &absence_guards,
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_packed_current_base"
+                ))
+                .await?;
+            if !untracked_deltas.is_empty() {
+                writer
+                    .stage_current_state_with_working_diff(
+                        &root.branch_id,
+                        Some(parent_generation),
+                        root.commit_id,
+                        &untracked_deltas,
+                        &BTreeSet::new(),
+                        None,
+                        None,
+                        None,
+                        &mut coverage,
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.materialization.tracked_head.stage_current_overlay"
+                    ))
+                    .await?;
+            }
+            generation
         } else if let Some(certified_live_increments) =
             host_certified_live_increments.get(&root.branch_id)
         {

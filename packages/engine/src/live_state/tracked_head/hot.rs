@@ -47,6 +47,19 @@ pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_0023),
     HOT_COLLECTION_CONTROL_NAMESPACE,
 );
+/// Generation-local immutable current-state bases.
+///
+/// Each tiny record points at one already-authored packed commit delta. Fresh
+/// validated inserts publish the reference instead of duplicating every row
+/// into `HOT_ROW`; later updates and deletes remain sparse HOT overlays.
+pub(crate) const PACKED_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0024),
+    "live_state.packed_current_base.v1",
+);
+pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0025),
+    "live_state.packed_current_base_control.v1",
+);
 const HOT_DENSE_SCAN_MIN_IDENTITIES: usize = 64;
 const HOT_DENSE_SCAN_MAX_OVERREAD: usize = 2;
 const HOT_DIFF_SEGMENT_VERSION: u8 = 1;
@@ -2165,6 +2178,417 @@ fn stage_complete_collection_controls(
     Ok(())
 }
 
+struct PackedCurrentBaseRef {
+    commit_id: CommitId,
+    checkpoint_commit_id: Option<CommitId>,
+    coverage_key: Bytes,
+}
+
+async fn packed_current_base_refs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+) -> Result<Vec<PackedCurrentBaseRef>, LixError> {
+    let prefix = hot_scope_prefix(branch_id, generation);
+    let marker = PointReadPlan::new(
+        PACKED_CURRENT_BASE_CONTROL_SPACE,
+        &[StorageKey(Bytes::copy_from_slice(&prefix))],
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?
+    .value
+    .into_iter()
+    .next()
+    .flatten();
+    if marker.is_none() {
+        return Ok(Vec::new());
+    }
+    let plan = ScanPlan::prefix(
+        PACKED_CURRENT_BASE_SPACE,
+        StoragePrefix {
+            bytes: Bytes::copy_from_slice(&prefix),
+        },
+    );
+    let mut refs = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let bytes = entry.key.0.as_ref();
+            if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
+                return Err(head_value_error(
+                    "packed current-base manifest has an invalid key",
+                ));
+            }
+            let commit_id = CommitId::new(
+                uuid::Uuid::from_slice(&bytes[prefix.len()..])
+                    .map_err(|error| head_value_error(error.to_string()))?,
+            );
+            let checkpoint_bytes = full_value_bytes(entry.value)?;
+            if checkpoint_bytes.len() != 16 {
+                return Err(head_value_error(
+                    "packed current-base manifest has an invalid checkpoint owner",
+                ));
+            }
+            let checkpoint_uuid = uuid::Uuid::from_slice(&checkpoint_bytes)
+                .map_err(|error| head_value_error(error.to_string()))?;
+            refs.push(PackedCurrentBaseRef {
+                commit_id,
+                checkpoint_commit_id: (!checkpoint_uuid.is_nil())
+                    .then(|| CommitId::new(checkpoint_uuid)),
+                coverage_key: entry.key.0,
+            });
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(refs)
+}
+
+async fn packed_current_base_has_schema(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+) -> Result<bool, LixError> {
+    for base_ref in packed_current_base_refs(store, branch_id, generation).await? {
+        if crate::tracked_state::commit_delta_contains_schema(store, base_ref.commit_id, schema_key)
+            .await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn packed_member_matches_filter(
+    member: &crate::tracked_state::CommitDeltaMember,
+    filter: &TrackedStateFilter,
+) -> bool {
+    (filter.schema_keys.is_empty()
+        || filter
+            .schema_keys
+            .iter()
+            .any(|schema_key| schema_key == &member.key.schema_key))
+        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&member.key.entity_pk))
+        && (filter.file_ids.is_empty()
+            || filter.file_ids.iter().any(|filter| match filter {
+                NullableKeyFilter::Any => true,
+                NullableKeyFilter::Null => member.key.file_id.is_none(),
+                NullableKeyFilter::Value(value) => member.key.file_id.as_ref() == Some(value),
+            }))
+}
+
+fn packed_exact_keys_for_filter(filter: &TrackedStateFilter) -> Option<Vec<TrackedStateKey>> {
+    if filter.schema_keys.is_empty() || filter.entity_pks.is_empty() {
+        return None;
+    }
+    let includes_unfiled = filter.file_ids.is_empty()
+        || filter
+            .file_ids
+            .iter()
+            .any(|file_id| matches!(file_id, NullableKeyFilter::Any | NullableKeyFilter::Null));
+    if !includes_unfiled {
+        return Some(Vec::new());
+    }
+    Some(
+        filter
+            .schema_keys
+            .iter()
+            .flat_map(|schema_key| {
+                filter
+                    .entity_pks
+                    .iter()
+                    .map(move |entity_pk| TrackedStateKey {
+                        schema_key: schema_key.clone(),
+                        file_id: None,
+                        entity_pk: entity_pk.clone(),
+                    })
+            })
+            .collect(),
+    )
+}
+
+fn materialize_packed_slot(
+    include: bool,
+    slot: JsonSlot,
+    json_refs: &mut Vec<JsonRef>,
+    deferred: &mut Vec<DeferredJson>,
+    row_index: usize,
+    field: DeferredJsonField,
+) -> Option<SharedStr> {
+    if !include {
+        return None;
+    }
+    match slot {
+        JsonSlot::None => None,
+        JsonSlot::Inline(json) => Some(SharedStr::from(json)),
+        JsonSlot::Ref(json_ref) => {
+            json_refs.push(json_ref);
+            deferred.push(DeferredJson {
+                row_index,
+                field,
+                json_ref,
+            });
+            None
+        }
+    }
+}
+
+async fn scan_packed_current_base_rows(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    request: &TrackedStateScanRequest,
+    limit: Option<usize>,
+) -> Result<MaterializedLiveStateBatch, LixError> {
+    if matches!(limit, Some(0)) {
+        return Ok(MaterializedLiveStateBatch::default());
+    }
+    let base_refs = packed_current_base_refs(store, branch_id, generation).await?;
+    if base_refs.is_empty() {
+        return Ok(MaterializedLiveStateBatch::default());
+    }
+    let mut winners = BTreeMap::new();
+    for base_ref in base_refs {
+        for member in
+            crate::tracked_state::load_commit_delta_members_with_payloads(store, base_ref.commit_id)
+                .await?
+        {
+            if member.value.deleted || !packed_member_matches_filter(&member, &request.filter) {
+                continue;
+            }
+            let identity = (
+                member.key.schema_key.clone(),
+                member.key.entity_pk.clone(),
+                member.key.file_id.clone(),
+            );
+            match winners.entry(identity) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(member);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if entry.get().value.commit_id < member.value.commit_id =>
+                {
+                    entry.insert(member);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+    let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
+    let row_capacity = limit.map_or(winners.len(), |limit| limit.min(winners.len()));
+    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(row_capacity);
+    let mut json_refs = Vec::new();
+    let mut deferred = Vec::new();
+    let global = branch_id == crate::GLOBAL_BRANCH_ID;
+    for (_, member) in winners.into_iter().take(row_capacity) {
+        let row_index = rows.len();
+        let snapshot = materialize_packed_slot(
+            projection.snapshot_content,
+            member.change.snapshot,
+            &mut json_refs,
+            &mut deferred,
+            row_index,
+            DeferredJsonField::Snapshot,
+        );
+        let metadata = materialize_packed_slot(
+            projection.metadata,
+            member.change.metadata,
+            &mut json_refs,
+            &mut deferred,
+            row_index,
+            DeferredJsonField::Metadata,
+        );
+        rows.push_materialized(
+            member.key.entity_pk,
+            member.key.schema_key,
+            member.key.file_id,
+            snapshot,
+            metadata,
+            false,
+            member.value.created_at,
+            member.value.updated_at,
+            global,
+            Some(member.value.change_id),
+            Some(member.value.commit_id),
+            false,
+            branch_id,
+        );
+    }
+    if json_refs.is_empty() {
+        return Ok(rows.finish());
+    }
+    let mut json_values = JsonStoreContext::new()
+        .load_bytes_many(
+            store,
+            JsonLoadRequestRef {
+                refs: &json_refs,
+                scope: JsonReadScopeRef::OutOfBand,
+            },
+        )
+        .await?
+        .into_values();
+    for (index, deferred) in deferred.into_iter().enumerate() {
+        let bytes = json_values
+            .get_mut(index)
+            .and_then(Option::take)
+            .ok_or_else(|| head_value_error("packed current-base JSON payload is missing"))?;
+        let json = SharedStr::from_utf8(bytes)
+            .map_err(|error| head_value_error(format!("packed JSON is not UTF-8: {error}")))?;
+        match deferred.field {
+            DeferredJsonField::Snapshot => rows.set_snapshot_content(deferred.row_index, json),
+            DeferredJsonField::Metadata => rows.set_metadata(deferred.row_index, json),
+        }
+    }
+    Ok(rows.finish())
+}
+
+async fn load_packed_current_base_exact(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    keys: &[TrackedStateKeyRef<'_>],
+    projection: ChangeRecordProjection,
+) -> Result<MaterializedLiveStateExactBatch, LixError> {
+    if keys.is_empty() {
+        return MaterializedLiveStateExactBatch::new(
+            MaterializedLiveStateBatch::default(),
+            Vec::new(),
+        );
+    }
+    let base_refs = packed_current_base_refs(store, branch_id, generation).await?;
+    if base_refs.is_empty() {
+        return MaterializedLiveStateExactBatch::new(
+            MaterializedLiveStateBatch::default(),
+            vec![None; keys.len()],
+        );
+    }
+    let owned_keys = keys
+        .iter()
+        .map(|key| TrackedStateKey {
+            schema_key: key.schema_key.to_owned(),
+            file_id: key.file_id.map(str::to_owned),
+            entity_pk: key.entity_pk.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut requests = Vec::with_capacity(base_refs.len().saturating_mul(keys.len()));
+    for base_ref in &base_refs {
+        requests.extend(
+            owned_keys
+                .iter()
+                .cloned()
+                .map(|key| (base_ref.commit_id, key)),
+        );
+    }
+    let loaded = crate::tracked_state::load_owned_commit_delta_entries(store, &requests).await?;
+    let mut winners = (0..keys.len()).map(|_| None).collect::<Vec<
+        Option<(
+            crate::tracked_state::TrackedStateIndexValue,
+            crate::changelog::ChangeRecord,
+        )>,
+    >>();
+    for entries in loaded.chunks(keys.len()) {
+        for (slot, entry) in winners.iter_mut().zip(entries) {
+            let Some(entry) = entry else {
+                continue;
+            };
+            if slot
+                .as_ref()
+                .is_none_or(|(previous, _)| previous.commit_id < entry.value.commit_id)
+            {
+                *slot = Some((entry.value.clone(), entry.change_record.clone()));
+            }
+        }
+    }
+
+    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
+    let mut slots = Vec::with_capacity(keys.len());
+    let mut json_refs = Vec::new();
+    let mut deferred = Vec::new();
+    let global = branch_id == crate::GLOBAL_BRANCH_ID;
+    for entry in winners {
+        let Some((value, change_record)) = entry else {
+            slots.push(None);
+            continue;
+        };
+        if value.deleted {
+            slots.push(None);
+            continue;
+        }
+        let row_index = rows.len();
+        let snapshot = materialize_packed_slot(
+            projection.snapshot_content,
+            change_record.snapshot,
+            &mut json_refs,
+            &mut deferred,
+            row_index,
+            DeferredJsonField::Snapshot,
+        );
+        let metadata = materialize_packed_slot(
+            projection.metadata,
+            change_record.metadata,
+            &mut json_refs,
+            &mut deferred,
+            row_index,
+            DeferredJsonField::Metadata,
+        );
+        slots.push(Some(u32::try_from(row_index).map_err(|_| {
+            head_value_error("packed exact row count exceeds u32")
+        })?));
+        rows.push_materialized(
+            change_record.entity_pk,
+            change_record.schema_key,
+            change_record.file_id,
+            snapshot,
+            metadata,
+            false,
+            value.created_at,
+            value.updated_at,
+            global,
+            Some(value.change_id),
+            Some(value.commit_id),
+            false,
+            branch_id,
+        );
+    }
+    if !json_refs.is_empty() {
+        let mut json_values = JsonStoreContext::new()
+            .load_bytes_many(
+                store,
+                JsonLoadRequestRef {
+                    refs: &json_refs,
+                    scope: JsonReadScopeRef::OutOfBand,
+                },
+            )
+            .await?
+            .into_values();
+        for (index, deferred) in deferred.into_iter().enumerate() {
+            let bytes = json_values
+                .get_mut(index)
+                .and_then(Option::take)
+                .ok_or_else(|| head_value_error("packed exact JSON payload is missing"))?;
+            let json = SharedStr::from_utf8(bytes)
+                .map_err(|error| head_value_error(format!("packed JSON is not UTF-8: {error}")))?;
+            match deferred.field {
+                DeferredJsonField::Snapshot => rows.set_snapshot_content(deferred.row_index, json),
+                DeferredJsonField::Metadata => rows.set_metadata(deferred.row_index, json),
+            }
+        }
+    }
+    MaterializedLiveStateExactBatch::new(rows.finish(), slots)
+}
+
 /// Direct reader for one published hot generation.
 pub(crate) struct HotStateStoreReader<S> {
     pub(super) store: S,
@@ -2256,6 +2680,11 @@ where
         // path staying free of unrelated storage scans.
         if schema_key.starts_with("lix_") {
             return Ok(false);
+        }
+        if packed_current_base_has_schema(&self.store, branch_id, control.generation, schema_key)
+            .await?
+        {
+            return Ok(true);
         }
         let certified = scan_certified_entity_batch_rows(
             &self.store,
@@ -2354,16 +2783,109 @@ where
         let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
         let rows =
             materialize_hot_scan_entries(&self.store, entries, projection, branch_id).await?;
-        let overlay_identities = rows
+        let rows = rows.filter(
+            |row| {
+                replaced_generation.is_none_or(|control| {
+                    row.commit_id()
+                        .is_some_and(|commit_id| commit_id > control.active_generation)
+                })
+            },
+            None,
+        );
+        let overlay_commits = rows
             .iter()
             .map(|row| {
                 (
-                    row.schema_key().to_owned(),
-                    row.entity_pk().clone(),
-                    row.file_id().map(str::to_owned),
+                    (
+                        row.schema_key().to_owned(),
+                        row.entity_pk().clone(),
+                        row.file_id().map(str::to_owned),
+                    ),
+                    row.commit_id(),
                 )
             })
-            .collect::<BTreeSet<_>>();
+            .collect::<BTreeMap<_, _>>();
+        let packed_limit = if overlay_commits.is_empty() {
+            request.limit.map(|limit| limit.saturating_sub(rows.len()))
+        } else {
+            None
+        };
+        let packed_rows = if let Some(keys) = packed_exact_keys_for_filter(&request.filter) {
+            let key_refs = keys
+                .iter()
+                .map(|key| TrackedStateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                })
+                .collect::<Vec<_>>();
+            load_packed_current_base_exact(
+                &self.store,
+                branch_id,
+                generation,
+                &key_refs,
+                projection,
+            )
+            .await?
+            .into_present_batch()
+            .filter(|_| true, packed_limit)
+        } else {
+            scan_packed_current_base_rows(&self.store, branch_id, generation, request, packed_limit)
+                .await?
+        }
+        .filter(
+            |row| {
+                overlay_commits.is_empty() || {
+                    let identity = (
+                        row.schema_key().to_owned(),
+                        row.entity_pk().clone(),
+                        row.file_id().map(str::to_owned),
+                    );
+                    overlay_commits.get(&identity).is_none_or(|overlay_commit| {
+                        overlay_commit.is_some_and(|overlay_commit| {
+                            row.commit_id()
+                                .is_some_and(|packed_commit| packed_commit > overlay_commit)
+                        })
+                    })
+                }
+            },
+            None,
+        );
+        let packed_commits = if rows.is_empty() {
+            BTreeMap::new()
+        } else {
+            packed_rows
+                .iter()
+                .map(|row| {
+                    (
+                        (
+                            row.schema_key().to_owned(),
+                            row.entity_pk().clone(),
+                            row.file_id().map(str::to_owned),
+                        ),
+                        row.commit_id(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let rows = rows.filter(
+            |row| {
+                packed_commits.is_empty() || {
+                    let identity = (
+                        row.schema_key().to_owned(),
+                        row.entity_pk().clone(),
+                        row.file_id().map(str::to_owned),
+                    );
+                    packed_commits.get(&identity).is_none_or(|packed_commit| {
+                        !packed_commit.is_some_and(|packed_commit| {
+                            row.commit_id()
+                                .is_some_and(|overlay_commit| packed_commit > overlay_commit)
+                        })
+                    })
+                }
+            },
+            None,
+        );
         // Format plugins cannot publish engine-owned schemas. Do not even
         // inspect certified semantic manifests for a scan that can only match
         // engine rows such as file descriptors or blob materializations.
@@ -2381,7 +2903,7 @@ where
                 branch_id,
                 generation,
                 request,
-                if overlay_identities.is_empty() {
+                if overlay_commits.is_empty() {
                     request.limit.map(|limit| limit.saturating_sub(rows.len()))
                 } else {
                     None
@@ -2390,26 +2912,46 @@ where
             .await?
             .filter(
                 |row| {
-                    !overlay_identities
-                        .iter()
-                        .any(|(schema_key, entity_pk, file_id)| {
-                            schema_key == row.schema_key()
-                                && entity_pk == row.entity_pk()
-                                && file_id.as_deref() == row.file_id()
-                        })
+                    overlay_commits.is_empty() || {
+                        let identity = (
+                            row.schema_key().to_owned(),
+                            row.entity_pk().clone(),
+                            row.file_id().map(str::to_owned),
+                        );
+                        overlay_commits.get(&identity).is_none()
+                    }
                 },
                 None,
             )
         };
-        let rows = if certified_rows.is_empty() {
-            rows
-        } else if rows.is_empty() {
+        let certified_rows = if certified_rows.is_empty() || packed_rows.is_empty() {
             certified_rows
         } else {
-            let mut combined = rows.into_rows();
-            combined.extend(certified_rows.into_rows());
-            MaterializedLiveStateBatch::from_rows(combined)
+            let packed_identities = packed_rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.schema_key().to_owned(),
+                        row.entity_pk().clone(),
+                        row.file_id().map(str::to_owned),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            certified_rows.filter(
+                |row| {
+                    !packed_identities.contains(&(
+                        row.schema_key().to_owned(),
+                        row.entity_pk().clone(),
+                        row.file_id().map(str::to_owned),
+                    ))
+                },
+                None,
+            )
         };
+        let mut combined = rows.into_rows();
+        combined.extend(packed_rows.into_rows());
+        combined.extend(certified_rows.into_rows());
+        let rows = MaterializedLiveStateBatch::from_rows(combined);
         if request.filter.include_tombstones
             && request.limit.is_none()
             && replaced_generation.is_none()
@@ -2566,14 +3108,7 @@ where
             }));
         }
         let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
-        if slots.iter().all(Option::is_some) {
-            return MaterializedLiveStateExactBatch::new(rows, slots);
-        }
-        if replaced_generation.is_some()
-            || keys.iter().all(|key| key.schema_key.starts_with("lix_"))
-        {
-            return MaterializedLiveStateExactBatch::new(rows, slots);
-        }
+        let engine_owned_only = keys.iter().all(|key| key.schema_key.starts_with("lix_"));
 
         // Certified immutable segments deliberately do not manufacture one
         // HOT_ROW entry per semantic row. Exact validation reads still need
@@ -2607,26 +3142,51 @@ where
             },
             limit: None,
         };
-        let certified = scan_certified_entity_batch_rows(
-            &self.store,
-            branch_id,
-            generation,
-            &certified_request,
-            None,
-        )
-        .await?;
-        if certified.is_empty() {
-            return MaterializedLiveStateExactBatch::new(rows, slots);
-        }
-
+        let packed =
+            load_packed_current_base_exact(&self.store, branch_id, generation, keys, *projection)
+                .await?;
+        let certified = if engine_owned_only {
+            MaterializedLiveStateBatch::default()
+        } else {
+            scan_certified_entity_batch_rows(
+                &self.store,
+                branch_id,
+                generation,
+                &certified_request,
+                None,
+            )
+            .await?
+        };
         let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
         let mut combined_slots = Vec::with_capacity(keys.len());
-        for (key, slot) in keys.iter().zip(slots) {
-            let row = slot.and_then(|slot| rows.get(slot as usize)).or_else(|| {
-                certified.iter().find(|row| {
-                    row.schema_key() == key.schema_key
-                        && row.entity_pk() == key.entity_pk
-                        && row.file_id() == key.file_id
+        for (index, (key, slot)) in keys.iter().zip(slots).enumerate() {
+            let mut row = slot.and_then(|slot| rows.get(slot as usize));
+            for candidate in [
+                packed.row(index),
+                certified.iter().find(|candidate| {
+                    candidate.schema_key() == key.schema_key
+                        && candidate.entity_pk() == key.entity_pk
+                        && candidate.file_id() == key.file_id
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if row.is_none_or(
+                    |current| match (current.commit_id(), candidate.commit_id()) {
+                        (Some(current), Some(candidate)) => candidate > current,
+                        (None, Some(_)) => false,
+                        (Some(_), None) => false,
+                        (None, None) => false,
+                    },
+                ) {
+                    row = Some(candidate);
+                }
+            }
+            let row = row.filter(|row| {
+                replaced_generation.is_none_or(|control| {
+                    row.commit_id()
+                        .is_some_and(|commit_id| commit_id > control.active_generation)
                 })
             });
             combined_slots.push(
@@ -2733,85 +3293,47 @@ where
         if matches!(limit, Some(0)) {
             return Ok(Vec::new());
         }
-        let collection_control = load_hot_collection_control(
-            &self.store,
-            branch_id,
-            generation,
-            crate::collection_generation::CollectionScopeRef {
-                schema_key,
-                file_id: None,
-            },
-        )
-        .await?;
-        let replaced_generation =
-            (collection_control.active_generation != generation).then_some(collection_control);
-        if replaced_generation.is_some_and(|control| control.live_count == 0) {
-            return Ok(Vec::new());
-        }
-        let use_finite_batch = !entity_pks.is_empty()
-            && !hot_schema_has_file_member(&self.store, branch_id, generation, schema_key).await?;
-        let fallback_filter = (!use_finite_batch).then(|| TrackedStateFilter {
-            schema_keys: vec![schema_key.to_string()],
-            entity_pks: entity_pks.to_vec(),
-            include_tombstones: false,
-            ..TrackedStateFilter::default()
-        });
-        let entries = if use_finite_batch {
-            let identities = FiniteHotIdentityBatchRef::new(
+        let rows = self
+            .scan_live_batch_for_generation(
                 branch_id,
                 generation,
-                schema_key,
-                entity_pks.iter().collect(),
-                vec![None],
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![schema_key.to_owned()],
+                        entity_pks: entity_pks.to_vec(),
+                        include_tombstones: false,
+                        ..TrackedStateFilter::default()
+                    },
+                    read_columns: TrackedStateReadColumns {
+                        columns: vec!["snapshot_content".to_owned()],
+                    },
+                    limit,
+                },
             )
-            .expect("a borrowed entity slice has a representable finite identity count");
-            HotScanEntries::Finite(
-                hot_scan_finite_identity_batches(&self.store, vec![identities], None).await?,
-            )
-        } else {
-            hot_scan_entries(
-                &self.store,
-                branch_id,
-                generation,
-                fallback_filter
-                    .as_ref()
-                    .expect("non-finite snapshots retain their fallback filter"),
-                None,
-            )
-            .await?
-        };
-        let mut snapshots = Vec::new();
-        let mut json_refs = Vec::new();
-        let mut deferred = Vec::new();
-        for bytes in hot_scan_values_in_logical_order(entries) {
-            let value = decode_head_value(&bytes)?;
-            if value.deleted
-                || replaced_generation.is_some_and(|control| {
-                    value
-                        .commit_id
-                        .is_none_or(|commit_id| commit_id <= control.active_generation)
-                })
-            {
-                continue;
-            }
-            let row_index = snapshots.len();
-            match value.snapshot {
-                HeadSlotView::None => snapshots.push(None),
-                HeadSlotView::Inline(snapshot)
-                | HeadSlotView::InlineFingerprinted { json: snapshot, .. } => {
-                    snapshots.push(Some(bytes.slice_ref(snapshot.as_bytes())));
-                }
-                HeadSlotView::Ref(json_ref) => {
-                    snapshots.push(None);
-                    json_refs.push(json_ref);
-                    deferred.push((row_index, json_ref));
-                }
-            }
-            if limit.is_some_and(|limit| snapshots.len() >= limit) {
-                break;
-            }
+            .await?;
+        let mut ordinals = (0..rows.len()).collect::<Vec<_>>();
+        if !ordinals.is_sorted_by(|left, right| {
+            let left = rows.row(*left);
+            let right = rows.row(*right);
+            left.entity_pk() < right.entity_pk()
+                || (left.entity_pk() == right.entity_pk() && left.file_id() <= right.file_id())
+        }) {
+            ordinals.sort_unstable_by(|left, right| {
+                let left = rows.row(*left);
+                let right = rows.row(*right);
+                left.entity_pk()
+                    .cmp(right.entity_pk())
+                    .then_with(|| left.file_id().cmp(&right.file_id()))
+            });
         }
-        materialize_entity_snapshot_refs(&self.store, snapshots, json_refs, deferred).await
+        Ok(ordinals
+            .into_iter()
+            .map(|ordinal| {
+                let row = rows.row(ordinal);
+                row.snapshot_content()
+                    .map(|snapshot| Bytes::copy_from_slice(snapshot.as_bytes()))
+            })
+            .collect())
     }
 }
 
@@ -2889,6 +3411,127 @@ impl<S> HotStateWriter<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    /// Publishes validated, tracked, unfiled creates as an immutable base.
+    ///
+    /// The commit-delta plane already owns the sorted identities and payloads,
+    /// so manufacturing an equivalent HOT value and backend mutation for every
+    /// row is pure write amplification. This path retains only collection
+    /// counts plus one generation-to-commit reference. Ordinary mutations
+    /// continue to shadow the base through HOT rows.
+    pub(crate) async fn stage_packed_insert_current_base(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        new_head: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        absence_guards: &[TrackedStateKeyRef<'_>],
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<CommitId, LixError> {
+        if deltas.is_empty() || deltas.len() != absence_guards.len() {
+            return Err(head_value_error(
+                "packed current base requires one absence proof per inserted row",
+            ));
+        }
+        let mut sorted = deltas.iter().collect::<Vec<_>>();
+        for delta in &sorted {
+            delta.validate()?;
+            if delta.untracked
+                || delta.deleted
+                || delta.file_id.is_some()
+                || delta.commit_id != Some(new_head)
+                || delta.change_id.is_none()
+            {
+                return Err(head_value_error(
+                    "packed current base accepts only live tracked unfiled creates",
+                ));
+            }
+        }
+        sorted.sort_unstable_by(|left, right| compare_hot_deltas(left, right));
+        if sorted
+            .windows(2)
+            .any(|pair| compare_hot_deltas(pair[0], pair[1]).is_eq())
+        {
+            return Err(current_state_duplicate_delta_error(sorted[1]));
+        }
+        let mut guarded = absence_guards
+            .iter()
+            .map(|guard| (guard.schema_key, guard.entity_pk, guard.file_id))
+            .collect::<Vec<_>>();
+        guarded.sort_unstable();
+        if sorted
+            .iter()
+            .map(|delta| (delta.schema_key, delta.entity_pk, delta.file_id))
+            .ne(guarded)
+        {
+            return Err(head_value_error(
+                "packed current base rows do not exactly match their validated absence proofs",
+            ));
+        }
+
+        let mut manifest_key = hot_scope_prefix(branch_id, generation);
+        manifest_key.reserve(16);
+        manifest_key.extend_from_slice(new_head.as_uuid().as_bytes());
+        if working_diff_capture_checkpoint_commit_id.is_some() {
+            coverage
+                .add_encoded_group_key(&manifest_key)
+                .ok_or_else(|| head_value_error("packed current-base diff count exceeds u64"))?;
+        }
+
+        let mut schema_increments = BTreeMap::<&str, u64>::new();
+        for delta in &sorted {
+            let increment = schema_increments.entry(delta.schema_key).or_default();
+            *increment = increment
+                .checked_add(1)
+                .ok_or_else(|| head_value_error("packed current-base row count exceeds u64"))?;
+        }
+        let scopes = schema_increments
+            .keys()
+            .map(
+                |schema_key| crate::collection_generation::CollectionScopeRef {
+                    schema_key,
+                    file_id: None,
+                },
+            )
+            .collect::<Vec<_>>();
+        let controls =
+            load_hot_collection_controls(self.store, branch_id, generation, &scopes).await?;
+        for ((schema_key, increment), mut control) in schema_increments.into_iter().zip(controls) {
+            control.live_count = control
+                .live_count
+                .checked_add(increment)
+                .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
+            stage_hot_collection_control(
+                self.writes,
+                branch_id,
+                generation,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key,
+                    file_id: None,
+                },
+                control,
+            )?;
+        }
+        self.writes.put(
+            PACKED_CURRENT_BASE_SPACE,
+            StorageKey(Bytes::from(manifest_key)),
+            StorageValue {
+                bytes: working_diff_capture_checkpoint_commit_id.map_or_else(
+                    || Bytes::from_static(&[0; 16]),
+                    |checkpoint| Bytes::copy_from_slice(checkpoint.as_uuid().as_bytes()),
+                ),
+            },
+        );
+        self.writes.put(
+            PACKED_CURRENT_BASE_CONTROL_SPACE,
+            StorageKey(Bytes::from(hot_scope_prefix(branch_id, generation))),
+            StorageValue {
+                bytes: Bytes::from_static(&[1]),
+            },
+        );
+        Ok(generation)
+    }
+
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn stage_commit(
         &mut self,
@@ -3224,6 +3867,68 @@ where
             })
             .collect::<Vec<_>>();
         debug_assert_eq!(loaded_previous_values.len(), 0);
+        let previous_keys = sorted
+            .iter()
+            .map(|delta| TrackedStateKeyRef {
+                schema_key: delta.schema_key,
+                entity_pk: delta.entity_pk,
+                file_id: delta.file_id,
+            })
+            .collect::<Vec<_>>();
+        let packed_previous = load_packed_current_base_exact(
+            self.store,
+            branch_id,
+            generation,
+            &previous_keys,
+            ChangeRecordProjection::full(),
+        )
+        .await?;
+        for (index, previous) in previous_values.iter_mut().enumerate() {
+            let Some(packed) = packed_previous.row(index) else {
+                continue;
+            };
+            let packed_is_newer = match (
+                previous.as_deref().map(decode_head_value).transpose()?,
+                packed.commit_id(),
+            ) {
+                (None, Some(_)) => true,
+                (Some(previous), Some(packed)) => {
+                    previous.commit_id.is_some_and(|previous| packed > previous)
+                }
+                _ => false,
+            };
+            if !packed_is_newer {
+                continue;
+            }
+            *previous = Some(Bytes::from(encode_head_value(&HeadValueRef {
+                change_id: packed.change_id(),
+                commit_id: packed.commit_id(),
+                untracked: packed.untracked(),
+                deleted: packed.deleted(),
+                created_at: packed.created_at(),
+                updated_at: packed.updated_at(),
+                snapshot: packed
+                    .snapshot_content()
+                    .map_or(JsonSlotRef::None, |snapshot| {
+                        JsonSlotRef::Inline(snapshot.as_str())
+                    }),
+                metadata: packed.metadata().map_or(JsonSlotRef::None, |metadata| {
+                    JsonSlotRef::Inline(metadata.as_str())
+                }),
+                working_diff_baseline: if working_diff_capture_checkpoint_commit_id.is_some()
+                    && !packed.untracked()
+                {
+                    // Checkpoints publish complete HOT rows. Therefore a
+                    // packed base in an active checkpoint generation was
+                    // created after that checkpoint and has an absent before
+                    // image; its O(1) manifest already owns the dirty-key
+                    // coverage.
+                    WorkingDiffBaseline::BeforeAbsent
+                } else {
+                    WorkingDiffBaseline::Disabled
+                },
+            })?));
+        }
         let mut collection_controls =
             load_incremental_collection_controls(self.store, branch_id, generation, &sorted)
                 .await?;
@@ -5250,19 +5955,6 @@ async fn materialize_hot_scan_entries(
     }
 }
 
-fn hot_scan_values_in_logical_order(entries: HotScanEntries<'_>) -> Vec<Bytes> {
-    match entries {
-        HotScanEntries::Decoded(mut entries) => {
-            entries.sort_by(|left, right| left.0.cmp(&right.0));
-            entries.into_iter().map(|(_, value)| value).collect()
-        }
-        HotScanEntries::Finite(batches) => batches
-            .into_iter()
-            .flat_map(|batch| batch.values.into_iter().flatten())
-            .collect(),
-    }
-}
-
 async fn hot_load_identity_ref_bytes(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -5379,6 +6071,37 @@ fn working_diff_baseline_before(
     }
 }
 
+fn packed_working_diff_slot(slot: &JsonSlot) -> WorkingDiffSlotFingerprint {
+    match slot {
+        JsonSlot::None => WorkingDiffSlotFingerprint {
+            kind: WORKING_DIFF_SLOT_NONE,
+            hash: [0; JSON_REF_BYTES],
+        },
+        JsonSlot::Ref(json_ref) => WorkingDiffSlotFingerprint {
+            kind: WORKING_DIFF_SLOT_REF,
+            hash: *json_ref.as_hash_array(),
+        },
+        JsonSlot::Inline(json) => WorkingDiffSlotFingerprint {
+            kind: WORKING_DIFF_SLOT_INLINE,
+            hash: *JsonRef::for_content(json.as_bytes()).as_hash_array(),
+        },
+    }
+}
+
+fn packed_working_diff_version(
+    member: &crate::tracked_state::CommitDeltaMember,
+) -> WorkingDiffVersion {
+    WorkingDiffVersion {
+        change_id: member.value.change_id,
+        commit_id: member.value.commit_id,
+        deleted: member.value.deleted,
+        created_at: member.value.created_at,
+        updated_at: member.value.updated_at,
+        snapshot: packed_working_diff_slot(&member.change.snapshot),
+        metadata: packed_working_diff_slot(&member.change.metadata),
+    }
+}
+
 /// Resolves a checkpoint diff from row-local first-before images. Broad diffs
 /// enumerate the sparse dirty-key index; finite PK queries read only the
 /// primary rows that can answer the request.
@@ -5390,7 +6113,12 @@ async fn hot_working_diff_entries(
     expected_coverage: WorkingDiffIndexCoverage,
     filter: &TrackedStateFilter,
 ) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
-    if !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
+    let packed_refs = packed_current_base_refs(store, branch_id, generation).await?;
+    let packed_refs = packed_refs
+        .into_iter()
+        .filter(|base| base.checkpoint_commit_id == Some(checkpoint_commit_id))
+        .collect::<Vec<_>>();
+    if packed_refs.is_empty() && !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
         return hot_working_diff_entries_for_finite_filter(store, branch_id, generation, filter)
             .await;
     }
@@ -5403,7 +6131,7 @@ async fn hot_working_diff_entries(
         },
     );
     let mut actual_coverage = WorkingDiffIndexCoverage::default();
-    let mut selected = Vec::<HeadIdentity>::new();
+    let mut selected = BTreeMap::<HeadIdentity, Option<WorkingDiffVersion>>::new();
     let mut resume_after = None;
     loop {
         let page = plan
@@ -5432,13 +6160,16 @@ async fn hot_working_diff_entries(
                     return Ok(None);
                 };
                 if matches_filter(&identity, filter) {
-                    selected.push(HeadIdentity {
-                        branch_id: branch_id.to_string(),
-                        generation,
-                        schema_key: identity.schema_key,
-                        entity_pk: identity.entity_pk,
-                        file_id: identity.file_id,
-                    });
+                    selected.insert(
+                        HeadIdentity {
+                            branch_id: branch_id.to_string(),
+                            generation,
+                            schema_key: identity.schema_key,
+                            entity_pk: identity.entity_pk,
+                            file_id: identity.file_id,
+                        },
+                        None,
+                    );
                 }
                 continue;
             }
@@ -5451,13 +6182,16 @@ async fn hot_working_diff_entries(
             let decoded =
                 visit_hot_diff_segment(&bytes, &scope, &mut actual_coverage, |identity| {
                     if matches_filter(&identity, filter) {
-                        selected.push(HeadIdentity {
-                            branch_id: branch_id.to_string(),
-                            generation,
-                            schema_key: identity.schema_key,
-                            entity_pk: identity.entity_pk,
-                            file_id: identity.file_id,
-                        });
+                        selected.insert(
+                            HeadIdentity {
+                                branch_id: branch_id.to_string(),
+                                generation,
+                                schema_key: identity.schema_key,
+                                entity_pk: identity.entity_pk,
+                                file_id: identity.file_id,
+                            },
+                            None,
+                        );
                     }
                 });
             if decoded.is_err() {
@@ -5468,26 +6202,75 @@ async fn hot_working_diff_entries(
             break;
         }
     }
+    for base_ref in packed_refs {
+        if actual_coverage
+            .add_encoded_group_key(&base_ref.coverage_key)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let Ok(members) = crate::tracked_state::load_commit_delta_members_with_payloads(
+            store,
+            base_ref.commit_id,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        for member in members {
+            if !packed_member_matches_filter(&member, filter) {
+                continue;
+            }
+            let identity = HeadIdentity {
+                branch_id: branch_id.to_string(),
+                generation,
+                schema_key: member.key.schema_key.clone(),
+                entity_pk: member.key.entity_pk.clone(),
+                file_id: member.key.file_id.clone(),
+            };
+            let version = packed_working_diff_version(&member);
+            match selected.entry(identity) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(version));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if entry
+                        .get()
+                        .is_some_and(|previous| previous.commit_id < version.commit_id) =>
+                {
+                    entry.insert(Some(version));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
     if actual_coverage != expected_coverage {
         return Ok(None);
     }
+    let (selected, base_versions): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
     let after_values = hot_load_primary_identity_bytes(store, &selected).await?;
     let mut candidates = Vec::with_capacity(selected.len());
-    for (identity, after) in selected.into_iter().zip(after_values) {
-        let Some(after) = after else {
-            return Ok(None);
-        };
-        let Ok(after) = decode_head_value(&after) else {
-            return Ok(None);
-        };
-        if after.untracked {
-            return Ok(None);
-        }
-        let Some(before) = working_diff_baseline_before(after.working_diff_baseline) else {
-            return Ok(None);
-        };
-        let Some(after) = after.working_diff_version() else {
-            return Ok(None);
+    for ((identity, after), base_after) in selected.into_iter().zip(after_values).zip(base_versions)
+    {
+        let (before, after) = if let Some(after) = after {
+            let Ok(after) = decode_head_value(&after) else {
+                return Ok(None);
+            };
+            if after.untracked {
+                return Ok(None);
+            }
+            let Some(before) = working_diff_baseline_before(after.working_diff_baseline) else {
+                return Ok(None);
+            };
+            let Some(after) = after.working_diff_version() else {
+                return Ok(None);
+            };
+            (before, after)
+        } else {
+            let Some(after) = base_after else {
+                return Ok(None);
+            };
+            (None, after)
         };
         let identity = identity.into_row_identity();
         candidates.push((
