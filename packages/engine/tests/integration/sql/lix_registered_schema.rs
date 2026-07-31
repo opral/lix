@@ -94,6 +94,108 @@ simulation_test!(
 );
 
 simulation_test!(
+    registered_schema_default_values_materializes_generated_and_literal_defaults,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let schema = json!({
+            "x-lix-key": "default_values_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "x-lix-default": "lix_uuid_v7()",
+                },
+                "label": {
+                    "type": "string",
+                    "default": "untitled",
+                },
+            },
+            "required": ["id", "label"],
+            "additionalProperties": false,
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                &[Value::Json(schema)],
+            )
+            .await
+            .expect("schema registration should succeed");
+
+        let inserted = session
+            .execute("INSERT INTO default_values_probe DEFAULT VALUES", &[])
+            .await
+            .expect("DEFAULT VALUES should materialize registered-schema defaults");
+        assert_eq!(inserted, ExecuteResult::from_rows_affected(1));
+
+        let selected = session
+            .execute("SELECT id, label FROM default_values_probe", &[])
+            .await
+            .expect("defaulted entity should be readable");
+        assert_eq!(selected.len(), 1);
+        let [Value::Text(id), Value::Text(label)] = selected.rows()[0].values() else {
+            panic!("generated and literal defaults should produce text columns");
+        };
+        let id = uuid::Uuid::parse_str(id).expect("generated default should be a UUID");
+        assert_eq!(id.get_version_num(), 7);
+        assert_eq!(label, "untitled");
+    }
+);
+
+simulation_test!(
+    registered_schema_default_values_still_validates_missing_required_properties,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let schema = json!({
+            "x-lix-key": "default_values_missing_required",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "x-lix-default": "lix_uuid_v7()",
+                },
+                "label": { "type": "string" },
+            },
+            "required": ["id", "label"],
+            "additionalProperties": false,
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                &[Value::Json(schema)],
+            )
+            .await
+            .expect("schema registration should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO default_values_missing_required DEFAULT VALUES",
+                &[],
+            )
+            .await
+            .expect_err("missing required properties must remain a validation error");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+    }
+);
+
+simulation_test!(
     sql_catalog_templates_follow_committed_transaction_snapshots,
     |sim| async move {
         let engine = sim.boot_engine().await;

@@ -86,7 +86,16 @@ pub(super) fn bind_insert_bound(
     };
     let table = bind_public_table(catalog, name)?;
     require_write_capability(&table.surface, BoundWriteOp::Insert)?;
-    if insert.columns.is_empty() {
+    // sqlparser represents standard `INSERT INTO table DEFAULT VALUES` as an
+    // INSERT without a source and without target columns. Support it only for
+    // registered-schema base tables, where omitted properties are materialized
+    // by the schema's default machinery. Keep it distinct from `INSERT INTO
+    // table VALUES (...)`, whose implicit public column list is deliberately
+    // unsupported.
+    let default_values = matches!(table.surface.kind, PublicSurfaceKind::EntityBase { .. })
+        && insert.columns.is_empty()
+        && insert.source.is_none();
+    if insert.columns.is_empty() && !default_values {
         return Err(super::error::unsupported(
             "INSERT requires an explicit public column list",
         ));
@@ -102,12 +111,22 @@ pub(super) fn bind_insert_bound(
             BoundWriteOp::Insert,
         )?);
     }
-    let input = bind_insert_input(
-        &table.surface.kind,
-        &columns,
-        insert.source.as_deref(),
-        &mut params,
-    )?;
+    let input = if default_values {
+        // Preserve the cardinality of `DEFAULT VALUES`: it inserts one row,
+        // whose public columns are all omitted and therefore materialized by
+        // the target schema's existing default machinery.
+        BoundWriteInput::Values(BoundInsertValues {
+            columns: Vec::new(),
+            rows: vec![Vec::new()],
+        })
+    } else {
+        bind_insert_input(
+            &table.surface.kind,
+            &columns,
+            insert.source.as_deref(),
+            &mut params,
+        )?
+    };
     let returning = bind_insert_returning(&table, insert.returning.as_ref(), &mut params)?;
     let conflict = bind_insert_conflict(insert.on.as_ref(), &table, &mut params)?;
     if conflict.is_some() {
@@ -1735,6 +1754,55 @@ mod tests {
                 .message
                 .contains("INSERT requires an explicit public column list")
         );
+    }
+
+    #[test]
+    fn bind_statement_rejects_default_values_for_non_entity_tables() {
+        let statement = parse_statement("INSERT INTO lix_file DEFAULT VALUES");
+        let error = bind_statement(&statement, &[], "branch1")
+            .expect_err("DEFAULT VALUES should remain unsupported outside registered schemas");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(
+            error
+                .message
+                .contains("INSERT requires an explicit public column list")
+        );
+    }
+
+    #[test]
+    fn bind_statement_binds_standard_insert_default_values_as_one_empty_row() {
+        let statement = parse_statement("INSERT INTO test_state_schema DEFAULT VALUES");
+        let bound = bind_statement(
+            &statement,
+            &[serde_json::json!({
+                "x-lix-key": "test_state_schema",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "x-lix-default": "lix_uuid_v7()" },
+                    "label": { "type": "string", "default": "untitled" }
+                },
+                "required": ["id", "label"],
+                "additionalProperties": false
+            })],
+            "branch1",
+        )
+        .expect("standard DEFAULT VALUES should bind");
+
+        assert!(matches!(
+            bound.target,
+            BoundWriteTarget::Entity(EntityWriteSurface::Base { .. })
+        ));
+        assert!(matches!(
+            bound.branch_scope,
+            BranchScope::Active { ref branch_id } if branch_id == "branch1"
+        ));
+        let BoundWriteInput::Values(values) = bound.input else {
+            panic!("DEFAULT VALUES should bind as a VALUES input");
+        };
+        assert!(values.columns.is_empty());
+        assert_eq!(values.rows, vec![Vec::new()]);
     }
 
     #[test]

@@ -135,6 +135,11 @@ path = "benches/diff_commands.rs"
 harness = false
 
 [[bench]]
+name = "entity_default_values"
+path = "benches/entity_default_values.rs"
+harness = false
+
+[[bench]]
 name = "small_blob_cas"
 path = "benches/small_blob_cas.rs"
 harness = false
