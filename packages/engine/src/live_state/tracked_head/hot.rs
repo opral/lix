@@ -3277,9 +3277,6 @@ where
             active_checkpoint_commit_id,
         )
         .await?;
-        if keys.iter().all(|key| key.schema_key.starts_with("lix_")) {
-            return MaterializedLiveStateExactBatch::new(rows, slots);
-        }
 
         // Certified immutable segments deliberately do not manufacture one
         // HOT_ROW entry per semantic row. Exact validation reads still need
@@ -8191,25 +8188,39 @@ mod tests {
         );
 
         let reader = HotStateStoreReader { store: read };
+        let control = BranchHeadControl {
+            head_commit_id: generation,
+            generation,
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at: timestamp(),
+            updated_at: timestamp(),
+            ref_change_id: ChangeId::for_test_label("packed-system-ref"),
+        };
         assert!(
             reader
-                .has_schema_rows(
-                    crate::GLOBAL_BRANCH_ID,
-                    BranchHeadControl {
-                        head_commit_id: generation,
-                        generation,
-                        current_state_revision: 0,
-                        schema_presence_bloom: [u64::MAX; 4],
-                        working_diff_checkpoint_commit_id: None,
-                        created_at: timestamp(),
-                        updated_at: timestamp(),
-                        ref_change_id: ChangeId::for_test_label("packed-system-ref"),
-                    },
-                    "lix_key_value",
-                )
+                .has_schema_rows(crate::GLOBAL_BRANCH_ID, control, "lix_key_value",)
                 .await
                 .expect("probe packed system schema"),
             "engine-owned schemas must probe packed bases before skipping plugin segments"
+        );
+        let exact = reader
+            .load_projected_live_batch_refs(
+                crate::GLOBAL_BRANCH_ID,
+                control,
+                &[TrackedStateKeyRef {
+                    schema_key: "lix_key_value",
+                    entity_pk: &entity_pk,
+                    file_id: None,
+                }],
+                &ChangeRecordProjection::full(),
+            )
+            .await
+            .expect("load packed system row through exact live-state API");
+        assert!(
+            exact.row(0).is_some(),
+            "engine-owned exact lookups must resolve packed bases before skipping plugin segments"
         );
     }
 
