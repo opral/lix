@@ -315,18 +315,6 @@ pub struct StorageLayoutAccounting {
 pub struct BinaryManifestLayoutAccounting {
     pub manifests: u64,
     pub encoded_bytes: u64,
-    pub inline_manifests: u64,
-    pub inline_original_bytes: u64,
-    pub inline_payload_bytes: u64,
-    pub inline_raw_manifests: u64,
-    pub inline_zstd_manifests: u64,
-    pub inline_concat_zstd1_bytes: u64,
-    pub inline_concat_zstd3_bytes: u64,
-    pub inline_concat_zstd9_bytes: u64,
-    pub inline_dict64k_zstd3_bytes: u64,
-    pub inline_dict64k_bytes: u64,
-    pub inline_individual_zstd3_bytes: u64,
-    pub inline_individual_zstd9_bytes: u64,
     pub empty_manifests: u64,
     pub single_chunk_manifests: u64,
     pub chunked_manifests: u64,
@@ -546,8 +534,6 @@ where
 {
     let entries = scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE).await;
     let mut accounting = BinaryManifestLayoutAccounting::default();
-    let mut inline_contents = Vec::new();
-    let mut inline_samples = Vec::new();
     for entry in entries {
         let StorageProjectedValue::FullValue(value) = entry.value else {
             unreachable!("binary manifest layout scan requests full values");
@@ -564,140 +550,8 @@ where
             crate::binary_cas::BinaryCasManifest::Chunked { .. } => {
                 accounting.chunked_manifests += 1;
             }
-            crate::binary_cas::BinaryCasManifest::Inline {
-                size_bytes,
-                codec,
-                payload,
-            } => {
-                accounting.inline_manifests += 1;
-                accounting.inline_original_bytes += size_bytes;
-                accounting.inline_payload_bytes += payload.len() as u64;
-                match codec {
-                    crate::binary_cas::BinaryChunkCodec::Raw => {
-                        accounting.inline_raw_manifests += 1;
-                        inline_contents.extend_from_slice(&payload);
-                        inline_samples.push(payload);
-                    }
-                    crate::binary_cas::BinaryChunkCodec::Zstd => {
-                        accounting.inline_zstd_manifests += 1;
-                        let decoded = crate::compression::decompress_zstd(
-                            &payload,
-                            usize::try_from(size_bytes).expect("inline size fits usize"),
-                        )
-                        .map_err(|error| {
-                            crate::LixError::new(
-                                crate::LixError::CODE_INTERNAL_ERROR,
-                                format!(
-                                    "benchmark binary manifest payload failed to decode: {error}"
-                                ),
-                            )
-                        })?;
-                        inline_contents.extend_from_slice(&decoded);
-                        inline_samples.push(decoded);
-                    }
-                }
-            }
-            crate::binary_cas::BinaryCasManifest::InlineDelta {
-                size_bytes,
-                codec,
-                payload,
-                ..
-            } => {
-                accounting.inline_manifests += 1;
-                accounting.inline_original_bytes += size_bytes;
-                accounting.inline_payload_bytes += payload.len() as u64;
-                match codec {
-                    crate::binary_cas::BinaryChunkCodec::Raw => {
-                        accounting.inline_raw_manifests += 1;
-                    }
-                    crate::binary_cas::BinaryChunkCodec::Zstd => {
-                        accounting.inline_zstd_manifests += 1;
-                    }
-                }
-            }
-            crate::binary_cas::BinaryCasManifest::InlineDictionary {
-                size_bytes,
-                payload,
-                ..
-            } => {
-                accounting.inline_manifests += 1;
-                accounting.inline_original_bytes += size_bytes;
-                accounting.inline_payload_bytes += payload.len() as u64;
-                accounting.inline_zstd_manifests += 1;
-            }
-            crate::binary_cas::BinaryCasManifest::InlineDictionaryDelta {
-                size_bytes,
-                payload,
-                ..
-            } => {
-                accounting.inline_manifests += 1;
-                accounting.inline_original_bytes += size_bytes;
-                accounting.inline_payload_bytes += payload.len() as u64;
-                accounting.inline_zstd_manifests += 1;
-            }
         }
     }
-    if !inline_contents.is_empty() {
-        accounting.inline_concat_zstd1_bytes = zstd::bulk::compress(&inline_contents, 1)
-            .expect("benchmark zstd-1 should encode")
-            .len() as u64;
-        accounting.inline_concat_zstd3_bytes = zstd::bulk::compress(&inline_contents, 3)
-            .expect("benchmark zstd-3 should encode")
-            .len() as u64;
-        accounting.inline_concat_zstd9_bytes = zstd::bulk::compress(&inline_contents, 9)
-            .expect("benchmark zstd-9 should encode")
-            .len() as u64;
-    }
-    if inline_samples.len() >= 32 && inline_samples.iter().map(Vec::len).sum::<usize>() >= 32 * 512
-    {
-        let sample_refs = inline_samples.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let dictionary = zstd::dict::from_samples(&sample_refs, 64 * 1024).map_err(|error| {
-            crate::LixError::new(
-                crate::LixError::CODE_INTERNAL_ERROR,
-                format!("benchmark dictionary failed to train: {error}"),
-            )
-        })?;
-        let mut compressor =
-            zstd::bulk::Compressor::with_dictionary(3, &dictionary).map_err(|error| {
-                crate::LixError::new(
-                    crate::LixError::CODE_INTERNAL_ERROR,
-                    format!("benchmark dictionary compressor failed to initialize: {error}"),
-                )
-            })?;
-        accounting.inline_dict64k_zstd3_bytes = inline_samples
-            .iter()
-            .map(|sample| {
-                compressor
-                    .compress(sample)
-                    .map(|encoded| encoded.len() as u64)
-                    .map_err(|error| {
-                        crate::LixError::new(
-                            crate::LixError::CODE_INTERNAL_ERROR,
-                            format!("benchmark dictionary frame failed to encode: {error}"),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .sum();
-        accounting.inline_dict64k_bytes = dictionary.len() as u64;
-    }
-    accounting.inline_individual_zstd3_bytes = inline_samples
-        .iter()
-        .map(|sample| {
-            zstd::bulk::compress(sample, 3)
-                .expect("benchmark individual zstd-3 frame should encode")
-                .len() as u64
-        })
-        .sum();
-    accounting.inline_individual_zstd9_bytes = inline_samples
-        .iter()
-        .map(|sample| {
-            zstd::bulk::compress(sample, 9)
-                .expect("benchmark individual zstd-9 frame should encode")
-                .len() as u64
-        })
-        .sum();
     Ok(accounting)
 }
 
@@ -763,9 +617,6 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE,
         crate::binary_cas::kv::BINARY_CAS_CHUNK_PRESENCE_SPACE,
         crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_DICTIONARY_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_DICTIONARY_CONTROL_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_DICTIONARY_SAMPLE_SPACE,
         crate::changelog::COMMIT_SPACE,
         crate::changelog::CHANGE_SPACE,
         crate::changelog::COMMIT_CHANGE_ID_SPACE,
@@ -877,9 +728,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        BinaryManifestLayoutAccounting, CheckpointCommitScanBenchMode,
-        binary_manifest_layout_accounting, plan_repository_gc_for_bench,
-        scan_checkpoint_commits_for_bench,
+        CheckpointCommitScanBenchMode, binary_manifest_layout_accounting,
+        plan_repository_gc_for_bench, scan_checkpoint_commits_for_bench,
     };
     use crate::Engine;
     use crate::changelog::bench::{append_ordered_commits, stage_append_once};
@@ -945,77 +795,55 @@ mod tests {
                 .sum::<u64>()
         );
     }
-
     #[tokio::test]
-    async fn binary_manifest_accounting_handles_empty_and_delta_only_repositories() {
+    async fn binary_manifest_accounting_handles_out_of_line_layouts() {
         let adapter = StorageAdapter::new(Memory::new());
-        let read = adapter
-            .begin_read(crate::ReadOptions::default())
-            .await
-            .expect("begin empty manifest accounting read");
-        assert_eq!(
-            binary_manifest_layout_accounting(&read)
-                .await
-                .expect("empty manifest accounting should not train a dictionary"),
-            BinaryManifestLayoutAccounting::default()
-        );
-        drop(read);
-
         let mut writes = adapter.new_write_set();
-        writes.put(
-            crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
-            StorageKey(bytes::Bytes::from(vec![1; 32])),
-            StorageValue {
-                bytes: bytes::Bytes::from(crate::binary_cas::encode_binary_cas_manifest(
-                    &crate::binary_cas::BinaryCasManifest::InlineDelta {
-                        size_bytes: 1_000,
-                        base_blob_hash: [3; 32],
-                        prefix_len: 400,
-                        suffix_len: 590,
-                        middle_len: 10,
-                        codec: crate::binary_cas::BinaryChunkCodec::Raw,
-                        payload: vec![4; 10],
-                    },
-                )),
-            },
-        );
-        writes.put(
-            crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
-            StorageKey(bytes::Bytes::from(vec![2; 32])),
-            StorageValue {
-                bytes: bytes::Bytes::from(crate::binary_cas::encode_binary_cas_manifest(
-                    &crate::binary_cas::BinaryCasManifest::InlineDictionaryDelta {
-                        size_bytes: 2_000,
-                        base_blob_hash: [5; 32],
-                        prefix_len: 900,
-                        suffix_len: 1_080,
-                        middle_len: 20,
-                        dictionary_hash: [6; 32],
-                        payload: vec![7; 20],
-                    },
-                )),
-            },
-        );
+        for (key_byte, manifest) in [
+            (
+                1,
+                crate::binary_cas::BinaryCasManifest::Empty { size_bytes: 0 },
+            ),
+            (
+                2,
+                crate::binary_cas::BinaryCasManifest::SingleChunk {
+                    size_bytes: 7,
+                    chunk_hash: [3; 32],
+                },
+            ),
+            (
+                3,
+                crate::binary_cas::BinaryCasManifest::Chunked {
+                    size_bytes: 42,
+                    chunk_count: 2,
+                },
+            ),
+        ] {
+            writes.put(
+                crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
+                StorageKey(bytes::Bytes::from(vec![key_byte; 32])),
+                StorageValue {
+                    bytes: bytes::Bytes::from(crate::binary_cas::encode_binary_cas_manifest(
+                        &manifest,
+                    )),
+                },
+            );
+        }
         adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("delta manifest fixtures should commit");
-
+            .expect("manifest fixtures should commit");
         let read = adapter
             .begin_read(crate::ReadOptions::default())
             .await
-            .expect("begin delta manifest accounting read");
+            .expect("begin manifest accounting read");
         let accounting = binary_manifest_layout_accounting(&read)
             .await
-            .expect("delta-only accounting should not train a dictionary");
-        assert_eq!(accounting.manifests, 2);
-        assert_eq!(accounting.inline_manifests, 2);
-        assert_eq!(accounting.inline_original_bytes, 3_000);
-        assert_eq!(accounting.inline_payload_bytes, 30);
-        assert_eq!(accounting.inline_raw_manifests, 1);
-        assert_eq!(accounting.inline_zstd_manifests, 1);
-        assert_eq!(accounting.inline_dict64k_bytes, 0);
-        assert_eq!(accounting.inline_dict64k_zstd3_bytes, 0);
+            .expect("manifest accounting should succeed");
+        assert_eq!(accounting.manifests, 3);
+        assert_eq!(accounting.empty_manifests, 1);
+        assert_eq!(accounting.single_chunk_manifests, 1);
+        assert_eq!(accounting.chunked_manifests, 1);
     }
 
     #[tokio::test]

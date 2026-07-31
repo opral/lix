@@ -96,27 +96,8 @@ impl BlobPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlobLayout {
     Empty,
-    Inline,
     SingleChunk { chunk_hash: BlobHash },
     Chunked { chunk_count: u32 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum InlineBlob {
-    Full {
-        codec: BinaryChunkCodec,
-        dictionary_hash: Option<BlobHash>,
-        payload: Vec<u8>,
-    },
-    Delta {
-        base_blob_hash: BlobHash,
-        prefix_len: u64,
-        suffix_len: u64,
-        middle_len: u64,
-        codec: BinaryChunkCodec,
-        dictionary_hash: Option<BlobHash>,
-        payload: Vec<u8>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +105,6 @@ pub(crate) struct BlobMetadata {
     pub(crate) hash: BlobHash,
     pub(crate) size_bytes: u64,
     pub(crate) layout: BlobLayout,
-    pub(crate) inline_blob: Option<InlineBlob>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
