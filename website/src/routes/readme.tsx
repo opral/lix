@@ -14,9 +14,9 @@ export const Route = createFileRoute("/readme")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title = "Lix README | Version control system for every file format";
+    const title = "Lix README | Database, filesystem, and version control";
     const description =
-      "Read how Lix tracks, reviews, branches, merges, and rolls back changes across Markdown, DOCX, XLSX, JSON, PDFs, and custom file formats.";
+      "Read how Lix combines normal files, queryable SQL rows, and version control in one system.";
     const canonicalUrl = buildCanonicalUrl("/readme");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({

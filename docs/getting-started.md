@@ -1,10 +1,10 @@
 ---
-description: Install Lix, open an in-memory repository, register a schema, write rows, and inspect a change in under 30 lines of JavaScript.
+description: Install Lix, open a file workspace, write files and SQL rows, isolate work on a branch, and merge it.
 ---
 
 # Getting Started
 
-This walks through opening Lix, registering a schema, writing a row, isolating a change in a separate version, previewing the merge, and merging.
+This guide opens a file workspace, writes a normal file, registers an app schema, writes a row, isolates a change on a branch, and merges it.
 
 ## Install
 
@@ -26,12 +26,30 @@ const lix = await openLix();
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	storage: new LocalFilesystem({
-		path: "./workspace",
-		syncAllFiles: true,
-	}),
+  storage: new LocalFilesystem({
+    path: "./workspace",
+    syncAllFiles: true,
+  }),
 });
 ```
+
+## Write a normal file
+
+Files are available through SQL and, with `LocalFilesystem`, on disk:
+
+```ts
+await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+  "/notes/status.md",
+  new TextEncoder().encode("# Status\n\nReady"),
+]);
+
+const file = await lix.execute(
+  "SELECT path, data FROM lix_file WHERE path = $1",
+  ["/notes/status.md"],
+);
+```
+
+Tools and agents can edit `notes/status.md` as a normal file. Lix imports those edits and tracks plugin-defined entities for supported formats. The SDK includes Markdown and CSV plugins.
 
 ## Register a schema
 
@@ -39,22 +57,22 @@ Lix stores application state as typed entities. Register a schema once, then rea
 
 ```ts
 await lix.execute(
-	"INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-	[
-		JSON.stringify({
-			$schema: "https://json-schema.org/draft/2020-12/schema",
-			"x-lix-key": "task",
-			"x-lix-primary-key": ["/id"],
-			type: "object",
-			required: ["id", "title", "done"],
-			properties: {
-				id: { type: "string" },
-				title: { type: "string" },
-				done: { type: "boolean" },
-			},
-			additionalProperties: false,
-		}),
-	],
+  "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+  [
+    JSON.stringify({
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      "x-lix-key": "task",
+      "x-lix-primary-key": ["/id"],
+      type: "object",
+      required: ["id", "title", "done"],
+      properties: {
+        id: { type: "string" },
+        title: { type: "string" },
+        done: { type: "boolean" },
+      },
+      additionalProperties: false,
+    }),
+  ],
 );
 ```
 
@@ -64,14 +82,14 @@ await lix.execute(
 
 ```ts
 await lix.execute("INSERT INTO task (id, title, done) VALUES ($1, $2, $3)", [
-	"task-1",
-	"Review agent changes",
-	false,
+  "task-1",
+  "Review agent changes",
+  false,
 ]);
 
 const result = await lix.execute(
-	"SELECT id, title, done FROM task WHERE id = $1",
-	["task-1"],
+  "SELECT id, title, done FROM task WHERE id = $1",
+  ["task-1"],
 );
 
 const row = result.rows[0]!;
@@ -90,47 +108,47 @@ Use `asBytes()` for byte content:
 
 ```ts
 const file = await lix.execute("SELECT data FROM lix_file WHERE path = $1", [
-	"/orders.xlsx",
+  "/notes/status.md",
 ]);
 const bytes = file.rows[0]!.value("data").asBytes();
 ```
 
-## Isolate a change in a version
+## Isolate a change on a branch
 
-A version is an isolated line of state. Create one for the change, switch into it, and edit:
+A branch is an isolated line of state. Create one for the change, switch into it, and edit:
 
 ```ts
-const main = await lix.activeVersionId();
+const main = await lix.activeBranchId();
 
-const draft = await lix.createVersion({ name: "Agent draft" });
-await lix.switchVersion({ versionId: draft.id });
+const draft = await lix.createBranch({ name: "Agent draft" });
+await lix.switchBranch({ branchId: draft.id });
 
 await lix.execute("UPDATE task SET done = $1 WHERE id = $2", [true, "task-1"]);
 
-await lix.switchVersion({ versionId: main });
+await lix.switchBranch({ branchId: main });
 ```
 
-The active version is now `main` again, and `task-1` is still `done = false` here. The draft change is isolated until you merge.
+The active branch is now `main` again, and `task-1` is still `done = false` here. The draft change is isolated until you merge.
 
 ## Preview and merge
 
 ```ts
-const preview = await lix.mergeVersionPreview({ sourceVersionId: draft.id });
+const preview = await lix.mergeBranchPreview({ sourceBranchId: draft.id });
 console.log(preview.outcome, preview.changeStats);
 // fastForward { total: 1, added: 0, modified: 1, removed: 0 }
 
 if (preview.conflicts.length === 0) {
-	await lix.mergeVersion({ sourceVersionId: draft.id });
+  await lix.mergeBranch({ sourceBranchId: draft.id });
 }
 ```
 
-`mergeVersionPreview()` reports the same merge decision as `mergeVersion()` without advancing refs. It returns the per-row conflict list when both sides changed the same entity. See [Versions & Merging](./versions.md).
+`mergeBranchPreview()` reports the same decision as `mergeBranch()` without changing state. It returns conflicts when both branches changed the same entity. See [Branches & Merging](./versions.md).
 
 ## The loop
 
 1. Open Lix.
 2. Register schemas for the entities you want to version.
 3. Write and read through generated tables.
-4. Create versions for isolated work.
+4. Create branches for isolated work.
 5. Preview, then merge or discard.
 6. Query [`lix_change`](./history.md) for audit and undo.

@@ -80,7 +80,7 @@ describe("SEO route smoke tests", () => {
       "How Lix compares to Git | Lix Documentation",
     );
     expect(findMetaContent(head.meta, "twitter:description")).toBe(
-      "Compare Git's source-code workflow with Lix's file-format version control for Markdown, DOCX, XLSX, JSON, PDFs, and custom formats.",
+      "Compare Git, databases, and Lix across file access, SQL, transactions, history, branches, and semantic review.",
     );
     expect(rendered.title).toBe("How Lix compares to Git");
     expect(rendered.body).not.toContain("<h1");

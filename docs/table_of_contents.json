@@ -3,12 +3,12 @@
     { "path": "./what-is-lix.md", "label": "What is Lix?" },
     { "path": "./getting-started.md", "label": "Getting Started" },
     { "path": "./lix-for-ai-agents.md", "label": "Lix for AI Agents" },
-    { "path": "./comparison-to-git.md", "label": "Comparison to Git" }
+    { "path": "./comparison-to-git.md", "label": "How Lix Fits" }
   ],
   "Concepts": [
     { "path": "./schemas.md", "label": "Schemas" },
     { "path": "./semantic-changes.md", "label": "Semantic Changes" },
-    { "path": "./versions.md", "label": "Versions & Merging" },
+    { "path": "./versions.md", "label": "Branches & Merging" },
     { "path": "./checkpoints.md", "label": "Checkpoints" },
     { "path": "./diff-commands.md", "label": "Diff Commands" },
     { "path": "./history.md", "label": "Change History" },

@@ -31,19 +31,29 @@ persists Lix's ordered keys and values is storage.
 
 ## Available implementations
 
-| Storage | Rust | JavaScript | Use for |
-| --- | --- | --- | --- |
-| `Memory` | `lix_engine` and `lix_sdk` | default when `storage` is omitted | tests, demos, and ephemeral work |
-| `SQLite` | `lix_sqlite_storage` and `lix_sdk` (`sqlite`) | `@lix-js/sdk` | a portable single-file application format |
-| `SlateDB` | `lix_slatedb_storage` | not exposed | object-storage and LSM-based deployments |
-| `RocksDB` | `lix_rocksdb_storage` | not exposed | native embedded persistence |
-| `LocalFilesystem` | `lix_sdk` (`local_filesystem`) | `@lix-js/sdk` | a local directory synchronized with Lix |
+| Storage           | Rust                                          | JavaScript                        | Use for                                   |
+| ----------------- | --------------------------------------------- | --------------------------------- | ----------------------------------------- |
+| `Memory`          | `lix_engine` and `lix_sdk`                    | default when `storage` is omitted | tests, demos, and ephemeral work          |
+| `SQLite`          | `lix_sqlite_storage` and `lix_sdk` (`sqlite`) | `@lix-js/sdk`                     | a portable single-file application format |
+| `SlateDB`         | `lix_slatedb_storage`                         | not exposed                       | object-storage and LSM-based deployments  |
+| `RocksDB`         | `lix_rocksdb_storage`                         | not exposed                       | native embedded persistence               |
+| `LocalFilesystem` | `lix_sdk` (`local_filesystem`)                | `@lix-js/sdk`                     | a local directory synchronized with Lix   |
 
 Rust applications can implement the public `Storage` traits described below.
 The JavaScript SDK currently accepts its built-in choices only: omit `storage`
 for `Memory`, or pass `SQLite` or `LocalFilesystem`. `SQLite` and
 `LocalFilesystem` require Node.js; the default `Memory` storage also works in
 browsers.
+
+### Remote clients and S3
+
+JavaScript clients do not pass S3 to `openLix()`. A server opens Lix with the Rust SlateDB storage implementation backed by an S3-compatible object store. The server exposes the workspace through the [Lix server protocol](https://github.com/opral/lix/blob/main/packages/server-protocol/README.md), and clients connect with `openLix({ server })`.
+
+```text
+JS client ── HTTP ──▶ Lix server protocol ──▶ Lix ──▶ SlateDB ──▶ S3
+```
+
+SlateDB provides the ordered, atomic storage layer above the object store. PostgreSQL and other engines require a custom Rust storage implementation.
 
 ### Memory
 
@@ -65,7 +75,7 @@ lives in one portable file.
 import { openLix, SQLite } from "@lix-js/sdk";
 
 const lix = await openLix({
-	storage: new SQLite({ path: "/var/data/app.lix" }),
+  storage: new SQLite({ path: "/var/data/app.lix" }),
 });
 ```
 
@@ -77,10 +87,10 @@ Use `LocalFilesystem` when Lix should synchronize a local directory:
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	storage: new LocalFilesystem({
-		path: "/var/data/workspace",
-		syncAllFiles: true,
-	}),
+  storage: new LocalFilesystem({
+    path: "/var/data/workspace",
+    syncAllFiles: true,
+  }),
 });
 ```
 

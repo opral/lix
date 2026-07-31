@@ -4,7 +4,7 @@ description: Lix tracks semantic changes at the entity level, so apps and agents
 
 # Semantic Changes
 
-Semantic changes are changes to the things your app understands: rows, cells, paragraphs, clauses, nodes, tasks, symbols, or any other entity described by a Lix schema.
+Semantic changes are changes to the things your app understands: rows, paragraphs, properties, tasks, or any other entity described by a Lix schema. File plugins map file content to these entities and apply entity changes back to normal files.
 
 Text-based diffs see lines and file bytes. Lix can see structured entities.
 
@@ -39,22 +39,24 @@ ORDER BY created_at DESC
 LIMIT 20;
 ```
 
-For version-scoped reads, use the state and history surfaces documented in [SQL Surfaces](./surfaces.md) and [Change History](./history.md).
+For branch-scoped reads, use the state and history surfaces documented in [SQL Surfaces](./surfaces.md) and [Change History](./history.md).
 
 ## JSON example
+
+With a JSON plugin, Lix can track properties instead of formatting:
 
 Given a JSON file:
 
 **Before:**
 
 ```json
-{"theme":"light","notifications":true,"language":"en"}
+{ "theme": "light", "notifications": true, "language": "en" }
 ```
 
 **After:**
 
 ```json
-{"theme":"dark","notifications":true,"language":"en"}
+{ "theme": "dark", "notifications": true, "language": "en" }
 ```
 
 Text-based diff:
@@ -64,7 +66,7 @@ Text-based diff:
 +{"theme":"dark","notifications":true,"language":"en"}
 ```
 
-Lix can see:
+The plugin can expose:
 
 ```diff
 property theme:
@@ -72,9 +74,9 @@ property theme:
 + dark
 ```
 
-## Excel example
+## CSV example
 
-The same idea applies to binary formats. With an XLSX plugin, Lix can expose cell or row level changes.
+The CSV plugin ships with the JavaScript SDK. It tracks CSV records as rows.
 
 **Before:**
 
@@ -94,13 +96,14 @@ The same idea applies to binary formats. With an XLSX plugin, Lix can expose cel
 | 1002     | Widget B | shipped |
 ```
 
-Byte-level diff:
+A text diff shows the whole line:
 
 ```diff
--Binary files differ
+-1002,Widget B,pending
++1002,Widget B,shipped
 ```
 
-Lix can see:
+Lix can show the row field that changed:
 
 ```diff
 order_id 1002 status:
@@ -125,9 +128,9 @@ SELECT
 FROM lix_change AS c
 JOIN lix_file AS f
   ON f.id = c.file_id
-WHERE c.schema_key = 'xlsx_row'
-  AND f.path = '/orders.xlsx'
+WHERE c.schema_key = 'csv_v2_row'
+  AND f.path = '/orders.csv'
 ORDER BY c.created_at DESC;
 ```
 
-The result is scoped to the file and entity type the agent asked about. No spreadsheet reread required.
+The result is scoped to the file and entity type the agent asked about. No full CSV reread is required. Other formats use the same model when a plugin defines their entities. An XLSX plugin, for example, could define cells or rows.

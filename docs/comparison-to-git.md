@@ -1,104 +1,72 @@
 ---
-description: Compare Git's source-code workflow with Lix's file-format version control for Markdown, DOCX, XLSX, JSON, PDFs, and custom formats.
+description: Compare Git, databases, and Lix across file access, SQL, transactions, history, branches, and semantic review.
 ---
 
 # How Lix compares to Git
 
-> **Git is optimized for source-code repositories. Lix is a version control system for every file format.**
+Git gives source code history, branches, and merge. Databases give apps SQL and transactions. Lix combines both with a filesystem that normal tools and agents can use.
 
-Use Git when developers are versioning source code. Use Lix when products, tools, agents, or teams need review, merge, rollback, and SQL-queryable history for **file formats beyond source code**: Markdown, DOCX, XLSX, CSV, JSON, PDFs, CAD files, datasets, generated reports, and custom artifacts.
+## The map: interoperability × database semantics
 
-The difference is the unit of change: Git is strongest when a line-oriented text diff explains the work. Lix is strongest when the thing you need to review is a cell, clause, property, row, record, prompt output, or parser-defined entity.
-
-|                   | Git                                             | Lix                                            |
-| :---------------- | :---------------------------------------------- | :--------------------------------------------- |
-| Primary fit       | Source-code repositories and developer workflows | File-format version control for documents, structured files, generated artifacts, and app records |
-| Integration model | External VCS, usually operated around a repo     | Runtime/library layer for products, tools, agents, services, and CLIs |
-| Artifact model    | Files and snapshots                              | Format-aware entities across files and data    |
-| Diff model        | Text-oriented by default; custom drivers possible | Semantic per-entity changes via format support |
-| Merge model       | Line merge for text; binary fallback for many formats | Entity-aware merge for supported formats       |
-| History surface   | Commit history and Git tooling                   | SQL-queryable change graph                     |
-| Driven by         | Developers, CI, and source-code tools            | Agents, services, automation, products, and users |
-
-Both can coexist: keep source code in Git, and use Lix for files and workflows where review, merge, and rollback need to happen at the level of cells, clauses, properties, records, or generated changes.
-
-## Source-code history vs semantic file history
-
-Git stores snapshots and commonly presents changes as text diffs. That works extremely well for source code, where line-oriented review is natural. For many file formats beyond source code, such as spreadsheets, rich documents, CSV datasets, CAD files, PDFs, and agent-generated outputs, a line or binary diff often loses the domain meaning users care about.
-
-Lix stores changes as data. File plugins can map formats into domain entities such as XLSX cells, DOCX clauses, CSV rows, JSON properties, PDF sections, CAD parts, or agent outputs. Format experts can add semantic versioning for the file types their products need.
-
-Product-, tool-, and agent-level questions become direct queries:
-
-- Which cells / clauses / parts changed?
-- Which prompt, tool call, user action, or service made this edit?
-- What would happen if we merged this version?
-
-Lix exposes history as queryable change data rather than only as repository history. That lets an agent ask which entities changed, who or what changed them, whether two branches touch the same entity, and what needs review before merge. See [Change History](./history.md).
-
-## What this looks like
-
-Git can be extended with custom diff drivers and textconv filters. The difference is that those semantic views usually sit beside Git, while Lix is designed to store and query structured changes as part of the version-control model.
-
-### Excel
-
-**Before:**
-
-| order_id | product  | status  |
-| -------- | -------- | ------- |
-| 1001     | Widget A | shipped |
-| 1002     | Widget B | pending |
-
-**After:**
-
-| order_id | product  | status  |
-| -------- | -------- | ------- |
-| 1001     | Widget A | shipped |
-| 1002     | Widget B | shipped |
-
-**Git default diff sees:**
-
-```diff
-Binary files differ
+```text
+                           database semantics
+                       (query · transact · track)
+                                  ▲
+                                  │
+       PostgreSQL / SQLite        │                 ★ Lix
+       SQL and transactions,      │          normal files and SQL rows,
+       but data lives in tables   │          with every change tracked
+                                  │
+   ───────────────────────────────┼──────────────────────────────────▶
+                                  │              file interoperability
+                                  │       (any agent or tool can read/write)
+                                  │
+                                  │             Filesystem / Git
+                                  │             normal files,
+                                  │         but no queryable rows
 ```
 
-**With an XLSX plugin, Lix can expose:**
+## Comparison
+
+| Capability                                 | Filesystem / Git                     | PostgreSQL / SQLite    | Lix                |
+| ------------------------------------------ | ------------------------------------ | ---------------------- | ------------------ |
+| Works with normal workspace files          | Yes                                  | No                     | Yes                |
+| Queries file content with SQL              | No                                   | Only after import      | Yes, with a plugin |
+| ACID transactions                          | No                                   | Yes                    | Yes                |
+| Change history                             | Git: blobs and lines; filesystem: no | You build audit tables | Files and rows     |
+| Branches and merging                       | Git: yes; filesystem: no             | You build them         | Yes                |
+| Reviews changes by paragraph, cell, or row | Text lines only                      | You build it           | Yes, with a plugin |
+
+Use Git for source-code repositories and developer workflows. Use Lix when a product or agent must work with normal files while the app queries their contents and history with SQL.
+
+Git and Lix can work together. Keep source code in Git. Use Lix for the files and app data your product needs to query, review, merge, and roll back.
+
+## The unit of change
+
+Git stores file snapshots and usually shows line diffs. This works well for source code.
+
+Lix stores changes as data. Plugins define the parts inside a file, such as Markdown blocks or CSV rows. Lix can query and review those parts directly.
+
+For example, an agent updates one field in an orders CSV:
 
 ```diff
 order_id 1002 status:
+
 - pending
 + shipped
 ```
 
-### JSON
+The Markdown and CSV plugins ship with the JavaScript SDK. Other formats need a plugin. For example, an XLSX plugin could define cells or rows, and a JSON plugin could define properties.
 
-Formatted JSON works reasonably well in Git. Semantic diffing helps when formatting, ordering, minification, or generated output obscures the actual field-level change.
+## SQL history
 
-**Before:**
+Lix exposes changes as rows:
 
-```json
-{ "theme": "light", "notifications": true, "language": "en" }
+```sql
+SELECT created_at, schema_key, entity_pk, snapshot_content
+FROM lix_change
+ORDER BY created_at DESC
+LIMIT 20;
 ```
 
-**After:**
-
-```json
-{ "theme": "dark", "notifications": true, "language": "en" }
-```
-
-**Git default diff on minified JSON sees:**
-
-```diff
--{ "theme": "light", "notifications": true, "language": "en" }
-+{ "theme": "dark", "notifications": true, "language": "en" }
-```
-
-**Lix sees:**
-
-```diff
-property theme:
-- light
-+ dark
-```
-
-If your product or agent workflow needs version history, review, rollback, or merge for file formats beyond source code, Lix gives it semantic primitives instead of opaque file diffs. Start with [Change History](./history.md).
+Apps and agents can ask which entities changed, which files they came from, and whether branches touch the same entity. See [Change History](./history.md).

@@ -6,7 +6,7 @@ description: Define the entity types Lix tracks for you. The x-lix-* JSON Schema
 
 Schemas describe the entities Lix tracks. You declare each entity type as a JSON Schema with a few `x-lix-*` extensions, and Lix exposes a SQL table for it.
 
-Schemas are also the foundation file-format plugins build on: a plugin parses a file format (XLSX, DOCX, CAD, ...) into entities described by a schema. You can register schemas yourself, and plugin authors can register schemas for the entities their format exposes.
+Schemas are also the foundation for file plugins. A plugin maps a file format to entities described by a schema. The SDK includes Markdown and CSV plugins. Other formats, such as XLSX, DOCX, and CAD, need a plugin.
 
 > [!NOTE]
 > **For agents.** Lix is self-documenting. When operating against a Lix repository, query `lix_registered_schema` to discover every schema currently in effect (including Lix's own internal schemas `lix_*`) rather than relying on a snapshot of these docs. The schemas you read back are authoritative and current.
@@ -33,7 +33,7 @@ INSERT INTO lix_registered_schema (value) VALUES (lix_json('{
 }'));
 ```
 
-After registration, `acme_section` is a SQL table you can `INSERT`, `SELECT`, `UPDATE`, and `DELETE` against. A sibling table `acme_section_by_version` exposes the same rows across all versions (see [Versions & Merging](./versions.md)).
+After registration, `acme_section` is a SQL table you can `INSERT`, `SELECT`, `UPDATE`, and `DELETE` against. A sibling table `acme_section_by_branch` exposes the same rows across all branches (see [Branches & Merging](./versions.md)).
 
 ## The `x-lix-*` extensions
 
@@ -144,7 +144,7 @@ Mint a new `x-lix-key`. Ship `acme_section_v2` as a separate schema, write migra
 | `figma_layer`, `figma_frame` | `layer`, `frame`  |
 
 Why it matters: a single Lix can hold many files and many schemas at once.
-App-level entities, file-format plugins (XLSX, DOCX, CAD, ...), and Lix's own
+App entities, file plugins, and Lix's own
 internal schemas all share the `lix_registered_schema` namespace. An
 unprefixed `task` collides the moment a second source registers the same name.
 The exact key `lix` and the `lix_*` prefix are reserved and enforced for
@@ -190,6 +190,6 @@ ORDER BY lixcol_entity_pk;
 
 Shape your entities the way your reads want them. Document blocks, spreadsheet cells, line items: model whatever's natural for the questions your code asks.
 
-Don't shrink rows just to avoid merge conflicts. Lix's conflict detection is row-level today (two versions editing different fields of the same row still conflict), but conflict semantics and resolution are still evolving; designs that bend around today's limitation will look strange as merge behavior matures.
+Don't shrink rows just to avoid merge conflicts. Lix's conflict detection is row-level today, so two branches that edit different fields of the same row still conflict. Conflict behavior is still evolving. Designs built around today's limitation may not make sense later.
 
 If two collaborators are likely to edit the same logical thing concurrently and your domain naturally splits it (a document into blocks, an invoice into line items), split it because the _data_ makes sense that way. Don't split a single record into ten just because a future merge might collide.

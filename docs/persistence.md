@@ -1,10 +1,29 @@
 ---
-description: Open Lix in memory for tests, persist a filesystem workspace with LocalFilesystem, or use SQLite for a single .lix application file.
+description: Run Lix in memory, in a local filesystem, in a SQLite file, or through a remote Lix server.
 ---
 
 # Persistence
 
-`openLix()` with no arguments opens an in-memory Lix that vanishes when the process exits. For anything that should survive a restart, pass a storage. For local files and directories, `LocalFilesystem` is the recommended storage.
+`openLix()` can open a local repository or connect to a remote Lix server. Local repositories use memory, `LocalFilesystem`, or SQLite. A remote server owns workspace persistence.
+
+## Remote workspace
+
+Connect to a hosted workspace with `server`:
+
+```ts
+import { openLix } from "@lix-js/sdk";
+
+const lix = await openLix({
+  server: {
+    mode: "remote",
+    url: "https://example.com/workspaces/acme",
+  },
+});
+```
+
+The client does not need a local workspace storage option. Files, SQL rows, and branches live on the server.
+
+For an S3 deployment, host Lix with the shipped Rust SlateDB storage implementation backed by an S3-compatible object store. Expose the workspace through the [Lix server protocol](https://github.com/opral/lix/blob/main/packages/server-protocol/README.md). JavaScript clients do not pass S3 directly to `openLix()`.
 
 ## In-memory (tests, demos)
 
@@ -28,10 +47,10 @@ npm install @lix-js/sdk
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	storage: new LocalFilesystem({
-		path: "/var/data/workspace",
-		syncAllFiles: true,
-	}),
+  storage: new LocalFilesystem({
+    path: "/var/data/workspace",
+    syncAllFiles: true,
+  }),
 });
 
 // ... use it ...
@@ -51,11 +70,11 @@ the workspace directory:
 
 ```ts
 const lix = await openLix({
-	storage: new LocalFilesystem({
-		path: "/var/data/workspace",
-		lixDir: "/tmp/session/.lix",
-		syncAllFiles: true,
-	}),
+  storage: new LocalFilesystem({
+    path: "/var/data/workspace",
+    lixDir: "/tmp/session/.lix",
+    syncAllFiles: true,
+  }),
 });
 ```
 
@@ -73,10 +92,10 @@ import path from "node:path";
 
 const dir = mkdtempSync(path.join(tmpdir(), "lix-"));
 const lix = await openLix({
-	storage: new LocalFilesystem({
-		path: path.join(dir, "workspace"),
-		syncAllFiles: true,
-	}),
+  storage: new LocalFilesystem({
+    path: path.join(dir, "workspace"),
+    syncAllFiles: true,
+  }),
 });
 ```
 
@@ -89,8 +108,8 @@ materialization; it does not filter unrelated Lix SQL state.
 
 ```ts
 const storage = new LocalFilesystem({
-	path: "/Users/me/Downloads",
-	syncAllFiles: false,
+  path: "/Users/me/Downloads",
+  syncAllFiles: false,
 });
 const lix = await openLix({ storage });
 await storage.importPaths(["notes/today.md"]);
@@ -104,7 +123,7 @@ Use `SQLite` when the `.lix` SQLite file is the application document itself. Thi
 import { openLix, SQLite } from "@lix-js/sdk";
 
 const lix = await openLix({
-	storage: new SQLite({ path: "/var/data/app.lix" }),
+  storage: new SQLite({ path: "/var/data/app.lix" }),
 });
 ```
 
@@ -116,6 +135,6 @@ Always `await lix.close()` in scripts and tests. Long-lived servers can hold a s
 
 ## Other storage targets
 
-Postgres, S3, Cloudflare D1 / Durable Objects, IndexedDB, OPFS, and other transactional key-value storage targets beyond the shipped storage implementations are not shipped by the Lix team.
+PostgreSQL, Cloudflare D1 / Durable Objects, IndexedDB, OPFS, and other storage engines require a custom storage implementation. S3-compatible object storage is available through the shipped Rust SlateDB implementation in a server deployment.
 
 The storage interface is public and small enough to implement yourself. The [Storage](./storage.md) page documents the full contract.
