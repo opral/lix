@@ -2773,6 +2773,28 @@ async fn load_packed_current_base_exact_entries(
     if base_refs.is_empty() {
         return Ok((0..keys.len()).map(|_| None).collect());
     }
+    if let [base_ref] = base_refs.as_slice() {
+        let requests = keys
+            .iter()
+            .map(|key| {
+                (
+                    base_ref.commit_id,
+                    TrackedStateKey {
+                        schema_key: key.schema_key.to_owned(),
+                        file_id: key.file_id.map(str::to_owned),
+                        entity_pk: key.entity_pk.clone(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        return Ok(
+            crate::tracked_state::load_owned_commit_delta_entries(store, &requests)
+                .await?
+                .into_iter()
+                .map(|entry| entry.map(|entry| (entry.value, entry.change_record)))
+                .collect(),
+        );
+    }
     let owned_keys = keys
         .iter()
         .map(|key| TrackedStateKey {
@@ -4383,14 +4405,6 @@ where
                 existing.created_at
             });
         }
-        let validated_delta_keys = sorted
-            .iter()
-            .map(|delta| TrackedStateKey {
-                schema_key: delta.schema_key.to_string(),
-                entity_pk: delta.entity_pk.clone(),
-                file_id: delta.file_id.map(str::to_string),
-            })
-            .collect::<BTreeSet<_>>();
         // A checkpoint often selects immutable change records whose HOT row
         // is already the exact authoritative value. Re-publishing those rows
         // only changes the row-local dirty marker and commit ownership, even
@@ -4441,6 +4455,14 @@ where
         let unmatched_guards = if absence_guards_validated || absence_guards.is_empty() {
             BTreeSet::new()
         } else {
+            let validated_delta_keys = sorted
+                .iter()
+                .map(|delta| TrackedStateKey {
+                    schema_key: delta.schema_key.to_string(),
+                    entity_pk: delta.entity_pk.clone(),
+                    file_id: delta.file_id.map(str::to_string),
+                })
+                .collect::<BTreeSet<_>>();
             absence_guards
                 .iter()
                 .filter(|key| !validated_delta_keys.contains(*key))

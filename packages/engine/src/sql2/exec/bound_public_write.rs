@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use datafusion::arrow::array::{Array, BooleanArray, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -425,8 +427,8 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
         bound_single_text_primary_key_param(&spec, &plan.bound.predicate);
     let direct_replacement = direct_path_value_replacement(&spec, plan, direct_primary_key_param);
     let mut parameter_rows = Vec::with_capacity(parameter_batch.num_rows());
-    let mut entity_pks = Vec::with_capacity(parameter_batch.num_rows());
-    let mut unique_entity_pks = std::collections::BTreeSet::new();
+    let mut entity_pks = Vec::<EntityPk>::with_capacity(parameter_batch.num_rows());
+    let mut entity_pks_strictly_ordered = true;
     for row_index in 0..parameter_batch.num_rows() {
         let params = super::write::parameter_row(parameter_batch, row_index)
             .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
@@ -446,20 +448,41 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
             }
             row_entity_pks.pop().expect("one point-update identity")
         };
-        if !unique_entity_pks.insert(entity_pk.clone()) {
-            // Repeated identities observe earlier staged writes and are not
-            // independent statements.
-            return Ok(None);
+        if let Some(previous) = entity_pks.last() {
+            match previous.cmp(&entity_pk) {
+                Ordering::Less => {}
+                Ordering::Equal => {
+                    // Repeated identities observe earlier staged writes and
+                    // are not independent statements.
+                    return Ok(None);
+                }
+                Ordering::Greater => entity_pks_strictly_ordered = false,
+            }
         }
         parameter_rows.push(params);
         entity_pks.push(entity_pk);
     }
+    if !entity_pks_strictly_ordered {
+        let mut unique_entity_pks = std::collections::BTreeSet::new();
+        if entity_pks
+            .iter()
+            .any(|entity_pk| !unique_entity_pks.insert(entity_pk))
+        {
+            return Ok(None);
+        }
+    }
 
+    let direct_ordered = entity_pks_strictly_ordered && direct_replacement.is_some();
+    let scan_entity_pks = if direct_ordered {
+        std::mem::take(&mut entity_pks)
+    } else {
+        entity_pks.clone()
+    };
     let candidates = scan_entity_candidates_for_pks(
         ctx,
         plan,
         &spec,
-        unique_entity_pks.into_iter().collect(),
+        scan_entity_pks,
         direct_replacement.is_some(),
     )
     .await?;
@@ -473,45 +496,84 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
         // entity replacements.
         return Ok(None);
     }
-    let mut candidates_by_pk = std::collections::BTreeMap::<EntityPk, Vec<_>>::new();
-    for candidate in candidates.iter() {
-        candidates_by_pk
-            .entry(candidate.entity_pk().clone())
-            .or_default()
-            .push(candidate);
-    }
-
     let mut affected_by_statement = Vec::with_capacity(parameter_rows.len());
     let mut write_rows = RawWriteBatch::with_capacity(parameter_rows.len());
-    for (row_index, (entity_pk, params)) in entity_pks.into_iter().zip(&parameter_rows).enumerate()
-    {
-        let mut affected = 0;
-        for candidate in candidates_by_pk.remove(&entity_pk).unwrap_or_default() {
-            let appended = match direct_replacement.as_ref() {
-                Some(replacement) => append_direct_path_value_replacement_row(
+    if direct_ordered && let Some(replacement) = direct_replacement.as_ref() {
+        // Exact scans return physical entity order. Merge the ordered request
+        // and result streams directly instead of cloning every identity into
+        // a second B-tree and allocating one candidate vector per row.
+        let mut candidates = candidates.iter().peekable();
+        let primary_key_param_index = direct_primary_key_param
+            .expect("ordered direct replacement has one primary-key parameter");
+        for (row_index, params) in parameter_rows.iter().enumerate() {
+            let expected_entity_pk = match params.get(primary_key_param_index) {
+                Some(Value::Text(value)) => value,
+                _ => unreachable!("direct replacement primary key was validated as text"),
+            };
+            let mut affected = 0;
+            while let Some(candidate) = candidates.peek().copied() {
+                if candidate
+                    .entity_pk()
+                    .as_single_string()
+                    .map_err(|error| with_parameter_batch_statement_index(error, row_index))?
+                    != expected_entity_pk
+                {
+                    break;
+                }
+                let candidate = candidates
+                    .next()
+                    .expect("peeked exact entity candidate remains available");
+                append_direct_path_value_replacement_row(
                     &mut write_rows,
                     &spec,
                     candidate,
                     params,
                     replacement,
                 )
-                .map(|()| true),
-                None => append_entity_update_row(
-                    &mut write_rows,
-                    ctx,
-                    plan,
-                    &spec,
-                    candidate,
-                    params,
-                    None,
-                ),
-            }
-            .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
-            if appended {
+                .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
                 affected += 1;
             }
+            affected_by_statement.push(affected);
         }
-        affected_by_statement.push(affected);
+    } else {
+        let mut candidates_by_pk = std::collections::BTreeMap::<EntityPk, Vec<_>>::new();
+        for candidate in candidates.iter() {
+            candidates_by_pk
+                .entry(candidate.entity_pk().clone())
+                .or_default()
+                .push(candidate);
+        }
+        for (row_index, (entity_pk, params)) in
+            entity_pks.into_iter().zip(&parameter_rows).enumerate()
+        {
+            let mut affected = 0;
+            for candidate in candidates_by_pk.remove(&entity_pk).unwrap_or_default() {
+                let appended = match direct_replacement.as_ref() {
+                    Some(replacement) => append_direct_path_value_replacement_row(
+                        &mut write_rows,
+                        &spec,
+                        candidate,
+                        params,
+                        replacement,
+                    )
+                    .map(|()| true),
+                    None => append_entity_update_row(
+                        &mut write_rows,
+                        ctx,
+                        plan,
+                        &spec,
+                        candidate,
+                        params,
+                        None,
+                    ),
+                }
+                .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
+                if appended {
+                    affected += 1;
+                }
+            }
+            affected_by_statement.push(affected);
+        }
     }
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
     #[cfg(test)]
@@ -3085,8 +3147,8 @@ fn certified_direct_parameter_insert_batch(
                             previous.cmp(current)
                         })
                         .find(|ordering| !ordering.is_eq())
-                        .unwrap_or(std::cmp::Ordering::Equal);
-                    if ordering != std::cmp::Ordering::Less {
+                        .unwrap_or(Ordering::Equal);
+                    if ordering != Ordering::Less {
                         // The common bulk producer is already ordered. Keep
                         // this arena route allocation-free and let the
                         // established generic certified path preserve
