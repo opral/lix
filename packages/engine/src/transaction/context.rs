@@ -1382,8 +1382,8 @@ where
         conflicts: Vec<WasmEntityConflict<WasmHostBytes>>,
     ) -> Result<ValidatedConflictTransition, LixError> {
         self.ensure_plugin_generation_read_guard().await;
-        let limits = WasmTransitionLimits::default();
         let expected_count = conflicts.len();
+        let limits = conflict_resolution_limits(expected_count)?;
         let source = VecEntityConflictSource::new(conflicts, limits)?;
         let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
         let factory = match self
@@ -6349,6 +6349,27 @@ where
     }
 }
 
+fn conflict_resolution_limits(conflict_count: usize) -> Result<WasmTransitionLimits, LixError> {
+    let conflict_count = u32::try_from(conflict_count).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "semantic conflict count exceeds the component protocol ordinal range",
+        )
+    })?;
+    let mut limits = WasmTransitionLimits::default();
+    // Each conflict can reference base, A, and B snapshots. These are
+    // host-owned attachments from an already admitted finite batch, so bound
+    // the source by its actual worst-case reference count instead of the
+    // small-transition default.
+    limits.max_attachment_refs = limits
+        .max_attachment_refs
+        .max(conflict_count.saturating_mul(3));
+    // A resolver may emit one bounded replacement page per conflict. Keep the
+    // independent aggregate byte and deadline limits unchanged.
+    limits.max_pages = limits.max_pages.max(conflict_count.saturating_add(1));
+    Ok(limits)
+}
+
 fn required_diff_change<'a>(
     records: &'a HashMap<ChangeId, ChangeRecord>,
     change_id: ChangeId,
@@ -10193,6 +10214,22 @@ mod tests {
     }
 
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    #[test]
+    fn semantic_conflict_limits_scale_host_owned_records_but_not_bytes_or_deadline() {
+        let defaults = WasmTransitionLimits::default();
+        let limits = conflict_resolution_limits(5_000).expect("conflict count should fit");
+
+        assert_eq!(limits.max_attachment_refs, 15_000);
+        assert_eq!(limits.max_pages, 5_001);
+        assert_eq!(limits.max_record_bytes, defaults.max_record_bytes);
+        assert_eq!(limits.max_page_bytes, defaults.max_page_bytes);
+        assert_eq!(limits.max_total_bytes, defaults.max_total_bytes);
+        assert_eq!(
+            limits.total_deadline_nanoseconds,
+            defaults.total_deadline_nanoseconds
+        );
+    }
 
     #[test]
     fn cold_successor_deadline_scales_with_submitted_file_size() {

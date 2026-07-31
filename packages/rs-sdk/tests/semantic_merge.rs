@@ -11,6 +11,7 @@ async fn plugin_resolved_rows_are_included_in_semantic_merge_change_stats() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_csv_plugin(&lix).await;
     write_file(&lix, "/semantic-merge.csv", b"quick,dog\n").await;
+
     let main_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
         .create_branch(CreateBranchOptions {
@@ -58,6 +59,58 @@ async fn plugin_resolved_rows_are_included_in_semantic_merge_change_stats() {
         b"very quick,sleepy dog\n"
     );
     lix.close().await.unwrap();
+}
+
+const CONFLICT_COUNT: usize = 1_500;
+
+#[tokio::test]
+async fn semantic_merge_resolves_more_conflicts_than_default_transition_caps() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_csv_plugin(&lix).await;
+    let base = csv_rows(|index| format!("left-{index:04},right-{index:04}"));
+    write_file(&lix, "/large-semantic-merge.csv", &base).await;
+    let main_branch_id = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "Large semantic source".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    let source_bytes = csv_rows(|index| format!("source-{index:04},right-{index:04}"));
+    write_file(&lix, "/large-semantic-merge.csv", &source_bytes).await;
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: main_branch_id,
+    })
+    .await
+    .unwrap();
+    let target_bytes = csv_rows(|index| format!("left-{index:04},target-{index:04}"));
+    write_file(&lix, "/large-semantic-merge.csv", &target_bytes).await;
+
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .unwrap();
+    let expected = csv_rows(|index| format!("source-{index:04},target-{index:04}"));
+    assert_eq!(read_file(&lix, "/large-semantic-merge.csv").await, expected);
+    lix.close().await.unwrap();
+}
+
+fn csv_rows(row: impl Fn(usize) -> String) -> Vec<u8> {
+    let mut csv = String::new();
+    for index in 0..CONFLICT_COUNT {
+        csv.push_str(&row(index));
+        csv.push('\n');
+    }
+    csv.into_bytes()
 }
 
 async fn install_csv_plugin<StorageImpl>(lix: &Lix<StorageImpl>)
