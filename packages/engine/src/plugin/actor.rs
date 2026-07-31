@@ -15,10 +15,11 @@ use tokio::sync::{
 };
 
 use super::incremental::FileBytesSha256;
-use crate::wasm::{WasmComponentActor, WasmDocumentHandle};
+use crate::wasm::{WasmComponentActor, WasmDocumentCheckpoint, WasmDocumentHandle};
 use crate::{Blob, LixError};
 
 pub(crate) const DEFAULT_MAX_LIVE_PLUGIN_STORES: usize = 16;
+const DEFAULT_MAX_DECODED_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 // One predecessor is enough for the required two-reader serialization while
 // keeping each file actor's retained working set bounded.
 pub(crate) const DEFAULT_MAX_PLUGIN_FILE_HISTORY: usize = 1;
@@ -121,8 +122,24 @@ impl PluginActorSlot {
 
 struct PluginActorCacheState {
     actors: BTreeMap<PluginActorKey, Arc<PluginActorSlot>>,
+    checkpoints: BTreeMap<(PluginActorKey, String), PluginActorCheckpoint>,
+    pending_checkpoints: BTreeMap<u64, PluginActorPendingCheckpoint>,
+    checkpoint_bytes: u64,
     clock: u64,
     next_nonce: u64,
+    next_checkpoint_nonce: u64,
+}
+
+struct PluginActorCheckpoint {
+    checkpoint: WasmDocumentCheckpoint,
+    last_used: u64,
+}
+
+struct PluginActorPendingCheckpoint {
+    key: PluginActorKey,
+    semantic_root: Arc<str>,
+    checkpoint: WasmDocumentCheckpoint,
+    last_used: u64,
 }
 
 /// Workspace-local index and hard admission bound for per-file actors.
@@ -132,6 +149,27 @@ pub(crate) struct PluginActorCache {
     store_admission: Arc<Semaphore>,
     state: Arc<Mutex<PluginActorCacheState>>,
     cold_open_gate: Arc<AsyncMutex<()>>,
+}
+
+pub(crate) struct PluginActorStagedCheckpoint {
+    cache: PluginActorCache,
+    nonce: Option<u64>,
+}
+
+impl PluginActorStagedCheckpoint {
+    pub(crate) fn publish(mut self) {
+        if let Some(nonce) = self.nonce.take() {
+            self.cache.publish_staged_checkpoint(nonce);
+        }
+    }
+}
+
+impl Drop for PluginActorStagedCheckpoint {
+    fn drop(&mut self) {
+        if let Some(nonce) = self.nonce.take() {
+            self.cache.discard_staged_checkpoint(nonce);
+        }
+    }
 }
 
 /// RAII admission for exactly one live Component Store.
@@ -188,8 +226,12 @@ impl PluginActorCache {
             store_admission: Arc::new(Semaphore::new(capacity.get())),
             state: Arc::new(Mutex::new(PluginActorCacheState {
                 actors: BTreeMap::new(),
+                checkpoints: BTreeMap::new(),
+                pending_checkpoints: BTreeMap::new(),
+                checkpoint_bytes: 0,
                 clock: 0,
                 next_nonce: 1,
+                next_checkpoint_nonce: 1,
             })),
             cold_open_gate: Arc::new(AsyncMutex::new(())),
         })
@@ -197,6 +239,163 @@ impl PluginActorCache {
 
     pub(crate) fn capacity(&self) -> usize {
         self.capacity.get()
+    }
+
+    /// Retains one decoded immutable arena root per actor identity. Unlike a
+    /// Wasmtime Store, this checkpoint owns no guest linear memory and can be
+    /// restored into a fresh actor after cache eviction.
+    pub(crate) fn remember_checkpoint(
+        &self,
+        key: &PluginActorKey,
+        semantic_root: &str,
+        checkpoint: Option<WasmDocumentCheckpoint>,
+    ) {
+        let Some(checkpoint) = checkpoint else {
+            return;
+        };
+        let retained_bytes = checkpoint.retained_bytes();
+        if retained_bytes > DEFAULT_MAX_DECODED_CHECKPOINT_BYTES {
+            return;
+        }
+        let mut state = self.lock();
+        let stale_keys = state
+            .checkpoints
+            .keys()
+            .filter(|(existing, _)| existing == key)
+            .cloned()
+            .collect::<Vec<_>>();
+        for stale_key in stale_keys {
+            if let Some(stale) = state.checkpoints.remove(&stale_key) {
+                state.checkpoint_bytes = state
+                    .checkpoint_bytes
+                    .saturating_sub(stale.checkpoint.retained_bytes());
+            }
+        }
+        state.clock = state.clock.wrapping_add(1);
+        let last_used = state.clock;
+        state.checkpoint_bytes = state.checkpoint_bytes.saturating_add(retained_bytes);
+        state.checkpoints.insert(
+            (key.clone(), semantic_root.to_owned()),
+            PluginActorCheckpoint {
+                checkpoint,
+                last_used,
+            },
+        );
+        while state.checkpoint_bytes > DEFAULT_MAX_DECODED_CHECKPOINT_BYTES {
+            if !evict_oldest_checkpoint(&mut state) {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn checkpoint(
+        &self,
+        key: &PluginActorKey,
+        semantic_root: &str,
+    ) -> Option<WasmDocumentCheckpoint> {
+        let mut state = self.lock();
+        state.clock = state.clock.wrapping_add(1);
+        let last_used = state.clock;
+        state
+            .checkpoints
+            .get_mut(&(key.clone(), semantic_root.to_owned()))
+            .map(|entry| {
+                entry.last_used = last_used;
+                entry.checkpoint.clone()
+            })
+    }
+
+    pub(crate) fn stage_checkpoint(
+        &self,
+        key: PluginActorKey,
+        semantic_root: Arc<str>,
+        checkpoint: Option<WasmDocumentCheckpoint>,
+    ) -> Option<PluginActorStagedCheckpoint> {
+        let checkpoint = checkpoint?;
+        let retained_bytes = checkpoint.retained_bytes();
+        if retained_bytes > DEFAULT_MAX_DECODED_CHECKPOINT_BYTES {
+            return None;
+        }
+        let mut state = self.lock();
+        state.clock = state.clock.wrapping_add(1);
+        let last_used = state.clock;
+        let nonce = state.next_checkpoint_nonce;
+        state.next_checkpoint_nonce = state.next_checkpoint_nonce.wrapping_add(1).max(1);
+        state.checkpoint_bytes = state.checkpoint_bytes.saturating_add(retained_bytes);
+        state.pending_checkpoints.insert(
+            nonce,
+            PluginActorPendingCheckpoint {
+                key,
+                semantic_root,
+                checkpoint,
+                last_used,
+            },
+        );
+        while state.checkpoint_bytes > DEFAULT_MAX_DECODED_CHECKPOINT_BYTES {
+            if !evict_oldest_checkpoint(&mut state) {
+                break;
+            }
+        }
+        drop(state);
+        Some(PluginActorStagedCheckpoint {
+            cache: self.clone(),
+            nonce: Some(nonce),
+        })
+    }
+
+    fn publish_staged_checkpoint(&self, nonce: u64) {
+        let mut state = self.lock();
+        let Some(mut pending) = state.pending_checkpoints.remove(&nonce) else {
+            return;
+        };
+        let stale_keys = state
+            .checkpoints
+            .keys()
+            .filter(|(existing, _)| existing == &pending.key)
+            .cloned()
+            .collect::<Vec<_>>();
+        for stale_key in stale_keys {
+            if let Some(stale) = state.checkpoints.remove(&stale_key) {
+                state.checkpoint_bytes = state
+                    .checkpoint_bytes
+                    .saturating_sub(stale.checkpoint.retained_bytes());
+            }
+        }
+        state.clock = state.clock.wrapping_add(1);
+        pending.last_used = state.clock;
+        state.checkpoints.insert(
+            (pending.key, pending.semantic_root.to_string()),
+            PluginActorCheckpoint {
+                checkpoint: pending.checkpoint,
+                last_used: pending.last_used,
+            },
+        );
+    }
+
+    fn discard_staged_checkpoint(&self, nonce: u64) {
+        let mut state = self.lock();
+        if let Some(pending) = state.pending_checkpoints.remove(&nonce) {
+            state.checkpoint_bytes = state
+                .checkpoint_bytes
+                .saturating_sub(pending.checkpoint.retained_bytes());
+        }
+    }
+
+    fn forget_checkpoints(&self, key: &PluginActorKey) {
+        let mut state = self.lock();
+        let stale_keys = state
+            .checkpoints
+            .keys()
+            .filter(|(existing, _)| existing == key)
+            .cloned()
+            .collect::<Vec<_>>();
+        for stale_key in stale_keys {
+            if let Some(stale) = state.checkpoints.remove(&stale_key) {
+                state.checkpoint_bytes = state
+                    .checkpoint_bytes
+                    .saturating_sub(stale.checkpoint.retained_bytes());
+            }
+        }
     }
 
     /// Serializes cold actor construction. The gate is workspace-wide rather
@@ -706,6 +905,52 @@ impl PluginActorCache {
     }
 }
 
+fn evict_oldest_checkpoint(state: &mut PluginActorCacheState) -> bool {
+    let committed = state
+        .checkpoints
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(key, entry)| (entry.last_used, key.clone()));
+    let pending = state
+        .pending_checkpoints
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(nonce, entry)| (entry.last_used, *nonce));
+    match (committed, pending) {
+        (None, None) => false,
+        (Some((_, key)), None) => {
+            if let Some(evicted) = state.checkpoints.remove(&key) {
+                state.checkpoint_bytes = state
+                    .checkpoint_bytes
+                    .saturating_sub(evicted.checkpoint.retained_bytes());
+            }
+            true
+        }
+        (None, Some((_, nonce))) => {
+            if let Some(evicted) = state.pending_checkpoints.remove(&nonce) {
+                state.checkpoint_bytes = state
+                    .checkpoint_bytes
+                    .saturating_sub(evicted.checkpoint.retained_bytes());
+            }
+            true
+        }
+        (Some((committed_used, key)), Some((pending_used, nonce))) => {
+            if committed_used <= pending_used {
+                if let Some(evicted) = state.checkpoints.remove(&key) {
+                    state.checkpoint_bytes = state
+                        .checkpoint_bytes
+                        .saturating_sub(evicted.checkpoint.retained_bytes());
+                }
+            } else if let Some(evicted) = state.pending_checkpoints.remove(&nonce) {
+                state.checkpoint_bytes = state
+                    .checkpoint_bytes
+                    .saturating_sub(evicted.checkpoint.retained_bytes());
+            }
+            true
+        }
+    }
+}
+
 fn plugin_store_resource_limit(capacity: NonZeroUsize) -> LixError {
     LixError::new(
         LixError::CODE_PLUGIN_RESOURCE_LIMIT,
@@ -721,6 +966,7 @@ fn plugin_store_resource_limit(capacity: NonZeroUsize) -> LixError {
 
 struct PluginActorSuccessor {
     document: WasmDocumentHandle,
+    checkpoint: Option<WasmDocumentCheckpoint>,
     bytes: Blob,
     bytes_sha256: Option<FileBytesSha256>,
     semantic_root: Arc<str>,
@@ -903,6 +1149,7 @@ impl PluginActorLease {
         &mut self,
         mut call: PluginActorPendingCall,
         document: WasmDocumentHandle,
+        checkpoint: Option<WasmDocumentCheckpoint>,
         bytes: Blob,
         bytes_sha256: impl Into<Option<FileBytesSha256>>,
         semantic_root: impl Into<Arc<str>>,
@@ -918,6 +1165,7 @@ impl PluginActorLease {
         let previous_successor = call.previous_successor.take();
         self.successor = Some(PluginActorSuccessor {
             document,
+            checkpoint,
             bytes,
             bytes_sha256,
             semantic_root: semantic_root.into(),
@@ -979,6 +1227,7 @@ impl PluginActorLease {
     pub(crate) fn complete_guest_call(
         &mut self,
         document: WasmDocumentHandle,
+        checkpoint: Option<WasmDocumentCheckpoint>,
         bytes: Blob,
         bytes_sha256: impl Into<Option<FileBytesSha256>>,
         semantic_root: impl Into<Arc<str>>,
@@ -993,6 +1242,7 @@ impl PluginActorLease {
         self.uncertain_guest_call = false;
         self.successor = Some(PluginActorSuccessor {
             document,
+            checkpoint,
             bytes,
             bytes_sha256,
             semantic_root: semantic_root.into(),
@@ -1012,6 +1262,18 @@ impl PluginActorLease {
             self.slot.retire();
         }
         result
+    }
+
+    pub(crate) fn successor_checkpoint(
+        &self,
+    ) -> Option<(PluginActorCache, Arc<str>, Option<WasmDocumentCheckpoint>)> {
+        self.successor.as_ref().map(|successor| {
+            (
+                self.cache.clone(),
+                Arc::clone(&successor.semantic_root),
+                successor.checkpoint.clone(),
+            )
+        })
     }
 
     /// Publishes the successor only after durable commit. A failure here is a
@@ -1079,6 +1341,14 @@ impl PluginActorLease {
             self.cache.remove_if_same(&self.key, &self.slot);
             return Err(error);
         }
+        if self.key != successor_key {
+            self.cache.forget_checkpoints(&self.key);
+        }
+        self.cache.remember_checkpoint(
+            &successor_key,
+            &successor.semantic_root,
+            successor.checkpoint,
+        );
         Ok(PluginObservation {
             key: successor_key,
             actor_nonce: self.slot.nonce,
@@ -1291,6 +1561,64 @@ mod tests {
         )
     }
 
+    #[test]
+    fn decoded_checkpoints_require_exact_actor_and_semantic_root() {
+        let cache = PluginActorCache::new(2).unwrap();
+        let actor_key = key("main", "/data.csv", "g1");
+        cache.remember_checkpoint(
+            &actor_key,
+            "root-1",
+            Some(WasmDocumentCheckpoint::new(42_u64, 128)),
+        );
+
+        assert_eq!(
+            cache
+                .checkpoint(&actor_key, "root-1")
+                .and_then(|checkpoint| checkpoint.downcast_ref::<u64>().copied()),
+            Some(42)
+        );
+        assert!(cache.checkpoint(&actor_key, "root-2").is_none());
+        assert!(
+            cache
+                .checkpoint(&key("main", "/other.csv", "g1"), "root-1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_and_published_checkpoints_share_one_hard_budget() {
+        let cache = PluginActorCache::new(2).unwrap();
+        let first_key = key("main", "/first.csv", "g1");
+        let second_key = key("main", "/second.csv", "g1");
+        let retained_bytes = 40 * 1024 * 1024;
+        let first = cache
+            .stage_checkpoint(
+                first_key.clone(),
+                Arc::from("root-1"),
+                Some(WasmDocumentCheckpoint::new(1_u64, retained_bytes)),
+            )
+            .unwrap();
+        let second = cache
+            .stage_checkpoint(
+                second_key.clone(),
+                Arc::from("root-2"),
+                Some(WasmDocumentCheckpoint::new(2_u64, retained_bytes)),
+            )
+            .unwrap();
+
+        assert!(cache.checkpoint(&second_key, "root-2").is_none());
+        first.publish();
+        second.publish();
+        assert!(cache.checkpoint(&first_key, "root-1").is_none());
+        assert_eq!(
+            cache
+                .checkpoint(&second_key, "root-2")
+                .and_then(|checkpoint| checkpoint.downcast_ref::<u64>().copied()),
+            Some(2)
+        );
+        assert!(cache.lock().checkpoint_bytes <= DEFAULT_MAX_DECODED_CHECKPOINT_BYTES);
+    }
+
     #[tokio::test]
     async fn successor_is_not_visible_until_commit() {
         let cache = PluginActorCache::new(2).unwrap();
@@ -1301,6 +1629,7 @@ mod tests {
         lease
             .complete_guest_call(
                 WasmDocumentHandle(2),
+                None,
                 b"after".as_slice().into(),
                 FileBytesSha256::compute(b"after"),
                 Arc::<str>::from("root-2"),
@@ -1355,6 +1684,7 @@ mod tests {
             .complete_pending_guest_call(
                 first_call,
                 WasmDocumentHandle(2),
+                None,
                 b"middle".as_slice().into(),
                 FileBytesSha256::compute(b"middle"),
                 Arc::<str>::from("root-2"),
@@ -1370,6 +1700,7 @@ mod tests {
             .complete_pending_guest_call(
                 second_call,
                 WasmDocumentHandle(3),
+                None,
                 b"after".as_slice().into(),
                 FileBytesSha256::compute(b"after"),
                 Arc::<str>::from("root-3"),
@@ -1422,6 +1753,7 @@ mod tests {
             .complete_pending_guest_call(
                 first_call,
                 WasmDocumentHandle(2),
+                None,
                 b"middle".as_slice().into(),
                 FileBytesSha256::compute(b"middle"),
                 Arc::<str>::from("root-2"),
@@ -1433,6 +1765,7 @@ mod tests {
             .complete_pending_guest_call(
                 second_call,
                 WasmDocumentHandle(3),
+                None,
                 b"after".as_slice().into(),
                 FileBytesSha256::compute(b"after"),
                 Arc::<str>::from("root-3"),
@@ -1465,6 +1798,7 @@ mod tests {
             .complete_pending_guest_call(
                 first_call,
                 WasmDocumentHandle(2),
+                None,
                 b"middle".as_slice().into(),
                 FileBytesSha256::compute(b"middle"),
                 Arc::<str>::from("root-2"),
@@ -1523,6 +1857,7 @@ mod tests {
         lease
             .complete_guest_call(
                 WasmDocumentHandle(2),
+                None,
                 b"after".as_slice().into(),
                 after_hash,
                 Arc::<str>::from("root-2"),
@@ -1541,6 +1876,7 @@ mod tests {
         latest
             .complete_guest_call(
                 WasmDocumentHandle(3),
+                None,
                 b"later".as_slice().into(),
                 None,
                 Arc::<str>::from("root-3"),
@@ -1569,6 +1905,7 @@ mod tests {
         lease
             .complete_guest_call(
                 WasmDocumentHandle(2),
+                None,
                 b"same".as_slice().into(),
                 FileBytesSha256::compute(b"same"),
                 Arc::<str>::from("root-2"),
@@ -1607,6 +1944,7 @@ mod tests {
         first_lease
             .complete_guest_call(
                 WasmDocumentHandle(2),
+                None,
                 b"after-a".as_slice().into(),
                 FileBytesSha256::compute(b"after-a"),
                 Arc::<str>::from("root-2"),
@@ -1653,6 +1991,7 @@ mod tests {
             lease
                 .complete_guest_call(
                     WasmDocumentHandle(revision),
+                    None,
                     bytes.clone().into(),
                     FileBytesSha256::compute(&bytes),
                     Arc::<str>::from(format!("root-{revision}")),
@@ -1675,6 +2014,7 @@ mod tests {
         lease
             .complete_guest_call(
                 WasmDocumentHandle(2),
+                None,
                 b"rejected".as_slice().into(),
                 FileBytesSha256::compute(b"rejected"),
                 Arc::<str>::from("root-2"),
@@ -2077,6 +2417,7 @@ mod tests {
         lease
             .complete_guest_call(
                 WasmDocumentHandle(2),
+                None,
                 b"winner".as_slice().into(),
                 FileBytesSha256::compute(b"winner"),
                 Arc::<str>::from("root-winner"),

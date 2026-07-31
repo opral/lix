@@ -762,6 +762,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn predecessor_v27_partial_current_state_protocols_are_rejected() {
+        for protocol in [
+            b"packed-current-base.v27".as_slice(),
+            b"checkpoint-owned-hot-baseline.v27".as_slice(),
+        ] {
+            let storage = Memory::new();
+            Engine::initialize(storage.clone())
+                .await
+                .expect("engine should initialize");
+            let storage_adapter = StorageAdapter::new(storage.clone());
+            let mut writes = storage_adapter.new_write_set();
+            writes.put(
+                crate::init::REPOSITORY_PROTOCOL_SPACE,
+                crate::init::REPOSITORY_PROTOCOL_KEY,
+                protocol,
+            );
+            storage_adapter
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("V27 protocol marker should commit");
+
+            let Err(error) = Engine::new(storage).await else {
+                panic!("V27 partial protocols must fail closed before HOT state is decoded");
+            };
+            assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+        }
+    }
+
+    #[tokio::test]
     async fn tracked_entity_fast_path_serves_broad_sql_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())

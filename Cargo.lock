@@ -3355,10 +3355,12 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "slatedb",
  "smallvec",
  "tempfile",
  "tokio",
  "tracing-subscriber",
+ "ulid",
  "xxhash-rust",
 ]
 

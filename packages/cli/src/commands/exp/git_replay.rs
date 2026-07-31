@@ -218,6 +218,9 @@ struct ReplayProfileReport {
     num_commits_requested: Option<u32>,
     checkpoint_every: Option<u32>,
     verify_state: bool,
+    git_lfs: bool,
+    git_lfs_files_materialized: u64,
+    git_lfs_bytes_materialized: u64,
     plugin_install_ms: f64,
     baseline_seed_parent: Option<String>,
     baseline_seed_ms: f64,
@@ -354,7 +357,7 @@ where
     let mut baseline_seed_files = 0usize;
     let seeded_blob_reader = if let Some(parent) = baseline_seed_parent.as_deref() {
         let seed_started = Instant::now();
-        let mut blob_reader = GitBlobReader::spawn(&repo_path)?;
+        let mut blob_reader = GitBlobReader::spawn(&repo_path, args.git_lfs)?;
         let seeded = seed_parent_tree(
             &repo_path,
             parent,
@@ -377,7 +380,7 @@ where
     let mut diff_reader = GitDiffTreeReader::spawn(&repo_path, &commits)?;
     let mut blob_reader = match seeded_blob_reader {
         Some(reader) => reader,
-        None => GitBlobReader::spawn(&repo_path)?,
+        None => GitBlobReader::spawn(&repo_path, args.git_lfs)?,
     };
     let mut applied = 0usize;
     let mut marker_only = 0usize;
@@ -520,6 +523,8 @@ where
         None
     };
     let replay_cleanup_started = Instant::now();
+    let git_lfs_files_materialized = blob_reader.git_lfs_files_materialized;
+    let git_lfs_bytes_materialized = blob_reader.git_lfs_bytes_materialized;
     blob_reader.finish()?;
     let replay_elapsed_ms =
         duration_to_ms(replay_before_final_verification + replay_cleanup_started.elapsed());
@@ -541,6 +546,11 @@ where
     println!("[git-replay] commits with marker only: {marker_only}");
     println!("[git-replay] changed paths total: {changed_paths}");
     println!("[git-replay] plugins: {}", args.plugins.as_str());
+    if args.git_lfs {
+        println!(
+            "[git-replay] materialized {git_lfs_files_materialized} Git LFS blobs ({git_lfs_bytes_materialized} bytes)"
+        );
+    }
     if args.plugins == GitReplayPlugins::All {
         println!(
             "[git-replay] text/CSV/Markdown/Excalidraw plugin setup excluded from replay timing: {plugin_install_ms:.3}ms"
@@ -575,6 +585,9 @@ where
                 num_commits_requested: args.num_commits,
                 checkpoint_every: args.checkpoint_every,
                 verify_state: args.verify_state,
+                git_lfs: args.git_lfs,
+                git_lfs_files_materialized,
+                git_lfs_bytes_materialized,
                 plugin_install_ms,
                 baseline_seed_parent,
                 baseline_seed_ms,
@@ -1122,14 +1135,79 @@ impl Drop for GitDiffTreeReader {
 
 struct GitBlobReader {
     repo_path: PathBuf,
+    git_lfs_objects_path: Option<PathBuf>,
+    git_lfs_oids_materialized: HashSet<String>,
+    git_lfs_files_materialized: u64,
+    git_lfs_bytes_materialized: u64,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     stderr_reader: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct GitLfsPointer {
+    oid: String,
+    size: u64,
+}
+
+fn git_lfs_objects_path(repo_path: &Path) -> Result<PathBuf, CliError> {
+    let common_dir = run_git_text(
+        repo_path,
+        &["rev-parse".to_string(), "--git-common-dir".to_string()],
+        None,
+    )?;
+    let common_dir = PathBuf::from(common_dir.trim());
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        repo_path.join(common_dir)
+    };
+    Ok(common_dir.join("lfs").join("objects"))
+}
+
+fn parse_git_lfs_pointer(bytes: &[u8]) -> Result<Option<GitLfsPointer>, CliError> {
+    const VERSION: &str = "version https://git-lfs.github.com/spec/v1";
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(None);
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(VERSION) {
+        return Ok(None);
+    }
+    let mut oid = None;
+    let mut size = None;
+    for line in lines {
+        if let Some(value) = line.strip_prefix("oid sha256:") {
+            if oid.is_some()
+                || value.len() != 64
+                || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(CliError::msg("malformed Git LFS SHA-256 pointer"));
+            }
+            oid = Some(value.to_ascii_lowercase());
+        } else if let Some(value) = line.strip_prefix("size ") {
+            if size.is_some() {
+                return Err(CliError::msg("duplicate Git LFS pointer size"));
+            }
+            size = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| CliError::msg("malformed Git LFS pointer size"))?,
+            );
+        }
+    }
+    Ok(Some(GitLfsPointer {
+        oid: oid.ok_or_else(|| CliError::msg("Git LFS pointer is missing its SHA-256 oid"))?,
+        size: size.ok_or_else(|| CliError::msg("Git LFS pointer is missing its size"))?,
+    }))
+}
+
 impl GitBlobReader {
-    fn spawn(repo_path: &Path) -> Result<Self, CliError> {
+    fn spawn(repo_path: &Path, git_lfs: bool) -> Result<Self, CliError> {
+        let git_lfs_objects_path = git_lfs
+            .then(|| git_lfs_objects_path(repo_path))
+            .transpose()?;
         let mut command = Command::new("git");
         command
             .arg("-C")
@@ -1161,6 +1239,10 @@ impl GitBlobReader {
         });
         Ok(Self {
             repo_path: repo_path.to_path_buf(),
+            git_lfs_objects_path,
+            git_lfs_oids_materialized: HashSet::new(),
+            git_lfs_files_materialized: 0,
+            git_lfs_bytes_materialized: 0,
             child: Some(child),
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
@@ -1262,7 +1344,44 @@ impl GitBlobReader {
                 "malformed git cat-file output: blob {requested_oid} lacks trailing newline"
             )));
         }
-        Ok(data)
+        let Some(objects_path) = &self.git_lfs_objects_path else {
+            return Ok(data);
+        };
+        let Some(pointer) = parse_git_lfs_pointer(&data)? else {
+            return Ok(data);
+        };
+        let object_path = objects_path
+            .join(&pointer.oid[..2])
+            .join(&pointer.oid[2..4])
+            .join(&pointer.oid);
+        let materialized = fs::read(&object_path).map_err(|source| {
+            CliError::msg(format!(
+                "Git LFS object {} is unavailable ({source}); run `git -C {} lfs fetch` before replay",
+                pointer.oid,
+                self.repo_path.display()
+            ))
+        })?;
+        if materialized.len() as u64 != pointer.size {
+            return Err(CliError::msg(format!(
+                "Git LFS object {} has {} bytes, pointer declares {}",
+                pointer.oid,
+                materialized.len(),
+                pointer.size
+            )));
+        }
+        let actual_oid = sha256_hex(&materialized);
+        if actual_oid != pointer.oid {
+            return Err(CliError::msg(format!(
+                "Git LFS object {} failed SHA-256 verification (read {actual_oid})",
+                pointer.oid
+            )));
+        }
+        if self.git_lfs_oids_materialized.insert(pointer.oid) {
+            self.git_lfs_files_materialized = self.git_lfs_files_materialized.saturating_add(1);
+            self.git_lfs_bytes_materialized =
+                self.git_lfs_bytes_materialized.saturating_add(pointer.size);
+        }
+        Ok(materialized)
     }
 
     fn finish(&mut self) -> Result<(), CliError> {
@@ -2385,6 +2504,81 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn git_lfs_pointer_parser_rejects_missing_and_malformed_fields() {
+        assert_eq!(
+            parse_git_lfs_pointer(b"ordinary bytes").expect("ordinary blob should parse"),
+            None
+        );
+        assert!(
+            parse_git_lfs_pointer(
+                b"version https://git-lfs.github.com/spec/v1\noid sha256:not-a-hash\nsize 5\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_git_lfs_pointer(
+                b"version https://git-lfs.github.com/spec/v1\noid sha256:\
+                  1111111111111111111111111111111111111111111111111111111111111111\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn persistent_blob_reader_materializes_and_verifies_local_git_lfs_objects() {
+        let repo = unique_temp_dir();
+        fs::create_dir_all(&repo).expect("fixture repository should be created");
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        let content = b"materialized LFS bytes";
+        let lfs_oid = sha256_hex(content);
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{lfs_oid}\nsize {}\n",
+            content.len()
+        );
+        fs::write(repo.join("asset.bin"), pointer).expect("pointer fixture should write");
+        git_ok(&repo, &["add", "asset.bin"]);
+        let index = run_git_text(&repo, &["ls-files".to_string(), "-s".to_string()], None)
+            .expect("index should list pointer blob");
+        let git_oid = index
+            .split_ascii_whitespace()
+            .nth(1)
+            .expect("index should contain pointer object id");
+        let object = repo
+            .join(".git/lfs/objects")
+            .join(&lfs_oid[..2])
+            .join(&lfs_oid[2..4])
+            .join(&lfs_oid);
+        fs::create_dir_all(object.parent().expect("LFS object has parent"))
+            .expect("LFS object directory should be created");
+        fs::write(&object, content).expect("LFS object should write");
+
+        let mut reader =
+            GitBlobReader::spawn(&repo, true).expect("persistent blob reader should start");
+        let blobs = reader
+            .read_blobs(&[git_oid.to_string()])
+            .expect("LFS pointer should materialize");
+        assert_eq!(
+            blobs.get(git_oid).map(Vec::as_slice),
+            Some(content.as_slice())
+        );
+        assert_eq!(reader.git_lfs_files_materialized, 1);
+        assert_eq!(reader.git_lfs_bytes_materialized, content.len() as u64);
+        reader
+            .finish()
+            .expect("persistent blob reader should finish");
+
+        fs::write(&object, vec![b'x'; content.len()]).expect("corrupt LFS object should write");
+        let mut reader =
+            GitBlobReader::spawn(&repo, true).expect("corrupt-object reader should start");
+        let error = reader
+            .read_blobs(&[git_oid.to_string()])
+            .expect_err("same-size corrupt LFS content must fail its SHA-256 check");
+        assert!(error.to_string().contains("SHA-256 verification"));
+        drop(reader);
+        fs::remove_dir_all(&repo).expect("fixture repository should be removable");
+    }
+
+    #[test]
     fn collect_wanted_blob_ids_skips_gitlink_oids() {
         let changes = vec![
             Change {
@@ -2611,6 +2805,7 @@ mod tests {
             num_commits: None,
             checkpoint_every: None,
             verify_state: false,
+            git_lfs: false,
             force: true,
             profile_json: None,
         });
@@ -2854,7 +3049,8 @@ mod tests {
             "fixture must exercise a second request batch"
         );
 
-        let mut reader = GitBlobReader::spawn(&repo).expect("persistent blob reader should start");
+        let mut reader =
+            GitBlobReader::spawn(&repo, false).expect("persistent blob reader should start");
         let blobs = reader
             .read_blobs(&blob_ids)
             .expect("batched blob requests should preserve every response");
@@ -2913,6 +3109,7 @@ mod tests {
             num_commits: None,
             checkpoint_every: Some(1),
             verify_state: true,
+            git_lfs: false,
             force: false,
             profile_json: Some(profile.clone()),
         })
@@ -3019,6 +3216,7 @@ mod tests {
                     num_commits: Some(1),
                     checkpoint_every: None,
                     verify_state: true,
+                    git_lfs: false,
                     force: false,
                     profile_json: Some(profile.clone()),
                 })
@@ -3119,6 +3317,7 @@ mod tests {
             num_commits: Some(100),
             checkpoint_every: None,
             verify_state: true,
+            git_lfs: false,
             force: false,
             profile_json: Some(profile.clone()),
         })
@@ -3266,6 +3465,7 @@ mod tests {
             num_commits: Some(2),
             checkpoint_every: None,
             verify_state: true,
+            git_lfs: false,
             force: false,
             profile_json: Some(profile.clone()),
         })

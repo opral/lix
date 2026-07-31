@@ -16,7 +16,7 @@ workspace = true
 default = ["rocksdb"]
 rocksdb = ["dep:lix_rocksdb_storage"]
 sqlite = ["dep:lix_sqlite_storage", "dep:rusqlite"]
-slatedb = ["dep:lix_slatedb_storage", "dep:object_store"]
+slatedb = ["dep:lix_slatedb_storage", "dep:object_store", "dep:slatedb", "dep:ulid"]
 storage-benches = ["lix_engine/storage-benches", "rocksdb", "sqlite"]
 
 [dependencies]
@@ -24,7 +24,9 @@ lix_engine = { workspace = true }
 lix_rocksdb_storage = { workspace = true, optional = true }
 lix_slatedb_storage = { workspace = true, optional = true }
 lix_sqlite_storage = { workspace = true, optional = true }
-object_store = { version = "0.14", default-features = false, optional = true }
+object_store = { version = "0.14", default-features = false, features = ["fs"], optional = true }
+slatedb = { version = "0.14.1", default-features = false, features = ["moka", "zstd"], optional = true }
+ulid = { version = "1.2.1", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]

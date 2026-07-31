@@ -64,11 +64,12 @@ use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256,
     LiveBatchEntitySource, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorCache,
     PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
-    PluginActorStore, PluginActorStorePermit, PluginArchiveInstallPlan, PluginContentType,
-    PluginFileOwner, PluginMaterialization, PluginObservation, PluginRegistry, PluginRegistryEntry,
-    PluginRegistryEntryInput, PluginRuntimeHost, SchemaAllowlist, ValidatedConflictTransition,
-    ValidatedFileTransition, ValidatedSameLengthOutputSplice, VecEntityChangeSource,
-    VecEntityConflictSource, VecEntitySource, build_file_update_splices, canonicalize_snapshot,
+    PluginActorStagedCheckpoint, PluginActorStore, PluginActorStorePermit,
+    PluginArchiveInstallPlan, PluginContentType, PluginFileOwner, PluginMaterialization,
+    PluginObservation, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
+    PluginRuntimeHost, SchemaAllowlist, ValidatedConflictTransition, ValidatedFileTransition,
+    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
+    VecEntitySource, build_file_update_splices, canonicalize_snapshot,
     drain_conflict_transition_resolutions, drain_entity_transition_edits,
     drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
     host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
@@ -168,10 +169,10 @@ use crate::transaction::validation::{
 };
 use crate::wasm::{
     WasmChangeEffect, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
-    WasmConflictUpdate, WasmDocumentHandle, WasmEntityChange, WasmEntityConflict, WasmEntityKey,
-    WasmEntityUpdate, WasmFileDescriptor, WasmFileUpdate, WasmHostBytes, WasmHostEntity,
-    WasmHostEntityChanges, WasmOpenEntitiesInput, WasmOpenFileInput, WasmPluginSelection,
-    WasmTransitionLimits,
+    WasmConflictUpdate, WasmDocumentCheckpoint, WasmDocumentHandle, WasmEntityChange,
+    WasmEntityConflict, WasmEntityKey, WasmEntityUpdate, WasmFileDescriptor, WasmFileUpdate,
+    WasmHostBytes, WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput, WasmOpenFileInput,
+    WasmPluginSelection, WasmTransitionLimits,
 };
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
@@ -3571,7 +3572,7 @@ where
                 return Err(error);
             }
 
-            for (pending, actor, validated) in completed_opens {
+            for (pending, mut actor, validated) in completed_opens {
                 let certified_row_count = validated
                     .certified_batches
                     .iter()
@@ -3643,6 +3644,7 @@ where
                     .push(PendingPluginActorPublication::New {
                         cache: self.plugin_host.actor_cache(),
                         key: pending.actor_key,
+                        checkpoint: actor.checkpoint_document(validated.document).await?,
                         store: PluginActorStore::new(actor, pending.store_permit),
                         document: validated.document,
                         bytes: pending.submitted_bytes,
@@ -3952,37 +3954,10 @@ where
                                     ));
                                 }
                             };
-                            let entity_rows = overlay_scan_batch(
-                                &base,
-                                &staged,
-                                &LiveStateScanRequest {
-                                    filter: LiveStateFilter {
-                                        schema_keys: selected.schema_keys().to_vec(),
-                                        branch_ids: vec![actor_key.branch_id.clone()],
-                                        file_ids: vec![NullableKeyFilter::Value(
-                                            actor_key.file_id.clone(),
-                                        )],
-                                        untracked: Some(false),
-                                        ..Default::default()
-                                    },
-                                    projection: plugin_state_live_state_projection(),
-                                    ..Default::default()
-                                },
-                            )
-                            .await?;
-                            let entity_ordinals = v2_host_entity_ordinals_from_live_batch(
-                                &entity_rows,
-                                &file_key,
-                                selected.schema_keys(),
-                            )?;
-                            let entity_count = entity_ordinals.len();
-                            let entity_source = LiveBatchEntitySource::new(
-                                entity_rows,
-                                entity_ordinals,
-                                cold_limits,
-                            )?;
-                            drop(base);
-                            drop(read);
+                            let decoded_checkpoint = cold_before.as_ref().and_then(|_| {
+                                cache.checkpoint(&actor_key, &visible_materialization.semantic_root)
+                            });
+                            let restored_checkpoint = decoded_checkpoint.is_some();
                             let store_permit = loop {
                                 match cache.admit_cold_store(&mut cold_install) {
                                     Ok(permit) => break permit,
@@ -4012,27 +3987,88 @@ where
                                     "lix.perf.plugin_actor_instantiate"
                                 ))
                                 .await?;
-                            let transition = match actor
-                                .cold_file_changed(
-                                    cold_limits,
-                                    WasmColdFileUpdate {
-                                        before_descriptor: cold_before_descriptor,
-                                        after_descriptor: descriptor.clone(),
-                                        before: cold_before,
-                                        edits: cold_edits,
-                                        after: Arc::new(ArcByteSource::new(
-                                            submitted_bytes.clone(),
-                                        )),
-                                        creates,
-                                        entities: Box::new(entity_source),
+                            let transition_result = if let Some(checkpoint) = decoded_checkpoint {
+                                drop(base);
+                                drop(read);
+                                let document = actor.restore_document(&checkpoint).await?;
+                                actor
+                                    .file_changed(
+                                        document,
+                                        cold_limits,
+                                        WasmFileUpdate {
+                                            before_descriptor: cold_before_descriptor,
+                                            after_descriptor: descriptor.clone(),
+                                            before: cold_before.expect(
+                                                "decoded checkpoints are used only for blob materializations",
+                                            ),
+                                            edits: cold_edits,
+                                            after: Arc::new(ArcByteSource::new(
+                                                submitted_bytes.clone(),
+                                            )),
+                                            creates,
+                                        },
+                                    )
+                                    .instrument(tracing::debug_span!(
+                                        target: "lix_perf",
+                                        "lix.perf.plugin_checkpoint_file_changed"
+                                    ))
+                                    .await
+                                    .map(|transition| (transition, 0))
+                            } else {
+                                let entity_rows = overlay_scan_batch(
+                                    &base,
+                                    &staged,
+                                    &LiveStateScanRequest {
+                                        filter: LiveStateFilter {
+                                            schema_keys: selected.schema_keys().to_vec(),
+                                            branch_ids: vec![actor_key.branch_id.clone()],
+                                            file_ids: vec![NullableKeyFilter::Value(
+                                                actor_key.file_id.clone(),
+                                            )],
+                                            untracked: Some(false),
+                                            ..Default::default()
+                                        },
+                                        projection: plugin_state_live_state_projection(),
+                                        ..Default::default()
                                     },
                                 )
-                                .instrument(tracing::debug_span!(
-                                    target: "lix_perf",
-                                    "lix.perf.plugin_cold_file_changed"
-                                ))
-                                .await
-                            {
+                                .await?;
+                                let entity_ordinals = v2_host_entity_ordinals_from_live_batch(
+                                    &entity_rows,
+                                    &file_key,
+                                    selected.schema_keys(),
+                                )?;
+                                let entity_count = entity_ordinals.len();
+                                let entity_source = LiveBatchEntitySource::new(
+                                    entity_rows,
+                                    entity_ordinals,
+                                    cold_limits,
+                                )?;
+                                drop(base);
+                                drop(read);
+                                actor
+                                    .cold_file_changed(
+                                        cold_limits,
+                                        WasmColdFileUpdate {
+                                            before_descriptor: cold_before_descriptor,
+                                            after_descriptor: descriptor.clone(),
+                                            before: cold_before,
+                                            edits: cold_edits,
+                                            after: Arc::new(ArcByteSource::new(
+                                                submitted_bytes.clone(),
+                                            )),
+                                            creates,
+                                            entities: Box::new(entity_source),
+                                        },
+                                    )
+                                    .instrument(tracing::debug_span!(
+                                        target: "lix_perf",
+                                        "lix.perf.plugin_cold_file_changed"
+                                    ))
+                                    .await
+                                    .map(|transition| (transition, entity_count))
+                            };
+                            let (transition, entity_count) = match transition_result {
                                 Ok(transition) => transition,
                                 Err(error) => {
                                     let _ = actor.retire().await;
@@ -4087,7 +4123,8 @@ where
                                     .unwrap_or(0);
                             counters.full_state_semantic_rows_materialized =
                                 u64::try_from(entity_count).unwrap_or(u64::MAX);
-                            counters.full_document_reparses = 1;
+                            counters.private_document_cache_hits = u64::from(restored_checkpoint);
+                            counters.full_document_reparses = u64::from(!restored_checkpoint);
                             counters.full_renderer_invocations = u64::from(matches!(
                                 selected.materialization(),
                                 PluginMaterialization::Derived
@@ -4104,6 +4141,9 @@ where
                                 PendingPluginActorPublication::New {
                                     cache,
                                     key: actor_key,
+                                    checkpoint: actor
+                                        .checkpoint_document(validated.document)
+                                        .await?,
                                     store: PluginActorStore::new(actor, store_permit),
                                     document: validated.document,
                                     bytes: submitted_bytes.clone(),
@@ -4413,8 +4453,17 @@ where
                             .unwrap_or(u64::MAX)
                             .saturating_add(certified_row_count);
                     self.plugin_host.record_transition_counters(counters);
+                    let successor_checkpoint = match lease
+                        .actor_mut()
+                        .checkpoint_document(successor_document)
+                        .await
+                    {
+                        Ok(checkpoint) => checkpoint,
+                        Err(error) => return Err(lease.handle_guest_call_error(error)),
+                    };
                     lease.complete_guest_call(
                         successor_document,
+                        successor_checkpoint,
                         materialized_bytes.clone(),
                         materialized_bytes_sha256,
                         materialization_version.clone(),
@@ -4507,6 +4556,7 @@ where
                     PendingPluginActorPublication::New {
                         cache: self.plugin_host.actor_cache(),
                         key: actor_key,
+                        checkpoint: actor.checkpoint_document(validated.document).await?,
                         store: PluginActorStore::new(actor, store_permit),
                         document: validated.document,
                         bytes: submitted_bytes.clone(),
@@ -7624,6 +7674,7 @@ enum PendingPluginActorPublication {
         key: PluginActorKey,
         store: PluginActorStore,
         document: WasmDocumentHandle,
+        checkpoint: Option<WasmDocumentCheckpoint>,
         bytes: crate::Blob,
         semantic_root: Arc<str>,
         view: PendingPluginActorView,
@@ -7636,6 +7687,7 @@ enum PendingPluginActorPublication {
     Uncached {
         path: String,
         view: PendingPluginActorView,
+        checkpoint: Option<PluginActorStagedCheckpoint>,
     },
 }
 
@@ -7647,24 +7699,35 @@ impl PendingPluginActorPublication {
                 successor_key,
                 view,
             } => {
+                let checkpoint =
+                    lease
+                        .successor_checkpoint()
+                        .and_then(|(cache, semantic_root, checkpoint)| {
+                            cache.stage_checkpoint(successor_key.clone(), semantic_root, checkpoint)
+                        });
                 let _ = lease.discard_successor().await;
                 Self::Uncached {
                     path: successor_key.path,
                     view,
+                    checkpoint,
                 }
             }
             Self::New {
+                cache,
                 mut store,
                 key,
                 document,
+                checkpoint,
+                semantic_root,
                 view,
                 ..
             } => {
                 let _ = store.actor_mut().drop_document(document).await;
                 let _ = store.actor_mut().retire().await;
                 Self::Uncached {
-                    path: key.path,
+                    path: key.path.clone(),
                     view,
+                    checkpoint: cache.stage_checkpoint(key, semantic_root, checkpoint),
                 }
             }
             publication @ Self::Uncached { .. } => publication,
@@ -7707,18 +7770,29 @@ impl PendingPluginActorPublication {
                 key,
                 store,
                 document,
+                checkpoint,
                 bytes,
                 semantic_root,
                 view,
             } => {
                 let path = key.path.clone();
+                cache.remember_checkpoint(&key, &semantic_root, checkpoint);
                 (
                     Some(cache.install(key, store, document, bytes, semantic_root)),
                     view,
                     path,
                 )
             }
-            Self::Uncached { path, view } => (None, view, path),
+            Self::Uncached {
+                path,
+                view,
+                checkpoint,
+            } => {
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.publish();
+                }
+                (None, view, path)
+            }
         };
         Ok((
             view.session_key,
@@ -7907,10 +7981,22 @@ async fn render_semantic_changes_with_lease(
     let mut counters = rendered.counters;
     counters.private_document_cache_hits = 1;
     counters.durable_semantic_changes = change_count;
+    let checkpoint = match lease
+        .actor_mut()
+        .checkpoint_document(rendered.document)
+        .await
+    {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            let error = lease.handle_pending_guest_call_error(call, error);
+            return Err((error, publication(lease)));
+        }
+    };
     if let Err(error) = lease
         .complete_pending_guest_call(
             call,
             rendered.document,
+            checkpoint,
             rendered.bytes,
             rendered.bytes_sha256,
             materialization_version.to_string(),

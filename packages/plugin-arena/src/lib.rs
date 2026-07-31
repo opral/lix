@@ -13,6 +13,7 @@
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::mem::size_of;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -280,6 +281,7 @@ pub struct ByteArena {
     len: u64,
     segments: Arc<[Segment]>,
     id: Digest,
+    retained_heap_bytes: usize,
 }
 
 impl ByteArena {
@@ -308,11 +310,20 @@ impl ByteArena {
             parts.push(segment.len.to_le_bytes().to_vec());
         }
         let id = digest(b"lix-plugin-v3/bytes\0", parts);
+        let retained_heap_bytes = size_of::<ByteArena>()
+            .saturating_add(segments.len().saturating_mul(size_of::<Segment>()))
+            .saturating_add(2 * size_of::<usize>())
+            .saturating_add(segments.iter().fold(0_usize, |total, segment| {
+                total
+                    .saturating_add(segment.page.bytes.len())
+                    .saturating_add(2 * size_of::<usize>())
+            }));
         Self {
             store,
             len,
             segments: segments.into(),
             id,
+            retained_heap_bytes,
         }
     }
 
@@ -531,6 +542,7 @@ pub struct MapArena {
     store: Store,
     entries: Arc<BTreeMap<Vec<u8>, ByteArena>>,
     id: Digest,
+    retained_heap_bytes: usize,
 }
 
 impl MapArena {
@@ -540,15 +552,22 @@ impl MapArena {
 
     fn from_entries(store: Store, entries: BTreeMap<Vec<u8>, ByteArena>) -> Self {
         let mut parts = Vec::with_capacity(entries.len() * 2);
+        let mut retained_heap_bytes = size_of::<MapArena>();
         for (key, value) in &entries {
             parts.push(key.clone());
             parts.push(value.id.0.to_vec());
+            retained_heap_bytes = retained_heap_bytes
+                .saturating_add(key.capacity())
+                .saturating_add(size_of::<(Vec<u8>, ByteArena)>())
+                .saturating_add(64)
+                .saturating_add(value.retained_heap_bytes);
         }
         let id = digest(b"lix-plugin-v3/map\0", parts);
         Self {
             store,
             entries: Arc::new(entries),
             id,
+            retained_heap_bytes,
         }
     }
 
@@ -642,6 +661,7 @@ pub struct Root {
     pub entities: MapArena,
     pub state: MapArena,
     id: Digest,
+    retained_heap_bytes: usize,
 }
 
 impl Root {
@@ -687,17 +707,33 @@ impl Root {
                 state.id.as_bytes(),
             ],
         );
+        let retained_heap_bytes = size_of::<Root>()
+            .saturating_add(bytes.retained_heap_bytes)
+            .saturating_add(entities.retained_heap_bytes)
+            .saturating_add(state.retained_heap_bytes);
         Self {
             generation,
             bytes,
             entities,
             state,
             id,
+            retained_heap_bytes,
         }
     }
 
     pub fn id(&self) -> Digest {
         self.id
+    }
+
+    /// Approximate heap bytes retained by this immutable root.
+    ///
+    /// This includes page payloads plus the per-entity keys, arenas,
+    /// segment arrays, and a conservative allowance for `BTreeMap` nodes and
+    /// allocation headers. It deliberately overcounts shared pages and
+    /// metadata so a decoded-root cache remains a hard memory bound. The value
+    /// is maintained while immutable arenas are built, so reading it is O(1).
+    pub fn retained_heap_bytes(&self) -> usize {
+        self.retained_heap_bytes
     }
 
     pub fn transaction(&self) -> Transaction {
@@ -1107,6 +1143,30 @@ mod tests {
         let metrics = store.metrics();
         assert_eq!(metrics.page_reads, 1);
         assert_eq!(metrics.page_bytes_read, 2);
+    }
+
+    #[test]
+    fn retained_heap_accounting_includes_entity_index_overhead() {
+        let store = Store::new(64);
+        let empty = Root::empty(store.clone(), "generation-a");
+        let populated = Root::import(
+            store,
+            "generation-a",
+            b"x",
+            (0..1_000).map(|index| {
+                (
+                    format!("row/{index:04}").into_bytes(),
+                    format!("{{\"id\":{index}}}").into_bytes(),
+                )
+            }),
+            std::iter::empty(),
+        );
+
+        assert!(populated.retained_heap_bytes() > empty.retained_heap_bytes());
+        assert!(
+            populated.retained_heap_bytes() > 100_000,
+            "small entity snapshots still retain map, key, arena, and allocation metadata"
+        );
     }
 
     #[test]

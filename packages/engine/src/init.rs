@@ -39,14 +39,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V27 publishes validated creates as branch-scoped immutable current-state
-/// bases instead of manufacturing one mutable HOT row per entity. Opening an
-/// older store must fail closed before its generation-only current-state
-/// layout is interpreted as the branch-scoped layout.
+/// V28 combines branch-scoped immutable current-state bases with explicitly
+/// checkpoint-owned dirty HOT baselines. Opening either predecessor must fail
+/// closed before its partial layout is interpreted as the combined protocol.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"packed-current-base.v27";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"packed-current-checkpoint-baseline.v28";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately

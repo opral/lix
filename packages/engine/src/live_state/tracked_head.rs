@@ -139,9 +139,12 @@ enum WorkingDiffBaseline {
     /// and has not changed since.
     Clean,
     /// The first mutation after the checkpoint created this identity.
-    BeforeAbsent,
+    BeforeAbsent { checkpoint_commit_id: CommitId },
     /// The first mutation after the checkpoint replaced this tracked value.
-    BeforePresent(WorkingDiffVersion),
+    BeforePresent {
+        checkpoint_commit_id: CommitId,
+        version: WorkingDiffVersion,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +158,7 @@ const WORKING_DIFF_SLOT_REF: u8 = 1;
 const WORKING_DIFF_SLOT_INLINE: u8 = 2;
 const WORKING_DIFF_VERSION_BYTES: usize =
     16 + 16 + 1 + 8 + 8 + 1 + JSON_REF_BYTES + 1 + JSON_REF_BYTES;
+const WORKING_DIFF_CHECKPOINT_BYTES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
 #[musli(packed)]
@@ -1123,6 +1127,13 @@ fn encode_working_diff_slot(encoded: &mut Vec<u8>, slot: WorkingDiffSlotFingerpr
     encoded.extend_from_slice(&slot.hash);
 }
 
+fn decode_working_diff_checkpoint(bytes: &[u8], offset: &mut usize) -> Result<CommitId, LixError> {
+    Ok(CommitId::new(uuid_from_working_diff_bytes(
+        take_working_diff_bytes(bytes, offset, WORKING_DIFF_CHECKPOINT_BYTES)?,
+        "checkpoint commit id",
+    )?))
+}
+
 fn decode_working_diff_version(
     bytes: &[u8],
     offset: &mut usize,
@@ -1246,7 +1257,7 @@ fn working_diff_error(message: &str) -> LixError {
 /// Persisting fingerprints only while a row is dirty keeps repeated diff
 /// classification independent of payload size without taxing checkpointed
 /// current state.
-const HEAD_VALUE_VERSION: u8 = 6;
+const HEAD_VALUE_VERSION: u8 = 7;
 const HEAD_VALUE_HEADER_BYTES: usize = 58;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
 const HEAD_VALUE_SNAPSHOT_SHIFT: u8 = 1;
@@ -1298,6 +1309,33 @@ impl HeadValueView<'_> {
             snapshot: working_diff_slot_fingerprint(self.snapshot),
             metadata: working_diff_slot_fingerprint(self.metadata),
         })
+    }
+}
+
+fn working_diff_checkpoint_owner(baseline: WorkingDiffBaseline) -> Option<CommitId> {
+    match baseline {
+        WorkingDiffBaseline::BeforeAbsent {
+            checkpoint_commit_id,
+        }
+        | WorkingDiffBaseline::BeforePresent {
+            checkpoint_commit_id,
+            ..
+        } => Some(checkpoint_commit_id),
+        WorkingDiffBaseline::Disabled | WorkingDiffBaseline::Clean => None,
+    }
+}
+
+fn effective_hot_commit_id(
+    value: HeadValueView<'_>,
+    active_checkpoint_commit_id: Option<CommitId>,
+) -> Option<CommitId> {
+    let commit_id = value.commit_id?;
+    match (
+        active_checkpoint_commit_id,
+        working_diff_checkpoint_owner(value.working_diff_baseline),
+    ) {
+        (Some(active), Some(owner)) if owner != active => Some(active),
+        _ => Some(commit_id),
     }
 }
 
@@ -1451,7 +1489,7 @@ fn append_head_value_parts(
 ) -> Result<std::ops::Range<usize>, LixError> {
     let fingerprint_inline = matches!(
         value.working_diff_baseline,
-        WorkingDiffBaseline::BeforeAbsent | WorkingDiffBaseline::BeforePresent(_)
+        WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. }
     );
     let snapshot_kind = encoded_slot_kind(value.snapshot, fingerprint_inline);
     let metadata_kind = encoded_slot_kind(value.metadata, fingerprint_inline);
@@ -1495,10 +1533,11 @@ fn append_head_value_parts(
         .and_then(|bytes| bytes.checked_add(metadata_len))
         .and_then(|bytes| {
             bytes.checked_add(match value.working_diff_baseline {
-                WorkingDiffBaseline::BeforePresent(_) => WORKING_DIFF_VERSION_BYTES,
-                WorkingDiffBaseline::Disabled
-                | WorkingDiffBaseline::Clean
-                | WorkingDiffBaseline::BeforeAbsent => 0,
+                WorkingDiffBaseline::BeforePresent { .. } => {
+                    WORKING_DIFF_CHECKPOINT_BYTES + WORKING_DIFF_VERSION_BYTES
+                }
+                WorkingDiffBaseline::BeforeAbsent { .. } => WORKING_DIFF_CHECKPOINT_BYTES,
+                WorkingDiffBaseline::Disabled | WorkingDiffBaseline::Clean => 0,
             })
         })
         .ok_or_else(|| head_value_error("encoded row length overflow"))?;
@@ -1530,8 +1569,18 @@ fn append_head_value_parts(
     );
     append_slot_payload(bytes, value.snapshot, fingerprint_inline);
     append_slot_payload(bytes, value.metadata, fingerprint_inline);
-    if let WorkingDiffBaseline::BeforePresent(version) = value.working_diff_baseline {
-        encode_working_diff_version(bytes, version);
+    match value.working_diff_baseline {
+        WorkingDiffBaseline::BeforeAbsent {
+            checkpoint_commit_id,
+        } => bytes.extend_from_slice(checkpoint_commit_id.as_uuid().as_bytes()),
+        WorkingDiffBaseline::BeforePresent {
+            checkpoint_commit_id,
+            version,
+        } => {
+            bytes.extend_from_slice(checkpoint_commit_id.as_uuid().as_bytes());
+            encode_working_diff_version(bytes, version);
+        }
+        WorkingDiffBaseline::Disabled | WorkingDiffBaseline::Clean => {}
     }
     debug_assert_eq!(bytes.len() - start, capacity);
     Ok(start..bytes.len())
@@ -1541,8 +1590,8 @@ fn encode_working_diff_baseline_tag(baseline: WorkingDiffBaseline) -> u8 {
     match baseline {
         WorkingDiffBaseline::Disabled => HEAD_WORKING_DIFF_DISABLED,
         WorkingDiffBaseline::Clean => HEAD_WORKING_DIFF_CLEAN,
-        WorkingDiffBaseline::BeforeAbsent => HEAD_WORKING_DIFF_BEFORE_ABSENT,
-        WorkingDiffBaseline::BeforePresent(_) => HEAD_WORKING_DIFF_BEFORE_PRESENT,
+        WorkingDiffBaseline::BeforeAbsent { .. } => HEAD_WORKING_DIFF_BEFORE_ABSENT,
+        WorkingDiffBaseline::BeforePresent { .. } => HEAD_WORKING_DIFF_BEFORE_PRESENT,
     }
 }
 
@@ -1632,10 +1681,13 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     let working_diff_baseline = match baseline_tag {
         HEAD_WORKING_DIFF_DISABLED => WorkingDiffBaseline::Disabled,
         HEAD_WORKING_DIFF_CLEAN => WorkingDiffBaseline::Clean,
-        HEAD_WORKING_DIFF_BEFORE_ABSENT => WorkingDiffBaseline::BeforeAbsent,
-        HEAD_WORKING_DIFF_BEFORE_PRESENT => WorkingDiffBaseline::BeforePresent(
-            decode_working_diff_version(bytes, &mut baseline_offset)?,
-        ),
+        HEAD_WORKING_DIFF_BEFORE_ABSENT => WorkingDiffBaseline::BeforeAbsent {
+            checkpoint_commit_id: decode_working_diff_checkpoint(bytes, &mut baseline_offset)?,
+        },
+        HEAD_WORKING_DIFF_BEFORE_PRESENT => WorkingDiffBaseline::BeforePresent {
+            checkpoint_commit_id: decode_working_diff_checkpoint(bytes, &mut baseline_offset)?,
+            version: decode_working_diff_version(bytes, &mut baseline_offset)?,
+        },
         _ => unreachable!("two-bit working-diff baseline tag is exhaustive"),
     };
     if baseline_offset != bytes.len() {
@@ -1873,6 +1925,7 @@ async fn materialize_live_entries<I>(
     entries: Vec<(I, Bytes)>,
     projection: ChangeRecordProjection,
     branch_id: &str,
+    active_checkpoint_commit_id: Option<CommitId>,
 ) -> Result<MaterializedLiveStateBatch, LixError>
 where
     I: LiveMaterializationIdentity,
@@ -1911,7 +1964,7 @@ where
             value.updated_at,
             global,
             value.change_id,
-            value.commit_id,
+            effective_hot_commit_id(value, active_checkpoint_commit_id),
             value.untracked,
             branch_id,
         );
@@ -2213,7 +2266,8 @@ mod tests {
     }
 
     #[test]
-    fn v6_value_codec_embeds_a_tracked_first_before_baseline() {
+    fn v7_value_codec_embeds_a_checkpoint_owned_tracked_first_before_baseline() {
+        let checkpoint_commit_id = CommitId::for_test_label("baseline-checkpoint");
         let baseline = WorkingDiffVersion {
             change_id: ChangeId::for_test_label("before-change"),
             commit_id: CommitId::for_test_label("before-commit"),
@@ -2238,21 +2292,28 @@ mod tests {
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"current\":true}"),
             metadata: JsonSlotRef::None,
-            working_diff_baseline: WorkingDiffBaseline::BeforePresent(baseline),
+            working_diff_baseline: WorkingDiffBaseline::BeforePresent {
+                checkpoint_commit_id,
+                version: baseline,
+            },
         };
 
-        let bytes = encode_head_value(&value).expect("encode v6 row with baseline");
+        let bytes = encode_head_value(&value).expect("encode v7 row with baseline");
         assert_eq!(
             bytes.len(),
             HEAD_VALUE_HEADER_BYTES
                 + JSON_REF_BYTES
                 + "{\"current\":true}".len()
+                + WORKING_DIFF_CHECKPOINT_BYTES
                 + WORKING_DIFF_VERSION_BYTES
         );
-        let decoded = decode_head_value(&bytes).expect("decode v6 row with baseline");
+        let decoded = decode_head_value(&bytes).expect("decode v7 row with baseline");
         assert_eq!(
             decoded.working_diff_baseline,
-            WorkingDiffBaseline::BeforePresent(baseline)
+            WorkingDiffBaseline::BeforePresent {
+                checkpoint_commit_id,
+                version: baseline,
+            }
         );
     }
 
@@ -2917,47 +2978,65 @@ mod tests {
             ChangeId::for_test_label("initial-change")
         );
 
-        // A checkpoint republishes a complete serving generation. Its tracked
-        // rows are all Clean in that new generation, so the old first-before
-        // baselines are neither read nor inherited by the next epoch.
+        // A checkpoint that selects the already-authoritative immutable
+        // change must not rewrite the HOT row just to clear its dirty
+        // baseline. The checkpoint owner on that baseline makes it stale for
+        // the next interval without touching the value.
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open no-op checkpoint write read");
         let mut writes = StorageWriteSet::new();
         let mut no_op_coverage = WorkingDiffIndexCoverage::default();
+        let selected = TrackedHeadDeltaRef {
+            schema_key: "schema",
+            file_id: None,
+            entity_pk: &entity_pk,
+            change_id: ChangeId::for_test_label("first-change"),
+            commit_id: first_head,
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-02T00:00:00Z"),
+            snapshot: JsonSlotRef::Inline("{\"value\":\"two\"}"),
+            metadata: JsonSlotRef::None,
+        };
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_commit_with_working_diff(
+            .stage_checkpoint_current_state(
                 branch_id,
-                None,
+                checkpoint,
                 no_op_checkpoint,
-                &[],
+                &[selected.as_current()],
                 &BTreeSet::new(),
-                Some(vec![MaterializedTrackedStateRow {
-                    entity_pk: entity_pk.clone(),
-                    schema_key: "schema".to_string(),
-                    file_id: None,
-                    snapshot_content: Some("{\"value\":\"two\"}".into()),
-                    metadata: None,
-                    deleted: false,
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
-                    updated_at: "2026-01-02T00:00:00Z".to_string(),
-                    change_id: ChangeId::for_test_label("first-change"),
-                    commit_id: first_head,
-                }]),
-                Some(no_op_checkpoint),
+                no_op_checkpoint,
                 &mut no_op_coverage,
             )
             .await
-            .expect("stage no-op checkpoint generation");
+            .expect("stage no-op checkpoint publication");
         assert_eq!(no_op_coverage, WorkingDiffIndexCoverage::default());
+        assert!(
+            !writes.contains_put(
+                HOT_ROW_SPACE,
+                &hot::encode_hot_row_key(&HeadIdentity {
+                    branch_id: branch_id.to_owned(),
+                    generation: checkpoint,
+                    schema_key: "schema".to_owned(),
+                    entity_pk: entity_pk.clone(),
+                    file_id: None,
+                }),
+            ),
+            "an identical selected change must not rewrite its HOT row"
+        );
+        assert!(
+            writes.is_empty(),
+            "an identical selection must not rewrite unchanged collection controls"
+        );
         stage_tracked_working_diff_epoch(
             &mut writes,
             branch_id,
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: no_op_checkpoint,
-                generation: no_op_checkpoint,
+                generation: checkpoint,
                 coverage: no_op_coverage,
             },
         )
@@ -2965,7 +3044,7 @@ mod tests {
         stage_branch_head_control(
             &mut writes,
             branch_id,
-            control(no_op_checkpoint, no_op_checkpoint, no_op_checkpoint),
+            control(no_op_checkpoint, checkpoint, no_op_checkpoint),
         )
         .expect("stage no-op checkpoint control");
         drop(read);
@@ -2986,7 +3065,7 @@ mod tests {
                 .expect("no-op checkpoint epoch should decode"),
             Some(TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: no_op_checkpoint,
-                generation: no_op_checkpoint,
+                generation: checkpoint,
                 coverage: WorkingDiffIndexCoverage::default(),
             })
         );
@@ -2998,13 +3077,38 @@ mod tests {
             .reader(read)
             .working_diff_for_control(
                 branch_id,
-                control(no_op_checkpoint, no_op_checkpoint, no_op_checkpoint),
+                control(no_op_checkpoint, checkpoint, no_op_checkpoint),
                 &TrackedStateDiffRequest::default(),
             )
             .await
             .expect("no-op checkpoint direct diff should read")
             .expect("no-op checkpoint direct diff should be known empty");
         assert!(empty_diff.diff.entries.is_empty());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open exact no-op checkpoint read");
+        let exact_empty_diff = TrackedHeadContext::new()
+            .reader(read)
+            .working_diff_for_control(
+                branch_id,
+                control(no_op_checkpoint, checkpoint, no_op_checkpoint),
+                &TrackedStateDiffRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec!["schema".to_owned()],
+                        entity_pks: vec![entity_pk.clone()],
+                        ..TrackedStateFilter::default()
+                    },
+                    ..TrackedStateDiffRequest::default()
+                },
+            )
+            .await
+            .expect("exact no-op checkpoint diff should read")
+            .expect("exact no-op checkpoint diff should be current");
+        assert!(
+            exact_empty_diff.diff.entries.is_empty(),
+            "finite diff reads must ignore a baseline owned by the prior checkpoint"
+        );
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3016,7 +3120,7 @@ mod tests {
             .writer(&read, &mut writes)
             .stage_commit_with_working_diff(
                 branch_id,
-                Some(no_op_checkpoint),
+                Some(checkpoint),
                 second_head,
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
@@ -3042,7 +3146,7 @@ mod tests {
             branch_id,
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: no_op_checkpoint,
-                generation: no_op_checkpoint,
+                generation: checkpoint,
                 coverage: second_coverage,
             },
         )
@@ -3050,7 +3154,7 @@ mod tests {
         stage_branch_head_control(
             &mut writes,
             branch_id,
-            control(second_head, no_op_checkpoint, no_op_checkpoint),
+            control(second_head, checkpoint, no_op_checkpoint),
         )
         .expect("stage second control");
         drop(read);
@@ -3067,7 +3171,7 @@ mod tests {
             .reader(read)
             .working_diff_for_control(
                 branch_id,
-                control(second_head, no_op_checkpoint, no_op_checkpoint),
+                control(second_head, checkpoint, no_op_checkpoint),
                 &TrackedStateDiffRequest::default(),
             )
             .await
@@ -3099,7 +3203,7 @@ mod tests {
             branch_id,
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: stale_checkpoint,
-                generation: no_op_checkpoint,
+                generation: checkpoint,
                 coverage: second_coverage,
             },
         )
@@ -3127,7 +3231,7 @@ mod tests {
                     .reader(read)
                     .working_diff_for_control(
                         branch_id,
-                        control(second_head, no_op_checkpoint, no_op_checkpoint),
+                        control(second_head, checkpoint, no_op_checkpoint),
                         &request,
                     )
                     .await
@@ -3143,7 +3247,7 @@ mod tests {
             branch_id,
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: no_op_checkpoint,
-                generation: no_op_checkpoint,
+                generation: checkpoint,
                 coverage: WorkingDiffIndexCoverage::default(),
             },
         )
@@ -3161,7 +3265,7 @@ mod tests {
                 .reader(read)
                 .working_diff_for_control(
                     branch_id,
-                    control(second_head, no_op_checkpoint, no_op_checkpoint),
+                    control(second_head, checkpoint, no_op_checkpoint),
                     &TrackedStateDiffRequest::default(),
                 )
                 .await
