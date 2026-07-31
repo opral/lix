@@ -1,16 +1,16 @@
-use lix_plugin_arena::{ByteEdit, PerformanceMeasurement, Root, Store, compare_to_v2};
+use lix_plugin_arena::{ByteEdit, PerformanceMeasurement, Root, Store, compare_to_baseline};
 use std::hint::black_box;
 use std::time::Instant;
 
 #[test]
-fn component_v3_wit_is_valid_and_has_no_guest_document_resource() {
+fn plugin_v1_wit_is_valid_and_has_no_guest_document_resource() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin-api/wit");
     let mut resolve = wit_parser::Resolve::default();
     resolve
         .push_dir(&path)
         .unwrap_or_else(|error| panic!("parse {}: {error:#}", path.display()));
     let wit = std::fs::read_to_string(path.join("lix-plugin.wit")).unwrap();
-    assert!(wit.contains("package lix:plugin@4.0.0"));
+    assert!(wit.contains("package lix:plugin@1.0.0"));
     assert!(wit.contains("resource snapshot"));
     assert!(wit.contains("resource transition"));
     assert!(wit.contains("apply: func("));
@@ -197,7 +197,7 @@ fn four_format_sparse_scorecard_reports_arena_ratios() {
 fn four_format_warm_edit_latency_scorecard() {
     const WARMUPS: usize = 100;
     const SAMPLES: usize = 5_000;
-    let enforce = std::env::var_os("LIX_V3_ENFORCE_ACCEPTANCE").is_some();
+    let enforce = std::env::var_os("LIX_PLUGIN_V1_ENFORCE_ACCEPTANCE").is_some();
     let mut failures = Vec::new();
     for format in Format::ALL {
         let bytes = format.fixture();
@@ -249,7 +249,7 @@ fn four_format_warm_edit_latency_scorecard() {
         let v3 = Distribution::new(v3_samples);
         let v2_retained_bytes = bytes.len() * 2;
         let v3_retained_bytes = store.unique_page_bytes();
-        let acceptance = compare_to_v2(
+        let acceptance = compare_to_baseline(
             PerformanceMeasurement {
                 p95_nanoseconds: v2.p95_ns,
                 peak_total_bytes: v2_retained_bytes as u64,
@@ -288,7 +288,7 @@ fn four_format_warm_edit_latency_scorecard() {
     if enforce {
         assert!(
             failures.is_empty(),
-            "Plugin API v3 failed the 2x latency / 3x memory gate for: {}",
+            "Plugin API v1 failed the 2x latency / 3x memory gate for: {}",
             failures.join(", ")
         );
     }

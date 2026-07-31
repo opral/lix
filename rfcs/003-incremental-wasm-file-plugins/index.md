@@ -5,7 +5,7 @@ date: "2026-07-23"
 # Incremental Wasm file plugins
 
 > Historical design note: the v2 contract described below has been superseded
-> by the hard-cut v3 contract in `docs/plugin-api-v3.md`. No v2 runtime or
+> by the hard-cut v1 contract in `docs/plugin-api-v1.md`. No prototype runtime or
 > compatibility adapter remains in the workspace.
 
 ## Summary

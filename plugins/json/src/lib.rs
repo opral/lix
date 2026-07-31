@@ -1,4 +1,4 @@
-//! JSON support for the fused Component API v4.
+//! JSON support for the fused Component API v1.
 #![allow(dead_code)]
 
 mod core;
@@ -1122,7 +1122,7 @@ impl BatchEncoder {
         if self.payload.len() > self.max_bytes {
             self.payload.clear();
             return Err(sdk::Error::limit_exceeded(
-                "one JSON entity exceeds the v3 batch limit",
+                "one JSON entity exceeds the plugin batch limit",
             ));
         }
         self.creates_only = Some(is_create);

@@ -253,7 +253,7 @@ mod tests {
             r#"{
                 "key":"plugin_json",
                 "runtime":"wasm-component",
-                "api_version":"4.0.0",
+                "api_version":"1.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.json"},
                 "entry":"plugin.wasm",
@@ -273,7 +273,7 @@ mod tests {
             r#"{
                 "key":"plugin_csv",
                 "runtime":"wasm-component",
-                "api_version":"4.0.0",
+                "api_version":"1.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.csv"},
                 "entry":"plugin.wasm",
@@ -282,31 +282,31 @@ mod tests {
         )
         .expect("current manifest should parse");
 
-        assert_eq!(validated.manifest.api_version, "4.0.0");
+        assert_eq!(validated.manifest.api_version, "1.0.0");
     }
 
     #[test]
-    fn rejects_pre_hard_cut_v3_manifest_before_instantiation() {
+    fn rejects_pre_v1_prototype_manifest_before_instantiation() {
         let error = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_csv",
                 "runtime":"wasm-component",
-                "api_version":"3.0.0",
+                "api_version":"4.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.csv"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/csv_row.json"]
             }"#,
         )
-        .expect_err("the hard cut must reject old WIT archives");
+        .expect_err("the v1 hard cut must reject prototype WIT archives");
 
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
         assert!(error.message.contains("api_version"));
-        assert!(error.message.contains("4.0.0"));
+        assert!(error.message.contains("1.0.0"));
     }
 
     #[test]
-    fn rejects_legacy_manifest() {
+    fn rejects_any_non_v1_manifest() {
         let error = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_csv",
@@ -318,11 +318,11 @@ mod tests {
                 "schemas":["schema/csv_row.json"]
             }"#,
         )
-        .expect_err("the runtime must fence legacy components");
+        .expect_err("the runtime must fence non-v1 components");
 
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
         assert!(error.message.contains("api_version"));
-        assert!(error.message.contains("4.0.0"));
+        assert!(error.message.contains("1.0.0"));
     }
 
     #[test]
@@ -330,7 +330,7 @@ mod tests {
         let err = parse_plugin_manifest_json(
             r#"{
                 "runtime":"wasm-component",
-                "api_version":"4.0.0",
+                "api_version":"1.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.json"},
                 "entry":"plugin.wasm",
@@ -350,7 +350,7 @@ mod tests {
             r#"{
                 "key":"plugin_markdown",
                 "runtime":"wasm-component",
-                "api_version":"4.0.0",
+                "api_version":"1.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.{md,mdx"},
                 "entry":"plugin.wasm",
@@ -407,7 +407,7 @@ mod tests {
             r#"{
                 "key":"plugin_text",
                 "runtime":"wasm-component",
-                "api_version":"4.0.0",
+                "api_version":"1.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"**/*", "content_type":"text"},
                 "entry":"plugin.wasm",
@@ -428,7 +428,7 @@ mod tests {
             r#"{
                 "key":"plugin_markdown",
                 "runtime":"wasm-component",
-                "api_version":"4.0.0",
+                "api_version":"1.0.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.{md,mdx}"},
                 "entry":"plugin.wasm",
@@ -451,7 +451,7 @@ mod tests {
         serde_json::json!({
             "key": "plugin_bounds",
             "runtime": "wasm-component",
-            "api_version": "4.0.0",
+            "api_version": "1.0.0",
             "materialization": "blob",
             "match": { "path_glob": path_glob },
             "entry": "plugin.wasm",

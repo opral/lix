@@ -187,7 +187,7 @@ try {
   WebAssembly binding. Vite follows this split without consumer configuration.
 - Every browser `openLix()` owns one dedicated worker, so database work does
   not block the page's main thread. Node.js uses the native binding's actor.
-- Node.js executes installed Component API v4 plugins with the Rust SDK's
+- Node.js executes installed Component API v1 plugins with the Rust SDK's
   Wasmtime runtime. The browser and Workerd bindings currently open without a
   component runtime: they can use ordinary Lix storage and SQL, but do not
   execute installed plugins. A browser Component host is a separate follow-up.

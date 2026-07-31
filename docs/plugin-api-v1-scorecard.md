@@ -1,4 +1,4 @@
-# Plugin API v3 scorecard
+# Plugin API v1 scorecard
 
 Measured on 2026-07-29 from `origin/main` at `57d619aad`. Release results are
 from a local Linux x86-64 build and are intended for relative design guidance,
@@ -82,7 +82,7 @@ cargo test -p lix_plugin_arena --test scorecard --release \
   four_format_warm_edit_latency_scorecard -- --ignored --nocapture
 
 # The same benchmark exits nonzero if any lane misses 2x latency or 3x memory.
-LIX_V3_ENFORCE_ACCEPTANCE=1 \
+LIX_PLUGIN_V1_ENFORCE_ACCEPTANCE=1 \
   cargo test -p lix_plugin_arena --test scorecard --release \
   four_format_warm_edit_latency_scorecard -- --ignored --nocapture
 ```
