@@ -2255,6 +2255,22 @@ async fn packed_current_base_refs(
     Ok(refs)
 }
 
+async fn stage_retire_packed_current_bases(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+) -> Result<(), LixError> {
+    for base_ref in packed_current_base_refs(store, branch_id, generation).await? {
+        writes.delete(PACKED_CURRENT_BASE_SPACE, StorageKey(base_ref.coverage_key));
+    }
+    writes.delete(
+        PACKED_CURRENT_BASE_CONTROL_SPACE,
+        StorageKey(Bytes::from(hot_scope_prefix(branch_id, generation))),
+    );
+    Ok(())
+}
+
 async fn packed_current_base_has_schema(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -3783,23 +3799,29 @@ where
         checkpoint_commit_id: CommitId,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
-        self.stage_current_state_with_working_diff_inner(
-            branch_id,
-            Some(generation),
-            new_head,
-            deltas,
-            absence_guards,
-            None,
-            None,
-            Some(checkpoint_commit_id),
-            coverage,
-            false,
-            None,
-            None,
-            true,
-            &BTreeMap::new(),
-        )
-        .await
+        let generation = self
+            .stage_current_state_with_working_diff_inner(
+                branch_id,
+                Some(generation),
+                new_head,
+                deltas,
+                absence_guards,
+                None,
+                None,
+                Some(checkpoint_commit_id),
+                coverage,
+                false,
+                None,
+                None,
+                true,
+                &BTreeMap::new(),
+            )
+            .await?;
+        // The checkpoint has now materialized the complete dirty set as HOT
+        // rows. Keeping the immutable packed inputs active would make every
+        // later read revisit checkpointed history within the same generation.
+        stage_retire_packed_current_bases(self.store, self.writes, branch_id, generation).await?;
+        Ok(generation)
     }
 
     /// Stages deltas whose absence was already validated against the coherent
@@ -8033,6 +8055,134 @@ mod tests {
         assert!(manifests[1].is_none());
         assert!(controls[0].is_some());
         assert!(controls[1].is_none());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_retires_materialized_packed_bases_in_active_generation() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000c9";
+        const COMMIT_LABEL: &str = "checkpoint-packed-base";
+        const SCHEMA_KEY: &str = "checkpoint_schema";
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label(COMMIT_LABEL);
+        let entity_pk = EntityPk::single("packed-row");
+        let created_at = timestamp();
+        crate::test_support::seed_branch_head_with_rows(
+            storage.clone(),
+            BRANCH_ID,
+            COMMIT_LABEL,
+            &[MaterializedTrackedStateRow {
+                entity_pk: entity_pk.clone(),
+                schema_key: SCHEMA_KEY.to_owned(),
+                file_id: None,
+                snapshot_content: Some(r#"{"key":"packed-row"}"#.into()),
+                metadata: None,
+                deleted: false,
+                created_at: created_at.to_string(),
+                updated_at: created_at.to_string(),
+                change_id: ChangeId::for_test_label("checkpoint-packed-base-change"),
+                commit_id: generation,
+            }],
+        )
+        .await;
+
+        let mut manifest_key = hot_scope_prefix(BRANCH_ID, generation);
+        manifest_key.extend_from_slice(generation.as_uuid().as_bytes());
+        let control_key = hot_scope_prefix(BRANCH_ID, generation);
+        let mut fixture_writes = StorageWriteSet::new();
+        fixture_writes.delete(
+            HOT_ROW_SPACE,
+            StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
+                branch_id: BRANCH_ID.to_owned(),
+                generation,
+                schema_key: SCHEMA_KEY.to_owned(),
+                entity_pk: entity_pk.clone(),
+                file_id: None,
+            }))),
+        );
+        fixture_writes.put(
+            PACKED_CURRENT_BASE_SPACE,
+            StorageKey(Bytes::from(manifest_key.clone())),
+            StorageValue {
+                bytes: Bytes::from_static(&[0; 16]),
+            },
+        );
+        fixture_writes.put(
+            PACKED_CURRENT_BASE_CONTROL_SPACE,
+            StorageKey(Bytes::from(control_key.clone())),
+            StorageValue {
+                bytes: Bytes::from_static(&[1]),
+            },
+        );
+        storage
+            .commit_write_set(fixture_writes, StorageWriteOptions::default())
+            .await
+            .expect("publish packed checkpoint fixture");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open packed checkpoint read");
+        let checkpoint_head = CommitId::for_test_label("checkpoint-packed-head");
+        let checkpoint_change = ChangeId::for_test_label("checkpoint-packed-change");
+        let snapshot = r#"{"key":"packed-row"}"#;
+        let delta = CurrentStateDeltaRef {
+            schema_key: SCHEMA_KEY,
+            file_id: None,
+            entity_pk: &entity_pk,
+            change_id: Some(checkpoint_change),
+            commit_id: Some(checkpoint_head),
+            untracked: false,
+            deleted: false,
+            created_at,
+            updated_at: created_at,
+            snapshot: JsonSlotRef::Inline(snapshot),
+            metadata: JsonSlotRef::None,
+        };
+        let mut checkpoint_writes = StorageWriteSet::new();
+        let mut coverage = WorkingDiffIndexCoverage::default();
+        HotStateWriter {
+            store: &read,
+            writes: &mut checkpoint_writes,
+        }
+        .stage_checkpoint_current_state(
+            BRANCH_ID,
+            generation,
+            checkpoint_head,
+            &[delta],
+            &BTreeSet::new(),
+            generation,
+            &mut coverage,
+        )
+        .await
+        .expect("stage checkpoint over packed base");
+        drop(read);
+        storage
+            .commit_write_set(checkpoint_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit checkpoint over packed base");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verify packed checkpoint retirement");
+        let packed = PointReadPlan::new(
+            PACKED_CURRENT_BASE_SPACE,
+            &[StorageKey(Bytes::from(manifest_key))],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("read retired packed manifest")
+        .value;
+        let control = PointReadPlan::new(
+            PACKED_CURRENT_BASE_CONTROL_SPACE,
+            &[StorageKey(Bytes::from(control_key))],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("read retired packed control")
+        .value;
+        assert!(packed[0].is_none());
+        assert!(control[0].is_none());
     }
 
     #[tokio::test]
