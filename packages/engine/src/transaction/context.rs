@@ -4135,11 +4135,12 @@ where
                                     Some(&observed_existing_authorities),
                                 )
                                 .await?;
-                            let entity_authorities = plugin_entity_authorities_after_changes(
+                            let entity_authorities = plugin_entity_authorities_after_transition(
                                 selected,
                                 &cold_base_authorities,
                                 &changes,
-                            );
+                                write.certified_entity_batches(),
+                            )?;
                             let mut counters = validated.counters;
                             counters.host_full_diff_bytes_compared = host_full_diff_bytes_compared;
                             counters.host_content_classification_bytes =
@@ -4383,11 +4384,12 @@ where
                             return Err(lease.handle_guest_call_error(error));
                         }
                     };
-                    let successor_entity_authorities = plugin_entity_authorities_after_changes(
+                    let successor_entity_authorities = plugin_entity_authorities_after_transition(
                         selected,
                         &accepted_entity_authorities,
                         &changes,
-                    );
+                        &detected_transition.certified_batches,
+                    )?;
                     let (successor_document, materialized_bytes, materialized_bytes_sha256) =
                         if observation_is_current {
                             // The actor lease serializes this file and the durable
@@ -7232,19 +7234,35 @@ fn plugin_entity_authorities_after_changes(
     base.with_delta(inserted, removed)
 }
 
-fn plugin_entity_authorities_from_changes(
-    plugin: &PluginRegistryEntry,
-    changes: &WasmHostEntityChanges,
-) -> PluginEntityAuthorities {
-    plugin_entity_authorities_after_changes(plugin, &PluginEntityAuthorities::empty(), changes)
-}
-
 fn plugin_entity_authorities_from_transition(
     plugin: &PluginRegistryEntry,
     changes: &WasmHostEntityChanges,
     certified_batches: &[WasmCertifiedEntityBatch],
 ) -> Result<PluginEntityAuthorities, LixError> {
-    let base = plugin_entity_authorities_from_changes(plugin, changes);
+    plugin_entity_authorities_after_transition(
+        plugin,
+        &PluginEntityAuthorities::empty(),
+        changes,
+        certified_batches,
+    )
+}
+
+fn plugin_entity_authorities_after_transition(
+    plugin: &PluginRegistryEntry,
+    prior: &PluginEntityAuthorities,
+    changes: &WasmHostEntityChanges,
+    certified_batches: &[WasmCertifiedEntityBatch],
+) -> Result<PluginEntityAuthorities, LixError> {
+    let empty = PluginEntityAuthorities::empty();
+    let base = if certified_batches
+        .iter()
+        .any(|batch| batch.complete_file_state)
+    {
+        &empty
+    } else {
+        prior
+    };
+    let base = plugin_entity_authorities_after_changes(plugin, base, changes);
     let mut ranges = Vec::new();
     for batch in certified_batches {
         for range in &batch.create_ranges {
@@ -10432,6 +10450,48 @@ mod tests {
             std::iter::repeat_n('a', 64).collect::<String>(),
             "the previously loaded authoritative entry remains untouched on rejection"
         );
+    }
+
+    #[test]
+    fn complete_certified_transition_replaces_prior_entity_authority() {
+        let plugin = upgrade_test_entry('a');
+        let prior_key =
+            WasmEntityKey::from_owned_parts("csv_row".to_owned(), vec!["removed-row".to_owned()]);
+        let prior = PluginEntityAuthorities::from_keys(BTreeSet::from([prior_key.clone()]));
+        let creates = crate::wasm::WasmCreateContext {
+            high: 0x019a_0000_0000_7000,
+            low: 0x8000_0000,
+        };
+        let replacement_key = WasmEntityKey::from_owned_parts(
+            "csv_row".to_owned(),
+            creates.entity_pk(7).expect("replacement identity"),
+        );
+        let certified = WasmCertifiedEntityBatch {
+            format: 1,
+            schema_keys: vec!["csv_row".to_owned()],
+            row_count: 1,
+            creates,
+            create_ranges: vec![crate::wasm::WasmCertifiedCreateRange {
+                schema_key: "csv_row".to_owned(),
+                first_local_ref: 7,
+                last_local_ref: 7,
+            }],
+            complete_file_state: true,
+            pages: vec![Bytes::new()],
+        };
+
+        let successor = plugin_entity_authorities_after_transition(
+            &plugin,
+            &prior,
+            &WasmHostEntityChanges {
+                changes: Vec::new(),
+            },
+            &[certified],
+        )
+        .expect("complete certified authority should rebuild");
+
+        assert!(!successor.contains(&prior_key));
+        assert!(successor.contains(&replacement_key));
     }
 
     #[tokio::test]
