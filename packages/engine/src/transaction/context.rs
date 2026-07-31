@@ -5054,7 +5054,7 @@ where
                     rows.row(index),
                     normalized,
                     &functions,
-                    *default_timestamp.get_or_insert_with(|| functions.call_timestamp()),
+                    &mut default_timestamp,
                 )?);
             }
             if rows.iter().any(|row| {
@@ -5151,7 +5151,7 @@ where
                         .take()
                         .expect("normalized domain row must have facts"),
                     &functions,
-                    *default_timestamp.get_or_insert_with(|| functions.call_timestamp()),
+                    &mut default_timestamp,
                 )?;
                 scalar_ordinal_by_row[index] = scalar_facts.schema_plan_ids.len();
                 scalar_facts.push(scalar);
@@ -6324,7 +6324,7 @@ fn plan_prepared_row_scalars(
     row: RawWriteRowRef<'_>,
     normalized: NormalizedRowFacts,
     functions: &FunctionProviderHandle,
-    default_timestamp: LixTimestamp,
+    default_timestamp: &mut Option<LixTimestamp>,
 ) -> Result<PreparedScalarRow, LixError> {
     let NormalizedRowFacts {
         schema_plan_id,
@@ -6332,7 +6332,7 @@ fn plan_prepared_row_scalars(
     } = normalized;
     let updated_at = match row.updated_at {
         Some(updated_at) => parse_prepared_timestamp("updated_at", updated_at)?,
-        None => default_timestamp,
+        None => *default_timestamp.get_or_insert_with(|| functions.call_timestamp()),
     };
     let created_at = match row.created_at {
         Some(created_at) => parse_prepared_timestamp("created_at", created_at)?,
@@ -9392,7 +9392,7 @@ mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::NullableKeyFilter;
     use crate::branch::BranchContext;
-    use crate::functions::FunctionProvider;
+    use crate::functions::{DeterministicFunctionProvider, FunctionProvider};
     use crate::storage_adapter::{Memory, StorageReadOptions};
     use crate::tracked_state::{
         TrackedStateDiffIdentity, TrackedStateKey, TrackedStateScanRequest,
@@ -10688,6 +10688,43 @@ mod tests {
         assert_eq!(
             rows.row(0).updated_at().to_string(),
             "2026-04-23T00:00:00.123Z"
+        );
+    }
+
+    #[test]
+    fn explicit_row_timestamps_do_not_advance_deterministic_sequence() {
+        let mut row = key_value_stage_row("explicit-timestamps", "value", true);
+        row.created_at = Some("2026-04-23T00:00:00.123Z".to_string());
+        row.updated_at = Some("2026-04-24T00:00:00.456Z".to_string());
+        row.change_id = Some(ChangeId::for_test_label("explicit-change").to_string());
+        let rows = raw_write_rows(vec![row]);
+        let functions =
+            FunctionProviderHandle::shared(Box::new(DeterministicFunctionProvider::new(0, false)));
+        let mut default_timestamp = None;
+
+        let planned = plan_prepared_row_scalars(
+            rows.row(0),
+            NormalizedRowFacts {
+                schema_plan_id: SchemaPlanId::for_test(0),
+                facts: PreparedRowFacts::default(),
+            },
+            &functions,
+            &mut default_timestamp,
+        )
+        .expect("explicit row timestamps should plan");
+
+        assert_eq!(
+            planned.created_at.to_string(),
+            "2026-04-23T00:00:00.123Z"
+        );
+        assert_eq!(
+            planned.updated_at.to_string(),
+            "2026-04-24T00:00:00.456Z"
+        );
+        assert_eq!(default_timestamp, None);
+        assert_eq!(
+            functions.deterministic_sequence_persist_highest_seen(),
+            None
         );
     }
 
