@@ -45,6 +45,14 @@ pub(crate) struct BlobSameLengthSplice {
     pub(crate) length: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlobEditSplice {
+    pub(crate) base_blob_hash: BlobHash,
+    pub(crate) offset: usize,
+    pub(crate) delete_len: usize,
+    pub(crate) insert_len: usize,
+}
+
 impl BlobSameLengthSplice {
     pub(crate) fn new(base_blob_hash: BlobHash, offset: usize, length: usize) -> Self {
         Self {
@@ -103,10 +111,34 @@ impl BlobPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BlobLayout {
-    Empty,
+pub(crate) enum BlobDeltaSegment {
+    Copy { offset: u64, length: u64 },
+    Insert { bytes: Vec<u8> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BlobDeltaBaseLayout {
     SingleChunk { chunk_hash: BlobHash },
     Chunked { chunk_count: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BlobLayout {
+    Empty,
+    SingleChunk {
+        chunk_hash: BlobHash,
+    },
+    Chunked {
+        chunk_count: u32,
+    },
+    /// One-level, flattened copy/insert program against a canonical full blob,
+    /// so reads never walk a history chain.
+    Delta {
+        base_blob_hash: BlobHash,
+        base_size_bytes: u64,
+        base_layout: BlobDeltaBaseLayout,
+        segments: Vec<BlobDeltaSegment>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

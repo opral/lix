@@ -17,6 +17,7 @@ pub(crate) struct BinaryCasStorageStats {
     pub empty_blob_rows: u64,
     pub single_chunk_blob_rows: u64,
     pub chunked_blob_rows: u64,
+    pub delta_blob_rows: u64,
     pub manifest_chunk_rows: u64,
     pub chunk_presence_rows: u64,
     pub chunk_rows: u64,
@@ -55,6 +56,7 @@ where
                     stats.chunked_blob_rows += 1;
                     stats.total_chunk_refs += u64::from(chunk_count);
                 }
+                BinaryCasManifest::Delta { .. } => stats.delta_blob_rows += 1,
             }
             Ok(())
         },
@@ -208,6 +210,7 @@ mod tests {
                 empty_blob_rows: 1,
                 single_chunk_blob_rows: 1,
                 chunked_blob_rows: 1,
+                delta_blob_rows: 0,
                 manifest_chunk_rows: 2,
                 chunk_presence_rows: 3,
                 chunk_rows: 3,

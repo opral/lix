@@ -25,6 +25,25 @@ pub(crate) enum BinaryCasManifest {
         size_bytes: u64,
         chunk_count: u32,
     },
+    Delta {
+        size_bytes: u64,
+        base_blob_hash: [u8; HASH_BYTES],
+        base_size_bytes: u64,
+        base_layout: StorageBinaryCasDeltaBaseLayout,
+        segments: Vec<StorageBinaryCasDeltaSegment>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub(crate) enum StorageBinaryCasDeltaBaseLayout {
+    SingleChunk { chunk_hash: [u8; HASH_BYTES] },
+    Chunked { chunk_count: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub(crate) enum StorageBinaryCasDeltaSegment {
+    Copy { offset: u64, length: u64 },
+    Insert { bytes: Vec<u8> },
 }
 
 #[derive(Encode, Decode)]
@@ -48,7 +67,8 @@ impl BinaryCasManifest {
         match self {
             Self::Empty { size_bytes }
             | Self::SingleChunk { size_bytes, .. }
-            | Self::Chunked { size_bytes, .. } => *size_bytes,
+            | Self::Chunked { size_bytes, .. }
+            | Self::Delta { size_bytes, .. } => *size_bytes,
         }
     }
 }
@@ -195,6 +215,34 @@ mod tests {
             assert_eq!(encoded.len(), expected_len);
             assert_eq!(decode_binary_cas_manifest(&encoded).unwrap(), manifest);
         }
+    }
+
+    #[test]
+    fn delta_manifest_roundtrips_copy_insert_program() {
+        let base_blob_hash = binary_blob_hash_bytes(b"base blob");
+        let chunk_hash = binary_blob_hash_bytes(b"base chunk");
+        let manifest = BinaryCasManifest::Delta {
+            size_bytes: 12,
+            base_blob_hash,
+            base_size_bytes: 10,
+            base_layout: StorageBinaryCasDeltaBaseLayout::SingleChunk { chunk_hash },
+            segments: vec![
+                StorageBinaryCasDeltaSegment::Copy {
+                    offset: 0,
+                    length: 5,
+                },
+                StorageBinaryCasDeltaSegment::Insert {
+                    bytes: b"delta".to_vec(),
+                },
+                StorageBinaryCasDeltaSegment::Copy {
+                    offset: 8,
+                    length: 2,
+                },
+            ],
+        };
+
+        let encoded = encode_binary_cas_manifest(&manifest);
+        assert_eq!(decode_binary_cas_manifest(&encoded).unwrap(), manifest);
     }
 
     #[test]

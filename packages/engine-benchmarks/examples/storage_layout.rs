@@ -185,12 +185,13 @@ async fn print_binary_manifest_layout(read: &impl lix_engine::storage_adapter::S
         .await
         .expect("decode binary manifest layout");
     println!(
-        "BINARY_MANIFEST\tmanifests={}\tencoded_bytes={}\tempty={}\tsingle_chunk={}\tchunked={}",
+        "BINARY_MANIFEST\tmanifests={}\tencoded_bytes={}\tempty={}\tsingle_chunk={}\tchunked={}\tdelta={}",
         layout.manifests,
         layout.encoded_bytes,
         layout.empty_manifests,
         layout.single_chunk_manifests,
         layout.chunked_manifests,
+        layout.delta_manifests,
     );
 }
 

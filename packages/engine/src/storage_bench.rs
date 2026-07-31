@@ -318,6 +318,7 @@ pub struct BinaryManifestLayoutAccounting {
     pub empty_manifests: u64,
     pub single_chunk_manifests: u64,
     pub chunked_manifests: u64,
+    pub delta_manifests: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -549,6 +550,9 @@ where
             }
             crate::binary_cas::BinaryCasManifest::Chunked { .. } => {
                 accounting.chunked_manifests += 1;
+            }
+            crate::binary_cas::BinaryCasManifest::Delta { .. } => {
+                accounting.delta_manifests += 1;
             }
         }
     }
