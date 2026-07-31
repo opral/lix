@@ -1,4 +1,4 @@
-# Lix plugin API v3
+# Lix plugin API v4
 
 The canonical, intentionally incompatible Component API for Lix plugins. It
 uses fused guest transitions with host-owned sources and push sinks.
@@ -37,7 +37,7 @@ published unless the export, complete drain, and subsequent commit all succeed.
 
 Cold-successor is not ordinary hydration. A cache miss during replay must not
 rebuild and render the predecessor merely to parse the successor. Warm apply,
-cold successor, and explicit hydration are separate v3 operations so the host
+cold successor, and explicit hydration are separate v4 operations so the host
 cannot accidentally reintroduce that work through an adapter.
 
 Measured on the 10.68 MiB / 220,001-entity CSV fixture:

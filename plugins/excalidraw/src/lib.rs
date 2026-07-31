@@ -1,4 +1,4 @@
-//! Excalidraw support for the fused Component API v3.
+//! Excalidraw support for the fused Component API v4.
 #![allow(dead_code)]
 
 mod core;

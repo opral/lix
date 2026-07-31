@@ -1,4 +1,4 @@
-//! CSV support for the fused Component API v3.
+//! CSV support for the fused Component API v4.
 #![allow(dead_code)]
 
 mod core;

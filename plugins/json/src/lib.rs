@@ -1,4 +1,4 @@
-//! JSON support for the fused Component API v3.
+//! JSON support for the fused Component API v4.
 #![allow(dead_code)]
 
 mod core;

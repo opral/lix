@@ -1,4 +1,4 @@
-# CSV Component API v3
+# CSV Component API v4
 
 Fused, push-based initial CSV import used only for runtime and boundary
 benchmarking.

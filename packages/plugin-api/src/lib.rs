@@ -1,4 +1,4 @@
-//! Authoring layer for Lix's fused, host-owned Component API v3.
+//! Authoring layer for Lix's fused, host-owned Component API v4.
 
 #![allow(clippy::missing_errors_doc)]
 
