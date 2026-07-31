@@ -1641,10 +1641,11 @@ async fn entity_update(
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<u64, LixError> {
+    let constraints_unchanged = update_assignments_preserve_constraints(ctx, plan, spec);
     let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
     let mut write_rows = RawWriteBatch::with_capacity(candidates.len());
     for candidate in candidates.iter() {
-        append_entity_update_row(
+        let appended = append_entity_update_row(
             &mut write_rows,
             ctx,
             plan,
@@ -1653,8 +1654,61 @@ async fn entity_update(
             params,
             active_branch_commit_id,
         )?;
+        if appended && constraints_unchanged {
+            write_rows.mark_last_constraints_unchanged();
+        }
     }
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await
+}
+
+fn update_assignments_preserve_constraints(
+    ctx: &dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
+) -> bool {
+    let Some(schema_catalog) = ctx.schema_catalog_snapshot() else {
+        return false;
+    };
+    let Some((_, schema_plan)) = schema_catalog.plan_for_key(&spec.schema_key) else {
+        return false;
+    };
+    let assigned = plan
+        .bound
+        .assignments
+        .iter()
+        .map(|assignment| assignment.column.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assigned_columns_preserve_constraints(schema_plan, &assigned)
+}
+
+fn assigned_columns_preserve_constraints(
+    schema_plan: &crate::catalog::SchemaPlan,
+    assigned: &std::collections::HashSet<&str>,
+) -> bool {
+    let touches = |path: &[String]| {
+        path.first()
+            .is_some_and(|property| assigned.contains(property.as_str()))
+    };
+    !schema_plan
+        .primary_key
+        .iter()
+        .flatten()
+        .any(|path| touches(path))
+        && !schema_plan
+            .uniques
+            .iter()
+            .flatten()
+            .any(|path| touches(path))
+        && !schema_plan
+            .foreign_keys
+            .iter()
+            .flat_map(|foreign_key| &foreign_key.local_properties)
+            .any(|path| touches(path))
+        && !schema_plan.state_foreign_keys.iter().any(|foreign_key| {
+            touches(&foreign_key.entity_pk_property)
+                || touches(&foreign_key.schema_key_property)
+                || touches(&foreign_key.file_id_property)
+        })
 }
 
 fn append_entity_update_row<'a>(
@@ -5133,6 +5187,53 @@ mod primary_key_route_tests {
                 .expect("identity predicate should be complete")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn only_constraint_source_assignments_require_commit_validation() {
+        let catalog = crate::catalog::CatalogSnapshot::from_visible_schemas(&[
+            serde_json::json!({
+                "x-lix-key": "parent",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            serde_json::json!({
+                "x-lix-key": "child",
+                "x-lix-primary-key": ["/id"],
+                "x-lix-unique": [["/slug"]],
+                "x-lix-foreign-keys": [{
+                    "properties": ["/parent_id"],
+                    "references": { "schemaKey": "parent", "properties": ["/id"] }
+                }],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "parent_id": { "type": "string" },
+                    "slug": { "type": "string" },
+                    "value": { "type": "string" }
+                },
+                "required": ["id", "parent_id", "slug", "value"],
+                "additionalProperties": false
+            }),
+        ])
+        .expect("constraint schemas should compile");
+        let (_, plan) = catalog
+            .plan_for_key("child")
+            .expect("child schema plan should exist");
+
+        assert!(assigned_columns_preserve_constraints(
+            plan,
+            &std::collections::HashSet::from(["value"]),
+        ));
+        for constrained in ["id", "slug", "parent_id"] {
+            assert!(!assigned_columns_preserve_constraints(
+                plan,
+                &std::collections::HashSet::from([constrained]),
+            ));
+        }
     }
 
     fn equals(left: BoundExpr, right: BoundExpr) -> BoundPredicate {
