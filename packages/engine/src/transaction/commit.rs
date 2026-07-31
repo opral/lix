@@ -2119,11 +2119,13 @@ async fn stage_tracked_head(
             .iter()
             .map(|delta| delta.schema_key)
             .collect::<BTreeSet<_>>();
+        let packed_guards_match = tracked_deltas.len() >= PACKED_CURRENT_BASE_MIN_ROWS
+            && packed_current_base_guards_match(&tracked_deltas, &absence_guards);
         let can_publish_packed_current_base = !is_checkpoint_publication
             && certified_fresh_plugin_file_id.is_none()
             && !host_certified_live_increments.contains_key(&root.branch_id)
             && staged.selected_change_batches.is_empty()
-            && tracked_deltas.len() == absence_guards.len()
+            && packed_guards_match
             && tracked_deltas.len() >= PACKED_CURRENT_BASE_MIN_ROWS
             && tracked_deltas.iter().all(|delta| {
                 !delta.untracked
@@ -2144,6 +2146,7 @@ async fn stage_tracked_head(
             packed_min_rows = PACKED_CURRENT_BASE_MIN_ROWS,
             untracked_delta_count = untracked_deltas.len(),
             absence_guard_count = absence_guards.len(),
+            packed_guards_match,
             is_checkpoint_publication,
             has_certified_file = certified_fresh_plugin_file_id.is_some(),
             has_certified_counts = host_certified_live_increments.contains_key(&root.branch_id),
@@ -2434,6 +2437,26 @@ fn owned_absence_guards(guards: &[TrackedStateKeyRef<'_>]) -> BTreeSet<TrackedSt
             entity_pk: guard.entity_pk.clone(),
         })
         .collect()
+}
+
+fn packed_current_base_guards_match(
+    deltas: &[crate::live_state::CurrentStateDeltaRef<'_>],
+    guards: &[TrackedStateKeyRef<'_>],
+) -> bool {
+    if deltas.len() != guards.len() {
+        return false;
+    }
+    let mut delta_identities = deltas
+        .iter()
+        .map(|delta| (delta.schema_key, delta.entity_pk, delta.file_id))
+        .collect::<Vec<_>>();
+    delta_identities.sort_unstable();
+    let mut guard_identities = guards
+        .iter()
+        .map(|guard| (guard.schema_key, guard.entity_pk, guard.file_id))
+        .collect::<Vec<_>>();
+    guard_identities.sort_unstable();
+    delta_identities == guard_identities
 }
 
 /// A selected historical change becomes visible through a newly materialized
@@ -3901,6 +3924,36 @@ mod tests {
             file_id: Some("certified-file".to_string()),
             entity_pk: EntityPk::single("certified-file"),
         }));
+    }
+
+    #[test]
+    fn packed_route_rejects_equal_count_guards_for_other_identities() {
+        let tracked_pk = EntityPk::single("tracked-update");
+        let untracked_pk = EntityPk::single("untracked-insert");
+        let timestamp = ts("2026-01-01T00:00:00Z");
+        let delta = crate::live_state::CurrentStateDeltaRef {
+            schema_key: "tracked_schema",
+            file_id: None,
+            entity_pk: &tracked_pk,
+            change_id: Some(change_id("tracked-update")),
+            commit_id: Some(commit_id("tracked-update")),
+            untracked: false,
+            deleted: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+            snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"value":1}"#),
+            metadata: crate::json_store::JsonSlotRef::None,
+        };
+        let guard = TrackedStateKeyRef {
+            schema_key: "untracked_schema",
+            file_id: None,
+            entity_pk: &untracked_pk,
+        };
+
+        assert!(
+            !packed_current_base_guards_match(&[delta], &[guard]),
+            "equal counts from tracked updates and unrelated untracked inserts must fall back"
+        );
     }
 
     fn live_state_context() -> LiveStateContext {
