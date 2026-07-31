@@ -2275,17 +2275,31 @@ fn packed_member_matches_filter(
     member: &crate::tracked_state::CommitDeltaMember,
     filter: &TrackedStateFilter,
 ) -> bool {
+    packed_identity_matches_filter(
+        &member.key.schema_key,
+        &member.key.entity_pk,
+        member.key.file_id.as_deref(),
+        filter,
+    )
+}
+
+fn packed_identity_matches_filter(
+    schema_key: &str,
+    entity_pk: &EntityPk,
+    file_id: Option<&str>,
+    filter: &TrackedStateFilter,
+) -> bool {
     (filter.schema_keys.is_empty()
         || filter
             .schema_keys
             .iter()
-            .any(|schema_key| schema_key == &member.key.schema_key))
-        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&member.key.entity_pk))
+            .any(|requested| requested == schema_key))
+        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(entity_pk))
         && (filter.file_ids.is_empty()
             || filter.file_ids.iter().any(|filter| match filter {
                 NullableKeyFilter::Any => true,
-                NullableKeyFilter::Null => member.key.file_id.is_none(),
-                NullableKeyFilter::Value(value) => member.key.file_id.as_ref() == Some(value),
+                NullableKeyFilter::Null => file_id.is_none(),
+                NullableKeyFilter::Value(value) => file_id == Some(value.as_str()),
             }))
 }
 
@@ -2359,28 +2373,63 @@ async fn scan_packed_current_base_rows(
     if base_refs.is_empty() {
         return Ok(MaterializedLiveStateBatch::default());
     }
+    let single_base = base_refs.len() == 1;
     let mut winners = BTreeMap::new();
     for base_ref in base_refs {
-        for member in
-            crate::tracked_state::load_commit_delta_members_with_payloads(store, base_ref.commit_id)
-                .await?
-        {
-            if member.value.deleted || !packed_member_matches_filter(&member, &request.filter) {
+        let compact = crate::tracked_state::scan_commit_delta_values(
+            store,
+            base_ref.commit_id,
+            &request.filter.schema_keys,
+        )
+        .await?;
+        let mut keys = Vec::new();
+        for row in compact.iter() {
+            let key = row.key_ref();
+            if row.value().deleted
+                || !packed_identity_matches_filter(
+                    key.schema_key,
+                    key.entity_pk,
+                    key.file_id,
+                    &request.filter,
+                )
+            {
                 continue;
             }
+            keys.push(TrackedStateKey {
+                schema_key: key.schema_key.to_owned(),
+                entity_pk: key.entity_pk.clone(),
+                file_id: key.file_id.map(str::to_owned),
+            });
+            if single_base && limit.is_some_and(|limit| keys.len() >= limit) {
+                break;
+            }
+        }
+        let requests = keys
+            .iter()
+            .cloned()
+            .map(|key| (base_ref.commit_id, key))
+            .collect::<Vec<_>>();
+        let loaded =
+            crate::tracked_state::load_owned_commit_delta_entries(store, &requests).await?;
+        for (key, loaded_entry) in keys.into_iter().zip(loaded) {
+            let Some(loaded_entry) = loaded_entry else {
+                return Err(head_value_error(
+                    "packed current-base manifest lost an indexed commit member",
+                ));
+            };
             let identity = (
-                member.key.schema_key.clone(),
-                member.key.entity_pk.clone(),
-                member.key.file_id.clone(),
+                key.schema_key.clone(),
+                key.entity_pk.clone(),
+                key.file_id.clone(),
             );
             match winners.entry(identity) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(member);
+                    entry.insert((key, loaded_entry.value, loaded_entry.change_record));
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry)
-                    if entry.get().value.commit_id < member.value.commit_id =>
+                    if entry.get().1.commit_id < loaded_entry.value.commit_id =>
                 {
-                    entry.insert(member);
+                    entry.insert((key, loaded_entry.value, loaded_entry.change_record));
                 }
                 std::collections::btree_map::Entry::Occupied(_) => {}
             }
@@ -2392,11 +2441,11 @@ async fn scan_packed_current_base_rows(
     let mut json_refs = Vec::new();
     let mut deferred = Vec::new();
     let global = branch_id == crate::GLOBAL_BRANCH_ID;
-    for (_, member) in winners.into_iter().take(row_capacity) {
+    for (_, (key, value, change)) in winners.into_iter().take(row_capacity) {
         let row_index = rows.len();
         let snapshot = materialize_packed_slot(
             projection.snapshot_content,
-            member.change.snapshot,
+            change.snapshot,
             &mut json_refs,
             &mut deferred,
             row_index,
@@ -2404,24 +2453,24 @@ async fn scan_packed_current_base_rows(
         );
         let metadata = materialize_packed_slot(
             projection.metadata,
-            member.change.metadata,
+            change.metadata,
             &mut json_refs,
             &mut deferred,
             row_index,
             DeferredJsonField::Metadata,
         );
         rows.push_materialized(
-            member.key.entity_pk,
-            member.key.schema_key,
-            member.key.file_id,
+            key.entity_pk,
+            key.schema_key,
+            key.file_id,
             snapshot,
             metadata,
             false,
-            member.value.created_at,
-            member.value.updated_at,
+            value.created_at,
+            value.updated_at,
             global,
-            Some(member.value.change_id),
-            Some(member.value.commit_id),
+            Some(value.change_id),
+            Some(value.commit_id),
             false,
             branch_id,
         );
@@ -2606,6 +2655,47 @@ async fn load_packed_current_base_exact_entries(
         }
     }
     Ok(winners)
+}
+
+fn compare_materialized_live_identities(
+    left: &MaterializedLiveStateRow,
+    right: &MaterializedLiveStateRow,
+) -> Ordering {
+    left.schema_key
+        .cmp(&right.schema_key)
+        .then_with(|| left.entity_pk.cmp(&right.entity_pk))
+        .then_with(|| left.file_id.cmp(&right.file_id))
+}
+
+fn merge_ordered_live_rows(
+    left: Vec<MaterializedLiveStateRow>,
+    right: Vec<MaterializedLiveStateRow>,
+) -> Vec<MaterializedLiveStateRow> {
+    let mut left = VecDeque::from(left);
+    let mut right = VecDeque::from(right);
+    let mut merged = Vec::with_capacity(left.len().saturating_add(right.len()));
+    while let (Some(left_row), Some(right_row)) = (left.front(), right.front()) {
+        match compare_materialized_live_identities(left_row, right_row) {
+            Ordering::Less => {
+                merged.push(left.pop_front().expect("peeked left row exists"));
+            }
+            Ordering::Greater => {
+                merged.push(right.pop_front().expect("peeked right row exists"));
+            }
+            Ordering::Equal => {
+                let left_row = left.pop_front().expect("peeked left row exists");
+                let right_row = right.pop_front().expect("peeked right row exists");
+                if left_row.commit_id < right_row.commit_id {
+                    merged.push(right_row);
+                } else {
+                    merged.push(left_row);
+                }
+            }
+        }
+    }
+    merged.extend(left);
+    merged.extend(right);
+    merged
 }
 
 /// Direct reader for one published hot generation.
@@ -2824,7 +2914,7 @@ where
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let packed_limit = if overlay_commits.is_empty() {
+        let packed_limit = if overlay_commits.is_empty() && replaced_generation.is_none() {
             request.limit.map(|limit| limit.saturating_sub(rows.len()))
         } else {
             None
@@ -2967,9 +3057,8 @@ where
                 None,
             )
         };
-        let mut combined = rows.into_rows();
-        combined.extend(packed_rows.into_rows());
-        combined.extend(certified_rows.into_rows());
+        let combined = merge_ordered_live_rows(rows.into_rows(), packed_rows.into_rows());
+        let combined = merge_ordered_live_rows(combined, certified_rows.into_rows());
         let rows = MaterializedLiveStateBatch::from_rows(combined);
         if request.filter.include_tombstones
             && request.limit.is_none()
@@ -7673,6 +7762,40 @@ mod tests {
 
     fn timestamp() -> LixTimestamp {
         LixTimestamp::expect_parse("hot working-diff test timestamp", "2026-01-01T00:00:00Z")
+    }
+
+    fn live_row(entity_pk: &str, commit_label: &str) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
+            entity_pk: EntityPk::single(entity_pk),
+            schema_key: "schema".to_owned(),
+            file_id: None,
+            snapshot_content: None,
+            metadata: None,
+            deleted: false,
+            created_at: timestamp(),
+            updated_at: timestamp(),
+            global: false,
+            change_id: Some(ChangeId::for_test_label(&format!("change-{commit_label}"))),
+            commit_id: Some(CommitId::for_test_label(commit_label)),
+            untracked: false,
+            branch_id: Arc::from("branch"),
+        }
+    }
+
+    #[test]
+    fn sparse_hot_overlay_merges_with_packed_rows_in_identity_order() {
+        let hot = vec![live_row("c", "hot-c")];
+        let packed = vec![live_row("a", "packed-a"), live_row("b", "packed-b")];
+
+        let merged = merge_ordered_live_rows(hot, packed);
+
+        assert_eq!(
+            merged
+                .iter()
+                .map(|row| row.entity_pk.as_single_string_owned().expect("single key"))
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
     }
 
     #[tokio::test]
