@@ -90,6 +90,10 @@ jobs:
 
       - name: Run Rust workspace tests
         if: matrix.task == 'test'
+        env:
+          # The CRUD public-result parity test exercises every adapter in one
+          # libtest worker and can exceed Rust's 2 MiB worker-stack default.
+          RUST_MIN_STACK: 8388608
         run: cargo test --profile test --workspace --all-features
 
       - name: Verify the packaged plugin API contract
