@@ -768,6 +768,7 @@ pub(crate) fn stage_addressable_commit_deltas(
 pub(crate) fn stage_ordered_addressable_commit_deltas<'a, I>(
     writes: &mut StorageWriteSet,
     deltas: I,
+    order_certified: bool,
 ) -> Result<Option<OrderedAddressableCommitDeltaStage>, LixError>
 where
     I: ExactSizeIterator<Item = Result<TrackedStateCommitDeltaRef<'a>, LixError>> + Clone,
@@ -787,23 +788,25 @@ where
         file_id: first.delta.file_id,
         entity_pk: first.delta.entity_pk,
     };
-    for delta in probe {
-        let delta = delta?;
-        if delta.delta.commit_id != commit_id {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state cannot pack deltas from different commits together",
-            ));
+    if !order_certified {
+        for delta in probe {
+            let delta = delta?;
+            if delta.delta.commit_id != commit_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state cannot pack deltas from different commits together",
+                ));
+            }
+            let key = TrackedStateKeyRef {
+                schema_key: delta.delta.schema_key,
+                file_id: delta.delta.file_id,
+                entity_pk: delta.delta.entity_pk,
+            };
+            if compare_tracked_state_key_refs(previous_key, key) != std::cmp::Ordering::Less {
+                return Ok(None);
+            }
+            previous_key = key;
         }
-        let key = TrackedStateKeyRef {
-            schema_key: delta.delta.schema_key,
-            file_id: delta.delta.file_id,
-            entity_pk: delta.delta.entity_pk,
-        };
-        if compare_tracked_state_key_refs(previous_key, key) != std::cmp::Ordering::Less {
-            return Ok(None);
-        }
-        previous_key = key;
     }
 
     let mut compressor = crate::compression::ZstdLevel1Compressor::new().map_err(|error| {
@@ -4327,6 +4330,7 @@ mod tests {
         let staged = super::stage_ordered_addressable_commit_deltas(
             &mut writes,
             deltas.iter().copied().map(Ok::<_, LixError>),
+            false,
         )
         .expect("ordered addressable deltas should stage")
         .expect("sorted deltas should use the streaming route");

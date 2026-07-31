@@ -1169,7 +1169,13 @@ fn stage_tracked_commit_delta_index(
                         );
                     Ok(delta)
                 });
-                stage_ordered_addressable_commit_deltas(writes, deltas)?
+                let order_certified = state_rows.certified_ordered_insert()
+                    && state_row_indices.len() == state_rows.len()
+                    && state_row_indices
+                        .iter()
+                        .enumerate()
+                        .all(|(index, &row_index)| index == row_index);
+                stage_ordered_addressable_commit_deltas(writes, deltas, order_certified)?
             };
             if let Some(ordered_stage) = ordered_stage {
                 if ordered_stage.row_count() != state_row_indices.len() {

@@ -2907,61 +2907,48 @@ fn certified_direct_parameter_insert_batch(
             return Ok(None);
         }
     }
-
     if shared_string_primary_keys {
         let primary_key_arena = SharedStr::from_utf8(bytes::Bytes::from(primary_key_arena))
             .map_err(|_| LixError::unknown("certified primary-key arena is not valid UTF-8"))?;
         entity_pks.reserve(row_count);
         for ranges in primary_key_ranges.chunks_exact(primary_key_columns.len()) {
-            entity_pks.push(
-                EntityPk::from_shared_external_parts(
+            if let [(start, end)] = ranges {
+                entity_pks.push(EntityPk::from_validated_shared_string(
+                    primary_key_arena
+                        .slice(*start as usize..*end as usize)
+                        .expect("certified primary-key ranges preserve UTF-8 boundaries"),
+                ));
+            } else {
+                entity_pks.push(EntityPk::from_validated_shared_string_parts(
                     ranges.iter().map(|&(start, end)| {
                         primary_key_arena
                             .slice(start as usize..end as usize)
                             .expect("certified primary-key ranges preserve UTF-8 boundaries")
                     }),
-                    &spec.primary_key_component_types,
-                )
-                .map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_SCHEMA_VALIDATION,
-                        format!(
-                            "INSERT failed to derive entity primary key for schema '{}': {error}",
-                            layout.schema_key
-                        ),
-                    )
-                })?,
-            );
+                ));
+            }
         }
     }
+    let tracked_keys_strictly_ordered =
+        shared_string_primary_keys || unordered_entity_pks.is_none();
     let snapshots = TransactionJson::from_certified_row_content_arena(normalized, offsets)?;
     let schema_key: SharedStr = layout.schema_key.as_str().into();
     let branch_id: SharedStr = ctx.active_branch_id().into();
-    let mut rows = RawWriteBatch::with_capacity(row_count);
-    for (entity_pk, snapshot) in entity_pks.into_iter().zip(snapshots) {
-        rows.push_parts(
-            Some(entity_pk),
-            schema_key.clone(),
-            None,
-            Some(snapshot),
-            None,
-            None,
-            None,
-            None,
-            false,
-            None,
-            None,
-            false,
-            branch_id.clone(),
-        );
-    }
-    rows.certify_preparation(CertifiedRawWriteBatchPreparation {
+    let certificate = CertifiedRawWriteBatchPreparation {
         schema_plan_id,
         facts: PreparedRowFacts {
             row_content_validated: true,
             requires_transaction_validation: false,
         },
-    });
+        tracked_keys_strictly_ordered,
+    };
+    let rows = RawWriteBatch::from_certified_parameter_insert(
+        entity_pks,
+        snapshots,
+        schema_key,
+        branch_id,
+        certificate,
+    )?;
     Ok(Some(rows))
 }
 
