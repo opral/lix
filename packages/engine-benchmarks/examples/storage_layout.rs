@@ -12,7 +12,7 @@ use object_store::local::LocalFileSystem;
 use slatedb::{SstReader, ValueDeletable};
 
 const HOT_SPACE: &str = "live_state.hot_row.v20";
-const IMMUTABLE_BINARY_CAS_CHUNK_DIR: &str = "db/lix-immutable-binary-cas-chunk-v2";
+const IMMUTABLE_BINARY_CAS_CHUNK_DIR: &str = "db/lix-immutable-binary-cas-chunk-v3";
 
 #[derive(Default)]
 struct HotGroup {

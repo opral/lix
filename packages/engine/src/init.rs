@@ -39,13 +39,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V35 combines LXCD8's wider certified commit-delta coordinates with the
-/// immutable binary-CAS object layout. Older locators and inline chunk rows
-/// must fail closed before either physical representation is decoded.
+/// V36 combines LXCD8's wider certified commit-delta coordinates with the
+/// tagged immutable binary-CAS object envelope. Older locators and inline or
+/// ambiguously encoded chunk rows must fail closed before either physical
+/// representation is decoded.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"lxcd8-immutable-binary-cas.v35";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"lxcd8-tagged-immutable-binary-cas.v36";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately

@@ -56,8 +56,11 @@ use std::io::{Read, Seek, SeekFrom};
 
 const DB_PATH: &str = "db";
 const SEGMENTED_FORMAT_PATH: &str = "lix-space-segments-v2";
-const IMMUTABLE_BINARY_CAS_CHUNK_PATH: &str = "lix-immutable-binary-cas-chunk-v2";
-const IMMUTABLE_VALUE_ZSTD_MAGIC: &[u8; 8] = b"LIXICZ2\0";
+const IMMUTABLE_BINARY_CAS_CHUNK_PATH: &str = "lix-immutable-binary-cas-chunk-v3";
+const IMMUTABLE_BINARY_CAS_CACHE_PATH: &str = "lix-immutable-binary-cas-chunk-v3";
+const IMMUTABLE_VALUE_MAGIC: &[u8; 8] = b"LIXICV3\0";
+const IMMUTABLE_VALUE_RAW: u8 = 0;
+const IMMUTABLE_VALUE_ZSTD: u8 = 1;
 const IMMUTABLE_VALUE_ZSTD_LEVEL: i32 = 3;
 const IMMUTABLE_VALUE_MIN_SAVINGS_BYTES: usize = 128;
 const IMMUTABLE_VALUE_MAX_ENCODED_BYTES: usize = 4 * 1024 * 1024 + 1024;
@@ -134,13 +137,19 @@ pub struct SlateDBFixture {
 struct ImmutableChunkStore {
     object_store: Arc<dyn ObjectStore>,
     prefix: ObjectPath,
+    cache: Option<ImmutableChunkCache>,
 }
 
 impl ImmutableChunkStore {
-    fn new(db_path: &str, object_store: Arc<dyn ObjectStore>) -> Self {
+    fn new(
+        db_path: &str,
+        object_store: Arc<dyn ObjectStore>,
+        cache: Option<&SlateDBCacheOptions>,
+    ) -> Self {
         Self {
             object_store,
             prefix: ObjectPath::from(join_db_path(db_path, IMMUTABLE_BINARY_CAS_CHUNK_PATH)),
+            cache: cache.map(ImmutableChunkCache::new),
         }
     }
 
@@ -214,22 +223,185 @@ impl ImmutableChunkStore {
             .map(|key| {
                 let store = Arc::clone(&self.object_store);
                 let location = self.location(&key);
+                let cache = self.cache.clone();
                 async move {
                     let location = location?;
-                    store
+                    if let Some(cache) = &cache
+                        && let Some(value) = cache.get(&key).await
+                    {
+                        match decode_immutable_value(value) {
+                            Ok(value) => return Ok(value),
+                            Err(_) => cache.remove(&key).await,
+                        }
+                    }
+                    let encoded = store
                         .get(&location)
                         .await
                         .map_err(object_store_error)?
                         .bytes()
                         .await
-                        .map_err(object_store_error)
-                        .and_then(decode_immutable_value)
+                        .map_err(object_store_error)?;
+                    let value = decode_immutable_value(encoded.clone())?;
+                    if let Some(cache) = &cache {
+                        cache.put(&key, encoded).await;
+                    }
+                    Ok(value)
                 }
             })
             .buffered(IMMUTABLE_CHUNK_IO_CONCURRENCY)
             .try_collect()
             .await
     }
+}
+
+/// Bounded whole-object cache for the immutable sidecar namespace.
+///
+/// SlateDB's internal cached object store is intentionally private upstream,
+/// so sidecar reads use an adjacent cache rooted in the caller's configured
+/// disk-cache directory. Cache failures are soft: the authoritative object
+/// store remains readable and immutable content makes stale validation
+/// unnecessary.
+#[derive(Clone, Debug)]
+struct ImmutableChunkCache {
+    root: PathBuf,
+    max_bytes: usize,
+    current_bytes: Arc<AtomicU64>,
+}
+
+impl ImmutableChunkCache {
+    fn new(options: &SlateDBCacheOptions) -> Self {
+        let root = options.root_folder.join(IMMUTABLE_BINARY_CAS_CACHE_PATH);
+        Self {
+            current_bytes: Arc::new(AtomicU64::new(immutable_chunk_cache_bytes(&root))),
+            root,
+            max_bytes: options.max_disk_cache_bytes,
+        }
+    }
+
+    fn path(&self, key: &Key) -> Option<PathBuf> {
+        let hash: [u8; 32] = key.0.as_ref().try_into().ok()?;
+        Some(
+            self.root
+                .join(blake3::Hash::from_bytes(hash).to_hex().as_str()),
+        )
+    }
+
+    async fn get(&self, key: &Key) -> Option<Bytes> {
+        let path = self.path(key)?;
+        tokio::task::spawn_blocking(move || std::fs::read(path).ok().map(Bytes::from))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn put(&self, key: &Key, value: Bytes) {
+        if value.len() > self.max_bytes {
+            return;
+        }
+        let Some(path) = self.path(key) else {
+            return;
+        };
+        let root = self.root.clone();
+        let max_bytes = self.max_bytes;
+        let current_bytes = Arc::clone(&self.current_bytes);
+        let _ = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+
+            std::fs::create_dir_all(&root)?;
+            if !path.exists() {
+                let mut temporary = tempfile::NamedTempFile::new_in(&root)?;
+                temporary.write_all(&value)?;
+                match temporary.persist_noclobber(&path) {
+                    Ok(_) => {
+                        current_bytes.fetch_add(value.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.error),
+                }
+            }
+            if current_bytes.load(Ordering::Relaxed) > max_bytes as u64 {
+                current_bytes.store(
+                    prune_immutable_chunk_cache(&root, max_bytes)?,
+                    Ordering::Relaxed,
+                );
+            }
+            Ok(())
+        })
+        .await;
+    }
+
+    async fn remove(&self, key: &Key) {
+        let Some(path) = self.path(key) else {
+            return;
+        };
+        let current_bytes = Arc::clone(&self.current_bytes);
+        let _ = tokio::task::spawn_blocking(move || {
+            let bytes = std::fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if std::fs::remove_file(path).is_ok() {
+                let _ =
+                    current_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(bytes))
+                    });
+            }
+        })
+        .await;
+    }
+}
+
+fn immutable_chunk_cache_bytes(root: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| is_immutable_chunk_cache_object(&entry.path()))
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .fold(0_u64, u64::saturating_add)
+}
+
+fn is_immutable_chunk_cache_object(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn prune_immutable_chunk_cache(root: &Path, max_bytes: usize) -> std::io::Result<u64> {
+    let mut total = 0_u64;
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if !is_immutable_chunk_cache_object(&entry.path()) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        total = total.saturating_add(metadata.len());
+        files.push((
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            metadata.len(),
+            entry.path(),
+        ));
+    }
+    if total <= max_bytes as u64 {
+        return Ok(total);
+    }
+    files.sort_unstable_by_key(|(modified, _, path)| (*modified, path.clone()));
+    for (_, bytes, path) in files {
+        match std::fs::remove_file(path) {
+            Ok(()) => total = total.saturating_sub(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if total <= max_bytes as u64 {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 fn encode_immutable_value(value: Bytes) -> Result<Bytes, StorageError> {
@@ -244,32 +416,42 @@ fn encode_immutable_value(value: Bytes) -> Result<Bytes, StorageError> {
     })?;
     let compressed = zstd::bulk::compress(&value, IMMUTABLE_VALUE_ZSTD_LEVEL)
         .map_err(|error| StorageError::Io(format!("immutable value compression: {error}")))?;
-    let envelope_bytes = IMMUTABLE_VALUE_ZSTD_MAGIC
+    let header_bytes = IMMUTABLE_VALUE_MAGIC
         .len()
-        .saturating_add(size_of::<u64>())
-        .saturating_add(compressed.len());
-    if value.len().saturating_sub(envelope_bytes) < IMMUTABLE_VALUE_MIN_SAVINGS_BYTES {
-        return Ok(value);
-    }
-    let mut envelope = Vec::with_capacity(envelope_bytes);
-    envelope.extend_from_slice(IMMUTABLE_VALUE_ZSTD_MAGIC);
+        .saturating_add(size_of::<u8>())
+        .saturating_add(size_of::<u64>());
+    let compressed_envelope_bytes = header_bytes.saturating_add(compressed.len());
+    let (encoding, payload) = if value.len().saturating_sub(compressed_envelope_bytes)
+        >= IMMUTABLE_VALUE_MIN_SAVINGS_BYTES
+    {
+        (IMMUTABLE_VALUE_ZSTD, compressed.as_slice())
+    } else {
+        (IMMUTABLE_VALUE_RAW, value.as_ref())
+    };
+    let mut envelope = Vec::with_capacity(header_bytes.saturating_add(payload.len()));
+    envelope.extend_from_slice(IMMUTABLE_VALUE_MAGIC);
+    envelope.push(encoding);
     envelope.extend_from_slice(&uncompressed_len.to_le_bytes());
-    envelope.extend_from_slice(&compressed);
+    envelope.extend_from_slice(payload);
     Ok(Bytes::from(envelope))
 }
 
 fn decode_immutable_value(value: Bytes) -> Result<Bytes, StorageError> {
-    if !value.starts_with(IMMUTABLE_VALUE_ZSTD_MAGIC) {
-        return Ok(value);
-    }
-    let header_len = IMMUTABLE_VALUE_ZSTD_MAGIC.len() + size_of::<u64>();
+    let header_len = IMMUTABLE_VALUE_MAGIC.len() + size_of::<u8>() + size_of::<u64>();
     if value.len() < header_len {
         return Err(StorageError::Corruption(
-            "immutable value compression envelope is truncated".to_string(),
+            "immutable value envelope is truncated".to_string(),
         ));
     }
+    if !value.starts_with(IMMUTABLE_VALUE_MAGIC) {
+        return Err(StorageError::Corruption(
+            "immutable value envelope magic is invalid".to_string(),
+        ));
+    }
+    let encoding = value[IMMUTABLE_VALUE_MAGIC.len()];
+    let length_start = IMMUTABLE_VALUE_MAGIC.len() + size_of::<u8>();
     let uncompressed_len = u64::from_le_bytes(
-        value[IMMUTABLE_VALUE_ZSTD_MAGIC.len()..header_len]
+        value[length_start..header_len]
             .try_into()
             .expect("fixed immutable value length header"),
     );
@@ -284,11 +466,26 @@ fn decode_immutable_value(value: Bytes) -> Result<Bytes, StorageError> {
             IMMUTABLE_VALUE_MAX_ENCODED_BYTES
         )));
     }
-    zstd::bulk::decompress(&value[header_len..], uncompressed_len)
-        .map(Bytes::from)
-        .map_err(|error| {
-            StorageError::Corruption(format!("immutable value decompression failed: {error}"))
-        })
+    match encoding {
+        IMMUTABLE_VALUE_RAW => {
+            let payload = value.slice(header_len..);
+            if payload.len() != uncompressed_len {
+                return Err(StorageError::Corruption(format!(
+                    "immutable raw value length {} does not match declared length {uncompressed_len}",
+                    payload.len()
+                )));
+            }
+            Ok(payload)
+        }
+        IMMUTABLE_VALUE_ZSTD => zstd::bulk::decompress(&value[header_len..], uncompressed_len)
+            .map(Bytes::from)
+            .map_err(|error| {
+                StorageError::Corruption(format!("immutable value decompression failed: {error}"))
+            }),
+        other => Err(StorageError::Corruption(format!(
+            "immutable value encoding {other} is unknown"
+        ))),
+    }
 }
 
 #[derive(Clone)]
@@ -1734,7 +1931,8 @@ impl SlateDB {
     ) -> Result<Self, StorageError> {
         validate_object_store_options(&options)?;
         let db_path = db_path.into();
-        let immutable_chunks = ImmutableChunkStore::new(&db_path, Arc::clone(&object_store));
+        let immutable_chunks =
+            ImmutableChunkStore::new(&db_path, Arc::clone(&object_store), options.cache.as_ref());
         Ok(Self {
             worker: SlateDBWorker::start(
                 db_path.clone(),
@@ -3941,19 +4139,24 @@ mod tests {
     fn immutable_value_envelope_roundtrips_and_rejects_oversized_lengths() {
         let compressible = Bytes::from(vec![0x44; 1024 * 1024]);
         let encoded = encode_immutable_value(compressible.clone()).expect("encode immutable value");
-        assert!(encoded.starts_with(IMMUTABLE_VALUE_ZSTD_MAGIC));
+        assert!(encoded.starts_with(IMMUTABLE_VALUE_MAGIC));
+        assert_eq!(encoded[IMMUTABLE_VALUE_MAGIC.len()], IMMUTABLE_VALUE_ZSTD);
         assert_eq!(
             decode_immutable_value(encoded).expect("decode immutable value"),
             compressible
         );
 
-        let raw = Bytes::from_static(b"already compact bytes");
+        let raw = Bytes::from_static(b"LIXICV3\0already compact bytes");
+        let encoded = encode_immutable_value(raw.clone()).expect("encode compact immutable value");
+        assert!(encoded.starts_with(IMMUTABLE_VALUE_MAGIC));
+        assert_eq!(encoded[IMMUTABLE_VALUE_MAGIC.len()], IMMUTABLE_VALUE_RAW);
         assert_eq!(
-            encode_immutable_value(raw.clone()).expect("retain compact immutable value"),
+            decode_immutable_value(encoded).expect("decode compact immutable value"),
             raw
         );
 
-        let mut oversized = Vec::from(IMMUTABLE_VALUE_ZSTD_MAGIC.as_slice());
+        let mut oversized = Vec::from(IMMUTABLE_VALUE_MAGIC.as_slice());
+        oversized.push(IMMUTABLE_VALUE_ZSTD);
         oversized
             .extend_from_slice(&((IMMUTABLE_VALUE_MAX_ENCODED_BYTES as u64) + 1).to_le_bytes());
         oversized.push(0);
@@ -4278,7 +4481,11 @@ mod tests {
         let stored_path =
             immutable_directory.join(blake3::Hash::from_bytes([0x2a; 32]).to_hex().as_str());
         let stored_bytes = std::fs::read(&stored_path).expect("read immutable chunk object");
-        assert!(stored_bytes.starts_with(IMMUTABLE_VALUE_ZSTD_MAGIC));
+        assert!(stored_bytes.starts_with(IMMUTABLE_VALUE_MAGIC));
+        assert_eq!(
+            stored_bytes[IMMUTABLE_VALUE_MAGIC.len()],
+            IMMUTABLE_VALUE_ZSTD
+        );
         assert!(stored_bytes.len() < value.len());
         let rolled_back_path =
             immutable_directory.join(blake3::Hash::from_bytes([0x19; 32]).to_hex().as_str());
@@ -4357,6 +4564,101 @@ mod tests {
         }]))
         .expect_err("a published marker must not hide a missing immutable object");
         assert!(matches!(error, StorageError::Io(_)));
+    }
+
+    #[test]
+    fn configured_disk_cache_serves_immutable_chunks_after_remote_removal() {
+        let object_store = Arc::new(InMemory::new());
+        let db_path = "immutable-chunk-cache";
+        let key = Key(Bytes::from(vec![0x37; 32]));
+        let value = Bytes::from(vec![0x8d; 2 * 1024 * 1024]);
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            object_store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open immutable chunk cache seed");
+        let mut write = block_on(storage.begin_write(WriteOptions::default()))
+            .expect("begin immutable chunk cache seed");
+        block_on(write.put_many(
+            BINARY_CAS_CHUNK_SPACE_ID,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: key.clone(),
+                    value: StoredValue {
+                        bytes: value.clone(),
+                    },
+                }],
+            },
+        ))
+        .expect("stage immutable chunk cache seed");
+        block_on(write.commit()).expect("commit immutable chunk cache seed");
+        block_on(storage.flush()).expect("flush immutable chunk cache seed");
+        drop(storage);
+
+        let cache = tempfile::tempdir().expect("create immutable chunk disk cache");
+        let cache_root = cache.path().join("object-cache");
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            object_store.clone(),
+            SlateDBObjectStoreOptions {
+                cache: Some(SlateDBCacheOptions {
+                    root_folder: cache_root.clone(),
+                    max_disk_cache_bytes: 8 * 1024 * 1024,
+                    block_cache_bytes: 1024 * 1024,
+                    metadata_cache_bytes: 1024 * 1024,
+                }),
+            },
+        )
+        .expect("open cached immutable chunk storage");
+        let read = block_on(storage.begin_read(ReadOptions::default()))
+            .expect("begin cached immutable chunk read");
+        let request = [GetManyRequest {
+            space: BINARY_CAS_CHUNK_SPACE_ID,
+            keys: std::slice::from_ref(&key),
+            opts: GetOptions {
+                projection: CoreProjection::FullValue,
+            },
+        }];
+        let first = block_on(read.get_many(&request)).expect("populate immutable chunk disk cache");
+        assert_eq!(
+            first.values,
+            vec![Some(ProjectedValue::FullValue(value.clone()))]
+        );
+        let cache_path = cache_root
+            .join(IMMUTABLE_BINARY_CAS_CACHE_PATH)
+            .join(blake3::Hash::from_bytes([0x37; 32]).to_hex().as_str());
+        assert!(cache_path.is_file());
+
+        std::fs::write(&cache_path, b"corrupt cache entry")
+            .expect("corrupt immutable disk cache entry");
+        let repaired = block_on(read.get_many(&request))
+            .expect("replace corrupt immutable cache entry from remote");
+        assert_eq!(
+            repaired.values,
+            vec![Some(ProjectedValue::FullValue(value.clone()))]
+        );
+
+        let remote_path = ObjectPath::from(join_db_path(db_path, IMMUTABLE_BINARY_CAS_CHUNK_PATH))
+            .join(blake3::Hash::from_bytes([0x37; 32]).to_hex().as_str());
+        block_on(object_store.delete(&remote_path)).expect("remove remote immutable chunk");
+        let cached = block_on(read.get_many(&request))
+            .expect("serve immutable chunk from configured disk cache");
+        assert_eq!(cached.values, vec![Some(ProjectedValue::FullValue(value))]);
+    }
+
+    #[test]
+    fn configured_immutable_chunk_cache_prunes_to_its_byte_bound() {
+        let directory = tempfile::tempdir().expect("create bounded immutable chunk cache");
+        let cache = ImmutableChunkCache::new(&SlateDBCacheOptions {
+            root_folder: directory.path().to_path_buf(),
+            max_disk_cache_bytes: 1024,
+            block_cache_bytes: 0,
+            metadata_cache_bytes: 0,
+        });
+        block_on(cache.put(&Key(Bytes::from(vec![0x11; 32])), Bytes::from(vec![1; 700])));
+        block_on(cache.put(&Key(Bytes::from(vec![0x22; 32])), Bytes::from(vec![2; 700])));
+        assert!(immutable_chunk_cache_bytes(&cache.root) <= 1024);
     }
 
     #[test]
