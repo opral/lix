@@ -1265,6 +1265,29 @@ pub(in crate::binary_cas) async fn stage_blob_write_skipping_existing_chunks<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
+    if let Some(hash) = precomputed_hash
+        && let Some(metadata) = load_metadata_many(store, &[hash])
+            .await?
+            .into_vec()
+            .into_iter()
+            .next()
+            .flatten()
+    {
+        let size_bytes = u64::try_from(bytes.len())
+            .map_err(|_| LixError::new(LixError::CODE_UNKNOWN, "binary CAS payload exceeds u64"))?;
+        if metadata.size_bytes != size_bytes {
+            return Err(LixError::new(
+                LixError::CODE_UNKNOWN,
+                "precomputed binary CAS hash names an existing blob with a different size",
+            ));
+        }
+        blob_hashes.insert(hash.into_bytes());
+        return Ok(BlobWriteReceipt {
+            hash,
+            size_bytes,
+            layout: metadata.layout,
+        });
+    }
     let plan = prepare_blob_write(chunking, bytes, precomputed_hash)?;
     let receipt = plan.receipt.clone();
     if !blob_hashes.insert(plan.blob_hash.into_bytes()) {
@@ -2372,6 +2395,31 @@ mod tests {
         bytes: &[u8],
     ) -> BlobWriteReceipt {
         stage_test_payload(storage, writes, &BlobPayload::from_bytes(bytes.to_vec())).await
+    }
+
+    #[tokio::test]
+    async fn prehashed_existing_blob_reuses_manifest_without_staging_chunks() {
+        let storage = StorageAdapter::new(Memory::new());
+        let bytes = definitely_multi_chunk_blob_bytes();
+        let payload = BlobPayload::from_bytes(bytes.clone());
+        let expected_hash = BlobHash::from_content(&bytes);
+
+        let mut initial = storage.new_write_set();
+        let initial_receipt = stage_test_payload(&storage, &mut initial, &payload).await;
+        storage
+            .commit_write_set(initial, StorageWriteOptions::default())
+            .await
+            .expect("initial blob write should commit");
+
+        let mut repeated = storage.new_write_set();
+        let repeated_receipt = stage_test_payload(&storage, &mut repeated, &payload).await;
+
+        assert_eq!(initial_receipt, repeated_receipt);
+        assert_eq!(repeated_receipt.hash, expected_hash);
+        assert!(
+            repeated.is_empty(),
+            "an existing prehashed blob must not restage its manifest or chunks"
+        );
     }
 
     #[tokio::test]
