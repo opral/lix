@@ -1243,15 +1243,23 @@ async fn stage_tracked_commit_delta_index(
                     )
                 })
                 .collect::<HashMap<_, _>>();
-            let source =
-                crate::tracked_state::scan_commit_delta_values(read, source_commit_id, &[]).await?;
-            (source.len() == selected.len()
-                && source.iter().all(|row| {
-                    selected
-                        .get(row.encoded_key_ref())
-                        .is_some_and(|change_id| *change_id == row.value().change_id)
-                }))
-            .then_some(source_commit_id)
+            let selected_fingerprint = crate::tracked_state::selected_change_selection_fingerprint(
+                selected
+                    .iter()
+                    .map(|(key, change_id)| (key.as_slice(), *change_id)),
+            );
+            let source = crate::tracked_state::load_commit_delta_selection_certificate(
+                read,
+                source_commit_id,
+            )
+            .await?;
+            source
+                .is_some_and(|source| {
+                    source.selected_source_commit_id.is_none()
+                        && usize::try_from(source.member_count).ok() == Some(selected.len())
+                        && source.selection_fingerprint == selected_fingerprint
+                })
+                .then_some(source_commit_id)
         } else {
             None
         };

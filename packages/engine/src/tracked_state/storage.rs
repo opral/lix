@@ -388,12 +388,21 @@ struct CommitDeltaManifest {
     /// Local inline/external segments are a disjoint authored overlay.
     #[musli(with = storage_codec::option)]
     selected_source_commit_id: Option<[u8; 16]>,
+    member_count: u32,
+    selection_fingerprint: [u8; 32],
     /// A complete leaf payload for a commit that fits in one segment. Keeping
     /// it in the directory preserves the one-record shape of tiny commits;
     /// larger commits use the indexed segment list below.
     #[musli(bytes)]
     inline_segment: Vec<u8>,
     segments: Vec<CommitDeltaSegmentBounds>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CommitDeltaSelectionCertificate {
+    pub(crate) member_count: u32,
+    pub(crate) selection_fingerprint: [u8; 32],
+    pub(crate) selected_source_commit_id: Option<CommitId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
@@ -840,6 +849,13 @@ where
     let mut first_segment = None::<(CommitDeltaSegmentBounds, Vec<u8>)>;
     let mut manifest = CommitDeltaManifest {
         selected_source_commit_id: None,
+        member_count: u32::try_from(row_count).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta member count exceeds the manifest format",
+            )
+        })?,
+        selection_fingerprint: [0; 32],
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS)),
     };
@@ -855,7 +871,7 @@ where
         }
         let segment_index = segment_row_counts.len();
         let mut candidate_len = pending.len();
-        let (bounds, encoded) = loop {
+        let (bounds, encoded, segment_fingerprint) = loop {
             match encode_ordered_addressable_commit_delta_segment(
                 commit_id,
                 segment_index,
@@ -863,10 +879,10 @@ where
                 candidate_len,
                 &mut compressor,
             ) {
-                Ok((bounds, encoded))
+                Ok((bounds, encoded, segment_fingerprint))
                     if encoded.len() <= COMMIT_DELTA_SEGMENT_TARGET_BYTES || candidate_len == 1 =>
                 {
-                    break (bounds, encoded);
+                    break (bounds, encoded, segment_fingerprint);
                 }
                 Ok(_) | Err(CommitDeltaSegmentEncodeError::SidecarTooLarge)
                     if candidate_len > 1 =>
@@ -877,6 +893,13 @@ where
                 Ok(_) => unreachable!("single-row segment exits through the guarded success arm"),
             }
         };
+        for (target, source) in manifest
+            .selection_fingerprint
+            .iter_mut()
+            .zip(segment_fingerprint)
+        {
+            *target ^= source;
+        }
         let row_count_u8 =
             u8::try_from(candidate_len).expect("commit-delta segment row count fits u8");
         segment_row_counts.push(row_count_u8);
@@ -946,7 +969,7 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
     deltas: impl Iterator<Item = TrackedStateCommitDeltaRef<'a>>,
     row_count: usize,
     compressor: &mut crate::compression::ZstdLevel1Compressor,
-) -> Result<(CommitDeltaSegmentBounds, Vec<u8>), CommitDeltaSegmentEncodeError> {
+) -> Result<(CommitDeltaSegmentBounds, Vec<u8>, [u8; 32]), CommitDeltaSegmentEncodeError> {
     let mut entries = TrackedStateMutationBatchBuilder::with_row_capacity(row_count);
     let mut payloads = Vec::with_capacity(row_count);
     for (ordinal, delta) in deltas.enumerate() {
@@ -995,8 +1018,13 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
             .key
             .to_vec(),
     };
+    let selection_fingerprint = selection_fingerprint(entries.iter().map(|entry| {
+        let value = decode_value(&entry.value)
+            .expect("ordered commit-delta values were encoded by the trusted builder");
+        (entry.key.as_ref(), value.change_id)
+    }));
     let encoded = try_encode_commit_delta_segment_with_payloads(&entries, &payloads, compressor)?;
-    Ok((bounds, encoded))
+    Ok((bounds, encoded, selection_fingerprint))
 }
 
 fn stage_commit_deltas_inner(
@@ -1147,6 +1175,17 @@ fn stage_commit_deltas_inner(
         encoded_segments.push((segment_start..segment_end, encoded));
         segment_start = segment_end;
     }
+    let member_count = u32::try_from(entries.len()).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_delta member count exceeds the manifest format",
+        )
+    })?;
+    let selection_fingerprint = selection_fingerprint(entries.iter().map(|entry| {
+        let value = decode_value(&entry.value)
+            .expect("staged commit-delta values were encoded by the trusted builder");
+        (entry.key.as_ref(), value.change_id)
+    }));
     let segment_count = encoded_segments.len();
     writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, 1, 0);
     if segment_count == 1 {
@@ -1159,6 +1198,8 @@ fn stage_commit_deltas_inner(
             value(encode_commit_delta_manifest(&CommitDeltaManifest {
                 selected_source_commit_id: selected_source_commit_id
                     .map(|commit_id| *commit_id.as_uuid().as_bytes()),
+                member_count,
+                selection_fingerprint,
                 inline_segment,
                 segments: Vec::new(),
             })?),
@@ -1177,6 +1218,8 @@ fn stage_commit_deltas_inner(
     let mut manifest = CommitDeltaManifest {
         selected_source_commit_id: selected_source_commit_id
             .map(|commit_id| *commit_id.as_uuid().as_bytes()),
+        member_count,
+        selection_fingerprint,
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(segment_count),
     };
@@ -3393,6 +3436,42 @@ fn encode_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<Vec<u8
     encoded.extend_from_slice(COMMIT_DELTA_FORMAT_MAGIC);
     encoded.extend_from_slice(&payload);
     Ok(encoded)
+}
+
+fn selection_fingerprint<'a>(
+    members: impl IntoIterator<Item = (&'a [u8], crate::changelog::ChangeId)>,
+) -> [u8; 32] {
+    let mut fingerprint = [0_u8; 32];
+    for (key, change_id) in members {
+        let mut member = blake3::Hasher::new();
+        member.update(b"lix.commit_delta.selection.v1");
+        member.update(&(key.len() as u64).to_be_bytes());
+        member.update(key);
+        member.update(change_id.as_uuid().as_bytes());
+        for (target, source) in fingerprint.iter_mut().zip(member.finalize().as_bytes()) {
+            *target ^= source;
+        }
+    }
+    fingerprint
+}
+
+pub(crate) fn selected_change_selection_fingerprint<'a>(
+    members: impl IntoIterator<Item = (&'a [u8], crate::changelog::ChangeId)>,
+) -> [u8; 32] {
+    selection_fingerprint(members)
+}
+
+pub(crate) async fn load_commit_delta_selection_certificate(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<CommitDeltaSelectionCertificate>, LixError> {
+    Ok(load_commit_delta_manifest(store, commit_id)
+        .await?
+        .map(|manifest| CommitDeltaSelectionCertificate {
+            member_count: manifest.member_count,
+            selection_fingerprint: manifest.selection_fingerprint,
+            selected_source_commit_id: manifest.selected_source_commit_id(),
+        }))
 }
 
 fn decode_commit_delta_manifest(bytes: &[u8]) -> Result<CommitDeltaManifest, LixError> {
@@ -5630,6 +5709,8 @@ mod tests {
             value(
                 encode_commit_delta_manifest(&CommitDeltaManifest {
                     selected_source_commit_id: None,
+                    member_count: 0,
+                    selection_fingerprint: [0; 32],
                     inline_segment: segment,
                     segments: Vec::new(),
                 })
@@ -6366,6 +6447,8 @@ mod tests {
             value(
                 encode_commit_delta_manifest(&CommitDeltaManifest {
                     selected_source_commit_id: None,
+                    member_count: 0,
+                    selection_fingerprint: [0; 32],
                     inline_segment: encode_commit_delta_segment(&entries),
                     segments: Vec::new(),
                 })
