@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::ops::{Bound, Range};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -61,8 +61,6 @@ pub struct RocksDBWrite {
     inner: Arc<RocksDBInner>,
     _writer_permit: OwnedMutexGuard<()>,
     batch: WriteBatch,
-    staged_put_key_bytes: Vec<u8>,
-    staged_put_key_ranges: Vec<Range<usize>>,
     stats: WriteStats,
 }
 
@@ -179,8 +177,6 @@ impl Storage for RocksDB {
                 } else {
                     WriteBatch::with_capacity_bytes(opts.batch_capacity_hint_bytes)
                 },
-                staged_put_key_bytes: Vec::new(),
-                staged_put_key_ranges: Vec::new(),
                 stats: WriteStats::default(),
             })
         }
@@ -378,37 +374,6 @@ impl StorageWrite for RocksDBWrite {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            let physical_key_bytes = entries.entries.iter().fold(0_usize, |bytes, entry| {
-                bytes.saturating_add(4).saturating_add(entry.key.0.len())
-            });
-            self.staged_put_key_bytes.reserve(physical_key_bytes);
-            self.staged_put_key_ranges.reserve(entries.entries.len());
-            let space_prefix = space.0.to_be_bytes();
-            for entry in entries.entries {
-                let key_start = self.staged_put_key_bytes.len();
-                self.staged_put_key_bytes.extend_from_slice(&space_prefix);
-                self.staged_put_key_bytes.extend_from_slice(&entry.key.0);
-                let key_end = self.staged_put_key_bytes.len();
-                let value = stored_value_bytes(entry.value);
-                self.stats.put_entries += 1;
-                self.stats.written_bytes += value.len() as u64;
-                self.batch.put(
-                    &self.staged_put_key_bytes[key_start..key_end],
-                    value.as_ref(),
-                );
-                self.staged_put_key_ranges.push(key_start..key_end);
-            }
-            self.stats.storage_calls += 1;
-            Ok(())
-        }
-    }
-
-    fn put_many_final(
-        &mut self,
-        space: SpaceId,
-        entries: PutBatch,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        async move {
             let max_key_bytes = entries
                 .entries
                 .iter()
@@ -481,13 +446,6 @@ impl StorageWrite for RocksDBWrite {
                     }
                     self.batch.delete(encoded_key);
                 }
-
-                for key in &self.staged_put_key_ranges {
-                    let key = &self.staged_put_key_bytes[key.clone()];
-                    if bounds.contains(key) {
-                        self.batch.delete(key);
-                    }
-                }
             }
             self.stats.deleted_ranges += 1;
             self.stats.storage_calls += 1;
@@ -557,17 +515,6 @@ impl EncodedBounds {
     }
 
     fn before_upper(&self, encoded_key: &[u8]) -> bool {
-        match &self.upper {
-            Bound::Included(upper) => encoded_key <= upper.as_slice(),
-            Bound::Excluded(upper) => encoded_key < upper.as_slice(),
-            Bound::Unbounded => true,
-        }
-    }
-
-    fn contains(&self, encoded_key: &[u8]) -> bool {
-        if !self.after_lower(encoded_key) {
-            return false;
-        }
         match &self.upper {
             Bound::Included(upper) => encoded_key <= upper.as_slice(),
             Bound::Excluded(upper) => encoded_key < upper.as_slice(),

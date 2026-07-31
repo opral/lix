@@ -90,27 +90,14 @@ pub trait StorageWrite: Send {
     ///
     /// Batches hold at most one mutation per key. Engine write-set lowering
     /// produces batches sorted ascending by key; other callers may pass
-    /// unsorted batches.
+    /// unsorted batches. Point batches are final for their keys: callers must
+    /// issue every range deletion before calling `put_many` in the same write
+    /// transaction. Exact point deletes remain valid after a put batch.
     fn put_many(
         &mut self,
         space: SpaceId,
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
-
-    /// Applies a point batch that no later range deletion in this write
-    /// transaction needs to observe.
-    ///
-    /// The default preserves ordinary [`Self::put_many`] behavior. Backends
-    /// that retain point keys only to reconcile future range deletes may
-    /// override this lane and stream the entries directly into their atomic
-    /// write batch. Exact point deletes remain valid after this call.
-    fn put_many_final(
-        &mut self,
-        space: SpaceId,
-        entries: PutBatch,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send {
-        self.put_many(space, entries)
-    }
 
     /// Deletes the given keys of one space. Batches hold at most one
     /// mutation per key; engine write-set lowering produces sorted keys.
@@ -120,9 +107,10 @@ pub trait StorageWrite: Send {
         keys: &[Key],
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// Deletes every key of one space within the range. An unbounded range
-    /// clears the whole space; storage implementations may fast-path that case (for
-    /// example by truncating the space's table).
+    /// Deletes every key of one space within the range. Range deletions must
+    /// precede point puts in the same write transaction. An unbounded range
+    /// clears the whole space; storage implementations may fast-path that case
+    /// (for example by truncating the space's table).
     fn delete_range(
         &mut self,
         space: SpaceId,

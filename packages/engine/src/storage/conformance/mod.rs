@@ -73,7 +73,6 @@ mod tests {
                 "baseline::delete_many_missing_keys_is_idempotent",
                 "baseline::delete_many_removes_existing_keys",
                 "baseline::delete_range_removes_exact_range",
-                "baseline::delete_range_applies_after_staged_puts",
                 "baseline::put_many_applies_after_delete_range",
                 "baseline::put_many_overwrites_existing_value",
                 "baseline::scan_range_sees_overwritten_existing_value",

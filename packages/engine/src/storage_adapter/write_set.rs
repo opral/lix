@@ -773,7 +773,7 @@ impl StorageWriteSet {
                 stats.put_batches += 1;
                 stats.storage_calls += 1;
                 write
-                    .put_many_final(space.id, PutBatch { entries: puts })
+                    .put_many(space.id, PutBatch { entries: puts })
                     .await
                     .map_err(StorageWriteSetError::Storage)?;
             }
@@ -800,7 +800,7 @@ impl StorageWriteSet {
                 stats.put_batches += 1;
                 stats.storage_calls += 1;
                 write
-                    .put_many_final(page.space.id, page.entries)
+                    .put_many(page.space.id, page.entries)
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
                         "lix.perf.storage_lowering.deferred_put_page"

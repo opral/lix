@@ -217,8 +217,11 @@ Use `Prefix::to_range()` to lower a byte prefix to its equivalent `KeyRange`.
 
 A `StorageWrite` handle stages mutations for one atomic commit. `put_many` and
 `delete_many` operate on one space at a time and accept at most one mutation per
-key in each batch. `delete_range` deletes all keys in the supplied range; a
-fully unbounded range clears that space and may be implemented as a truncate.
+key in each batch. Range deletions must be staged before point puts in the same
+write transaction; the storage contract does not support deleting a range over
+already-staged puts. `delete_range` deletes all previously stored keys in the
+supplied range; a fully unbounded range clears that space and may be implemented
+as a truncate.
 
 `commit` atomically publishes the handle's staged mutations and returns a
 `CommitResult` with provider commit information and `WriteStats`. `rollback`
