@@ -391,13 +391,12 @@ function LandingPage({
               </svg>
             </a>
             <h1 className="text-gray-900 font-bold leading-[1.1] text-4xl sm:text-5xl md:text-6xl tracking-tight">
-              Embeddable version control system for AI agents
+              Database + filesystem + version control in one
             </h1>
 
             <p className="text-gray-500 text-lg sm:text-xl max-w-4xl mx-auto mt-8">
-              Lix is a version control system that can be imported as a library.
-              Use it to, for example, enable human-in-the-loop workflows for AI
-              agents like diffs and reviews.
+              Normal files for tools and agents. SQL rows for apps. Version
+              control for every change.
             </p>
 
             {/* Trust signals */}
@@ -546,7 +545,7 @@ function LandingPage({
                   <span className="text-indigo-600">await</span>{" "}
                   <span className="text-gray-900">lix.fs.writeFile</span>
                   <span className="text-gray-900">{"("}</span>
-                  <span className="text-amber-600">"/hello.json"</span>
+                  <span className="text-amber-600">"/hello.md"</span>
                   <span className="text-gray-900">{", bytes)"}</span>
                 </div>
               </div>
@@ -588,18 +587,18 @@ function LandingPage({
                 </div>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    Fits into your tech stack
+                    Works with normal files
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Import Lix and get branching, diff, and rollback without
-                    changing your architecture.
+                    Tools and agents keep reading and writing workspace files.
+                    Lix tracks the changes.
                   </p>
                 </div>
               </div>
               <div className="flex flex-col items-center sm:items-start gap-4">
                 {/* Diff illustration - semantic/field-level */}
                 <div className="w-full max-w-[220px] h-32 rounded-lg border border-gray-200 bg-white p-4">
-                  <div className="text-xs text-gray-400 mb-3">config.json</div>
+                  <div className="text-xs text-gray-400 mb-3">pricing.csv</div>
                   <div className="space-y-3 text-sm">
                     <div className="flex items-center justify-between">
                       <span className="text-gray-600">title</span>
@@ -629,11 +628,11 @@ function LandingPage({
                 </div>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    Tracks semantic changes
+                    Query file content with SQL
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Lix stores semantic changes via plugins. Diffs, blame, and
-                    history are queryable via SQL.
+                    Plugins map file content to rows. Apps query current data
+                    and history with SQL.
                   </p>
                 </div>
               </div>
@@ -654,7 +653,7 @@ function LandingPage({
                       <line x1="16" y1="13" x2="8" y2="13" />
                       <line x1="16" y1="17" x2="8" y2="17" />
                     </svg>
-                    <span className="text-gray-600">edit config.json</span>
+                    <span className="text-gray-600">edit brief.md</span>
                   </div>
                   <div className="flex items-center gap-2 text-gray-400 mt-1.5">
                     <span>12:04</span>
@@ -670,7 +669,7 @@ function LandingPage({
                       <line x1="16" y1="13" x2="8" y2="13" />
                       <line x1="16" y1="17" x2="8" y2="17" />
                     </svg>
-                    <span className="text-gray-600">update data.xlsx</span>
+                    <span className="text-gray-600">update pricing.csv</span>
                   </div>
                   <div className="flex items-center gap-2 mt-1.5">
                     <span className="text-gray-400">12:05</span>
@@ -701,16 +700,16 @@ function LandingPage({
                       <line x1="16" y1="13" x2="8" y2="13" />
                       <line x1="16" y1="17" x2="8" y2="17" />
                     </svg>
-                    <span className="text-gray-600">edit report.pdf</span>
+                    <span className="text-gray-600">edit report.md</span>
                   </div>
                 </div>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    Human in the loop for agents
+                    Safe branches for agents
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Agents propose changes in isolated versions. Humans review,
-                    approve, and merge.
+                    Agents work on isolated branches. Humans review, approve,
+                    and merge.
                   </p>
                 </div>
               </div>

@@ -1,48 +1,72 @@
 ---
-description: Route agent writes through Lix to get isolated workspaces, previewable changes, and approve-or-discard review for every agent task.
+description: Give each agent an isolated branch, preview its changes, then merge or discard the result.
 ---
 
 # Lix for AI Agents
 
-Agent review is one of Lix's headline use cases, but the same primitives ([Versions](./versions.md), [Change History](./history.md)) power any product where end users review proposed changes. If you're building knowledge-work tools, the patterns here apply to humans drafting changes too.
+Agents make fast, useful, and sometimes wrong changes. Lix gives each agent task its own branch so a human or policy can review the work before it reaches main.
 
-Agents make fast, useful, and sometimes wrong changes. Lix gives each agent task its own isolated version of state so a human or a policy can review it before it lands.
+Agents can work through normal files with `LocalFilesystem`, through SQL, or through a hosted Lix server. All writes stay isolated on the task branch.
 
 ## The pattern
 
-1. Create a version for the agent task.
-2. Switch the agent's writes into that version.
-3. Run the agent. All writes are isolated.
-4. Preview the merge: `changeStats` for the count, `conflicts` for collisions.
-5. Approve, request changes, or discard.
+1. Create a branch for the agent task.
+2. Switch the agent to that branch.
+3. Let the agent edit files or SQL rows.
+4. Switch back to main and preview the merge.
+5. Merge, request changes, or discard the branch.
 
 ```ts
-const main = await lix.activeVersionId();
+const main = await lix.activeBranchId();
 
-const task = await lix.createVersion({ name: "Agent task 123" });
-await lix.switchVersion({ versionId: task.id });
+const task = await lix.createBranch({ name: "Agent task 123" });
+await lix.switchBranch({ branchId: task.id });
 
-// run the agent; every lix.execute is now isolated to `task`
+// Run the agent. Its file and SQL writes are isolated to `task`.
 
-await lix.switchVersion({ versionId: main });
+await lix.switchBranch({ branchId: main });
 
-const preview = await lix.mergeVersionPreview({ sourceVersionId: task.id });
+const preview = await lix.mergeBranchPreview({ sourceBranchId: task.id });
 if (preview.conflicts.length === 0) {
-  await lix.mergeVersion({ sourceVersionId: task.id });
+  await lix.mergeBranch({ sourceBranchId: task.id });
 }
 ```
 
-## Why versions matter for agents
+## Local file workspace
 
-- Run multiple agents in parallel without stepping on each other.
-- Compare proposed outcomes side by side.
-- Keep the main state stable while work is in progress.
-- Discard a bad attempt with no manual cleanup.
+Use `LocalFilesystem` when the agent works with files on disk:
 
-## Showing the work
+```ts
+import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
-The point of routing agent writes through Lix is that you can ask SQL what the
-agent did. Query the typed history relation for each application schema:
+const lix = await openLix({
+  storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
+});
+```
+
+## Hosted workspace
+
+Use remote mode when the workspace runs on a server:
+
+```ts
+const lix = await openLix({
+  server: {
+    mode: "remote",
+    url: "https://example.com/workspaces/acme",
+  },
+});
+```
+
+## Why branches matter
+
+- Run agents in parallel without changing main.
+- Compare proposed results side by side.
+- Review semantic changes instead of rereading every file.
+- Discard a bad attempt without manual cleanup.
+
+## Inspect the work
+
+Query typed history for each app or plugin schema:
 
 ```sql
 SELECT id, title, status, lixcol_depth,
@@ -51,19 +75,16 @@ FROM acme_task_history()
 ORDER BY lixcol_depth, id;
 ```
 
-Discover schemas through `lix_registered_schema` when the agent works across
-applications. Use `lix_change` only for workspace-global activity; it is not
-implicitly scoped to the agent's active branch. See
-[Change History](./history.md) for the scope distinction and more recipes.
+Use `lix_registered_schema` to discover available schemas. Use `lix_change` for activity across the whole workspace. It is not limited to the active branch.
 
 ## Conflicts
 
-Merge is per-entity today: two versions editing different rows merge cleanly; two versions editing the same row produce a `sameEntityChanged` conflict. Wrap `mergeVersion()` and handle the conflict in your review flow.
+Merge is per entity today. Two branches that edit different rows can merge cleanly. Two branches that edit the same row produce a `sameEntityChanged` conflict.
 
-Don't reshape your schemas around this. Conflict semantics are still evolving; design entities for how your code reads them, not around today's merge granularity. See [Versions & Merging](./versions.md#dont-shape-entities-around-merge).
+See [Branches & Merging](./versions.md) for preview results and conflict handling.
 
 ## Next
 
-- [Getting Started](./getting-started.md): the basic loop.
-- [Versions & Merging](./versions.md): preview shape, conflicts, side-by-side reads.
-- [Change History](./history.md): the SQL surface for review and undo.
+- [Getting Started](./getting-started.md): the basic setup.
+- [Branches & Merging](./versions.md): previews, conflicts, and side-by-side reads.
+- [Change History](./history.md): SQL for review and undo.

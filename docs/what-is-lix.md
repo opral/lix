@@ -1,96 +1,80 @@
 ---
-description: Lix is a version control system for every file format. It tracks semantic changes across Markdown, DOCX, XLSX, JSON, PDFs, and custom formats, exposed as SQL.
+description: Lix combines a database, filesystem, and version control. Tools work with normal files, apps use SQL, and Lix tracks every change.
 ---
 
 # What is Lix?
 
-Lix is a **version control system for every file format**. It tracks changes across Markdown, DOCX, XLSX, JSON, PDFs, CAD files, and custom formats as semantic entities: a spreadsheet cell, document clause, JSON property, PDF section, CAD part, or application row.
+Lix is a **database + filesystem + version control system in one**.
 
-Versions, branches, merge, rollback, and immutable change history are exposed through SQL, so products and tools can bring version control workflows beyond source code.
+Tools and agents work with normal files. Apps query and update SQL rows. Lix tracks every change with branches, history, review, rollback, and merge.
 
-> Lix makes version control a runtime primitive for files: products can store, query, review, sync, and merge changes without inventing a custom history system.
+## Files become queryable rows
 
-[See what a semantic diff looks like →](./comparison-to-git.md#what-this-looks-like)
+File plugins map parts of a file to rows. A row can represent a Markdown block, CSV record, spreadsheet cell, JSON property, document clause, or another entity defined by a plugin.
+
+```text
+what tools see                 what your app can query
+
+                               entity      field      value
+/orders.csv   ── plugin ──▶   row 1001    status     shipped
+                               row 1002    status     pending
+```
+
+Apps read and write these rows with SQL. Lix records their history. In filesystem mode, plugin changes are written back to normal files on disk.
+
+The JavaScript SDK includes Markdown and CSV plugins. Other formats, including JSON, XLSX, DOCX, and PDF, need a plugin.
+
+## What Lix provides
+
+```text
+filesystem      normal files for existing tools and agents
+database        SQL queries, schemas, and ACID transactions
+version control branches, history, review, rollback, and merge
+```
+
+The same model also works for app data that does not come from a file. Register a schema and Lix creates a SQL table for it. Rows in that table get the same history and branch behavior as file entities.
+
+## Prime use cases
+
+### Safe workspaces for agents
+
+Give each agent task its own branch. The agent can edit files and SQL rows without changing the main branch. Preview the result, then merge or discard it.
+
+See [Lix for AI Agents](./lix-for-ai-agents.md).
+
+### File-based apps with SQL and version control
+
+Build editors, knowledge bases, document workflows, and other file-based apps. Existing tools keep using files while your app uses SQL for queries and transactions. Lix adds history, rollback, branches, merging, and review.
+
+## Run Lix locally or remotely
+
+Run Lix inside your app with memory, `LocalFilesystem`, or SQLite:
 
 ```ts
-import { openLix } from "@lix-js/sdk";
+import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
-const lix = await openLix();
-
-await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES (?, CAST(? AS BYTEA))",
-  ["/hello.txt", "hello"],
-);
-
-const changes = await lix.execute(
-  "SELECT created_at, schema_key, entity_pk FROM lix_change",
-);
+const lix = await openLix({
+  storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
+});
 ```
 
-## How it works
+Or connect to a Lix server:
 
-Each file format is parsed into **entities**: cells in a spreadsheet, clauses in a document, parts in a CAD drawing. Lix versions those entities. Per-row merge and history fall out for free.
-
-## Where Lix fits
-
-The same `openLix()` powers three different shapes:
-
-**Inside an end-user product.** Lawyers redlining a contract, analysts iterating on a forecast, engineers updating a BOM, designers exploring a layout: give them drafts, review, rollback, and history inside your product UI.
-
-**Inside an AI workflow.** Every agent task gets an isolated workspace; humans or policies review the diff and merge or discard. See [Lix for AI Agents](./lix-for-ai-agents.md).
-
-**As the version-control core for file-based products.** Build a versioned filesystem, an artifact or model registry, a configuration service, a branchable database, or a domain-specific CLI. Lix is the version-control core; you ship the surface.
-
-## Why this matters
-
-Source-code version control works best when text diffs explain the change. Many products edit files where the useful diff is a domain entity instead: a cell, clause, property, section, part, record, or generated output.
-
-Lix gives those files version-control primitives directly:
-
-- **Any file format** can be represented through parser plugins or custom schemas.
-- **Semantic changes** are stored per entity instead of only as whole-file snapshots.
-- **SQL** is the query interface for application code, AI agents, and tools.
-- **Pluggable storage.** Run in-memory, sync a filesystem workspace with `LocalFilesystem`, use a `.lix` SQLite file as an application file format, or implement the [storage interface](./storage.md) to put Lix on Postgres, S3, Cloudflare, IndexedDB, OPFS, or anything transactional and key-value-shaped.
-- **ACID transactions** work across files and entities.
-
-No daemon, no protocol, no remote.
-
-## The change-first model
-
-Lix stores changes as data, not snapshots. Typed history reconstructs the
-states reachable from a branch, while the global journal records workspace
-activity:
-
-```sql
--- Which revisions of this task are reachable from the active branch?
-SELECT id, title, lixcol_depth, lixcol_is_deleted
-FROM acme_task_history()
-WHERE id = 't1'
-ORDER BY lixcol_depth;
+```ts
+const lix = await openLix({
+  server: {
+    mode: "remote",
+    url: "https://example.com/workspaces/acme",
+  },
+});
 ```
 
-Whether the entity is a spreadsheet cell, a document clause, a CAD part, or an
-application row, its registered schema supplies the typed SQL surface. Diffs,
-undo, audit, blame, and attribution are all SQL. See
-[Change History](./history.md).
-
-## Examples of what Lix versions
-
-With parser plugins, Lix can version:
-
-- DOCX contracts, with clause-level diffs and redlines
-- XLSX models, with cell-level history and conflict-aware merges
-- CAD drawings, with per-part revision tracking
-- PDFs and any other format behind a parser plugin
-
-Available today through the entity foundation:
-
-- Application state: tasks, line items, translations, CMS sections, model metadata, config keys
-- Anything you can describe with a JSON Schema
+Remote clients use the same file, SQL, branch, and observation APIs supported by the server protocol.
 
 ## Next
 
-- [Getting Started](./getting-started.md): install, register a schema, version, merge.
-- [Comparison to Git](./comparison-to-git.md): when to reach for which.
-- [Lix for AI Agents](./lix-for-ai-agents.md): one shape, in depth.
-- [Schemas](./schemas.md), [Versions & Merging](./versions.md), [Change History](./history.md), [Persistence](./persistence.md), [SQL Functions](./sql-functions.md).
+- [Getting Started](./getting-started.md): open Lix, write data, create a branch, and merge it.
+- [How Lix compares to Git](./comparison-to-git.md): files, databases, and version control side by side.
+- [Schemas](./schemas.md): define app rows and plugin entities.
+- [Semantic Changes](./semantic-changes.md): track changes inside files.
+- [Persistence](./persistence.md): choose a local or remote setup.

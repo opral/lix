@@ -1,12 +1,10 @@
 ---
-description: "Reference for the JavaScript SDK Lix instance, transactions, execute results, rows, and values."
+description: "Reference for opening local and remote Lix instances, running SQL, using transactions, and working with branches."
 ---
 
 # JavaScript API Reference
 
-The JavaScript SDK exports `openLix()`, `SQLite`, and `LocalFilesystem` from `@lix-js/sdk`.
-`openLix()` returns a `Lix` instance: an in-process handle to one Lix
-repository.
+The JavaScript SDK exports `openLix()`, `SQLite`, and `LocalFilesystem` from `@lix-js/sdk`. `openLix()` returns a `Lix` instance connected to a local or remote repository.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -22,9 +20,24 @@ const lix = await openLix(options?);
 
 Options:
 
-| Option    | Type                         | Description                                                          |
-| --------- | ---------------------------- | -------------------------------------------------------------------- |
-| `storage` | `LocalFilesystem \| SQLite` | Optional storage implementation. Omit it for the default in-memory storage. |
+| Option    | Type                                              | Description                                                                      |
+| --------- | ------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `storage` | `LocalFilesystem \| SQLite \| LixSnapshotStorage` | Local storage. Omit it for memory.                                               |
+| `server`  | `RemoteLixServerOptions`                          | Connect to a remote Lix server. Cannot be combined with local workspace storage. |
+
+Connect to a remote server:
+
+```ts
+const lix = await openLix({
+  server: {
+    mode: "remote",
+    url: "https://example.com/workspaces/acme",
+    headers: () => ({ Authorization: `Bearer ${token}` }),
+  },
+});
+```
+
+Remote file data, SQL rows, and branches live on the server. An optional `LixSnapshotStorage` in remote mode stores only private client state. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
 
 Use `LocalFilesystem` for a filesystem workspace directory backed by RocksDB at
 `<workspace>/.lix/.internal/rocksdb`:
@@ -33,10 +46,10 @@ Use `LocalFilesystem` for a filesystem workspace directory backed by RocksDB at
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	storage: new LocalFilesystem({
-		path: "./workspace",
-		syncAllFiles: true,
-	}),
+  storage: new LocalFilesystem({
+    path: "./workspace",
+    syncAllFiles: true,
+  }),
 });
 ```
 
@@ -45,11 +58,11 @@ Pass `lixDir` for filesystem sync with repository metadata in an external
 
 ```ts
 const lix = await openLix({
-	storage: new LocalFilesystem({
-		path: "./workspace",
-		lixDir: "/tmp/session/.lix",
-		syncAllFiles: true,
-	}),
+  storage: new LocalFilesystem({
+    path: "./workspace",
+    lixDir: "/tmp/session/.lix",
+    syncAllFiles: true,
+  }),
 });
 ```
 
@@ -62,8 +75,8 @@ materialization; it does not filter unrelated Lix SQL state.
 
 ```ts
 const storage = new LocalFilesystem({
-	path: "./workspace",
-	syncAllFiles: false,
+  path: "./workspace",
+  syncAllFiles: false,
 });
 const lix = await openLix({ storage });
 await storage.importPaths(["notes/today.md"]);
@@ -77,7 +90,7 @@ application file format:
 import { openLix, SQLite } from "@lix-js/sdk";
 
 const lix = await openLix({
-	storage: new SQLite({ path: "app.lix" }),
+  storage: new SQLite({ path: "app.lix" }),
 });
 ```
 
@@ -104,10 +117,10 @@ Result:
 
 ```ts
 type ExecuteResult = {
-	columns: string[];
-	rows: Row[];
-	rowsAffected: number;
-	notices: LixNotice[];
+  columns: string[];
+  rows: Row[];
+  rowsAffected: number;
+  notices: LixNotice[];
 };
 ```
 
@@ -122,8 +135,8 @@ Example:
 
 ```ts
 const result = await lix.execute(
-	"SELECT path, data FROM lix_file WHERE path = $1",
-	["/hello.txt"],
+  "SELECT path, data FROM lix_file WHERE path = $1",
+  ["/hello.txt"],
 );
 
 const path = result.rows[0]?.get("path");
@@ -141,110 +154,110 @@ Starts a transaction. While it is open, execute statements on the transaction ha
 ```ts
 const tx = await lix.beginTransaction();
 try {
-	await tx.execute("INSERT INTO lix_file (path, data) VALUES (?, ?)", [
-		"/hello.txt",
-		new TextEncoder().encode("hello"),
-	]);
-	await tx.commit();
+  await tx.execute("INSERT INTO lix_file (path, data) VALUES (?, ?)", [
+    "/hello.txt",
+    new TextEncoder().encode("hello"),
+  ]);
+  await tx.commit();
 } catch (error) {
-	await tx.rollback();
-	throw error;
+  await tx.rollback();
+  throw error;
 }
 ```
 
-### activeVersionId()
+### activeBranchId()
 
 ```ts
-const versionId = await lix.activeVersionId();
+const branchId = await lix.activeBranchId();
 ```
 
-Returns the id of the version the Lix handle is currently reading and writing.
+Returns the id of the branch the Lix instance is currently reading and writing.
 
-### createVersion()
+### createBranch()
 
 ```ts
-const version = await lix.createVersion({
-	name: "Explore",
+const branch = await lix.createBranch({
+  name: "Explore",
 });
 ```
 
-Creates a version.
+Creates a branch.
 
 Options:
 
 | Option         | Type     | Description                       |
 | -------------- | -------- | --------------------------------- |
-| `name`         | `string` | Version name.                     |
-| `id`           | `string` | Optional explicit version id.     |
+| `name`         | `string` | Branch name.                      |
+| `id`           | `string` | Optional explicit branch id.      |
 | `fromCommitId` | `string` | Optional commit id to start from. |
 
 Result:
 
 ```ts
-type CreateVersionResult = {
-	id: string;
-	name: string;
-	hidden: boolean;
-	commitId: string;
+type CreateBranchReceipt = {
+  id: string;
+  name: string;
+  hidden: boolean;
+  commitId: string;
 };
 ```
 
-### switchVersion()
+### switchBranch()
 
 ```ts
-await lix.switchVersion({ versionId });
+await lix.switchBranch({ branchId });
 ```
 
-Switches the Lix handle to another version. Plain SQL tables read and write the active version.
+Switches the Lix instance to another branch. Plain SQL tables read and write the active branch.
 
-### mergeVersionPreview()
+### mergeBranchPreview()
 
 ```ts
-const preview = await lix.mergeVersionPreview({
-	sourceVersionId: draft.id,
+const preview = await lix.mergeBranchPreview({
+  sourceBranchId: draft.id,
 });
 ```
 
-Computes the merge result from `sourceVersionId` into the currently active target version without applying it.
+Computes the merge result from `sourceBranchId` into the active branch without applying it.
 
 Result:
 
 ```ts
-type MergeVersionPreviewResult = {
-	outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
-	targetVersionId: string;
-	sourceVersionId: string;
-	baseCommitId: string;
-	targetHeadCommitId: string;
-	sourceHeadCommitId: string;
-	changeStats: MergeChangeStats;
-	conflicts: MergeConflict[];
+type MergeBranchPreview = {
+  outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
+  targetBranchId: string;
+  sourceBranchId: string;
+  baseCommitId: string;
+  targetHeadCommitId: string;
+  sourceHeadCommitId: string;
+  changeStats: MergeChangeStats;
+  conflicts: MergeConflict[];
 };
 ```
 
-### mergeVersion()
+### mergeBranch()
 
 ```ts
-const merge = await lix.mergeVersion({
-	sourceVersionId: draft.id,
+const merge = await lix.mergeBranch({
+  sourceBranchId: draft.id,
 });
 ```
 
-Merges `sourceVersionId` into the currently active target version.
+Merges `sourceBranchId` into the active branch.
 
 Result:
 
 ```ts
-type MergeVersionResult = {
-	outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
-	targetVersionId: string;
-	sourceVersionId: string;
-	baseCommitId: string;
-	targetHeadBeforeCommitId: string;
-	sourceHeadBeforeCommitId: string;
-	targetHeadAfterCommitId: string;
-	createdMergeCommitId: string | null;
-	changeStats: MergeChangeStats;
+type MergeBranchReceipt = {
+  outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
+  targetBranchId: string;
+  sourceBranchId: string;
+  baseCommitId: string;
+  targetHeadBeforeCommitId: string;
+  sourceHeadBeforeCommitId: string;
+  targetHeadAfterCommitId: string;
+  createdMergeCommitId: string | null;
+  changeStats: MergeChangeStats;
 };
 ```
 
@@ -252,10 +265,10 @@ type MergeVersionResult = {
 
 ```ts
 type MergeChangeStats = {
-	total: number;
-	added: number;
-	modified: number;
-	removed: number;
+  total: number;
+  added: number;
+  modified: number;
+  removed: number;
 };
 ```
 
@@ -263,12 +276,12 @@ type MergeChangeStats = {
 
 ```ts
 type MergeConflict = {
-	kind: "sameEntityChanged";
-	schemaKey: string;
-	entityPk: string[];
-	fileId: string | null;
-	target: MergeConflictSide;
-	source: MergeConflictSide;
+  kind: "sameEntityChanged";
+  schemaKey: string;
+  entityPk: string[];
+  fileId: string | null;
+  target: MergeConflictSide;
+  source: MergeConflictSide;
 };
 ```
 
@@ -298,12 +311,12 @@ Rows are returned by `execute()`.
 const row = result.rows[0]!;
 ```
 
-| Surface                 | Return type              | Description                                                    |
-| ----------------------- | ------------------------ | -------------------------------------------------------------- |
-| `row.get(columnName)`   | `unknown`                | Native JS value for a column. Throws if the column is missing. |
-| `row.value(columnName)` | `Value`                  | Typed `Value` for a column. Throws if the column is missing.   |
-| `row.toObject()`        | `Record<string, unknown>` | Object of native JS values keyed by column name.              |
-| `row.toValueMap()`      | `Record<string, Value>`  | Object of typed values keyed by column name.                   |
+| Surface                 | Return type               | Description                                                    |
+| ----------------------- | ------------------------- | -------------------------------------------------------------- |
+| `row.get(columnName)`   | `unknown`                 | Native JS value for a column. Throws if the column is missing. |
+| `row.value(columnName)` | `Value`                   | Typed `Value` for a column. Throws if the column is missing.   |
+| `row.toObject()`        | `Record<string, unknown>` | Object of native JS values keyed by column name.               |
+| `row.toValueMap()`      | `Record<string, Value>`   | Object of typed values keyed by column name.                   |
 
 ## Value
 

@@ -1,130 +1,111 @@
 ---
-description: Versions are isolated lines of state. Create them, switch into them, read across them with _by_version tables, and merge with conflict-aware preview.
+description: Branches are isolated lines of state. Create them, switch between them, read across them with _by_branch tables, and preview merges.
 ---
 
-# Versions & Merging
+# Branches & Merging
 
-A **version** in Lix is what Git calls a branch: an isolated line of state that can diverge from main and be merged back. Lix uses "version" because product UIs don't say "branch."
+A branch is an isolated line of state. It can change without affecting the main branch, then be merged back.
 
 ## Create and switch
 
 ```ts
-const main = await lix.activeVersionId();
+const main = await lix.activeBranchId();
 
-const draft = await lix.createVersion({ name: "Marketing edit" });
-await lix.switchVersion({ versionId: draft.id });
+const draft = await lix.createBranch({ name: "Marketing edit" });
+await lix.switchBranch({ branchId: draft.id });
 
-// writes here are isolated to `draft`
-await lix.execute(
-  "UPDATE acme_section SET title = $1 WHERE id = $2",
-  ["Sharper launch copy", "s1"],
-);
+await lix.execute("UPDATE acme_section SET title = $1 WHERE id = $2", [
+  "Sharper launch copy",
+  "s1",
+]);
 
-await lix.switchVersion({ versionId: main });
+await lix.switchBranch({ branchId: main });
 ```
 
-`createVersion()` returns `{ id, name, hidden }`. `switchVersion()` is per-Lix-instance state; it changes which version subsequent SQL goes against.
+`createBranch()` returns `{ id, name, hidden, commitId }`. `switchBranch()` changes which branch later SQL statements read and write.
 
-Use names that match your callers' vocabulary. For an end-user product that's domain language: `"Marketing edit"`, `"Q3 pricing draft"`. For a CLI or infrastructure tool, developer terms like `"feature/x"` or `"staging"` are fine; Lix doesn't prescribe.
+Use names that fit your product, such as `"Marketing edit"`, `"Q3 pricing draft"`, or `"Agent task 123"`.
 
-## Side-by-side reads with `_by_version`
+## Read branches side by side
 
-Every registered schema `X` gets a sibling table `X_by_version` with a `lixcol_version_id` column. (Files and directories have the same shape: `lix_file_by_version`, `lix_directory_by_version`. For the full surface map see [SQL Surfaces](./surfaces.md).) Use it to read or write across versions without switching:
+Every registered schema `X` gets an `X_by_branch` table with a `lixcol_branch_id` column. Files and directories have the same pattern with `lix_file_by_branch` and `lix_directory_by_branch`.
 
 ```ts
 const sideBySide = await lix.execute(
-  `SELECT v.name, s.title
-     FROM acme_section_by_version s
-     JOIN lix_version v ON v.id = s.lixcol_version_id
-    WHERE s.id = $1
-      AND s.lixcol_version_id IN ($2, $3)
-    ORDER BY v.name`,
+  `SELECT b.name, s.title
+	 FROM acme_section_by_branch s
+	 JOIN lix_branch b ON b.id = s.lixcol_branch_id
+	 WHERE s.id = $1
+	   AND s.lixcol_branch_id IN ($2, $3)
+	 ORDER BY b.name`,
   ["s1", main, draft.id],
 );
 ```
 
-Rules for `_by_version`:
+Rules for `_by_branch` tables:
 
-- `SELECT`: filter by `lixcol_version_id`, or omit the filter to scan all versions.
-- `INSERT`: must include `lixcol_version_id`.
-- `UPDATE` / `DELETE`: must include `lixcol_version_id` in the `WHERE` clause.
-- The plain (non-suffixed) table is the active-version view.
+- `SELECT` can read one or many branches.
+- `INSERT` must include `lixcol_branch_id`.
+- `UPDATE` and `DELETE` must filter by `lixcol_branch_id`.
+- The plain table reads and writes the active branch.
 
-Prefer `_by_version` for review UIs, sync, and any side-by-side rendering; it avoids the cost and risk of switching the active version.
+Use `_by_branch` tables for review UIs and side-by-side views. See [SQL Surfaces](./surfaces.md) for the full table map.
 
 ## Preview a merge
 
-`mergeVersionPreview()` reports the same merge decision as `mergeVersion()` without touching state.
+`mergeBranchPreview()` reports what `mergeBranch()` would do without changing state.
 
 ```ts
-const preview = await lix.mergeVersionPreview({ sourceVersionId: draft.id });
+const preview = await lix.mergeBranchPreview({
+  sourceBranchId: draft.id,
+});
 
-// preview shape:
 // {
 //   outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted",
-//   targetVersionId, sourceVersionId,
-//   baseCommitId, targetHeadCommitId, sourceHeadCommitId,
+//   targetBranchId,
+//   sourceBranchId,
 //   changeStats: { total, added, modified, removed },
 //   conflicts: MergeConflict[],
 // }
 ```
 
-Outcomes:
+`mergeBranch()` always merges into the active branch. Switch to the target branch before previewing or merging.
 
-- `alreadyUpToDate`: source has no commits the target lacks.
-- `fastForward`: target advances to source without a merge commit.
-- `mergeCommitted`: a new merge commit will be created.
+```ts
+await lix.switchBranch({ branchId: main });
 
-`mergeVersion()` always merges into the **active** version. If you want a different target, switch to it first.
+const preview = await lix.mergeBranchPreview({ sourceBranchId: draft.id });
+if (preview.conflicts.length === 0) {
+  await lix.mergeBranch({ sourceBranchId: draft.id });
+}
+```
 
 ## Conflicts
 
-If both versions modified the same entity since their merge base, `mergeVersionPreview()` returns them in `conflicts`, and `mergeVersion()` throws a `LixError`.
-
-Each conflict has the shape:
+If both branches changed the same entity after their merge base, the preview includes a `sameEntityChanged` conflict. `mergeBranch()` throws a `LixError` until the caller resolves it.
 
 ```ts
 {
-  kind: "sameEntityChanged",
-  schemaKey: "acme_section",
-  entityPk: ["s1"],
-  fileId: null,
-  target: { kind: "added" | "modified" | "removed", beforeChangeId, afterChangeId },
-  source: { kind: "added" | "modified" | "removed", beforeChangeId, afterChangeId },
+	kind: "sameEntityChanged",
+	schemaKey: "acme_section",
+	entityPk: ["s1"],
+	fileId: null,
+	target: { kind: "modified", beforeChangeId, afterChangeId },
+	source: { kind: "modified", beforeChangeId, afterChangeId },
 }
 ```
 
-Conflict detection is row-level today, not field-level: two versions editing different fields of the same row still conflict. Conflict semantics and resolution are still evolving. **Don't reshape your schemas to avoid this**; design entities around how your code reads them, not around today's merge granularity.
+Conflict detection is row-level today. Two branches that edit different fields of the same row still conflict. Design entities for how your app reads them, not around the current merge rule.
 
-Always wrap `mergeVersion()` when conflicts are possible:
+## Hide or delete a branch
 
-```ts
-try {
-  const result = await lix.mergeVersion({ sourceVersionId: draft.id });
-  console.log(result.outcome, result.changeStats.total);
-} catch (error) {
-  // resolve conflicts in calling code, then retry
-}
-```
-
-## Don't shape entities around merge
-
-It's tempting to split rows finely to dodge the row-level conflict rule. **Don't.** Schema design should follow how your code reads, writes, and joins data, not how today's merge engine resolves conflicts. Conflict semantics will improve; data models that work today should still work then.
-
-If a domain naturally splits (a document into blocks, an invoice into line items, a translation set into per-key messages), split it because the *reads* want it that way. If the natural shape is one row with several fields, write it that way and handle conflicts in calling code when they happen. See [Schemas](./schemas.md#design-for-querying-not-for-merging).
-
-## Hiding and deleting versions
-
-`lix_version` is a writable system table. Hide a version from the active set without deleting it:
+`lix_branch` is a writable system table:
 
 ```ts
-await lix.execute("UPDATE lix_version SET hidden = true WHERE id = $1", [draft.id]);
+await lix.execute("UPDATE lix_branch SET hidden = true WHERE id = $1", [
+  draft.id,
+]);
+await lix.execute("DELETE FROM lix_branch WHERE id = $1", [draft.id]);
 ```
 
-Delete a version with SQL:
-
-```ts
-await lix.execute("DELETE FROM lix_version WHERE id = $1", [draft.id]);
-```
-
-The engine refuses to delete the global version or the active version.
+Lix does not allow deleting the global branch or the active branch.

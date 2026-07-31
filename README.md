@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Embeddable version control system for every file format</h3>
+<h3 align="center">Database + filesystem + version control in one</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,22 +11,109 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Lix tracks, reviews, branches, merges, and rolls back changes across Markdown, DOCX, XLSX, JSON, PDFs, and custom file formats.
+Agents and tools work with files. Applications need a database. Teams need version control.
 
-Use Lix standalone or as the change-control layer for editors, knowledge bases, AI workflows, and file-based products. Lix stores files, tracks semantic changes, exposes history through SQL, and brings version control workflows beyond source code.
+Lix combines all three: normal files for tools, SQL rows for apps, and version control for every change.
 
-- 📌 **Supports any file format.** Create drafts, branches, checkpoints, and releases for Markdown, DOCX, XLSX, JSON, PDFs, and custom formats.
-- 🔍 **Track semantic changes.** See the paragraph, cell, property, clause, or custom entity that changed.
-- 🔀 **Review and merge changes.** Build change proposals, accept/reject flows, rollback, and merge workflows around files.
-- 🤝 **Sync in real time.** Keep versions and changes in sync across users, agents, devices, and runtimes.
-- ✅ **Validate and automate.** Run checks, enforce rules, and trigger workflows when files change.
-- 🧠 **Query everything with SQL.** Ask what changed, where, when, and by whom without rereading whole files.
+## Files × database
 
-## Try a demo app
+Plugins map file parts such as paragraphs, cells, and properties to SQL rows. Your app can also define its own rows.
 
-[Flashtype](https://flashtype.ai) is a Markdown editor for Claude and Codex built on Lix. Open local Markdown files, let agents edit them, review changes as diffs, and restore previous versions from history.
+```text
+what tools see                 what your app can query
 
-[![Flashtype app preview](https://flashtype.ai/og.png)](https://flashtype.ai)
+                               entity      field      value
+/orders.csv   ── plugin ──▶   row 1001    status     shipped
+                               row 1002    status     pending
+```
+
+Apps read and write the rows with SQL. Lix tracks every change. With `LocalFilesystem`, other tools and agents keep working with the files on disk.
+
+The SDK includes plugins for Markdown and CSV. Add a plugin for other formats, such as JSON, XLSX, DOCX, or PDF.
+
+### The map: interoperability × database semantics
+
+```text
+                           database semantics
+                       (query · transact · track)
+                                  ▲
+                                  │
+       PostgreSQL / SQLite        │                 ★ Lix
+       SQL and transactions,      │          normal files and SQL rows,
+       but data lives in tables   │          with every change tracked
+                                  │
+   ───────────────────────────────┼──────────────────────────────────▶
+                                  │              file interoperability
+                                  │       (any agent or tool can read/write)
+                                  │
+                                  │             Filesystem / Git
+                                  │             normal files,
+                                  │         but no queryable rows
+```
+
+### Comparison
+
+| Capability                                 | Filesystem / Git                     | PostgreSQL / SQLite    | Lix                |
+| ------------------------------------------ | ------------------------------------ | ---------------------- | ------------------ |
+| Works with normal workspace files          | Yes                                  | No                     | Yes                |
+| Queries file content with SQL              | No                                   | Only after import      | Yes, with a plugin |
+| ACID transactions                          | No                                   | Yes                    | Yes                |
+| Change history                             | Git: blobs and lines; filesystem: no | You build audit tables | Files and rows     |
+| Branches and merging                       | Git: yes; filesystem: no             | You build them         | Yes                |
+| Reviews changes by paragraph, cell, or row | Text lines only                      | You build it           | Yes, with a plugin |
+
+## Prime use cases
+
+### Give agents safe, isolated workspaces
+
+Give each agent its own branch. The agent works with normal files while the main branch stays stable. Preview its work, then merge or discard it.
+
+```ts
+const main = await lix.activeBranchId();
+const task = await lix.createBranch({ name: "Agent task" });
+
+await lix.switchBranch({ branchId: task.id });
+// Run the agent. Its file and SQL writes are isolated to this branch.
+
+await lix.switchBranch({ branchId: main });
+const preview = await lix.mergeBranchPreview({ sourceBranchId: task.id });
+
+if (preview.conflicts.length === 0) {
+  await lix.mergeBranch({ sourceBranchId: task.id });
+}
+```
+
+[Flashtype](https://flashtype.ai) is a Markdown editor for Claude and Codex built on Lix. Agents edit local files. Users review the changes and restore earlier versions.
+
+### Build file-based apps with SQL and version control
+
+Build editors, knowledge bases, and document workflows on normal files. Use SQL for app logic and Lix for history, rollback, branches, merging, and review.
+
+Plugins define the parts Lix tracks. You can review a change to a paragraph, cell, property, or row instead of only bytes and lines.
+
+For example, when an agent updates an orders CSV, Lix can show the row field that changed:
+
+```diff
+order_id 1002 status:
+
+- pending
++ shipped
+```
+
+Query changes without reading every file:
+
+```ts
+const changes = await lix.execute(`
+  SELECT created_at, schema_key, entity_pk, snapshot_content
+  FROM lix_change
+  ORDER BY created_at DESC
+  LIMIT 20
+`);
+```
+
+Update Lix files and rows in one ACID transaction. Lix records the history automatically.
+
+[Read more about semantic changes →](https://lix.dev/docs/semantic-changes)
 
 ## Getting started
 
@@ -45,221 +132,48 @@ npm install @lix-js/sdk
 import { LocalFilesystem, openLix } from "@lix-js/sdk";
 
 const lix = await openLix({
-	storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
+  storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
 });
 
-await lix.execute(
-	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-	["/notes/status.txt", new TextEncoder().encode("draft")],
-);
-
-const main = await lix.activeBranchId();
-
-const draft = await lix.createBranch({ name: "Explore" });
-
-await lix.switchBranch({ branchId: draft.id });
-
-await lix.execute(
-	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-	["/notes/status.txt", new TextEncoder().encode("ready for review")],
-);
-
-await lix.switchBranch({ branchId: main });
-
-const changes = await lix.execute(
-	"SELECT schema_key, count(*) AS count FROM lix_change GROUP BY schema_key",
-);
+await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+  "/notes/status.txt",
+  new TextEncoder().encode("ready"),
+]);
 ```
 
-## Why Lix?
-
-### Version control should not stop at source code.
-
-Most version control systems assume source code and text diffs. But many important products edit files where the useful change is a paragraph, spreadsheet cell, JSON property, PDF section, knowledge-base page, or custom entity.
-
-Lix is built for those files. Plugins translate file updates into semantic changes that can be queried, reviewed, branched, merged, and rolled back.
-
-[Flashtype](https://flashtype.ai), a Markdown editor for Claude and Codex, uses Lix so every local Markdown edit can be checkpointed, reviewed as a diff, and restored.
-
-[How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
-
-### What Lix provides
-
-#### Import as a library
-
-Import Lix and open it inside your worker, service, CLI, browser, desktop app, or server-side runtime. No daemon, no protocol.
+## Run locally or on a server
 
 ```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
-
 const lix = await openLix({
-	storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
+  server: {
+    mode: "remote",
+    url: "https://example.com/workspaces/acme",
+  },
 });
 ```
 
-#### ACID transactions
+## Where this is going
 
-Write files, blobs, and history in one transaction.
-
-```ts
-const tx = await lix.beginTransaction();
-
-try {
-	await tx.execute(
-		"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-		["/spec.docx", body],
-	);
-	await tx.execute(
-		"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-		["/spec.png", image],
-	);
-	await tx.commit();
-} catch (error) {
-	await tx.rollback();
-	throw error;
-}
-```
-
-#### Parallel branches
-
-Give every draft, user, tool, or AI agent its own isolated branch.
-
-```ts
-const main = await lix.activeBranchId();
-
-const copy = await lix.createBranch({ name: "Copy draft" });
-const pricing = await lix.createBranch({ name: "Pricing draft" });
-const qa = await lix.createBranch({ name: "QA draft" });
-
-await lix.switchBranch({ branchId: copy.id });
-await lix.execute(
-	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-	["/landing.md", copyDraft],
-);
-
-await lix.switchBranch({ branchId: pricing.id });
-await lix.execute(
-	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-	["/plans.json", priceModel],
-);
-
-await lix.switchBranch({ branchId: qa.id });
-await lix.execute(
-	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
-	["/checks/report.json", testRun],
-);
-
-await lix.switchBranch({ branchId: main });
-```
-
-#### Semantic changes
-
-Lix can track structured entities: XLSX rows, DOCX clauses, JSON properties, app records, custom entities, and more.
-
-```ts
-const changes = await lix.execute(`
-  SELECT created_at, schema_key, entity_pk, snapshot_content
-  FROM lix_change
-  ORDER BY created_at DESC
-  LIMIT 20
-`);
-```
-
-For example, a workflow edits an orders spreadsheet:
+Git makes code available to every developer tool. Lix aims to do the same for documents, spreadsheets, app data, and agent output while keeping SQL and version control.
 
 ```text
-Before:
-| order_id | product  | status  |
-| -------- | -------- | ------- |
-| 1001     | Widget A | shipped |
-| 1002     | Widget B | pending |
-
-After:
-| order_id | product  | status  |
-| -------- | -------- | ------- |
-| 1001     | Widget A | shipped |
-| 1002     | Widget B | shipped |
+ contracts.docx    pricing.xlsx      app data     agent output
+       │                │              │              │
+       └────────────────┴───────┬──────┴──────────────┘
+                                ▼
+┌─────────────────── ONE LIX REPOSITORY ───────────────────┐
+│                                                          │
+│  ┌──────────────┐     ┌──────────────┐     ┌────────────┐ │
+│  │  FILESYSTEM  │  ×  │   DATABASE   │  ×  │  VERSION   │ │
+│  │              │     │              │     │  CONTROL   │ │
+│  │ tools and    │     │ SQL queries  │     │review/merge│ │
+│  │ agents       │     │ transactions │     │ rollback   │ │
+│  └──────────────┘     └──────────────┘     └────────────┘ │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
 ```
 
-A text-based diff can only tell you the file changed:
-
-```diff
--Binary files differ
-```
-
-Lix can expose the row field that changed:
-
-```diff
-order_id 1002 status:
-
-- pending
-+ shipped
-```
-
-[Read more about semantic changes →](https://lix.dev/docs/semantic-changes)
-
-#### SQL interface
-
-Answer version-control questions with SQL instead of whole-file rereads.
-
-<img src="./website/public/assets/claude-sql-question.svg" alt="Claude Code asks: Which orders changed status in this branch? Executing SQL" width="460" />
-
-```ts
-const rows = await lix.execute(`
-  SELECT created_at, schema_key, entity_pk, snapshot_content
-  FROM lix_change
-  ORDER BY created_at DESC
-  LIMIT 20
-`);
-```
-
-Every change, across every file and every branch, is a row in `lix_change`. Filter by branch, file, schema, or time without re-reading whole files.
-
-#### Portable runtimes and storage
-
-Use Lix standalone or plug it into the infrastructure your product already runs.
-
-<p><img src="https://cdn.simpleicons.org/sqlite/003B57" alt="SQLite" width="18" height="18" /> SQLite · <img src="https://cdn.simpleicons.org/postgresql/4169E1" alt="Postgres" width="18" height="18" /> Postgres · <img src="https://api.iconify.design/logos:aws-s3.svg" alt="S3" width="18" height="18" /> S3 · <img src="https://cdn.simpleicons.org/cloudflareworkers/F38020" alt="Cloudflare Workers" width="18" height="18" /> Cloudflare Workers · <img src="https://cdn.simpleicons.org/supabase/3FCF8E" alt="Supabase" width="18" height="18" /> Supabase</p>
-
-```ts
-import { LocalFilesystem, openLix } from "@lix-js/sdk";
-
-const lix = await openLix({
-	storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
-});
-```
-
-Use `SQLite` when a single `.lix` SQLite file is the application document itself, for example when defining a new file format and using Lix as the application's file format.
-
-## How Lix works
-
-Lix runs in-process inside your runtime.
-
-It owns the version-control model: files, blobs, versions, history, transactions, and semantic changes. Use it standalone with `LocalFilesystem` for filesystem workspaces, use SQLite for single-file application formats, or plug it into whatever storage you need: in-memory, Postgres, S3, Cloudflare, or your own adapter.
-
-SQL is the query interface on top. Products, scripts, and agents can ask what changed without rereading whole files.
-
-```
-┌─────────────────────────────────────────────────┐
-│                  Your runtime                   │
-│       browser · desktop · server · CLI · worker  │
-│                                                 │
-│   ┌─────────────────────────────────────────┐   │
-│   │                  Lix                    │   │
-│   │  Filesystem · Versions · History · SQL  │   │
-│   └────────────────────┬────────────────────┘   │
-│                        │                        │
-└────────────────────────┼────────────────────────┘
-                         ▼
-┌─────────────────────────────────────────────────┐
-│                    Storage                      │
-│      SQLite, Postgres, S3, Cloudflare, custom   │
-└─────────────────────────────────────────────────┘
-```
-
-[Read more about Lix architecture →](https://lix.dev/docs/architecture)
-
-## Learn More
+## Learn more
 
 - **[Getting Started Guide](https://lix.dev/docs/getting-started)** - Build your first app with Lix
 - **[Documentation](https://lix.dev/docs)** - Full API reference and guides
