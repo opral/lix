@@ -6780,8 +6780,8 @@ async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_co
         .expect("the next write restores root-new authority and applies the sparse edit");
     let counters = lix_a.plugin_transition_counters();
     assert_eq!(
-        counters.full_state_semantic_rows_materialized, 3,
-        "cold reconstruction materializes the table entity and both row entities"
+        counters.full_state_semantic_rows_materialized, 0,
+        "the durable checkpoint avoids materializing the table and row entities"
     );
     assert_eq!(counters.full_renderer_invocations, 0);
     assert_eq!(read_file(&lix_a, path).await.unwrap(), Some(final_bytes));
