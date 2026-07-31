@@ -3313,6 +3313,16 @@ mod tests {
 
     #[test]
     fn replay_profiles_plugin_controls_on_both_storage_adapters() {
+        thread::Builder::new()
+            .name("git-replay-storage-plugin-matrix".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(replay_profiles_plugin_controls_on_both_storage_adapters_inner)
+            .expect("replay matrix thread should spawn")
+            .join()
+            .expect("replay matrix thread should complete");
+    }
+
+    fn replay_profiles_plugin_controls_on_both_storage_adapters_inner() {
         let fixture = unique_temp_dir();
         let repo = fixture.join("repo");
         fs::create_dir_all(&repo).expect("fixture repository should be created");
