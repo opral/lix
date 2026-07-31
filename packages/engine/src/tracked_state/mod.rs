@@ -36,7 +36,7 @@ pub(crate) use storage::{
     scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_values,
     stage_addressable_commit_deltas, stage_change_locators, stage_commit_deltas,
     stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
-    stage_delete_commit_roots,
+    stage_delete_commit_roots, stage_ordered_addressable_commit_deltas,
 };
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{
