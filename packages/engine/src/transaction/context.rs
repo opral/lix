@@ -792,7 +792,7 @@ where
                 entity_pk: entry.identity.entity_pk().clone(),
             })
             .collect::<BTreeSet<_>>();
-        let candidate_indices = prepared_writes
+        let overlapping_indices = prepared_writes
             .state_rows
             .iter()
             .enumerate()
@@ -802,45 +802,44 @@ where
                     file_id: row.file_id.map(|file_id| file_id.to_string()),
                     entity_pk: row.entity_pk.clone(),
                 };
-                (concurrent_keys.contains(&key)
-                    && row.file_id.is_some()
+                concurrent_keys.contains(&key).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let candidate_indices = overlapping_indices
+            .iter()
+            .copied()
+            .filter(|&index| {
+                let row = prepared_writes.state_rows.row(index);
+                row.file_id.is_some()
                     && !matches!(
                         row.schema_key.as_str(),
                         BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
-                    ))
-                .then_some(index)
+                    )
             })
             .collect::<Vec<_>>();
-        if candidate_indices.is_empty() {
-            return Err(conflict_error());
-        }
-        let file_ids = candidate_indices
+        let file_ids = overlapping_indices
             .iter()
-            .map(|&index| {
+            .filter_map(|&index| {
                 prepared_writes
                     .state_rows
                     .row(index)
                     .file_id
-                    .expect("candidate has file id")
-                    .to_string()
+                    .map(ToString::to_string)
             })
             .collect::<BTreeSet<_>>();
-        if concurrent_keys.iter().any(|key| {
-            prepared_writes.state_rows.iter().any(|row| {
-                row.schema_key.as_str() == key.schema_key
-                    && row.file_id.map(SharedStr::as_str) == key.file_id.as_deref()
-                    && row.entity_pk == &key.entity_pk
-            }) && (!file_ids.contains(key.file_id.as_deref().unwrap_or_default())
-                || !matches!(
-                    key.schema_key.as_str(),
-                    BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
-                ) && !candidate_indices.iter().any(|&index| {
-                    let row = prepared_writes.state_rows.row(index);
-                    row.schema_key.as_str() == key.schema_key
-                        && row.file_id.map(SharedStr::as_str) == key.file_id.as_deref()
-                        && row.entity_pk == &key.entity_pk
-                }))
-        }) {
+        if file_ids.is_empty()
+            || overlapping_indices.iter().any(|&index| {
+                let row = prepared_writes.state_rows.row(index);
+                let Some(file_id) = row.file_id.map(SharedStr::as_str) else {
+                    return true;
+                };
+                !file_ids.contains(file_id)
+                    || (!matches!(
+                        row.schema_key.as_str(),
+                        BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
+                    ) && !candidate_indices.contains(&index))
+            })
+        {
             return Err(conflict_error());
         }
 
@@ -1039,6 +1038,9 @@ where
                 .saturating_add(prepared_writes.state_rows.len()),
         );
         for group in groups.values() {
+            if group.conflicts.is_empty() {
+                continue;
+            }
             let conflicts = group
                 .conflicts
                 .iter()
