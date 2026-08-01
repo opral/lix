@@ -2308,85 +2308,94 @@ async fn hydrate_certified_members(
     if pending.is_empty() {
         return Ok(());
     }
-    let commit_ids = pending
-        .iter()
-        .map(|(_, commit_id, _, _)| *commit_id)
-        .collect::<BTreeSet<_>>();
-    let request = crate::tracked_state::TrackedStateScanRequest {
-        filter: crate::tracked_state::TrackedStateFilter {
-            schema_keys: pending
-                .iter()
-                .map(|(_, _, _, key)| key.schema_key.clone())
-                .collect(),
-            entity_pks: pending
-                .iter()
-                .map(|(_, _, _, key)| key.entity_pk.clone())
-                .collect(),
-            file_ids: pending
-                .iter()
-                .map(|(_, _, _, key)| {
-                    key.file_id.clone().map_or(
-                        crate::NullableKeyFilter::Null,
-                        crate::NullableKeyFilter::Value,
-                    )
-                })
-                .collect(),
-            include_tombstones: true,
-        },
-        read_columns: crate::tracked_state::TrackedStateReadColumns {
-            columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
-        },
-        limit: None,
-    };
-    let rows = crate::live_state::scan_certified_history_rows(store, &commit_ids, &request).await?;
-    let mut payloads = BTreeMap::new();
-    for row in rows {
-        let Some(commit_id) = row.commit_id else {
-            continue;
-        };
-        payloads.insert(
-            (commit_id, row.schema_key, row.file_id, row.entity_pk),
-            (
-                row.snapshot_content
-                    .map_or(crate::json_store::JsonSlot::None, |json| {
-                        crate::json_store::JsonSlot::Inline(json.as_str().into())
-                    }),
-                row.metadata
-                    .map_or(crate::json_store::JsonSlot::None, |json| {
-                        crate::json_store::JsonSlot::Inline(json.as_str().into())
-                    }),
-            ),
-        );
+    let mut pending_by_commit = BTreeMap::<CommitId, Vec<usize>>::new();
+    for (pending_index, (_, commit_id, _, _)) in pending.iter().enumerate() {
+        pending_by_commit
+            .entry(*commit_id)
+            .or_default()
+            .push(pending_index);
     }
-    for (index, commit_id, change_id, key) in pending {
-        let lookup = (
-            commit_id,
-            key.schema_key.clone(),
-            key.file_id.clone(),
-            key.entity_pk.clone(),
-        );
-        let Some((snapshot, metadata)) = payloads.remove(&lookup) else {
-            let candidates = payloads
-                .keys()
-                .filter(|(candidate_commit, schema_key, file_id, _)| {
-                    *candidate_commit == commit_id
-                        && schema_key == &key.schema_key
-                        && file_id == &key.file_id
-                })
-                .take(5)
-                .map(|(_, _, _, entity_pk)| format!("{entity_pk:?}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state certified change '{change_id}' has no certified payload at commit '{commit_id}' for schema '{}' file {:?} entity {:?}; candidates: {candidates}",
-                    key.schema_key, key.file_id, key.entity_pk
-                ),
-            ));
+    for (commit_id, pending_indexes) in pending_by_commit {
+        let keys = pending_indexes
+            .iter()
+            .map(|pending_index| &pending[*pending_index].3)
+            .collect::<Vec<_>>();
+        let request = crate::tracked_state::TrackedStateScanRequest {
+            filter: crate::tracked_state::TrackedStateFilter {
+                schema_keys: keys.iter().map(|key| key.schema_key.clone()).collect(),
+                entity_pks: keys.iter().map(|key| key.entity_pk.clone()).collect(),
+                file_ids: keys
+                    .iter()
+                    .map(|key| {
+                        key.file_id.clone().map_or(
+                            crate::NullableKeyFilter::Null,
+                            crate::NullableKeyFilter::Value,
+                        )
+                    })
+                    .collect(),
+                include_tombstones: true,
+            },
+            read_columns: crate::tracked_state::TrackedStateReadColumns {
+                columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
+            },
+            limit: None,
         };
-        members[index].change.snapshot = snapshot;
-        members[index].change.metadata = metadata;
+        let rows = crate::live_state::scan_certified_history_rows(
+            store,
+            &BTreeSet::from([commit_id]),
+            &request,
+        )
+        .await?;
+        let mut payloads = BTreeMap::new();
+        for row in rows {
+            let Some(row_commit_id) = row.commit_id else {
+                continue;
+            };
+            payloads.insert(
+                (row_commit_id, row.schema_key, row.file_id, row.entity_pk),
+                (
+                    row.snapshot_content
+                        .map_or(crate::json_store::JsonSlot::None, |json| {
+                            crate::json_store::JsonSlot::Inline(json.as_str().into())
+                        }),
+                    row.metadata
+                        .map_or(crate::json_store::JsonSlot::None, |json| {
+                            crate::json_store::JsonSlot::Inline(json.as_str().into())
+                        }),
+                ),
+            );
+        }
+        for pending_index in pending_indexes {
+            let (member_index, _, change_id, key) = &pending[pending_index];
+            let lookup = (
+                commit_id,
+                key.schema_key.clone(),
+                key.file_id.clone(),
+                key.entity_pk.clone(),
+            );
+            let Some((snapshot, metadata)) = payloads.remove(&lookup) else {
+                let candidates = payloads
+                    .keys()
+                    .filter(|(candidate_commit, schema_key, file_id, _)| {
+                        *candidate_commit == commit_id
+                            && schema_key == &key.schema_key
+                            && file_id == &key.file_id
+                    })
+                    .take(5)
+                    .map(|(_, _, _, entity_pk)| format!("{entity_pk:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state certified change '{change_id}' has no certified payload at commit '{commit_id}' for schema '{}' file {:?} entity {:?}; candidates: {candidates}",
+                        key.schema_key, key.file_id, key.entity_pk
+                    ),
+                ));
+            };
+            members[*member_index].change.snapshot = snapshot;
+            members[*member_index].change.metadata = metadata;
+        }
     }
     Ok(())
 }
