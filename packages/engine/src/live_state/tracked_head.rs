@@ -13,13 +13,12 @@ pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
     CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
     DeferredFreshHotRowRef, DeferredFreshHotRows, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE,
-    HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
-    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, scan_certified_history_rows,
-    stage_certified_entity_batches,
+    HotStateTransactionCache, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
+    PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+    scan_certified_history_rows, stage_certified_entity_batches,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -411,7 +410,25 @@ impl TrackedHeadContext {
     where
         S: StorageAdapterRead,
     {
-        hot::HotStateStoreReader { store }
+        hot::HotStateStoreReader {
+            store,
+            transaction_cache: None,
+        }
+    }
+
+    #[expect(clippy::unused_self)]
+    pub(crate) fn transaction_reader<S>(
+        &self,
+        store: S,
+        cache: Arc<HotStateTransactionCache>,
+    ) -> hot::HotStateStoreReader<S>
+    where
+        S: StorageAdapterRead,
+    {
+        hot::HotStateStoreReader {
+            store,
+            transaction_cache: Some(cache),
+        }
     }
 
     #[expect(clippy::unused_self)]

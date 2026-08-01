@@ -11,6 +11,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use crate::wasm::WasmCreateContext;
 use base64::Engine as _;
@@ -942,6 +943,7 @@ async fn scan_certified_entity_batch_rows(
     generation: CommitId,
     request: &TrackedStateScanRequest,
     limit: Option<usize>,
+    transaction_cache: Option<&HotStateTransactionCache>,
 ) -> Result<MaterializedLiveStateBatch, LixError> {
     if matches!(limit, Some(0)) {
         return Ok(MaterializedLiveStateBatch::default());
@@ -963,8 +965,14 @@ async fn scan_certified_entity_batch_rows(
             })
             .collect::<BTreeSet<_>>()
     });
+    if exact_file_ids.is_none()
+        && let Some(cache) = transaction_cache
+        && cache.certified_generation_absent(generation)?
+    {
+        return Ok(MaterializedLiveStateBatch::default());
+    }
     let mut manifest_entries = Vec::new();
-    if let Some(file_ids) = exact_file_ids {
+    if let Some(file_ids) = exact_file_ids.as_ref() {
         for file_id in file_ids {
             let mut prefix = generation.as_uuid().as_bytes().to_vec();
             append_batch_text(&mut prefix, file_id)?;
@@ -988,6 +996,12 @@ async fn scan_certified_entity_batch_rows(
         .collect(store, StorageScanOptions::default())
         .await?;
         manifest_entries = manifests.value.entries;
+    }
+    if exact_file_ids.is_none() && manifest_entries.is_empty() {
+        if let Some(cache) = transaction_cache {
+            cache.remember_certified_generation_absent(generation)?;
+        }
+        return Ok(MaterializedLiveStateBatch::default());
     }
     let content_keys = manifest_entries
         .into_iter()
@@ -1834,6 +1848,78 @@ struct HotCollectionControl {
     active_generation: CommitId,
     live_count: u64,
     ordered_identity_digest: Option<[u8; 32]>,
+}
+
+const TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct HotCollectionCacheKey {
+    branch_id: String,
+    generation: CommitId,
+    schema_key: String,
+    file_id: Option<String>,
+}
+
+/// Bounded serving metadata retained for one transaction snapshot.
+#[derive(Default)]
+pub(crate) struct HotStateTransactionCache {
+    collection_controls: StdMutex<BTreeMap<HotCollectionCacheKey, HotCollectionControl>>,
+    certified_absent_generations: StdMutex<BTreeSet<CommitId>>,
+}
+
+impl HotStateTransactionCache {
+    fn collection_control(
+        &self,
+        key: &HotCollectionCacheKey,
+    ) -> Result<Option<HotCollectionControl>, LixError> {
+        Ok(self
+            .collection_controls
+            .lock()
+            .map_err(|_| hot_state_cache_lock_error())?
+            .get(key)
+            .copied())
+    }
+
+    fn remember_collection_control(
+        &self,
+        key: HotCollectionCacheKey,
+        control: HotCollectionControl,
+    ) -> Result<(), LixError> {
+        let mut entries = self
+            .collection_controls
+            .lock()
+            .map_err(|_| hot_state_cache_lock_error())?;
+        if entries.len() < TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES {
+            entries.entry(key).or_insert(control);
+        }
+        Ok(())
+    }
+
+    fn certified_generation_absent(&self, generation: CommitId) -> Result<bool, LixError> {
+        Ok(self
+            .certified_absent_generations
+            .lock()
+            .map_err(|_| hot_state_cache_lock_error())?
+            .contains(&generation))
+    }
+
+    fn remember_certified_generation_absent(&self, generation: CommitId) -> Result<(), LixError> {
+        let mut entries = self
+            .certified_absent_generations
+            .lock()
+            .map_err(|_| hot_state_cache_lock_error())?;
+        if entries.len() < TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES {
+            entries.insert(generation);
+        }
+        Ok(())
+    }
+}
+
+fn hot_state_cache_lock_error() -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        "transaction hot-state metadata cache lock is poisoned",
+    )
 }
 
 struct PackedCollectionIncrement {
@@ -3104,19 +3190,45 @@ fn merge_ordered_live_batches(
 /// Direct reader for one published hot generation.
 pub(crate) struct HotStateStoreReader<S> {
     pub(super) store: S,
+    pub(super) transaction_cache: Option<Arc<HotStateTransactionCache>>,
 }
 
 impl<S> HotStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    async fn collection_control(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<HotCollectionControl, LixError> {
+        let key = HotCollectionCacheKey {
+            branch_id: branch_id.to_owned(),
+            generation,
+            schema_key: scope.schema_key.to_owned(),
+            file_id: scope.file_id.map(str::to_owned),
+        };
+        if let Some(cache) = self.transaction_cache.as_deref()
+            && let Some(control) = cache.collection_control(&key)?
+        {
+            return Ok(control);
+        }
+        let control =
+            load_hot_collection_control(&self.store, branch_id, generation, scope).await?;
+        if let Some(cache) = self.transaction_cache.as_deref() {
+            cache.remember_collection_control(key, control)?;
+        }
+        Ok(control)
+    }
+
     pub(crate) async fn collection_generation(
         &self,
         branch_id: &str,
         branch_generation: CommitId,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<crate::collection_generation::CollectionGeneration, LixError> {
-        load_hot_collection_control(&self.store, branch_id, branch_generation, scope)
+        self.collection_control(branch_id, branch_generation, scope)
             .await
             .map(
                 |control| crate::collection_generation::CollectionGeneration {
@@ -3217,6 +3329,7 @@ where
                 limit: Some(1),
             },
             Some(1),
+            self.transaction_cache.as_deref(),
         )
         .await?;
         Ok(!certified.is_empty())
@@ -3281,8 +3394,7 @@ where
                 if schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY =>
             {
                 Some(
-                    load_hot_collection_control(
-                        &self.store,
+                    self.collection_control(
                         branch_id,
                         generation,
                         crate::collection_generation::CollectionScopeRef {
@@ -3443,6 +3555,7 @@ where
                 } else {
                     None
                 },
+                self.transaction_cache.as_deref(),
             )
             .await?
             .filter(
@@ -3728,6 +3841,7 @@ where
                 generation,
                 &certified_request,
                 None,
+                self.transaction_cache.as_deref(),
             )
             .await?
         };
@@ -8750,9 +8864,147 @@ mod tests {
         StorageWriteOptions,
     };
 
+    #[test]
+    fn transaction_hot_state_cache_is_bounded_per_metadata_lane() {
+        let cache = HotStateTransactionCache::default();
+        for index in 0..=TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES {
+            let generation = CommitId::for_test_label(&format!("cache-generation-{index}"));
+            cache
+                .remember_collection_control(
+                    HotCollectionCacheKey {
+                        branch_id: "cache-branch".to_owned(),
+                        generation,
+                        schema_key: format!("schema-{index}"),
+                        file_id: None,
+                    },
+                    HotCollectionControl {
+                        active_generation: generation,
+                        live_count: index as u64,
+                        ordered_identity_digest: None,
+                    },
+                )
+                .expect("remember collection control");
+            cache
+                .remember_certified_generation_absent(generation)
+                .expect("remember absent certified generation");
+        }
+        assert_eq!(
+            cache.collection_controls.lock().unwrap().len(),
+            TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES
+        );
+        assert_eq!(
+            cache.certified_absent_generations.lock().unwrap().len(),
+            TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_reader_reuses_collection_control_point_read() {
+        const BRANCH_ID: &str = "collection-control-cache-branch";
+        const SCHEMA_KEY: &str = "collection_control_cache_schema";
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("collection-control-cache-generation");
+        let mut writes = StorageWriteSet::new();
+        stage_hot_collection_control(
+            &mut writes,
+            BRANCH_ID,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: SCHEMA_KEY,
+                file_id: None,
+            },
+            HotCollectionControl {
+                active_generation: generation,
+                live_count: 7,
+                ordered_identity_digest: Some([3; 32]),
+            },
+        )
+        .expect("stage collection control fixture");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("publish collection control fixture");
+
+        let get_many_calls = Arc::new(AtomicUsize::new(0));
+        let reader = HotStateStoreReader {
+            store: CountingRead {
+                inner: storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("open collection control fixture read"),
+                get_many_calls: Arc::clone(&get_many_calls),
+                scan_calls: None,
+            },
+            transaction_cache: Some(Arc::new(HotStateTransactionCache::default())),
+        };
+        for _ in 0..2 {
+            let control = reader
+                .collection_generation(
+                    BRANCH_ID,
+                    generation,
+                    crate::collection_generation::CollectionScopeRef {
+                        schema_key: SCHEMA_KEY,
+                        file_id: None,
+                    },
+                )
+                .await
+                .expect("load cached collection control");
+            assert_eq!(control.live_count, 7);
+            assert_eq!(control.ordered_identity_digest, Some([3; 32]));
+        }
+        assert_eq!(
+            get_many_calls.load(Ordering::Relaxed),
+            1,
+            "the immutable transaction snapshot should point-read a control once"
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_cache_reuses_absent_certified_manifest_scan() {
+        const BRANCH_ID: &str = "absent-certified-cache-branch";
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("absent-certified-cache-generation");
+        let scan_calls = Arc::new(AtomicUsize::new(0));
+        let read = CountingRead {
+            inner: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("open absent certified fixture read"),
+            get_many_calls: Arc::new(AtomicUsize::new(0)),
+            scan_calls: Some(Arc::clone(&scan_calls)),
+        };
+        let cache = HotStateTransactionCache::default();
+        let request = TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys: vec!["plugin_row".to_owned()],
+                ..TrackedStateFilter::default()
+            },
+            ..TrackedStateScanRequest::default()
+        };
+        for _ in 0..2 {
+            let rows = scan_certified_entity_batch_rows(
+                &read,
+                BRANCH_ID,
+                generation,
+                &request,
+                None,
+                Some(&cache),
+            )
+            .await
+            .expect("scan absent certified generation");
+            assert!(rows.is_empty());
+        }
+        assert_eq!(
+            scan_calls.load(Ordering::Relaxed),
+            1,
+            "an immutable generation without manifests should be scanned once"
+        );
+    }
+
     struct CountingRead<R> {
         inner: R,
         get_many_calls: Arc<AtomicUsize>,
+        scan_calls: Option<Arc<AtomicUsize>>,
     }
 
     impl<R: StorageAdapterRead> StorageAdapterRead for CountingRead<R> {
@@ -8774,6 +9026,9 @@ mod tests {
             range: StorageKeyRange,
             opts: StorageScanOptions,
         ) -> Result<StorageScanChunk, crate::storage_adapter::StorageError> {
+            if let Some(scan_calls) = &self.scan_calls {
+                scan_calls.fetch_add(1, Ordering::Relaxed);
+            }
             self.inner.scan(space, range, opts).await
         }
     }
@@ -8945,7 +9200,10 @@ mod tests {
             "mutation predecessor lookup must not read large JSON payloads"
         );
 
-        let reader = HotStateStoreReader { store: read };
+        let reader = HotStateStoreReader {
+            store: read,
+            transaction_cache: None,
+        };
         let control = BranchHeadControl {
             head_commit_id: generation,
             generation,
@@ -9615,6 +9873,7 @@ mod tests {
                 ..TrackedStateScanRequest::default()
             },
             None,
+            None,
         )
         .await
         .expect("exact-file scan must not decode unrelated certified content");
@@ -9684,6 +9943,7 @@ mod tests {
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("open exact HOT read"),
+            transaction_cache: None,
         };
         let result = reader
             .load_projected_live_batch_for_generation_refs(
@@ -9882,6 +10142,7 @@ mod tests {
         let read = CountingRead {
             inner: read,
             get_many_calls: Arc::clone(&get_many_calls),
+            scan_calls: None,
         };
         let rows = scan_certified_entity_batch_rows(
             &read,
@@ -9897,6 +10158,7 @@ mod tests {
                 },
                 limit: None,
             },
+            None,
             None,
         )
         .await
