@@ -82,6 +82,50 @@ fn seeded_sparse_gap_storage(runtime: &tokio::runtime::Runtime, history_depth: u
     })
 }
 
+fn seeded_wide_parent_storage(runtime: &tokio::runtime::Runtime, parent_width: usize) -> Vec<u8> {
+    runtime.block_on(async move {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("benchmark storage initializes");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("benchmark engine opens");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("benchmark session opens");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('target-key', 'before')",
+                &[],
+            )
+            .await
+            .expect("benchmark target starts");
+        let values = (0..parent_width)
+            .map(|index| format!("('noise-{index}', '{index}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
+                &[],
+            )
+            .await
+            .expect("wide parent commit succeeds");
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'target-key'",
+                &[],
+            )
+            .await
+            .expect("benchmark target update succeeds");
+        storage
+            .export_snapshot()
+            .expect("benchmark storage snapshot exports")
+    })
+}
+
 fn open_session(
     runtime: &tokio::runtime::Runtime,
     storage: Memory,
@@ -179,6 +223,34 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                         runtime
                             .block_on(session.redo())
                             .expect("benchmarked redo succeeds");
+                        elapsed += started.elapsed();
+                    }
+                    elapsed
+                });
+            },
+        );
+    }
+    group.finish();
+
+    let mut group = criterion.benchmark_group("undo_wide_parent_delta");
+    for parent_width in [10_usize, 1_000] {
+        let snapshot = seeded_wide_parent_storage(&runtime, parent_width);
+        group.bench_with_input(
+            BenchmarkId::new("undo", parent_width),
+            &parent_width,
+            |benchmark, _| {
+                benchmark.iter_custom(|iterations| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let session = open_session(
+                            &runtime,
+                            Memory::from_snapshot(&snapshot)
+                                .expect("wide-parent benchmark snapshot restores"),
+                        );
+                        let started = Instant::now();
+                        runtime
+                            .block_on(session.undo())
+                            .expect("benchmarked wide-parent undo succeeds");
                         elapsed += started.elapsed();
                     }
                     elapsed
