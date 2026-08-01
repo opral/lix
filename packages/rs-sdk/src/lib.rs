@@ -46,12 +46,12 @@ pub use lix_engine::{
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeBranchReceipt as MergeBranchResult,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
     MutationIdentity, ObserveEvent, ObserveEvents, ProjectedValue, PutBatch, ReadDurability,
-    ReadEntry, ReadOptions, RequestBlobSpliceProvenance, Row, ScanChunk, ScanOptions, SpaceId,
-    SqlQueryResult, SqlScriptPlan, SqlScriptStatement, Storage, StorageConformanceReport,
+    ReadEntry, ReadOptions, RedoReceipt, RequestBlobSpliceProvenance, Row, ScanChunk, ScanOptions,
+    SpaceId, SqlQueryResult, SqlScriptPlan, SqlScriptStatement, Storage, StorageConformanceReport,
     StorageConformanceResult, StorageConformanceStatus, StorageConformanceTest, StorageError,
     StorageFactory, StorageFixture, StorageRead, StorageTestConfig, StorageWrite, StoredValue,
     SwitchBranchOptions, SwitchBranchReceipt, SwitchBranchReceipt as SwitchBranchResult,
-    TryFromValue, Value, VerifiedRequestBlob, WireValue, WriteOptions, WriteStats,
+    TryFromValue, UndoReceipt, Value, VerifiedRequestBlob, WireValue, WriteOptions, WriteStats,
     parse_sql_script, run_storage_conformance,
 };
 #[cfg(feature = "sqlite")]

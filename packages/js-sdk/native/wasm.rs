@@ -248,6 +248,26 @@ impl WasmLix {
         })
     }
 
+    #[wasm_bindgen(js_name = undo)]
+    pub async fn undo(&self) -> Result<JsValue, JsValue> {
+        let receipt = self.inner.undo().await.map_err(lix_error_to_js)?;
+        to_js(&UndoReceiptDto {
+            branch_id: receipt.branch_id,
+            target_commit_id: receipt.target_commit_id,
+            inverse_commit_id: receipt.inverse_commit_id,
+        })
+    }
+
+    #[wasm_bindgen(js_name = redo)]
+    pub async fn redo(&self) -> Result<JsValue, JsValue> {
+        let receipt = self.inner.redo().await.map_err(lix_error_to_js)?;
+        to_js(&RedoReceiptDto {
+            branch_id: receipt.branch_id,
+            target_commit_id: receipt.target_commit_id,
+            replay_commit_id: receipt.replay_commit_id,
+        })
+    }
+
     #[wasm_bindgen(js_name = switchBranch)]
     pub async fn switch_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
         let options: SwitchBranchOptionsDto = from_js(options)?;
@@ -449,6 +469,22 @@ struct CreateBranchReceiptDto {
 #[serde(rename_all = "camelCase")]
 struct CreateCheckpointReceiptDto {
     commit_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UndoReceiptDto {
+    branch_id: String,
+    target_commit_id: String,
+    inverse_commit_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RedoReceiptDto {
+    branch_id: String,
+    target_commit_id: String,
+    replay_commit_id: String,
 }
 
 #[derive(Deserialize)]

@@ -138,6 +138,10 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				return requiredLix().createBranch(operation.options);
 			case "createCheckpoint":
 				return requiredLix().createCheckpoint();
+			case "undo":
+				return requiredLix().undo();
+			case "redo":
+				return requiredLix().redo();
 			case "switchBranch":
 				return requiredLix().switchBranch(operation.options);
 			case "mergeBranchPreview":

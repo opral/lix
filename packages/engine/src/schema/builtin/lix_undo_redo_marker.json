@@ -1,0 +1,43 @@
+{
+  "x-lix-key": "lix_undo_redo_marker",
+  "description": "Internal tracked marker carrying branch undo/redo cursor state. This schema is intentionally hidden from generated entity SQL surfaces.",
+  "x-lix-primary-key": [
+    "/branch_id"
+  ],
+  "type": "object",
+  "properties": {
+    "branch_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["undo", "redo"]
+    },
+    "target_commit_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "undo_target_after": {
+      "type": ["string", "null"],
+      "format": "uuid"
+    },
+    "redo_top_after": {
+      "type": ["string", "null"],
+      "format": "uuid"
+    },
+    "redo_next": {
+      "type": ["string", "null"],
+      "format": "uuid"
+    }
+  },
+  "required": [
+    "branch_id",
+    "kind",
+    "target_commit_id",
+    "undo_target_after",
+    "redo_top_after",
+    "redo_next"
+  ],
+  "additionalProperties": false
+}

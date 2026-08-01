@@ -196,7 +196,10 @@ where
                                 .map_err(lix_error_to_datafusion_error)?
                         };
                         for entry in diff.entries {
-                            if entry.identity.schema_key() == CHECKPOINT_MARKER_SCHEMA_KEY {
+                            if entry.identity.schema_key() == CHECKPOINT_MARKER_SCHEMA_KEY
+                                || entry.identity.schema_key()
+                                    == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                            {
                                 continue;
                             }
                             rows.push(WorkingChangeSqlRow {

@@ -116,6 +116,8 @@ where
                         let mut source_membership_exact = true;
                         for entry in entries.into_iter().filter(|entry| {
                             entry.identity.schema_key() != CHECKPOINT_MARKER_SCHEMA_KEY
+                                && entry.identity.schema_key()
+                                    != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
                         }) {
                             let row = entry.after.ok_or_else(|| {
                                 LixError::new(

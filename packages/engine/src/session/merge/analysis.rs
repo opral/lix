@@ -113,5 +113,6 @@ where
 fn exclude_internal_checkpoint_markers(diff: &mut TrackedStateDiff) {
     diff.entries.retain(|entry| {
         entry.identity.schema_key() != crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
+            && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
     });
 }

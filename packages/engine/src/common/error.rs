@@ -197,6 +197,12 @@ impl LixError {
     /// such as merging a branch into itself.
     pub const CODE_INVALID_MERGE: &'static str = "LIX_INVALID_MERGE";
 
+    /// The selected branch has no ordinary commit above its undo boundary.
+    pub const CODE_NOTHING_TO_UNDO: &'static str = "LIX_NOTHING_TO_UNDO";
+
+    /// The selected branch has no abandoned action available to replay.
+    pub const CODE_NOTHING_TO_REDO: &'static str = "LIX_NOTHING_TO_REDO";
+
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),

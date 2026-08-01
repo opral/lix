@@ -191,6 +191,8 @@ function workerBinding(client: LixWorkerClient): LixBinding {
 		clientStateDelete: (key) => request({ kind: "clientState.delete", key }),
 		createBranch: (options) => request({ kind: "createBranch", options }),
 		createCheckpoint: () => request({ kind: "createCheckpoint" }),
+		undo: () => request({ kind: "undo" }),
+		redo: () => request({ kind: "redo" }),
 		switchBranch: (options) => request({ kind: "switchBranch", options }),
 		importFilesystemPaths: (paths) =>
 			request({ kind: "importFilesystemPaths", paths }),
@@ -284,6 +286,8 @@ function persistentSnapshotBinding(
 		createBranch: (branchOptions) =>
 			afterMutation(binding.createBranch(branchOptions)),
 		createCheckpoint: () => afterMutation(binding.createCheckpoint()),
+		undo: () => afterMutation(binding.undo()),
+		redo: () => afterMutation(binding.redo()),
 		switchBranch: (branchOptions) =>
 			afterMutation(binding.switchBranch(branchOptions)),
 		importFilesystemPaths: (paths) =>

@@ -2,8 +2,7 @@ use clap::Args;
 
 #[derive(Debug, Args)]
 pub struct RedoCommand {
-    /// Override the target version by `lix_version.id` / active `version_id`,
-    /// not the `lix_active_version.id` row key.
+    /// Target branch id. Defaults to the active branch.
     #[arg(long)]
-    pub version: Option<String>,
+    pub branch: Option<String>,
 }

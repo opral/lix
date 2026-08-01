@@ -120,6 +120,18 @@ export type RemoteCreateCheckpointResponse = {
 	commitId: string;
 };
 
+export type RemoteUndoResponse = {
+	branchId: string;
+	targetCommitId: string;
+	inverseCommitId: string;
+};
+
+export type RemoteRedoResponse = {
+	branchId: string;
+	targetCommitId: string;
+	replayCommitId: string;
+};
+
 export type RemoteSwitchBranchRequest = { branchId: string };
 export type RemoteSwitchBranchResponse = { branchId: string };
 

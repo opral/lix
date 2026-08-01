@@ -5,8 +5,8 @@ use lix_engine::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, EngineOptions,
     ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
     ExecuteStatementMetadata, ExecutionDisposition, LixError, Memory, MergeBranchOptions,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents,
-    SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
+    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, RedoReceipt,
+    SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -408,6 +408,16 @@ where
 
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
         self.session.create_checkpoint().await
+    }
+
+    /// Reverses the latest undoable tracked commit on this handle's active branch.
+    pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
+        self.session.undo().await
+    }
+
+    /// Replays the latest tracked commit abandoned by undo on this handle's active branch.
+    pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
+        self.session.redo().await
     }
 
     pub async fn switch_branch(

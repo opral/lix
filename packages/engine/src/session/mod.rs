@@ -21,6 +21,7 @@ mod merge;
 pub(crate) mod observe;
 mod switch_branch;
 mod transaction;
+mod undo_redo;
 
 pub use crate::common::{
     ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance, VerifiedRequestBlob,
@@ -46,3 +47,4 @@ pub use merge::{
 pub use observe::{ObserveEvent, ObserveEvents};
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;
+pub use undo_redo::{RedoReceipt, UndoReceipt};

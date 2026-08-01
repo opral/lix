@@ -698,6 +698,56 @@ test("remote createCheckpoint posts no body and decodes the receipt", async () =
 	await lix.close();
 });
 
+test("remote undo and redo decode branch-history receipts", async () => {
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+				const request = new Request(input, init);
+				const pathname = new URL(request.url).pathname;
+				if (pathname.endsWith("/lix/v1/")) {
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+					});
+				}
+				if (pathname.endsWith("/undo")) {
+					return Response.json({
+						branchId: "main-id",
+						targetCommitId: "target-id",
+						inverseCommitId: "inverse-id",
+					});
+				}
+				if (pathname.endsWith("/redo")) {
+					return Response.json({
+						branchId: "main-id",
+						targetCommitId: "target-id",
+						replayCommitId: "replay-id",
+					});
+				}
+				if (request.method === "DELETE") {
+					return new Response(null, { status: 204 });
+				}
+				throw new Error(`Unexpected request: ${pathname}`);
+			}) as typeof fetch,
+		},
+	});
+
+	await expect(lix.undo()).resolves.toEqual({
+		branchId: "main-id",
+		targetCommitId: "target-id",
+		inverseCommitId: "inverse-id",
+	});
+	await expect(lix.redo()).resolves.toEqual({
+		branchId: "main-id",
+		targetCommitId: "target-id",
+		replayCommitId: "replay-id",
+	});
+	await lix.close();
+});
+
 test("a failed remote branch switch leaves the active branch unchanged", async () => {
 	let handshakeCalls = 0;
 	const lix = await openLix({

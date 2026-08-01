@@ -158,7 +158,10 @@ where
                         .map_err(lix_error_to_datafusion_error)?;
                     let mut rows = Vec::with_capacity(diff.entries.len());
                     for entry in diff.entries {
-                        if entry.identity.schema_key() == CHECKPOINT_MARKER_SCHEMA_KEY {
+                        if entry.identity.schema_key() == CHECKPOINT_MARKER_SCHEMA_KEY
+                            || entry.identity.schema_key()
+                                == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                        {
                             continue;
                         }
                         rows.push(DiffSqlRow {

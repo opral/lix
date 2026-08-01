@@ -70,6 +70,7 @@ pub(crate) mod tracked_state;
 pub mod transaction;
 #[cfg(not(feature = "storage-benches"))]
 pub(crate) mod transaction;
+pub(crate) mod undo_redo;
 pub mod wasm;
 
 pub use schema::{
@@ -94,7 +95,8 @@ pub use session::{
     CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, MergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
-    SessionContext, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
+    RedoReceipt, SessionContext, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
+    UndoReceipt,
 };
 pub use sql2::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 pub use storage::conformance::{

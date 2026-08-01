@@ -10,6 +10,7 @@ import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
 	CreateCheckpointReceipt,
+	RedoReceipt,
 	ExecuteOptions,
 	LixBatchOptions,
 	MergeBranchOptions,
@@ -18,6 +19,7 @@ import type {
 	RemoteLixServerOptions,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
+	UndoReceipt,
 } from "../types.js";
 import type { NativeLixValue } from "../value.js";
 import {
@@ -380,6 +382,50 @@ class RemoteLixBinding implements LixBinding {
 				throw protocolError("create checkpoint response is invalid");
 			}
 			return { commitId: value.commitId };
+		});
+	}
+
+	async undo(): Promise<UndoReceipt> {
+		this.#assertOpen();
+		return this.#enqueue(async () => {
+			const value = record(
+				await this.#requestJson("undo", { method: "POST" }),
+				"undo response",
+			);
+			if (
+				typeof value.branchId !== "string" ||
+				typeof value.targetCommitId !== "string" ||
+				typeof value.inverseCommitId !== "string"
+			) {
+				throw protocolError("undo response is invalid");
+			}
+			return {
+				branchId: value.branchId,
+				targetCommitId: value.targetCommitId,
+				inverseCommitId: value.inverseCommitId,
+			};
+		});
+	}
+
+	async redo(): Promise<RedoReceipt> {
+		this.#assertOpen();
+		return this.#enqueue(async () => {
+			const value = record(
+				await this.#requestJson("redo", { method: "POST" }),
+				"redo response",
+			);
+			if (
+				typeof value.branchId !== "string" ||
+				typeof value.targetCommitId !== "string" ||
+				typeof value.replayCommitId !== "string"
+			) {
+				throw protocolError("redo response is invalid");
+			}
+			return {
+				branchId: value.branchId,
+				targetCommitId: value.targetCommitId,
+				replayCommitId: value.replayCommitId,
+			};
 		});
 	}
 
