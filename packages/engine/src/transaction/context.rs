@@ -94,7 +94,8 @@ use crate::sql2::{
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    Memory, StoragePrecondition, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
+    Memory, StoragePrecondition, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+    StorageWriteSetStats,
 };
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
@@ -504,6 +505,12 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     trust_filesystem_planner: bool,
     origin_key: Option<SharedStr>,
     idempotency_receipt: Option<(crate::storage_adapter::StorageKey, Vec<u8>)>,
+    /// Storage-native metadata that must publish in the same backend commit as
+    /// this transaction's file rows and history. Resumable media finalization
+    /// uses this lane for its completed manifest and upload receipt.
+    atomic_metadata_writes: Option<StorageWriteSet>,
+    atomic_metadata_preconditions: Vec<StoragePrecondition>,
+    await_durable_commit: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
@@ -643,6 +650,33 @@ impl<StorageImpl> Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    pub(crate) fn stage_atomic_cas_publication(
+        &mut self,
+        writes: StorageWriteSet,
+        preconditions: Vec<StoragePrecondition>,
+        blob_id: BlobId,
+    ) -> Result<(), LixError> {
+        if self.atomic_metadata_writes.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "atomic transaction metadata was staged more than once",
+            ));
+        }
+        if !self
+            .binary_cas
+            .prepared_manifest_is_staged(&writes, blob_id)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "atomic CAS publication is missing its prepared manifest",
+            ));
+        }
+        self.atomic_metadata_writes = Some(writes);
+        self.atomic_metadata_preconditions.extend(preconditions);
+        self.await_durable_commit = true;
+        Ok(())
+    }
+
     fn opening_read(&self) -> SharedStorageAdapterRead<StorageImpl::Read<'static>> {
         self.opening_read.clone()
     }
@@ -1281,6 +1315,9 @@ where
                 trust_filesystem_planner: false,
                 origin_key: None,
                 idempotency_receipt: None,
+                atomic_metadata_writes: None,
+                atomic_metadata_preconditions: Vec::new(),
+                await_durable_commit: false,
                 session_file_views,
                 pending_file_view_mutations: BTreeMap::new(),
                 pending_plugin_actor_publications: Vec::new(),
@@ -1439,10 +1476,17 @@ where
         if tracked_state_changed {
             StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
         }
+        if let Some(metadata_writes) = transaction.atomic_metadata_writes.take() {
+            writes.extend(metadata_writes);
+        }
         let mut write_options = StorageWriteOptions::default();
+        write_options.await_durable = transaction.await_durable_commit;
         write_options
             .preconditions
             .extend(materialization_preconditions);
+        write_options
+            .preconditions
+            .append(&mut transaction.atomic_metadata_preconditions);
         if requires_tracked_snapshot_fence {
             write_options.preconditions.push(
                 StorageAdapter::<StorageImpl>::tracked_mutation_revision_precondition(

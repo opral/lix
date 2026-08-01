@@ -895,6 +895,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
             "total_size".to_string(),
             "range_start".to_string(),
             "range_end".to_string(),
+            "content_identity".to_string(),
         ]
     } else {
         vec!["path".to_string(), "data".to_string()]
@@ -5384,6 +5385,21 @@ async fn exact_path_data_rows_from_prepared(
             .expect("prepared lix_file descriptor should have a path");
         let blob_key = file.blob_ref_key(&live_rows);
         if let Some(range) = data_range {
+            let content_identity = blob_rows
+                .get(&blob_key)
+                .map(|blob_ref| blob_ref.blob_hash.clone())
+                .or_else(|| {
+                    derived_rows
+                        .get(&blob_key)
+                        .map(|derived| derived.sha256.clone())
+                })
+                .or_else(|| {
+                    live_rows
+                        .row(file.live)
+                        .change_id()
+                        .map(|change_id| change_id.to_string())
+                })
+                .unwrap_or_else(|| file.id.clone());
             let selected = match blob_ranges.take(&blob_key) {
                 Some(data) => data,
                 None => match rendered_plugin_bytes.remove(&key) {
@@ -5404,6 +5420,7 @@ async fn exact_path_data_rows_from_prepared(
                     Value::Null,
                     Value::Null,
                     Value::Null,
+                    Value::Null,
                 ]);
                 continue;
             };
@@ -5419,6 +5436,7 @@ async fn exact_path_data_rows_from_prepared(
                 Value::Integer(i64::try_from(selected.range.end).map_err(|_| {
                     LixError::new(LixError::CODE_INTERNAL_ERROR, "file range exceeds SQL i64")
                 })?),
+                Value::Text(content_identity),
             ]);
         } else {
             let data = match blob_bytes.take(&blob_key) {
@@ -5447,6 +5465,16 @@ async fn exact_path_data_rows_from_prepared(
 fn materialize_vec_range(data: Vec<u8>, requested: Range<u64>) -> Result<BlobRangeBytes, LixError> {
     let total_size = u64::try_from(data.len())
         .map_err(|_| LixError::new(LixError::CODE_INTERNAL_ERROR, "file size exceeds u64"))?;
+    // A zero-width result is the metadata-bearing representation of a
+    // present empty file. It lets bounded download callers distinguish that
+    // file from a missing path without materializing an unbounded read first.
+    if total_size == 0 && requested.start == 0 {
+        return Ok(BlobRangeBytes {
+            bytes: Vec::new(),
+            total_size,
+            range: 0..0,
+        });
+    }
     if requested.start >= requested.end || requested.start >= total_size {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,

@@ -56,15 +56,11 @@ use std::io::{Read, Seek, SeekFrom};
 
 const DB_PATH: &str = "db";
 const SEGMENTED_FORMAT_PATH: &str = "lix-space-segments-v2";
-const IMMUTABLE_BINARY_CAS_CHUNK_PATH: &str = "lix-immutable-binary-cas-segment-v4";
-const IMMUTABLE_BINARY_CAS_CACHE_PATH: &str = "lix-immutable-binary-cas-segment-v4";
+const IMMUTABLE_BINARY_CAS_CHUNK_PATH: &str = "lix-immutable-binary-cas-segment-v5";
+const IMMUTABLE_BINARY_CAS_CACHE_PATH: &str = "lix-immutable-binary-cas-segment-v5";
 const IMMUTABLE_CACHE_VALUE_MAGIC: &[u8; 8] = b"LIXICV5\0";
-const IMMUTABLE_VALUE_MAGIC: &[u8; 8] = b"LIXICV3\0";
-const IMMUTABLE_VALUE_RAW: u8 = 0;
-const IMMUTABLE_VALUE_ZSTD: u8 = 1;
+const IMMUTABLE_VALUE_MAGIC: &[u8; 8] = b"LIXICV6\0";
 const IMMUTABLE_LOCATOR_MAGIC: &[u8; 8] = b"LIXILV4\0";
-const IMMUTABLE_VALUE_ZSTD_LEVEL: i32 = 3;
-const IMMUTABLE_VALUE_MIN_SAVINGS_BYTES: usize = 128;
 const IMMUTABLE_VALUE_MAX_ENCODED_BYTES: usize = 4 * 1024 * 1024 + 1024;
 const IMMUTABLE_SEGMENT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const BINARY_CAS_CHUNK_SPACE_ID: SpaceId = SpaceId(0x0005_0003);
@@ -703,33 +699,19 @@ fn encode_immutable_value(value: Bytes) -> Result<Bytes, StorageError> {
             IMMUTABLE_VALUE_MAX_ENCODED_BYTES
         )));
     }
-    let uncompressed_len = u64::try_from(value.len()).map_err(|_| {
+    let value_len = u64::try_from(value.len()).map_err(|_| {
         StorageError::Io("immutable value exceeds the u64 storage limit".to_string())
     })?;
-    let compressed = zstd::bulk::compress(&value, IMMUTABLE_VALUE_ZSTD_LEVEL)
-        .map_err(|error| StorageError::Io(format!("immutable value compression: {error}")))?;
-    let header_bytes = IMMUTABLE_VALUE_MAGIC
-        .len()
-        .saturating_add(size_of::<u8>())
-        .saturating_add(size_of::<u64>());
-    let compressed_envelope_bytes = header_bytes.saturating_add(compressed.len());
-    let (encoding, payload) = if value.len().saturating_sub(compressed_envelope_bytes)
-        >= IMMUTABLE_VALUE_MIN_SAVINGS_BYTES
-    {
-        (IMMUTABLE_VALUE_ZSTD, compressed.as_slice())
-    } else {
-        (IMMUTABLE_VALUE_RAW, value.as_ref())
-    };
-    let mut envelope = Vec::with_capacity(header_bytes.saturating_add(payload.len()));
+    let header_bytes = IMMUTABLE_VALUE_MAGIC.len().saturating_add(size_of::<u64>());
+    let mut envelope = Vec::with_capacity(header_bytes.saturating_add(value.len()));
     envelope.extend_from_slice(IMMUTABLE_VALUE_MAGIC);
-    envelope.push(encoding);
-    envelope.extend_from_slice(&uncompressed_len.to_le_bytes());
-    envelope.extend_from_slice(payload);
+    envelope.extend_from_slice(&value_len.to_le_bytes());
+    envelope.extend_from_slice(&value);
     Ok(Bytes::from(envelope))
 }
 
 fn decode_immutable_value(value: Bytes) -> Result<Bytes, StorageError> {
-    let header_len = IMMUTABLE_VALUE_MAGIC.len() + size_of::<u8>() + size_of::<u64>();
+    let header_len = IMMUTABLE_VALUE_MAGIC.len() + size_of::<u64>();
     if value.len() < header_len {
         return Err(StorageError::Corruption(
             "immutable value envelope is truncated".to_string(),
@@ -740,44 +722,29 @@ fn decode_immutable_value(value: Bytes) -> Result<Bytes, StorageError> {
             "immutable value envelope magic is invalid".to_string(),
         ));
     }
-    let encoding = value[IMMUTABLE_VALUE_MAGIC.len()];
-    let length_start = IMMUTABLE_VALUE_MAGIC.len() + size_of::<u8>();
-    let uncompressed_len = u64::from_le_bytes(
+    let length_start = IMMUTABLE_VALUE_MAGIC.len();
+    let value_len = u64::from_le_bytes(
         value[length_start..header_len]
             .try_into()
             .expect("fixed immutable value length header"),
     );
-    let uncompressed_len = usize::try_from(uncompressed_len).map_err(|_| {
-        StorageError::Corruption(
-            "immutable value uncompressed length exceeds this platform".to_string(),
-        )
+    let value_len = usize::try_from(value_len).map_err(|_| {
+        StorageError::Corruption("immutable value length exceeds this platform".to_string())
     })?;
-    if uncompressed_len > IMMUTABLE_VALUE_MAX_ENCODED_BYTES {
+    if value_len > IMMUTABLE_VALUE_MAX_ENCODED_BYTES {
         return Err(StorageError::Corruption(format!(
             "immutable value exceeds the {} byte format maximum",
             IMMUTABLE_VALUE_MAX_ENCODED_BYTES
         )));
     }
-    match encoding {
-        IMMUTABLE_VALUE_RAW => {
-            let payload = value.slice(header_len..);
-            if payload.len() != uncompressed_len {
-                return Err(StorageError::Corruption(format!(
-                    "immutable raw value length {} does not match declared length {uncompressed_len}",
-                    payload.len()
-                )));
-            }
-            Ok(payload)
-        }
-        IMMUTABLE_VALUE_ZSTD => zstd::bulk::decompress(&value[header_len..], uncompressed_len)
-            .map(Bytes::from)
-            .map_err(|error| {
-                StorageError::Corruption(format!("immutable value decompression failed: {error}"))
-            }),
-        other => Err(StorageError::Corruption(format!(
-            "immutable value encoding {other} is unknown"
-        ))),
+    let payload = value.slice(header_len..);
+    if payload.len() != value_len {
+        return Err(StorageError::Corruption(format!(
+            "immutable raw value length {} does not match declared length {value_len}",
+            payload.len()
+        )));
     }
+    Ok(payload)
 }
 
 #[derive(Clone)]
@@ -2368,7 +2335,7 @@ impl Storage for SlateDB {
                 // The engine sets this only for the atomic mutation plus
                 // idempotency-receipt commit. Its replay contract requires a
                 // durable receipt before the request can be acknowledged.
-                await_durable: opts.idempotency_key.is_some(),
+                await_durable: opts.await_durable || opts.idempotency_key.is_some(),
                 base: None,
                 overlay: BTreeMap::new(),
                 immutable_values: BTreeMap::new(),
@@ -4469,27 +4436,20 @@ mod tests {
     }
 
     #[test]
-    fn immutable_value_envelope_roundtrips_and_rejects_oversized_lengths() {
-        let compressible = Bytes::from(vec![0x44; 1024 * 1024]);
-        let encoded = encode_immutable_value(compressible.clone()).expect("encode immutable value");
+    fn immutable_value_envelope_is_raw_and_rejects_oversized_lengths() {
+        let payload = Bytes::from(vec![0x44; 1024 * 1024]);
+        let encoded = encode_immutable_value(payload.clone()).expect("encode immutable value");
         assert!(encoded.starts_with(IMMUTABLE_VALUE_MAGIC));
-        assert_eq!(encoded[IMMUTABLE_VALUE_MAGIC.len()], IMMUTABLE_VALUE_ZSTD);
+        assert_eq!(
+            encoded.len(),
+            IMMUTABLE_VALUE_MAGIC.len() + size_of::<u64>() + payload.len()
+        );
         assert_eq!(
             decode_immutable_value(encoded).expect("decode immutable value"),
-            compressible
-        );
-
-        let raw = Bytes::from_static(b"LIXICV3\0already compact bytes");
-        let encoded = encode_immutable_value(raw.clone()).expect("encode compact immutable value");
-        assert!(encoded.starts_with(IMMUTABLE_VALUE_MAGIC));
-        assert_eq!(encoded[IMMUTABLE_VALUE_MAGIC.len()], IMMUTABLE_VALUE_RAW);
-        assert_eq!(
-            decode_immutable_value(encoded).expect("decode compact immutable value"),
-            raw
+            payload
         );
 
         let mut oversized = Vec::from(IMMUTABLE_VALUE_MAGIC.as_slice());
-        oversized.push(IMMUTABLE_VALUE_ZSTD);
         oversized
             .extend_from_slice(&((IMMUTABLE_VALUE_MAX_ENCODED_BYTES as u64) + 1).to_le_bytes());
         oversized.push(0);
@@ -4866,10 +4826,9 @@ mod tests {
         let stored_bytes = std::fs::read(&stored_path).expect("read immutable chunk object");
         assert!(stored_bytes.starts_with(IMMUTABLE_VALUE_MAGIC));
         assert_eq!(
-            stored_bytes[IMMUTABLE_VALUE_MAGIC.len()],
-            IMMUTABLE_VALUE_ZSTD
+            stored_bytes.len(),
+            IMMUTABLE_VALUE_MAGIC.len() + size_of::<u64>() + value.len()
         );
-        assert!(stored_bytes.len() < value.len());
         assert_eq!(
             std::fs::read_dir(&immutable_directory)
                 .expect("list immutable segments")
@@ -6272,6 +6231,54 @@ mod tests {
             .values,
             vec![Some(ProjectedValue::FullValue(value))]
         );
+    }
+
+    #[test]
+    fn await_durable_write_does_not_acknowledge_a_blocked_wal_upload() {
+        let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
+        let storage = SlateDB::open_object_store_with_options(
+            "test-await-durable-write",
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open await-durable storage");
+        let blocked_write = store.block_next_write();
+        let committer_storage = storage.clone();
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let committer = std::thread::spawn(move || {
+            let mut write = block_on(committer_storage.begin_write(WriteOptions {
+                await_durable: true,
+                ..WriteOptions::default()
+            }))
+            .expect("begin await-durable write");
+            block_on(write.put_many(
+                SpaceId(8),
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: Key(Bytes::from_static(b"durable-before-ack")),
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"value"),
+                        },
+                    }],
+                },
+            ))
+            .expect("stage await-durable row");
+            commit_tx
+                .send(block_on(write.commit()))
+                .expect("send await-durable result");
+        });
+
+        blocked_write.wait_for_entries(1, "await-durable SlateDB WAL write");
+        assert!(
+            commit_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "durable write must not acknowledge before its WAL upload completes",
+        );
+        drop(blocked_write);
+        commit_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("durable write should finish after WAL upload")
+            .expect("await-durable commit");
+        committer.join().expect("join await-durable committer");
     }
 
     #[test]
