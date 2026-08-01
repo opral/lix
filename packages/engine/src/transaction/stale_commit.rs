@@ -16,6 +16,17 @@ pub(super) enum StaleCommitPlan {
     Unsafe,
 }
 
+impl StaleCommitPlan {
+    pub(super) const fn kind(&self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::RevalidateOrdinaryInsert => "revalidate_ordinary_insert",
+            Self::ReconcilePlugin(_) => "reconcile_plugin",
+            Self::Unsafe => "unsafe",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct StalePluginReconciliationPlan {
     pub(super) semantic_conflict_indices: Vec<usize>,

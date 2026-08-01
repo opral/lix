@@ -3768,6 +3768,9 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use http_body_util::BodyExt as _;
+    use lix_collaboration_test_support::{
+        CapacityConfig, CollaborationCapacityBackend, WavePlan, run_capacity_workload,
+    };
     use lix_sdk::{
         Blob, CommitResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite, OpenLixOptions,
         PutBatch, ReadOptions, RequestBlobSpliceProvenance, SpaceId, StorageError, StorageWrite,
@@ -3777,6 +3780,7 @@ mod tests {
     use object_store::memory::InMemory as ObjectStoreMemory;
     use serde_json::{Value as JsonValue, json};
     use std::{
+        collections::BTreeMap,
         io::{Cursor, Read as _, Write as _},
         path::Path,
         sync::{Arc, Mutex, atomic::AtomicBool},
@@ -7054,100 +7058,126 @@ mod tests {
         assert_eq!(converged_rows[0], converged_rows[1]);
     }
 
-    #[tokio::test]
-    #[ignore = "manual release-mode remote commit-to-observation capacity gate"]
-    async fn remote_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95() {
-        const CLIENTS: usize = 100;
-        const OPERATIONS: usize = 100;
-        const WAVE_SIZE: usize = 5;
-        const ARRIVAL_INTERVAL: Duration = Duration::from_millis(50);
-        const GATE: Duration = Duration::from_millis(100);
+    struct RemoteCapacityBackend {
+        app: TestApp,
+        path: &'static str,
+        sessions: Vec<String>,
+        observations: Vec<TestSseStream>,
+    }
 
-        let app = app_with_options(ProtocolServerOptions {
-            max_sessions: 128,
-            ..ProtocolServerOptions::default()
-        })
-        .await;
-        let root = &app.server.inner.root;
-        root.execute(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-            &[
-                Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
-                Value::Blob(build_json_plugin_archive().into()),
-            ],
-        )
-        .await
-        .expect("JSON plugin should install");
-        let path = "/remote-collaboration-capacity.json";
-        let base = (0..=OPERATIONS)
-            .map(|slot| (format!("k{slot}"), JsonValue::String("base".into())))
-            .collect::<serde_json::Map<_, _>>();
-        root.execute(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-            &[
-                Value::Text(path.to_owned()),
-                Value::Blob(serde_json::to_vec(&base).unwrap().into()),
-            ],
-        )
-        .await
-        .expect("capacity document should import");
-
-        let mut sessions = Vec::with_capacity(CLIENTS);
-        let mut observations = Vec::with_capacity(CLIENTS);
-        for _ in 0..CLIENTS {
-            let (session_id, _) = new_session(&app.router).await;
-            let response = request(
-                &app.router,
-                "POST",
-                "/lix/v1/observe",
-                Some(&session_id),
-                Some(json!({
-                    "sql": "SELECT data FROM lix_file WHERE path = $1",
-                    "params": [{ "kind": "text", "value": path }]
-                })),
-            )
+    impl RemoteCapacityBackend {
+        async fn open(clients: usize, operations: usize) -> Self {
+            let app = app_with_options(ProtocolServerOptions {
+                max_sessions: 128,
+                ..ProtocolServerOptions::default()
+            })
             .await;
-            let mut stream = TestSseStream::new(response);
-            let initial = stream.next().await;
-            assert_eq!(initial["sequence"].as_u64(), Some(0));
-            sessions.push(session_id);
-            observations.push(stream);
+            let root = &app.server.inner.root;
+            root.execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                &[
+                    Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
+                    Value::Blob(build_json_plugin_archive().into()),
+                ],
+            )
+            .await
+            .expect("JSON plugin should install");
+            let path = "/remote-collaboration-capacity.json";
+            let base = (0..=operations)
+                .map(|slot| (format!("k{slot}"), JsonValue::String("base".into())))
+                .collect::<serde_json::Map<_, _>>();
+            root.execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                &[
+                    Value::Text(path.to_owned()),
+                    Value::Blob(serde_json::to_vec(&base).unwrap().into()),
+                ],
+            )
+            .await
+            .expect("capacity document should import");
+
+            let mut sessions = Vec::with_capacity(clients);
+            let mut observations = Vec::with_capacity(clients);
+            for _ in 0..clients {
+                let (session_id, _) = new_session(&app.router).await;
+                let response = request(
+                    &app.router,
+                    "POST",
+                    "/lix/v1/observe",
+                    Some(&session_id),
+                    Some(json!({
+                        "sql": "SELECT data FROM lix_file WHERE path = $1",
+                        "params": [{ "kind": "text", "value": path }]
+                    })),
+                )
+                .await;
+                let mut stream = TestSseStream::new(response);
+                let initial = stream.next().await;
+                assert_eq!(initial["sequence"].as_u64(), Some(0));
+                sessions.push(session_id);
+                observations.push(stream);
+            }
+            root.reset_plugin_transition_counters();
+            Self {
+                app,
+                path,
+                sessions,
+                observations,
+            }
         }
 
-        let mut convergence_latencies = Vec::with_capacity(CLIENTS * OPERATIONS / WAVE_SIZE);
-        let mut service_latencies = Vec::with_capacity(OPERATIONS);
-        let mut schedule_lags = Vec::with_capacity(OPERATIONS / WAVE_SIZE);
-        let schedule_origin = Instant::now() + ARRIVAL_INTERVAL;
-        root.reset_plugin_transition_counters();
-        for wave in 0..OPERATIONS / WAVE_SIZE {
-            let current = root
+        async fn close(mut self) {
+            self.observations.clear();
+            self.app
+                .server
+                .close()
+                .await
+                .expect("capacity server should close");
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl CollaborationCapacityBackend for RemoteCapacityBackend {
+        type StagedWave = Vec<(String, String)>;
+
+        fn backend_name(&self) -> &'static str {
+            "server_protocol_in_process"
+        }
+
+        fn format_name(&self) -> &'static str {
+            "json"
+        }
+
+        async fn read_base(&self) -> Vec<u8> {
+            self.app
+                .server
+                .inner
+                .root
                 .execute(
                     "SELECT data FROM lix_file WHERE path = $1",
-                    &[Value::Text(path.to_owned())],
+                    &[Value::Text(self.path.to_owned())],
                 )
                 .await
                 .expect("wave base should read")
                 .rows()[0]
                 .get::<Vec<u8>>("data")
-                .expect("wave base should be bytes");
-            let current = serde_json::from_slice::<serde_json::Map<String, JsonValue>>(&current)
+                .expect("wave base should be bytes")
+        }
+
+        async fn stage_wave(&mut self, wave: &WavePlan, base: &[u8]) -> Self::StagedWave {
+            let current = serde_json::from_slice::<serde_json::Map<String, JsonValue>>(base)
                 .expect("wave base should parse");
-            let mut capabilities = Vec::with_capacity(WAVE_SIZE);
-            let mut marker = String::new();
-            for participant in 0..WAVE_SIZE {
-                let operation = wave * WAVE_SIZE + participant;
-                let conflict = wave.is_multiple_of(4) && participant < 2;
-                let slot = if conflict { 0 } else { operation + 1 };
-                let token = format!("wave-{wave}-client-{operation}");
-                if participant == WAVE_SIZE - 1 {
-                    marker.clone_from(&token);
-                }
-                let mut edit = current.clone();
-                edit.insert(format!("k{slot}"), JsonValue::String(token));
-                let session_id = &sessions[operation % CLIENTS];
-                let transaction_id = begin_remote_transaction(&app.router, session_id).await;
+            let mut capabilities = Vec::with_capacity(wave.edits.len());
+            for edit in &wave.edits {
+                let mut document = current.clone();
+                document.insert(
+                    format!("k{}", edit.slot),
+                    JsonValue::String(edit.token.clone()),
+                );
+                let session_id = &self.sessions[edit.operation % self.sessions.len()];
+                let transaction_id = begin_remote_transaction(&self.app.router, session_id).await;
                 let staged = remote_transaction_request(
-                    &app.router,
+                    &self.app.router,
                     "POST",
                     "/lix/v1/transaction/execute",
                     session_id,
@@ -7157,9 +7187,9 @@ mod tests {
                         "params": [
                             {
                                 "kind": "blob",
-                                "base64": BASE64_STANDARD.encode(serde_json::to_vec(&edit).unwrap())
+                                "base64": BASE64_STANDARD.encode(serde_json::to_vec(&document).unwrap())
                             },
-                            { "kind": "text", "value": path }
+                            { "kind": "text", "value": self.path }
                         ]
                     })),
                 )
@@ -7167,15 +7197,14 @@ mod tests {
                 assert_eq!(staged.status(), StatusCode::OK);
                 capabilities.push((session_id.clone(), transaction_id));
             }
+            capabilities
+        }
 
-            let wave_started = schedule_origin
-                + ARRIVAL_INTERVAL.saturating_mul(u32::try_from(wave).expect("wave fits u32"));
-            tokio::time::sleep_until(tokio::time::Instant::from_std(wave_started)).await;
-            schedule_lags.push(wave_started.elapsed());
-            let marker_capability = capabilities.pop().expect("marker capability");
+        async fn commit_wave(&mut self, mut staged: Self::StagedWave) -> Vec<Duration> {
+            let marker_capability = staged.pop().expect("marker capability");
             let mut commits = tokio::task::JoinSet::new();
-            for (session_id, transaction_id) in capabilities {
-                let router = app.router.clone();
+            for (session_id, transaction_id) in staged {
+                let router = self.app.router.clone();
                 commits.spawn(async move {
                     let started = Instant::now();
                     let response = remote_transaction_request(
@@ -7190,14 +7219,15 @@ mod tests {
                     (started.elapsed(), response.status())
                 });
             }
+            let mut services = Vec::with_capacity(5);
             while let Some(joined) = commits.join_next().await {
                 let (elapsed, status) = joined.expect("remote commit task should not panic");
                 assert_eq!(status, StatusCode::NO_CONTENT);
-                service_latencies.push(elapsed);
+                services.push(elapsed);
             }
             let marker_started = Instant::now();
             let marker_response = remote_transaction_request(
-                &app.router,
+                &self.app.router,
                 "POST",
                 "/lix/v1/transaction/commit",
                 &marker_capability.0,
@@ -7206,9 +7236,18 @@ mod tests {
             )
             .await;
             assert_eq!(marker_response.status(), StatusCode::NO_CONTENT);
-            service_latencies.push(marker_started.elapsed());
+            services.push(marker_started.elapsed());
+            services
+        }
 
-            let marker = marker.into_bytes();
+        async fn await_convergence(
+            &mut self,
+            marker: &[u8],
+            wave_started: Instant,
+        ) -> Vec<Duration> {
+            let observations = std::mem::take(&mut self.observations);
+            let clients = self.sessions.len();
+            let marker = marker.to_vec();
             let mut deliveries = tokio::task::JoinSet::new();
             for mut stream in observations {
                 let marker = marker.clone();
@@ -7227,46 +7266,112 @@ mod tests {
                     }
                 });
             }
-            observations = Vec::with_capacity(CLIENTS);
+            let mut convergences = Vec::with_capacity(clients);
             while let Some(joined) = deliveries.join_next().await {
                 let (stream, elapsed) = joined.expect("delivery task should not panic");
-                observations.push(stream);
-                convergence_latencies.push(elapsed);
+                self.observations.push(stream);
+                convergences.push(elapsed);
+            }
+            convergences
+        }
+
+        async fn assert_final_state(&self, expected_tokens: &[String]) {
+            let final_bytes = self.read_base().await;
+            for token in expected_tokens {
+                assert!(
+                    final_bytes
+                        .windows(token.len())
+                        .any(|window| window == token.as_bytes()),
+                    "non-overlapping edit {token} was not retained"
+                );
+            }
+            for session_id in &self.sessions {
+                let response = request(
+                    &self.app.router,
+                    "POST",
+                    "/lix/v1/execute",
+                    Some(session_id),
+                    Some(json!({
+                        "sql": "SELECT data FROM lix_file WHERE path = $1",
+                        "params": [{ "kind": "text", "value": self.path }]
+                    })),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response_json(response).await;
+                let encoded = body["rows"][0][0]["base64"]
+                    .as_str()
+                    .expect("final remote file should be bytes");
+                assert_eq!(
+                    BASE64_STANDARD.decode(encoded).expect("final blob decodes"),
+                    final_bytes
+                );
             }
         }
 
-        service_latencies.sort_unstable();
-        convergence_latencies.sort_unstable();
-        schedule_lags.sort_unstable();
-        let service_p95 = service_latencies[(service_latencies.len() * 95)
-            .div_ceil(100)
-            .saturating_sub(1)];
-        let convergence_p95 = convergence_latencies[(convergence_latencies.len() * 95)
-            .div_ceil(100)
-            .saturating_sub(1)];
-        let schedule_lag_p95 =
-            schedule_lags[(schedule_lags.len() * 95).div_ceil(100).saturating_sub(1)];
-        eprintln!(
-            "remote_collaboration_capacity clients={CLIENTS} operations={OPERATIONS} \
-             wave_size={WAVE_SIZE} arrival_ms={} overlap_percent=10 service_p95_ms={:.3} \
-             convergence_p95_ms={:.3} schedule_lag_p95_ms={:.3} resolver_calls={}",
-            ARRIVAL_INTERVAL.as_millis(),
-            service_p95.as_secs_f64() * 1_000.0,
-            convergence_p95.as_secs_f64() * 1_000.0,
-            schedule_lag_p95.as_secs_f64() * 1_000.0,
-            root.plugin_transition_counters().conflict_resolution_calls,
+        fn resolver_calls(&self) -> u64 {
+            self.app
+                .server
+                .inner
+                .root
+                .plugin_transition_counters()
+                .conflict_resolution_calls
+        }
+
+        fn resource_counters(&self) -> BTreeMap<String, u64> {
+            BTreeMap::from([
+                ("protocol_sessions".to_owned(), self.sessions.len() as u64),
+                (
+                    "open_observations".to_owned(),
+                    self.observations.len() as u64,
+                ),
+            ])
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "manual release-mode remote commit-to-observation capacity gate"]
+    async fn remote_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95() {
+        const WAVE_SIZE: usize = 5;
+        let clients = capacity_env_usize("LIX_COLLAB_CLIENTS", 100);
+        let operations = capacity_env_usize("LIX_COLLAB_OPERATIONS", 100);
+        let arrival_interval = Duration::from_millis(
+            capacity_env_usize("LIX_COLLAB_ARRIVAL_MS", 50)
+                .try_into()
+                .expect("arrival interval fits u64"),
         );
-        assert!(root.plugin_transition_counters().conflict_resolution_calls > 0);
-        assert!(
-            convergence_p95 < GATE,
-            "remote commit-to-convergence p95 was {:.3} ms",
-            convergence_p95.as_secs_f64() * 1_000.0
+        let gate = Duration::from_millis(
+            capacity_env_usize("LIX_COLLAB_GATE_MS", 100)
+                .try_into()
+                .expect("gate fits u64"),
         );
-        drop(observations);
-        app.server
-            .close()
-            .await
-            .expect("capacity server should close");
+        assert!((50..=100).contains(&clients));
+        let mut backend = RemoteCapacityBackend::open(clients, operations).await;
+        let report = run_capacity_workload(
+            &mut backend,
+            CapacityConfig {
+                clients,
+                operations,
+                wave_size: WAVE_SIZE,
+                conflict_wave_interval: 4,
+                arrival_interval,
+                convergence_gate: gate,
+            },
+        )
+        .await;
+        report.emit_json();
+        backend.close().await;
+    }
+
+    fn capacity_env_usize(key: &str, default: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .map(|value| {
+                value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{key} should be numeric"))
+            })
+            .unwrap_or(default)
     }
 
     #[tokio::test]

@@ -5,12 +5,18 @@
 //! concurrently and a fifth same-base marker edit closes the wave. Every live
 //! client must observe that marker before the wave has converged.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Cursor, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use lix_sdk::{Lix, OpenLixOptions, Storage, Value, open_lix};
+use async_trait::async_trait;
+use lix_collaboration_test_support::{
+    CapacityConfig, CollaborationCapacityBackend, WavePlan, run_capacity_workload,
+};
+use lix_engine::ObserveEvents;
+use lix_sdk::{Lix, LixTransaction, Memory, OpenLixOptions, Storage, Value, open_lix};
 
 const DEFAULT_CLIENTS: usize = 100;
 const WAVE_SIZE: usize = 5;
@@ -148,60 +154,103 @@ async fn realtime_collaboration_commit_to_convergence_capacity() {
     );
     assert!(operations >= WAVE_SIZE && operations.is_multiple_of(WAVE_SIZE));
 
-    let lix = open_lix(OpenLixOptions::default())
-        .await
-        .expect("capacity workspace should open");
-    install_plugin(&lix, format.plugin_key(), &format.plugin_archive()).await;
-    let path = format!("/collaboration-capacity.{}", format.extension());
-    write_file(&lix, &path, &format.base_document(operations + 1)).await;
+    let mut backend = LocalCapacityBackend::open(format, clients, operations).await;
+    let report = run_capacity_workload(
+        &mut backend,
+        CapacityConfig {
+            clients,
+            operations,
+            wave_size: WAVE_SIZE,
+            conflict_wave_interval: CONFLICT_WAVE_INTERVAL,
+            arrival_interval,
+            convergence_gate: gate,
+        },
+    )
+    .await;
+    report.emit_json();
+    backend.close().await;
+}
 
-    let mut peers = Vec::with_capacity(clients);
-    let mut observations = Vec::with_capacity(clients);
-    for _ in 0..clients {
-        let peer = lix
-            .open_workspace_session()
+struct LocalCapacityBackend {
+    format: DocumentFormat,
+    path: String,
+    root: Lix<Memory>,
+    peers: Vec<Lix<Memory>>,
+    observations: Vec<ObserveEvents<Memory>>,
+}
+
+impl LocalCapacityBackend {
+    async fn open(format: DocumentFormat, clients: usize, operations: usize) -> Self {
+        let root = open_lix(OpenLixOptions::default())
             .await
-            .expect("collaborator session should open");
-        let mut events = peer
-            .observe(
-                "SELECT data FROM lix_file WHERE path = $1",
-                &[Value::Text(path.clone())],
-            )
-            .expect("collaborator observation should open");
-        events
-            .next()
-            .await
-            .expect("initial observation should evaluate")
-            .expect("initial observation should stay open");
-        peers.push(peer);
-        observations.push(events);
+            .expect("capacity workspace should open");
+        install_plugin(&root, format.plugin_key(), &format.plugin_archive()).await;
+        let path = format!("/collaboration-capacity.{}", format.extension());
+        write_file(&root, &path, &format.base_document(operations + 1)).await;
+
+        let mut peers = Vec::with_capacity(clients);
+        let mut observations = Vec::with_capacity(clients);
+        for _ in 0..clients {
+            let peer = root
+                .open_workspace_session()
+                .await
+                .expect("collaborator session should open");
+            let mut events = peer
+                .observe(
+                    "SELECT data FROM lix_file WHERE path = $1",
+                    &[Value::Text(path.clone())],
+                )
+                .expect("collaborator observation should open");
+            events
+                .next()
+                .await
+                .expect("initial observation should evaluate")
+                .expect("initial observation should stay open");
+            peers.push(peer);
+            observations.push(events);
+        }
+        root.reset_plugin_transition_counters();
+        Self {
+            format,
+            path,
+            root,
+            peers,
+            observations,
+        }
     }
 
-    lix.reset_plugin_transition_counters();
-    let mut service_latencies = Vec::with_capacity(operations);
-    let mut convergence_latencies = Vec::with_capacity(clients * operations / WAVE_SIZE);
-    let mut wave_latencies = Vec::with_capacity(operations / WAVE_SIZE);
-    let mut schedule_lags = Vec::with_capacity(operations / WAVE_SIZE);
-    let mut expected_tokens = Vec::with_capacity(operations);
-    let run_started = Instant::now();
-    let schedule_origin = run_started + arrival_interval;
+    async fn close(mut self) {
+        self.observations.clear();
+        for peer in self.peers {
+            peer.close().await.expect("collaborator should close");
+        }
+        self.root
+            .close()
+            .await
+            .expect("capacity workspace should close");
+    }
+}
 
-    for wave in 0..operations / WAVE_SIZE {
-        let base = read_file(&lix, &path).await;
-        let mut transactions = Vec::with_capacity(WAVE_SIZE);
-        let mut marker = String::new();
-        for participant in 0..WAVE_SIZE {
-            let operation = wave * WAVE_SIZE + participant;
-            let conflict = wave.is_multiple_of(CONFLICT_WAVE_INTERVAL) && participant < 2;
-            let slot = if conflict { 0 } else { operation + 1 };
-            let token = format!("wave-{wave}-client-{operation}");
-            if !conflict {
-                expected_tokens.push(token.clone());
-            }
-            if participant == WAVE_SIZE - 1 {
-                marker.clone_from(&token);
-            }
-            let mut transaction = peers[operation % clients]
+#[async_trait(?Send)]
+impl CollaborationCapacityBackend for LocalCapacityBackend {
+    type StagedWave = Vec<LixTransaction<Memory>>;
+
+    fn backend_name(&self) -> &'static str {
+        "local"
+    }
+
+    fn format_name(&self) -> &'static str {
+        self.format.name()
+    }
+
+    async fn read_base(&self) -> Vec<u8> {
+        read_file(&self.root, &self.path).await
+    }
+
+    async fn stage_wave(&mut self, wave: &WavePlan, base: &[u8]) -> Self::StagedWave {
+        let mut transactions = Vec::with_capacity(wave.edits.len());
+        for edit in &wave.edits {
+            let mut transaction = self.peers[edit.operation % self.peers.len()]
                 .begin_transaction()
                 .await
                 .expect("wave transaction should open");
@@ -209,28 +258,26 @@ async fn realtime_collaboration_commit_to_convergence_capacity() {
                 .execute(
                     "UPDATE lix_file SET data = $1 WHERE path = $2",
                     &[
-                        Value::Blob(format.edit(&base, slot, &token).into()),
-                        Value::Text(path.clone()),
+                        Value::Blob(self.format.edit(base, edit.slot, &edit.token).into()),
+                        Value::Text(self.path.clone()),
                     ],
                 )
                 .await
                 .expect("wave edit should stage");
             transactions.push(transaction);
         }
+        transactions
+    }
 
-        let wave_started = schedule_origin
-            + arrival_interval.saturating_mul(u32::try_from(wave).expect("wave fits u32"));
-        tokio::time::sleep_until(tokio::time::Instant::from_std(wave_started)).await;
-        schedule_lags.push(wave_started.elapsed());
-        let wave_marker = marker.into_bytes();
+    async fn commit_wave(&mut self, mut staged: Self::StagedWave) -> Vec<Duration> {
+        let marker_transaction = staged
+            .pop()
+            .expect("wave should contain marker transaction");
         let local = tokio::task::LocalSet::new();
-        let wave_result = local
+        local
             .run_until(async move {
-                let marker_transaction = transactions
-                    .pop()
-                    .expect("wave should contain marker transaction");
                 let mut commit_tasks = tokio::task::JoinSet::new();
-                for transaction in transactions {
+                for transaction in staged {
                     commit_tasks.spawn_local(async move {
                         let started = Instant::now();
                         let result = transaction.commit().await;
@@ -249,14 +296,24 @@ async fn realtime_collaboration_commit_to_convergence_capacity() {
                     .await
                     .expect("same-base marker edit should commit");
                 services.push(marker_started.elapsed());
+                services
+            })
+            .await
+    }
 
-                // A Lix session deliberately rejects reads while its explicit
-                // transaction is active. Start client delivery immediately
-                // after every transaction in the wave reaches a terminal
-                // state; the wall clock still begins before commit scheduling.
+    async fn await_convergence(&mut self, marker: &[u8], wave_started: Instant) -> Vec<Duration> {
+        // A Lix session deliberately rejects reads while its explicit
+        // transaction is active. Delivery begins as soon as the wave reaches
+        // terminal commit states; the clock still starts at scheduled arrival.
+        let observations = std::mem::take(&mut self.observations);
+        let clients = self.peers.len();
+        let marker = marker.to_vec();
+        let local = tokio::task::LocalSet::new();
+        let (next_observations, convergences) = local
+            .run_until(async move {
                 let mut observer_tasks = tokio::task::JoinSet::new();
                 for mut events in observations {
-                    let marker = wave_marker.clone();
+                    let marker = marker.clone();
                     observer_tasks.spawn_local(async move {
                         loop {
                             let event = tokio::time::timeout(OBSERVE_TIMEOUT, events.next())
@@ -280,78 +337,43 @@ async fn realtime_collaboration_commit_to_convergence_capacity() {
                     next_observations.push(events);
                     convergences.push(elapsed);
                 }
-                (next_observations, services, convergences)
+                (next_observations, convergences)
             })
             .await;
-        observations = wave_result.0;
-        service_latencies.extend(wave_result.1);
-        convergence_latencies.extend(wave_result.2.iter().copied());
-        wave_latencies.push(
-            wave_result
-                .2
-                .into_iter()
-                .max()
-                .expect("wave should have convergence samples"),
-        );
+        self.observations = next_observations;
+        convergences
     }
 
-    let final_bytes = read_file(&lix, &path).await;
-    for token in &expected_tokens {
-        assert!(
-            final_bytes
-                .windows(token.len())
-                .any(|window| window == token.as_bytes()),
-            "non-overlapping edit {token} was not retained"
-        );
+    async fn assert_final_state(&self, expected_tokens: &[String]) {
+        let final_bytes = read_file(&self.root, &self.path).await;
+        for token in expected_tokens {
+            assert!(
+                final_bytes
+                    .windows(token.len())
+                    .any(|window| window == token.as_bytes()),
+                "non-overlapping edit {token} was not retained"
+            );
+        }
+        for peer in &self.peers {
+            assert_eq!(read_file(peer, &self.path).await, final_bytes);
+        }
     }
-    for peer in &peers {
-        assert_eq!(read_file(peer, &path).await, final_bytes);
-    }
-    let counters = lix.plugin_transition_counters();
-    assert!(
-        counters.conflict_resolution_calls > 0,
-        "10% overlap workload must invoke the plugin resolver"
-    );
 
-    service_latencies.sort_unstable();
-    convergence_latencies.sort_unstable();
-    wave_latencies.sort_unstable();
-    schedule_lags.sort_unstable();
-    let service_p95 = percentile(&service_latencies, 95);
-    let convergence_p50 = percentile(&convergence_latencies, 50);
-    let convergence_p95 = percentile(&convergence_latencies, 95);
-    let convergence_p99 = percentile(&convergence_latencies, 99);
-    let wave_p95 = percentile(&wave_latencies, 95);
-    let schedule_lag_p95 = percentile(&schedule_lags, 95);
-    eprintln!(
-        "realtime_collaboration_capacity format={} clients={clients} operations={operations} \
-         wave_size={WAVE_SIZE} arrival_ms={:.3} overlap_percent=10 service_p95_ms={:.3} \
-         convergence_p50_ms={:.3} convergence_p95_ms={:.3} convergence_p99_ms={:.3} \
-         wave_p95_ms={:.3} schedule_lag_p95_ms={:.3} total_ms={:.3} resolver_calls={}",
-        format.name(),
-        millis(arrival_interval),
-        millis(service_p95),
-        millis(convergence_p50),
-        millis(convergence_p95),
-        millis(convergence_p99),
-        millis(wave_p95),
-        millis(schedule_lag_p95),
-        millis(run_started.elapsed()),
-        counters.conflict_resolution_calls,
-    );
-    assert!(
-        convergence_p95 < gate,
-        "{} {clients}-client commit-to-convergence p95 {:.3} ms exceeded {:.3} ms",
-        format.name(),
-        millis(convergence_p95),
-        millis(gate),
-    );
-
-    drop(observations);
-    for peer in peers {
-        peer.close().await.expect("collaborator should close");
+    fn resolver_calls(&self) -> u64 {
+        self.root
+            .plugin_transition_counters()
+            .conflict_resolution_calls
     }
-    lix.close().await.expect("capacity workspace should close");
+
+    fn resource_counters(&self) -> BTreeMap<String, u64> {
+        BTreeMap::from([
+            ("open_peer_sessions".to_owned(), self.peers.len() as u64),
+            (
+                "open_observations".to_owned(),
+                self.observations.len() as u64,
+            ),
+        ])
+    }
 }
 
 #[tokio::test]
@@ -421,11 +443,24 @@ async fn abandoned_transactions_and_sessions_release_resources() {
     let final_rss = resident_set_bytes();
     let warm_rss = warm_rss.expect("warmup RSS should be captured");
     let growth = final_rss.saturating_sub(warm_rss);
-    eprintln!(
-        "realtime_collaboration_soak clients={clients} rounds={rounds} abandoned_transactions={} \
-         warm_rss_bytes={warm_rss} peak_rss_bytes={peak_rss} final_rss_bytes={final_rss} \
-         post_warmup_growth_bytes={growth} growth_limit_bytes={rss_limit}",
-        clients * rounds,
+    let abandoned_transactions = clients * rounds;
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": "lix.collaboration-soak.v1",
+            "clients_per_round": clients,
+            "rounds": rounds,
+            "sessions_opened": abandoned_transactions,
+            "sessions_closed": abandoned_transactions,
+            "transactions_staged": abandoned_transactions,
+            "transactions_abandoned": abandoned_transactions,
+            "staged_writes_visible": 0,
+            "warm_rss_bytes": warm_rss,
+            "peak_rss_bytes": peak_rss,
+            "final_rss_bytes": final_rss,
+            "post_warmup_growth_bytes": growth,
+            "growth_limit_bytes": rss_limit,
+        })
     );
     assert!(
         growth <= rss_limit,
@@ -443,15 +478,6 @@ fn env_usize(key: &str, default: usize) -> usize {
                 .unwrap_or_else(|_| panic!("{key} should be numeric"))
         })
         .unwrap_or(default)
-}
-
-fn percentile(samples: &[Duration], percentile: usize) -> Duration {
-    assert!(!samples.is_empty());
-    samples[(samples.len() * percentile).div_ceil(100).saturating_sub(1)]
-}
-
-fn millis(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1_000.0
 }
 
 fn resident_set_bytes() -> u64 {
