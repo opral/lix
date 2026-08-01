@@ -77,6 +77,11 @@ JSON run on the stacked transaction changes was 16.420 ms. The receipt changes
 benchmark bookkeeping, not commit or observation semantics: every client still
 consumes its own event at or beyond the verified marker generation.
 
+Replacing split protocol lease/transaction flags with one RAII-owned activity
+state left the same server workload flat at 18.068 ms convergence p95 versus
+18.172 ms immediately before (-0.6%, within run variance). This cut is a
+cancellation-safety and maintainability change, not a throughput claim.
+
 ## Profile and change
 
 The first realistic run failed before producing a latency result. Same-file
