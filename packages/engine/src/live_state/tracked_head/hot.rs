@@ -8,7 +8,7 @@
 //! file-first row index.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -1242,6 +1242,18 @@ fn decode_certified_entity_batch_rows(
                 })
                 .collect::<BTreeSet<_>>()
         });
+    // Packet identities are arbitrary component tuples, so they cannot use the
+    // compact local-reference optimization above. Index the requested keys once
+    // instead of rescanning the entire filter for every decoded packet row.
+    let selected_packet_entity_pks =
+        (format != 1 && !request.filter.entity_pks.is_empty()).then(|| {
+            request
+                .filter
+                .entity_pks
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>()
+        });
     let page_count = input.u32()?;
     if !request.filter.schema_keys.is_empty()
         && !request
@@ -1311,6 +1323,7 @@ fn decode_certified_entity_batch_rows(
                 branch_id,
                 file_id,
                 request,
+                selected_packet_entity_pks.as_ref(),
                 needs_snapshot,
                 limit,
                 decoded_rows,
@@ -1452,6 +1465,7 @@ fn decode_certified_packet_rows(
     branch_id: &str,
     file_id: &str,
     request: &TrackedStateScanRequest,
+    selected_entity_pks: Option<&HashSet<EntityPk>>,
     needs_snapshot: bool,
     limit: Option<usize>,
     base_ordinal: u64,
@@ -1531,12 +1545,7 @@ fn decode_certified_packet_rows(
                 .schema_keys
                 .iter()
                 .any(|candidate| candidate == schema_key))
-            && (request.filter.entity_pks.is_empty()
-                || request
-                    .filter
-                    .entity_pks
-                    .iter()
-                    .any(|candidate| candidate == &entity_pk));
+            && selected_entity_pks.is_none_or(|selected| selected.contains(&entity_pk));
         if !selected {
             continue;
         }
