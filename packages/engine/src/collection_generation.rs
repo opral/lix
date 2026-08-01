@@ -20,6 +20,21 @@ pub(crate) struct CollectionScopeRef<'a> {
 pub(crate) struct CollectionGeneration {
     pub(crate) active_generation: CommitId,
     pub(crate) live_count: u64,
+    /// Present only while the active collection is exactly one certified,
+    /// ordered, tracked, unfiled generation with no incremental mutations.
+    pub(crate) ordered_identity_digest: Option<[u8; 32]>,
+}
+
+pub(crate) fn ordered_single_string_identity_digest<'a>(
+    entity_pks: impl IntoIterator<Item = &'a EntityPk>,
+) -> Option<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new();
+    for entity_pk in entity_pks {
+        let value = entity_pk.as_single_string().ok()?;
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    Some(*hasher.finalize().as_bytes())
 }
 
 pub(crate) fn collection_scope_key(scope: CollectionScopeRef<'_>) -> String {

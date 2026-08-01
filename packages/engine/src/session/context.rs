@@ -547,6 +547,8 @@ where
             Ok(value) => {
                 self.ensure_open()?;
                 let outcome = transaction.commit(&runtime_functions).await?;
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_crud_physical_writes(outcome.storage_stats);
                 drop(write_access);
                 self.observe_invalidation
                     .bump_if_storage_changed(&outcome.storage_stats);
@@ -623,7 +625,12 @@ where
     R: crate::storage_adapter::StorageRead + 'static,
 {
     async fn compiled_sql_catalog(&self) -> Result<Arc<CatalogSnapshot>, LixError> {
-        let revision = load_catalog_revision(&self.read_store).await?;
+        let revision = load_catalog_revision(&self.read_store)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.public_read.catalog_revision"
+            ))
+            .await?;
         let live_state = self.live_state();
         self.catalog_context
             .compiled_catalog_for_transaction_open(
@@ -707,7 +714,13 @@ where
     }
 
     async fn public_catalog(&self) -> Result<Arc<crate::sql2::PublicCatalog>, LixError> {
-        let catalog = self.compiled_sql_catalog().await?;
+        let catalog = self
+            .compiled_sql_catalog()
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.public_read.compiled_catalog"
+            ))
+            .await?;
         self.sql_planning_cache
             .public_catalog(catalog.fingerprint(), || Ok(catalog.schema_jsons()))
     }

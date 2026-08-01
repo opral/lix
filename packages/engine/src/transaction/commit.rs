@@ -69,11 +69,19 @@ fn compare_certified_predecessors(
 std::thread_local! {
     static ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn take_ordered_packed_current_base_publications() -> usize {
     ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| publications.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_complete_replacement_packed_current_base_publications() -> usize {
+    COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS
+        .with(|publications| publications.replace(0))
 }
 
 /// Commits prepared transaction rows into tracked history and unified current
@@ -2249,21 +2257,57 @@ async fn stage_tracked_head(
                         .change_id
                         .is_some_and(|change_id| change_id != ChangeId::default())
             });
-        let absence_guards = if can_publish_ordered_packed_current_base {
-            Vec::new()
-        } else {
-            let _span = tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.materialization.tracked_head.absence_guards"
-            )
-            .entered();
-            tracked_head_absence_guards(
-                state_rows,
-                insert_selection,
-                &root.branch_id,
-                certified_fresh_plugin_file_id,
-            )
-        };
+        let complete_replacement_schema = (state_rows.certified_complete_collection_replacement()
+            && ordered_addressable_commits.contains(&root.commit_id)
+            && !is_checkpoint_publication
+            && state_row_indices.len() >= PACKED_CURRENT_BASE_MIN_ROWS
+            && certified_fresh_plugin_file_id.is_none()
+            && !host_certified_live_increments.contains_key(&root.branch_id)
+            && staged.selected_change_batches.is_empty()
+            && selected_materialization.is_none()
+            && untracked_deltas.is_empty()
+            && engine_rows.is_empty()
+            && explicit_branch_targets.is_empty()
+            && state_row_indices.len() == state_rows.len()
+            && insert_selection.is_empty())
+        .then(|| state_rows.first())
+        .flatten()
+        .filter(|first| {
+            state_row_indices.iter().all(|&row_index| {
+                let row = state_rows.row(row_index);
+                row.schema_key == first.schema_key
+                    && row.branch_id.as_str() == root.branch_id
+                    && !row.global
+                    && !row.untracked
+                    && row.snapshot.is_some()
+                    && row.metadata.is_none()
+                    && row.file_id.is_none()
+                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                    && row.schema_key
+                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    && row.commit_id == Some(root.commit_id)
+                    && row
+                        .change_id
+                        .is_some_and(|change_id| change_id != ChangeId::default())
+            })
+        })
+        .map(|row| row.schema_key.as_str());
+        let absence_guards =
+            if can_publish_ordered_packed_current_base || complete_replacement_schema.is_some() {
+                Vec::new()
+            } else {
+                let _span = tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.absence_guards"
+                )
+                .entered();
+                tracked_head_absence_guards(
+                    state_rows,
+                    insert_selection,
+                    &root.branch_id,
+                    certified_fresh_plugin_file_id,
+                )
+            };
         let parent_generation = match (root.parent_commit_id, parent_control) {
             (_, Some(control)) if is_checkpoint_publication => Some(control.generation),
             (Some(parent_commit_id), Some(control))
@@ -2401,6 +2445,47 @@ async fn stage_tracked_head(
                     .iter()
                     .map(|&row_index| state_rows.row(row_index).schema_key.as_str()),
             );
+            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+            continue;
+        }
+        if let Some(schema_key) = complete_replacement_schema {
+            #[cfg(test)]
+            COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| {
+                publications.set(publications.get().saturating_add(1));
+            });
+            let generation = tracked_head
+                .writer(read, writes)
+                .stage_complete_collection_replacement_current_base(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    schema_key,
+                    state_row_indices.len(),
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_complete_collection_replacement_current_base"
+                ))
+                .await?;
+            if let Some(epoch) = working_diff_epoch {
+                let next_epoch = TrackedWorkingDiffEpoch {
+                    checkpoint_commit_id: epoch.checkpoint_commit_id,
+                    generation,
+                    coverage,
+                };
+                if next_epoch != epoch {
+                    stage_tracked_working_diff_epoch(writes, &root.branch_id, next_epoch)?;
+                }
+            }
+            let mut control = normal_branch_head_control(
+                root,
+                parent_control,
+                generation,
+                working_diff_checkpoint_commit_id,
+            )?;
+            control.note_schemas(std::iter::once(schema_key));
             insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
             continue;
         }

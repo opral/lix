@@ -373,7 +373,17 @@ pub(crate) async fn execute_write_logical_plan_value_batch<'a>(
         return Ok(None);
     }
     validate_write_parameter_count(&write_plan.plan, first.len())?;
-    super::bound_public_write::try_execute_entity_insert_value_batch(
+    if let Some(results) = super::bound_public_write::try_execute_entity_insert_value_batch(
+        ctx,
+        &write_plan.plan,
+        parameter_rows,
+    )
+    .await
+    .map_err(normalize_bound_public_write_error)?
+    {
+        return Ok(Some(results));
+    }
+    super::bound_public_write::try_execute_entity_update_value_batch(
         ctx,
         &write_plan.plan,
         parameter_rows,

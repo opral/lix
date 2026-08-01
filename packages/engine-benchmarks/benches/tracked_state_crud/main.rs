@@ -1,13 +1,113 @@
 #![allow(clippy::large_futures)]
 
 use std::time::{Duration, Instant};
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+use std::{
+    alloc::GlobalAlloc,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 use criterion::measurement::WallTime;
 use criterion::{BatchSize, BenchmarkGroup, Criterion, black_box, criterion_group, criterion_main};
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
 #[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+struct CountingAllocator;
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+static ALLOCATION_ACCOUNTING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let pointer = unsafe { mimalloc::MiMalloc.alloc(layout) };
+        if !pointer.is_null() {
+            record_allocation(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        unsafe { mimalloc::MiMalloc.dealloc(pointer, layout) };
+    }
+
+    unsafe fn realloc(
+        &self,
+        pointer: *mut u8,
+        layout: std::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        let replacement = unsafe { mimalloc::MiMalloc.realloc(pointer, layout, new_size) };
+        if !replacement.is_null() && new_size >= layout.size() {
+            record_allocation(new_size - layout.size());
+        }
+        replacement
+    }
+}
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+fn record_allocation(bytes: usize) {
+    if ALLOCATION_ACCOUNTING_ENABLED.load(Ordering::Relaxed) {
+        ALLOCATED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+fn reset_allocation_accounting() {
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    ALLOCATION_ACCOUNTING_ENABLED.store(
+        std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_ALLOCATION_BYTES").is_some(),
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(feature = "system-allocation-profiler")
+))]
+fn print_allocation_accounting(phase: &str) {
+    if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_ALLOCATION_BYTES").is_some() {
+        ALLOCATION_ACCOUNTING_ENABLED.store(false, Ordering::Relaxed);
+        println!(
+            "tracked_state_crud allocation phase: {phase} allocated_bytes={}",
+            ALLOCATED_BYTES.load(Ordering::Relaxed)
+        );
+    }
+}
+
+#[cfg(any(target_family = "wasm", feature = "system-allocation-profiler"))]
+fn reset_allocation_accounting() {}
+#[cfg(any(target_family = "wasm", feature = "system-allocation-profiler"))]
+fn print_allocation_accounting(_phase: &str) {}
 
 mod accounting;
 mod io_stats;
@@ -30,7 +130,26 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
         .build()
         .expect("create tokio runtime for tracked_state_crud benchmarks");
     if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE").is_some() {
-        let rows = fixture_rows(profile_row_count());
+        let row_count = profile_row_count();
+        if std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_LAYER").as_deref()
+            == Ok("sql_session_bound")
+            && std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS").is_none()
+        {
+            assert_eq!(
+                std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_OP").as_deref(),
+                Ok("update_all"),
+                "sql_session_bound only supports update_all"
+            );
+            profile_sql_session_bound_updates(
+                &runtime,
+                row_count,
+                READ_MANY_PK_COUNT.min(row_count),
+                profile_sample_count(),
+                profile_sql_session_storage(),
+            );
+            return;
+        }
+        let rows = fixture_rows(row_count);
         profile_operation(&runtime, &rows);
         return;
     }
@@ -48,6 +167,14 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
             bench_sql_session(c, &runtime, profile, &rows[..row_count], label);
         }
     }
+}
+
+fn profile_sample_count() -> usize {
+    std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&count| count > 0)
+        .unwrap_or(15)
 }
 
 fn init_perf_tracing() {
@@ -128,11 +255,7 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
         ),
     };
     let read_many_pk_count = profile_read_many_pk_count(operation, rows.len());
-    let sample_count = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_SAMPLES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&count| count > 0)
-        .unwrap_or(15);
+    let sample_count = profile_sample_count();
     let hot_repeats = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS")
         .ok()
         .map(|value| {
@@ -244,7 +367,7 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
             } else {
                 profile_sql_session_bound_updates(
                     runtime,
-                    rows,
+                    rows.len(),
                     read_many_pk_count,
                     sample_count,
                     profile,
@@ -341,8 +464,10 @@ fn profile_sql_session_storage() -> StorageProfile {
         Ok("rocksdb") | Err(_) => StorageProfile::RocksDB,
         #[cfg(feature = "slatedb")]
         Ok("slatedb") => StorageProfile::SlateDB,
+        #[cfg(feature = "slatedb")]
+        Ok("slatedb_remote") => StorageProfile::SlateDBRemoteObjectStore,
         Ok(other) => panic!(
-            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_STORAGE '{other}'; expected rocksdb, sqlite, or slatedb"
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_STORAGE '{other}'; expected rocksdb, sqlite, slatedb, or slatedb_remote"
         ),
     }
 }
@@ -353,8 +478,10 @@ fn profile_transaction_storage() -> StorageProfile {
         Ok("rocksdb") | Err(_) => StorageProfile::RocksDB,
         #[cfg(feature = "slatedb")]
         Ok("slatedb") => StorageProfile::SlateDB,
+        #[cfg(feature = "slatedb")]
+        Ok("slatedb_remote") => StorageProfile::SlateDBRemoteObjectStore,
         Ok(other) => panic!(
-            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_STORAGE '{other}'; expected rocksdb, sqlite, or slatedb"
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_STORAGE '{other}'; expected rocksdb, sqlite, slatedb, or slatedb_remote"
         ),
     }
 }
@@ -417,6 +544,7 @@ fn profile_hot_sql_session_operations(
         rows,
         read_many_pk_count,
     ));
+    let _ = lix_engine::storage_bench::take_entity_point_snapshot_cache_accounting();
     let start = Instant::now();
     let mut row_count = 0;
     for _ in 0..repeats {
@@ -431,6 +559,13 @@ fn profile_hot_sql_session_operations(
         repeats,
         elapsed / repeats_u32,
     );
+    if matches!(operation, TransactionBenchOp::ReadOneByPk) {
+        let cache = lix_engine::storage_bench::take_entity_point_snapshot_cache_accounting();
+        println!(
+            "tracked_state_crud point cache accounting: hits={} misses={}",
+            cache.hits, cache.misses
+        );
+    }
     black_box(row_count);
 }
 
@@ -469,6 +604,26 @@ fn profile_hot_sql_session_bound_updates(
     );
     black_box(row_count);
 }
+
+#[cfg(target_os = "linux")]
+fn maybe_print_profile_rss_phase(phase: &str) {
+    if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_RSS_PHASES").is_none() {
+        return;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").expect("read process status");
+    let rss = status
+        .lines()
+        .find(|line| line.starts_with("VmRSS:"))
+        .unwrap_or("VmRSS: unavailable");
+    let high_water = status
+        .lines()
+        .find(|line| line.starts_with("VmHWM:"))
+        .unwrap_or("VmHWM: unavailable");
+    println!("tracked_state_crud rss phase: {phase} {rss} {high_water}");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maybe_print_profile_rss_phase(_phase: &str) {}
 
 fn profile_hot_raw_sqlite_operations(
     rows: &[WorkloadRow],
@@ -729,30 +884,55 @@ fn profile_sql_session_operation(
 
 fn profile_sql_session_bound_updates(
     runtime: &tokio::runtime::Runtime,
-    rows: &[WorkloadRow],
+    row_count: usize,
     read_many_pk_count: usize,
     sample_count: usize,
     profile: StorageProfile,
 ) {
-    let bound_update_row_count = profile_bound_update_row_count(rows.len());
+    let bound_update_row_count = profile_bound_update_row_count(row_count);
     let spread = profile_bound_update_spread();
     let mut samples = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
-        let fixture = runtime.block_on(sql_session::seeded_fixture_with_read_many_pk_count(
-            profile,
-            rows,
-            read_many_pk_count,
-        ));
+        maybe_print_profile_rss_phase("before_seed");
+        reset_allocation_accounting();
+        let rows = fixture_rows(row_count);
+        let fixture = runtime.block_on(
+            sql_session::seeded_bound_update_fixture_with_read_many_pk_count(
+                profile,
+                rows,
+                read_many_pk_count,
+            ),
+        );
+        maybe_print_profile_rss_phase("after_seed");
+        print_allocation_accounting("seed");
+        reset_allocation_accounting();
+        let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
+        let _ = lix_engine::storage_bench::take_certified_entity_update_value_batch_accounting();
         let start = Instant::now();
         let result = if spread {
             runtime.block_on(fixture.update_spread_bound_rows(bound_update_row_count))
-        } else if bound_update_row_count == rows.len() {
+        } else if bound_update_row_count == row_count {
             runtime.block_on(fixture.update_all_bound())
         } else {
             runtime.block_on(fixture.update_bound_rows(bound_update_row_count))
         };
         samples.push(start.elapsed());
         black_box(result);
+        maybe_print_profile_rss_phase("after_update");
+        print_allocation_accounting("update");
+        let certificate =
+            lix_engine::storage_bench::take_certified_entity_update_value_batch_accounting();
+        let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
+        println!(
+            "tracked_state_crud generated update accounting: logical_rows={bound_update_row_count} certificate_attempts={} certificate_hits={} certificate_misses={} certified_rows={} physical_puts={} physical_deletes={} physical_written_bytes={}",
+            certificate.attempts,
+            certificate.hits,
+            certificate.misses,
+            certificate.certified_rows,
+            physical.puts,
+            physical.deletes,
+            physical.written_bytes
+        );
     }
     print_profile_samples(
         &format!("sql_session_bound/{}", profile.name()),

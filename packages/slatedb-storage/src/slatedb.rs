@@ -74,10 +74,13 @@ const SPACE_PREFIX_EXTRACTOR_NAME: &str = "lix-storage-space-be32-v1";
 const MAX_SLATEDB_KEY_LEN: usize = u16::MAX as usize;
 const RUNTIME_WORKER_THREADS: usize = 2;
 const POINT_READ_CONCURRENCY: usize = 64;
-const SNAPSHOT_POINT_CACHE_BYTES: usize = 16 * 1024 * 1024;
-const SNAPSHOT_POINT_CACHE_ENTRIES: usize = 4096;
+// The engine-level exact-point cache already absorbs the dominant hot-read
+// workload. Keep this snapshot cache as a bounded coherence aid rather than a
+// second 16 MiB copy of the same values.
+const SNAPSHOT_POINT_CACHE_BYTES: usize = 2 * 1024 * 1024;
+const SNAPSHOT_POINT_CACHE_ENTRIES: usize = 512;
 const SNAPSHOT_POINT_CACHE_MAX_VALUE_BYTES: usize = 64 * 1024;
-const DEFAULT_BLOCK_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_BLOCK_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 // Keep the commit, change, and reverse change-ID indexes' Bloom filters
 // resident across batched point validation. At 10M commits, 64 MiB thrashed
 // these multi-megabyte filters and turned 1,001 five-key probes into 353 MiB
@@ -100,7 +103,10 @@ const COMPACTOR_SAFETY_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(15 * 
 const WRITE_PIPELINE_MAX_PENDING_ENTRIES: usize = 1024 * 1024;
 const WRITE_PIPELINE_MAX_PENDING_BYTES: usize = 128 * 1024 * 1024;
 const LOCAL_SST_FILE_CACHE_ENTRIES: usize = 256;
-const LOCAL_SST_CONTENT_CACHE_BYTES: usize = 32 * 1024 * 1024;
+// Local direct reads do not pay object-store request latency. An 8 MiB content
+// budget preserves small-SST reuse without retaining a second 32 MiB tier next
+// to SlateDB's block cache.
+const LOCAL_SST_CONTENT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const LOCAL_SST_CONTENT_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -1423,7 +1429,11 @@ impl DirectLocalReads {
         let modified = metadata
             .modified()
             .map_err(|source| direct_local_io_error(location, source))?;
-        let contents = if cacheable && metadata.len() <= LOCAL_SST_CONTENT_MAX_FILE_BYTES {
+        let contents = if cacheable
+            && LOCAL_SST_CONTENT_CACHE_BYTES > 0
+            && metadata.len() <= LOCAL_SST_CONTENT_MAX_FILE_BYTES
+            && metadata.len() <= LOCAL_SST_CONTENT_CACHE_BYTES as u64
+        {
             let length =
                 usize::try_from(metadata.len()).map_err(|source| object_store::Error::Generic {
                     store: "LocalFileSystem",

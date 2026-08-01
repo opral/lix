@@ -17,6 +17,14 @@ static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
 static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS: AtomicU64 = AtomicU64::new(0);
+static CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
+static ENTITY_POINT_SNAPSHOT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static ENTITY_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
+static CRUD_PHYSICAL_DELETES: AtomicU64 = AtomicU64::new(0);
+static CRUD_PHYSICAL_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
@@ -28,6 +36,78 @@ pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
 /// cannot silently turn the measured bulk INSERT back into sequential writes.
 pub fn take_certified_entity_insert_parameter_batch_executions() -> u64 {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.swap(0, Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudCertificateAccounting {
+    pub attempts: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub certified_rows: u64,
+}
+
+pub(crate) fn record_certified_entity_update_value_batch_attempt() {
+    CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_certified_entity_update_value_batch_hit(row_count: usize) {
+    CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS.fetch_add(1, Ordering::Relaxed);
+    CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS.fetch_add(row_count as u64, Ordering::Relaxed);
+}
+
+/// Returns and resets generated UPDATE certificate hit/miss accounting.
+pub fn take_certified_entity_update_value_batch_accounting() -> CrudCertificateAccounting {
+    let attempts = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ATTEMPTS.swap(0, Ordering::Relaxed);
+    let hits = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_HITS.swap(0, Ordering::Relaxed);
+    let certified_rows = CERTIFIED_ENTITY_UPDATE_VALUE_BATCH_ROWS.swap(0, Ordering::Relaxed);
+    CrudCertificateAccounting {
+        attempts,
+        hits,
+        misses: attempts.saturating_sub(hits),
+        certified_rows,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EntityPointSnapshotCacheAccounting {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+pub(crate) fn record_entity_point_snapshot_cache_hit() {
+    ENTITY_POINT_SNAPSHOT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_entity_point_snapshot_cache_miss() {
+    ENTITY_POINT_SNAPSHOT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn take_entity_point_snapshot_cache_accounting() -> EntityPointSnapshotCacheAccounting {
+    EntityPointSnapshotCacheAccounting {
+        hits: ENTITY_POINT_SNAPSHOT_CACHE_HITS.swap(0, Ordering::Relaxed),
+        misses: ENTITY_POINT_SNAPSHOT_CACHE_MISSES.swap(0, Ordering::Relaxed),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudPhysicalWriteAccounting {
+    pub puts: u64,
+    pub deletes: u64,
+    pub written_bytes: u64,
+}
+
+pub(crate) fn record_crud_physical_writes(stats: crate::storage_adapter::StorageWriteSetStats) {
+    CRUD_PHYSICAL_PUTS.fetch_add(stats.staged_puts, Ordering::Relaxed);
+    CRUD_PHYSICAL_DELETES.fetch_add(stats.staged_deletes, Ordering::Relaxed);
+    CRUD_PHYSICAL_WRITTEN_BYTES.fetch_add(stats.written_bytes, Ordering::Relaxed);
+}
+
+pub fn take_crud_physical_write_accounting() -> CrudPhysicalWriteAccounting {
+    CrudPhysicalWriteAccounting {
+        puts: CRUD_PHYSICAL_PUTS.swap(0, Ordering::Relaxed),
+        deletes: CRUD_PHYSICAL_DELETES.swap(0, Ordering::Relaxed),
+        written_bytes: CRUD_PHYSICAL_WRITTEN_BYTES.swap(0, Ordering::Relaxed),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

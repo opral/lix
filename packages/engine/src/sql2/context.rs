@@ -222,6 +222,17 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         .await
     }
 
+    async fn stage_parameter_batch_replace(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Replace,
+            rows,
+        })
+        .await
+    }
+
     async fn execute_diff_command(
         &mut self,
         _command: DiffCommand,
