@@ -2248,9 +2248,28 @@ where
     ) -> Result<ExecuteResult, LixError> {
         let telemetry =
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, "transaction", None);
+        let may_reuse_literal_shape = self.has_started_statement;
+        self.has_started_statement = true;
         let operation = async {
             let _operation_guard = self.begin_session_operation()?;
-            let statement = self.sql_planning_cache.parse_statement(sql)?;
+            let auto_parameterized = (may_reuse_literal_shape && params.is_empty())
+                .then(|| self.sql_planning_cache.auto_parameterized_update(sql))
+                .flatten();
+            let (planning_sql, statement, auto_params) =
+                if let Some(auto_parameterized) = auto_parameterized {
+                    (
+                        auto_parameterized.sql,
+                        auto_parameterized.statement,
+                        Some(auto_parameterized.params),
+                    )
+                } else {
+                    (
+                        Arc::from(sql),
+                        self.sql_planning_cache.parse_statement(sql)?,
+                        None,
+                    )
+                };
+            let params = auto_params.as_deref().unwrap_or(params);
             let transaction = self.transaction_mut()?;
             let is_read = matches!(
                 sql2::bind_statement_route(&statement)?,
@@ -2275,7 +2294,7 @@ where
                 } else {
                     execute_transaction_write_auto(
                         transaction,
-                        sql,
+                        &planning_sql,
                         statement,
                         params,
                         options,
@@ -6645,6 +6664,65 @@ mod tests {
             .rollback()
             .await
             .expect("transaction should roll back");
+    }
+
+    #[tokio::test]
+    async fn explicit_transaction_literal_updates_preserve_escaped_string_values() {
+        let session = open_session().await;
+        for (key, value) in [("auto'one", "seed one"), ("auto'two", "seed two")] {
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+                    &[Value::Text(key.to_string()), Value::Text(value.to_string())],
+                )
+                .await
+                .expect("seed row should commit");
+        }
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        let first = transaction
+            .execute(
+                "UPDATE lix_key_value SET value = 'first''s value' WHERE key = 'auto''one'",
+                &[],
+            )
+            .await
+            .expect("first literal update should stage");
+        let second = transaction
+            .execute(
+                "UPDATE lix_key_value SET value = 'second''s value' WHERE key = 'auto''two'",
+                &[],
+            )
+            .await
+            .expect("second literal update should reuse the statement shape");
+        assert_eq!(first.rows_affected(), 1);
+        assert_eq!(second.rows_affected(), 1);
+        transaction
+            .commit()
+            .await
+            .expect("literal updates should commit atomically");
+
+        let values = session
+            .execute(
+                "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
+                &[
+                    Value::Text("auto'one".to_string()),
+                    Value::Text("auto'two".to_string()),
+                ],
+            )
+            .await
+            .expect("updated rows should be readable");
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            values.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("first's value")
+        );
+        assert_eq!(
+            values.rows()[1].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("second's value")
+        );
     }
 
     #[tokio::test]
