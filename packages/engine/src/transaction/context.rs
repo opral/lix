@@ -54,8 +54,8 @@ use crate::gc::{
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{
-    LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter,
-    LiveStateProjection, LiveStateScanRequest, MaterializedLiveStateBatch,
+    BranchHeadControlCache, LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest,
+    LiveStateFilter, LiveStateProjection, LiveStateScanRequest, MaterializedLiveStateBatch,
     MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
     MaterializedLiveStateRowRef, StagedLiveStateRows, TrackedHeadContext, TrackedWorkingDiff,
     overlay_load_exact_batch, overlay_scan_batch,
@@ -382,6 +382,7 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
+    branch_head_control_cache: Arc<BranchHeadControlCache>,
     storage: StorageAdapter<StorageImpl>,
     functions: FunctionProviderHandle,
     /// Tracked-state revision observed by the coherent transaction-open read.
@@ -644,6 +645,7 @@ where
                 staged_writes,
                 filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
                 filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
+                branch_head_control_cache: Arc::new(BranchHeadControlCache::default()),
                 storage,
                 functions,
                 opening_tracked_mutation_revision,
@@ -1513,7 +1515,9 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let base = self.live_state.reader(read);
+        let base = self
+            .live_state
+            .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
         overlay_scan_batch(&base, &staged, request).await
     }
 
@@ -1890,7 +1894,9 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let base = self.live_state.reader(read);
+        let base = self
+            .live_state
+            .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
         overlay_load_exact_batch(&base, &staged, request).await
     }
 
@@ -5800,6 +5806,7 @@ where
         let staged_writes = Arc::clone(&self.staged_writes);
         let filesystem_path_index_cache = Arc::clone(&self.filesystem_path_index_cache);
         let filesystem_path_index_epoch = Arc::clone(&self.filesystem_path_index_epoch);
+        let branch_head_control_cache = Arc::clone(&self.branch_head_control_cache);
         let plugin_host = self.plugin_host.clone();
 
         with_static_transaction_sql_read::<StorageImpl, _, _>(read, |read_store| async move {
@@ -5815,6 +5822,7 @@ where
                 staged_writes,
                 filesystem_path_index_cache,
                 filesystem_path_index_epoch,
+                branch_head_control_cache,
                 plugin_host,
             };
             let result = crate::sql2::execute_transaction_read_statement_from_parsed(
@@ -6462,6 +6470,7 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
+    branch_head_control_cache: Arc<BranchHeadControlCache>,
     plugin_host: PluginRuntimeHost,
 }
 
@@ -6478,7 +6487,10 @@ where
 
     fn live_state(&self) -> Arc<dyn crate::live_state::LiveStateReader> {
         Arc::new(TransactionReadLiveStateReader {
-            base: self.live_state.reader(self.read_store.clone()),
+            base: self.live_state.transaction_reader(
+                self.read_store.clone(),
+                Arc::clone(&self.branch_head_control_cache),
+            ),
             read_store: self.read_store.clone(),
             staged: self.staged.clone(),
             filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
@@ -6488,7 +6500,10 @@ where
 
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
         Arc::new(TransactionReadLiveStateReader {
-            base: self.live_state.reader(self.read_store.clone()),
+            base: self.live_state.transaction_reader(
+                self.read_store.clone(),
+                Arc::clone(&self.branch_head_control_cache),
+            ),
             read_store: self.read_store.clone(),
             staged: self.staged.clone(),
             filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
