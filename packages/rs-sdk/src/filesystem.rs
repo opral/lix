@@ -1843,7 +1843,7 @@ fn create_materialized_directory(layout: &FilesystemLayout, path: &str) -> Resul
         return Ok(());
     };
     if path_contains_unmanaged_entry(layout, &local_path)? {
-        return Ok(());
+        return Err(unsupported_materialization_entry(path, &local_path));
     }
     std::fs::create_dir_all(&local_path)
         .map_err(|error| io_error("create filesystem directory", &local_path, error))
@@ -1861,20 +1861,20 @@ fn write_materialized_file(
         return Ok(());
     };
     if path_contains_unmanaged_entry(layout, &local_path)? {
-        return Ok(());
+        return Err(unsupported_materialization_entry(path, &local_path));
     }
     if let Some(parent) = local_path.parent() {
         if path_contains_unmanaged_entry(layout, parent)? {
-            return Ok(());
+            return Err(unsupported_materialization_entry(path, &local_path));
         }
         std::fs::create_dir_all(parent)
             .map_err(|error| io_error("create filesystem file parent", parent, error))?;
         if path_contains_unmanaged_entry(layout, parent)? {
-            return Ok(());
+            return Err(unsupported_materialization_entry(path, &local_path));
         }
     }
     if path_contains_unmanaged_entry(layout, &local_path)? {
-        return Ok(());
+        return Err(unsupported_materialization_entry(path, &local_path));
     }
     std::fs::write(&local_path, data)
         .map_err(|error| io_error("write filesystem file", &local_path, error))
@@ -2214,6 +2214,16 @@ fn filesystem_sync_storage_error(error: LixError) -> StorageError {
 
 fn filesystem_error(message: impl Into<String>) -> LixError {
     LixError::new("LIX_FILESYSTEM_ERROR", message)
+}
+
+fn unsupported_materialization_entry(path: &str, local_path: &Path) -> LixError {
+    LixError::new(
+        "LIX_FILESYSTEM_UNSUPPORTED_ENTRY",
+        format!(
+            "cannot materialize regular Lix path {path} at {}: the path is blocked by a symlink or another unsupported filesystem entry",
+            local_path.display()
+        ),
+    )
 }
 
 #[cfg(feature = "local_filesystem")]
@@ -2615,6 +2625,34 @@ mod tests {
         assert_eq!(
             lix_path_to_local_path(root, "/#hash?.txt").unwrap(),
             root.join("#hash?.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materializing_a_regular_file_reports_symlink_collisions() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().join("workspace");
+        let lix_dir = root.join(".lix");
+        std::fs::create_dir_all(&lix_dir).unwrap();
+        std::fs::write(root.join("target.txt"), b"target").unwrap();
+        symlink("target.txt", root.join("link.txt")).unwrap();
+        let layout = FilesystemLayout {
+            root,
+            lix_dir,
+            lix_dir_is_default: true,
+        };
+
+        let error = write_materialized_file(&layout, "/link.txt", b"replacement")
+            .expect_err("a symlink collision must be reported");
+
+        assert_eq!(error.code, "LIX_FILESYSTEM_UNSUPPORTED_ENTRY");
+        assert!(error.message.contains("/link.txt"));
+        assert_eq!(
+            std::fs::read(layout.root.join("target.txt")).unwrap(),
+            b"target"
         );
     }
 

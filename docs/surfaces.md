@@ -20,6 +20,14 @@ Lix exposes logical application data through typed SQL relations:
 shared workspace metadata, and `lix_change` provides workspace-wide activity.
 There is no generic `lix_state*` SQL family.
 
+`lix_file` represents regular file contents only. Its public shape remains
+`id`, `path`, and `data` (plus the standard `lixcol_*` bookkeeping columns):
+`path` is an absolute, literal UTF-8 path and `data` is the file's bytes. Path
+characters such as spaces, `%`, `#`, `?`, and `@` are not URL-encoded. Symbolic
+links, device nodes, sockets, and other non-regular filesystem entries are not
+represented as `lix_file` rows. Executable and other permission bits are not
+part of the current file contract.
+
 The checkpoint and diff relations are read-only. Their `diff_id` rows can feed
 the `lix_revert`, `lix_apply`, and `lix_create_checkpoint` command sinks. See
 [Checkpoints](./checkpoints.md) and [Diff commands](./diff-commands.md).
