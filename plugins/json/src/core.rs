@@ -12,7 +12,7 @@ pub const ARRAY_ITEM_SCHEMA_KEY: &str = "json_array_item";
 const ROOT_ID: &str = "root";
 const OBJECT_CONTAINER_DOMAIN: &[u8] = b"lix-json-object-container-v2\0";
 const NODES_PER_SPAN_CHUNK: usize = 512;
-const SCALAR_ONLY_SEMANTIC_WRITE: &str = "JSON semantic writes support one existing scalar value only; use a file byte write for additions, deletions, containers, moves, ordering, or layout changes";
+const SCALAR_ONLY_SEMANTIC_WRITE: &str = "JSON semantic writes support existing scalar values only; use a file byte write for additions, deletions, containers, moves, ordering, or layout changes";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdNamespace(pub [u8; 16]);
@@ -1575,20 +1575,40 @@ impl Document {
         if changes.is_empty() {
             return Ok((self.clone(), Vec::new()));
         }
-        if changes.len() != 1 {
-            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
+        let mut edits = Vec::with_capacity(changes.len());
+        for change in changes {
+            if let Some(edit) = self.scalar_entity_edit(change)? {
+                edits.push(edit);
+            }
         }
-        self.single_scalar_entity_changed(&changes[0])?
-            .ok_or_else(|| SCALAR_ONLY_SEMANTIC_WRITE.to_owned())
+        edits.sort_unstable_by_key(|edit| edit.offset);
+        if edits.windows(2).any(|pair| {
+            pair[0]
+                .offset
+                .checked_add(pair[0].delete_len)
+                .is_none_or(|end| end > pair[1].offset)
+        }) {
+            return Err("JSON semantic write batch contains overlapping scalar edits".to_owned());
+        }
+        if edits.is_empty() {
+            return Ok((self.clone(), edits));
+        }
+        let splices = edits
+            .iter()
+            .map(|edit| InputSplice {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert: edit.insert.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let (after, _) = self.file_changed(&splices, IdNamespace([0; 16]))?;
+        Ok((after, edits))
     }
 
-    fn single_scalar_entity_changed(
-        &self,
-        change: &EntityChange,
-    ) -> Result<Option<(Self, Vec<ByteEdit>)>, String> {
+    fn scalar_entity_edit(&self, change: &EntityChange) -> Result<Option<ByteEdit>, String> {
         let identity = EntityIdentity::from_parts(&change.schema_key, &change.entity_pk)?;
         let Some(&node_index) = self.0.lookup.get(&identity_fingerprint(&identity)) else {
-            return Ok(None);
+            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         };
         let node_index = usize::try_from(node_index).expect("u32 fits usize");
         let node = &self.0.nodes[node_index];
@@ -1596,10 +1616,10 @@ impl Document {
             return Err("JSON entity identity fingerprint collision".to_owned());
         }
         if node.kind.is_container() {
-            return Ok(None);
+            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         }
         let Some(snapshot) = &change.snapshot else {
-            return Ok(None);
+            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         };
         let mut strings = HashSet::new();
         let entity = SemanticEntity::parse(
@@ -1611,7 +1631,7 @@ impl Document {
             &mut strings,
         )?;
         if entity.identity() != identity || entity.kind().is_container() {
-            return Ok(None);
+            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         }
         let current = SemanticEntity::parse(
             EntityRecord {
@@ -1622,7 +1642,7 @@ impl Document {
             &mut strings,
         )?;
         if !entity.same_location(&current) {
-            return Ok(None);
+            return Err(SCALAR_ONLY_SEMANTIC_WRITE.to_owned());
         }
         let scalar = entity
             .scalar_json()
@@ -1643,23 +1663,13 @@ impl Document {
                 .ok_or_else(|| "JSON scalar range overflow".to_owned())?,
         )?;
         if before == scalar.as_bytes() {
-            return Ok(Some((self.clone(), Vec::new())));
+            return Ok(None);
         }
-        let splice = InputSplice {
+        Ok(Some(ByteEdit {
             offset: u64::from(value_start),
             delete_len: u64::from(value_len),
-            insert: scalar.as_bytes(),
-        };
-        let (after, _) = self.file_changed(&[splice], IdNamespace([0; 16]))?;
-        let insert = Arc::new(scalar.as_bytes().to_vec());
-        Ok(Some((
-            after,
-            vec![ByteEdit {
-                offset: u64::from(value_start),
-                delete_len: u64::from(value_len),
-                insert,
-            }],
-        )))
+            insert: Arc::new(scalar.as_bytes().to_vec()),
+        }))
     }
 
     pub fn open_entities(entities: Vec<EntityRecord>) -> Result<(Self, ByteEdit), String> {

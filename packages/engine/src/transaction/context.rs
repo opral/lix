@@ -1031,12 +1031,8 @@ where
         self.pending_file_view_mutations
             .retain(|key, _| !file_ids.contains(&key.file_id));
 
-        let mut reconciliation_batches = Vec::<RawWriteBatch>::with_capacity(
-            candidate_indices
-                .len()
-                .saturating_add(prepared_writes.state_rows.len()),
-        );
-        for group in groups.values() {
+        let mut reconciliation_batches = BTreeMap::<String, RawWriteBatch>::new();
+        for (file_id, group) in &groups {
             if group.conflicts.is_empty() {
                 continue;
             }
@@ -1071,15 +1067,11 @@ where
                     conflict_count = group.conflicts.len(),
                 ))
                 .await?;
+            let rows = reconciliation_batches
+                .entry(file_id.clone())
+                .or_insert_with(|| RawWriteBatch::with_capacity(group.conflicts.len()));
             for (conflict, resolution) in group.conflicts.iter().zip(resolutions.resolutions) {
-                let mut rows = RawWriteBatch::with_capacity(1);
-                push_stale_conflict_resolution(
-                    &mut rows,
-                    conflict,
-                    resolution,
-                    &self.active_branch_id,
-                )?;
-                reconciliation_batches.push(rows);
+                push_stale_conflict_resolution(rows, conflict, resolution, &self.active_branch_id)?;
             }
         }
         let conflict_row_indices = candidate_indices.iter().copied().collect::<BTreeSet<_>>();
@@ -1101,38 +1093,40 @@ where
             {
                 continue;
             }
-            let mut rows = RawWriteBatch::with_capacity(1);
-            rows.push_parts(
-                Some(row.entity_pk.clone()),
-                row.schema_key.clone(),
-                row.file_id.cloned(),
-                row.snapshot.map(|snapshot| {
-                    TransactionJson::from_unvalidated_shared_normalized_content(
-                        snapshot.materialize_shared(),
-                    )
-                }),
-                row.metadata.map(|metadata| {
-                    TransactionJson::from_unvalidated_shared_normalized_content(
-                        metadata.materialize_shared(),
-                    )
-                }),
-                row.origin.cloned(),
-                Some(row.created_at.to_string().into()),
-                Some(row.updated_at.to_string().into()),
-                row.global,
-                row.change_id.map(|change_id| change_id.to_string().into()),
-                None,
-                row.untracked,
-                row.branch_id.clone(),
-            );
-            reconciliation_batches.push(rows);
+            reconciliation_batches
+                .entry(file_id.to_owned())
+                .or_insert_with(RawWriteBatch::new)
+                .push_parts(
+                    Some(row.entity_pk.clone()),
+                    row.schema_key.clone(),
+                    row.file_id.cloned(),
+                    row.snapshot.map(|snapshot| {
+                        TransactionJson::from_unvalidated_shared_normalized_content(
+                            snapshot.materialize_shared(),
+                        )
+                    }),
+                    row.metadata.map(|metadata| {
+                        TransactionJson::from_unvalidated_shared_normalized_content(
+                            metadata.materialize_shared(),
+                        )
+                    }),
+                    row.origin.cloned(),
+                    Some(row.created_at.to_string().into()),
+                    Some(row.updated_at.to_string().into()),
+                    row.global,
+                    row.change_id.map(|change_id| change_id.to_string().into()),
+                    None,
+                    row.untracked,
+                    row.branch_id.clone(),
+                );
         }
-        // Plugins may deliberately accept only one semantic edit per warm
-        // transition. Preserve the accumulated conflict decision while
-        // replaying its resolved and retained edits through one actor in order.
+        // Conflict discovery and resolution already operate per file. Replay
+        // the complete resolved write set through the same boundary so each
+        // file performs one semantic transition and one render, independent
+        // of how many conflicts and retained edits it contains.
         let replay_batch_count = reconciliation_batches.len();
         async {
-            for rows in reconciliation_batches {
+            for rows in reconciliation_batches.into_values() {
                 self.stage_write(TransactionWrite::Rows {
                     mode: TransactionWriteMode::Replace,
                     rows,

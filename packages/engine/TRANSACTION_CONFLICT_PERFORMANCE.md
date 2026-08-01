@@ -42,6 +42,31 @@ six-process worst of 18.095 ms. The real-time path therefore remains flat
 within run-to-run variance and far below the 100 ms gate while high-cardinality
 discovery improves by an order of magnitude.
 
+## Batched conflict replay
+
+Conflict resolution was already invoked once per file, but its resolved and
+retained rows were replayed through one plugin transition at a time. The hard
+cut groups those rows by file and sends one semantic batch through the existing
+plugin boundary. JSON now accepts multiple independent existing-scalar edits;
+CSV, Markdown, and text already accepted multi-entity updates. Every reference
+plugin is covered by a multi-entity same-base convergence test that asserts one
+resolver call and one render transition.
+
+| Conflicts in one JSON file | Before p50 | After p50 | Before guest exports | After guest exports | Speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 41,065 µs | 5,099 µs | 66 | 3 | 8.05× |
+
+Eight release-mode rounds measured stale `commit()` only after both
+transactions were staged and the winning commit completed. The before probe
+uses the same batch-capable plugin and fixture with only the engine replay loop
+restored, isolating the effect of replay cardinality. Its p95 falls from
+43,041 µs to 5,251 µs (8.20×).
+
+The 100-client capacity regression remained below the 100 ms gate in every
+reference format: JSON 16.201 ms p95, CSV 16.415 ms, Markdown 24.990 ms, and
+text 12.167 ms. Each run retained the exact 10% semantic-overlap workload and
+reported five resolver calls across twenty waves.
+
 ## Reproduction
 
 ```bash
@@ -50,8 +75,11 @@ cargo test -p lix_engine --release \
 
 cargo test -p lix_engine --release \
   generation_write_set_benchmark_probe --lib -- --ignored --nocapture
+
+cargo test -p lix_sdk_tests --release --test e2e \
+  stale_plugin_replay_batch_benchmark_probe -- --ignored --nocapture
 ```
 
-Both probes emit versioned machine-readable records or stable key/value output
+The probes emit versioned machine-readable records or stable key/value output
 and assert that the optimized path beats its exact predecessor on the same
 fixture.
