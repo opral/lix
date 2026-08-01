@@ -4125,6 +4125,7 @@ where
                                         &actor_key.branch_id,
                                         &actor_key.file_id,
                                         &actor_key.plugin_generation,
+                                        &visible_materialization.semantic_root,
                                         checkpoint_blob_hash,
                                     )
                                     .await
@@ -8122,10 +8123,10 @@ impl PluginWriteReconciliation {
     ) -> Result<(), LixError> {
         let mut checkpoints = BTreeMap::<
             (String, String),
-            (WasmDurableDocumentCheckpoint, crate::Blob, String),
+            (WasmDurableDocumentCheckpoint, crate::Blob, String, String),
         >::new();
         for publication in &self.actor_publications {
-            let Some((branch_id, file_id, generation, checkpoint, authorities)) =
+            let Some((branch_id, file_id, generation, semantic_root, checkpoint, authorities)) =
                 publication.durable_checkpoint()
             else {
                 continue;
@@ -8137,10 +8138,17 @@ impl PluginWriteReconciliation {
             };
             checkpoints.insert(
                 (branch_id.to_owned(), file_id.to_owned()),
-                (checkpoint, authority.into(), generation.to_owned()),
+                (
+                    checkpoint,
+                    authority.into(),
+                    generation.to_owned(),
+                    semantic_root.to_string(),
+                ),
             );
         }
-        for ((branch_id, file_id), (checkpoint, authority, generation)) in checkpoints {
+        for ((branch_id, file_id), (checkpoint, authority, generation, semantic_root)) in
+            checkpoints
+        {
             if self
                 .derived_materializations
                 .keys()
@@ -8159,7 +8167,7 @@ impl PluginWriteReconciliation {
                         ),
                     )
                 })?;
-            write.set_plugin_checkpoint(generation, checkpoint.bytes(), authority);
+            write.set_plugin_checkpoint(generation, semantic_root, checkpoint.bytes(), authority);
         }
         Ok(())
     }
@@ -8211,6 +8219,7 @@ enum PendingPluginActorPublication {
         key: PluginActorKey,
         view: PendingPluginActorView,
         checkpoint: Option<PluginActorStagedCheckpoint>,
+        semantic_root: Option<Arc<str>>,
         durable_checkpoint: Option<WasmDurableDocumentCheckpoint>,
         entity_authorities: PluginEntityAuthorities,
     },
@@ -8224,10 +8233,14 @@ impl PendingPluginActorPublication {
                 successor_key,
                 view,
             } => {
-                let durable_checkpoint = lease
-                    .successor_checkpoint()
-                    .and_then(|(_, _, checkpoint)| checkpoint)
+                let successor_checkpoint = lease.successor_checkpoint();
+                let durable_checkpoint = successor_checkpoint
+                    .as_ref()
+                    .and_then(|(_, _, checkpoint)| checkpoint.as_ref())
                     .and_then(|checkpoint| checkpoint.durable_checkpoint());
+                let semantic_root = successor_checkpoint
+                    .as_ref()
+                    .map(|(_, semantic_root, _)| Arc::clone(semantic_root));
                 let entity_authorities = lease
                     .successor_entity_authorities()
                     .cloned()
@@ -8243,6 +8256,7 @@ impl PendingPluginActorPublication {
                     key: successor_key,
                     view,
                     checkpoint,
+                    semantic_root,
                     durable_checkpoint,
                     entity_authorities,
                 }
@@ -8262,13 +8276,14 @@ impl PendingPluginActorPublication {
                     .as_ref()
                     .and_then(WasmDocumentCheckpoint::durable_checkpoint);
                 let staged_checkpoint =
-                    cache.stage_checkpoint(key.clone(), semantic_root, checkpoint);
+                    cache.stage_checkpoint(key.clone(), Arc::clone(&semantic_root), checkpoint);
                 let _ = store.actor_mut().drop_document(document).await;
                 let _ = store.actor_mut().retire().await;
                 Self::Uncached {
                     key,
                     view,
                     checkpoint: staged_checkpoint,
+                    semantic_root: Some(semantic_root),
                     durable_checkpoint,
                     entity_authorities,
                 }
@@ -8372,6 +8387,7 @@ impl PendingPluginActorPublication {
         &str,
         &str,
         &str,
+        Arc<str>,
         WasmDurableDocumentCheckpoint,
         &PluginEntityAuthorities,
     )> {
@@ -8380,23 +8396,26 @@ impl PendingPluginActorPublication {
                 lease,
                 successor_key,
                 ..
-            } => lease
-                .successor_checkpoint()
-                .and_then(|(_, _, checkpoint)| checkpoint)
-                .and_then(|checkpoint| checkpoint.durable_checkpoint())
-                .zip(lease.successor_entity_authorities())
-                .map(|(bytes, authorities)| {
-                    (
-                        successor_key.branch_id.as_str(),
-                        successor_key.file_id.as_str(),
-                        successor_key.plugin_generation.as_str(),
-                        bytes,
-                        authorities,
-                    )
-                }),
+            } => {
+                let (_, semantic_root, checkpoint) = lease.successor_checkpoint()?;
+                checkpoint
+                    .and_then(|checkpoint| checkpoint.durable_checkpoint())
+                    .zip(lease.successor_entity_authorities())
+                    .map(|(bytes, authorities)| {
+                        (
+                            successor_key.branch_id.as_str(),
+                            successor_key.file_id.as_str(),
+                            successor_key.plugin_generation.as_str(),
+                            semantic_root,
+                            bytes,
+                            authorities,
+                        )
+                    })
+            }
             Self::New {
                 key,
                 checkpoint,
+                semantic_root,
                 entity_authorities,
                 ..
             } => checkpoint
@@ -8407,24 +8426,29 @@ impl PendingPluginActorPublication {
                         key.branch_id.as_str(),
                         key.file_id.as_str(),
                         key.plugin_generation.as_str(),
+                        Arc::clone(semantic_root),
                         bytes,
                         entity_authorities,
                     )
                 }),
             Self::Uncached {
                 key,
+                semantic_root,
                 durable_checkpoint,
                 entity_authorities,
                 ..
-            } => durable_checkpoint.clone().map(|bytes| {
-                (
-                    key.branch_id.as_str(),
-                    key.file_id.as_str(),
-                    key.plugin_generation.as_str(),
-                    bytes,
-                    entity_authorities,
-                )
-            }),
+            } => durable_checkpoint.clone().zip(semantic_root.clone()).map(
+                |(bytes, semantic_root)| {
+                    (
+                        key.branch_id.as_str(),
+                        key.file_id.as_str(),
+                        key.plugin_generation.as_str(),
+                        semantic_root,
+                        bytes,
+                        entity_authorities,
+                    )
+                },
+            ),
         }
     }
 

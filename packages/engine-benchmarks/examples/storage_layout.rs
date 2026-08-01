@@ -207,7 +207,7 @@ async fn print_binary_cas_owners(read: &impl lix_engine::storage_adapter::Storag
 async fn print_plugin_checkpoint_layout(
     read: &impl lix_engine::storage_adapter::StorageAdapterRead,
 ) {
-    const HEADER_BYTES: usize = 76;
+    const HEADER_BYTES: usize = 92;
 
     let inventory = space_inventory(read, "plugin.current_checkpoint.v1").await;
     let mut runtime_bytes = 0_u64;
@@ -216,12 +216,12 @@ async fn print_plugin_checkpoint_layout(
     let mut unique_authority = BTreeSet::new();
     for (_key, value) in &inventory {
         let runtime_len = u32::from_le_bytes(
-            value[68..72]
+            value[84..88]
                 .try_into()
                 .expect("plugin checkpoint runtime length"),
         ) as usize;
         let authority_len = u32::from_le_bytes(
-            value[72..76]
+            value[88..92]
                 .try_into()
                 .expect("plugin checkpoint authority length"),
         ) as usize;

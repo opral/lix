@@ -11,8 +11,8 @@ use crate::{Blob, LixError};
 pub(crate) const PLUGIN_CHECKPOINT_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0026), "plugin.current_checkpoint.v1");
 
-const MAGIC: &[u8; 4] = b"LPC1";
-const HEADER_BYTES: usize = 4 + 32 + 32 + 4 + 4;
+const MAGIC: &[u8; 4] = b"LPC2";
+const HEADER_BYTES: usize = 4 + 32 + 32 + 16 + 4 + 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CurrentPluginCheckpoint {
@@ -25,11 +25,13 @@ pub(crate) fn stage_current_plugin_checkpoint(
     branch_id: &str,
     file_id: &str,
     generation: &str,
+    semantic_root: &str,
     blob_hash: BlobHash,
     runtime: &[u8],
     authority: &[u8],
 ) -> Result<(), LixError> {
     let generation = BlobHash::from_hex(generation)?;
+    let semantic_root = parse_semantic_root(semantic_root)?;
     let runtime_len = u32::try_from(runtime.len()).map_err(|_| checkpoint_too_large())?;
     let authority_len = u32::try_from(authority.len()).map_err(|_| checkpoint_too_large())?;
     let capacity = HEADER_BYTES
@@ -40,6 +42,7 @@ pub(crate) fn stage_current_plugin_checkpoint(
     value.extend_from_slice(MAGIC);
     value.extend_from_slice(generation.as_bytes());
     value.extend_from_slice(blob_hash.as_bytes());
+    value.extend_from_slice(semantic_root.as_bytes());
     value.extend_from_slice(&runtime_len.to_le_bytes());
     value.extend_from_slice(&authority_len.to_le_bytes());
     value.extend_from_slice(runtime);
@@ -139,9 +142,11 @@ pub(crate) async fn load_current_plugin_checkpoint(
     branch_id: &str,
     file_id: &str,
     generation: &str,
+    semantic_root: &str,
     blob_hash: BlobHash,
 ) -> Result<Option<CurrentPluginCheckpoint>, LixError> {
     let expected_generation = BlobHash::from_hex(generation)?;
+    let expected_semantic_root = parse_semantic_root(semantic_root)?;
     let values = PointReadPlan::new(
         PLUGIN_CHECKPOINT_SPACE,
         &[checkpoint_key(branch_id, file_id)?],
@@ -163,11 +168,12 @@ pub(crate) async fn load_current_plugin_checkpoint(
     if &header[..4] != MAGIC
         || header[4..36] != expected_generation.as_bytes()[..]
         || header[36..68] != blob_hash.as_bytes()[..]
+        || header[68..84] != expected_semantic_root.as_bytes()[..]
     {
         return Ok(None);
     }
-    let runtime_len = u32::from_le_bytes(header[68..72].try_into().expect("runtime length"));
-    let authority_len = u32::from_le_bytes(header[72..76].try_into().expect("authority length"));
+    let runtime_len = u32::from_le_bytes(header[84..88].try_into().expect("runtime length"));
+    let authority_len = u32::from_le_bytes(header[88..92].try_into().expect("authority length"));
     let runtime_len = runtime_len as usize;
     let authority_len = authority_len as usize;
     let runtime_end = HEADER_BYTES
@@ -183,6 +189,15 @@ pub(crate) async fn load_current_plugin_checkpoint(
         runtime: value.slice(HEADER_BYTES..runtime_end).into(),
         authority: value.slice(runtime_end..value_end).into(),
     }))
+}
+
+fn parse_semantic_root(semantic_root: &str) -> Result<uuid::Uuid, LixError> {
+    uuid::Uuid::parse_str(semantic_root).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("plugin checkpoint semantic root is not a UUID: {error}"),
+        )
+    })
 }
 
 fn checkpoint_key(branch_id: &str, file_id: &str) -> Result<StorageKey, LixError> {
@@ -219,9 +234,11 @@ mod tests {
     const BRANCH_ID: &str = "01920000-0000-7000-8000-000000000001";
     const OTHER_BRANCH_ID: &str = "01920000-0000-7000-8000-000000000003";
     const FILE_ID: &str = "01920000-0000-7000-8000-000000000002";
+    const SEMANTIC_ROOT: &str = "01920000-0000-7000-8000-000000000004";
+    const OTHER_SEMANTIC_ROOT: &str = "01920000-0000-7000-8000-000000000005";
 
     #[tokio::test]
-    async fn current_checkpoint_overwrites_and_is_bound_to_generation_and_blob() {
+    async fn current_checkpoint_overwrites_and_is_bound_to_generation_blob_and_semantic_root() {
         let storage = StorageAdapter::new(Memory::new());
         let generation = BlobHash::from_content(b"generation");
         let first_blob = BlobHash::from_content(b"first");
@@ -245,6 +262,7 @@ mod tests {
                 BRANCH_ID,
                 FILE_ID,
                 &generation.to_hex(),
+                SEMANTIC_ROOT,
                 blob_hash,
                 runtime,
                 authority,
@@ -266,6 +284,7 @@ mod tests {
                 BRANCH_ID,
                 FILE_ID,
                 &generation.to_hex(),
+                SEMANTIC_ROOT,
                 first_blob,
             )
             .await
@@ -278,6 +297,20 @@ mod tests {
                 BRANCH_ID,
                 FILE_ID,
                 &BlobHash::from_content(b"other-generation").to_hex(),
+                SEMANTIC_ROOT,
+                second_blob,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            load_current_plugin_checkpoint(
+                &read,
+                BRANCH_ID,
+                FILE_ID,
+                &generation.to_hex(),
+                OTHER_SEMANTIC_ROOT,
                 second_blob,
             )
             .await
@@ -289,6 +322,7 @@ mod tests {
             BRANCH_ID,
             FILE_ID,
             &generation.to_hex(),
+            SEMANTIC_ROOT,
             second_blob,
         )
         .await
@@ -310,6 +344,7 @@ mod tests {
                 branch_id,
                 FILE_ID,
                 &generation.to_hex(),
+                SEMANTIC_ROOT,
                 blob_hash,
                 b"runtime",
                 b"authority",
@@ -344,6 +379,7 @@ mod tests {
                 BRANCH_ID,
                 FILE_ID,
                 &generation.to_hex(),
+                SEMANTIC_ROOT,
                 blob_hash,
             )
             .await
@@ -356,6 +392,7 @@ mod tests {
                 OTHER_BRANCH_ID,
                 FILE_ID,
                 &generation.to_hex(),
+                SEMANTIC_ROOT,
                 blob_hash,
             )
             .await
@@ -385,6 +422,7 @@ mod tests {
                 OTHER_BRANCH_ID,
                 FILE_ID,
                 &generation.to_hex(),
+                SEMANTIC_ROOT,
                 blob_hash,
             )
             .await
