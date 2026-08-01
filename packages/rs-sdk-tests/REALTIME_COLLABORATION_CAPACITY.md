@@ -14,8 +14,12 @@ p95 below 100 ms with 50-100 active collaborators on one document.
   next wave's convergence latency.
 - Two writers overlap in every fourth wave. That is exactly 10% overlapping
   operations; the other 90% target distinct semantic entities.
-- A wave converges only after every client observes the marker through its own
-  query stream. The timer begins before commits are scheduled, so it includes
+- A wave converges only after every client reaches the marker's mutation
+  generation through its own query stream. One designated observer verifies
+  the marker bytes and publishes that generation as the wave receipt; the
+  remaining observers compare their scalar `mutation_sequence` instead of
+  rescanning and, remotely, Base64-decoding the complete document. The timer
+  begins before commits are scheduled, so it includes
   commit queueing, stale conflict discovery, plugin reconciliation, the
   in-memory storage commit, invalidation, query reevaluation, and observation
   fan-out.
@@ -65,6 +69,13 @@ above were 18.095 ms and 25.977 ms. These single post-refactor runs are a
 regression check, not a replacement for the six-process worst-value matrix;
 they show that structured reporting and disabled-by-default stage spans did
 not consume the latency budget.
+
+After switching convergence detection to the verified generation receipt, one
+100-client release validation reported 12.547 ms local JSON convergence p95
+and 18.172 ms in-process server-protocol p95. The immediately preceding local
+JSON run on the stacked transaction changes was 16.420 ms. The receipt changes
+benchmark bookkeeping, not commit or observation semantics: every client still
+consumes its own event at or beyond the verified marker generation.
 
 ## Profile and change
 
