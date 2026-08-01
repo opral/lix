@@ -30,16 +30,16 @@ pub(crate) use row_materialization::{
 #[cfg(test)]
 pub(crate) use storage::load_commit_delta_change_ids;
 pub(crate) use storage::{
-    CommitDeltaChangeLocator, CommitDeltaMember, commit_delta_contains_schema,
-    direct_change_locator, load_change_record_by_id, load_commit_delta_change_records,
-    load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
-    load_commit_delta_selection_certificate, load_owned_commit_delta_entries,
-    load_owned_commit_delta_entries_one_ordered_ref, scan_change_records_from_commit_deltas,
-    scan_commit_delta_inventory, scan_commit_delta_values, selected_change_selection_fingerprint,
-    stage_addressable_commit_deltas, stage_addressable_commit_deltas_with_selected_source,
-    stage_change_locators, stage_commit_deltas, stage_delete_change_locators,
-    stage_delete_commit_delta_inventory_entry, stage_delete_commit_roots,
-    stage_ordered_addressable_commit_deltas,
+    CommitDeltaChangeLocator, CommitDeltaMember, CommitDeltaPointReadCache,
+    commit_delta_contains_schema, direct_change_locator, load_change_record_by_id,
+    load_commit_delta_change_records, load_commit_delta_members_with_payloads,
+    load_commit_delta_members_with_payloads_for_schemas, load_commit_delta_selection_certificate,
+    load_owned_commit_delta_entries, load_owned_commit_delta_entries_one_ordered_ref,
+    scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_values,
+    selected_change_selection_fingerprint, stage_addressable_commit_deltas,
+    stage_addressable_commit_deltas_with_selected_source, stage_change_locators,
+    stage_commit_deltas, stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
+    stage_delete_commit_roots, stage_ordered_addressable_commit_deltas,
 };
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{
