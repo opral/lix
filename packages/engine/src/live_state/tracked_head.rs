@@ -14,7 +14,8 @@ pub(crate) use hot::{
     CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, DeferredFreshHotPlan,
     DeferredFreshHotRowRef, DeferredFreshHotRows, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE,
     HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
-    scan_certified_history_rows, stage_certified_entity_batches,
+    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, scan_certified_history_rows,
+    stage_certified_entity_batches,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -97,6 +98,16 @@ impl WorkingDiffIndexCoverage {
         let hash = blake3::hash(key);
         let mut group_key_xor = *self.group_key_xor.as_hash_array();
         for (target, source) in group_key_xor.iter_mut().zip(hash.as_bytes()) {
+            *target ^= source;
+        }
+        self.group_key_xor = JsonRef::from_hash_bytes(group_key_xor);
+        Some(())
+    }
+
+    fn remove_encoded_group_key(&mut self, key: &[u8]) -> Option<()> {
+        self.group_count = self.group_count.checked_sub(1)?;
+        let mut group_key_xor = *self.group_key_xor.as_hash_array();
+        for (target, source) in group_key_xor.iter_mut().zip(blake3::hash(key).as_bytes()) {
             *target ^= source;
         }
         self.group_key_xor = JsonRef::from_hash_bytes(group_key_xor);

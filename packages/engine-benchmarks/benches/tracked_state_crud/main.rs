@@ -602,6 +602,20 @@ fn profile_hot_sql_session_bound_updates(
         profile.name(),
         elapsed / repeats_u32,
     );
+    // Keep the post-update serving cost outside the timed mutation window.
+    if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_READ_AFTER_HOT_UPDATES").is_some() {
+        let read_start = Instant::now();
+        let read_rows = runtime.block_on(run_sql_session_operation(
+            TransactionBenchOp::ReadAll,
+            &fixture,
+        ));
+        println!(
+            "tracked_state_crud hot profile: sql_session_bound/{}/read_all_after_{repeats}_updates: elapsed={:?}",
+            profile.name(),
+            read_start.elapsed(),
+        );
+        black_box(read_rows);
+    }
     black_box(row_count);
 }
 

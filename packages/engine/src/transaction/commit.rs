@@ -71,6 +71,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_RETIREMENTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -82,6 +84,11 @@ pub(crate) fn take_ordered_packed_current_base_publications() -> usize {
 pub(crate) fn take_complete_replacement_packed_current_base_publications() -> usize {
     COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS
         .with(|publications| publications.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_complete_replacement_packed_current_base_retirements() -> usize {
+    COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_RETIREMENTS.with(|retirements| retirements.replace(0))
 }
 
 /// Commits prepared transaction rows into tracked history and unified current
@@ -2453,7 +2460,7 @@ async fn stage_tracked_head(
             COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| {
                 publications.set(publications.get().saturating_add(1));
             });
-            let generation = tracked_head
+            let (generation, _retired_predecessor_bases) = tracked_head
                 .writer(read, writes)
                 .stage_complete_collection_replacement_current_base(
                     &root.branch_id,
@@ -2469,6 +2476,12 @@ async fn stage_tracked_head(
                     "lix.perf.materialization.tracked_head.stage_complete_collection_replacement_current_base"
                 ))
                 .await?;
+            #[cfg(test)]
+            if _retired_predecessor_bases {
+                COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_RETIREMENTS.with(|retirements| {
+                    retirements.set(retirements.get().saturating_add(1));
+                });
+            }
             if let Some(epoch) = working_diff_epoch {
                 let next_epoch = TrackedWorkingDiffEpoch {
                     checkpoint_commit_id: epoch.checkpoint_commit_id,

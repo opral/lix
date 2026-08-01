@@ -4340,6 +4340,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_ordered_parameter_update_replaces_complete_packed_current_base() {
+        const ROW_COUNT: usize = 1_024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "ordered_packed_update_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": [
+                        "object", "array", "string", "number", "integer", "boolean", "null"
+                    ]
+                }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        let insert_sql =
+            "INSERT INTO ordered_packed_update_probe (path, value) VALUES ($1, lix_json($2))";
+        let insert_statements = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: insert_sql.to_string(),
+                params: vec![
+                    Value::Text(format!("{row_index:04}")),
+                    Value::Text(format!("\"value-{row_index:04}\"")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session.execute_batch(&insert_statements).await.unwrap();
+
+        crate::transaction::take_complete_replacement_packed_current_base_retirements();
+        let update_sql =
+            "UPDATE ordered_packed_update_probe SET value = lix_json($1) WHERE path = $2";
+        for version in 1..=2 {
+            let update_statements = (0..ROW_COUNT)
+                .map(|row_index| ExecuteBatchStatement {
+                    sql: update_sql.to_string(),
+                    params: vec![
+                        Value::Text(format!("\"updated-{version}-{row_index:04}\"")),
+                        Value::Text(format!("{row_index:04}")),
+                    ],
+                })
+                .collect::<Vec<_>>();
+            let affected = session
+                .execute_batch(&update_statements)
+                .await
+                .unwrap()
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .sum::<u64>();
+            assert_eq!(affected, ROW_COUNT as u64);
+            assert_eq!(
+                crate::transaction::take_complete_replacement_packed_current_base_retirements(),
+                1,
+                "each complete certified replacement should swap one packed base reference"
+            );
+        }
+
+        let rows = session
+            .execute(
+                "SELECT path, value FROM ordered_packed_update_probe WHERE path IN ('0000', '1023') ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("updated-2-0000")
+        );
+        assert_eq!(
+            rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("updated-2-1023")
+        );
+        let working_diff = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_working_diff WHERE schema_key = 'ordered_packed_update_probe' AND diff_type = 'added'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            working_diff.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64,
+            "replacing a packed base must preserve its working-diff epoch"
+        );
+
+        session
+            .execute(
+                "UPDATE ordered_packed_update_probe SET value = lix_json('\"partial\"') WHERE path = '0000'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::transaction::take_complete_replacement_packed_current_base_retirements(),
+            0,
+            "a partial replacement must remain a point-addressable HOT overlay"
+        );
+        let partial = session
+            .execute(
+                "SELECT value FROM ordered_packed_update_probe WHERE path = '0000'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            partial.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("partial")
+        );
+        session
+            .create_checkpoint()
+            .await
+            .expect("replaced packed current base should remain checkpointable");
+        let working_diff = session
+            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            working_diff.rows()[0].get::<i64>("entries").unwrap(),
+            0,
+            "checkpointing a replaced packed base must clear its working diff"
+        );
+    }
+
+    #[tokio::test]
     async fn certified_parameter_batch_revalidates_after_staged_schema_amendment() {
         let session = open_session().await;
         let schema = serde_json::json!({
