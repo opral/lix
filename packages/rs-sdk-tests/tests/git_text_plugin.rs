@@ -18,6 +18,67 @@ struct GitTextLine {
 }
 
 #[tokio::test]
+async fn git_text_same_line_branch_conflict_uses_static_canonical_resolver() {
+    let lix = open_lix(OpenLixOptions::new(lix_sdk::Memory::new()))
+        .await
+        .expect("workspace should open");
+    install_plugin(&lix, &build_plugin_archive())
+        .await
+        .expect("Git text plugin should install");
+
+    let path = "/same-line.txt";
+    write_file(&lix, path, b"base\n")
+        .await
+        .expect("base line should import");
+    let target_branch_id = lix.active_branch_id().await.expect("target branch");
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-000000000507".to_owned()),
+            name: "Git text conflict source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("source branch should create");
+
+    write_file(&lix, path, b"target\n")
+        .await
+        .expect("target line should change");
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .expect("source branch should activate");
+    write_file(&lix, path, b"source\n")
+        .await
+        .expect("source line should change");
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: target_branch_id,
+    })
+    .await
+    .expect("target branch should reactivate");
+
+    lix.reset_plugin_transition_counters();
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("the default static resolver should resolve the line conflict");
+    let merged = read_file(&lix, path)
+        .await
+        .expect("merged file should exist");
+    assert!(
+        matches!(merged.as_slice(), b"target\n" | b"source\n"),
+        "canonical resolution must select one complete side"
+    );
+    let counters = lix.plugin_transition_counters();
+    assert_eq!(counters.conflict_resolution_calls, 1);
+    assert_eq!(counters.conflict_resolution_records, 1);
+    assert_eq!(counters.conflict_resolution_takes, 1);
+
+    lix.close().await.expect("workspace should close");
+}
+
+#[tokio::test]
 async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
     let storage = lix_sdk::Memory::new();
     let lix = open_lix(OpenLixOptions::new(storage.clone()))

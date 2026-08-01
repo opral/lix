@@ -100,8 +100,8 @@ use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
 };
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateScanRequest,
-    TrackedStateStoreReader,
+    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateKey,
+    TrackedStateScanRequest, TrackedStateStoreReader,
 };
 use crate::transaction::commit;
 use crate::transaction::normalization::{
@@ -171,17 +171,120 @@ use crate::transaction::validation::{
 };
 use crate::wasm::{
     WasmCertifiedEntityBatch, WasmChangeEffect, WasmColdFileUpdate, WasmComponentActor,
-    WasmComponentFactory, WasmConflictUpdate, WasmDocumentCheckpoint, WasmDocumentHandle,
-    WasmDurableDocumentCheckpoint, WasmEntityChange, WasmEntityConflict, WasmEntityKey,
-    WasmEntityUpdate, WasmFileDescriptor, WasmFileUpdate, WasmHostBytes, WasmHostEntity,
-    WasmHostEntityChanges, WasmOpenEntitiesInput, WasmOpenFileInput, WasmPluginSelection,
-    WasmTransitionLimits,
+    WasmComponentFactory, WasmConflictResolution, WasmConflictTake, WasmConflictUpdate,
+    WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint, WasmEntityChange,
+    WasmEntityConflict, WasmEntityKey, WasmEntityUpdate, WasmFileDescriptor, WasmFileUpdate,
+    WasmHostBytes, WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput, WasmOpenFileInput,
+    WasmPluginSelection, WasmTransitionLimits,
 };
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TransactionCommitOutcome {
     pub(crate) storage_stats: StorageWriteSetStats,
+}
+
+#[derive(Clone)]
+struct StaleConflictPayload {
+    snapshot: SharedStr,
+    metadata: Option<SharedStr>,
+}
+
+struct StaleSemanticConflict {
+    key: TrackedStateKey,
+    base: Option<StaleConflictPayload>,
+    a: Option<StaleConflictPayload>,
+    b: Option<StaleConflictPayload>,
+}
+
+struct StalePluginConflictGroup {
+    plugin: PluginRegistryEntry,
+    descriptor: WasmFileDescriptor,
+    conflicts: Vec<StaleSemanticConflict>,
+}
+
+fn stale_payload_from_tracked(
+    row: Option<crate::tracked_state::MaterializedTrackedStateRowRef<'_>>,
+) -> Option<StaleConflictPayload> {
+    row.filter(|row| !row.deleted()).and_then(|row| {
+        Some(StaleConflictPayload {
+            snapshot: row.snapshot_content()?.clone(),
+            metadata: row.metadata().cloned(),
+        })
+    })
+}
+
+fn stale_conflict_bytes(payload: Option<&StaleConflictPayload>) -> Option<WasmHostBytes> {
+    payload
+        .map(|payload| WasmHostBytes::Inline(Bytes::copy_from_slice(payload.snapshot.as_bytes())))
+}
+
+fn push_stale_conflict_resolution(
+    rows: &mut RawWriteBatch,
+    conflict: &StaleSemanticConflict,
+    resolution: WasmConflictResolution<WasmHostBytes>,
+    branch_id: &str,
+) -> Result<(), LixError> {
+    let (snapshot, metadata) = match resolution {
+        WasmConflictResolution::Take(side) => {
+            let selected = match side {
+                WasmConflictTake::Base => conflict.base.as_ref(),
+                WasmConflictTake::A => conflict.a.as_ref(),
+                WasmConflictTake::B => conflict.b.as_ref(),
+            }
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "plugin conflict resolver selected an absent value; use delete for a tombstone",
+                )
+            })?;
+            (
+                Some(TransactionJson::from_unvalidated_shared_normalized_content(
+                    selected.snapshot.clone(),
+                )),
+                selected
+                    .metadata
+                    .clone()
+                    .map(TransactionJson::from_unvalidated_shared_normalized_content),
+            )
+        }
+        WasmConflictResolution::Delete => (None, None),
+        WasmConflictResolution::Replace {
+            snapshot_content,
+            effect,
+        } => {
+            let WasmHostBytes::CanonicalJson(snapshot) = snapshot_content else {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "validated conflict replacement is not canonical JSON",
+                ));
+            };
+            let metadata = match effect {
+                WasmChangeEffect::Content => None,
+                WasmChangeEffect::FormatOnly => Some(v2_format_only_metadata()),
+            };
+            (
+                Some(TransactionJson::from_canonical_batch(snapshot)),
+                metadata,
+            )
+        }
+    };
+    rows.push_parts(
+        Some(conflict.key.entity_pk.clone()),
+        SharedStr::from(conflict.key.schema_key.as_str()),
+        conflict.key.file_id.as_deref().map(SharedStr::from),
+        snapshot,
+        metadata,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        false,
+        SharedStr::from(branch_id),
+    );
+    Ok(())
 }
 
 /// The durable identity and byte proof of one plugin materialization.
@@ -366,7 +469,7 @@ fn record_transaction_path_index_build(descriptor_rows: usize) {
 /// that may write. Write-relevant reads must be exposed from this transaction,
 /// after the storage write transaction has begun, rather than from session-level
 /// helpers.
-pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
+pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     active_branch_id: String,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
@@ -383,12 +486,20 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
     branch_head_control_cache: Arc<BranchHeadControlCache>,
-    storage: StorageAdapter<StorageImpl>,
+    /// Coherent storage snapshot retained for explicit transaction reads.
+    /// This field is declared before `storage` so it is dropped first.
+    opening_read: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
+    storage: Arc<StorageAdapter<StorageImpl>>,
     functions: FunctionProviderHandle,
     /// Tracked-state revision observed by the coherent transaction-open read.
     /// Durable tracked publication must still be based on this revision;
     /// untracked current-state writes do not invalidate the tracked snapshot.
     opening_tracked_mutation_revision: Option<Bytes>,
+    /// Branch roots captured by the same coherent opening read. They let an
+    /// explicit transaction distinguish a disjoint concurrent commit from an
+    /// overlapping semantic write without creating a temporary branch.
+    opening_active_branch_head: Option<CommitId>,
+    opening_global_branch_head: Option<CommitId>,
     commit_boundary: Option<TransactionCommitBoundary>,
     trust_filesystem_planner: bool,
     origin_key: Option<SharedStr>,
@@ -532,22 +643,516 @@ impl<StorageImpl> Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    pub(crate) fn ensure_opening_snapshot_is_current(
-        &self,
-    ) -> impl Future<Output = Result<(), LixError>> + Send + 'static {
-        let storage = self.storage.clone();
-        let opening_revision = self.opening_tracked_mutation_revision.clone();
-        async move {
-            let current = storage.load_tracked_mutation_revision().await?;
-            if current == opening_revision {
-                return Ok(());
-            }
-            Err(LixError::new(
-                LixError::CODE_TRANSACTION_CONFLICT,
-                "transaction snapshot is stale because tracked state changed after it opened",
-            )
-            .with_hint("Retry the transaction against the latest committed state."))
+    fn opening_read(&self) -> SharedStorageAdapterRead<StorageImpl::Read<'static>> {
+        self.opening_read.clone()
+    }
+
+    async fn reconcile_stale_disjoint_writes<S>(
+        &mut self,
+        read: &S,
+        prepared_writes: &mut PreparedWriteSet,
+    ) -> Result<(), LixError>
+    where
+        S: StorageAdapterRead,
+    {
+        let current_revision =
+            StorageAdapter::<StorageImpl>::load_tracked_mutation_revision_from_read(read).await?;
+        if current_revision == self.opening_tracked_mutation_revision {
+            return Ok(());
         }
+
+        let conflict = |message: &'static str| {
+            LixError::new(LixError::CODE_TRANSACTION_CONFLICT, message)
+                .with_hint("Retry the transaction against the latest committed state.")
+        };
+        if prepared_writes.state_rows.iter().any(|row| {
+            row.untracked || row.global || row.branch_id.as_str() != self.active_branch_id
+        }) || !prepared_writes.extra_commit_parents_by_branch.is_empty()
+            || !prepared_writes
+                .first_commit_parent_override_by_branch
+                .is_empty()
+            || !prepared_writes.intermediate_commits.is_empty()
+            || !prepared_writes.checkpoint_publications.is_empty()
+            || prepared_writes
+                .commit_change_refs_by_branch
+                .keys()
+                .any(|branch_id| branch_id != &self.active_branch_id)
+        {
+            return Err(conflict(
+                "transaction snapshot is stale and contains writes outside the supported semantic reconciliation lane",
+            ));
+        }
+
+        let branch_reader = self.branch_ctx.ref_reader(read);
+        let current_global_head = branch_reader.load_head_commit_id(GLOBAL_BRANCH_ID).await?;
+        let current_active_head = branch_reader
+            .load_head_commit_id(&self.active_branch_id)
+            .await?;
+        if self.opening_active_branch_head.is_some() && current_active_head.is_none() {
+            return Err(LixError::new(
+                LixError::CODE_BRANCH_NOT_FOUND,
+                format!("branch '{}' does not exist", self.active_branch_id),
+            ));
+        }
+        if current_global_head != self.opening_global_branch_head {
+            return Err(conflict(
+                "transaction snapshot is stale because global schemas or plugin state changed after it opened",
+            ));
+        }
+        if current_active_head == self.opening_active_branch_head {
+            self.opening_tracked_mutation_revision = current_revision;
+            return Ok(());
+        }
+        let Some(opening_head) = self.opening_active_branch_head else {
+            return Err(conflict(
+                "transaction snapshot is stale because its branch lifecycle changed after it opened",
+            ));
+        };
+        let Some(current_head) = current_active_head else {
+            return Err(LixError::new(
+                LixError::CODE_BRANCH_NOT_FOUND,
+                format!("branch '{}' does not exist", self.active_branch_id),
+            ));
+        };
+
+        let mut tracked = self.tracked_state.reader(read);
+        let concurrent = tracked
+            .diff_commits(
+                &opening_head.to_string(),
+                &current_head.to_string(),
+                &TrackedStateDiffRequest::default(),
+            )
+            .await?;
+        let overlapping_row_indices = prepared_writes
+            .state_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                concurrent
+                    .entries
+                    .iter()
+                    .any(|entry| {
+                        row.schema_key.as_str() == entry.identity.schema_key()
+                            && row.file_id.map(SharedStr::as_str) == entry.identity.file_id()
+                            && row.entity_pk == entry.identity.entity_pk()
+                    })
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if !overlapping_row_indices.is_empty() {
+            // Ordinary INSERT races keep their established constraint surface:
+            // commit-time validation reports the exact UNIQUE/statement-index
+            // error from the current snapshot. Updates and file-scoped semantic
+            // rows cannot safely use that absence-check lane.
+            let ordinary_insert_race = overlapping_row_indices.iter().all(|&index| {
+                prepared_writes.insert_selection.contains(index)
+                    && prepared_writes.state_rows.row(index).file_id.is_none()
+            });
+            if !ordinary_insert_race {
+                self.resolve_stale_plugin_overlaps(
+                    read,
+                    prepared_writes,
+                    &concurrent,
+                    opening_head,
+                    current_head,
+                )
+                .await?;
+            }
+        }
+
+        self.opening_active_branch_head = Some(current_head);
+        self.opening_tracked_mutation_revision = current_revision;
+        Ok(())
+    }
+
+    async fn resolve_stale_plugin_overlaps<S>(
+        &mut self,
+        read: &S,
+        prepared_writes: &mut PreparedWriteSet,
+        concurrent: &crate::tracked_state::TrackedStateDiff,
+        opening_head: CommitId,
+        current_head: CommitId,
+    ) -> Result<(), LixError>
+    where
+        S: StorageAdapterRead,
+    {
+        let conflict_error = || {
+            LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "concurrent transaction changed an overlapping entity outside a stable plugin-owned file",
+            )
+            .with_hint("Retry the transaction against the latest committed state.")
+        };
+        let concurrent_keys = concurrent
+            .entries
+            .iter()
+            .map(|entry| TrackedStateKey {
+                schema_key: entry.identity.schema_key().to_owned(),
+                file_id: entry.identity.file_id().map(str::to_owned),
+                entity_pk: entry.identity.entity_pk().clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        let candidate_indices = prepared_writes
+            .state_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let key = TrackedStateKey {
+                    schema_key: row.schema_key.to_string(),
+                    file_id: row.file_id.map(|file_id| file_id.to_string()),
+                    entity_pk: row.entity_pk.clone(),
+                };
+                (concurrent_keys.contains(&key)
+                    && row.file_id.is_some()
+                    && !matches!(
+                        row.schema_key.as_str(),
+                        BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
+                    ))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if candidate_indices.is_empty() {
+            return Err(conflict_error());
+        }
+        let file_ids = candidate_indices
+            .iter()
+            .map(|&index| {
+                prepared_writes
+                    .state_rows
+                    .row(index)
+                    .file_id
+                    .expect("candidate has file id")
+                    .to_string()
+            })
+            .collect::<BTreeSet<_>>();
+        if concurrent_keys.iter().any(|key| {
+            prepared_writes.state_rows.iter().any(|row| {
+                row.schema_key.as_str() == key.schema_key
+                    && row.file_id.map(SharedStr::as_str) == key.file_id.as_deref()
+                    && row.entity_pk == &key.entity_pk
+            }) && (!file_ids.contains(key.file_id.as_deref().unwrap_or_default())
+                || !matches!(
+                    key.schema_key.as_str(),
+                    BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
+                ) && !candidate_indices.iter().any(|&index| {
+                    let row = prepared_writes.state_rows.row(index);
+                    row.schema_key.as_str() == key.schema_key
+                        && row.file_id.map(SharedStr::as_str) == key.file_id.as_deref()
+                        && row.entity_pk == &key.entity_pk
+                }))
+        }) {
+            return Err(conflict_error());
+        }
+
+        let owner_keys = file_ids
+            .iter()
+            .map(|file_id| TrackedStateKey {
+                schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
+                file_id: Some(file_id.clone()),
+                entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
+            })
+            .collect::<Vec<_>>();
+        let registry_key = TrackedStateKey {
+            schema_key: KEY_VALUE_SCHEMA_KEY.to_owned(),
+            file_id: None,
+            entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
+        };
+        let mut tracked = self.tracked_state.reader(read);
+        let base_owners = tracked
+            .load_projected_batch_at_commit(
+                &opening_head.to_string(),
+                &owner_keys,
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        let current_owners = tracked
+            .load_projected_batch_at_commit(
+                &current_head.to_string(),
+                &owner_keys,
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        let base_registry = tracked
+            .load_projected_batch_at_commit(
+                &opening_head.to_string(),
+                std::slice::from_ref(&registry_key),
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        let current_registry = tracked
+            .load_projected_batch_at_commit(
+                &current_head.to_string(),
+                std::slice::from_ref(&registry_key),
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        let base_registry_row = base_registry.row(0);
+        let current_registry_row = current_registry.row(0);
+        if base_registry_row.map(|row| row.change_id())
+            != current_registry_row.map(|row| row.change_id())
+        {
+            return Err(conflict_error());
+        }
+        let registry_snapshot = current_registry_row
+            .filter(|row| !row.deleted())
+            .and_then(|row| row.snapshot_content())
+            .map(|snapshot| serde_json::from_str(snapshot.as_str()))
+            .transpose()
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!("plugin registry snapshot is invalid JSON: {error}"),
+                )
+            })?;
+        let registry = PluginRegistry::from_optional_snapshot(registry_snapshot.as_ref())?;
+
+        let path_index = self
+            .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
+                self.active_branch_id.clone(),
+            ]))
+            .await?;
+        let mut groups = BTreeMap::<String, StalePluginConflictGroup>::new();
+        for (owner_index, file_id) in file_ids.iter().enumerate() {
+            let base_owner_row = base_owners.row(owner_index);
+            let current_owner_row = current_owners.row(owner_index);
+            if base_owner_row.map(|row| row.change_id())
+                != current_owner_row.map(|row| row.change_id())
+            {
+                return Err(conflict_error());
+            }
+            let owner = current_owner_row
+                .filter(|row| !row.deleted())
+                .map(PluginFileOwner::from_tracked_state_row_ref)
+                .transpose()?
+                .flatten()
+                .ok_or_else(conflict_error)?;
+            let plugin = registry
+                .plugin(owner.plugin_key())
+                .filter(|plugin| plugin.schema_keys() == owner.schema_keys())
+                .cloned()
+                .ok_or_else(conflict_error)?;
+            let paths = path_index.exact_file_id_entries(file_id);
+            let path = paths
+                .iter()
+                .find(|entry| entry.key.branch_id() == self.active_branch_id)
+                .map(|entry| entry.path.clone())
+                .ok_or_else(conflict_error)?;
+            groups.insert(
+                file_id.clone(),
+                StalePluginConflictGroup {
+                    descriptor: WasmFileDescriptor {
+                        path: Some(path.clone()),
+                        media_type: inferred_media_type_for_path(Some(&path)).map(str::to_owned),
+                        plugin: WasmPluginSelection {
+                            plugin_key: plugin.key().to_owned(),
+                            generation: plugin.archive_blob_hash().to_owned(),
+                        },
+                    },
+                    plugin,
+                    conflicts: Vec::new(),
+                },
+            );
+        }
+
+        let candidate_keys = candidate_indices
+            .iter()
+            .map(|&index| {
+                let row = prepared_writes.state_rows.row(index);
+                TrackedStateKey {
+                    schema_key: row.schema_key.to_string(),
+                    file_id: row.file_id.map(|file_id| file_id.to_string()),
+                    entity_pk: row.entity_pk.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let base_rows = tracked
+            .load_projected_batch_at_commit(
+                &opening_head.to_string(),
+                &candidate_keys,
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        let current_rows = tracked
+            .load_projected_batch_at_commit(
+                &current_head.to_string(),
+                &candidate_keys,
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        for (slot, &row_index) in candidate_indices.iter().enumerate() {
+            let source = prepared_writes.state_rows.row(row_index);
+            let file_id = source.file_id.expect("candidate has file id").to_string();
+            let group = groups.get_mut(&file_id).ok_or_else(conflict_error)?;
+            if !group
+                .plugin
+                .schema_keys()
+                .iter()
+                .any(|schema_key| schema_key == source.schema_key.as_str())
+            {
+                return Err(conflict_error());
+            }
+            let target = current_rows.row(slot);
+            let source_payload = source.snapshot.map(|snapshot| StaleConflictPayload {
+                snapshot: snapshot.materialize_shared(),
+                metadata: source
+                    .metadata
+                    .map(|metadata| metadata.materialize_shared()),
+            });
+            let target_payload = stale_payload_from_tracked(target);
+            let source_change_id = source.change_id.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "staged tracked plugin row is missing change_id",
+                )
+            })?;
+            let source_order = (source.updated_at, source_change_id);
+            let target_order = target.map(|row| (row.updated_at(), row.change_id()));
+            let (a, b) = if target_order.is_some_and(|order| order < source_order) {
+                (target_payload, source_payload)
+            } else {
+                (source_payload, target_payload)
+            };
+            group.conflicts.push(StaleSemanticConflict {
+                key: candidate_keys[slot].clone(),
+                base: stale_payload_from_tracked(base_rows.row(slot)),
+                a,
+                b,
+            });
+        }
+
+        // Staging the original stale semantic update retained a successor
+        // actor. Retire it before admitting the short-lived static resolver;
+        // otherwise two same-base transactions can exhaust the bounded Store
+        // pool while one waits for capacity held by its own superseded work.
+        let (superseded, retained): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.pending_plugin_actor_publications)
+                .into_iter()
+                .partition(|publication| file_ids.contains(&publication.session_key().file_id));
+        self.pending_plugin_actor_publications = retained;
+        discard_plugin_actor_publications(superseded).await;
+        self.pending_file_view_mutations
+            .retain(|key, _| !file_ids.contains(&key.file_id));
+
+        let mut reconciliation_batches = Vec::<RawWriteBatch>::with_capacity(
+            candidate_indices
+                .len()
+                .saturating_add(prepared_writes.state_rows.len()),
+        );
+        for group in groups.values() {
+            let conflicts = group
+                .conflicts
+                .iter()
+                .enumerate()
+                .map(|(ordinal, conflict)| {
+                    Ok(WasmEntityConflict {
+                        ordinal: u32::try_from(ordinal).map_err(|_| {
+                            LixError::new(
+                                LixError::CODE_INVALID_PLUGIN,
+                                "plugin conflict batch exceeds the u32 ordinal limit",
+                            )
+                        })?,
+                        key: WasmEntityKey::from_owned_parts(
+                            conflict.key.schema_key.clone(),
+                            conflict.key.entity_pk.clone().into_parts(),
+                        ),
+                        base: stale_conflict_bytes(conflict.base.as_ref()),
+                        a: stale_conflict_bytes(conflict.a.as_ref()),
+                        b: stale_conflict_bytes(conflict.b.as_ref()),
+                    })
+                })
+                .collect::<Result<Vec<_>, LixError>>()?;
+            let resolutions = self
+                .resolve_plugin_conflicts(&group.plugin, group.descriptor.clone(), conflicts)
+                .await?;
+            for (conflict, resolution) in group.conflicts.iter().zip(resolutions.resolutions) {
+                let mut rows = RawWriteBatch::with_capacity(1);
+                push_stale_conflict_resolution(
+                    &mut rows,
+                    conflict,
+                    resolution,
+                    &self.active_branch_id,
+                )?;
+                reconciliation_batches.push(rows);
+            }
+        }
+        let conflict_row_indices = candidate_indices.iter().copied().collect::<BTreeSet<_>>();
+        for (index, row) in prepared_writes.state_rows.iter().enumerate() {
+            if conflict_row_indices.contains(&index) {
+                continue;
+            }
+            let Some(file_id) = row.file_id.map(SharedStr::as_str) else {
+                continue;
+            };
+            let Some(group) = groups.get(file_id) else {
+                continue;
+            };
+            if !group
+                .plugin
+                .schema_keys()
+                .iter()
+                .any(|schema_key| schema_key == row.schema_key.as_str())
+            {
+                continue;
+            }
+            let mut rows = RawWriteBatch::with_capacity(1);
+            rows.push_parts(
+                Some(row.entity_pk.clone()),
+                row.schema_key.clone(),
+                row.file_id.cloned(),
+                row.snapshot.map(|snapshot| {
+                    TransactionJson::from_unvalidated_shared_normalized_content(
+                        snapshot.materialize_shared(),
+                    )
+                }),
+                row.metadata.map(|metadata| {
+                    TransactionJson::from_unvalidated_shared_normalized_content(
+                        metadata.materialize_shared(),
+                    )
+                }),
+                row.origin.cloned(),
+                Some(row.created_at.to_string().into()),
+                Some(row.updated_at.to_string().into()),
+                row.global,
+                row.change_id.map(|change_id| change_id.to_string().into()),
+                None,
+                row.untracked,
+                row.branch_id.clone(),
+            );
+            reconciliation_batches.push(rows);
+        }
+        // Plugins may deliberately accept only one semantic edit per warm
+        // transition. Preserve the accumulated conflict decision while
+        // replaying its resolved and retained edits through one actor in order.
+        for rows in reconciliation_batches {
+            self.stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows,
+            })
+            .await?;
+        }
+        let mut replacement = self.staged_writes.drain()?;
+        let mut latest_file_data = BTreeMap::new();
+        for write in replacement.file_data_writes.drain(..) {
+            latest_file_data.insert((write.branch_id.clone(), write.file_id.clone()), write);
+        }
+        replacement
+            .file_data_writes
+            .extend(latest_file_data.into_values());
+        let commit_id = prepared_writes
+            .commit_change_refs_by_branch
+            .get(&self.active_branch_id)
+            .map(|change_refs| change_refs.commit_id)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "stale semantic transaction is missing its staged commit identity",
+                )
+            })?;
+        for index in 0..replacement.state_rows.len() {
+            replacement.state_rows.set_commit_id(index, Some(commit_id));
+        }
+        prepared_writes.replace_reconciled_file_writes(replacement, &file_ids);
+        Ok(())
     }
 
     /// Opens an execution-scoped staging area for SQL/provider hooks.
@@ -563,8 +1168,14 @@ where
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         session_file_views: SessionFileViews,
     ) -> Result<OpenTransaction<StorageImpl>, LixError> {
-        let read =
-            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+        let storage = Arc::new(storage);
+        let read = storage.begin_read(StorageReadOptions::default()).await?;
+        // SAFETY: `storage` is retained in the transaction behind an `Arc` and
+        // `opening_read` is declared before it, so the widened read is always
+        // dropped before the storage value that produced it.
+        let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
+        let opening_read = SharedStorageAdapterRead::new(read);
+        let read = opening_read.clone();
         let setup_result = async {
             let active_branch_id =
                 resolve_active_branch_id(mode, live_state.as_ref(), branch_ctx.as_ref(), &read)
@@ -597,6 +1208,14 @@ where
             let opening_tracked_mutation_revision =
                 StorageAdapter::<StorageImpl>::load_tracked_mutation_revision_from_read(&read)
                     .await?;
+            let branch_reader = branch_ctx.ref_reader(&read);
+            let opening_active_branch_head =
+                branch_reader.load_head_commit_id(&active_branch_id).await?;
+            let opening_global_branch_head = if active_branch_id == GLOBAL_BRANCH_ID {
+                opening_active_branch_head
+            } else {
+                branch_reader.load_head_commit_id(GLOBAL_BRANCH_ID).await?
+            };
             Ok::<_, LixError>((
                 active_branch_id,
                 runtime_functions,
@@ -604,6 +1223,8 @@ where
                 sql_schema_catalog,
                 tracked_schema_catalog,
                 opening_tracked_mutation_revision,
+                opening_active_branch_head,
+                opening_global_branch_head,
             ))
         }
         .await;
@@ -614,6 +1235,8 @@ where
             sql_schema_catalog,
             tracked_schema_catalog,
             opening_tracked_mutation_revision,
+            opening_active_branch_head,
+            opening_global_branch_head,
         ) = match setup_result {
             Ok(result) => result,
             Err(error) => {
@@ -646,9 +1269,12 @@ where
                 filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
                 filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
                 branch_head_control_cache: Arc::new(BranchHeadControlCache::default()),
+                opening_read,
                 storage,
                 functions,
                 opening_tracked_mutation_revision,
+                opening_active_branch_head,
+                opening_global_branch_head,
                 commit_boundary: None,
                 trust_filesystem_planner: false,
                 origin_key: None,
@@ -674,7 +1300,7 @@ where
     ) -> Result<TransactionCommitOutcome, LixError> {
         let mut transaction = self;
         let commit_boundary = transaction.commit_boundary.clone();
-        let prepared_writes = match transaction.staged_writes.drain() {
+        let mut prepared_writes = match transaction.staged_writes.drain() {
             Ok(prepared_writes) => prepared_writes,
             Err(error) => {
                 transaction
@@ -707,11 +1333,30 @@ where
         // final write's tracked-state precondition fences the decisions made
         // here, including plugin-produced prepared rows.
         let commit_read_storage = transaction.storage.clone();
-        let mut read = SharedStorageAdapterRead::new(
-            commit_read_storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let commit_read = commit_read_storage
+            .begin_read(StorageReadOptions::default())
+            .await?;
+        // SAFETY: `commit_read_storage` is an `Arc` retained through commit,
+        // and the transaction drops this read before its storage field.
+        let commit_read = unsafe { assume_static_storage_read::<StorageImpl>(commit_read) };
+        let mut read = SharedStorageAdapterRead::new(commit_read);
+        // Commit-time reconciliation and validation must all observe this
+        // current coherent snapshot, while user statements above observed the
+        // snapshot retained from transaction open.
+        transaction.opening_read = read.clone();
+        if let Err(error) = transaction
+            .reconcile_stale_disjoint_writes(&read, &mut prepared_writes)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.transaction_reconcile_stale"
+            ))
+            .await
+        {
+            transaction
+                .discard_pending_plugin_actor_publications()
+                .await;
+            return Err(error);
+        }
         let commit_parent_heads = match commit::resolve_prepared_commit_parent_heads(
             transaction.branch_ctx.as_ref(),
             &read,
@@ -1031,6 +1676,21 @@ where
             &mut self.pending_plugin_actor_publications,
         ))
         .await;
+    }
+
+    /// Releases private plugin actor leases after an explicit write statement.
+    ///
+    /// The durable semantic rows and checkpoints remain staged in this
+    /// transaction. Keeping the live actor leased until commit would serialize
+    /// another same-base transaction that edits the same file, so explicit
+    /// transactions retain only the cold-open marker between statements.
+    pub(crate) async fn release_pending_plugin_actor_leases(&mut self) {
+        let publications = std::mem::take(&mut self.pending_plugin_actor_publications);
+        let mut uncached = Vec::with_capacity(publications.len());
+        for publication in publications {
+            uncached.push(publication.into_uncached().await);
+        }
+        self.pending_plugin_actor_publications = uncached;
     }
 
     /// Stages one decoded write batch into this transaction.
@@ -1384,12 +2044,8 @@ where
             staged: staged.clone(),
             rows: prospective_rows,
         };
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let base = self.live_state.reader(read);
+        let read = self.opening_read();
+        let base = self.live_state.snapshot_reader(read);
         preflight_derived_path_stability(&base, &staged, &prospective, &prospective.rows).await
     }
 
@@ -1510,11 +2166,7 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let base = self
             .live_state
             .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
@@ -5794,8 +6446,7 @@ where
         statement: DataFusionStatement,
         params: Vec<Value>,
     ) -> Result<SqlQueryResult, LixError> {
-        let storage = self.storage.clone();
-        let read = storage.begin_read(StorageReadOptions::default()).await?;
+        let read_store = self.opening_read();
         let active_branch_id = self.active_branch_id.clone();
         let live_state = Arc::clone(&self.live_state);
         let binary_cas = Arc::clone(&self.binary_cas);
@@ -5809,29 +6460,24 @@ where
         let branch_head_control_cache = Arc::clone(&self.branch_head_control_cache);
         let plugin_host = self.plugin_host.clone();
 
-        with_static_transaction_sql_read::<StorageImpl, _, _>(read, |read_store| async move {
-            let read_ctx = TransactionSqlReadExecutionContext {
-                active_branch_id,
-                read_store,
-                live_state,
-                binary_cas,
-                branch_ctx,
-                visible_schemas,
-                functions,
-                staged,
-                staged_writes,
-                filesystem_path_index_cache,
-                filesystem_path_index_epoch,
-                branch_head_control_cache,
-                plugin_host,
-            };
-            let result = crate::sql2::execute_transaction_read_statement_from_parsed(
-                &read_ctx, self, &sql, statement, &params,
-            )
-            .await;
-            drop(read_ctx);
-            result
-        })
+        let read_ctx = TransactionSqlReadExecutionContext {
+            active_branch_id,
+            read_store,
+            live_state,
+            binary_cas,
+            branch_ctx,
+            visible_schemas,
+            functions,
+            staged,
+            staged_writes,
+            filesystem_path_index_cache,
+            filesystem_path_index_epoch,
+            branch_head_control_cache,
+            plugin_host,
+        };
+        crate::sql2::execute_transaction_read_statement_from_parsed(
+            &read_ctx, self, &sql, statement, &params,
+        )
         .await
     }
 
@@ -5948,11 +6594,7 @@ where
         head_commit_id: CommitId,
         request: &TrackedStateDiffRequest,
     ) -> Result<Option<TrackedWorkingDiff>, LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let Some(control) = BranchHeadControlContext::new()
             .reader(read.clone())
             .load(branch_id)
@@ -6678,42 +7320,12 @@ where
     }
 }
 
-/// Runs one transaction SQL read using a widened storage-read lifetime.
-///
-/// DataFusion requires provider state to be `'static`, but transaction reads
-/// are scoped to the current storage snapshot. Keep this bridge private to
-/// transaction SQL execution so no crate-level API can receive the widened
-/// storage read handle.
-async fn with_static_transaction_sql_read<StorageImpl, F, Fut>(
-    read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
-    f: F,
-) -> Result<SqlQueryResult, LixError>
-where
-    StorageImpl: Storage + 'static,
-    F: FnOnce(SharedStorageAdapterRead<StorageImpl::Read<'static>>) -> Fut,
-    Fut: Future<Output = Result<SqlQueryResult, LixError>>,
-{
-    // SAFETY: the widened read is wrapped immediately in `SharedStorageAdapterRead`,
-    // only passed into this private SQL execution closure, and explicitly
-    // dropped before returning. Escaped clones are detected by `finish()`.
-    let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
-    let read = SharedStorageAdapterRead::new(read);
-    let finish = read.clone();
-    let result = f(read).await;
-    let finish_result = finish.finish().map_err(LixError::from);
-    match (result, finish_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (_, Err(finish_error)) => Err(finish_error),
-    }
-}
-
 /// Erases the storage borrow lifetime for scoped transaction SQL execution.
 ///
 /// # Safety
 ///
 /// The returned read scope must not outlive the storage value that produced
-/// `read`, and it must be dropped before the enclosing SQL execution returns.
+/// `read`, and it must be dropped before that value.
 unsafe fn assume_static_storage_read<StorageImpl>(
     read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
 ) -> StorageAdapterReadScope<StorageImpl::Read<'static>>
@@ -6949,7 +7561,7 @@ fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWr
         })
 }
 
-pub(crate) struct OpenTransaction<StorageImpl: Storage = Memory> {
+pub(crate) struct OpenTransaction<StorageImpl: Storage + 'static = Memory> {
     pub(crate) transaction: Transaction<StorageImpl>,
     pub(crate) runtime_functions: FunctionContext,
 }
@@ -7048,14 +7660,14 @@ where
         &mut self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
         let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
         if descriptor_epoch == 0 {
-            return self.live_state.reader(read).path_index(request).await;
+            return self
+                .live_state
+                .snapshot_reader(read)
+                .path_index(request)
+                .await;
         }
         // The revision probe is only a cache-freshness optimization. Preserve the
         // pre-cache overlay behavior if a storage fault affects that single key.
@@ -7071,7 +7683,7 @@ where
             return Ok(index);
         }
         let staged = self.staged_writes.staging_overlay()?;
-        let base = self.live_state.reader(read);
+        let base = self.live_state.snapshot_reader(read);
         let rows = overlay_scan_batch(&base, &staged, &request.live_state_request()).await?;
         #[cfg(test)]
         record_transaction_path_index_build(rows.len());
@@ -7086,11 +7698,7 @@ where
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
+        let read = self.opening_read();
 
         self.branch_ctx
             .ref_reader(read)

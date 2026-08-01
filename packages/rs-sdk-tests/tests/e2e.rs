@@ -5848,6 +5848,209 @@ async fn v2_json_entity_write_rollback_keeps_original_bytes_and_actor() {
 }
 
 #[tokio::test]
+async fn same_base_json_transactions_resolve_overlap_and_converge() {
+    let archive = build_json_plugin_archive();
+    let first = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &first,
+        "plugin_json",
+        &archive,
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/transaction-conflict.json";
+    write_file(&first, path, b"{\"value\":\"base\"}\n".to_vec())
+        .await
+        .unwrap();
+    let file_id = file_id_at_path(&first, path).await;
+    let second = first.open_workspace_session().await.unwrap();
+    let mut first_transaction = first.begin_transaction().await.unwrap();
+    let mut second_transaction = second.begin_transaction().await.unwrap();
+    for (transaction, value) in [
+        (&mut first_transaction, r#""first""#),
+        (&mut second_transaction, r#""second""#),
+    ] {
+        transaction
+            .execute(
+                "UPDATE json_object_member SET scalar_json = $1 \
+                 WHERE parent_id = 'root' AND key = 'value' AND lixcol_file_id = $2",
+                &[Value::Text(value.to_owned()), Value::Text(file_id.clone())],
+            )
+            .await
+            .unwrap();
+    }
+
+    first.reset_plugin_transition_counters();
+    first_transaction.commit().await.unwrap();
+    second_transaction
+        .commit()
+        .await
+        .expect("stale plugin overlap should resolve at commit");
+    let counters = first.plugin_transition_counters();
+    assert_eq!(counters.conflict_resolution_calls, 1);
+    assert_eq!(counters.conflict_resolution_records, 1);
+    let first_bytes = read_file(&first, path).await.unwrap().unwrap();
+    let second_bytes = read_file(&second, path).await.unwrap().unwrap();
+    assert_eq!(first_bytes, second_bytes);
+    assert_ne!(first_bytes, b"{\"value\":\"base\"}\n");
+    second.close().await.unwrap();
+    first.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_json_transaction_renders_retained_same_file_edits_with_resolutions() {
+    let archive = build_json_plugin_archive();
+    let stale_client = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &stale_client,
+        "plugin_json",
+        &archive,
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/partial-transaction-conflict.json";
+    write_file(
+        &stale_client,
+        path,
+        b"{\"overlap\":\"base\",\"retained\":\"base\"}\n".to_vec(),
+    )
+    .await
+    .unwrap();
+    let winner_client = stale_client.open_workspace_session().await.unwrap();
+    let mut stale = stale_client.begin_transaction().await.unwrap();
+    let mut winner = winner_client.begin_transaction().await.unwrap();
+    stale
+        .execute(
+            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            &[
+                Value::Blob(
+                    b"{\"overlap\":\"stale\",\"retained\":\"stale\"}\n"
+                        .to_vec()
+                        .into(),
+                ),
+                Value::Text(path.to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+    winner
+        .execute(
+            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            &[
+                Value::Blob(
+                    b"{\"overlap\":\"winner\",\"retained\":\"base\"}\n"
+                        .to_vec()
+                        .into(),
+                ),
+                Value::Text(path.to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+
+    stale_client.reset_plugin_transition_counters();
+    winner.commit().await.unwrap();
+    stale.commit().await.unwrap();
+    assert_eq!(
+        stale_client
+            .plugin_transition_counters()
+            .conflict_resolution_calls,
+        1
+    );
+    let bytes = read_file(&stale_client, path).await.unwrap().unwrap();
+    let rendered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rendered["retained"], "stale");
+    assert_eq!(read_file(&winner_client, path).await.unwrap(), Some(bytes));
+    winner_client.close().await.unwrap();
+    stale_client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn same_base_transactions_resolve_reference_plugin_file_overlaps() {
+    let cases = [
+        (
+            "json",
+            "plugin_json",
+            build_json_plugin_archive(),
+            vec!["json_root", "json_object_member", "json_array_item"],
+            b"{\"value\":\"base\"}\n".to_vec(),
+            b"{\"value\":\"first\"}\n".to_vec(),
+            b"{\"value\":\"second\"}\n".to_vec(),
+        ),
+        (
+            "csv",
+            "plugin_csv",
+            build_csv_plugin_archive(),
+            vec!["csv_v2_table", "csv_v2_row"],
+            b"name,value\nitem,base\n".to_vec(),
+            b"name,value\nitem,first\n".to_vec(),
+            b"name,value\nitem,second\n".to_vec(),
+        ),
+        (
+            "markdown",
+            "plugin_markdown",
+            build_markdown_plugin_archive(),
+            vec!["markdown_node_v2"],
+            b"# Base\n".to_vec(),
+            b"# First\n".to_vec(),
+            b"# Second\n".to_vec(),
+        ),
+        (
+            "text",
+            "plugin_git_text",
+            build_text_plugin_archive(),
+            vec!["git_text_line_v2"],
+            b"base\n".to_vec(),
+            b"first\n".to_vec(),
+            b"second\n".to_vec(),
+        ),
+    ];
+
+    for (extension, plugin_key, archive, schemas, base, first_edit, second_edit) in cases {
+        let first = open_lix(OpenLixOptions::default()).await.unwrap();
+        install_reference_plugin_in_blank_registry(&first, plugin_key, &archive, &schemas).await;
+        let path = format!("/transaction-conflict.{extension}");
+        write_file(&first, &path, base.clone()).await.unwrap();
+        let second = first.open_workspace_session().await.unwrap();
+        let mut first_transaction = first.begin_transaction().await.unwrap();
+        let mut second_transaction = second.begin_transaction().await.unwrap();
+        for (transaction, bytes) in [
+            (&mut first_transaction, first_edit),
+            (&mut second_transaction, second_edit),
+        ] {
+            transaction
+                .execute(
+                    "UPDATE lix_file SET data = $1 WHERE path = $2",
+                    &[Value::Blob(bytes.into()), Value::Text(path.clone())],
+                )
+                .await
+                .unwrap();
+        }
+
+        first.reset_plugin_transition_counters();
+        first_transaction.commit().await.unwrap();
+        second_transaction
+            .commit()
+            .await
+            .unwrap_or_else(|error| panic!("{extension} overlap should resolve: {error}"));
+        let counters = first.plugin_transition_counters();
+        assert!(
+            counters.conflict_resolution_calls > 0,
+            "{extension} must invoke its conflict resolver"
+        );
+        let first_bytes = read_file(&first, &path).await.unwrap().unwrap();
+        let second_bytes = read_file(&second, &path).await.unwrap().unwrap();
+        assert_eq!(
+            first_bytes, second_bytes,
+            "{extension} clients must converge"
+        );
+        assert_ne!(first_bytes, base, "{extension} must commit a resolved edit");
+        second.close().await.unwrap();
+        first.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn v2_json_rejects_mixed_byte_and_entity_transitions_in_one_transaction() {
     let archive = build_json_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
@@ -7832,6 +8035,34 @@ fn build_markdown_plugin_archive() -> Vec<u8> {
         (
             "schema/markdown_node_v2.json",
             include_str!("../../../plugins/markdown/schema/markdown_node_v2.json").as_bytes(),
+        ),
+        ("plugin.wasm", wasm.as_slice()),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn build_text_plugin_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text"));
+    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read bindep-built text v3 wasm at {}: {error}",
+            wasm_path.display()
+        )
+    });
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        (
+            "manifest.json",
+            include_str!("../../../plugins/text/manifest.json").as_bytes(),
+        ),
+        (
+            "schema/git_text_line_v2.json",
+            include_str!("../../../plugins/text/schema/git_text_line_v2.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {

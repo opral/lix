@@ -3504,6 +3504,7 @@ dependencies = [
  "lix_sdk",
  "lix_slatedb_storage",
  "object_store 0.14.0",
+ "plugin_json",
  "serde",
  "serde_json",
  "sha2",
@@ -3513,6 +3514,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "zip",
  "zstd",
 ]
 

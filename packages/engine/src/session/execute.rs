@@ -2256,9 +2256,6 @@ where
                 sql2::bind_statement_route(&statement)?,
                 sql2::BoundStatementRoute::Read
             );
-            if is_read {
-                transaction.ensure_opening_snapshot_is_current().await?;
-            }
             // A successful explicit transaction retains its function provider
             // until commit. Rewind deterministic runtime state whenever this
             // statement fails, including errors before a direct RETURNING
@@ -2288,11 +2285,8 @@ where
                     .await
                 };
                 let result = result.map_err(|error| normalize_sql_surface_error(error, sql))?;
-                if is_read {
-                    // The query opens its own coherent storage read. Checking on both sides
-                    // ensures a concurrent tracked commit cannot leak a newer snapshot
-                    // through an older explicit transaction.
-                    transaction.ensure_opening_snapshot_is_current().await?;
+                if !is_read {
+                    transaction.release_pending_plugin_actor_leases().await;
                 }
                 Ok(result)
             }

@@ -204,6 +204,24 @@ impl LiveStateContext {
         }
     }
 
+    /// Creates a reader whose derived indexes are private to one retained
+    /// storage snapshot. Process-wide caches intentionally advance with live
+    /// commits and therefore cannot serve an older explicit transaction.
+    pub(crate) fn snapshot_reader<S>(&self, store: S) -> LiveStateStoreReader<S>
+    where
+        S: StorageAdapterRead,
+    {
+        LiveStateStoreReader {
+            store,
+            tracked_head: self.tracked_head,
+            commit_graph: self.commit_graph.clone(),
+            filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
+            entity_field_index_cache: std::sync::Arc::new(EntitySnapshotFieldIndexCache::default()),
+            entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
+            branch_head_control_cache: None,
+        }
+    }
+
     pub(crate) fn advance_filesystem_path_indexes(
         &self,
         previous_revision: Option<&[u8]>,
