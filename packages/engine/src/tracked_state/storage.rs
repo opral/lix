@@ -39,11 +39,11 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_MANIFEST_NAMESPACE: &str =
 pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE: &str =
     "tracked_state.commit_delta_segment.v3";
 pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE: &str = "tracked_state.change_locator.v2";
-pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0001),
     TRACKED_STATE_TREE_CHUNK_NAMESPACE,
 );
-pub(crate) const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0004),
     TRACKED_STATE_COMMIT_ROOT_NAMESPACE,
 );
@@ -52,11 +52,11 @@ pub(crate) const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::n
 /// Immutable roots are sparse checkpoints. The manifest maps an identity to
 /// one small front-coded segment, avoiding both one RocksDB key per mutation
 /// on writes and full-commit hydration for historical point replay.
-pub(crate) const TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0019),
     TRACKED_STATE_COMMIT_DELTA_MANIFEST_NAMESPACE,
 );
-pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_001a),
     TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE,
 );
@@ -64,7 +64,7 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace = Storag
 /// (`0x0004_001b..=0x0004_001d`). Backends order the space prefix first, so a
 /// locator above those spaces makes each mixed manifest/locator SST overlap
 /// unrelated live-state point reads.
-pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0018),
     TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE,
 );
@@ -5349,7 +5349,7 @@ where
         let mut slots = result.values.iter_mut();
         for request in requests {
             for (key, slot) in request.keys.iter().zip(slots.by_ref()) {
-                let Some(bytes) = self.staged_bytes(request.space, key) else {
+                let Some(bytes) = self.staged_bytes(request.space.id, key) else {
                     continue;
                 };
                 *slot = Some(match request.opts.projection {
@@ -5363,12 +5363,11 @@ where
 
     async fn scan(
         &self,
-        space: StorageSpaceId,
+        space: StorageSpace,
         range: StorageKeyRange,
         opts: StorageScanOptions,
     ) -> Result<StorageScanChunk, StorageError> {
-        if space == TRACKED_STATE_COMMIT_ROOT_SPACE.id || space == TRACKED_STATE_TREE_CHUNK_SPACE.id
-        {
+        if space == TRACKED_STATE_COMMIT_ROOT_SPACE || space == TRACKED_STATE_TREE_CHUNK_SPACE {
             return Err(StorageError::Io(
                 "tracked-state staged audit supports point reads only for overlay spaces"
                     .to_string(),

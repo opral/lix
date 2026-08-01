@@ -2,6 +2,8 @@
 
 pub mod conformance;
 mod error;
+#[doc(hidden)]
+pub mod immutable;
 mod in_memory;
 mod predicate;
 mod traits;
@@ -21,6 +23,6 @@ pub use types::{
     BufferRange, CommitResult, CoreProjection, EncodedMutationBatch, EncodedMutationBatchError,
     EncodedPut, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS,
     Prefix, ProjectedValue, PutBatch, PutEntry, ReadConsistency, ReadDurability, ReadEntry,
-    ReadOptions, ScanChunk, ScanOptions, SnapshotRef, SpaceId, StoredValue, WriteOptions,
-    WriteStats,
+    ReadOptions, ScanChunk, ScanOptions, SnapshotRef, SpaceId, StorageSpace, StoredValue,
+    ValueSemantics, WriteOptions, WriteStats,
 };

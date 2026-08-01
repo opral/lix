@@ -33,18 +33,18 @@ pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
 pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
 pub(crate) const HOT_COLLECTION_CONTROL_NAMESPACE: &str = "live_state.hot_collection_control.v1";
 pub(crate) const HOT_ROW_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_001b), HOT_ROW_NAMESPACE);
+    StorageSpace::mutable(StorageSpaceId(0x0004_001b), HOT_ROW_NAMESPACE);
 /// Conservative `(branch, generation, schema)` file-membership markers.
 ///
 /// The authoritative hot row owns every value and file identity. Markers are
 /// never removed within a generation, so they may produce a harmless false
 /// positive after the last file member is deleted but cannot hide live rows.
 pub(crate) const HOT_FILE_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_001c), HOT_FILE_NAMESPACE);
+    StorageSpace::mutable(StorageSpaceId(0x0004_001c), HOT_FILE_NAMESPACE);
 /// Reserved for the row-level first-before working-diff index.
 pub(crate) const HOT_DIFF_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_001d), HOT_DIFF_NAMESPACE);
-pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpace::mutable(StorageSpaceId(0x0004_001d), HOT_DIFF_NAMESPACE);
+pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0023),
     HOT_COLLECTION_CONTROL_NAMESPACE,
 );
@@ -53,11 +53,11 @@ pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::new(
 /// Each tiny record points at one already-authored packed commit delta. Fresh
 /// validated inserts publish the reference instead of duplicating every row
 /// into `HOT_ROW`; later updates and deletes remain sparse HOT overlays.
-pub(crate) const PACKED_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const PACKED_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0024),
     "live_state.packed_current_base.v1",
 );
-pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0025),
     "live_state.packed_current_base_control.v1",
 );
@@ -66,7 +66,7 @@ pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace:
 /// Complete collection replacements retire every indexed predecessor for the
 /// schema without inspecting or risking packed bases shared by unrelated
 /// schemas.
-pub(crate) const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0027),
     "live_state.packed_current_exclusive_schema_base.v1",
 );
@@ -82,15 +82,15 @@ const HOT_DIFF_PACK_MIN_IDENTITIES: usize = 64;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V1: &[u8; 4] = b"CEB1";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V2: &[u8; 4] = b"CEB2";
-pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_001f),
     "live_state.certified_entity_batch.v1",
 );
-pub(crate) const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0021),
     "live_state.certified_entity_batch_manifest.v1",
 );
-pub(crate) const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0022),
     "live_state.certified_entity_batch_page.v1",
 );
@@ -8977,8 +8977,7 @@ mod tests {
     use crate::branch::{BranchHeadControl, stage_branch_head_control};
     use crate::storage_adapter::{
         Memory, StorageAdapter, StorageGetManyRequest, StorageGetManyResult, StorageKeyRange,
-        StorageReadOptions, StorageScanChunk, StorageScanOptions, StorageSpaceId,
-        StorageWriteOptions,
+        StorageReadOptions, StorageScanChunk, StorageScanOptions, StorageWriteOptions,
     };
 
     #[test]
@@ -9176,7 +9175,7 @@ mod tests {
 
         async fn scan(
             &self,
-            space: StorageSpaceId,
+            space: StorageSpace,
             range: StorageKeyRange,
             opts: StorageScanOptions,
         ) -> Result<StorageScanChunk, crate::storage_adapter::StorageError> {
@@ -9203,7 +9202,7 @@ mod tests {
         ) -> Result<StorageGetManyResult, crate::storage_adapter::StorageError> {
             if requests
                 .iter()
-                .any(|request| request.space == crate::json_store::store::JSON_SPACE.id)
+                .any(|request| request.space == crate::json_store::store::JSON_SPACE)
             {
                 self.json_get_many_calls.fetch_add(1, Ordering::Relaxed);
             }
@@ -9212,7 +9211,7 @@ mod tests {
 
         async fn scan(
             &self,
-            space: StorageSpaceId,
+            space: StorageSpace,
             range: StorageKeyRange,
             opts: StorageScanOptions,
         ) -> Result<StorageScanChunk, crate::storage_adapter::StorageError> {

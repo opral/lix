@@ -3835,8 +3835,8 @@ mod tests {
     use http_body_util::BodyExt as _;
     use lix_sdk::{
         Blob, CommitResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite, OpenLixOptions,
-        PutBatch, ReadOptions, RequestBlobSpliceProvenance, SpaceId, StorageError, StorageWrite,
-        TracingTelemetrySink, WriteOptions, open_lix, open_lix_with_telemetry,
+        PutBatch, ReadOptions, RequestBlobSpliceProvenance, StorageError, StorageSpace,
+        StorageWrite, TracingTelemetrySink, WriteOptions, open_lix, open_lix_with_telemetry,
     };
     use lix_slatedb_storage::{SlateDB, SlateDBObjectStoreOptions, SlateDBRead, SlateDBWrite};
     use object_store::memory::InMemory as ObjectStoreMemory;
@@ -4238,19 +4238,23 @@ mod tests {
     impl StorageWrite for PostCommitUnknownWrite {
         async fn put_many(
             &mut self,
-            space: SpaceId,
+            space: StorageSpace,
             entries: PutBatch,
         ) -> Result<(), StorageError> {
             self.inner.put_many(space, entries).await
         }
 
-        async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), StorageError> {
+        async fn delete_many(
+            &mut self,
+            space: StorageSpace,
+            keys: &[Key],
+        ) -> Result<(), StorageError> {
             self.inner.delete_many(space, keys).await
         }
 
         async fn delete_range(
             &mut self,
-            space: SpaceId,
+            space: StorageSpace,
             range: KeyRange,
         ) -> Result<(), StorageError> {
             self.inner.delete_range(space, range).await
@@ -4333,19 +4337,23 @@ mod tests {
     impl StorageWrite for PostCommitUnknownSlateDBWrite {
         async fn put_many(
             &mut self,
-            space: SpaceId,
+            space: StorageSpace,
             entries: PutBatch,
         ) -> Result<(), StorageError> {
             self.inner.put_many(space, entries).await
         }
 
-        async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), StorageError> {
+        async fn delete_many(
+            &mut self,
+            space: StorageSpace,
+            keys: &[Key],
+        ) -> Result<(), StorageError> {
             self.inner.delete_many(space, keys).await
         }
 
         async fn delete_range(
             &mut self,
-            space: SpaceId,
+            space: StorageSpace,
             range: KeyRange,
         ) -> Result<(), StorageError> {
             self.inner.delete_range(space, range).await

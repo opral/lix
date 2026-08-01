@@ -37,7 +37,7 @@ mod tests {
     }
 
     fn space() -> StorageSpace {
-        StorageSpace::new(SpaceId(1), "test.space")
+        StorageSpace::mutable(SpaceId(1), "test.space")
     }
 
     #[derive(Clone, Default)]
@@ -68,7 +68,7 @@ mod tests {
 
         fn scan(
             &self,
-            _space: SpaceId,
+            _space: StorageSpace,
             range: KeyRange,
             _opts: ScanOptions,
         ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
@@ -105,7 +105,7 @@ mod tests {
 
         async fn scan(
             &self,
-            _space: SpaceId,
+            _space: StorageSpace,
             _range: KeyRange,
             _opts: ScanOptions,
         ) -> Result<ScanChunk, StorageError> {
@@ -125,7 +125,7 @@ mod tests {
         let left = shared.clone();
         let left_task = tokio::spawn(async move {
             left.get_many(&[GetManyRequest {
-                space: SpaceId(1),
+                space: StorageSpace::mutable(SpaceId(1), "test.mutable"),
                 keys: &[],
                 opts: GetOptions::default(),
             }])
@@ -135,7 +135,7 @@ mod tests {
         let right_task = tokio::spawn(async move {
             right
                 .get_many(&[GetManyRequest {
-                    space: SpaceId(1),
+                    space: StorageSpace::mutable(SpaceId(1), "test.mutable"),
                     keys: &[],
                     opts: GetOptions::default(),
                 }])

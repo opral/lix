@@ -11,21 +11,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bytes::{Buf, Bytes};
+use lix_engine::storage::immutable::validate_immutable_batch;
 use lix_engine::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue,
-    WriteOptions, WriteStats,
+    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
+    StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use rocksdb::Snapshot;
-use rocksdb::{BlockBasedOptions, DB, Direction, IteratorMode, Options, WriteBatch};
+use rocksdb::{
+    BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,
+    WriteBatch,
+};
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const DEFAULT_BLOB_MIN_SIZE: u64 = 32 * 1024;
 const DEFAULT_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
 const BLOB_GC_FORCE_THRESHOLD: f64 = 0.5;
+const MUTABLE_COLUMN_FAMILY: &str = "default";
+const IMMUTABLE_COLUMN_FAMILY: &str = "lix-immutable-v1";
 
 #[derive(Debug)]
 pub struct RocksDBFactory {
@@ -53,6 +59,7 @@ struct RocksDBInner {
 
 #[allow(missing_debug_implementations)]
 pub struct RocksDBRead<'a> {
+    db: &'a DB,
     snapshot: Snapshot<'a>,
 }
 
@@ -125,7 +132,15 @@ impl RocksDB {
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
-        self.inner.db.flush().map_err(rocksdb_error)
+        for name in [MUTABLE_COLUMN_FAMILY, IMMUTABLE_COLUMN_FAMILY] {
+            let cf = self
+                .inner
+                .db
+                .cf_handle(name)
+                .expect("configured column family is open");
+            self.inner.db.flush_cf(cf).map_err(rocksdb_error)?;
+        }
+        Ok(())
     }
 
     /// Flushes the WAL without forcing the active memtable into an SST.
@@ -157,6 +172,7 @@ impl Storage for RocksDB {
                 return Err(StorageError::Durability);
             }
             Ok(RocksDBRead {
+                db: &self.inner.db,
                 snapshot: self.inner.db.snapshot(),
             })
         }
@@ -187,16 +203,18 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
     let mut failures = Vec::new();
     for (index, precondition) in preconditions.iter().enumerate() {
         let matches = match precondition {
-            Precondition::KeyAbsent { space, key } => db
-                .get(physical_key(*space, key).0)
-                .map_err(rocksdb_error)?
-                .is_none(),
-            Precondition::KeyPresent { space, key } => db
-                .get(physical_key(*space, key).0)
-                .map_err(rocksdb_error)?
-                .is_some(),
+            Precondition::KeyAbsent { space, key } => !key_exists(
+                db,
+                column_family(db, *space),
+                &physical_key(space.id, key).0,
+            )?,
+            Precondition::KeyPresent { space, key } => key_exists(
+                db,
+                column_family(db, *space),
+                &physical_key(space.id, key).0,
+            )?,
             Precondition::KeyValueHashEquals { space, key, hash } => db
-                .get(physical_key(*space, key).0)
+                .get_cf(column_family(db, *space), physical_key(space.id, key).0)
                 .map_err(rocksdb_error)?
                 .is_some_and(|value| blake3::hash(&value).as_bytes() == hash),
             Precondition::KeyValueEquals {
@@ -204,27 +222,15 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
                 key,
                 expected,
             } => db
-                .get(physical_key(*space, key).0)
+                .get_cf(column_family(db, *space), physical_key(space.id, key).0)
                 .map_err(rocksdb_error)?
                 .is_some_and(|value| value.as_slice() == expected.as_ref()),
             Precondition::RangeEmpty { space, range } => {
-                let bounds = EncodedBounds::new(physical_range(*space, range.clone()), None);
-                let mut empty = true;
-                for item in db.iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
-                {
-                    let (key, _) = item.map_err(rocksdb_error)?;
-                    if !bounds.after_lower(&key) {
-                        continue;
-                    }
-                    if bounds.before_upper(&key) {
-                        empty = false;
-                    }
-                    break;
-                }
-                empty
+                let bounds = EncodedBounds::new(physical_range(space.id, range.clone()), None);
+                range_is_empty(db, column_family(db, *space), &bounds)?
             }
             Precondition::BranchEquals { ref_key, expected } => db
-                .get(ref_key.0.as_ref())
+                .get_cf(mutable_column_family(db), ref_key.0.as_ref())
                 .map_err(rocksdb_error)?
                 .is_some_and(|value| value.as_slice() == expected.as_ref()),
         };
@@ -239,8 +245,46 @@ fn check_preconditions(db: &DB, preconditions: &[Precondition]) -> Result<(), St
     }
 }
 
-/// RocksDB keeps its single-keyspace layout; spaces are scoped by prefixing
-/// the 4-byte big-endian space id internally. Reads return logical keys.
+fn column_family(db: &DB, space: StorageSpace) -> &ColumnFamily {
+    match space.value_semantics {
+        ValueSemantics::Mutable => mutable_column_family(db),
+        ValueSemantics::Immutable => db
+            .cf_handle(IMMUTABLE_COLUMN_FAMILY)
+            .expect("immutable column family is opened with the database"),
+    }
+}
+
+fn mutable_column_family(db: &DB) -> &ColumnFamily {
+    db.cf_handle(MUTABLE_COLUMN_FAMILY)
+        .expect("default column family is opened with the database")
+}
+
+fn key_exists(db: &DB, cf: &ColumnFamily, key: &[u8]) -> Result<bool, StorageError> {
+    let mut iterator = db.raw_iterator_cf(cf);
+    iterator.seek(key);
+    iterator.status().map_err(rocksdb_error)?;
+    Ok(iterator.key().is_some_and(|candidate| candidate == key))
+}
+
+fn range_is_empty(
+    db: &DB,
+    cf: &ColumnFamily,
+    bounds: &EncodedBounds,
+) -> Result<bool, StorageError> {
+    let mut iterator = db.raw_iterator_cf(cf);
+    iterator.seek(&bounds.lower_seek);
+    while let Some(key) = iterator.key() {
+        if bounds.after_lower(key) {
+            return Ok(!bounds.before_upper(key));
+        }
+        iterator.next();
+    }
+    iterator.status().map_err(rocksdb_error)?;
+    Ok(true)
+}
+
+/// Spaces share the column family for their value semantics and are scoped by
+/// a four-byte big-endian space id prefix within that physical domain.
 fn physical_key(space: SpaceId, key: &Key) -> Key {
     let mut bytes = Vec::with_capacity(4 + key.0.len());
     bytes.extend_from_slice(&space.0.to_be_bytes());
@@ -274,53 +318,53 @@ impl StorageRead for RocksDBRead<'_> {
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         async move {
-            if let [request] = requests
-                && let [key] = request.keys
-            {
-                let physical_key = physical_key(request.space, key);
-                let value = self
-                    .snapshot
-                    .get(physical_key.0.as_ref())
-                    .map_err(rocksdb_error)?;
-                return Ok(GetManyResult::new(vec![value.map(|value| {
-                    project_owned_value(value, request.opts.projection)
-                })]));
-            }
-            let physical_keys = requests
-                .iter()
-                .flat_map(|request| {
-                    request
-                        .keys
-                        .iter()
-                        .map(|key| physical_key(request.space, key))
-                })
-                .collect::<Vec<_>>();
-            let mut values = self
-                .snapshot
-                .multi_get(physical_keys.iter().map(|key| key.0.as_ref()))
-                .into_iter();
-            let mut results = Vec::with_capacity(physical_keys.len());
+            let key_count = requests.iter().map(|request| request.keys.len()).sum();
+            let mut results = Vec::with_capacity(key_count);
             for request in requests {
-                let request_values = values
-                    .by_ref()
-                    .take(request.keys.len())
-                    .map(|value| {
-                        value.map_err(rocksdb_error).map(|value| {
-                            value.map(|value| project_owned_value(value, request.opts.projection))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                results.extend(request_values);
+                let cf = column_family(self.db, request.space);
+                let physical_keys = request
+                    .keys
+                    .iter()
+                    .map(|key| physical_key(request.space.id, key))
+                    .collect::<Vec<_>>();
+                match request.opts.projection {
+                    CoreProjection::KeyOnly => {
+                        for key in &physical_keys {
+                            let mut iterator = self.snapshot.raw_iterator_cf(cf);
+                            iterator.seek(key.0.as_ref());
+                            iterator.status().map_err(rocksdb_error)?;
+                            results.push(
+                                iterator
+                                    .key()
+                                    .is_some_and(|candidate| candidate == key.0.as_ref())
+                                    .then_some(ProjectedValue::KeyOnly),
+                            );
+                        }
+                    }
+                    CoreProjection::FullValue => {
+                        let values = self
+                            .snapshot
+                            .multi_get_cf(physical_keys.iter().map(|key| (cf, key.0.as_ref())));
+                        results.extend(
+                            values
+                                .into_iter()
+                                .map(|value| {
+                                    value.map_err(rocksdb_error).map(|value| {
+                                        value.map(|value| ProjectedValue::FullValue(value.into()))
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?,
+                        );
+                    }
+                }
             }
-            let unexpected_value = values.next();
-            debug_assert!(unexpected_value.is_none());
             Ok(GetManyResult::new(results))
         }
     }
 
     fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
@@ -334,30 +378,60 @@ impl StorageRead for RocksDBRead<'_> {
             let resume_after = opts
                 .resume_after
                 .as_ref()
-                .map(|key| physical_key(space, key));
-            let bounds = EncodedBounds::new(physical_range(space, range), resume_after.as_ref());
+                .map(|key| physical_key(space.id, key));
+            let bounds = EncodedBounds::new(physical_range(space.id, range), resume_after.as_ref());
             let mut entries = Vec::with_capacity(opts.page_size());
-            for item in self
-                .snapshot
-                .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
-            {
-                let (encoded_key, value) = item.map_err(rocksdb_error)?;
-                if !bounds.after_lower(encoded_key.as_ref()) {
-                    continue;
+            let cf = column_family(self.db, space);
+            match opts.projection {
+                CoreProjection::KeyOnly => {
+                    let mut iterator = self.snapshot.raw_iterator_cf(cf);
+                    iterator.seek(&bounds.lower_seek);
+                    while let Some(encoded_key) = iterator.key() {
+                        if bounds.after_lower(encoded_key) {
+                            if !bounds.before_upper(encoded_key) {
+                                break;
+                            }
+                            if entries.len() == opts.page_size() {
+                                return Ok(ScanChunk {
+                                    entries,
+                                    has_more: true,
+                                });
+                            }
+                            entries.push(ReadEntry {
+                                key: logical_key_from_physical(
+                                    encoded_key.to_vec().into_boxed_slice(),
+                                ),
+                                value: ProjectedValue::KeyOnly,
+                            });
+                        }
+                        iterator.next();
+                    }
+                    iterator.status().map_err(rocksdb_error)?;
                 }
-                if !bounds.before_upper(encoded_key.as_ref()) {
-                    break;
+                CoreProjection::FullValue => {
+                    for item in self.snapshot.iterator_cf(
+                        cf,
+                        IteratorMode::From(&bounds.lower_seek, Direction::Forward),
+                    ) {
+                        let (encoded_key, value) = item.map_err(rocksdb_error)?;
+                        if !bounds.after_lower(encoded_key.as_ref()) {
+                            continue;
+                        }
+                        if !bounds.before_upper(encoded_key.as_ref()) {
+                            break;
+                        }
+                        if entries.len() == opts.page_size() {
+                            return Ok(ScanChunk {
+                                entries,
+                                has_more: true,
+                            });
+                        }
+                        entries.push(ReadEntry {
+                            key: logical_key_from_physical(encoded_key),
+                            value: project_owned_value(value, opts.projection),
+                        });
+                    }
                 }
-                if entries.len() == opts.page_size() {
-                    return Ok(ScanChunk {
-                        entries,
-                        has_more: true,
-                    });
-                }
-                entries.push(ReadEntry {
-                    key: logical_key_from_physical(encoded_key),
-                    value: project_owned_value(value, opts.projection),
-                });
             }
             Ok(ScanChunk {
                 entries,
@@ -370,10 +444,13 @@ impl StorageRead for RocksDBRead<'_> {
 impl StorageWrite for RocksDBWrite {
     fn put_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
+            if space.value_semantics == ValueSemantics::Immutable {
+                validate_immutable_batch(&entries)?;
+            }
             let max_key_bytes = entries
                 .entries
                 .iter()
@@ -381,7 +458,8 @@ impl StorageWrite for RocksDBWrite {
                 .max()
                 .unwrap_or(0);
             let mut physical_key = Vec::with_capacity(max_key_bytes);
-            let space_prefix = space.0.to_be_bytes();
+            let cf = column_family(&self.inner.db, space);
+            let space_prefix = space.id.0.to_be_bytes();
             for entry in entries.entries {
                 physical_key.clear();
                 physical_key.extend_from_slice(&space_prefix);
@@ -389,7 +467,8 @@ impl StorageWrite for RocksDBWrite {
                 let value = stored_value_bytes(entry.value);
                 self.stats.put_entries += 1;
                 self.stats.written_bytes += value.len() as u64;
-                self.batch.put(physical_key.as_slice(), value.as_ref());
+                self.batch
+                    .put_cf(cf, physical_key.as_slice(), value.as_ref());
             }
             self.stats.storage_calls += 1;
             Ok(())
@@ -398,7 +477,7 @@ impl StorageWrite for RocksDBWrite {
 
     fn delete_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         keys: &[Key],
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
@@ -406,13 +485,14 @@ impl StorageWrite for RocksDBWrite {
                 bytes.saturating_add(4).saturating_add(key.0.len())
             });
             let mut key_bytes = Vec::with_capacity(physical_key_bytes);
-            let space_prefix = space.0.to_be_bytes();
+            let cf = column_family(&self.inner.db, space);
+            let space_prefix = space.id.0.to_be_bytes();
             for key in keys {
                 let key_start = key_bytes.len();
                 key_bytes.extend_from_slice(&space_prefix);
                 key_bytes.extend_from_slice(&key.0);
                 let key_end = key_bytes.len();
-                self.batch.delete(&key_bytes[key_start..key_end]);
+                self.batch.delete_cf(cf, &key_bytes[key_start..key_end]);
             }
             self.stats.deleted_entries += keys.len() as u64;
             self.stats.storage_calls += 1;
@@ -422,20 +502,21 @@ impl StorageWrite for RocksDBWrite {
 
     fn delete_range(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            let range = physical_range(space, range);
+            let cf = column_family(&self.inner.db, space);
+            let range = physical_range(space.id, range);
             if let Some((lower, upper)) = rocksdb_delete_range_bounds(&range) {
-                self.batch.delete_range(lower.as_slice(), upper.as_slice());
+                self.batch
+                    .delete_range_cf(cf, lower.as_slice(), upper.as_slice());
             } else {
                 let bounds = EncodedBounds::new(range, None);
-                for item in self
-                    .inner
-                    .db
-                    .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
-                {
+                for item in self.inner.db.iterator_cf(
+                    cf,
+                    IteratorMode::From(&bounds.lower_seek, Direction::Forward),
+                ) {
                     let (encoded_key, _value) = item.map_err(rocksdb_error)?;
                     let encoded_key = encoded_key.as_ref();
                     if !bounds.after_lower(encoded_key) {
@@ -444,7 +525,7 @@ impl StorageWrite for RocksDBWrite {
                     if !bounds.before_upper(encoded_key) {
                         break;
                     }
-                    self.batch.delete(encoded_key);
+                    self.batch.delete_cf(cf, encoded_key);
                 }
             }
             self.stats.deleted_ranges += 1;
@@ -636,29 +717,44 @@ fn registry_key(path: &Path) -> Result<PathBuf, StorageError> {
 }
 
 fn open_rocksdb(path: &Path) -> Result<DB, StorageError> {
+    let mut database_options = Options::default();
+    database_options.create_if_missing(true);
+    database_options.create_missing_column_families(true);
+    database_options.set_use_fsync(false);
+
+    let mut mutable_options = column_family_options();
+    mutable_options.set_compression_type(rocksdb::DBCompressionType::Zstd);
+    mutable_options.set_compression_options(-14, 1, 0, 0);
+
+    let mut immutable_options = column_family_options();
+    // Media payloads are generally compressed already. Blob separation keeps
+    // their bytes out of LSM compaction while the CF retains keys and indexes.
+    immutable_options.set_compression_type(rocksdb::DBCompressionType::None);
+    immutable_options.set_enable_blob_files(true);
+    immutable_options.set_min_blob_size(DEFAULT_BLOB_MIN_SIZE);
+    immutable_options.set_blob_file_size(DEFAULT_BLOB_FILE_SIZE);
+    immutable_options.set_blob_compression_type(rocksdb::DBCompressionType::None);
+    immutable_options.set_enable_blob_gc(true);
+    immutable_options.set_blob_gc_age_cutoff(0.0);
+    immutable_options.set_blob_gc_force_threshold(BLOB_GC_FORCE_THRESHOLD);
+
+    let column_families = [
+        ColumnFamilyDescriptor::new(MUTABLE_COLUMN_FAMILY, mutable_options),
+        ColumnFamilyDescriptor::new(IMMUTABLE_COLUMN_FAMILY, immutable_options),
+    ];
+    DB::open_cf_descriptors(&database_options, path, column_families)
+        .map_err(|error| rocksdb_open_error(error, path))
+}
+
+fn column_family_options() -> Options {
     let mut options = Options::default();
-    options.create_if_missing(true);
-    options.set_use_fsync(false);
     options.set_write_buffer_size(64 * 1024 * 1024);
-    options.set_compression_type(rocksdb::DBCompressionType::Zstd);
-    options.set_compression_options(-14, 1, 0, 0);
     let mut table_options = BlockBasedOptions::default();
     // Full whole-key filters let missing point reads skip unrelated SST data.
     table_options.set_bloom_filter(8.0, false);
     table_options.set_optimize_filters_for_memory(true);
     options.set_block_based_table_factory(&table_options);
-    options.set_enable_blob_files(true);
-    options.set_min_blob_size(DEFAULT_BLOB_MIN_SIZE);
-    options.set_blob_file_size(DEFAULT_BLOB_FILE_SIZE);
-    options.set_blob_compression_type(rocksdb::DBCompressionType::Zstd);
-    // Lix payloads are immutable CAS objects and repository GC owns their
-    // reachability lifecycle. Do not relocate merely old live blobs during
-    // ordinary compaction (over 10x physical writes in the 20 GiB run), but
-    // retain physical reclamation once a blob file is at least half garbage.
-    options.set_enable_blob_gc(true);
-    options.set_blob_gc_age_cutoff(0.0);
-    options.set_blob_gc_force_threshold(BLOB_GC_FORCE_THRESHOLD);
-    DB::open(&options, path).map_err(|error| rocksdb_open_error(error, path))
+    options
 }
 
 fn stored_value_bytes(value: StoredValue) -> Bytes {

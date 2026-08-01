@@ -218,9 +218,8 @@ pub struct StorageWriteSetArenaStats {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StorageWriteSetError {
     ConflictingSpaceDeclaration {
-        id: SpaceId,
-        existing_name: &'static str,
-        incoming_name: &'static str,
+        existing: StorageSpace,
+        incoming: StorageSpace,
     },
     DuplicateMutation {
         space: StorageSpace,
@@ -693,9 +692,8 @@ impl StorageWriteSet {
         for group in &self.groups {
             if let Some(incoming) = group.conflicting_declarations.first() {
                 return Err(StorageWriteSetError::ConflictingSpaceDeclaration {
-                    id: group.space.id,
-                    existing_name: group.space.name,
-                    incoming_name: incoming.name,
+                    existing: group.space,
+                    incoming: *incoming,
                 });
             }
         }
@@ -747,9 +745,8 @@ impl StorageWriteSet {
         for group in &self.groups {
             if let Some(incoming) = group.conflicting_declarations.first() {
                 return Err(StorageWriteSetError::ConflictingSpaceDeclaration {
-                    id: group.space.id,
-                    existing_name: group.space.name,
-                    incoming_name: incoming.name,
+                    existing: group.space,
+                    incoming: *incoming,
                 });
             }
         }
@@ -796,7 +793,7 @@ impl StorageWriteSet {
             stats.delete_batches += 1;
             stats.storage_calls += 1;
             write
-                .delete_range(space.id, range)
+                .delete_range(space, range)
                 .await
                 .map_err(StorageWriteSetError::Storage)?;
         }
@@ -829,7 +826,7 @@ impl StorageWriteSet {
                 stats.put_batches += 1;
                 stats.storage_calls += 1;
                 write
-                    .put_many(space.id, PutBatch { entries: puts })
+                    .put_many(space, PutBatch { entries: puts })
                     .await
                     .map_err(StorageWriteSetError::Storage)?;
             }
@@ -837,7 +834,7 @@ impl StorageWriteSet {
                 stats.delete_batches += 1;
                 stats.storage_calls += 1;
                 write
-                    .delete_many(space.id, &deletes)
+                    .delete_many(space, &deletes)
                     .await
                     .map_err(StorageWriteSetError::Storage)?;
             }
@@ -856,7 +853,7 @@ impl StorageWriteSet {
                 stats.put_batches += 1;
                 stats.storage_calls += 1;
                 write
-                    .put_many(page.space.id, page.entries)
+                    .put_many(page.space, page.entries)
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
                         "lix.perf.storage_lowering.deferred_put_page"
@@ -898,7 +895,7 @@ impl StorageWriteSet {
     fn group_mut(&mut self, space: StorageSpace) -> &mut StorageWriteGroup {
         if let Some(index) = self.group_index.get(&space.id).copied() {
             let group = &mut self.groups[index];
-            if group.space.name != space.name {
+            if group.space != space {
                 group.conflicting_declarations.push(space);
             }
             return group;
@@ -909,7 +906,7 @@ impl StorageWriteSet {
         self.stats.touched_spaces += 1;
         self.groups.push(StorageWriteGroup::new(space));
         let group = &mut self.groups[index];
-        if group.space.name != space.name {
+        if group.space != space {
             group.conflicting_declarations.push(space);
         }
         group
@@ -1199,13 +1196,10 @@ fn slice_bytes(bytes: &[u8], range: ArenaRange) -> &[u8] {
 impl fmt::Display for StorageWriteSetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ConflictingSpaceDeclaration {
-                id,
-                existing_name,
-                incoming_name,
-            } => write!(
+            Self::ConflictingSpaceDeclaration { existing, incoming } => write!(
                 f,
-                "conflicting storage space declarations for {id:?}: {existing_name} vs {incoming_name}"
+                "conflicting storage space declarations for {:?}: {existing} vs {incoming}",
+                existing.id
             ),
             Self::DuplicateMutation { space, key } => {
                 write!(f, "duplicate storage mutation for {space}/{key:?}")
@@ -1253,19 +1247,19 @@ mod tests {
     }
 
     fn space() -> StorageSpace {
-        StorageSpace::new(SpaceId(1), "test.space")
+        StorageSpace::mutable(SpaceId(1), "test.space")
     }
 
     #[derive(Default)]
     struct CapturingStorageWrite {
-        puts: Vec<(SpaceId, PutBatch)>,
-        deletes: Vec<(SpaceId, Vec<Key>)>,
+        puts: Vec<(StorageSpace, PutBatch)>,
+        deletes: Vec<(StorageSpace, Vec<Key>)>,
     }
 
     impl StorageWrite for CapturingStorageWrite {
         fn put_many(
             &mut self,
-            space: SpaceId,
+            space: StorageSpace,
             entries: PutBatch,
         ) -> impl Future<Output = Result<(), StorageError>> + Send {
             self.puts.push((space, entries));
@@ -1274,7 +1268,7 @@ mod tests {
 
         fn delete_many(
             &mut self,
-            space: SpaceId,
+            space: StorageSpace,
             keys: &[Key],
         ) -> impl Future<Output = Result<(), StorageError>> + Send {
             self.deletes.push((space, keys.to_vec()));
@@ -1283,7 +1277,7 @@ mod tests {
 
         fn delete_range(
             &mut self,
-            _space: SpaceId,
+            _space: StorageSpace,
             _range: KeyRange,
         ) -> impl Future<Output = Result<(), StorageError>> + Send {
             async { Ok(()) }
@@ -1674,6 +1668,22 @@ mod tests {
         assert!(matches!(
             writes.validate(),
             Err(StorageWriteSetError::DuplicateMutation { .. })
+        ));
+    }
+
+    #[test]
+    fn one_space_id_cannot_change_value_semantics() {
+        let mut writes = StorageWriteSet::new();
+        writes.put(space(), key("mutable"), value("A"));
+        writes.put(
+            StorageSpace::immutable(SpaceId(1), "test.space"),
+            key("immutable"),
+            value("B"),
+        );
+
+        assert!(matches!(
+            writes.validate(),
+            Err(StorageWriteSetError::ConflictingSpaceDeclaration { .. })
         ));
     }
 }

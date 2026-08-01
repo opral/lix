@@ -53,7 +53,7 @@ impl ScanPlan {
                 has_more: false,
             }
         } else {
-            read.scan(self.space.id, range, opts.clone()).await?
+            read.scan(self.space, range, opts.clone()).await?
         };
         let mut stats = scan_trace_stats(
             kind,

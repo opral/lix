@@ -9,8 +9,8 @@ use crate::storage::conformance::{StorageFactory, StorageFixture, StorageTestCon
 use crate::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue,
-    WriteOptions, WriteStats,
+    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
+    StorageWrite, StoredValue, WriteOptions, WriteStats,
 };
 
 type InMemoryMap = PersistentMap<Key, Bytes>;
@@ -299,7 +299,7 @@ impl StorageRead for MemoryRead {
             .flat_map(|request| {
                 request.keys.iter().map(|key| {
                     self.entries
-                        .get(&physical_key(request.space, key))
+                        .get(&physical_key(request.space.id, key))
                         .map(|value| project_value(value, request.opts.projection))
                 })
             })
@@ -309,16 +309,16 @@ impl StorageRead for MemoryRead {
 
     async fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {
-        let physical = physical_range(space, range);
+        let physical = physical_range(space.id, range);
         let physical_opts = ScanOptions {
             resume_after: opts
                 .resume_after
                 .as_ref()
-                .map(|key| physical_key(space, key)),
+                .map(|key| physical_key(space.id, key)),
             ..opts
         };
         let mut chunk = collect_range_chunk(&self.entries, physical, &physical_opts);
@@ -330,9 +330,13 @@ impl StorageRead for MemoryRead {
 }
 
 impl StorageWrite for MemoryWrite {
-    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), StorageError> {
+    async fn put_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
         for entry in entries.entries {
-            let key = physical_key(space, &entry.key);
+            let key = physical_key(space.id, &entry.key);
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
@@ -345,9 +349,9 @@ impl StorageWrite for MemoryWrite {
         Ok(())
     }
 
-    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), StorageError> {
+    async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         for key in keys {
-            let key = physical_key(space, key);
+            let key = physical_key(space.id, key);
             if !self.overlay.puts.is_empty() {
                 self.overlay.puts.remove(&key);
             }
@@ -358,8 +362,12 @@ impl StorageWrite for MemoryWrite {
         Ok(())
     }
 
-    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), StorageError> {
-        let range = physical_range(space, range);
+    async fn delete_range(
+        &mut self,
+        space: StorageSpace,
+        range: KeyRange,
+    ) -> Result<(), StorageError> {
+        let range = physical_range(space.id, range);
         let mut base_keys = Vec::new();
         let mut resume_after = None;
         loop {
@@ -431,24 +439,24 @@ fn check_preconditions(
         .filter_map(|(index, precondition)| {
             let matches = match precondition {
                 Precondition::KeyAbsent { space, key } => {
-                    entries.get(&physical_key(*space, key)).is_none()
+                    entries.get(&physical_key(space.id, key)).is_none()
                 }
                 Precondition::KeyPresent { space, key } => {
-                    entries.get(&physical_key(*space, key)).is_some()
+                    entries.get(&physical_key(space.id, key)).is_some()
                 }
                 Precondition::KeyValueHashEquals { space, key, hash } => entries
-                    .get(&physical_key(*space, key))
+                    .get(&physical_key(space.id, key))
                     .is_some_and(|value| blake3::hash(value).as_bytes() == hash),
                 Precondition::KeyValueEquals {
                     space,
                     key,
                     expected,
                 } => entries
-                    .get(&physical_key(*space, key))
+                    .get(&physical_key(space.id, key))
                     .is_some_and(|value| value == expected),
                 Precondition::RangeEmpty { space, range } => collect_range_chunk(
                     entries,
-                    physical_range(*space, range.clone()),
+                    physical_range(space.id, range.clone()),
                     &ScanOptions {
                         limit_rows: 1,
                         projection: CoreProjection::KeyOnly,
@@ -580,7 +588,7 @@ mod tests {
     use crate::storage::{
         GetManyRequest, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Memory, ProjectedValue,
         PutBatch, PutEntry, ReadOptions, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
-        StorageWrite, StoredValue, WriteOptions,
+        StorageSpace, StorageWrite, StoredValue, WriteOptions,
     };
 
     #[tokio::test]
@@ -601,7 +609,7 @@ mod tests {
     #[tokio::test]
     async fn delete_range_covers_more_than_one_scan_page() {
         let storage = Memory::new();
-        let space = SpaceId(7);
+        let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
         let mut write = storage
             .begin_write(WriteOptions::default())
             .await
@@ -665,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_roundtrip_is_deterministic_and_point_in_time() {
         let storage = Memory::new();
-        let space = SpaceId(17);
+        let space = StorageSpace::mutable(SpaceId(17), "test.mutable");
         let key_a = Key(Bytes::from_static(b"a"));
         let key_b = Key(Bytes::from_static(b"b"));
         let mut write = storage

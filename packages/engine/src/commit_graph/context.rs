@@ -504,7 +504,7 @@ mod tests {
         CommitGraphChange, CommitGraphChangeHistoryRequest, CommitGraphContext,
     };
     use crate::storage::{
-        GetManyResult, KeyRange, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead,
+        GetManyResult, KeyRange, ScanChunk, ScanOptions, StorageError, StorageRead,
     };
     use crate::storage_adapter::{
         Memory, MemoryRead, Storage, StorageAdapter, StorageAdapterReadScope, StorageReadOptions,
@@ -527,7 +527,7 @@ mod tests {
         ) -> Result<GetManyResult, StorageError> {
             if requests
                 .iter()
-                .any(|request| request.space == crate::changelog::CHANGE_SPACE.id)
+                .any(|request| request.space == crate::changelog::CHANGE_SPACE)
             {
                 self.change_get_many_calls.fetch_add(1, Ordering::Relaxed);
             }
@@ -536,7 +536,7 @@ mod tests {
 
         async fn scan(
             &self,
-            space: SpaceId,
+            space: crate::storage::StorageSpace,
             range: KeyRange,
             opts: ScanOptions,
         ) -> Result<ScanChunk, StorageError> {

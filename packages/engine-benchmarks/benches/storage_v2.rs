@@ -2187,7 +2187,7 @@ fn physical_point_scan_range(_space_id: u32) -> KeyRange {
 }
 
 fn space(id: u32) -> StorageSpace {
-    StorageSpace::new(SpaceId(id), "bench.storage_v2")
+    StorageSpace::mutable(SpaceId(id), "bench.storage_v2")
 }
 
 fn key(bytes: impl Into<String>) -> Key {

@@ -1005,7 +1005,7 @@ impl StorageRead for CountingRead {
 
     async fn scan(
         &self,
-        space: SpaceId,
+        space: lix_engine::storage::StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {
@@ -1015,8 +1015,8 @@ impl StorageRead for CountingRead {
 }
 
 impl CountingRead {
-    fn count_user_read(&self, space: SpaceId) {
-        if space != SpaceId(0x0007_0001) && !self.counted.swap(true, Ordering::SeqCst) {
+    fn count_user_read(&self, space: lix_engine::storage::StorageSpace) {
+        if space.id != SpaceId(0x0007_0001) && !self.counted.swap(true, Ordering::SeqCst) {
             self.read_count.fetch_add(1, Ordering::SeqCst);
         }
     }

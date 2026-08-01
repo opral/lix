@@ -28,7 +28,7 @@ const REAL_WORKLOAD_ROWS: usize = 10_000;
 const PNPM_LOCK_JSON: &str = include_str!("../fixtures/pnpm-lock.fixture.json");
 const JSON_POINTER_SCHEMA_JSON: &str = include_str!("../fixtures/json_pointer.schema.json");
 const SESSION_INSERT_CHUNK_SIZE: usize = 500;
-const ROW_SPACE: StorageSpace = StorageSpace::new(SpaceId(0x00ff_0001), "bench.untracked_row");
+const ROW_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(0x00ff_0001), "bench.untracked_row");
 
 #[derive(Clone)]
 struct PointerRow {

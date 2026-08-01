@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use lix_engine::storage::{
     GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, WriteOptions,
+    ScanChunk, ScanOptions, Storage, StorageError, StorageRead, WriteOptions,
 };
 use lix_engine::{Engine, ExecuteResult, SessionContext, Value};
 use serde::Serialize;
@@ -844,7 +844,7 @@ impl StorageRead for CountingRead {
 
     async fn scan(
         &self,
-        space: SpaceId,
+        space: lix_engine::storage::StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {

@@ -10,7 +10,7 @@ use bytes::Bytes;
 use lix_sdk::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Lix, LixError,
     ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage,
-    StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
+    StorageError, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions, WriteStats,
     open_lix_with_storage,
 };
 use serde::{Deserialize, Serialize};
@@ -338,7 +338,7 @@ impl StorageRead for FileStorageRead {
                     .flat_map(|request| {
                         request.keys.iter().map(|key| {
                             self.kv
-                                .get(physical_key(request.space, key).as_slice())
+                                .get(physical_key(request.space.id, key).as_slice())
                                 .map(|value| project_value(value, request.opts.projection))
                         })
                     })
@@ -349,7 +349,7 @@ impl StorageRead for FileStorageRead {
 
     fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
@@ -360,11 +360,11 @@ impl StorageRead for FileStorageRead {
                     has_more: false,
                 });
             }
-            let range = physical_range(space, range);
+            let range = physical_range(space.id, range);
             let resume_after = opts
                 .resume_after
                 .as_ref()
-                .map(|key| Key(Bytes::from(physical_key(space, key))));
+                .map(|key| Key(Bytes::from(physical_key(space.id, key))));
             let mut rows = self
                 .kv
                 .iter()
@@ -388,7 +388,7 @@ impl StorageRead for FileStorageRead {
 impl StorageWrite for FileStorageWrite {
     fn put_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
@@ -396,7 +396,7 @@ impl StorageWrite for FileStorageWrite {
                 self.stats.put_entries += 1;
                 self.stats.written_bytes += entry.value.bytes.len() as u64;
                 self.kv.insert(
-                    physical_key(space, &entry.key),
+                    physical_key(space.id, &entry.key),
                     stored_value_bytes(entry.value),
                 );
             }
@@ -407,12 +407,12 @@ impl StorageWrite for FileStorageWrite {
 
     fn delete_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         keys: &[Key],
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             for key in keys {
-                self.kv.remove(physical_key(space, key).as_slice());
+                self.kv.remove(physical_key(space.id, key).as_slice());
             }
             self.stats.deleted_entries += keys.len() as u64;
             self.stats.storage_calls += 1;
@@ -422,11 +422,11 @@ impl StorageWrite for FileStorageWrite {
 
     fn delete_range(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
-            let range = physical_range(space, range);
+            let range = physical_range(space.id, range);
             let before = self.kv.len();
             self.kv
                 .retain(|key, _| !key_matches_range(key, &range, None));

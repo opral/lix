@@ -42,14 +42,14 @@ pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifes
 pub(crate) const BINARY_CAS_CHUNK_NAMESPACE: &str = "binary_cas.chunk";
 pub(crate) const BINARY_CAS_CHUNK_PRESENCE_NAMESPACE: &str = "binary_cas.chunk_presence";
 pub(crate) const BINARY_CAS_MANIFEST_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0005_0001), BINARY_CAS_MANIFEST_NAMESPACE);
-pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpace::mutable(StorageSpaceId(0x0005_0001), BINARY_CAS_MANIFEST_NAMESPACE);
+pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0005_0002),
     BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
 );
 pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0005_0003), BINARY_CAS_CHUNK_NAMESPACE);
-pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpace::immutable(StorageSpaceId(0x0005_0003), BINARY_CAS_CHUNK_NAMESPACE);
+pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0005_0004),
     BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
 );
@@ -2105,15 +2105,15 @@ mod tests {
             requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
         ) -> Result<StorageGetManyResult, StorageError> {
             for request in requests {
-                if request.space == BINARY_CAS_MANIFEST_SPACE.id {
+                if request.space == BINARY_CAS_MANIFEST_SPACE {
                     self.manifest_get_many_calls.fetch_add(1, Ordering::Relaxed);
                 }
-                if request.space == BINARY_CAS_CHUNK_SPACE.id {
+                if request.space == BINARY_CAS_CHUNK_SPACE {
                     self.chunk_get_many_calls.fetch_add(1, Ordering::Relaxed);
                     self.chunk_keys_requested
                         .fetch_add(request.keys.len(), Ordering::Relaxed);
                 }
-                if request.space == BINARY_CAS_CHUNK_PRESENCE_SPACE.id {
+                if request.space == BINARY_CAS_CHUNK_PRESENCE_SPACE {
                     self.presence_get_many_calls.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -2122,11 +2122,11 @@ mod tests {
 
         async fn scan(
             &self,
-            space: StorageSpaceId,
+            space: StorageSpace,
             range: StorageKeyRange,
             opts: StorageScanOptions,
         ) -> Result<StorageScanChunk, StorageError> {
-            let is_manifest_scan = space == BINARY_CAS_MANIFEST_CHUNK_SPACE.id;
+            let is_manifest_scan = space == BINARY_CAS_MANIFEST_CHUNK_SPACE;
             let manifest_hash = if is_manifest_scan {
                 manifest_hash_from_range(&range)
             } else {

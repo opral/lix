@@ -12,10 +12,11 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use lix_engine::storage::StorageSpace;
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    CommitResult, Engine, Key, KeyRange, LixError, PutBatch, ReadOptions, SessionContext, SpaceId,
-    Storage, StorageError, StorageWrite, Value, WriteOptions,
+    CommitResult, Engine, Key, KeyRange, LixError, PutBatch, ReadOptions, SessionContext, Storage,
+    StorageError, StorageWrite, Value, WriteOptions,
 };
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
@@ -414,7 +415,7 @@ impl Storage for LocalFilesystem {
 impl StorageWrite for LocalFilesystemWrite<'_> {
     fn put_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.put_many(space, entries)
@@ -422,7 +423,7 @@ impl StorageWrite for LocalFilesystemWrite<'_> {
 
     fn delete_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         keys: &[Key],
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.delete_many(space, keys)
@@ -430,7 +431,7 @@ impl StorageWrite for LocalFilesystemWrite<'_> {
 
     fn delete_range(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.delete_range(space, range)
@@ -521,7 +522,7 @@ where
 {
     fn put_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.put_many(space, entries)
@@ -529,7 +530,7 @@ where
 
     fn delete_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         keys: &[Key],
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.delete_many(space, keys)
@@ -537,7 +538,7 @@ where
 
     fn delete_range(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         self.inner.delete_range(space, range)

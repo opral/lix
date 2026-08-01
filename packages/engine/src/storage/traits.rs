@@ -1,6 +1,6 @@
 use crate::storage::{
     CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, PutBatch, ReadOptions, ScanChunk,
-    ScanOptions, SpaceId, StorageError, WriteOptions,
+    ScanOptions, StorageError, StorageSpace, WriteOptions,
 };
 
 /// An ordered byte-key entry storage with coherent read views, batched point
@@ -79,7 +79,7 @@ pub trait StorageRead: Send + Sync {
     /// reports `has_more: false`.
     fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send;
@@ -95,7 +95,7 @@ pub trait StorageWrite: Send {
     /// transaction. Exact point deletes remain valid after a put batch.
     fn put_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
@@ -103,7 +103,7 @@ pub trait StorageWrite: Send {
     /// mutation per key; engine write-set lowering produces sorted keys.
     fn delete_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         keys: &[Key],
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
@@ -113,7 +113,7 @@ pub trait StorageWrite: Send {
     /// (for example by truncating the space's table).
     fn delete_range(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 

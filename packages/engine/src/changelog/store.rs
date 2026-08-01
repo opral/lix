@@ -18,9 +18,9 @@ pub(crate) const COMMIT_CHANGE_ID_INDEX_FORMAT_KEY: &[u8] = b"format-v1";
 pub(crate) const COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE: &[u8] = b"1";
 
 pub(crate) const COMMIT_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0006_0001), COMMIT_NAMESPACE);
+    StorageSpace::mutable(StorageSpaceId(0x0006_0001), COMMIT_NAMESPACE);
 pub(crate) const CHANGE_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0006_0002), CHANGE_NAMESPACE);
+    StorageSpace::mutable(StorageSpaceId(0x0006_0002), CHANGE_NAMESPACE);
 // The former commit-membership storage space is intentionally retired. Packed
 // tracked-state commit deltas are the sole commit-membership authority.
 /// Immutable reverse lookup from a commit-derived change id to its commit id.
@@ -28,7 +28,7 @@ pub(crate) const CHANGE_SPACE: StorageSpace =
 /// The changelog write path uses this to enforce the globally unique
 /// `CommitRecord::change_id` invariant without scanning every commit record.
 pub(crate) const COMMIT_CHANGE_ID_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0006_0004), COMMIT_CHANGE_ID_NAMESPACE);
+    StorageSpace::mutable(StorageSpaceId(0x0006_0004), COMMIT_CHANGE_ID_NAMESPACE);
 
 // Identity keys are the raw 16 UUID bytes. UUIDv7's big-endian byte order
 // matches the lexicographic order of its lowercase hyphenated text, so range

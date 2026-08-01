@@ -445,8 +445,8 @@ mod tests {
         let storage_adapter = StorageAdapter::new(storage.clone());
         let mut writes = storage_adapter.new_write_set();
         let predecessor_spaces = [
-            StorageSpace::new(StorageSpaceId(0x0001_0002), "untracked_state.row.v1"),
-            StorageSpace::new(
+            StorageSpace::mutable(StorageSpaceId(0x0001_0002), "untracked_state.row.v1"),
+            StorageSpace::mutable(
                 StorageSpaceId(0x0004_0005),
                 "live_state.index.branch_root.v1",
             ),
@@ -504,7 +504,7 @@ mod tests {
     async fn predecessor_only_repository_is_uninitialized_and_untouched() {
         let storage = Memory::new();
         let storage_adapter = StorageAdapter::new(storage.clone());
-        let predecessor_space = StorageSpace::new(
+        let predecessor_space = StorageSpace::mutable(
             StorageSpaceId(0x0004_0005),
             "live_state.index.branch_root.v1",
         );

@@ -8,7 +8,7 @@ use crate::binary_cas::kv::{
 };
 use crate::storage_adapter::{
     StorageAdapterRead, StorageCoreProjection, StorageError, StorageKeyRange,
-    StorageProjectedValue, StorageScanOptions, StorageSpaceId,
+    StorageProjectedValue, StorageScanOptions, StorageSpace,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -34,7 +34,7 @@ where
     let mut stats = BinaryCasStorageStats::default();
     stats.manifest_rows = scan_space(
         read,
-        BINARY_CAS_MANIFEST_SPACE.id,
+        BINARY_CAS_MANIFEST_SPACE,
         StorageCoreProjection::FullValue,
         |value| {
             let StorageProjectedValue::FullValue(bytes) = value else {
@@ -62,13 +62,13 @@ where
         },
     )
     .await?;
-    stats.manifest_chunk_rows = count_space(read, BINARY_CAS_MANIFEST_CHUNK_SPACE.id).await?;
-    stats.chunk_presence_rows = count_space(read, BINARY_CAS_CHUNK_PRESENCE_SPACE.id).await?;
-    stats.chunk_rows = count_space(read, BINARY_CAS_CHUNK_SPACE.id).await?;
+    stats.manifest_chunk_rows = count_space(read, BINARY_CAS_MANIFEST_CHUNK_SPACE).await?;
+    stats.chunk_presence_rows = count_space(read, BINARY_CAS_CHUNK_PRESENCE_SPACE).await?;
+    stats.chunk_rows = count_space(read, BINARY_CAS_CHUNK_SPACE).await?;
     Ok(stats)
 }
 
-async fn count_space<R>(read: &R, space: StorageSpaceId) -> Result<u64, StorageError>
+async fn count_space<R>(read: &R, space: StorageSpace) -> Result<u64, StorageError>
 where
     R: StorageAdapterRead + ?Sized,
 {
@@ -77,7 +77,7 @@ where
 
 async fn scan_space<R, F>(
     read: &R,
-    space: StorageSpaceId,
+    space: StorageSpace,
     projection: StorageCoreProjection,
     mut visit: F,
 ) -> Result<u64, StorageError>

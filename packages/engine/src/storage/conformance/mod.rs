@@ -20,7 +20,7 @@ pub use runner::{
 pub(crate) trait SingleSpaceStorageRead {
     async fn get_many_in_space(
         &self,
-        space: crate::storage::SpaceId,
+        space: crate::storage::StorageSpace,
         keys: &[crate::storage::Key],
         opts: crate::storage::GetOptions,
     ) -> Result<crate::storage::GetManyResult, crate::storage::StorageError>;
@@ -32,7 +32,7 @@ where
 {
     async fn get_many_in_space(
         &self,
-        space: crate::storage::SpaceId,
+        space: crate::storage::StorageSpace,
         keys: &[crate::storage::Key],
         opts: crate::storage::GetOptions,
     ) -> Result<crate::storage::GetManyResult, crate::storage::StorageError> {

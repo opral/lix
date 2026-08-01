@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use ahash::RandomState;
 
-use crate::storage::{GetOptions, Key, ProjectedValue, SpaceId, StorageError};
+use crate::storage::{GetOptions, Key, ProjectedValue, StorageError};
 use crate::storage_adapter::{
     StorageAdapterRead, StorageReadResult, StorageReadStats, StorageSpace,
 };
@@ -11,7 +11,7 @@ type FastHashBuilder = RandomState;
 
 #[derive(Clone, Debug)]
 pub struct PointReadPlan {
-    pub space: SpaceId,
+    pub space: StorageSpace,
     pub logical_unique_keys: Vec<Key>,
     pub requested_to_unique: RequestedToUnique,
 }
@@ -129,7 +129,7 @@ impl PointReadPlan {
         requested_to_unique: RequestedToUnique,
     ) -> Self {
         Self {
-            space: space.id,
+            space,
             logical_unique_keys,
             requested_to_unique,
         }
