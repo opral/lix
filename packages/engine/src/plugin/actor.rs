@@ -21,7 +21,7 @@ use crate::wasm::{
 };
 use crate::{Blob, LixError};
 
-pub(crate) const DEFAULT_MAX_LIVE_PLUGIN_STORES: usize = 16;
+pub(crate) const DEFAULT_MAX_LIVE_PLUGIN_STORES: usize = 10;
 // The vscode-docs 303-path transition needs roughly 80-96 MiB to retain one
 // decoded predecessor per touched file. At 64 MiB the cache reparses 115
 // documents; 96 MiB retains the complete measured working set while remaining
