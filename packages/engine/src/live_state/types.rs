@@ -99,6 +99,7 @@ impl LiveStateStringDictionary {
 /// legacy owned DTO at an API boundary that still requires it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MaterializedLiveStateBatch {
+    singleton: Option<Box<MaterializedLiveStateSingleton>>,
     strings: LiveStateStringDictionary,
     schema_keys: Vec<SchemaKeyId>,
     file_ids: Vec<Option<FileIdId>>,
@@ -121,6 +122,15 @@ pub(crate) struct MaterializedLiveStateBatch {
     durable_predecessor: Vec<Option<CertifiedCurrentStatePredecessor>>,
 }
 
+/// Row-oriented storage for the overwhelmingly common one-row point-read
+/// handoff. Keeping this behind one box avoids allocating every column vector
+/// and dictionary index while leaving the bulk columnar owner compact.
+#[derive(Debug, Clone)]
+struct MaterializedLiveStateSingleton {
+    row: MaterializedLiveStateRow,
+    durable_predecessor: Option<CertifiedCurrentStatePredecessor>,
+}
+
 impl MaterializedLiveStateBatch {
     pub(crate) fn from_rows(rows: Vec<MaterializedLiveStateRow>) -> Self {
         let (dictionary_entries, dictionary_bytes) = owned_row_dictionary_capacity(&rows);
@@ -136,11 +146,13 @@ impl MaterializedLiveStateBatch {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.entity_pks.len()
+        self.singleton
+            .as_ref()
+            .map_or_else(|| self.entity_pks.len(), |_| 1)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.entity_pks.is_empty()
+        self.singleton.is_none() && self.entity_pks.is_empty()
     }
 
     pub(crate) fn row(&self, index: usize) -> MaterializedLiveStateRowRef<'_> {
@@ -159,7 +171,10 @@ impl MaterializedLiveStateBatch {
         }
     }
 
-    pub(crate) fn into_rows(self) -> Vec<MaterializedLiveStateRow> {
+    pub(crate) fn into_rows(mut self) -> Vec<MaterializedLiveStateRow> {
+        if let Some(singleton) = self.singleton.take() {
+            return vec![singleton.row];
+        }
         let branch_ids = self.terminal_branch_owners();
         (0..self.len())
             .map(|index| {
@@ -181,6 +196,9 @@ impl MaterializedLiveStateBatch {
     /// are already identity ordered in the common case; the permutation below
     /// preserves the previous defensive ordering for mixed serving layouts.
     pub(crate) fn into_identity_ordered_snapshots(mut self) -> Vec<Option<Bytes>> {
+        if let Some(singleton) = self.singleton.take() {
+            return vec![singleton.row.snapshot_content.map(SharedStr::into_bytes)];
+        }
         let mut ordinals = (0..self.len()).collect::<Vec<_>>();
         if !ordinals.is_sorted_by(|left, right| {
             let left = self.row(*left);
@@ -216,6 +234,9 @@ impl MaterializedLiveStateBatch {
     }
 
     fn terminal_branch_owners(&self) -> Vec<Option<Arc<str>>> {
+        if let Some(singleton) = &self.singleton {
+            return vec![Some(Arc::clone(&singleton.row.branch_id))];
+        }
         let mut owners = vec![None; self.strings.ranges.len()];
         for branch_id in &self.branch_ids {
             let ordinal = branch_id.0 as usize;
@@ -224,6 +245,12 @@ impl MaterializedLiveStateBatch {
             }
         }
         owners
+    }
+
+    fn branch_owner_ordinal(&self, index: usize) -> usize {
+        self.singleton
+            .as_ref()
+            .map_or_else(|| self.branch_ids[index].0 as usize, |_| 0)
     }
 
     pub(crate) fn filter(
@@ -249,36 +276,73 @@ impl MaterializedLiveStateBatch {
 
     #[cfg(test)]
     pub(crate) fn dictionary_entry_count(&self) -> usize {
+        if let Some(singleton) = &self.singleton {
+            let row = &singleton.row;
+            return 2 + usize::from(row.file_id.is_some())
+                - usize::from(row.schema_key == row.branch_id.as_ref())
+                - usize::from(row.file_id.as_deref().is_some_and(|file_id| {
+                    file_id == row.schema_key || file_id == row.branch_id.as_ref()
+                }));
+        }
         self.strings.ranges.len()
     }
 
     #[cfg(test)]
     pub(crate) fn dictionary_bytes_len(&self) -> usize {
+        if let Some(singleton) = &self.singleton {
+            let row = &singleton.row;
+            let mut bytes = row.schema_key.len();
+            if row.branch_id.as_ref() != row.schema_key {
+                bytes += row.branch_id.len();
+            }
+            if let Some(file_id) = row.file_id.as_deref()
+                && file_id != row.schema_key
+                && file_id != row.branch_id.as_ref()
+            {
+                bytes += file_id.len();
+            }
+            return bytes;
+        }
         self.strings.bytes.len()
     }
 
     #[cfg(test)]
     pub(crate) fn dictionary_arena_buffer_count(&self) -> usize {
+        if self.singleton.is_some() {
+            return 0;
+        }
         usize::from(!self.strings.bytes.is_empty())
     }
 
     #[cfg(test)]
     pub(crate) fn dictionary_arena_allocation_count(&self) -> usize {
+        if self.singleton.is_some() {
+            return 0;
+        }
         self.strings.arena_allocation_count
     }
 
     #[cfg(test)]
     pub(crate) fn dictionary_arena_large_allocation_count(&self) -> usize {
+        if self.singleton.is_some() {
+            return 0;
+        }
         self.strings.arena_large_allocation_count
     }
 
     #[cfg(test)]
     pub(crate) fn entity_column_ptr(&self) -> *const EntityPk {
+        if let Some(singleton) = &self.singleton {
+            return &singleton.row.entity_pk;
+        }
         self.entity_pks.as_ptr()
     }
 
     #[cfg(test)]
     fn large_column_allocation_count(&self, threshold: usize) -> usize {
+        if self.singleton.is_some() {
+            return usize::from(size_of::<MaterializedLiveStateSingleton>() >= threshold);
+        }
         [
             self.schema_keys.capacity() * size_of::<SchemaKeyId>(),
             self.file_ids.capacity() * size_of::<Option<FileIdId>>(),
@@ -316,60 +380,116 @@ pub(crate) struct MaterializedLiveStateRowRef<'a> {
 }
 
 impl<'a> MaterializedLiveStateRowRef<'a> {
+    fn singleton(self) -> Option<&'a MaterializedLiveStateSingleton> {
+        self.batch.singleton.as_deref()
+    }
+
     pub(crate) fn entity_pk(self) -> &'a EntityPk {
-        &self.batch.entity_pks[self.index]
+        self.singleton().map_or_else(
+            || &self.batch.entity_pks[self.index],
+            |singleton| &singleton.row.entity_pk,
+        )
     }
 
     pub(crate) fn schema_key(self) -> &'a str {
-        self.batch.strings.get(self.batch.schema_keys[self.index].0)
+        self.singleton().map_or_else(
+            || self.batch.strings.get(self.batch.schema_keys[self.index].0),
+            |singleton| singleton.row.schema_key.as_str(),
+        )
     }
 
     pub(crate) fn file_id(self) -> Option<&'a str> {
-        self.batch.file_ids[self.index].map(|ordinal| self.batch.strings.get(ordinal.ordinal()))
+        self.singleton().map_or_else(
+            || {
+                self.batch.file_ids[self.index]
+                    .map(|ordinal| self.batch.strings.get(ordinal.ordinal()))
+            },
+            |singleton| singleton.row.file_id.as_deref(),
+        )
     }
 
     pub(crate) fn snapshot_content(self) -> Option<&'a SharedStr> {
-        self.batch.snapshot_content[self.index].as_ref()
+        self.singleton().map_or_else(
+            || self.batch.snapshot_content[self.index].as_ref(),
+            |singleton| singleton.row.snapshot_content.as_ref(),
+        )
     }
 
     pub(crate) fn metadata(self) -> Option<&'a SharedStr> {
-        self.batch.metadata[self.index].as_ref()
+        self.singleton().map_or_else(
+            || self.batch.metadata[self.index].as_ref(),
+            |singleton| singleton.row.metadata.as_ref(),
+        )
     }
 
     pub(crate) fn deleted(self) -> bool {
-        self.batch.deleted[self.index]
+        self.singleton().map_or_else(
+            || self.batch.deleted[self.index],
+            |singleton| singleton.row.deleted,
+        )
     }
 
     pub(crate) fn created_at(self) -> LixTimestamp {
-        self.batch.created_at[self.index]
+        self.singleton().map_or_else(
+            || self.batch.created_at[self.index],
+            |singleton| singleton.row.created_at,
+        )
     }
 
     pub(crate) fn updated_at(self) -> LixTimestamp {
-        self.batch.updated_at[self.index]
+        self.singleton().map_or_else(
+            || self.batch.updated_at[self.index],
+            |singleton| singleton.row.updated_at,
+        )
     }
 
     pub(crate) fn global(self) -> bool {
-        self.batch.global[self.index]
+        self.singleton().map_or_else(
+            || self.batch.global[self.index],
+            |singleton| singleton.row.global,
+        )
     }
 
     pub(crate) fn change_id(self) -> Option<ChangeId> {
-        self.batch.change_id[self.index]
+        self.singleton().map_or_else(
+            || self.batch.change_id[self.index],
+            |singleton| singleton.row.change_id,
+        )
     }
 
     pub(crate) fn commit_id(self) -> Option<CommitId> {
-        self.batch.commit_id[self.index]
+        self.singleton().map_or_else(
+            || self.batch.commit_id[self.index],
+            |singleton| singleton.row.commit_id,
+        )
     }
 
     pub(crate) fn untracked(self) -> bool {
-        self.batch.untracked[self.index]
+        self.singleton().map_or_else(
+            || self.batch.untracked[self.index],
+            |singleton| singleton.row.untracked,
+        )
     }
 
     pub(crate) fn durable_predecessor(self) -> Option<&'a CertifiedCurrentStatePredecessor> {
-        self.batch.durable_predecessor[self.index].as_ref()
+        self.singleton().map_or_else(
+            || self.batch.durable_predecessor[self.index].as_ref(),
+            |singleton| singleton.durable_predecessor.as_ref(),
+        )
     }
 
     pub(crate) fn branch_id(self) -> &'a str {
-        self.batch.strings.get(self.batch.branch_ids[self.index].0)
+        self.singleton().map_or_else(
+            || self.batch.strings.get(self.batch.branch_ids[self.index].0),
+            |singleton| singleton.row.branch_id.as_ref(),
+        )
+    }
+
+    fn branch_owner(self) -> Arc<str> {
+        self.singleton().map_or_else(
+            || Arc::from(self.branch_id()),
+            |singleton| Arc::clone(&singleton.row.branch_id),
+        )
     }
 
     /// Materializes an owned row at a scalar or persistent-index boundary.
@@ -516,7 +636,7 @@ impl MaterializedLiveStateExactBatch {
             .map(|ordinal| {
                 ordinal.map(|ordinal| {
                     let index = ordinal as usize;
-                    let branch_ordinal = self.batch.branch_ids[index].0 as usize;
+                    let branch_ordinal = self.batch.branch_owner_ordinal(index);
                     self.batch.row(index).to_owned_with_branch(Arc::clone(
                         branch_ids[branch_ordinal]
                             .as_ref()
@@ -810,6 +930,8 @@ fn live_state_dictionary_hash(hash_builder: &FastHashBuilder, value: &[u8]) -> u
 /// hash table whose entries are compact arena ordinals. Finish transfers the
 /// arena into the immutable batch without copying it.
 pub(crate) struct MaterializedLiveStateBatchBuilder {
+    singleton_capacity: bool,
+    singleton: Option<Box<MaterializedLiveStateSingleton>>,
     strings: LiveStateStringDictionaryBuilder,
     schema_keys: Vec<SchemaKeyId>,
     file_ids: Vec<Option<FileIdId>>,
@@ -856,32 +978,46 @@ impl MaterializedLiveStateBatchBuilder {
         dictionary_byte_capacity: usize,
         exact_byte_capacity: bool,
     ) -> Self {
+        let singleton_capacity = capacity == 1;
+        let column_capacity = if singleton_capacity { 0 } else { capacity };
         Self {
+            singleton_capacity,
+            singleton: None,
             strings: LiveStateStringDictionaryBuilder::with_capacity(
-                capacity,
-                dictionary_entry_capacity,
-                dictionary_byte_capacity,
+                column_capacity,
+                if singleton_capacity {
+                    0
+                } else {
+                    dictionary_entry_capacity
+                },
+                if singleton_capacity {
+                    0
+                } else {
+                    dictionary_byte_capacity
+                },
                 exact_byte_capacity,
             ),
-            schema_keys: Vec::with_capacity(capacity),
-            file_ids: Vec::with_capacity(capacity),
-            branch_ids: Vec::with_capacity(capacity),
-            entity_pks: Vec::with_capacity(capacity),
-            snapshot_content: Vec::with_capacity(capacity),
-            metadata: Vec::with_capacity(capacity),
-            deleted: Vec::with_capacity(capacity),
-            created_at: Vec::with_capacity(capacity),
-            updated_at: Vec::with_capacity(capacity),
-            global: Vec::with_capacity(capacity),
-            change_id: Vec::with_capacity(capacity),
-            commit_id: Vec::with_capacity(capacity),
-            untracked: Vec::with_capacity(capacity),
-            durable_predecessor: Vec::with_capacity(capacity),
+            schema_keys: Vec::with_capacity(column_capacity),
+            file_ids: Vec::with_capacity(column_capacity),
+            branch_ids: Vec::with_capacity(column_capacity),
+            entity_pks: Vec::with_capacity(column_capacity),
+            snapshot_content: Vec::with_capacity(column_capacity),
+            metadata: Vec::with_capacity(column_capacity),
+            deleted: Vec::with_capacity(column_capacity),
+            created_at: Vec::with_capacity(column_capacity),
+            updated_at: Vec::with_capacity(column_capacity),
+            global: Vec::with_capacity(column_capacity),
+            change_id: Vec::with_capacity(column_capacity),
+            commit_id: Vec::with_capacity(column_capacity),
+            untracked: Vec::with_capacity(column_capacity),
+            durable_predecessor: Vec::with_capacity(column_capacity),
         }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.entity_pks.len()
+        self.singleton
+            .as_ref()
+            .map_or_else(|| self.entity_pks.len(), |_| 1)
     }
 
     fn intern_owned(&mut self, value: String) -> u32 {
@@ -893,26 +1029,68 @@ impl MaterializedLiveStateBatchBuilder {
     }
 
     pub(crate) fn push_owned(&mut self, row: MaterializedLiveStateRow) {
-        let schema_key = SchemaKeyId(self.intern_owned(row.schema_key));
-        let file_id = row
-            .file_id
-            .map(|file_id| FileIdId::from_ordinal(self.intern_owned(file_id)));
-        let branch_id = BranchIdId(self.intern_ref(row.branch_id.as_ref()));
+        if self.singleton_capacity && self.singleton.is_none() && self.entity_pks.is_empty() {
+            self.singleton = Some(Box::new(MaterializedLiveStateSingleton {
+                row,
+                durable_predecessor: None,
+            }));
+            return;
+        }
+        self.promote_singleton();
+        self.push_owned_columnar(row, None);
+    }
+
+    fn promote_singleton(&mut self) {
+        let Some(singleton) = self.singleton.take() else {
+            self.singleton_capacity = false;
+            return;
+        };
+        self.singleton_capacity = false;
+        self.push_owned_columnar(singleton.row, singleton.durable_predecessor);
+    }
+
+    fn push_owned_columnar(
+        &mut self,
+        row: MaterializedLiveStateRow,
+        durable_predecessor: Option<CertifiedCurrentStatePredecessor>,
+    ) {
+        let MaterializedLiveStateRow {
+            entity_pk,
+            schema_key,
+            file_id,
+            snapshot_content,
+            metadata,
+            deleted,
+            created_at,
+            updated_at,
+            global,
+            change_id,
+            commit_id,
+            untracked,
+            branch_id,
+        } = row;
+        let schema_key = SchemaKeyId(self.intern_owned(schema_key));
+        let file_id = file_id.map(|file_id| FileIdId::from_ordinal(self.intern_owned(file_id)));
+        let branch_id = BranchIdId(self.intern_ref(branch_id.as_ref()));
         self.push_columns(
             schema_key,
             file_id,
             branch_id,
-            row.entity_pk,
-            row.snapshot_content,
-            row.metadata,
-            row.deleted,
-            row.created_at,
-            row.updated_at,
-            row.global,
-            row.change_id,
-            row.commit_id,
-            row.untracked,
+            entity_pk,
+            snapshot_content,
+            metadata,
+            deleted,
+            created_at,
+            updated_at,
+            global,
+            change_id,
+            commit_id,
+            untracked,
         );
+        *self
+            .durable_predecessor
+            .last_mut()
+            .expect("pushed live-state row has a predecessor slot") = durable_predecessor;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -933,6 +1111,24 @@ impl MaterializedLiveStateBatchBuilder {
         branch_id: &str,
     ) -> usize {
         let ordinal = self.len();
+        if self.singleton_capacity {
+            self.push_owned(MaterializedLiveStateRow {
+                entity_pk,
+                schema_key,
+                file_id,
+                snapshot_content,
+                metadata,
+                deleted,
+                created_at,
+                updated_at,
+                global,
+                change_id,
+                commit_id,
+                untracked,
+                branch_id: Arc::from(branch_id),
+            });
+            return ordinal;
+        }
         let schema_key = SchemaKeyId(self.intern_owned(schema_key));
         let file_id = file_id.map(|file_id| FileIdId::from_ordinal(self.intern_owned(file_id)));
         let branch_id = BranchIdId(self.intern_ref(branch_id));
@@ -972,6 +1168,24 @@ impl MaterializedLiveStateBatchBuilder {
         branch_id: &str,
     ) -> usize {
         let ordinal = self.len();
+        if self.singleton_capacity {
+            self.push_owned(MaterializedLiveStateRow {
+                entity_pk: entity_pk.clone(),
+                schema_key: schema_key.to_owned(),
+                file_id: file_id.map(str::to_owned),
+                snapshot_content,
+                metadata,
+                deleted,
+                created_at,
+                updated_at,
+                global,
+                change_id,
+                commit_id,
+                untracked,
+                branch_id: Arc::from(branch_id),
+            });
+            return ordinal;
+        }
         let schema_key = SchemaKeyId(self.intern_ref(schema_key));
         let file_id = file_id.map(|file_id| FileIdId::from_ordinal(self.intern_ref(file_id)));
         let branch_id = BranchIdId(self.intern_ref(branch_id));
@@ -999,6 +1213,15 @@ impl MaterializedLiveStateBatchBuilder {
         branch_override: Option<&str>,
     ) -> usize {
         let ordinal = self.len();
+        if self.singleton_capacity {
+            let branch_id = branch_override.map_or_else(|| row.branch_owner(), Arc::from);
+            let durable_predecessor = row.durable_predecessor().cloned();
+            self.push_owned(row.to_owned_with_branch(branch_id));
+            if let Some(durable_predecessor) = durable_predecessor {
+                self.set_durable_predecessor(ordinal, durable_predecessor);
+            }
+            return ordinal;
+        }
         let schema_key = SchemaKeyId(self.intern_ref(row.schema_key()));
         let file_id = row
             .file_id()
@@ -1061,10 +1284,20 @@ impl MaterializedLiveStateBatchBuilder {
     }
 
     pub(crate) fn set_snapshot_content(&mut self, row: usize, value: SharedStr) {
+        if let Some(singleton) = self.singleton.as_mut() {
+            assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
+            singleton.row.snapshot_content = Some(value);
+            return;
+        }
         self.snapshot_content[row] = Some(value);
     }
 
     pub(crate) fn set_metadata(&mut self, row: usize, value: SharedStr) {
+        if let Some(singleton) = self.singleton.as_mut() {
+            assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
+            singleton.row.metadata = Some(value);
+            return;
+        }
         self.metadata[row] = Some(value);
     }
 
@@ -1073,11 +1306,17 @@ impl MaterializedLiveStateBatchBuilder {
         row: usize,
         value: CertifiedCurrentStatePredecessor,
     ) {
+        if let Some(singleton) = self.singleton.as_mut() {
+            assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
+            singleton.durable_predecessor = Some(value);
+            return;
+        }
         self.durable_predecessor[row] = Some(value);
     }
 
     pub(crate) fn finish(self) -> MaterializedLiveStateBatch {
         MaterializedLiveStateBatch {
+            singleton: self.singleton,
             strings: self.strings.finish(),
             schema_keys: self.schema_keys,
             file_ids: self.file_ids,
@@ -1331,6 +1570,51 @@ mod batch_tests {
         assert!(
             batch.large_column_allocation_count(32 * 1024) <= 13,
             "a 10k batch has a constant number of large column buffers"
+        );
+    }
+
+    #[test]
+    fn one_row_builder_uses_boxed_singleton_storage() {
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(1);
+        builder.push_owned(row(EntityPk::single("only")));
+        builder.set_snapshot_content(0, SharedStr::from_static(r#"{"path":"only"}"#));
+        builder.set_metadata(0, SharedStr::from_static(r#"{"source":"test"}"#));
+
+        let batch = builder.finish();
+
+        assert!(batch.singleton.is_some());
+        assert!(batch.entity_pks.is_empty());
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.row(0).schema_key(), "shared_schema");
+        assert_eq!(batch.row(0).file_id(), Some("shared_file"));
+        assert_eq!(batch.row(0).branch_id(), "shared_branch");
+        assert_eq!(
+            batch.row(0).snapshot_content().map(AsRef::as_ref),
+            Some(r#"{"path":"only"}"#)
+        );
+        assert_eq!(
+            batch.row(0).metadata().map(AsRef::as_ref),
+            Some(r#"{"source":"test"}"#)
+        );
+    }
+
+    #[test]
+    fn singleton_builder_promotes_when_capacity_hint_is_exceeded() {
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(1);
+        builder.push_owned(row(EntityPk::single("first")));
+        builder.push_owned(row(EntityPk::single("second")));
+
+        let batch = builder.finish();
+
+        assert!(batch.singleton.is_none());
+        assert_eq!(batch.len(), 2);
+        assert_eq!(
+            batch.row(0).entity_pk().as_single_string().unwrap(),
+            "first"
+        );
+        assert_eq!(
+            batch.row(1).entity_pk().as_single_string().unwrap(),
+            "second"
         );
     }
 
