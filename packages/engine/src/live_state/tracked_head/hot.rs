@@ -1035,12 +1035,14 @@ async fn scan_certified_entity_batch_rows(
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(
         limit.unwrap_or_else(|| decode_inputs.len().saturating_mul(1024)),
     );
+    let selected_packet_entity_pks = packet_entity_pk_index(request);
     for (value, external_pages) in decode_inputs {
         decode_certified_entity_batch_rows(
             &value,
             external_pages.as_deref(),
             branch_id,
             request,
+            selected_packet_entity_pks.as_ref(),
             needs_snapshot,
             decode_limit,
             &mut builder,
@@ -1092,6 +1094,7 @@ pub(crate) async fn scan_certified_history_rows(
         .columns
         .iter()
         .any(|column| column == "snapshot_content");
+    let selected_packet_entity_pks = packet_entity_pk_index(request);
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(commit_ids.len() * 1024);
     for commit_id in commit_ids {
         let plan = ScanPlan::prefix(
@@ -1145,6 +1148,7 @@ pub(crate) async fn scan_certified_history_rows(
                     external_pages.as_deref(),
                     "",
                     request,
+                    selected_packet_entity_pks.as_ref(),
                     needs_snapshot,
                     None,
                     &mut builder,
@@ -1176,11 +1180,20 @@ fn certified_batch_commit_id(bytes: &[u8]) -> Result<CommitId, LixError> {
     ))
 }
 
+fn packet_entity_pk_index(request: &TrackedStateScanRequest) -> Option<HashSet<EntityPk>> {
+    // Packet identities are arbitrary component tuples, so they cannot use the
+    // compact local-reference optimization available to certified CSV pages.
+    // Build one request-scoped index and share it across every decoded batch.
+    (!request.filter.entity_pks.is_empty())
+        .then(|| request.filter.entity_pks.iter().cloned().collect())
+}
+
 fn decode_certified_entity_batch_rows(
     bytes: &[u8],
     external_pages: Option<&[(u32, Bytes)]>,
     branch_id: &str,
     request: &TrackedStateScanRequest,
+    selected_packet_entity_pks: Option<&HashSet<EntityPk>>,
     needs_snapshot: bool,
     limit: Option<usize>,
     builder: &mut MaterializedLiveStateBatchBuilder,
@@ -1241,18 +1254,6 @@ fn decode_certified_entity_batch_rows(
                     _ => None,
                 })
                 .collect::<BTreeSet<_>>()
-        });
-    // Packet identities are arbitrary component tuples, so they cannot use the
-    // compact local-reference optimization above. Index the requested keys once
-    // instead of rescanning the entire filter for every decoded packet row.
-    let selected_packet_entity_pks =
-        (format != 1 && !request.filter.entity_pks.is_empty()).then(|| {
-            request
-                .filter
-                .entity_pks
-                .iter()
-                .cloned()
-                .collect::<HashSet<_>>()
         });
     let page_count = input.u32()?;
     if !request.filter.schema_keys.is_empty()
@@ -1323,7 +1324,7 @@ fn decode_certified_entity_batch_rows(
                 branch_id,
                 file_id,
                 request,
-                selected_packet_entity_pks.as_ref(),
+                selected_packet_entity_pks,
                 needs_snapshot,
                 limit,
                 decoded_rows,
