@@ -5,6 +5,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
 use crate::common::ExecuteStatementMetadata;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
@@ -84,6 +85,7 @@ pub struct FileRead {
     data: Blob,
     total_size: u64,
     range: Range<u64>,
+    content_identity: String,
 }
 
 impl FileRead {
@@ -101,6 +103,10 @@ impl FileRead {
 
     pub fn range(&self) -> Range<u64> {
         self.range.clone()
+    }
+
+    pub fn content_identity(&self) -> &str {
+        &self.content_identity
     }
 }
 
@@ -2074,7 +2080,16 @@ fn native_file_read_from_exact_result(
             .map(|data| materialize_file_read(data, None))
             .transpose();
     }
-    if result.columns.as_slice() != ["path", "data", "total_size", "range_start", "range_end"] {
+    if result.columns.as_slice()
+        != [
+            "path",
+            "data",
+            "total_size",
+            "range_start",
+            "range_end",
+            "content_identity",
+        ]
+    {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "native ranged file read returned an unexpected result schema",
@@ -2096,6 +2111,7 @@ fn native_file_read_from_exact_result(
         Value::Integer(total_size),
         Value::Integer(range_start),
         Value::Integer(range_end),
+        Value::Text(content_identity),
     ] = row.as_mut_slice()
     else {
         return Err(LixError::new(
@@ -2140,6 +2156,7 @@ fn native_file_read_from_exact_result(
         data,
         total_size,
         range: range_start..range_end,
+        content_identity: std::mem::take(content_identity),
     }))
 }
 
@@ -2201,6 +2218,7 @@ fn materialize_file_read(
             "native file size does not fit the public 64-bit range",
         )
     })?;
+    let content_identity = BlobId::from_content(data.as_ref()).to_hex();
     let range = match requested_range {
         None => 0..total_size,
         Some(range) => {
@@ -2227,6 +2245,7 @@ fn materialize_file_read(
         data,
         total_size,
         range,
+        content_identity,
     })
 }
 

@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::storage::{
-    BufferRange, CommitResult, EncodedMutationBatch, Key, PutBatch, PutEntry, SpaceId, Storage,
-    StorageError, StorageWrite, StoredValue, WriteOptions,
+    BufferRange, CommitResult, EncodedMutationBatch, Key, KeyRange, PutBatch, PutEntry, SpaceId,
+    Storage, StorageError, StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
@@ -73,6 +73,7 @@ impl IntoStorageValue for &[u8] {
 pub struct StorageWriteSet {
     groups: Vec<StorageWriteGroup>,
     group_index: HashMap<SpaceId, usize, FastHashBuilder>,
+    exclusive_range_deletes: Vec<(StorageSpace, KeyRange)>,
     deferred_final_puts: Vec<Box<dyn DeferredFinalPutSource>>,
     stats: StorageWriteSetStats,
     // Domain stores can seal a write lane after planning a destructive sweep.
@@ -87,6 +88,7 @@ impl fmt::Debug for StorageWriteSet {
         formatter
             .debug_struct("StorageWriteSet")
             .field("groups", &self.groups)
+            .field("exclusive_range_deletes", &self.exclusive_range_deletes)
             .field(
                 "deferred_final_put_sources",
                 &self.deferred_final_puts.len(),
@@ -244,6 +246,7 @@ impl StorageWriteSet {
                 expected_spaces,
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
             ),
+            exclusive_range_deletes: Vec::new(),
             deferred_final_puts: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
@@ -252,6 +255,7 @@ impl StorageWriteSet {
 
     pub fn is_empty(&self) -> bool {
         self.deferred_final_puts.is_empty()
+            && self.exclusive_range_deletes.is_empty()
             && self
                 .groups
                 .iter()
@@ -522,6 +526,41 @@ impl StorageWriteSet {
         self.stage_encoded_batch(space.into_storage_space(), batch);
     }
 
+    /// Stages one storage-native range deletion for a space with no other
+    /// mutations in this write set. Keeping the lane exclusive makes its
+    /// ordering and duplicate semantics unambiguous while avoiding millions
+    /// of materialized point-delete keys for temporary upload metadata.
+    pub(crate) fn delete_range_exclusive(
+        &mut self,
+        space: StorageSpace,
+        range: KeyRange,
+    ) -> Result<(), StorageWriteSetError> {
+        let has_points = self
+            .group_index
+            .get(&space.id)
+            .and_then(|index| self.groups.get(*index))
+            .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty());
+        let has_range = self
+            .exclusive_range_deletes
+            .iter()
+            .any(|(existing, _)| existing.id == space.id);
+        let has_deferred = self.deferred_final_puts.iter().any(|source| {
+            source
+                .target_spaces()
+                .iter()
+                .any(|target| target.id == space.id)
+        });
+        if has_points || has_range || has_deferred {
+            return Err(StorageWriteSetError::DuplicateMutation {
+                space,
+                key: Key(Bytes::new()),
+            });
+        }
+        self.stats.touched_spaces += 1;
+        self.exclusive_range_deletes.push((space, range));
+        Ok(())
+    }
+
     /// Reserves capacity for a storage space's grouped puts and deletes.
     ///
     /// This is most useful with canonical construction, where domain stores can
@@ -556,6 +595,7 @@ impl StorageWriteSet {
     pub fn extend(&mut self, other: Self) {
         let Self {
             groups,
+            exclusive_range_deletes,
             deferred_final_puts,
             stats,
             changelog_gc_sealed,
@@ -566,6 +606,10 @@ impl StorageWriteSet {
             let space = group.space;
             let target = self.group_mut(space);
             target.append(group);
+        }
+        for (space, range) in exclusive_range_deletes {
+            self.delete_range_exclusive(space, range)
+                .expect("extended exclusive range-delete spaces remain exclusive");
         }
         for source in deferred_final_puts {
             for &space in source.target_spaces() {
@@ -645,6 +689,7 @@ impl StorageWriteSet {
     /// This performs the full duplicate/conflicting-declaration scan before
     /// lowering so the storage never receives ambiguous final mutations.
     pub fn validate(&self) -> Result<(), StorageWriteSetError> {
+        self.validate_exclusive_range_deletes()?;
         for group in &self.groups {
             if let Some(incoming) = group.conflicting_declarations.first() {
                 return Err(StorageWriteSetError::ConflictingSpaceDeclaration {
@@ -698,6 +743,7 @@ impl StorageWriteSet {
     /// duplicate by adjacent/merge comparison without cloning the keys or
     /// allocating a second full-workload hash table.
     fn validate_and_sort(&mut self) -> Result<(), StorageWriteSetError> {
+        self.validate_exclusive_range_deletes()?;
         for group in &self.groups {
             if let Some(incoming) = group.conflicting_declarations.first() {
                 return Err(StorageWriteSetError::ConflictingSpaceDeclaration {
@@ -740,10 +786,20 @@ impl StorageWriteSet {
     {
         let Self {
             groups,
+            exclusive_range_deletes,
             mut deferred_final_puts,
             mut stats,
             ..
         } = self;
+
+        for (space, range) in exclusive_range_deletes {
+            stats.delete_batches += 1;
+            stats.storage_calls += 1;
+            write
+                .delete_range(space.id, range)
+                .await
+                .map_err(StorageWriteSetError::Storage)?;
+        }
 
         for group in groups {
             #[cfg(feature = "storage-benches")]
@@ -858,6 +914,32 @@ impl StorageWriteSet {
         }
         group
     }
+
+    fn validate_exclusive_range_deletes(&self) -> Result<(), StorageWriteSetError> {
+        for (index, (space, _)) in self.exclusive_range_deletes.iter().enumerate() {
+            let conflicts_with_points = self
+                .group_index
+                .get(&space.id)
+                .and_then(|group_index| self.groups.get(*group_index))
+                .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty());
+            let conflicts_with_range = self.exclusive_range_deletes[index + 1..]
+                .iter()
+                .any(|(other, _)| other.id == space.id);
+            let conflicts_with_deferred = self.deferred_final_puts.iter().any(|source| {
+                source
+                    .target_spaces()
+                    .iter()
+                    .any(|target| target.id == space.id)
+            });
+            if conflicts_with_points || conflicts_with_range || conflicts_with_deferred {
+                return Err(StorageWriteSetError::DuplicateMutation {
+                    space: *space,
+                    key: Key(Bytes::new()),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate_sorted_group(group: &StorageWriteGroup) -> Result<(), StorageWriteSetError> {
@@ -906,6 +988,7 @@ impl Default for StorageWriteSet {
         Self {
             groups: Vec::new(),
             group_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
+            exclusive_range_deletes: Vec::new(),
             deferred_final_puts: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,

@@ -32,6 +32,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     future::Future,
+    io,
     mem::size_of,
     sync::{
         Arc, Mutex, Once,
@@ -101,6 +102,8 @@ const MAX_REQUEST_BLOB_CACHE_BYTES: usize = 16 * 1024 * 1024;
 /// blob retry path; request correctness never depends on cache admission.
 pub const DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
+/// Maximum bytes held by one raw file-download response body at a time.
+const FILE_READ_STREAM_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 
 const SESSION_TOKEN_BYTES: usize = 32;
 const SESSION_TOKEN_HEX_LEN: usize = SESSION_TOKEN_BYTES * 2;
@@ -2128,24 +2131,82 @@ where
     let path = required_non_empty(request.path, "path")?;
     let requested_range = parse_single_file_range(&headers)?;
     let partial = requested_range.is_some();
+    let first_requested_range = requested_range
+        .as_ref()
+        .map(|range| {
+            range.start
+                ..range
+                    .end
+                    .min(range.start.saturating_add(FILE_READ_STREAM_WINDOW_BYTES))
+        })
+        .unwrap_or(0..FILE_READ_STREAM_WINDOW_BYTES);
+    let first_path = path.clone();
     let data = lease
-        .run_cancellable_read(
-            move |lix| async move { lix.read_file_data(path, requested_range).await },
-        )
+        .run_cancellable_read(move |lix| async move {
+            lix.read_file_data(first_path, Some(first_requested_range))
+                .await
+        })
         .await?;
-    let (found, body, file_range) = data.map_or_else(
-        || ("false", Bytes::new(), None),
-        |read| {
-            let range = read.range();
+    let (found, body, file_range) = match data {
+        None => ("false", axum::body::Body::empty(), None),
+        Some(read) => {
+            let first_range = read.range();
             let total_size = read.total_size();
-            (
-                "true",
-                read.into_data().into_bytes(),
-                Some((range, total_size)),
-            )
-        },
-    );
-    let mut response = Response::new(axum::body::Body::from(body));
+            let content_identity = read.content_identity().to_owned();
+            if partial && total_size == 0 {
+                return Err(ApiError::bad_request("file read range is not satisfiable"));
+            }
+            let response_range = requested_range
+                .as_ref()
+                .map(|range| range.start..range.end.min(total_size))
+                .unwrap_or(0..total_size);
+            let next_offset = first_range.end;
+            let end_offset = response_range.end;
+            let first = read.into_data().into_bytes();
+            let body_stream = async_stream::stream! {
+                yield Ok::<Bytes, io::Error>(first);
+                let mut next_offset = next_offset;
+                while next_offset < end_offset {
+                    let next_end = end_offset.min(
+                        next_offset.saturating_add(FILE_READ_STREAM_WINDOW_BYTES),
+                    );
+                    let read_path = path.clone();
+                    let read = match lease
+                        .run_cancellable_read(move |lix| async move {
+                            lix.read_file_data(read_path, Some(next_offset..next_end))
+                                .await
+                        })
+                        .await {
+                            Ok(Some(read)) => read,
+                            Ok(None) => {
+                                yield Err(io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    "file disappeared while its response was streaming",
+                                ));
+                                break;
+                            }
+                            Err(error) => {
+                                yield Err(file_stream_error(error));
+                                break;
+                            }
+                        };
+                    let actual_range = read.range();
+                    if read.content_identity() != content_identity {
+                        yield Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "file changed while its response was streaming",
+                        ));
+                        break;
+                    }
+                    next_offset = actual_range.end;
+                    yield Ok(read.into_data().into_bytes());
+                }
+            };
+            let body = axum::body::Body::from_stream(body_stream);
+            ("true", body, Some((response_range, total_size)))
+        }
+    };
+    let mut response = Response::new(body);
     if partial && file_range.is_some() {
         *response.status_mut() = StatusCode::PARTIAL_CONTENT;
     }
@@ -2185,6 +2246,10 @@ where
         }
     }
     Ok(response)
+}
+
+fn file_stream_error(error: LixError) -> io::Error {
+    io::Error::other(error.to_string())
 }
 
 /// Parses the common single, forward byte range. Multipart and suffix ranges
@@ -6075,7 +6140,9 @@ mod tests {
     async fn binary_file_read_returns_raw_bytes_and_distinguishes_empty_and_missing() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
-        let payload = vec![0, 1, 2, 3, 255];
+        let payload = (0..FILE_READ_STREAM_WINDOW_BYTES as usize + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
         let inserted = app
             .router
             .clone()
@@ -6152,7 +6219,10 @@ mod tests {
         );
         assert_eq!(
             ranged.headers().get(CONTENT_RANGE),
-            Some(&axum::http::HeaderValue::from_static("bytes 1-3/5"))
+            Some(
+                &axum::http::HeaderValue::from_str(&format!("bytes 1-3/{}", payload.len()))
+                    .expect("content range header")
+            )
         );
         assert_eq!(
             ranged
@@ -6164,6 +6234,51 @@ mod tests {
                 .as_ref(),
             &payload[1..4]
         );
+
+        let concurrent = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/lix/v1/file?path=%2Fpayload.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .body(Body::empty())
+                    .expect("concurrent binary file read request"),
+            )
+            .await
+            .expect("concurrent binary file read response");
+        let mut concurrent_body = concurrent.into_body();
+        let first_frame = concurrent_body
+            .frame()
+            .await
+            .expect("first stream frame")
+            .expect("first stream frame should succeed")
+            .into_data()
+            .expect("first stream frame should contain data");
+        assert_eq!(first_frame.len(), FILE_READ_STREAM_WINDOW_BYTES as usize);
+
+        let replacement = vec![0xee; payload.len()];
+        let replaced = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/file/upsert?path=%2Fpayload.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .body(Body::from(replacement))
+                    .expect("concurrent binary file replacement request"),
+            )
+            .await
+            .expect("concurrent binary file replacement response");
+        assert_eq!(replaced.status(), StatusCode::OK);
+        let stream_error = concurrent_body
+            .frame()
+            .await
+            .expect("changed stream should produce a terminal frame")
+            .expect_err("changed stream must not mix file versions");
+        assert!(stream_error.to_string().contains("file changed"));
 
         let emptied = app
             .router
@@ -6208,6 +6323,21 @@ mod tests {
                 .to_bytes()
                 .is_empty()
         );
+        let empty_range = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/lix/v1/file?path=%2Fpayload.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .header(RANGE, "bytes=0-")
+                    .body(Body::empty())
+                    .expect("empty ranged binary file read request"),
+            )
+            .await
+            .expect("empty ranged read response");
+        assert_eq!(empty_range.status(), StatusCode::BAD_REQUEST);
 
         let missing = app
             .router

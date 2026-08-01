@@ -165,6 +165,39 @@ async fn load_declared_manifest_chunks(
         .collect()
 }
 
+/// Loads one ordinal interval from a fixed-size media manifest.
+async fn load_declared_manifest_chunk_range(
+    store: &(impl StorageAdapterRead + ?Sized),
+    blob_hash: BlobId,
+    start_index: u64,
+    end_index: u64,
+) -> Result<Vec<KvBlobManifestChunk>, LixError> {
+    if start_index >= end_index {
+        return Ok(Vec::new());
+    }
+    let range = StorageKeyRange {
+        lower: Bound::Included(StorageKey(Bytes::from(manifest_chunk_key(
+            blob_hash,
+            start_index,
+        )))),
+        upper: Bound::Excluded(StorageKey(Bytes::from(manifest_chunk_key(
+            blob_hash, end_index,
+        )))),
+    };
+    let plan = ScanPlan::range(BINARY_CAS_MANIFEST_CHUNK_SPACE, range);
+    scan_all_values_for_plan(store, &plan)
+        .await?
+        .into_iter()
+        .map(|value| {
+            let (chunk_hash, chunk_size) = decode_binary_cas_manifest_chunk(&value)?;
+            Ok(KvBlobManifestChunk {
+                chunk_hash,
+                chunk_size,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn stage_manifest_chunk(
     writes: &mut StorageWriteSet,
     blob_hash: BlobId,
@@ -728,32 +761,75 @@ async fn load_blob_range(
             decoded[start..end].to_vec()
         }
         BlobLayout::Chunked { chunk_count } => {
-            let manifest =
-                load_declared_manifest_chunks(store, metadata.hash, *chunk_count).await?;
-            if manifest.len() != *chunk_count as usize {
+            let fixed_chunk_bytes = crate::binary_cas::chunking::MEDIA_CHUNK_BYTES as u64;
+            let first_chunk_index = range.start / fixed_chunk_bytes;
+            let end_chunk_index = range
+                .end
+                .div_ceil(fixed_chunk_bytes)
+                .min(u64::from(*chunk_count));
+            let manifest = load_declared_manifest_chunk_range(
+                store,
+                metadata.hash,
+                first_chunk_index,
+                end_chunk_index,
+            )
+            .await?;
+            let expected_manifest_len = usize::try_from(end_chunk_index - first_chunk_index)
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "binary CAS selected manifest range exceeds this runtime",
+                    )
+                })?;
+            if manifest.len() != expected_manifest_len {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
-                        "binary CAS blob '{}' expected {} chunks, found {}",
+                        "binary CAS blob '{}' expected {} selected chunks, found {}",
                         metadata.hash.to_hex(),
-                        chunk_count,
+                        expected_manifest_len,
                         manifest.len()
                     ),
                 ));
             }
-            let mut selected = Vec::new();
-            let mut offset = 0u64;
-            for chunk in manifest {
-                let chunk_end = offset.checked_add(chunk.chunk_size).ok_or_else(|| {
+            let mut selected = Vec::with_capacity(manifest.len());
+            for (selected_index, chunk) in manifest.into_iter().enumerate() {
+                let chunk_index = first_chunk_index
+                    + u64::try_from(selected_index).map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "binary CAS selected chunk index exceeds u64",
+                        )
+                    })?;
+                let chunk_start = chunk_index.checked_mul(fixed_chunk_bytes).ok_or_else(|| {
                     LixError::new("LIX_ERROR_UNKNOWN", "binary CAS chunk offsets overflow u64")
                 })?;
-                if offset < range.end && chunk_end > range.start {
-                    selected.push((offset, chunk));
+                let expected_chunk_size = if chunk_index + 1 == u64::from(*chunk_count) {
+                    metadata
+                        .size_bytes
+                        .checked_sub(chunk_start)
+                        .ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                "binary CAS final chunk starts beyond the declared blob size",
+                            )
+                        })?
+                } else {
+                    fixed_chunk_bytes
+                };
+                if chunk.chunk_size != expected_chunk_size {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "binary CAS blob '{}' chunk {} has size {}, expected {}",
+                            metadata.hash.to_hex(),
+                            chunk_index,
+                            chunk.chunk_size,
+                            expected_chunk_size,
+                        ),
+                    ));
                 }
-                offset = chunk_end;
-                if offset >= range.end {
-                    break;
-                }
+                selected.push((chunk_start, chunk));
             }
             let hashes = selected
                 .iter()
@@ -2720,6 +2796,31 @@ mod tests {
         assert_eq!(actual.range, requested.clone());
         assert_eq!(
             actual.bytes,
+            data[requested.start as usize..requested.end as usize]
+        );
+
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            BINARY_CAS_MANIFEST_CHUNK_SPACE,
+            manifest_chunk_key(blob_hash, 2),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("remove manifest row outside selected range");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("second ranged read should open");
+        let selected = load_ranges_many(&store, &[(blob_hash, requested.clone())])
+            .await
+            .expect("range read must not visit unselected manifest rows")
+            .into_vec()
+            .pop()
+            .flatten()
+            .expect("selected range should exist");
+        assert_eq!(
+            selected.bytes,
             data[requested.start as usize..requested.end as usize]
         );
     }

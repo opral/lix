@@ -1,5 +1,9 @@
 pub(super) const SINGLE_CHUNK_FAST_PATH_MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_BINARY_CAS_CHUNK_BYTES: usize = 4096 * 1024;
+// SlateDB packs sequential immutable payloads into 64 MiB sidecar segments.
+// The local mixed movie profile in engine-benchmarks/MOVIE_WORKSPACE.md was
+// showed no ingest gain at 4 MiB and a slightly worse save p95; retain the
+// smaller seek unit until a remote profile demonstrates a material win.
 pub(crate) const MEDIA_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

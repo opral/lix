@@ -321,6 +321,9 @@ pub enum ReadConsistency {
 pub struct WriteOptions {
     pub base_snapshot: Option<SnapshotRef>,
     pub idempotency_key: Option<Bytes>,
+    /// Do not acknowledge the commit until the backend has crossed its
+    /// durable persistence boundary.
+    pub await_durable: bool,
     /// Conditions evaluated atomically against the state immediately before
     /// this write becomes visible.
     pub preconditions: Vec<Precondition>,
