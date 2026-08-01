@@ -17,7 +17,7 @@ use super::{
 const MAX_PLUGIN_EXECUTION_TIMEOUT_MS: u64 = 60_000;
 /// Preserve enough headroom for recursive plugins and large minified text
 /// snapshots. The live-Store working set remains independently bounded.
-pub(crate) const DEFAULT_PLUGIN_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const DEFAULT_PLUGIN_MEMORY_BYTES: u64 = 192 * 1024 * 1024;
 
 fn plugin_wasm_limits(max_memory_bytes: u64) -> Result<WasmLimits, LixError> {
     if max_memory_bytes == 0 {
@@ -269,11 +269,11 @@ mod tests {
         assert_eq!(WasmLimits::default().max_memory_bytes, 64 * 1024 * 1024);
         assert_eq!(
             default_plugin_wasm_limits().max_memory_bytes,
-            128 * 1024 * 1024
+            192 * 1024 * 1024
         );
         assert_eq!(
             DEFAULT_PLUGIN_MEMORY_BYTES * DEFAULT_MAX_LIVE_PLUGIN_STORES as u64,
-            2 * 1024 * 1024 * 1024
+            1_920 * 1024 * 1024
         );
         assert_eq!(
             default_plugin_wasm_limits().timeout_ms,
