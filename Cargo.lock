@@ -3299,6 +3299,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lix_collaboration_test_support"
+version = "0.9.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lix_engine"
 version = "0.9.0"
 dependencies = [
@@ -3465,6 +3475,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "codspeed-criterion-compat",
+ "lix_collaboration_test_support",
  "lix_engine",
  "lix_rocksdb_storage",
  "lix_sdk",
@@ -3502,6 +3513,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "lix_collaboration_test_support",
  "lix_sdk",
  "lix_slatedb_storage",
  "object_store 0.14.0",

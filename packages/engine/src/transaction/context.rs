@@ -753,16 +753,78 @@ where
         };
 
         let mut tracked = self.tracked_state.reader(read);
-        let concurrent = tracked
-            .diff_commits(
-                &opening_head.to_string(),
-                &current_head.to_string(),
-                &TrackedStateDiffRequest::default(),
-            )
+        let opening_head_text = opening_head.to_string();
+        let current_head_text = current_head.to_string();
+        let generation_write_set = tracked
+            .changed_identities_in_first_parent_interval(&opening_head_text, &current_head_text)
+            .instrument(tracing::debug_span!(
+                target: "lix_transaction",
+                "lix.transaction.stale.generation_write_set"
+            ))
             .await?;
-        match classify_stale_commit(prepared_writes, &concurrent) {
+        let (plan, concurrent_change_count, discovery) = match generation_write_set {
+            Some(identities) => {
+                let count = identities.len();
+                let plan = {
+                    let span = tracing::debug_span!(
+                        target: "lix_transaction",
+                        "lix.transaction.stale.classify",
+                        prepared_rows = prepared_writes.state_rows.len(),
+                        concurrent_changes = count,
+                    );
+                    let _entered = span.enter();
+                    classify_stale_commit(
+                        prepared_writes,
+                        identities.iter().map(|identity| identity.as_key_ref()),
+                    )
+                };
+                (plan, count, "generation_write_set")
+            }
+            None => {
+                let concurrent = tracked
+                    .diff_commits(
+                        &opening_head_text,
+                        &current_head_text,
+                        &TrackedStateDiffRequest::default(),
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_transaction",
+                        "lix.transaction.stale.general_diff"
+                    ))
+                    .await?;
+                let count = concurrent.entries.len();
+                let plan = {
+                    let span = tracing::debug_span!(
+                        target: "lix_transaction",
+                        "lix.transaction.stale.classify",
+                        prepared_rows = prepared_writes.state_rows.len(),
+                        concurrent_changes = count,
+                    );
+                    let _entered = span.enter();
+                    classify_stale_commit(
+                        prepared_writes,
+                        concurrent
+                            .entries
+                            .iter()
+                            .map(|entry| entry.identity.as_key_ref()),
+                    )
+                };
+                (plan, count, "general_diff")
+            }
+        };
+        tracing::debug!(
+            target: "lix_transaction",
+            plan = plan.kind(),
+            discovery,
+            prepared_rows = prepared_writes.state_rows.len(),
+            concurrent_changes = concurrent_change_count,
+            "classified stale transaction commit"
+        );
+        match plan {
             StaleCommitPlan::Direct | StaleCommitPlan::RevalidateOrdinaryInsert => {}
             StaleCommitPlan::ReconcilePlugin(plan) => {
+                let file_count = plan.file_ids.len();
+                let semantic_conflict_count = plan.semantic_conflict_indices.len();
                 self.reconcile_stale_plugin_writes(
                     read,
                     prepared_writes,
@@ -770,6 +832,12 @@ where
                     opening_head,
                     current_head,
                 )
+                .instrument(tracing::debug_span!(
+                    target: "lix_transaction",
+                    "lix.transaction.stale.reconcile",
+                    file_count,
+                    semantic_conflict_count,
+                ))
                 .await?;
             }
             StaleCommitPlan::Unsafe => {
@@ -1030,6 +1098,12 @@ where
                 .collect::<Result<Vec<_>, LixError>>()?;
             let resolutions = self
                 .resolve_plugin_conflicts(&group.plugin, group.descriptor.clone(), conflicts)
+                .instrument(tracing::debug_span!(
+                    target: "lix_transaction",
+                    "lix.transaction.stale.resolve_plugin",
+                    plugin_key = group.plugin.key(),
+                    conflict_count = group.conflicts.len(),
+                ))
                 .await?;
             for (conflict, resolution) in group.conflicts.iter().zip(resolutions.resolutions) {
                 let mut rows = RawWriteBatch::with_capacity(1);
@@ -1090,13 +1164,23 @@ where
         // Plugins may deliberately accept only one semantic edit per warm
         // transition. Preserve the accumulated conflict decision while
         // replaying its resolved and retained edits through one actor in order.
-        for rows in reconciliation_batches {
-            self.stage_write(TransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows,
-            })
-            .await?;
+        let replay_batch_count = reconciliation_batches.len();
+        async {
+            for rows in reconciliation_batches {
+                self.stage_write(TransactionWrite::Rows {
+                    mode: TransactionWriteMode::Replace,
+                    rows,
+                })
+                .await?;
+            }
+            Ok::<(), LixError>(())
         }
+        .instrument(tracing::debug_span!(
+            target: "lix_transaction",
+            "lix.transaction.stale.replay",
+            replay_batch_count,
+        ))
+        .await?;
         let mut replacement = self.staged_writes.drain()?;
         let mut latest_file_data = BTreeMap::new();
         for write in replacement.file_data_writes.drain(..) {

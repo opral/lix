@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use crate::common::SharedStr;
 use crate::filesystem::DERIVED_FILE_REF_SCHEMA_KEY;
-use crate::tracked_state::{TrackedStateDiff, TrackedStateKeyRef};
+use crate::tracked_state::TrackedStateKeyRef;
 
 use super::staging::PreparedWriteSet;
 
@@ -16,15 +16,25 @@ pub(super) enum StaleCommitPlan {
     Unsafe,
 }
 
+impl StaleCommitPlan {
+    pub(super) const fn kind(&self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::RevalidateOrdinaryInsert => "revalidate_ordinary_insert",
+            Self::ReconcilePlugin(_) => "reconcile_plugin",
+            Self::Unsafe => "unsafe",
+        }
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct StalePluginReconciliationPlan {
     pub(super) semantic_conflict_indices: Vec<usize>,
     pub(super) file_ids: BTreeSet<String>,
 }
 
-pub(super) fn classify_stale_commit(
-    prepared_writes: &PreparedWriteSet,
-    concurrent: &TrackedStateDiff,
+pub(super) fn classify_stale_commit<'a>(
+    prepared_writes: &'a PreparedWriteSet,
+    concurrent: impl Iterator<Item = TrackedStateKeyRef<'a>>,
 ) -> StaleCommitPlan {
     let overlapping_indices = indexed_overlap_indices(
         prepared_writes
@@ -41,10 +51,7 @@ pub(super) fn classify_stale_commit(
                     },
                 )
             }),
-        concurrent
-            .entries
-            .iter()
-            .map(|entry| entry.identity.as_key_ref()),
+        concurrent,
     );
     if overlapping_indices.is_empty() {
         return StaleCommitPlan::Direct;
