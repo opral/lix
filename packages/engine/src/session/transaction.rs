@@ -30,6 +30,7 @@ pub struct SessionTransaction<StorageImpl: Storage = Memory> {
     write_access: Option<SessionWriteAccess>,
     collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
+    pub(super) has_started_statement: bool,
 }
 
 impl<StorageImpl> SessionContext<StorageImpl>
@@ -87,6 +88,7 @@ where
             write_access: Some(write_access),
             collaboration_write_gate: Arc::clone(&self.collaboration_write_gate),
             telemetry: self.telemetry.clone(),
+            has_started_statement: false,
         })
     }
 }

@@ -2,15 +2,27 @@ use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::LixError;
 use crate::sql2::catalog::PublicCatalog;
 use crate::sql2::plan::LogicalWritePlan;
+use crate::{LixError, Value};
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use lru::LruCache;
 
 const PARSED_STATEMENT_CAPACITY: usize = 256;
 const PUBLIC_CATALOG_CAPACITY: usize = 16;
 const WRITE_PLAN_CAPACITY: usize = 256;
+
+/// One conservative auto-parameterization of a literal UPDATE statement.
+///
+/// The normalized SQL is suitable as a planning-cache key while `params`
+/// preserves the values from the caller's original statement. Keeping this
+/// representation private to SQL execution avoids making automatic
+/// parameterization part of the public API contract.
+pub(crate) struct AutoParameterizedUpdate {
+    pub(crate) sql: Arc<str>,
+    pub(crate) statement: DataFusionStatement,
+    pub(crate) params: Vec<Value>,
+}
 
 /// Bounded, engine-owned cache for snapshot-independent SQL planning templates.
 ///
@@ -75,6 +87,24 @@ where
         }
         statements.put(Arc::from(sql), Arc::new(parsed.clone()));
         Ok(parsed)
+    }
+
+    /// Reuses one parsed template for UPDATE statements that differ only in
+    /// ordinary string literals.
+    ///
+    /// This intentionally accepts a narrow, unambiguous SQL subset. Existing
+    /// placeholders, comments, prefixed string forms, and malformed literals
+    /// fall back to exact parsing. The fallback keeps the full SQL surface and
+    /// its existing diagnostics authoritative while the common literal CRUD
+    /// shape avoids churning the bounded exact-text caches.
+    pub(crate) fn auto_parameterized_update(&self, sql: &str) -> Option<AutoParameterizedUpdate> {
+        let (normalized_sql, params) = normalize_update_string_literals(sql)?;
+        let statement = self.parse_statement(&normalized_sql).ok()?;
+        Some(AutoParameterizedUpdate {
+            sql: Arc::from(normalized_sql),
+            statement,
+            params,
+        })
     }
 
     /// Returns stable public-surface metadata for one catalog generation.
@@ -162,6 +192,86 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn normalize_update_string_literals(sql: &str) -> Option<(String, Vec<Value>)> {
+    let trimmed = sql.trim_start();
+    let update = trimmed.get(.."UPDATE".len())?;
+    if !update.eq_ignore_ascii_case("UPDATE")
+        || !trimmed
+            .as_bytes()
+            .get("UPDATE".len())
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        return None;
+    }
+
+    let bytes = sql.as_bytes();
+    let mut normalized = String::with_capacity(sql.len());
+    let mut params = Vec::new();
+    let mut cursor = 0;
+    let mut copied = 0;
+    let mut quoted_identifier = false;
+
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'"' => {
+                if quoted_identifier && bytes.get(cursor + 1) == Some(&b'"') {
+                    cursor += 2;
+                    continue;
+                }
+                quoted_identifier = !quoted_identifier;
+                cursor += 1;
+            }
+            b'-' if !quoted_identifier && bytes.get(cursor + 1) == Some(&b'-') => return None,
+            b'/' if !quoted_identifier && bytes.get(cursor + 1) == Some(&b'*') => return None,
+            b'?' | b'$' if !quoted_identifier => return None,
+            b'\'' if !quoted_identifier => {
+                if bytes[..cursor]
+                    .iter()
+                    .rposition(|byte| !byte.is_ascii_whitespace())
+                    .is_some_and(|index| {
+                        matches!(bytes[index], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+                    })
+                {
+                    return None;
+                }
+                normalized.push_str(&sql[copied..cursor]);
+                normalized.push('$');
+                normalized.push_str(&(params.len() + 1).to_string());
+
+                cursor += 1;
+                let mut value = String::new();
+                let value_start = cursor;
+                let mut segment_start = cursor;
+                loop {
+                    let quote = bytes[cursor..]
+                        .iter()
+                        .position(|byte| *byte == b'\'')
+                        .map(|offset| cursor + offset)?;
+                    value.push_str(&sql[segment_start..quote]);
+                    if bytes.get(quote + 1) == Some(&b'\'') {
+                        value.push('\'');
+                        cursor = quote + 2;
+                        segment_start = cursor;
+                        continue;
+                    }
+                    cursor = quote + 1;
+                    copied = cursor;
+                    break;
+                }
+                debug_assert!(cursor > value_start);
+                params.push(Value::Text(value));
+            }
+            _ => cursor += 1,
+        }
+    }
+
+    if quoted_identifier || params.is_empty() {
+        return None;
+    }
+    normalized.push_str(&sql[copied..]);
+    Some((normalized, params))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +316,54 @@ mod tests {
 
         assert!(cache.parse_statement("SELECT (").is_err());
         assert!(lock_or_recover(&cache.parsed_statements).is_empty());
+    }
+
+    #[test]
+    fn literal_updates_share_one_parameterized_parse_template() {
+        let cache = test_cache(8);
+        let first = cache
+            .auto_parameterized_update(
+                "UPDATE notes SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
+            )
+            .expect("literal update auto-parameterizes");
+        let second = cache
+            .auto_parameterized_update(
+                "UPDATE notes SET value = lix_json('{\"text\":\"second\"}') WHERE id = 'b'",
+            )
+            .expect("case-equivalent literal update auto-parameterizes");
+
+        assert_eq!(
+            first.sql.as_ref(),
+            "UPDATE notes SET value = lix_json($1) WHERE id = $2"
+        );
+        assert_eq!(
+            first.params,
+            [
+                Value::Text("{\"text\":\"first\"}".to_string()),
+                Value::Text("a".to_string())
+            ]
+        );
+        assert_eq!(
+            second.params,
+            [
+                Value::Text("{\"text\":\"second\"}".to_string()),
+                Value::Text("b".to_string())
+            ]
+        );
+        assert_eq!(lock_or_recover(&cache.parsed_statements).len(), 1);
+    }
+
+    #[test]
+    fn ambiguous_literal_updates_keep_exact_sql_path() {
+        let cache = test_cache(8);
+        for sql in [
+            "UPDATE notes SET value = $1 WHERE id = 'a'",
+            "UPDATE notes SET value = DATE '2026-08-01' WHERE id = 'a'",
+            "UPDATE notes SET value = 'a' -- comment",
+            "SELECT 'not an update'",
+        ] {
+            assert!(cache.auto_parameterized_update(sql).is_none(), "{sql}");
+        }
     }
 
     #[test]
