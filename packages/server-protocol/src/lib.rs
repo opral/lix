@@ -111,6 +111,8 @@ const MAX_COMPLETED_REMOTE_TRANSACTIONS: usize = 8;
 const MAX_IDEMPOTENCY_COMPONENT_BYTES: usize = 255;
 const SESSION_OPEN_GATE_CLOSING: usize = 1 << (usize::BITS - 1);
 const SESSION_OPEN_GATE_COUNT_MASK: usize = !SESSION_OPEN_GATE_CLOSING;
+const SESSION_ACTIVITY_TRANSACTION: usize = 1 << (usize::BITS - 1);
+const SESSION_ACTIVITY_LEASE_COUNT_MASK: usize = !SESSION_ACTIVITY_TRANSACTION;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// A stable principal namespace injected by an authenticated protocol host.
@@ -292,8 +294,7 @@ where
     lix: Arc<AsyncRwLock<Arc<Lix<S>>>>,
     transactions: AsyncMutex<RemoteTransactionRegistry<S>>,
     last_used: Mutex<Instant>,
-    leases: AtomicUsize,
-    transaction_active: std::sync::atomic::AtomicBool,
+    activity: Arc<SessionActivity>,
     request_blobs: Mutex<RequestBlobCache>,
     max_reconstructed_request_blob_bytes: usize,
 }
@@ -312,6 +313,84 @@ where
 {
     id: String,
     transaction: LixTransaction<S>,
+    _pin: RemoteTransactionPin,
+}
+
+#[derive(Debug)]
+struct RemoteTransactionPin {
+    activity: Arc<SessionActivity>,
+}
+
+impl RemoteTransactionPin {
+    fn acquire(activity: Arc<SessionActivity>) -> Result<Self, LixError> {
+        activity.acquire_transaction()?;
+        Ok(Self { activity })
+    }
+}
+
+impl Drop for RemoteTransactionPin {
+    fn drop(&mut self) {
+        self.activity.release_transaction();
+    }
+}
+
+#[derive(Debug, Default)]
+struct SessionActivity {
+    state: AtomicUsize,
+}
+
+impl SessionActivity {
+    fn acquire_lease(&self) {
+        let previous = self.state.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            previous & SESSION_ACTIVITY_LEASE_COUNT_MASK < SESSION_ACTIVITY_LEASE_COUNT_MASK,
+            "session lease count overflow"
+        );
+    }
+
+    fn release_lease(&self) {
+        let previous = self.state.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            previous & SESSION_ACTIVITY_LEASE_COUNT_MASK > 0,
+            "session lease count underflow"
+        );
+    }
+
+    fn acquire_transaction(&self) -> Result<(), LixError> {
+        let previous = self
+            .state
+            .fetch_or(SESSION_ACTIVITY_TRANSACTION, Ordering::AcqRel);
+        if previous & SESSION_ACTIVITY_TRANSACTION != 0 {
+            return Err(remote_transaction_state_error(
+                "Lix session already has an active transaction",
+            ));
+        }
+        Ok(())
+    }
+
+    fn release_transaction(&self) {
+        let previous = self
+            .state
+            .fetch_and(!SESSION_ACTIVITY_TRANSACTION, Ordering::AcqRel);
+        assert!(
+            previous & SESSION_ACTIVITY_TRANSACTION != 0,
+            "session transaction pin was not active"
+        );
+    }
+
+    #[cfg(test)]
+    fn lease_count(&self) -> usize {
+        self.state.load(Ordering::Acquire) & SESSION_ACTIVITY_LEASE_COUNT_MASK
+    }
+
+    fn is_idle(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 0
+    }
+
+    #[cfg(test)]
+    fn transaction_is_active(&self) -> bool {
+        self.state.load(Ordering::Acquire) & SESSION_ACTIVITY_TRANSACTION != 0
+    }
 }
 
 #[derive(Clone)]
@@ -498,15 +577,14 @@ where
             lix: Arc::new(AsyncRwLock::new(Arc::new(lix))),
             transactions: AsyncMutex::new(RemoteTransactionRegistry::default()),
             last_used: Mutex::new(now),
-            leases: AtomicUsize::new(0),
-            transaction_active: std::sync::atomic::AtomicBool::new(false),
+            activity: Arc::new(SessionActivity::default()),
             request_blobs: Mutex::new(RequestBlobCache::new(request_blob_budget)),
             max_reconstructed_request_blob_bytes,
         }
     }
 
     fn acquire(&self, now: Instant) {
-        self.leases.fetch_add(1, Ordering::AcqRel);
+        self.activity.acquire_lease();
         *self
             .last_used
             .lock()
@@ -518,12 +596,12 @@ where
             .last_used
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
-        let previous = self.leases.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "session lease count underflow");
+        self.activity.release_lease();
     }
 
+    #[cfg(test)]
     fn lease_count(&self) -> usize {
-        self.leases.load(Ordering::Acquire)
+        self.activity.lease_count()
     }
 
     fn last_used(&self) -> Instant {
@@ -534,9 +612,11 @@ where
     }
 
     fn is_idle_expired(&self, now: Instant, timeout: Duration) -> bool {
-        self.lease_count() == 0
-            && !self.transaction_active.load(Ordering::Acquire)
-            && now.saturating_duration_since(self.last_used()) >= timeout
+        self.is_idle() && now.saturating_duration_since(self.last_used()) >= timeout
+    }
+
+    fn is_idle(&self) -> bool {
+        self.activity.is_idle()
     }
 
     fn request_blob(&self, sha256: &str) -> Option<VerifiedRequestBlob> {
@@ -779,13 +859,12 @@ where
         }
         let lix = Arc::clone(&*self.record.lix.read().await);
         let id = generate_capability_id()?;
+        let pin = RemoteTransactionPin::acquire(Arc::clone(&self.record.activity))?;
         transactions.active = Some(ActiveRemoteTransaction {
             id: id.clone(),
             transaction: lix.begin_transaction().await?,
+            _pin: pin,
         });
-        self.record
-            .transaction_active
-            .store(true, Ordering::Release);
         Ok(id)
     }
 
@@ -886,9 +965,6 @@ where
         while transactions.completed.len() > MAX_COMPLETED_REMOTE_TRANSACTIONS {
             transactions.completed.pop_front();
         }
-        self.record
-            .transaction_active
-            .store(false, Ordering::Release);
         result.map(|_| ())
     }
 
@@ -1379,9 +1455,7 @@ where
             let lru_idle_id = registry
                 .sessions
                 .iter()
-                .filter(|(_, record)| {
-                    record.lease_count() == 0 && !record.transaction_active.load(Ordering::Acquire)
-                })
+                .filter(|(_, record)| record.is_idle())
                 .min_by_key(|(_, record)| record.last_used())
                 .map(|(session_id, _)| session_id.clone());
             let Some(lru_idle_id) = lru_idle_id else {
@@ -1465,7 +1539,6 @@ where
         Some(active) => active.transaction.rollback().await,
         None => Ok(()),
     };
-    record.transaction_active.store(false, Ordering::Release);
     let lix = record.lix.write().await;
     let close_result = lix.close().await;
     rollback_result.and(close_result)
@@ -9327,6 +9400,46 @@ mod tests {
         assert_eq!(replacement.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn remote_transaction_pin_is_exclusive_and_releases_on_drop() {
+        let activity = Arc::new(SessionActivity::default());
+        let pin = RemoteTransactionPin::acquire(Arc::clone(&activity)).expect("first pin opens");
+        assert!(activity.transaction_is_active());
+        let error = RemoteTransactionPin::acquire(Arc::clone(&activity))
+            .expect_err("a second transaction pin must be rejected");
+        assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+        drop(pin);
+
+        assert!(!activity.transaction_is_active());
+        let replacement =
+            RemoteTransactionPin::acquire(Arc::clone(&activity)).expect("released pin reopens");
+        drop(replacement);
+        assert!(!activity.transaction_is_active());
+    }
+
+    #[test]
+    fn session_activity_keeps_lease_count_and_transaction_pin_coherent() {
+        let activity = Arc::new(SessionActivity::default());
+        activity.acquire_lease();
+        let transaction =
+            RemoteTransactionPin::acquire(Arc::clone(&activity)).expect("transaction pin opens");
+        activity.acquire_lease();
+
+        assert_eq!(activity.lease_count(), 2);
+        assert!(activity.transaction_is_active());
+        assert!(!activity.is_idle());
+
+        activity.release_lease();
+        drop(transaction);
+        assert_eq!(activity.lease_count(), 1);
+        assert!(!activity.transaction_is_active());
+        assert!(!activity.is_idle());
+
+        activity.release_lease();
+        assert!(activity.is_idle());
+    }
+
     #[tokio::test]
     async fn server_shutdown_discards_abandoned_remote_transaction_and_session() {
         let app = app().await;
@@ -9598,6 +9711,94 @@ mod tests {
         }
         let replacement = request(&router, "GET", "/lix/v1", None, None).await;
         assert_eq!(replacement.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cancelled_remote_commit_releases_transaction_pin_after_detached_work() {
+        let storage = BlockingFencedWriteStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open lix"),
+        );
+        let server = LixProtocolServer::with_options(
+            root,
+            ProtocolServerOptions {
+                max_sessions: 1,
+                session_idle_timeout: Duration::from_mins(1),
+                ..ProtocolServerOptions::default()
+            },
+        )
+        .expect("protocol server");
+        let router = handler(server.clone());
+        let (session_id, _) = new_session(&router).await;
+        let transaction_id = begin_remote_transaction(&router, &session_id).await;
+        let staged = remote_transaction_request(
+            &router,
+            "POST",
+            "/lix/v1/transaction/execute",
+            &session_id,
+            &transaction_id,
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('cancelled-commit', 'value')"
+            })),
+        )
+        .await;
+        assert_eq!(staged.status(), StatusCode::OK);
+        let record = server
+            .inner
+            .registry
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .expect("transaction session remains registered");
+
+        storage.block_next_write();
+        let commit_router = router.clone();
+        let commit_session_id = session_id.clone();
+        let commit_transaction_id = transaction_id.clone();
+        let commit = tokio::spawn(async move {
+            remote_transaction_request(
+                &commit_router,
+                "POST",
+                "/lix/v1/transaction/commit",
+                &commit_session_id,
+                &commit_transaction_id,
+                None,
+            )
+            .await
+        });
+        storage.wait_for_blocked_write().await;
+
+        commit.abort();
+        assert!(
+            commit
+                .await
+                .expect_err("outer commit request was cancelled")
+                .is_cancelled()
+        );
+        assert_eq!(
+            request(&router, "GET", "/lix/v1", None, None)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "detached storage work must keep its operation lease"
+        );
+
+        storage.release_blocked_write();
+        while record.lease_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!record.activity.transaction_is_active());
+        assert_eq!(
+            request(&router, "GET", "/lix/v1", None, None)
+                .await
+                .status(),
+            StatusCode::OK,
+            "dropped transaction state must release the lifecycle pin"
+        );
     }
 
     #[tokio::test]

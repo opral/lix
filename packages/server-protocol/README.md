@@ -80,6 +80,10 @@ Expired sessions are
 removed opportunistically. At capacity, the least-recently-used idle session
 is evicted; if every session is leased by an active HTTP request or SSE stream,
 the new handshake returns `503` instead of closing active work.
+An open remote transaction owns an RAII lifecycle pin in the same idleness
+predicate. Committing, rolling back, cancellation, and session teardown all
+release that pin by dropping the transaction state; no terminal path manually
+repairs a second activity flag.
 
 Request blob splices use a bounded, per-session FIFO cache: at most eight
 entries and 16 MiB aggregate, with only blobs from 32 KiB through 16 MiB
