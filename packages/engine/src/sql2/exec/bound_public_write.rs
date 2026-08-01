@@ -4,7 +4,7 @@ use datafusion::arrow::array::{Array, BooleanArray, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, value::RawValue};
 use tracing::Instrument;
 
 use crate::catalog::{SchemaPlanId, TypedJsonScalarRef};
@@ -898,22 +898,8 @@ async fn try_execute_direct_path_value_replacement_batch(
         match parameter_batch.value(replacement.value_param_index, statement_index) {
             DirectParameterValue::Null => normalized.extend_from_slice(b"null"),
             DirectParameterValue::String(raw) => {
-                let value = serde_json::from_str::<JsonValue>(raw).map_err(|error| {
-                    with_parameter_batch_statement_index(
-                        LixError::new(
-                            LixError::CODE_TYPE_MISMATCH,
-                            format!("lix_json argument is not valid JSON: {error}"),
-                        ),
-                        statement_index,
-                    )
-                })?;
-                serde_json::to_writer(&mut normalized, &value).map_err(|error| {
-                    with_parameter_batch_statement_index(
-                        LixError::unknown(format!(
-                            "certified replacement value failed to serialize: {error}"
-                        )),
-                        statement_index,
-                    )
+                append_canonical_json_parameter(&mut normalized, raw).map_err(|error| {
+                    with_parameter_batch_statement_index(error, statement_index)
                 })?;
             }
             DirectParameterValue::Boolean(_) => {
@@ -1208,26 +1194,360 @@ fn append_direct_path_value_replacement_json_text(
     candidate: EntityLiveRowRef<'_>,
     raw: Option<&str>,
 ) -> Result<(), LixError> {
-    let value = match raw {
-        None => JsonValue::Null,
-        Some(raw) => serde_json::from_str(raw).map_err(|error| {
-            LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("lix_json argument is not valid JSON: {error}"),
-            )
-        })?,
-    };
     normalized.extend_from_slice(br#"{"path":"#);
     append_canonical_json_string(normalized, candidate.entity_pk().as_single_string()?)?;
     normalized.extend_from_slice(br#","value":"#);
-    serde_json::to_writer(&mut *normalized, &value).map_err(|error| {
-        LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!("certified replacement value failed to serialize: {error}"),
-        )
-    })?;
+    match raw {
+        None => normalized.extend_from_slice(b"null"),
+        Some(raw) => append_canonical_json_parameter(normalized, raw)?,
+    }
     normalized.push(b'}');
     Ok(())
+}
+
+/// Appends a `lix_json` parameter in serde_json's stable compact form.
+///
+/// Public parameters do not carry a canonical-JSON type certificate, but the
+/// common path is already produced by `JSON.stringify` or `serde_json`. A
+/// borrowed `RawValue` validates that input without building a DOM. The small
+/// lexical recognizer then proves that parsing into `Value` and serializing it
+/// would leave every byte unchanged: object keys are ordered, strings use the
+/// serializer's preferred escapes, and numbers are exact in-range integers.
+/// Inputs outside that deliberately narrow proof retain the canonical DOM
+/// fallback and therefore preserve existing SQL semantics.
+fn append_canonical_json_parameter(normalized: &mut Vec<u8>, raw: &str) -> Result<(), LixError> {
+    serde_json::from_str::<&RawValue>(raw).map_err(|error| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("lix_json argument is not valid JSON: {error}"),
+        )
+    })?;
+    if CanonicalJsonText::recognizes(raw) {
+        normalized.extend_from_slice(raw.as_bytes());
+        return Ok(());
+    }
+    let original_len = normalized.len();
+    if CanonicalJsonText::append_normalized(raw, normalized) {
+        return Ok(());
+    }
+    normalized.truncate(original_len);
+
+    let value = serde_json::from_str::<JsonValue>(raw).map_err(|error| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("lix_json argument is not valid JSON: {error}"),
+        )
+    })?;
+    serde_json::to_writer(normalized, &value).map_err(|error| {
+        LixError::unknown(format!(
+            "certified replacement value failed to serialize: {error}"
+        ))
+    })
+}
+
+struct CanonicalJsonText<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> CanonicalJsonText<'a> {
+    fn recognizes(raw: &'a str) -> bool {
+        let mut parser = Self {
+            bytes: raw.as_bytes(),
+            position: 0,
+        };
+        parser.value() && parser.position == parser.bytes.len()
+    }
+
+    fn append_normalized(raw: &'a str, output: &mut Vec<u8>) -> bool {
+        let mut parser = Self {
+            bytes: raw.as_bytes(),
+            position: 0,
+        };
+        parser.write_value(output) && parser.position == parser.bytes.len()
+    }
+
+    fn value(&mut self) -> bool {
+        match self.peek() {
+            Some(b'n') => self.literal(b"null"),
+            Some(b't') => self.literal(b"true"),
+            Some(b'f') => self.literal(b"false"),
+            Some(b'"') => self.string(false).is_some(),
+            Some(b'[') => self.array(),
+            Some(b'{') => self.object(),
+            Some(b'-' | b'0'..=b'9') => self.integer(),
+            _ => false,
+        }
+    }
+
+    fn array(&mut self) -> bool {
+        self.position += 1;
+        if self.take(b']') {
+            return true;
+        }
+        loop {
+            if !self.value() {
+                return false;
+            }
+            if self.take(b']') {
+                return true;
+            }
+            if !self.take(b',') {
+                return false;
+            }
+        }
+    }
+
+    fn object(&mut self) -> bool {
+        self.position += 1;
+        if self.take(b'}') {
+            return true;
+        }
+        let mut previous_key: Option<&[u8]> = None;
+        loop {
+            let Some(key) = self.string(true) else {
+                return false;
+            };
+            if previous_key.is_some_and(|previous| previous >= key) {
+                return false;
+            }
+            previous_key = Some(key);
+            if !self.take(b':') || !self.value() {
+                return false;
+            }
+            if self.take(b'}') {
+                return true;
+            }
+            if !self.take(b',') {
+                return false;
+            }
+        }
+    }
+
+    fn write_value(&mut self, output: &mut Vec<u8>) -> bool {
+        let start = self.position;
+        match self.peek() {
+            Some(b'n') if self.literal(b"null") => output.extend_from_slice(b"null"),
+            Some(b't') if self.literal(b"true") => output.extend_from_slice(b"true"),
+            Some(b'f') if self.literal(b"false") => output.extend_from_slice(b"false"),
+            Some(b'"') if self.string(false).is_some() => {
+                output.extend_from_slice(&self.bytes[start..self.position]);
+            }
+            Some(b'[') => return self.write_array(output),
+            Some(b'{') => return self.write_object(output),
+            Some(b'-' | b'0'..=b'9') if self.integer() => {
+                output.extend_from_slice(&self.bytes[start..self.position]);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn write_array(&mut self, output: &mut Vec<u8>) -> bool {
+        self.position += 1;
+        output.push(b'[');
+        if self.take(b']') {
+            output.push(b']');
+            return true;
+        }
+        let mut first = true;
+        loop {
+            if !first {
+                output.push(b',');
+            }
+            first = false;
+            if !self.write_value(output) {
+                return false;
+            }
+            if self.take(b']') {
+                output.push(b']');
+                return true;
+            }
+            if !self.take(b',') {
+                return false;
+            }
+        }
+    }
+
+    fn write_object(&mut self, output: &mut Vec<u8>) -> bool {
+        self.position += 1;
+        if self.take(b'}') {
+            output.extend_from_slice(b"{}");
+            return true;
+        }
+        let mut members = smallvec::SmallVec::<[(&'a [u8], &'a [u8]); 8]>::new();
+        loop {
+            let Some(key) = self.string(true) else {
+                return false;
+            };
+            if !self.take(b':') {
+                return false;
+            }
+            let value_start = self.position;
+            if !self.skip_value() {
+                return false;
+            }
+            members.push((key, &self.bytes[value_start..self.position]));
+            if self.take(b'}') {
+                break;
+            }
+            if !self.take(b',') {
+                return false;
+            }
+        }
+        members.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        if members.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return false;
+        }
+
+        output.push(b'{');
+        for (index, (key, value)) in members.into_iter().enumerate() {
+            if index != 0 {
+                output.push(b',');
+            }
+            output.push(b'"');
+            output.extend_from_slice(key);
+            output.extend_from_slice(b"\":");
+            let mut value_parser = Self {
+                bytes: value,
+                position: 0,
+            };
+            if !value_parser.write_value(output) || value_parser.position != value.len() {
+                return false;
+            }
+        }
+        output.push(b'}');
+        true
+    }
+
+    fn skip_value(&mut self) -> bool {
+        match self.peek() {
+            Some(b'n') => self.literal(b"null"),
+            Some(b't') => self.literal(b"true"),
+            Some(b'f') => self.literal(b"false"),
+            Some(b'"') => self.string(false).is_some(),
+            Some(b'[') => self.skip_array(),
+            Some(b'{') => self.skip_object(),
+            Some(b'-' | b'0'..=b'9') => self.integer(),
+            _ => false,
+        }
+    }
+
+    fn skip_array(&mut self) -> bool {
+        self.position += 1;
+        if self.take(b']') {
+            return true;
+        }
+        loop {
+            if !self.skip_value() {
+                return false;
+            }
+            if self.take(b']') {
+                return true;
+            }
+            if !self.take(b',') {
+                return false;
+            }
+        }
+    }
+
+    fn skip_object(&mut self) -> bool {
+        self.position += 1;
+        if self.take(b'}') {
+            return true;
+        }
+        loop {
+            if self.string(true).is_none() || !self.take(b':') || !self.skip_value() {
+                return false;
+            }
+            if self.take(b'}') {
+                return true;
+            }
+            if !self.take(b',') {
+                return false;
+            }
+        }
+    }
+
+    fn string(&mut self, reject_escapes: bool) -> Option<&'a [u8]> {
+        if !self.take(b'"') {
+            return None;
+        }
+        let start = self.position;
+        while let Some(byte) = self.peek() {
+            match byte {
+                b'"' => {
+                    let end = self.position;
+                    self.position += 1;
+                    return Some(&self.bytes[start..end]);
+                }
+                b'\\' => {
+                    if reject_escapes {
+                        return None;
+                    }
+                    self.position += 1;
+                    match self.peek() {
+                        Some(b'"' | b'\\' | b'b' | b'f' | b'n' | b'r' | b't') => {
+                            self.position += 1;
+                        }
+                        // `\/` and `\uXXXX` are valid but serde_json emits a
+                        // different compact spelling after decoding them.
+                        _ => return None,
+                    }
+                }
+                _ => self.position += 1,
+            }
+        }
+        None
+    }
+
+    fn integer(&mut self) -> bool {
+        let start = self.position;
+        if self.take(b'-') && !matches!(self.peek(), Some(b'1'..=b'9')) {
+            return false;
+        }
+        if self.take(b'0') {
+            if matches!(self.peek(), Some(b'0'..=b'9' | b'.' | b'e' | b'E')) {
+                return false;
+            }
+        } else {
+            let digit_start = self.position;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.position += 1;
+            }
+            if self.position == digit_start || matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
+                return false;
+            }
+        }
+        let Ok(text) = std::str::from_utf8(&self.bytes[start..self.position]) else {
+            return false;
+        };
+        if text.starts_with('-') {
+            text.parse::<i64>().is_ok()
+        } else {
+            text.parse::<u64>().is_ok()
+        }
+    }
+
+    fn literal(&mut self, literal: &[u8]) -> bool {
+        if self.bytes.get(self.position..self.position + literal.len()) != Some(literal) {
+            return false;
+        }
+        self.position += literal.len();
+        true
+    }
+
+    fn take(&mut self, expected: u8) -> bool {
+        if self.peek() != Some(expected) {
+            return false;
+        }
+        self.position += 1;
+        true
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.position).copied()
+    }
 }
 
 fn append_direct_path_value_replacement_prepared_row(
@@ -2291,17 +2611,7 @@ async fn try_execute_direct_path_value_replacement(
     match replacement_value {
         None => normalized.extend_from_slice(b"null"),
         Some(raw) => {
-            let value = serde_json::from_str::<JsonValue>(raw).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    format!("lix_json argument is not valid JSON: {error}"),
-                )
-            })?;
-            serde_json::to_writer(&mut normalized, &value).map_err(|error| {
-                LixError::unknown(format!(
-                    "certified replacement value failed to serialize: {error}"
-                ))
-            })?;
+            append_canonical_json_parameter(&mut normalized, raw)?;
         }
     }
     normalized.push(b'}');
@@ -6188,6 +6498,65 @@ mod primary_key_route_tests {
             append_canonical_json_string(&mut actual, value)
                 .expect("canonical string should serialize");
             assert_eq!(actual, serde_json::to_vec(value).unwrap());
+        }
+    }
+
+    #[test]
+    fn recognizes_only_json_text_unchanged_by_serde_value_roundtrip() {
+        let canonical = [
+            "null",
+            "true",
+            "false",
+            "0",
+            "18446744073709551615",
+            "-9223372036854775808",
+            r#""plain""#,
+            r#""quote\" and slash\\ and line\n""#,
+            r#"[0,true,"café",{"a":1,"b":[2,3]}]"#,
+            r#"{"a":1,"b":{"c":"value"},"z":null}"#,
+        ];
+        for raw in canonical {
+            assert!(
+                CanonicalJsonText::recognizes(raw),
+                "expected {raw} to route"
+            );
+            let parsed: JsonValue = serde_json::from_str(raw).unwrap();
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), raw);
+        }
+
+        for raw in [
+            " 0",
+            "0 ",
+            "-0",
+            "1.0",
+            "1e2",
+            "18446744073709551616",
+            r#""unicode \u0061""#,
+            r#""escaped\/slash""#,
+            r#"{"b":1,"a":2}"#,
+            r#"{"a":1,"a":2}"#,
+            r#"{"escaped\u0061":1}"#,
+        ] {
+            assert!(
+                !CanonicalJsonText::recognizes(raw),
+                "expected {raw} to retain DOM canonicalization"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_json_parameter_fallback_preserves_existing_normalization() {
+        for raw in [
+            " { \"b\" : 1, \"a\" : 2 } ",
+            r#"{"value":1.0,"escaped":"\u0061"}"#,
+            r#"{"ordinal":42,"lane":"scale","updated":true}"#,
+            r#"[{"z":1,"a":{"d":4,"c":3}},2]"#,
+        ] {
+            let mut actual = Vec::new();
+            append_canonical_json_parameter(&mut actual, raw).unwrap();
+            let expected =
+                serde_json::to_vec(&serde_json::from_str::<JsonValue>(raw).unwrap()).unwrap();
+            assert_eq!(actual, expected);
         }
     }
 
