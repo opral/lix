@@ -1540,7 +1540,7 @@ where
         let large_files = prepared_writes
             .file_data_writes
             .iter()
-            .filter(|write| write.len() > MAX_RETAINED_IMPORT_BYTES)
+            .filter(|write| write.len() > MAX_RETAINED_IMPORT_BYTES as u64)
             .map(|write| (write.branch_id.as_str(), write.file_id.as_str()))
             .collect::<BTreeSet<_>>();
         if large_files.is_empty() {

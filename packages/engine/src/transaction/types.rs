@@ -1501,10 +1501,10 @@ impl FileContent {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> u64 {
         match self {
-            Self::Inline(payload) => payload.len(),
-            Self::PreparedCas(receipt) => usize::try_from(receipt.size_bytes).unwrap_or(usize::MAX),
+            Self::Inline(payload) => payload.len() as u64,
+            Self::PreparedCas(receipt) => receipt.size_bytes,
         }
     }
 
@@ -1727,7 +1727,7 @@ impl TransactionFileData {
         if length == 0
             || offset
                 .checked_add(length)
-                .is_none_or(|end| end > self.content.len())
+                .is_none_or(|end| end as u64 > self.content.len())
         {
             return;
         }
@@ -1749,7 +1749,7 @@ impl TransactionFileData {
             || (delete_len == 0 && insert_len == 0)
             || offset
                 .checked_add(insert_len)
-                .is_none_or(|end| end > self.content.len())
+                .is_none_or(|end| end as u64 > self.content.len())
         {
             return;
         }
@@ -1765,7 +1765,7 @@ impl TransactionFileData {
         self.content.blob_id()
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> u64 {
         self.content.len()
     }
 

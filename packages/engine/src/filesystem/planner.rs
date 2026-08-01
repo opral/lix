@@ -357,25 +357,16 @@ impl FileDescriptorWriteIntent {
 pub(crate) struct BlobRefRowInput {
     pub(crate) file_id: String,
     pub(crate) blob_hash: BlobId,
-    pub(crate) size_bytes: usize,
+    pub(crate) size_bytes: u64,
     pub(crate) context: FilesystemRowContext,
 }
 
 impl BlobRefRowInput {
     pub(crate) fn append_to(self, rows: &mut RawWriteBatch) -> Result<(), LixError> {
-        let size_bytes = u64::try_from(self.size_bytes).map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "binary blob size exceeds supported range for file '{}' branch '{}'",
-                    self.file_id, self.context.branch_id
-                ),
-            )
-        })?;
         let snapshot = json!({
             "id": self.file_id,
             "blob_hash": self.blob_hash.to_hex(),
-            "size_bytes": size_bytes,
+            "size_bytes": self.size_bytes,
         });
         let file_id = self.file_id;
         append_state_row(

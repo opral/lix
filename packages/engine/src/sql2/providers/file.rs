@@ -12358,14 +12358,18 @@ mod tests {
             rows,
             ..CapturingWriteContext::default()
         };
-        let payload = b"durable media payload";
-        let size_bytes = payload.len() as u64;
-        let chunk_hash = ChunkHash::from_content(payload);
-        let blob_id = BlobId::from_single_chunk(chunk_hash);
+        let chunk_hash = ChunkHash::from_content(b"durable media chunk");
+        let chunk_count = 4_096;
+        let chunk_size = 1024 * 1024;
+        let size_bytes = u64::from(chunk_count) * chunk_size;
+        let blob_id = BlobId::from_chunks(
+            size_bytes,
+            (0..chunk_count).map(|_| (chunk_hash, chunk_size)),
+        );
         let receipt = BlobWriteReceipt {
             hash: blob_id,
             size_bytes,
-            layout: BlobLayout::SingleChunk { chunk_hash },
+            layout: BlobLayout::Chunked { chunk_count },
         };
 
         let outcome = super::execute_fast_lix_file_prepared_path_write(
@@ -12386,7 +12390,7 @@ mod tests {
         assert_eq!(file_data.len(), 1);
         assert!(file_data[0].inline_data().is_none());
         assert_eq!(file_data[0].blob_hash(), Some(blob_id));
-        assert_eq!(file_data[0].len(), payload.len());
+        assert_eq!(file_data[0].len(), size_bytes);
         let blob_ref = rows
             .iter()
             .find(|row| row.schema_key == super::BLOB_REF_SCHEMA_KEY)
