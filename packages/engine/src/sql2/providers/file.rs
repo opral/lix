@@ -11,6 +11,7 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -30,7 +31,7 @@ use datafusion::prelude::SessionContext;
 use futures_util::{FutureExt, future::try_join_all};
 use serde::Deserialize;
 
-use crate::binary_cas::{BlobDataReader, BlobHash};
+use crate::binary_cas::{BlobDataReader, BlobHash, BlobRangeBytes};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
 use crate::entity_pk::EntityPk;
@@ -822,6 +823,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     session_file_views: Option<SessionFileViews>,
     plugin_cache_snapshot: Option<u128>,
     paths: &BTreeSet<String>,
+    data_range: Option<Range<u64>>,
 ) -> Result<SqlQueryResult, LixError> {
     let base_schema = lix_file_schema();
     let schema = Arc::new(Schema::new(vec![
@@ -846,7 +848,8 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                .with_cached_blob_data(true),
+                .with_blob_refs(true)
+                .with_cached_blob_data(data_range.is_none()),
         )
         .await?;
     let matches = indexed_file_matches(index, &FilePathPredicate::In(paths.clone()));
@@ -878,9 +881,26 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     // No relational operators remain after exact path selection. Move owned
     // blobs into the result instead of packing them into Arrow only for
     // DataFusion to copy them back into row values.
-    let rows = exact_path_data_rows_from_prepared(&blob_reader, plugin_render, prepared).await?;
+    let rows = exact_path_data_rows_from_prepared(
+        &blob_reader,
+        plugin_render,
+        prepared,
+        data_range.as_ref(),
+    )
+    .await?;
+    let columns = if data_range.is_some() {
+        vec![
+            "path".to_string(),
+            "data".to_string(),
+            "total_size".to_string(),
+            "range_start".to_string(),
+            "range_end".to_string(),
+        ]
+    } else {
+        vec!["path".to_string(), "data".to_string()]
+    };
     Ok(SqlQueryResult {
-        columns: vec!["path".to_string(), "data".to_string()],
+        columns,
         rows,
         notices: Vec::new(),
     })
@@ -2707,11 +2727,19 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
     conflict: FastLixFilePathWriteConflict,
     mutation_identity: Option<MutationIdentity>,
 ) -> Result<Option<u64>, LixError> {
-    execute_fast_lix_file_id_path_writes(
+    execute_fast_lix_file_id_path_writes_inner(
         ctx,
         writes
             .into_iter()
-            .map(|(path, data, metadata, splice)| (None, path, data, metadata, splice))
+            .map(|(path, data, metadata, splice)| {
+                (
+                    None,
+                    path,
+                    FastFileWriteData::Inline(data),
+                    metadata,
+                    splice,
+                )
+            })
             .collect(),
         conflict,
         mutation_identity,
@@ -2725,6 +2753,46 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
         Option<String>,
         String,
         crate::Blob,
+        Option<TransactionJson>,
+        Option<RequestBlobSpliceProvenance>,
+    )>,
+    conflict: FastLixFilePathWriteConflict,
+    mutation_identity: Option<MutationIdentity>,
+) -> Result<Option<u64>, LixError> {
+    execute_fast_lix_file_id_path_writes_inner(
+        ctx,
+        writes
+            .into_iter()
+            .map(|(id, path, data, metadata, splice)| {
+                (id, path, FastFileWriteData::Inline(data), metadata, splice)
+            })
+            .collect(),
+        conflict,
+        mutation_identity,
+    )
+    .await
+}
+
+pub(crate) async fn execute_fast_lix_file_prepared_path_write(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    path: String,
+    receipt: crate::binary_cas::BlobWriteReceipt,
+) -> Result<Option<u64>, LixError> {
+    execute_fast_lix_file_id_path_writes_inner(
+        ctx,
+        vec![(None, path, FastFileWriteData::Prepared(receipt), None, None)],
+        FastLixFilePathWriteConflict::UpdateData,
+        None,
+    )
+    .await
+}
+
+async fn execute_fast_lix_file_id_path_writes_inner(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    writes: Vec<(
+        Option<String>,
+        String,
+        FastFileWriteData,
         Option<TransactionJson>,
         Option<RequestBlobSpliceProvenance>,
     )>,
@@ -2784,6 +2852,8 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
     let mut staged = LixFileStagedBatch::with_row_capacity(parsed_writes.len().saturating_mul(3));
 
     for write in parsed_writes {
+        let prepared_blob = write.data.prepared().cloned();
+        let planning_data = write.data.planning_bytes();
         if let Some(existing) = filesystem.file_entry(&write.parsed.path).cloned() {
             let base_blob_hash = existing
                 .blob_hash
@@ -2805,14 +2875,17 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
                         file_id: None,
                         metadata: write.metadata,
                     };
-                    let plan = plan_parsed_file_path_write_with_resolvers(
+                    let mut plan = plan_parsed_file_path_write_with_resolvers(
                         &mut path_resolvers,
                         write.parsed.parsed_path,
                         Some(file_id),
-                        Some(write.data),
+                        Some(planning_data),
                         context,
                         &mut || ctx.functions().call_uuid_v7().to_string(),
                     )?;
+                    if let Some(receipt) = prepared_blob {
+                        apply_prepared_file_data(&mut plan.rows, &mut plan.file_data, 0, receipt)?;
+                    }
                     staged.extend_filesystem_plan(plan)?;
                 }
                 FastLixFilePathWriteConflict::DoNothing
@@ -2829,7 +2902,7 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
                         existing.id.clone(),
                         Some(write.parsed.path),
                         Some(existing.name.clone()),
-                        write.data,
+                        planning_data,
                         context,
                         existing.blob_hash.is_some(),
                         existing.has_derived_file_ref,
@@ -2837,6 +2910,14 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
                         None,
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+                    if let Some(receipt) = prepared_blob {
+                        apply_prepared_file_data(
+                            &mut staged.state_rows,
+                            &mut staged.file_data_writes,
+                            file_data_start,
+                            receipt,
+                        )?;
+                    }
                     attach_fast_file_write_metadata(
                         &mut staged.file_data_writes[file_data_start..],
                         write.splice_provenance,
@@ -2864,7 +2945,7 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
                         existing.id.clone(),
                         Some(write.parsed.path),
                         Some(existing.name.clone()),
-                        write.data,
+                        planning_data,
                         context,
                         existing.blob_hash.is_some(),
                         existing.has_derived_file_ref,
@@ -2872,6 +2953,14 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
                         None,
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+                    if let Some(receipt) = prepared_blob {
+                        apply_prepared_file_data(
+                            &mut staged.state_rows,
+                            &mut staged.file_data_writes,
+                            file_data_start,
+                            receipt,
+                        )?;
+                    }
                     attach_fast_file_write_metadata(
                         &mut staged.file_data_writes[file_data_start..],
                         write.splice_provenance,
@@ -2893,10 +2982,13 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
                 &mut path_resolvers,
                 write.parsed.parsed_path,
                 Some(file_id.clone()),
-                Some(write.data),
+                Some(planning_data),
                 context,
                 &mut || ctx.functions().call_uuid_v7().to_string(),
             )?;
+            if let Some(receipt) = prepared_blob {
+                apply_prepared_file_data(&mut plan.rows, &mut plan.file_data, 0, receipt)?;
+            }
             attach_fast_file_write_metadata(
                 &mut plan.file_data,
                 write.splice_provenance,
@@ -3060,6 +3152,8 @@ async fn stage_indexed_file_path_writes(
     let mut staged = LixFileStagedBatch::with_row_capacity(writes.len().saturating_mul(3));
 
     for (write, entry) in writes.into_iter().zip(indexed.existing) {
+        let prepared_blob = write.data.prepared().cloned();
+        let planning_data = write.data.planning_bytes();
         if let Some(entry) = entry {
             if conflict == FastLixFilePathWriteConflict::IdDoNothing {
                 continue;
@@ -3115,7 +3209,7 @@ async fn stage_indexed_file_path_writes(
                 entry.id().to_string(),
                 Some(update_path),
                 Some(entry.name.clone()),
-                write.data,
+                planning_data,
                 context,
                 materialization.has_blob_ref,
                 materialization.has_derived_file_ref,
@@ -3123,6 +3217,14 @@ async fn stage_indexed_file_path_writes(
                 None,
             )
             .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+            if let Some(receipt) = prepared_blob {
+                apply_prepared_file_data(
+                    &mut staged.state_rows,
+                    &mut staged.file_data_writes,
+                    file_data_start,
+                    receipt,
+                )?;
+            }
             attach_fast_file_write_metadata(
                 &mut staged.file_data_writes[file_data_start..],
                 write.splice_provenance,
@@ -3145,10 +3247,13 @@ async fn stage_indexed_file_path_writes(
                     .expect("missing indexed path should have directory resolvers"),
                 write.parsed.parsed_path,
                 Some(file_id.clone()),
-                Some(write.data),
+                Some(planning_data),
                 context,
                 &mut || ctx.functions().call_uuid_v7().to_string(),
             )?;
+            if let Some(receipt) = prepared_blob {
+                apply_prepared_file_data(&mut plan.rows, &mut plan.file_data, 0, receipt)?;
+            }
             attach_fast_file_write_metadata(
                 &mut plan.file_data,
                 write.splice_provenance,
@@ -3447,16 +3552,94 @@ async fn execute_fast_lix_file_data_update_by_id_impl(
 struct FastLixFilePathWrite {
     id: Option<String>,
     parsed: ParsedFileWritePath,
-    data: crate::Blob,
+    data: FastFileWriteData,
     metadata: Option<TransactionJson>,
     splice_provenance: Option<RequestBlobSpliceProvenance>,
+}
+
+#[derive(Clone)]
+enum FastFileWriteData {
+    Inline(crate::Blob),
+    Prepared(crate::binary_cas::BlobWriteReceipt),
+}
+
+impl FastFileWriteData {
+    fn planning_bytes(&self) -> crate::Blob {
+        match self {
+            Self::Inline(data) => data.clone(),
+            // A present byte makes the ordinary planner create a blob-ref row;
+            // `apply_prepared_file_data` replaces its identity and size before
+            // transaction validation observes it.
+            Self::Prepared(_) => vec![0].into(),
+        }
+    }
+
+    fn prepared(&self) -> Option<&crate::binary_cas::BlobWriteReceipt> {
+        match self {
+            Self::Prepared(receipt) => Some(receipt),
+            Self::Inline(_) => None,
+        }
+    }
+}
+
+fn apply_prepared_file_data(
+    rows: &mut RawWriteBatch,
+    file_data: &mut [TransactionFileData],
+    start: usize,
+    receipt: crate::binary_cas::BlobWriteReceipt,
+) -> Result<(), LixError> {
+    let affected_ids = file_data[start..]
+        .iter()
+        .map(|write| write.file_id.clone())
+        .collect::<BTreeSet<_>>();
+    if affected_ids.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "prepared file write did not produce file data",
+        ));
+    }
+    for write in &mut file_data[start..] {
+        write.use_prepared_blob(receipt.clone());
+    }
+    let size_bytes = usize::try_from(receipt.size_bytes).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "prepared file size exceeds this platform",
+        )
+    })?;
+    for index in 0..rows.len() {
+        let row = rows.row(index);
+        if row.schema_key.as_str() != BLOB_REF_SCHEMA_KEY
+            || row
+                .file_id
+                .is_none_or(|id| !affected_ids.contains(id.as_str()))
+        {
+            continue;
+        }
+        let file_id = row
+            .file_id
+            .expect("checked prepared blob-ref file id")
+            .to_string();
+        rows.set_snapshot(
+            index,
+            Some(TransactionJson::from_value(
+                serde_json::json!({
+                    "id": file_id,
+                    "blob_hash": receipt.hash.to_hex(),
+                    "size_bytes": size_bytes,
+                }),
+                "prepared binary blob ref",
+            )?),
+        );
+    }
+    Ok(())
 }
 
 fn parse_fast_lix_file_path_writes(
     writes: Vec<(
         Option<String>,
         String,
-        crate::Blob,
+        FastFileWriteData,
         Option<TransactionJson>,
         Option<RequestBlobSpliceProvenance>,
     )>,
@@ -5264,6 +5447,7 @@ async fn exact_path_data_rows_from_prepared(
     blob_reader: &Arc<dyn BlobDataReader>,
     plugin_render: Option<PluginRenderContext>,
     prepared: PreparedLixFileRows,
+    data_range: Option<&Range<u64>>,
 ) -> Result<Vec<Vec<Value>>, LixError> {
     let PreparedLixFileRows {
         live_rows,
@@ -5273,8 +5457,24 @@ async fn exact_path_data_rows_from_prepared(
         mut file_paths,
         path_ordered_file_keys,
     } = prepared;
-    let mut blob_bytes =
-        load_blob_bytes_for_files(blob_reader, &live_rows, &file_rows, &blob_rows).await?;
+    let mut blob_bytes = if data_range.is_none() {
+        load_blob_bytes_for_files(blob_reader, &live_rows, &file_rows, &blob_rows).await?
+    } else {
+        LoadedBlobBytes::default()
+    };
+    let mut blob_ranges = match data_range {
+        Some(range) => {
+            load_blob_ranges_for_files(
+                blob_reader,
+                &live_rows,
+                &file_rows,
+                &blob_rows,
+                range.clone(),
+            )
+            .await?
+        }
+        None => LoadedBlobRanges::default(),
+    };
     let file_keys =
         path_ordered_file_keys.unwrap_or_else(|| file_rows.keys().cloned().collect::<Vec<_>>());
     let mut rows = Vec::with_capacity(file_keys.len());
@@ -5302,26 +5502,86 @@ async fn exact_path_data_rows_from_prepared(
             .remove(&key)
             .expect("prepared lix_file descriptor should have a path");
         let blob_key = file.blob_ref_key(&live_rows);
-        let data = match blob_bytes.take(&blob_key) {
-            Some(data) => data,
-            None => match rendered_plugin_bytes.remove(&key) {
-                Some(data) => Some(data),
-                None if derived_rows.contains_key(&blob_key) => {
-                    return Err(invalid_plugin_read_state(format!(
-                        "derived-materialization file '{}' has no renderer output",
-                        file.id
-                    )));
-                }
-                None => Some(Vec::new()),
-            },
-        };
-        rows.push(vec![
-            Value::Text(path),
-            data.map_or(Value::Null, |data| Value::Blob(data.into())),
-        ]);
+        if let Some(range) = data_range {
+            let selected = match blob_ranges.take(&blob_key) {
+                Some(data) => data,
+                None => match rendered_plugin_bytes.remove(&key) {
+                    Some(data) => Some(materialize_vec_range(data, range.clone())?),
+                    None if derived_rows.contains_key(&blob_key) => {
+                        return Err(invalid_plugin_read_state(format!(
+                            "derived-materialization file '{}' has no renderer output",
+                            file.id
+                        )));
+                    }
+                    None => Some(materialize_vec_range(Vec::new(), range.clone())?),
+                },
+            };
+            let Some(selected) = selected else {
+                rows.push(vec![
+                    Value::Text(path),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]);
+                continue;
+            };
+            rows.push(vec![
+                Value::Text(path),
+                Value::Blob(selected.bytes.into()),
+                Value::Integer(i64::try_from(selected.total_size).map_err(|_| {
+                    LixError::new(LixError::CODE_INTERNAL_ERROR, "file size exceeds SQL i64")
+                })?),
+                Value::Integer(i64::try_from(selected.range.start).map_err(|_| {
+                    LixError::new(LixError::CODE_INTERNAL_ERROR, "file range exceeds SQL i64")
+                })?),
+                Value::Integer(i64::try_from(selected.range.end).map_err(|_| {
+                    LixError::new(LixError::CODE_INTERNAL_ERROR, "file range exceeds SQL i64")
+                })?),
+            ]);
+        } else {
+            let data = match blob_bytes.take(&blob_key) {
+                Some(data) => data,
+                None => match rendered_plugin_bytes.remove(&key) {
+                    Some(data) => Some(data),
+                    None if derived_rows.contains_key(&blob_key) => {
+                        return Err(invalid_plugin_read_state(format!(
+                            "derived-materialization file '{}' has no renderer output",
+                            file.id
+                        )));
+                    }
+                    None => Some(Vec::new()),
+                },
+            };
+            rows.push(vec![
+                Value::Text(path),
+                data.map_or(Value::Null, |data| Value::Blob(data.into())),
+            ]);
+        }
     }
 
     Ok(rows)
+}
+
+fn materialize_vec_range(data: Vec<u8>, requested: Range<u64>) -> Result<BlobRangeBytes, LixError> {
+    let total_size = u64::try_from(data.len())
+        .map_err(|_| LixError::new(LixError::CODE_INTERNAL_ERROR, "file size exceeds u64"))?;
+    if requested.start >= requested.end || requested.start >= total_size {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "file read range is not satisfiable",
+        ));
+    }
+    let range = requested.start..requested.end.min(total_size);
+    let start = usize::try_from(range.start)
+        .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "file range is too large"))?;
+    let end = usize::try_from(range.end)
+        .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "file range is too large"))?;
+    Ok(BlobRangeBytes {
+        bytes: data[start..end].to_vec(),
+        total_size,
+        range,
+    })
 }
 
 #[derive(Default)]
@@ -5344,6 +5604,80 @@ impl LoadedBlobBytes {
             None => None,
         }
     }
+}
+
+#[derive(Default)]
+struct LoadedBlobRanges {
+    bytes_by_key: BTreeMap<FilesystemBlobRefKey, Option<BlobRangeBytes>>,
+    remaining_by_key: BTreeMap<FilesystemBlobRefKey, usize>,
+}
+
+impl LoadedBlobRanges {
+    fn take(&mut self, key: &FilesystemBlobRefKey) -> Option<Option<BlobRangeBytes>> {
+        match self.remaining_by_key.get_mut(key) {
+            Some(remaining) if *remaining > 1 => {
+                *remaining -= 1;
+                self.bytes_by_key.get(key).cloned()
+            }
+            Some(_) => {
+                self.remaining_by_key.remove(key);
+                self.bytes_by_key.remove(key)
+            }
+            None => None,
+        }
+    }
+}
+
+async fn load_blob_ranges_for_files(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    live_rows: &LiveStateBatchOwners,
+    file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
+    blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
+    range: Range<u64>,
+) -> Result<LoadedBlobRanges, LixError> {
+    if file_rows.is_empty() || blob_rows.is_empty() {
+        return Ok(LoadedBlobRanges::default());
+    }
+    let mut keys = Vec::new();
+    let mut requests = Vec::new();
+    let mut bytes_by_key = BTreeMap::new();
+    let mut remaining_by_key = BTreeMap::<FilesystemBlobRefKey, usize>::new();
+    for file in file_rows.values() {
+        let key = file.blob_ref_key(live_rows);
+        if let Some(row) = blob_rows.get(&key) {
+            let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
+            if *remaining == 0 {
+                if let Some(data) = &row.inline_data {
+                    bytes_by_key.insert(
+                        key.clone(),
+                        Some(materialize_vec_range(data.clone(), range.clone())?),
+                    );
+                } else {
+                    keys.push(key);
+                    requests.push((BlobHash::from_hex(&row.blob_hash)?, range.clone()));
+                }
+            }
+            *remaining += 1;
+        }
+    }
+    if !keys.is_empty() {
+        let values = blob_reader.load_ranges_many(&requests).await?.into_vec();
+        if values.len() != keys.len() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "blob range reader returned {} values for {} requested hashes",
+                    values.len(),
+                    keys.len()
+                ),
+            ));
+        }
+        bytes_by_key.extend(keys.into_iter().zip(values));
+    }
+    Ok(LoadedBlobRanges {
+        bytes_by_key,
+        remaining_by_key,
+    })
 }
 
 async fn load_blob_bytes_for_files(

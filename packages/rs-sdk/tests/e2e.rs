@@ -259,10 +259,10 @@ async fn rs_sdk_native_file_read_distinguishes_missing_and_empty_files() {
     let lix = open_lix(OpenLixOptions::default()).await.expect("open Lix");
 
     assert_eq!(
-        lix.read_file_data("/native/missing.bin")
+        lix.read_file_data("/native/missing.bin", None)
             .await
             .expect("read missing native file")
-            .map(|data| data.to_vec()),
+            .map(|read| read.into_data().to_vec()),
         None
     );
 
@@ -270,15 +270,15 @@ async fn rs_sdk_native_file_read_distinguishes_missing_and_empty_files() {
         .await
         .expect("create empty native file");
     assert_eq!(
-        lix.read_file_data("/native/empty.bin")
+        lix.read_file_data("/native/empty.bin", None)
             .await
             .expect("read empty native file")
-            .map(|data| data.to_vec()),
+            .map(|read| read.into_data().to_vec()),
         Some(Vec::new())
     );
 
     let error = lix
-        .read_file_data("relative.bin")
+        .read_file_data("relative.bin", None)
         .await
         .expect_err("relative native file path should be rejected");
     assert_eq!(error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");

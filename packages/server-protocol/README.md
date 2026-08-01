@@ -127,6 +127,16 @@ uses the normal transactional filesystem write path, and returns the standard
 `ExecuteResponse` envelope with `rowsAffected: 1`. It has the same configured
 request-body ceiling as JSON protocol requests.
 
+Media clients use this same endpoint for a sequential resumable write by
+supplying a client-generated `Lix-Upload-Id` and `Content-Range: bytes
+<start>-<end>/<total>`. Non-final bodies are exactly 16 MiB and aligned to a
+16 MiB offset; the final body may be shorter. An incomplete write returns 308
+and `Range: bytes=0-<last-acknowledged-byte>`. The last part publishes one
+ordinary file version and returns the normal response with `rowsAffected: 1`.
+Upload receipts and CAS chunks are durable, so a new session can continue at
+the acknowledged offset. Parts are sequential only: parallel, out-of-order,
+unknown-length, and server-side composition flows are outside this contract.
+
 This is intentionally a structured file-transfer operation, not a transparent
 replacement for arbitrary SQL `UPDATE`: callers choose its upsert behavior
 explicitly. The path must be a percent-encoded absolute Lix file path (for
@@ -171,6 +181,7 @@ Clients that explicitly want one file's rendered bytes can check for
 ```text
 GET /lix/v1/file?path=<percent-encoded-absolute-file-path>
 Lix-Session-Id: <session-id>
+Range: bytes=<start>-<inclusive-end> # optional
 ```
 
 The successful response has `Content-Type: application/octet-stream`,
@@ -180,6 +191,15 @@ The successful response has `Content-Type: application/octet-stream`,
 the same active-branch, plugin rendering, and per-session acknowledgement
 semantics as `SELECT data FROM lix_file WHERE path = $1`; it is not a generic
 SQL read endpoint.
+
+The route accepts one forward byte range and returns `206 Partial Content`,
+`Accept-Ranges: bytes`, `Content-Range`, and the selected bytes. Open-ended
+ranges are accepted. Multipart and suffix ranges are deliberately rejected:
+media clients use forward reads, and keeping one response body preserves the
+same file-read abstraction. Ordinary CAS-backed files load only the manifest
+and intersecting chunks. Flat document deltas retain their established full
+reconstruction path because they optimize localized document edits rather
+than immutable media playback.
 
 ## Remote protocol qualification
 

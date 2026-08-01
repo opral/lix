@@ -1,6 +1,5 @@
 mod chunking;
 mod codec;
-mod compression;
 mod context;
 pub(crate) mod kv;
 pub(crate) mod metrics;
@@ -19,6 +18,7 @@ pub(crate) use codec::{
 pub(crate) use context::{BinaryCasContext, BlobDataReader};
 pub(crate) use kv::load_bytes_many;
 pub(crate) use types::{
-    BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice, BlobHash, BlobLayout,
-    BlobMetadata, BlobMetadataBatch, BlobPayload, BlobSameLengthSplice, BlobWriteReceipt,
+    BlobBytesBatch, BlobChunkReceipt, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,
+    BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobPayload, BlobRangeBytes,
+    BlobRangeBytesBatch, BlobSameLengthSplice, BlobWriteReceipt,
 };
