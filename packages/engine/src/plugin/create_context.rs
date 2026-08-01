@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
 use crate::LixError;
-use crate::binary_cas::BlobHash;
+use crate::binary_cas::BlobId;
 #[cfg(test)]
 use crate::common::LixTimestamp;
 use crate::common::MutationIdentity;
@@ -131,7 +131,7 @@ fn framed_digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
         input.extend_from_slice(&u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
         input.extend_from_slice(field);
     }
-    BlobHash::from_content(&input).into_bytes()
+    BlobId::from_content(&input).into_bytes()
 }
 
 /// Result of validating generated identities in one sparse guest transition.

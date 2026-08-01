@@ -2,7 +2,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::ops::Bound;
 
-use crate::binary_cas::{BlobChunkReceipt, BlobHash, BlobLayout, BlobWriteReceipt};
+use crate::binary_cas::{BlobChunkReceipt, BlobId, BlobLayout, BlobWriteReceipt, ChunkHash};
 use crate::storage_adapter::{
     MAX_SCAN_PAGE_ROWS, Storage, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
     StorageKey, StorageKeyRange, StorageProjectedValue, StorageReadOptions, StorageScanOptions,
@@ -204,12 +204,12 @@ impl UploadState {
     fn blob_receipt(&self) -> Result<BlobWriteReceipt, LixError> {
         let hash = self
             .complete_hash
-            .map(BlobHash::from_bytes)
+            .map(BlobId::from_bytes)
             .ok_or_else(|| invalid_upload("upload has no complete manifest"))?;
         let layout = match self.chunk_count {
             0 => BlobLayout::Empty,
             1 => BlobLayout::SingleChunk {
-                chunk_hash: BlobHash::from_bytes(
+                chunk_hash: ChunkHash::from_bytes(
                     self.first_chunk_hash
                         .ok_or_else(|| invalid_upload("upload is missing its first chunk"))?,
                 ),
@@ -387,7 +387,7 @@ async fn load_upload_chunks(
             let mut size = [0u8; 8];
             size.copy_from_slice(&value[32..]);
             receipts.push(BlobChunkReceipt {
-                hash: BlobHash::from_bytes(hash),
+                hash: ChunkHash::from_bytes(hash),
                 size_bytes: u64::from_be_bytes(size),
             });
         }

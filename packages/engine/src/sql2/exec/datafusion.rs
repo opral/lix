@@ -2693,7 +2693,7 @@ mod tests {
 
         async fn load_bytes_many(
             &mut self,
-            hashes: &[crate::binary_cas::BlobHash],
+            hashes: &[crate::binary_cas::BlobId],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
             self.blob_reader.load_bytes_many(hashes).await
         }
@@ -2780,7 +2780,7 @@ mod tests {
 
         async fn load_bytes_many(
             &mut self,
-            hashes: &[crate::binary_cas::BlobHash],
+            hashes: &[crate::binary_cas::BlobId],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
             self.inner.load_bytes_many(hashes).await
         }
@@ -3258,7 +3258,7 @@ mod tests {
     impl BlobDataReader for DummyBlobReader {
         async fn load_bytes_many(
             &self,
-            hashes: &[crate::binary_cas::BlobHash],
+            hashes: &[crate::binary_cas::BlobId],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
             Ok(crate::binary_cas::BlobBytesBatch::new(vec![
                 None;
@@ -3271,7 +3271,7 @@ mod tests {
     impl BlobDataReader for StaticBlobReader {
         async fn load_bytes_many(
             &self,
-            hashes: &[crate::binary_cas::BlobHash],
+            hashes: &[crate::binary_cas::BlobId],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
             Ok(crate::binary_cas::BlobBytesBatch::new(vec![
                 Some(
@@ -3393,7 +3393,7 @@ mod tests {
             snapshot_content: Some(
                 json!({
                     "id": entity_pk,
-                    "blob_hash": crate::binary_cas::BlobHash::from_content(bytes).to_hex(),
+                    "blob_hash": crate::binary_cas::BlobId::from_content(bytes).to_hex(),
                     "size_bytes": bytes.len()
                 })
                 .to_string()
@@ -5162,7 +5162,7 @@ mod tests {
         assert_eq!(blob_ref["size_bytes"], 3);
         assert_eq!(
             blob_ref["blob_hash"],
-            crate::binary_cas::BlobHash::from_content(b"new").to_hex()
+            crate::binary_cas::BlobId::from_content(b"new").to_hex()
         );
     }
 
@@ -6463,7 +6463,7 @@ mod tests {
         assert_eq!(snapshot["size_bytes"], 3);
         assert_eq!(
             snapshot["blob_hash"],
-            crate::binary_cas::BlobHash::from_content(b"new").to_hex()
+            crate::binary_cas::BlobId::from_content(b"new").to_hex()
         );
     }
 

@@ -7,7 +7,9 @@ use std::{
 };
 
 use crate::LixError;
-use crate::binary_cas::{BlobEditSplice, BlobHash, BlobPayload, BlobSameLengthSplice};
+use crate::binary_cas::{
+    BlobEditSplice, BlobId, BlobPayload, BlobSameLengthSplice, BlobWriteReceipt,
+};
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance, SharedStr};
@@ -1476,7 +1478,68 @@ where
         .map(|primary_key| primary_key.map(Arc::new))
 }
 
-/// Incoming file payload paired with transaction write rows.
+/// File content accepted by the ordinary transaction write abstraction.
+///
+/// Prepared CAS content is already durable; publishing it is a metadata-only
+/// transaction operation. Keeping that state in the content enum prevents a
+/// prepared blob from masquerading as an empty inline payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileContent {
+    Inline(BlobPayload),
+    PreparedCas(BlobWriteReceipt),
+}
+
+impl FileContent {
+    pub(crate) fn inline(data: impl Into<crate::Blob>) -> Self {
+        Self::Inline(BlobPayload::from_bytes(data))
+    }
+
+    pub(crate) fn blob_id(&self) -> Option<BlobId> {
+        match self {
+            Self::Inline(payload) => payload.hash(),
+            Self::PreparedCas(receipt) => Some(receipt.hash),
+        }
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            Self::Inline(payload) => payload.len() as u64,
+            Self::PreparedCas(receipt) => receipt.size_bytes,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Inline(payload) => payload.is_empty(),
+            Self::PreparedCas(receipt) => receipt.size_bytes == 0,
+        }
+    }
+
+    pub(crate) fn inline_payload(&self) -> Option<&BlobPayload> {
+        match self {
+            Self::Inline(payload) => Some(payload),
+            Self::PreparedCas(_) => None,
+        }
+    }
+
+    pub(crate) fn inline_bytes(&self) -> Option<&[u8]> {
+        self.inline_payload().map(BlobPayload::bytes)
+    }
+}
+
+impl From<crate::Blob> for FileContent {
+    fn from(data: crate::Blob) -> Self {
+        Self::inline(data)
+    }
+}
+
+impl From<Vec<u8>> for FileContent {
+    fn from(data: Vec<u8>) -> Self {
+        Self::inline(data)
+    }
+}
+
+/// Incoming file content paired with transaction write rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TransactionFileData {
     pub(crate) file_id: String,
@@ -1496,7 +1559,7 @@ pub(crate) struct TransactionFileData {
     /// available without an additional read. This is transient write
     /// provenance only; it lets a verified v2 same-length edit reuse durable
     /// CAS chunk references at commit.
-    base_blob_hash: Option<BlobHash>,
+    base_blob_hash: Option<BlobId>,
     /// A fixed-width replacement proven by the v2 transition against the
     /// exact accepted document. The complete output bytes remain authoritative;
     /// this only permits an internal CAS staging fast path.
@@ -1512,12 +1575,7 @@ pub(crate) struct TransactionFileData {
     /// durable plugin state. The current HTTP protocol does not expose replay
     /// identity.
     mutation_identity: Option<MutationIdentity>,
-    payload: BlobPayload,
-    /// A complete CAS object whose chunks and manifest were durably staged by
-    /// the resumable transfer path before this history transaction began.
-    /// The file row still publishes through the ordinary transaction path;
-    /// it simply does not retain the multi-gigabyte payload again.
-    prepared_blob: Option<crate::binary_cas::BlobWriteReceipt>,
+    content: FileContent,
     /// Content-addressed payloads produced while validating this file write.
     /// Plugin installation uses this for the extracted WASM component so
     /// steady-state reads can load it directly without reopening the archive.
@@ -1539,7 +1597,7 @@ impl TransactionFileData {
         branch_id: String,
         global: bool,
         untracked: bool,
-        data: impl Into<crate::Blob>,
+        content: impl Into<FileContent>,
     ) -> Self {
         Self {
             file_id,
@@ -1554,8 +1612,7 @@ impl TransactionFileData {
             edit_blob_splice: None,
             splice_provenance: None,
             mutation_identity: None,
-            payload: BlobPayload::from_bytes(data),
-            prepared_blob: None,
+            content: content.into(),
             auxiliary_payloads: Vec::new(),
             plugin_checkpoint: None,
             stage_payload_at_commit: true,
@@ -1568,7 +1625,7 @@ impl TransactionFileData {
         self
     }
 
-    pub(crate) fn with_base_blob_hash(mut self, base_blob_hash: Option<BlobHash>) -> Self {
+    pub(crate) fn with_base_blob_hash(mut self, base_blob_hash: Option<BlobId>) -> Self {
         self.had_blob_ref |= base_blob_hash.is_some();
         self.base_blob_hash = base_blob_hash;
         self
@@ -1628,27 +1685,22 @@ impl TransactionFileData {
         self.stage_payload_at_commit = false;
     }
 
-    pub(crate) fn use_prepared_blob(&mut self, receipt: crate::binary_cas::BlobWriteReceipt) {
-        self.payload = BlobPayload::from_bytes(Vec::new());
-        self.prepared_blob = Some(receipt);
-        self.stage_payload_at_commit = false;
-        self.splice_provenance = None;
-        self.base_blob_hash = None;
-        self.same_length_blob_splice = None;
-        self.edit_blob_splice = None;
-    }
-
     pub(crate) fn stage_payload_at_commit(&self) -> bool {
-        self.stage_payload_at_commit
+        self.stage_payload_at_commit && matches!(self.content, FileContent::Inline(_))
     }
 
+    pub(crate) fn inline_data(&self) -> Option<&[u8]> {
+        self.content.inline_bytes()
+    }
+
+    #[cfg(test)]
     pub(crate) fn data(&self) -> &[u8] {
-        self.payload.bytes()
+        self.inline_data()
+            .expect("test fixture expected inline file content")
     }
 
     pub(crate) fn replace_data(&mut self, data: impl Into<crate::Blob>) {
-        self.payload = BlobPayload::from_bytes(data);
-        self.prepared_blob = None;
+        self.content = FileContent::inline(data);
         // Transport provenance describes the replaced request payload. Once a
         // plugin renderer materializes merged bytes, it no longer applies.
         self.splice_provenance = None;
@@ -1662,7 +1714,7 @@ impl TransactionFileData {
     /// leaves this unset so CAS staging follows the normal full path.
     pub(crate) fn set_verified_same_length_blob_splice(
         &mut self,
-        visible_base_blob_hash: BlobHash,
+        visible_base_blob_hash: BlobId,
         offset: usize,
         length: usize,
     ) {
@@ -1675,7 +1727,7 @@ impl TransactionFileData {
         if length == 0
             || offset
                 .checked_add(length)
-                .is_none_or(|end| end > self.payload.len())
+                .is_none_or(|end| end as u64 > self.content.len())
         {
             return;
         }
@@ -1685,7 +1737,7 @@ impl TransactionFileData {
 
     pub(crate) fn set_verified_blob_edit_splice(
         &mut self,
-        visible_base_blob_hash: BlobHash,
+        visible_base_blob_hash: BlobId,
         offset: usize,
         delete_len: usize,
         insert_len: usize,
@@ -1697,7 +1749,7 @@ impl TransactionFileData {
             || (delete_len == 0 && insert_len == 0)
             || offset
                 .checked_add(insert_len)
-                .is_none_or(|end| end > self.payload.len())
+                .is_none_or(|end| end as u64 > self.content.len())
         {
             return;
         }
@@ -1709,22 +1761,16 @@ impl TransactionFileData {
         });
     }
 
-    pub(crate) fn blob_hash(&self) -> Option<BlobHash> {
-        self.prepared_blob
-            .as_ref()
-            .map(|receipt| receipt.hash)
-            .or_else(|| self.payload.hash())
+    pub(crate) fn blob_hash(&self) -> Option<BlobId> {
+        self.content.blob_id()
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.prepared_blob.as_ref().map_or_else(
-            || self.payload.len(),
-            |receipt| usize::try_from(receipt.size_bytes).unwrap_or(usize::MAX),
-        )
+    pub(crate) fn len(&self) -> u64 {
+        self.content.len()
     }
 
-    pub(crate) fn payload(&self) -> &BlobPayload {
-        &self.payload
+    pub(crate) fn inline_payload(&self) -> Option<&BlobPayload> {
+        self.content.inline_payload()
     }
 
     pub(crate) fn same_length_blob_splice(&self) -> Option<BlobSameLengthSplice> {
@@ -1736,7 +1782,7 @@ impl TransactionFileData {
     }
 
     #[cfg(test)]
-    pub(crate) fn base_blob_hash(&self) -> Option<BlobHash> {
+    pub(crate) fn base_blob_hash(&self) -> Option<BlobId> {
         self.base_blob_hash
     }
 
@@ -1745,10 +1791,7 @@ impl TransactionFileData {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.prepared_blob.as_ref().map_or_else(
-            || self.payload.is_empty(),
-            |receipt| receipt.size_bytes == 0,
-        )
+        self.content.is_empty()
     }
 }
 
@@ -4637,8 +4680,8 @@ mod tests {
 
     #[test]
     fn verified_same_length_splice_requires_the_visible_blob_base() {
-        let base = BlobHash::from_content(b"before");
-        let wrong_base = BlobHash::from_content(b"other!");
+        let base = BlobId::from_content(b"before");
+        let wrong_base = BlobId::from_content(b"other!");
         let mut write = TransactionFileData::new(
             "file".to_string(),
             None,
@@ -4666,8 +4709,8 @@ mod tests {
 
     #[test]
     fn verified_edit_splice_is_format_neutral_and_cleared_by_rematerialization() {
-        let base = BlobHash::from_content(b"before");
-        let wrong_base = BlobHash::from_content(b"other!");
+        let base = BlobId::from_content(b"before");
+        let wrong_base = BlobId::from_content(b"other!");
         let mut write = TransactionFileData::new(
             "file".to_string(),
             None,

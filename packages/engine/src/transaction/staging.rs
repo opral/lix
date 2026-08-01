@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use smallvec::SmallVec;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::binary_cas::{BlobBytesBatch, BlobHash};
+use crate::binary_cas::{BlobBytesBatch, BlobId};
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::SharedStr;
@@ -1702,7 +1702,7 @@ impl TransactionWriteBuffer {
     /// staged file payloads that commit will later write.
     pub(crate) fn load_staged_file_bytes_many(
         &self,
-        hashes: &[BlobHash],
+        hashes: &[BlobId],
     ) -> Result<BlobBytesBatch, LixError> {
         if hashes.is_empty() {
             return Ok(BlobBytesBatch::new(Vec::new()));
@@ -1717,16 +1717,21 @@ impl TransactionWriteBuffer {
             .iter()
             .copied()
             .map(|hash| (hash, None))
-            .collect::<BTreeMap<BlobHash, Option<&[u8]>>>();
+            .collect::<BTreeMap<BlobId, Option<&[u8]>>>();
         let mut remaining = requested.len();
         'writes: for write in file_data_guard.iter() {
+            let Some(data) = write.inline_data() else {
+                // Prepared CAS content is already durable. Leaving its slot
+                // unresolved lets the transaction reader fall through to CAS.
+                continue;
+            };
             let hash = write
                 .blob_hash()
-                .unwrap_or_else(|| BlobHash::from_content(write.data()));
+                .unwrap_or_else(|| BlobId::from_content(data));
             if let Some(bytes) = requested.get_mut(&hash)
                 && bytes.is_none()
             {
-                *bytes = Some(write.data());
+                *bytes = Some(data);
                 remaining -= 1;
                 if remaining == 0 {
                     break 'writes;
@@ -1735,7 +1740,7 @@ impl TransactionWriteBuffer {
             for payload in write.auxiliary_payloads() {
                 let hash = payload
                     .hash()
-                    .unwrap_or_else(|| BlobHash::from_content(payload.bytes()));
+                    .unwrap_or_else(|| BlobId::from_content(payload.bytes()));
                 if let Some(bytes) = requested.get_mut(&hash)
                     && bytes.is_none()
                 {
@@ -4094,9 +4099,9 @@ mod tests {
             })
             .expect("file payloads should stage");
 
-        let auxiliary_hash = BlobHash::from_content(b"requested-auxiliary");
-        let missing_hash = BlobHash::from_content(b"missing");
-        let main_hash = BlobHash::from_content(b"requested-main");
+        let auxiliary_hash = BlobId::from_content(b"requested-auxiliary");
+        let missing_hash = BlobId::from_content(b"missing");
+        let main_hash = BlobId::from_content(b"requested-main");
         let loaded = staged_writes
             .load_staged_file_bytes_many(&[auxiliary_hash, missing_hash, main_hash, auxiliary_hash])
             .expect("staged payload lookup should succeed")

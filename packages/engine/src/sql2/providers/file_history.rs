@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 
 use crate::LixError;
 use crate::NullableKeyFilter;
-use crate::binary_cas::{BlobDataReader, BlobHash};
+use crate::binary_cas::{BlobDataReader, BlobId};
 use crate::commit_graph::CommitGraphReader;
 use crate::common::{SharedStr, compose_file_path};
 use crate::entity_pk::EntityPk;
@@ -966,14 +966,14 @@ async fn load_file_history_blob_bytes(
     blob_reader: &Arc<dyn BlobDataReader>,
     rows: &[PreparedFileHistoryRow],
 ) -> Result<BTreeMap<String, Option<Vec<u8>>>, LixError> {
-    let mut hashes = BTreeMap::<BlobHash, BTreeSet<String>>::new();
+    let mut hashes = BTreeMap::<BlobId, BTreeSet<String>>::new();
     for hash in rows
         .iter()
         .filter(|row| row.descriptor().name.is_some())
         .filter_map(|row| row.blob_hash.as_deref())
     {
         hashes
-            .entry(BlobHash::from_hex(hash)?)
+            .entry(BlobId::from_hex(hash)?)
             .or_default()
             .insert(hash.to_string());
     }
@@ -1095,7 +1095,7 @@ async fn render_derived_file_history_bytes(
         limits,
     )?;
     let source = VecEntitySource::new(entities, limits)?;
-    let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
+    let wasm_hash = BlobId::from_hex(plugin.wasm_blob_hash())?;
     let factory = match plugin_host.cached_plugin_factory(plugin.key(), wasm_hash)? {
         Some(factory) => factory,
         None => {
@@ -2688,7 +2688,7 @@ mod tests {
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 
     use crate::LixError;
-    use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
+    use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobId};
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::SharedStr;
     use crate::entity_pk::EntityPk;
@@ -2786,7 +2786,7 @@ mod tests {
         }
     }
 
-    fn blob_record(file_id: &str, hash: BlobHash, depth: u32) -> FileHistoryBlobRecord {
+    fn blob_record(file_id: &str, hash: BlobId, depth: u32) -> FileHistoryBlobRecord {
         let mut entry = history_entry(file_id, depth, None);
         entry.change.id = format!("blob-{file_id}-{depth}");
         entry.change.schema_key = super::BLOB_REF_SCHEMA_KEY.to_string();
@@ -3014,9 +3014,9 @@ mod tests {
             manifest_json,
             archive_file_id: plugin_storage_archive_file_id(plugin_key),
             archive_path: plugin_storage_archive_path(plugin_key),
-            archive_blob_hash: BlobHash::from_content(format!("archive-{plugin_key}").as_bytes())
+            archive_blob_hash: BlobId::from_content(format!("archive-{plugin_key}").as_bytes())
                 .to_hex(),
-            wasm_blob_hash: BlobHash::from_content(wasm).to_hex(),
+            wasm_blob_hash: BlobId::from_content(wasm).to_hex(),
         })
         .expect("test plugin registry entry should be valid");
         PluginRegistry::new(vec![entry]).expect("test plugin registry should be valid")
@@ -3046,13 +3046,13 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingBlobReader {
-        calls: StdMutex<Vec<Vec<BlobHash>>>,
-        values: BTreeMap<BlobHash, Option<Vec<u8>>>,
+        calls: StdMutex<Vec<Vec<BlobId>>>,
+        values: BTreeMap<BlobId, Option<Vec<u8>>>,
     }
 
     #[async_trait]
     impl BlobDataReader for RecordingBlobReader {
-        async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+        async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
             self.calls.lock().unwrap().push(hashes.to_vec());
             Ok(BlobBytesBatch::new(
                 hashes
@@ -3067,14 +3067,14 @@ mod tests {
 
     #[async_trait]
     impl BlobDataReader for FixedBatchBlobReader {
-        async fn load_bytes_many(&self, _hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+        async fn load_bytes_many(&self, _hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
             Ok(BlobBytesBatch::new(self.0.clone()))
         }
     }
 
     #[test]
     fn public_id_and_path_filters_prune_before_hydration() {
-        let hash = BlobHash::from_content(b"content");
+        let hash = BlobId::from_content(b"content");
         let live_a = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0);
         let live_b = descriptor("01920000-0000-7000-8000-0000000000b2", Some("b.md"), 0);
         let tombstone = descriptor("file-deleted", None, 0);
@@ -3299,7 +3299,7 @@ mod tests {
         let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.txt"), 0);
         let blob = blob_record(
             "01920000-0000-7000-8000-0000000000a2",
-            BlobHash::from_content(b"raw"),
+            BlobId::from_content(b"raw"),
             0,
         );
         let proof = derived_file_ref_record("01920000-0000-7000-8000-0000000000a2", &sha256, 3, 0);
@@ -3338,7 +3338,7 @@ mod tests {
         let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.txt"), 0);
         let blob = blob_record(
             "01920000-0000-7000-8000-0000000000a2",
-            BlobHash::from_content(b"raw"),
+            BlobId::from_content(b"raw"),
             0,
         );
         let mut proof_tombstone = derived_file_ref_record(
@@ -3607,8 +3607,8 @@ mod tests {
 
     #[tokio::test]
     async fn blob_hydration_batches_deduplicates_and_preserves_missing_values() {
-        let present_hash = BlobHash::from_content(b"present");
-        let missing_hash = BlobHash::from_content(b"missing");
+        let present_hash = BlobId::from_content(b"present");
+        let missing_hash = BlobId::from_content(b"missing");
         let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0);
         let event = file_history_event_from_entry(
             "01920000-0000-7000-8000-0000000000a2".to_string(),
@@ -3618,7 +3618,7 @@ mod tests {
             [descriptor.entry.clone()],
             PluginRegistry::empty(),
         ));
-        let row = |id: &str, hash: BlobHash| PreparedFileHistoryRow {
+        let row = |id: &str, hash: BlobId| PreparedFileHistoryRow {
             id: id.to_string(),
             path: Some(format!("/{id}.md")),
             observed_state: Arc::clone(&observed_state),
@@ -3663,7 +3663,7 @@ mod tests {
             [descriptor.entry.clone()],
             PluginRegistry::empty(),
         ));
-        let row = |id: &str, hash: BlobHash| PreparedFileHistoryRow {
+        let row = |id: &str, hash: BlobId| PreparedFileHistoryRow {
             id: id.to_string(),
             path: Some(format!("/{id}.md")),
             observed_state: Arc::clone(&observed_state),
@@ -3675,11 +3675,11 @@ mod tests {
         let rows = vec![
             row(
                 "01920000-0000-7000-8000-0000000000a2",
-                BlobHash::from_content(b"first"),
+                BlobId::from_content(b"first"),
             ),
             row(
                 "01920000-0000-7000-8000-0000000000b2",
-                BlobHash::from_content(b"second"),
+                BlobId::from_content(b"second"),
             ),
         ];
 
@@ -3698,8 +3698,8 @@ mod tests {
 
     #[tokio::test]
     async fn unfiltered_bulk_history_keeps_all_rows_and_uses_one_blob_batch() {
-        let first_hash = BlobHash::from_content(b"first");
-        let second_hash = BlobHash::from_content(b"second");
+        let first_hash = BlobId::from_content(b"first");
+        let second_hash = BlobId::from_content(b"second");
         let descriptors = vec![
             descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0),
             descriptor("01920000-0000-7000-8000-0000000000b2", Some("b.md"), 0),

@@ -1878,7 +1878,7 @@ mod tests {
 
         async fn load_bytes_many(
             &mut self,
-            hashes: &[crate::binary_cas::BlobHash],
+            hashes: &[crate::binary_cas::BlobId],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
             Ok(crate::binary_cas::BlobBytesBatch::new(vec![
                 None;

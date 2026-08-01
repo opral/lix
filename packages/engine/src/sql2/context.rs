@@ -7,7 +7,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::LixError;
-use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
+use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobId};
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
@@ -166,7 +166,7 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         None
     }
 
-    async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError>;
+    async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError>;
 
     async fn scan_live_state_batch(
         &mut self,
@@ -350,7 +350,7 @@ impl SqlWriteContext {
 
     pub(crate) async fn load_bytes_many(
         &self,
-        hashes: &[BlobHash],
+        hashes: &[BlobId],
     ) -> Result<BlobBytesBatch, LixError> {
         let _guard = self.gate.lock().await;
         unsafe {
@@ -442,7 +442,7 @@ impl WriteContextBlobDataReader {
 
 #[async_trait]
 impl BlobDataReader for WriteContextBlobDataReader {
-    async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+    async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
         self.ctx.load_bytes_many(hashes).await
     }
 }

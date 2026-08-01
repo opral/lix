@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use crate::binary_cas::BlobHash;
+use crate::binary_cas::BlobId;
 use crate::common::LixError;
 use crate::wasm::{WasmComponentFactory, WasmLimits, WasmRuntime, WasmTransitionCounters};
 
@@ -41,7 +41,7 @@ fn default_plugin_wasm_limits() -> WasmLimits {
 
 #[derive(Clone)]
 struct CachedPluginFactory {
-    wasm_hash: BlobHash,
+    wasm_hash: BlobId,
     factory: Arc<dyn WasmComponentFactory>,
 }
 
@@ -239,7 +239,7 @@ impl PluginRuntimeHost {
     pub(crate) fn cached_plugin_factory(
         &self,
         plugin_key: &str,
-        wasm_hash: BlobHash,
+        wasm_hash: BlobId,
     ) -> Result<Option<Arc<dyn WasmComponentFactory>>, LixError> {
         let cache = self
             .plugin_factory_cache
