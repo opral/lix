@@ -198,7 +198,6 @@ struct VisibleMaterialization {
 enum VisibleMaterializationBytes {
     Blob {
         hash: BlobHash,
-        plugin_checkpoint_hashes: Option<(BlobHash, BlobHash)>,
     },
     Derived {
         path: String,
@@ -273,23 +272,6 @@ fn decode_visible_materialization_parts(
             }
             VisibleMaterializationBytes::Blob {
                 hash: BlobHash::from_hex(&snapshot.blob_hash)?,
-                plugin_checkpoint_hashes: match (
-                    snapshot.plugin_state_checkpoint_hash.as_deref(),
-                    snapshot.plugin_authority_checkpoint_hash.as_deref(),
-                ) {
-                    (Some(state), Some(authority)) => {
-                        Some((BlobHash::from_hex(state)?, BlobHash::from_hex(authority)?))
-                    }
-                    (None, None) => None,
-                    _ => {
-                        return Err(LixError::new(
-                            LixError::CODE_INVALID_PLUGIN,
-                            format!(
-                                "owned component plugin file '{file_id}' has an incomplete checkpoint reference"
-                            ),
-                        ));
-                    }
-                },
             }
         }
         DERIVED_FILE_REF_SCHEMA_KEY => {
@@ -2187,7 +2169,6 @@ where
                                 .blob_hash()
                                 .unwrap_or_else(|| BlobHash::from_content(payload.data())),
                             size_bytes: payload.len(),
-                            plugin_checkpoint_hashes: payload.plugin_checkpoint_hashes(),
                             context: FilesystemRowContext {
                                 branch_id: file_key.branch_id.clone(),
                                 global: file_key.global,
@@ -2295,7 +2276,6 @@ where
                                 .blob_hash()
                                 .unwrap_or_else(|| BlobHash::from_content(payload.data())),
                             size_bytes: payload.len(),
-                            plugin_checkpoint_hashes: payload.plugin_checkpoint_hashes(),
                             context: FilesystemRowContext {
                                 branch_id: file_key.branch_id.clone(),
                                 global: file_key.global,
@@ -4042,7 +4022,7 @@ where
                             let (
                                 cold_before,
                                 checkpoint_accepted_bytes,
-                                durable_checkpoint_hashes,
+                                checkpoint_blob_hash,
                                 cold_edits,
                                 host_full_diff_bytes_compared,
                                 same_length_blob_splice,
@@ -4050,10 +4030,7 @@ where
                             ) = match (selected.materialization(), visible_materialization.bytes) {
                                 (
                                     PluginMaterialization::Blob,
-                                    VisibleMaterializationBytes::Blob {
-                                        hash,
-                                        plugin_checkpoint_hashes,
-                                    },
+                                    VisibleMaterializationBytes::Blob { hash },
                                 ) => {
                                     let before_bytes: crate::Blob =
                                         load_transaction_blob_bytes(
@@ -4103,7 +4080,7 @@ where
                                     (
                                         Some(before_source),
                                         Some(before_bytes),
-                                        plugin_checkpoint_hashes,
+                                        Some(hash),
                                         built_splices.edits,
                                         built_splices.full_diff_bytes_compared,
                                         same_length_blob_splice,
@@ -4142,38 +4119,28 @@ where
                                 cache.checkpoint(&actor_key, &visible_materialization.semantic_root)
                             });
                             let mut durable_checkpoint = if decoded_checkpoint.is_none() {
-                                if let Some((state_hash, authority_hash)) =
-                                    durable_checkpoint_hashes
-                                {
-                                    let batch = load_transaction_blob_bytes(
-                                        &self.binary_cas.reader(read.clone()),
-                                        &self.staged_writes,
-                                        &[state_hash, authority_hash],
+                                if let Some(checkpoint_blob_hash) = checkpoint_blob_hash {
+                                    crate::transaction::plugin_checkpoint::load_current_plugin_checkpoint(
+                                        &read,
+                                        &actor_key.branch_id,
+                                        &actor_key.file_id,
+                                        &actor_key.plugin_generation,
+                                        checkpoint_blob_hash,
                                     )
-                                    .await;
-                                    batch.ok().and_then(|batch| {
-                                        let mut values = batch.into_vec().into_iter();
-                                        values
-                                            .next()
-                                            .flatten()
-                                            .zip(values.next().flatten())
-                                            .and_then(|(runtime, authority)| {
-                                                let runtime = decode_bound_plugin_checkpoint(
-                                                    &runtime,
-                                                    &actor_key.plugin_generation,
-                                                )?;
-                                                Some(DecodedDurablePluginCheckpoint {
-                                                    runtime: WasmDurableDocumentCheckpoint::decode(
-                                                        &runtime,
-                                                    )
-                                                    .ok()?,
-                                                    authorities:
-                                                        PluginEntityAuthorities::decode_checkpoint(
-                                                            &authority,
-                                                        )
-                                                        .ok()?,
-                                                })
-                                            })
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|checkpoint| {
+                                        Some(DecodedDurablePluginCheckpoint {
+                                            runtime: WasmDurableDocumentCheckpoint::decode(
+                                                &checkpoint.runtime,
+                                            )
+                                            .ok()?,
+                                            authorities: PluginEntityAuthorities::decode_checkpoint(
+                                                &checkpoint.authority,
+                                            )
+                                            .ok()?,
+                                        })
                                     })
                                 } else {
                                     None
@@ -8148,43 +8115,6 @@ struct DecodedDurablePluginCheckpoint {
     authorities: PluginEntityAuthorities,
 }
 
-const BOUND_PLUGIN_CHECKPOINT_MAGIC: &[u8; 8] = b"LIXDPB01";
-
-fn encode_bound_plugin_checkpoint(
-    generation: &str,
-    checkpoint: &WasmDurableDocumentCheckpoint,
-) -> Result<crate::Blob, LixError> {
-    let generation_len = u32::try_from(generation.len()).map_err(|_| {
-        LixError::new(
-            LixError::CODE_PLUGIN_RESOURCE_LIMIT,
-            "plugin generation exceeds the checkpoint format limit",
-        )
-    })?;
-    let checkpoint = checkpoint.bytes();
-    let mut encoded = Vec::with_capacity(12 + generation.len() + checkpoint.len());
-    encoded.extend_from_slice(BOUND_PLUGIN_CHECKPOINT_MAGIC);
-    encoded.extend_from_slice(&generation_len.to_le_bytes());
-    encoded.extend_from_slice(generation.as_bytes());
-    encoded.extend_from_slice(&checkpoint);
-    Ok(encoded.into())
-}
-
-fn decode_bound_plugin_checkpoint(
-    encoded: &[u8],
-    expected_generation: &str,
-) -> Option<crate::Blob> {
-    if encoded.get(..8)? != BOUND_PLUGIN_CHECKPOINT_MAGIC {
-        return None;
-    }
-    let generation_len =
-        usize::try_from(u32::from_le_bytes(encoded.get(8..12)?.try_into().ok()?)).ok()?;
-    let generation_end = 12_usize.checked_add(generation_len)?;
-    if encoded.get(12..generation_end)? != expected_generation.as_bytes() {
-        return None;
-    }
-    Some(encoded.get(generation_end..)?.to_vec().into())
-}
-
 impl PluginWriteReconciliation {
     fn attach_durable_checkpoints(
         &self,
@@ -8229,10 +8159,7 @@ impl PluginWriteReconciliation {
                         ),
                     )
                 })?;
-            let state = encode_bound_plugin_checkpoint(&generation, &checkpoint)?;
-            let state_hash = BlobHash::from_content(&state);
-            let authority_hash = BlobHash::from_content(&authority);
-            write.set_plugin_checkpoint(state, state_hash, authority, authority_hash);
+            write.set_plugin_checkpoint(generation, checkpoint.bytes(), authority);
         }
         Ok(())
     }
@@ -8732,10 +8659,6 @@ struct PluginGenerationUpgrade {
 struct PluginUpgradeBlobRefSnapshot {
     id: String,
     blob_hash: String,
-    #[serde(default)]
-    plugin_state_checkpoint_hash: Option<String>,
-    #[serde(default)]
-    plugin_authority_checkpoint_hash: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -10422,20 +10345,6 @@ mod tests {
         assert!(prepared_writes_require_filesystem_index_rebuild(
             &prepared_writes
         ));
-    }
-
-    #[test]
-    fn durable_plugin_checkpoint_is_bound_to_one_generation() {
-        let checkpoint =
-            WasmDurableDocumentCheckpoint::new(crate::Blob::from(&b"opaque-state"[..])).unwrap();
-        let encoded = encode_bound_plugin_checkpoint("generation-a", &checkpoint).unwrap();
-        let decoded = decode_bound_plugin_checkpoint(&encoded, "generation-a")
-            .expect("matching generation should restore");
-        assert_eq!(
-            WasmDurableDocumentCheckpoint::decode(&decoded).unwrap(),
-            crate::Blob::from(&b"opaque-state"[..])
-        );
-        assert!(decode_bound_plugin_checkpoint(&encoded, "generation-b").is_none());
     }
 
     #[test]

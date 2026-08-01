@@ -3,6 +3,7 @@ mod bench_support;
 mod commit;
 mod context;
 mod normalization;
+pub(crate) mod plugin_checkpoint;
 mod schema_resolver;
 mod staging;
 pub(crate) mod types;

@@ -19,14 +19,6 @@
       "type": "integer",
       "minimum": 0,
       "description": "Logical uncompressed file size in bytes for the referenced binary payload."
-    },
-    "plugin_state_checkpoint_hash": {
-      "type": "string",
-      "description": "Optional BLAKE3 CAS hash of the exact-root plugin runtime-state checkpoint."
-    },
-    "plugin_authority_checkpoint_hash": {
-      "type": "string",
-      "description": "Optional BLAKE3 CAS hash of the host-validated plugin identity authority checkpoint."
     }
   },
   "required": [

@@ -321,6 +321,21 @@ pub struct BinaryManifestLayoutAccounting {
     pub delta_manifests: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BinaryCasOwnerLayoutAccounting {
+    pub owner: String,
+    pub references: u64,
+    pub manifests: u64,
+    pub logical_bytes: u64,
+    pub encoded_manifest_bytes: u64,
+    pub empty_manifests: u64,
+    pub single_chunk_manifests: u64,
+    pub chunked_manifests: u64,
+    pub delta_manifests: u64,
+    pub chunk_values: u64,
+    pub encoded_chunk_bytes: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitDeltaLayoutAccounting {
     pub commit_id: String,
@@ -559,6 +574,243 @@ where
     Ok(accounting)
 }
 
+/// Attributes every binary-CAS manifest to the durable JSON field which owns it.
+///
+/// This benchmark-only inventory walks decoded commit deltas instead of raw
+/// storage values, so adapter compression and packed history do not hide CAS
+/// references. A final `unowned` row makes missing ownership explicit.
+pub async fn binary_cas_owner_layout_accounting<R>(
+    read: &R,
+) -> Result<Vec<BinaryCasOwnerLayoutAccounting>, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    use crate::json_store::JsonSlot;
+
+    let inventory = crate::tracked_state::scan_commit_delta_inventory(read).await?;
+    let mut seen_changes = std::collections::BTreeSet::new();
+    let mut references = std::collections::BTreeMap::<String, u64>::new();
+    let mut owners = std::collections::BTreeMap::<crate::binary_cas::BlobHash, String>::new();
+    let mut json_ref_hashes = std::collections::BTreeSet::new();
+    for member in inventory
+        .commits
+        .values()
+        .flat_map(|entry| entry.members.iter())
+    {
+        if !seen_changes.insert(member.change.change_id) {
+            continue;
+        }
+        match &member.change.snapshot {
+            JsonSlot::Inline(snapshot) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(snapshot) {
+                    collect_binary_cas_json_owners(&value, &mut references, &mut owners);
+                }
+            }
+            JsonSlot::Ref(json_ref) => {
+                json_ref_hashes.insert(*json_ref.as_hash_array());
+            }
+            JsonSlot::None => {}
+        }
+    }
+    let json_refs = json_ref_hashes
+        .into_iter()
+        .map(crate::json_store::JsonRef::from_hash_bytes)
+        .collect::<Vec<_>>();
+    let loaded = crate::json_store::JsonStoreContext::new()
+        .load_bytes_many(
+            read,
+            crate::json_store::JsonLoadRequestRef {
+                refs: &json_refs,
+                scope: crate::json_store::JsonReadScopeRef::OutOfBand,
+            },
+        )
+        .await?;
+    for value in loaded.into_values().into_iter().flatten() {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&value) {
+            collect_binary_cas_json_owners(&value, &mut references, &mut owners);
+        }
+    }
+
+    let manifest_chunk_entries =
+        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE).await;
+    let mut manifest_chunks = std::collections::BTreeMap::<
+        crate::binary_cas::BlobHash,
+        Vec<crate::binary_cas::BlobHash>,
+    >::new();
+    for entry in manifest_chunk_entries {
+        let blob_hash: [u8; 32] = entry
+            .key
+            .0
+            .get(..32)
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    "benchmark binary CAS manifest-chunk key is too short",
+                )
+            })?
+            .try_into()
+            .expect("manifest-chunk hash slice is 32 bytes");
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            unreachable!("binary manifest-chunk owner scan requests full values");
+        };
+        let (chunk_hash, _) = crate::binary_cas::decode_binary_cas_manifest_chunk(&value)?;
+        manifest_chunks
+            .entry(crate::binary_cas::BlobHash::from_bytes(blob_hash))
+            .or_default()
+            .push(crate::binary_cas::BlobHash::from_bytes(chunk_hash));
+    }
+
+    let entries = scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE).await;
+    let mut accounting =
+        std::collections::BTreeMap::<String, BinaryCasOwnerLayoutAccounting>::new();
+    let mut chunk_owners = std::collections::BTreeMap::<
+        crate::binary_cas::BlobHash,
+        std::collections::BTreeSet<String>,
+    >::new();
+    let mut blob_chunks = std::collections::BTreeMap::<
+        crate::binary_cas::BlobHash,
+        Vec<crate::binary_cas::BlobHash>,
+    >::new();
+    let mut delta_bases = Vec::new();
+    for entry in entries {
+        let hash_bytes: [u8; 32] = entry.key.0.as_ref().try_into().map_err(|_| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "benchmark binary CAS manifest key is not one hash",
+            )
+        })?;
+        let owner = owners
+            .get(&crate::binary_cas::BlobHash::from_bytes(hash_bytes))
+            .cloned()
+            .unwrap_or_else(|| "unowned".to_owned());
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            unreachable!("binary manifest owner scan requests full values");
+        };
+        let manifest = crate::binary_cas::decode_binary_cas_manifest(&value)?;
+        let reference_count = references.get(&owner).copied().unwrap_or_default();
+        let row =
+            accounting
+                .entry(owner.clone())
+                .or_insert_with(|| BinaryCasOwnerLayoutAccounting {
+                    owner: owner.clone(),
+                    references: reference_count,
+                    ..Default::default()
+                });
+        row.manifests += 1;
+        row.logical_bytes += manifest.size_bytes();
+        row.encoded_manifest_bytes += value.len() as u64;
+        match manifest {
+            crate::binary_cas::BinaryCasManifest::Empty { .. } => row.empty_manifests += 1,
+            crate::binary_cas::BinaryCasManifest::SingleChunk { chunk_hash, .. } => {
+                row.single_chunk_manifests += 1;
+                let chunk_hash = crate::binary_cas::BlobHash::from_bytes(chunk_hash);
+                blob_chunks.insert(
+                    crate::binary_cas::BlobHash::from_bytes(hash_bytes),
+                    vec![chunk_hash],
+                );
+                chunk_owners.entry(chunk_hash).or_default().insert(owner);
+            }
+            crate::binary_cas::BinaryCasManifest::Chunked { .. } => {
+                row.chunked_manifests += 1;
+                let blob_hash = crate::binary_cas::BlobHash::from_bytes(hash_bytes);
+                let chunks = manifest_chunks.get(&blob_hash).cloned().unwrap_or_default();
+                for chunk_hash in &chunks {
+                    chunk_owners
+                        .entry(*chunk_hash)
+                        .or_default()
+                        .insert(owner.clone());
+                }
+                blob_chunks.insert(blob_hash, chunks);
+            }
+            crate::binary_cas::BinaryCasManifest::Delta { base_blob_hash, .. } => {
+                row.delta_manifests += 1;
+                delta_bases.push((
+                    owner,
+                    crate::binary_cas::BlobHash::from_bytes(base_blob_hash),
+                ));
+            }
+        }
+    }
+    for (owner, base_blob_hash) in delta_bases {
+        if let Some(chunks) = blob_chunks.get(&base_blob_hash) {
+            for chunk_hash in chunks {
+                chunk_owners
+                    .entry(*chunk_hash)
+                    .or_default()
+                    .insert(owner.clone());
+            }
+        }
+    }
+    let chunk_entries =
+        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE).await;
+    for entry in chunk_entries {
+        let chunk_hash: [u8; 32] = entry.key.0.as_ref().try_into().map_err(|_| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                "benchmark binary CAS chunk key is not one hash",
+            )
+        })?;
+        let StorageProjectedValue::FullValue(value) = entry.value else {
+            unreachable!("binary chunk owner scan requests full values");
+        };
+        let owners = chunk_owners.get(&crate::binary_cas::BlobHash::from_bytes(chunk_hash));
+        let owner = match owners {
+            None => "unowned_chunk".to_owned(),
+            Some(owners) if owners.len() == 1 => owners.first().expect("one chunk owner").clone(),
+            Some(owners) => format!(
+                "shared_chunk:{}",
+                owners.iter().cloned().collect::<Vec<_>>().join("+")
+            ),
+        };
+        let row =
+            accounting
+                .entry(owner.clone())
+                .or_insert_with(|| BinaryCasOwnerLayoutAccounting {
+                    owner,
+                    ..Default::default()
+                });
+        row.chunk_values += 1;
+        row.encoded_chunk_bytes += value.len() as u64;
+    }
+    Ok(accounting.into_values().collect())
+}
+
+fn collect_binary_cas_json_owners(
+    value: &serde_json::Value,
+    references: &mut std::collections::BTreeMap<String, u64>,
+    owners: &mut std::collections::BTreeMap<crate::binary_cas::BlobHash, String>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (field, value) in object {
+                if field.ends_with("hash") {
+                    if let Some(value) = value.as_str() {
+                        if let Ok(hash) = crate::binary_cas::BlobHash::from_hex(value) {
+                            let owner = match field.as_str() {
+                                "blob_hash" => "file_blob",
+                                "plugin_state_checkpoint_hash" => "plugin_runtime_checkpoint",
+                                "plugin_authority_checkpoint_hash" => "plugin_authority_checkpoint",
+                                "wasm_blob_hash" => "plugin_wasm",
+                                _ => field,
+                            }
+                            .to_owned();
+                            *references.entry(owner.clone()).or_default() += 1;
+                            owners.entry(hash).or_insert(owner);
+                        }
+                    }
+                }
+                collect_binary_cas_json_owners(value, references, owners);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_binary_cas_json_owners(value, references, owners);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Per-row (key, value bytes) inventory of one space.
 ///
 /// Equivalence tests compare these inventories byte-for-byte, so the scan
@@ -610,6 +862,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::live_state::CERTIFIED_ENTITY_BATCH_SPACE,
         crate::live_state::CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
         crate::live_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
+        crate::transaction::plugin_checkpoint::PLUGIN_CHECKPOINT_SPACE,
         crate::json_store::store::JSON_SPACE,
         crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
         crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
