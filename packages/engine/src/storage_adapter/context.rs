@@ -202,13 +202,6 @@ where
             }))
     }
 
-    pub(crate) async fn load_tracked_mutation_revision(
-        &self,
-    ) -> Result<Option<Bytes>, StorageError> {
-        let read = self.storage.begin_read(ReadOptions::default()).await?;
-        Self::load_tracked_mutation_revision_from_read(&StorageAdapterReadScope::new(read)).await
-    }
-
     pub async fn delete_range(
         &self,
         space: StorageSpace,

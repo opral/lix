@@ -20,7 +20,7 @@ use super::SessionContext;
 use super::context::{SessionWriteAccess, closed_error};
 
 #[expect(missing_debug_implementations)]
-pub struct SessionTransaction<StorageImpl: Storage = Memory> {
+pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     pub(super) transaction: Option<Transaction<StorageImpl>>,
     pub(super) runtime_functions: FunctionContext,
     transaction_manager: SessionTransactionManager,

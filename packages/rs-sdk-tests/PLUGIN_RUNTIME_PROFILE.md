@@ -4,6 +4,30 @@ Profiled on Linux x86-64 with Rust nightly 1.97.0. The release benchmarks were
 verified against `origin/main` at `c082f5f14`. The exact VS Code Docs replay
 uses commit `d5badf95f8ab16c4deb91199dc696f2293d93554`.
 
+## Conflict-resolution scaling
+
+The Component-v2 resolver has two materially different format paths. JSON and
+Git text use the API's canonical `b`-or-delete default without reading snapshot
+bytes. CSV reads each conflicting row and may compose disjoint cell edits;
+Markdown does the same for disjoint inline spans. CSV and Markdown therefore
+have an information-theoretic lower bound of one decision per semantic
+conflict. Returning an exact aligned result for every arbitrary conflict is
+also Ω(conflicts), so sublinear total resolution is not a valid correctness
+target.
+
+The avoidable scaling was in host routing around that required resolver pass.
+For a successful all-plugin merge, the old path scanned the complete conflict
+batch four times: derived-file discovery, resolver eligibility, unresolved-row
+rejection, and resolver input construction. It also loaded the same base,
+target, and source plugin registries twice and reconstructed the same common
+file descriptors twice. The merge now builds one file-to-conflict index while
+discovering derived files, retains the pinned plugin generation and descriptor,
+and routes later stages by eligible indices. The successful path is one O(N)
+classification pass plus O(K) resolver preparation for K plugin conflicts;
+the unresolved-error path alone rescans N rows to construct public details.
+Point membership remains O(log K), and the plugin is still invoked once per
+file rather than once per conflict.
+
 ## Results
 
 | Workload | Time | Host allocation | Peak live host allocation | Process peak RSS |

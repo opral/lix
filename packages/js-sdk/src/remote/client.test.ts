@@ -988,6 +988,95 @@ test("remote responses reject malformed rows and non-JSON HTTP errors", async ()
 	await lix.close();
 });
 
+test("remote beginTransaction uses one capability-bound server lifecycle", async () => {
+	const requests: Array<{
+		method: string;
+		path: string;
+		transactionId?: string;
+		body?: unknown;
+	}> = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				const path = new URL(request.url).pathname;
+				requests.push({
+					method: request.method,
+					path,
+					...(request.headers.get("Lix-Transaction-Id") === null
+						? {}
+						: {
+								transactionId: request.headers.get("Lix-Transaction-Id")!,
+							}),
+					...(request.body === null ? {} : { body: await requestJson(request) }),
+				});
+				if (path.endsWith("/lix/v1/")) {
+					return Response.json({
+						protocolVersion: 1,
+						activeBranchId: "main-id",
+						sessionId: "session-1",
+					});
+				}
+				if (path.endsWith("/transaction/begin")) {
+					return Response.json({ transactionId: "transaction-1" });
+				}
+				if (path.endsWith("/transaction/execute")) {
+					return Response.json({
+						columns: ["value"],
+						rows: [[{ kind: "int", value: 7 }]],
+						rowsAffected: 0,
+						notices: [],
+					});
+				}
+				return new Response(null, { status: 204 });
+			},
+		},
+	});
+
+	const transaction = await lix.beginTransaction();
+	const result = await transaction.execute("SELECT $1 AS value", [7], {
+		originKey: "remote-transaction-test",
+	});
+	expect(result.rows[0]?.get("value")).toBe(7);
+	await transaction.commit();
+	await expect(transaction.execute("SELECT 1")).rejects.toMatchObject({
+		code: "LIX_INVALID_TRANSACTION_STATE",
+	});
+
+	const rolledBack = await lix.beginTransaction();
+	await rolledBack.rollback();
+	await lix.close();
+
+	expect(requests).toEqual([
+		{ method: "GET", path: "/@acme/workspace/lix/v1/" },
+		{ method: "POST", path: "/@acme/workspace/lix/v1/transaction/begin" },
+		{
+			method: "POST",
+			path: "/@acme/workspace/lix/v1/transaction/execute",
+			transactionId: "transaction-1",
+			body: {
+				sql: "SELECT $1 AS value",
+				params: [{ kind: "int", value: 7 }],
+				options: { originKey: "remote-transaction-test" },
+			},
+		},
+		{
+			method: "POST",
+			path: "/@acme/workspace/lix/v1/transaction/commit",
+			transactionId: "transaction-1",
+		},
+		{ method: "POST", path: "/@acme/workspace/lix/v1/transaction/begin" },
+		{
+			method: "POST",
+			path: "/@acme/workspace/lix/v1/transaction/rollback",
+			transactionId: "transaction-1",
+		},
+		{ method: "DELETE", path: "/@acme/workspace/lix/v1/session" },
+	]);
+});
+
 test("remote mode rejects unsupported local-only operations honestly", async () => {
 	const lix = await openLix({
 		server: {
@@ -1002,9 +1091,6 @@ test("remote mode rejects unsupported local-only operations honestly", async () 
 		},
 	});
 
-	await expect(lix.beginTransaction()).rejects.toMatchObject({
-		code: "LIX_UNSUPPORTED_REMOTE_OPERATION",
-	});
 	await expect(
 		lix.mergeBranch({ sourceBranchId: "source" }),
 	).rejects.toMatchObject({ code: "LIX_UNSUPPORTED_REMOTE_OPERATION" });

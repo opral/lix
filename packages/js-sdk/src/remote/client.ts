@@ -41,6 +41,7 @@ import { readSseEvents } from "./sse.js";
 const OBSERVE_RETRY_BASE_MS = 100;
 const OBSERVE_RETRY_MAX_MS = 5_000;
 const REMOTE_SESSION_HEADER = "Lix-Session-Id";
+const REMOTE_TRANSACTION_HEADER = "Lix-Transaction-Id";
 const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
 const REQUEST_BLOB_DELTA_MIN_BYTES = 32 * 1024;
 const REQUEST_BLOB_DELTA_MIN_WIRE_RATIO = 0.9;
@@ -246,7 +247,78 @@ class RemoteLixBinding implements LixBinding {
 
 	async beginTransaction(): Promise<LixTransactionBinding> {
 		this.#assertOpen();
-		throw unsupportedRemoteOperation("beginTransaction");
+		return this.#enqueue(async () => {
+			const begun = record(
+				await this.#requestJson("transaction/begin", { method: "POST" }),
+				"begin transaction response",
+			);
+			if (typeof begun.transactionId !== "string") {
+				throw protocolError(
+					"begin transaction response.transactionId must be a string",
+				);
+			}
+			const transactionId = begun.transactionId;
+			let active = true;
+			const assertActive = () => {
+				if (!active) {
+					throw remoteError(
+						"LIX_INVALID_TRANSACTION_STATE",
+						"Lix transaction is closed",
+					);
+				}
+			};
+			return {
+				execute: async (sql, params, options) => {
+					assertActive();
+					const snapshot = snapshotParams(params);
+					const requestOptions = remoteExecuteOptions(options);
+					return this.#enqueue(async () => {
+						const value = await this.#requestJson("transaction/execute", {
+							method: "POST",
+							headers: { [REMOTE_TRANSACTION_HEADER]: transactionId },
+							body: JSON.stringify({
+								sql,
+								params: snapshot.map(encodeWireValue),
+								...(requestOptions === undefined
+									? {}
+									: { options: requestOptions }),
+							}),
+						});
+						return decodeExecuteResult(value);
+					});
+				},
+				commit: async () => {
+					assertActive();
+					return this.#enqueue(async () => {
+						assertActive();
+						await this.#requestJson(
+							"transaction/commit",
+							{
+								method: "POST",
+								headers: { [REMOTE_TRANSACTION_HEADER]: transactionId },
+							},
+							"empty",
+						);
+						active = false;
+					});
+				},
+				rollback: async () => {
+					assertActive();
+					return this.#enqueue(async () => {
+						assertActive();
+						await this.#requestJson(
+							"transaction/rollback",
+							{
+								method: "POST",
+								headers: { [REMOTE_TRANSACTION_HEADER]: transactionId },
+							},
+							"empty",
+						);
+						active = false;
+					});
+				},
+			};
+		});
 	}
 
 	async activeBranchId(): Promise<string> {
