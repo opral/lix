@@ -401,6 +401,16 @@ pub struct BinaryManifestLayoutAccounting {
     pub delta_manifests: u64,
 }
 
+/// One fully reconstructed binary-CAS value for offline physical-layout
+/// experiments. This stays behind `storage-benches`: production callers must
+/// address CAS values by hash instead of enumerating the repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BinaryCasPayloadInventoryEntry {
+    pub hash: [u8; 32],
+    pub bytes: Vec<u8>,
+    pub encoded_manifest_bytes: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BinaryCasOwnerLayoutAccounting {
     pub owner: String,
@@ -652,6 +662,59 @@ where
         }
     }
     Ok(accounting)
+}
+
+/// Reconstructs every unique binary-CAS payload through the production read
+/// path. The bounded batches make the oracle usable for company-sized replay
+/// fixtures without turning one inventory into an unbounded point-read plan.
+pub async fn binary_cas_payload_inventory<R>(
+    read: &R,
+) -> Result<Vec<BinaryCasPayloadInventoryEntry>, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    const BATCH_SIZE: usize = 256;
+
+    let manifests =
+        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE).await;
+    let mut entries = Vec::with_capacity(manifests.len());
+    for batch in manifests.chunks(BATCH_SIZE) {
+        let hashes = batch
+            .iter()
+            .map(|entry| {
+                let hash: [u8; 32] = entry.key.0.as_ref().try_into().map_err(|_| {
+                    crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        "benchmark binary CAS manifest key is not one hash",
+                    )
+                })?;
+                Ok(crate::binary_cas::BlobHash::from_bytes(hash))
+            })
+            .collect::<Result<Vec<_>, crate::LixError>>()?;
+        let payloads = crate::binary_cas::load_bytes_many(read, &hashes)
+            .await?
+            .into_vec();
+        for ((manifest, hash), payload) in batch.iter().zip(hashes).zip(payloads) {
+            let StorageProjectedValue::FullValue(encoded_manifest) = &manifest.value else {
+                unreachable!("binary CAS payload inventory requests full manifests");
+            };
+            let bytes = payload.ok_or_else(|| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "benchmark binary CAS manifest '{}' has no payload",
+                        hash.to_hex()
+                    ),
+                )
+            })?;
+            entries.push(BinaryCasPayloadInventoryEntry {
+                hash: hash.into_bytes(),
+                bytes,
+                encoded_manifest_bytes: encoded_manifest.len() as u64,
+            });
+        }
+    }
+    Ok(entries)
 }
 
 /// Attributes every binary-CAS manifest to the durable JSON field which owns it.

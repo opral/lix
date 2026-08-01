@@ -34,6 +34,7 @@ object_store = { version = "0.14", default-features = false, features = ["fs"], 
 slatedb = { version = "0.14.1", default-features = false, features = ["moka", "zstd"], optional = true }
 ulid = { version = "1.2.1", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+zstd = "0.13"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 mimalloc.workspace = true
@@ -57,6 +58,11 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 [[example]]
 name = "storage_layout"
 path = "examples/storage_layout.rs"
+required-features = ["storage-benches", "slatedb"]
+
+[[example]]
+name = "revision_pack_oracle"
+path = "examples/revision_pack_oracle.rs"
 required-features = ["storage-benches", "slatedb"]
 
 [[test]]
