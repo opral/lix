@@ -19,7 +19,8 @@ use crate::storage_adapter::{
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, PendingChunkBatch,
     TrackedStateMutationBatchBuilder, decode_key, decode_key_shared, decode_node_ref, decode_value,
-    encode_key_ref, encode_leaf_node, encode_schema_key_prefix, encode_value_ref,
+    encode_key_ref, encode_key_ref_into, encode_leaf_node, encode_schema_key_prefix,
+    encode_value_ref,
 };
 use crate::tracked_state::types::{
     TRACKED_STATE_HASH_BYTES, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
@@ -2509,6 +2510,45 @@ pub(crate) async fn load_owned_commit_delta_entries(
     Ok(output)
 }
 
+/// Loads one ordered exact-key batch without first owning a second copy of
+/// every identity. Dense current-state reads have this shape and normally
+/// resolve every key from the physical owner; unusual selected-source or
+/// missing-key cases fall back to the general loader.
+pub(crate) async fn load_owned_commit_delta_entries_one_ordered_ref(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    keys: &[TrackedStateKeyRef<'_>],
+) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let strictly_ordered = keys.windows(2).all(|pair| {
+        (pair[0].schema_key, pair[0].file_id, pair[0].entity_pk)
+            < (pair[1].schema_key, pair[1].file_id, pair[1].entity_pk)
+    });
+    if strictly_ordered {
+        let output =
+            load_local_owned_commit_delta_entries_one_ordered(store, commit_id, keys).await?;
+        if output.iter().all(Option::is_some) {
+            return Ok(output);
+        }
+    }
+    let requests = keys
+        .iter()
+        .map(|key| {
+            (
+                commit_id,
+                TrackedStateKey {
+                    schema_key: key.schema_key.to_owned(),
+                    file_id: key.file_id.map(str::to_owned),
+                    entity_pk: key.entity_pk.clone(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    load_owned_commit_delta_entries(store, &requests).await
+}
+
 async fn load_local_owned_commit_delta_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     requests: &[(CommitId, TrackedStateKey)],
@@ -2520,8 +2560,18 @@ async fn load_local_owned_commit_delta_entries(
         .windows(2)
         .all(|pair| pair[0].0 == pair[1].0 && pair[0].1 < pair[1].1)
     {
+        let keys = requests
+            .iter()
+            .map(|(_, key)| TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            })
+            .collect::<Vec<_>>();
         return Box::pin(load_local_owned_commit_delta_entries_one_ordered(
-            store, requests,
+            store,
+            requests[0].0,
+            &keys,
         ))
         .await;
     }
@@ -2646,9 +2696,9 @@ async fn load_local_owned_commit_delta_entries(
 /// commit map, a segment B-tree, and one lookup vector per segment.
 async fn load_local_owned_commit_delta_entries_one_ordered(
     store: &(impl StorageAdapterRead + ?Sized),
-    requests: &[(CommitId, TrackedStateKey)],
+    commit_id: CommitId,
+    keys: &[TrackedStateKeyRef<'_>],
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
-    let commit_id = requests[0].0;
     let manifest_key = StorageKey(Bytes::from(commit_delta_manifest_key(commit_id)));
     let manifest_values = PointReadPlan::new(
         TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
@@ -2663,14 +2713,14 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
         .flatten()
         .and_then(full_value_bytes)
     else {
-        return Ok((0..requests.len()).map(|_| None).collect());
+        return Ok((0..keys.len()).map(|_| None).collect());
     };
     let manifest = decode_commit_delta_manifest(&bytes)?;
-    let mut output = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+    let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
     if let Some(inline_segment) = manifest.inline_segment() {
         let (leaf, payloads) = decode_commit_delta_with_payloads(inline_segment, None)?;
-        for (request_index, (_, key)) in requests.iter().enumerate() {
-            let encoded_key = encoded_commit_delta_lookup_key(key);
+        for (request_index, &key) in keys.iter().enumerate() {
+            let encoded_key = encode_key_ref(key);
             output[request_index] =
                 find_loaded_commit_delta_entry(&leaf, &payloads, &encoded_key, commit_id)?;
         }
@@ -2678,11 +2728,14 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
         return Ok(output);
     }
 
-    let mut routed = Vec::<(usize, usize, Vec<u8>)>::with_capacity(requests.len());
+    let mut encoded_keys = Vec::new();
+    let mut routed = Vec::<(usize, usize, Range<usize>)>::with_capacity(keys.len());
     let mut segment_indices = Vec::new();
-    for (request_index, (_, key)) in requests.iter().enumerate() {
-        let encoded_key = encoded_commit_delta_lookup_key(key);
-        let Some(segment_index) = commit_delta_segment_for_key(&manifest, &encoded_key) else {
+    for (request_index, &key) in keys.iter().enumerate() {
+        let encoded_key = encode_key_ref_into(&mut encoded_keys, key);
+        let Some(segment_index) =
+            commit_delta_segment_for_key(&manifest, &encoded_keys[encoded_key.clone()])
+        else {
             continue;
         };
         if segment_indices.last().copied() != Some(segment_index) {
@@ -2726,6 +2779,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
             )
         })?;
         let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(bounds))?;
+        let mut leaf_index = 0usize;
         while routed
             .peek()
             .is_some_and(|(_, routed_segment, _)| *routed_segment == segment_index)
@@ -2733,8 +2787,26 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
             let (request_index, _, encoded_key) = routed
                 .next()
                 .expect("peeked routed lookup remains available");
-            output[request_index] =
-                find_loaded_commit_delta_entry(&leaf, &payloads, &encoded_key, commit_id)?;
+            let encoded_key = &encoded_keys[encoded_key];
+            while leaf_index < leaf.len()
+                && leaf.key(leaf_index)?.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state packed commit_delta leaf has a missing key",
+                    )
+                })? < encoded_key
+            {
+                leaf_index += 1;
+            }
+            let Some(leaf_key) = leaf.key(leaf_index)? else {
+                continue;
+            };
+            if leaf_key == encoded_key {
+                output[request_index] = Some(load_commit_delta_entry_at_index(
+                    &leaf, &payloads, leaf_index, commit_id,
+                )?);
+                leaf_index += 1;
+            }
         }
     }
     hydrate_selected_loaded_entries(store, &mut output).await?;
@@ -4374,6 +4446,20 @@ fn find_loaded_commit_delta_entry(
     let Some(index) = find_commit_delta_entry_index(leaf, target_key)? else {
         return Ok(None);
     };
+    Ok(Some(load_commit_delta_entry_at_index(
+        leaf,
+        payloads,
+        index,
+        expected_commit_id,
+    )?))
+}
+
+fn load_commit_delta_entry_at_index(
+    leaf: &DecodedLeafNodeRef,
+    payloads: &CommitDeltaPayloadIndexRef<'_>,
+    index: usize,
+    expected_commit_id: CommitId,
+) -> Result<LoadedCommitDeltaEntry, LixError> {
     let entry = leaf.entry(index)?.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -4430,13 +4516,13 @@ fn find_loaded_commit_delta_entry(
         created_at: value.updated_at,
         origin_key,
     };
-    Ok(Some(LoadedCommitDeltaEntry {
+    Ok(LoadedCommitDeltaEntry {
         value,
         change_record,
         selected_ref,
         certified_ref,
         owner_commit_id: expected_commit_id,
-    }))
+    })
 }
 
 fn find_commit_delta_entry_index(

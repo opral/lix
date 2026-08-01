@@ -84,6 +84,23 @@ pub(crate) fn resolve_visible_batch(
     request: &VisibilityRequest,
 ) -> MaterializedLiveStateBatch {
     let requested_branch_ids = requested_branch_ids(&request.branch_scope);
+    if staged_rows.is_empty()
+        && request.limit.is_none_or(|limit| base_rows.len() <= limit)
+        && base_rows.iter().all(|row| {
+            (request.include_tombstones || !row.deleted())
+                && (requested_branch_ids.is_empty()
+                    || (!row.global()
+                        && requested_branch_ids
+                            .iter()
+                            .any(|branch_id| branch_id == row.branch_id())))
+        })
+        && base_rows
+            .iter()
+            .map(materialized_row_identity)
+            .is_sorted_by(|left, right| left < right)
+    {
+        return base_rows;
+    }
     resolve_live_state_batch(
         &base_rows,
         &staged_rows,
@@ -91,6 +108,15 @@ pub(crate) fn resolve_visible_batch(
         request.include_tombstones,
         request.limit,
     )
+}
+
+fn materialized_row_identity(row: MaterializedLiveStateRowRef<'_>) -> LiveStateRowIdentityRef<'_> {
+    LiveStateRowIdentityRef {
+        branch_id: row.branch_id(),
+        schema_key: row.schema_key(),
+        entity_pk: row.entity_pk(),
+        file_id: row.file_id(),
+    }
 }
 
 pub(crate) async fn overlay_scan_batch<S>(
@@ -315,9 +341,7 @@ impl<'a> OverlayCandidate<'a> {
     fn identity(self) -> LiveStateRowIdentityRef<'a> {
         LiveStateRowIdentityRef {
             branch_id: self.branch_id,
-            schema_key: self.row.schema_key(),
-            entity_pk: self.row.entity_pk(),
-            file_id: self.row.file_id(),
+            ..materialized_row_identity(self.row)
         }
     }
 }
@@ -512,8 +536,10 @@ mod tests {
                 branch_id: branch_id.into(),
             })
             .collect();
+        let source = MaterializedLiveStateBatch::from_rows(rows);
+        let source_entity_column = source.entity_column_ptr();
         let batch = resolve_visible_batch(
-            MaterializedLiveStateBatch::from_rows(rows),
+            source,
             MaterializedLiveStateBatch::default(),
             &VisibilityRequest {
                 branch_scope: VisibilityBranchScope::BranchIds {
@@ -525,6 +551,7 @@ mod tests {
         );
 
         assert_eq!(batch.len(), 10_000);
+        assert_eq!(batch.entity_column_ptr(), source_entity_column);
         assert_eq!(batch.dictionary_entry_count(), 3);
         assert_eq!(batch.row(0).schema_key(), batch.row(9_999).schema_key());
         assert_eq!(

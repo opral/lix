@@ -426,27 +426,45 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
     let direct_primary_key_param =
         bound_single_text_primary_key_param(&spec, &plan.bound.predicate);
     let direct_replacement = direct_path_value_replacement(&spec, plan, direct_primary_key_param);
+    let borrowed_direct_parameters = direct_replacement.as_ref().and_then(|replacement| {
+        direct_replacement_text_columns(
+            parameter_batch,
+            direct_primary_key_param?,
+            replacement.value_param_index,
+        )
+    });
     let mut parameter_rows = Vec::with_capacity(parameter_batch.num_rows());
     let mut entity_pks = Vec::<EntityPk>::with_capacity(parameter_batch.num_rows());
     let mut entity_pks_strictly_ordered = true;
     for row_index in 0..parameter_batch.num_rows() {
-        let params = super::write::parameter_row(parameter_batch, row_index)
-            .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
-        let entity_pk = if let Some(param_index) = direct_primary_key_param {
-            let Some(Value::Text(value)) = params.get(param_index) else {
-                return Ok(None);
-            };
-            EntityPk::single(value.clone())
-        } else {
-            let Some(mut row_entity_pks) =
-                bound_entity_pks_from_primary_key_predicate(&spec, &plan.bound.predicate, &params)
-            else {
-                return Ok(None);
-            };
-            if row_entity_pks.len() != 1 {
+        let entity_pk = if let Some(columns) = borrowed_direct_parameters {
+            if columns.primary_keys.is_null(row_index) {
                 return Ok(None);
             }
-            row_entity_pks.pop().expect("one point-update identity")
+            EntityPk::single(columns.primary_keys.value(row_index).to_owned())
+        } else {
+            let params = super::write::parameter_row(parameter_batch, row_index)
+                .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
+            let entity_pk = if let Some(param_index) = direct_primary_key_param {
+                let Some(Value::Text(value)) = params.get(param_index) else {
+                    return Ok(None);
+                };
+                EntityPk::single(value.clone())
+            } else {
+                let Some(mut row_entity_pks) = bound_entity_pks_from_primary_key_predicate(
+                    &spec,
+                    &plan.bound.predicate,
+                    &params,
+                ) else {
+                    return Ok(None);
+                };
+                if row_entity_pks.len() != 1 {
+                    return Ok(None);
+                }
+                row_entity_pks.pop().expect("one point-update identity")
+            };
+            parameter_rows.push(params);
+            entity_pk
         };
         if let Some(previous) = entity_pks.last() {
             match previous.cmp(&entity_pk) {
@@ -459,7 +477,6 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
                 Ordering::Greater => entity_pks_strictly_ordered = false,
             }
         }
-        parameter_rows.push(params);
         entity_pks.push(entity_pk);
     }
     if !entity_pks_strictly_ordered {
@@ -469,6 +486,14 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
             .any(|entity_pk| !unique_entity_pks.insert(entity_pk))
         {
             return Ok(None);
+        }
+    }
+    if borrowed_direct_parameters.is_some() && !entity_pks_strictly_ordered {
+        for row_index in 0..parameter_batch.num_rows() {
+            parameter_rows.push(
+                super::write::parameter_row(parameter_batch, row_index)
+                    .map_err(|error| with_parameter_batch_statement_index(error, row_index))?,
+            );
         }
     }
 
@@ -508,10 +533,22 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
         let mut normalized = Vec::with_capacity(parameter_rows.len().saturating_mul(64));
         let mut offsets = Vec::with_capacity(parameter_rows.len());
         let mut matched_candidates = Vec::with_capacity(parameter_rows.len());
-        for (row_index, params) in parameter_rows.iter().enumerate() {
-            let expected_entity_pk = match params.get(primary_key_param_index) {
-                Some(Value::Text(value)) => value,
-                _ => unreachable!("direct replacement primary key was validated as text"),
+        for row_index in 0..parameter_batch.num_rows() {
+            let (expected_entity_pk, borrowed_value, params) = if let Some(columns) =
+                borrowed_direct_parameters
+            {
+                (
+                    columns.primary_keys.value(row_index),
+                    (!columns.values.is_null(row_index)).then(|| columns.values.value(row_index)),
+                    None,
+                )
+            } else {
+                let params = &parameter_rows[row_index];
+                let expected_entity_pk = match params.get(primary_key_param_index) {
+                    Some(Value::Text(value)) => value.as_str(),
+                    _ => unreachable!("direct replacement primary key was validated as text"),
+                };
+                (expected_entity_pk, None, Some(params.as_slice()))
             };
             let mut affected = 0;
             while let Some(candidate) = candidates.peek().copied() {
@@ -529,13 +566,21 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
                         .expect("peeked exact entity candidate remains available"),
                 );
                 let start = normalized.len();
-                append_direct_path_value_replacement_json(
-                    &mut normalized,
-                    candidate,
-                    params,
-                    replacement,
-                )
-                .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
+                let result = if borrowed_direct_parameters.is_some() {
+                    append_direct_path_value_replacement_json_text(
+                        &mut normalized,
+                        candidate,
+                        borrowed_value,
+                    )
+                } else {
+                    append_direct_path_value_replacement_json(
+                        &mut normalized,
+                        candidate,
+                        params.expect("owned direct replacement has one parameter row"),
+                        replacement,
+                    )
+                };
+                result.map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
                 offsets.push((start, normalized.len()));
                 matched_candidates.push((row_index, candidate));
                 affected += 1;
@@ -614,6 +659,32 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
 
 struct DirectPathValueReplacement {
     value_param_index: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DirectReplacementTextColumns<'a> {
+    primary_keys: &'a StringArray,
+    values: &'a StringArray,
+}
+
+fn direct_replacement_text_columns<'a>(
+    batch: &'a RecordBatch,
+    primary_key_param_index: usize,
+    value_param_index: usize,
+) -> Option<DirectReplacementTextColumns<'a>> {
+    if crate::sql2::result_metadata::field_is_json(batch.schema().field(value_param_index)) {
+        return None;
+    }
+    Some(DirectReplacementTextColumns {
+        primary_keys: batch
+            .column(primary_key_param_index)
+            .as_any()
+            .downcast_ref::<StringArray>()?,
+        values: batch
+            .column(value_param_index)
+            .as_any()
+            .downcast_ref::<StringArray>()?,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -790,14 +861,9 @@ fn append_direct_path_value_replacement_json(
     params: &[Value],
     replacement: &DirectPathValueReplacement,
 ) -> Result<(), LixError> {
-    let value = match params.get(replacement.value_param_index) {
-        Some(Value::Null) => JsonValue::Null,
-        Some(Value::Text(raw)) => serde_json::from_str(raw).map_err(|error| {
-            LixError::new(
-                LixError::CODE_TYPE_MISMATCH,
-                format!("lix_json argument is not valid JSON: {error}"),
-            )
-        })?,
+    let raw = match params.get(replacement.value_param_index) {
+        Some(Value::Null) => None,
+        Some(Value::Text(raw)) => Some(raw.as_str()),
         Some(_) => {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
@@ -813,6 +879,23 @@ fn append_direct_path_value_replacement_json(
                 ),
             ));
         }
+    };
+    append_direct_path_value_replacement_json_text(normalized, candidate, raw)
+}
+
+fn append_direct_path_value_replacement_json_text(
+    normalized: &mut Vec<u8>,
+    candidate: EntityLiveRowRef<'_>,
+    raw: Option<&str>,
+) -> Result<(), LixError> {
+    let value = match raw {
+        None => JsonValue::Null,
+        Some(raw) => serde_json::from_str(raw).map_err(|error| {
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("lix_json argument is not valid JSON: {error}"),
+            )
+        })?,
     };
     normalized.extend_from_slice(br#"{"path":"#);
     append_canonical_json_string(normalized, candidate.entity_pk().as_single_string()?)?;
