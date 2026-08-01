@@ -15,6 +15,7 @@ use datafusion::sql::sqlparser::ast::{
     Value as SqlValue,
 };
 use serde_json::Value as JsonValue;
+use tracing::Instrument as _;
 
 use crate::entity_pk::EntityPk;
 use crate::live_state::{LiveStateFilter, LiveStateProjection, LiveStateScanRequest};
@@ -55,7 +56,8 @@ where
     // A native route must retain all public SQL-surface validation. This runs
     // after structural recognition so normal queries do not pay an additional
     // validation pass before their existing DataFusion path.
-    crate::sql2::bind_read_statement(sql, statement)?;
+    tracing::debug_span!(target: "lix_perf", "lix.perf.public_read.bind")
+        .in_scope(|| crate::sql2::bind_read_statement(sql, statement))?;
 
     let catalog = ctx.public_catalog().await?;
     let Some(surface) = catalog.surface(shape.table_name()) else {
@@ -102,7 +104,14 @@ where
                 limit: None,
             };
             if let Some(reader) = ctx.entity_snapshot_reader()
-                && let Some(snapshots) = reader.scan_entity_snapshots(request.clone()).await?
+                && let Some(snapshots) = reader
+                    .scan_entity_snapshots(request.clone())
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.public_read.snapshot_scan",
+                        row_count = request.filter.entity_pks.len()
+                    ))
+                    .await?
             {
                 return Ok(Some(SqlQueryResult {
                     columns: shape.projection.clone(),

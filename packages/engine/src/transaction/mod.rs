@@ -15,6 +15,8 @@ pub mod bench {
 }
 
 #[cfg(test)]
+pub(crate) use commit::take_complete_replacement_packed_current_base_publications;
+#[cfg(test)]
 pub(crate) use commit::take_ordered_packed_current_base_publications;
 pub(crate) use context::CertifiedHistoryStoreReader;
 #[cfg(test)]

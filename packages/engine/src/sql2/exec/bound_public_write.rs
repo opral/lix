@@ -7,7 +7,7 @@ use datafusion::common::ScalarValue;
 use serde_json::Value as JsonValue;
 use tracing::Instrument;
 
-use crate::catalog::TypedJsonScalarRef;
+use crate::catalog::{SchemaPlanId, TypedJsonScalarRef};
 use crate::changelog::CommitId;
 use crate::common::{
     ExecuteStatementMetadata, RequestBlobSpliceProvenance, SharedStr, validate_row_metadata,
@@ -49,6 +49,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static CERTIFIED_GENERATION_IDENTITY_REPLACEMENTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -69,6 +71,11 @@ pub(crate) fn take_certified_entity_insert_batch_executions() -> usize {
 #[cfg(test)]
 pub(crate) fn take_certified_entity_insert_parameter_batch_executions() -> usize {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_certified_generation_identity_replacements() -> usize {
+    CERTIFIED_GENERATION_IDENTITY_REPLACEMENTS.with(|executions| executions.replace(0))
 }
 
 #[cfg(test)]
@@ -353,12 +360,14 @@ async fn try_execute_entity_insert_batch(
     if let Some(error) = committed_conflict {
         return Err(error);
     }
-    #[cfg(test)]
-    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
-        executions.set(executions.get().saturating_add(1));
-    });
-    #[cfg(feature = "storage-benches")]
-    crate::storage_bench::record_certified_entity_insert_parameter_batch_execution();
+    if !spec.certifies_path_value_replacement {
+        #[cfg(test)]
+        CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+            executions.set(executions.get().saturating_add(1));
+        });
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_certified_entity_insert_parameter_batch_execution();
+    }
     Ok(Some(
         (0..parameter_batch.num_rows())
             .map(|_| SqlWriteResult::affected(1))
@@ -391,17 +400,42 @@ async fn collection_is_certifiably_empty(
 /// narrower: every logical statement must target a distinct primary key in
 /// the same unconstrained entity surface, so evaluating them together is
 /// observationally equivalent to evaluating them one at a time.
+pub(crate) async fn try_execute_entity_update_value_batch<'a>(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    parameter_rows: &'a [&'a [Value]],
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    try_execute_direct_path_value_replacement_batch(
+        ctx,
+        plan,
+        EntityInsertParameterBatch::Values(parameter_rows),
+    )
+    .await
+}
+
 pub(crate) async fn try_execute_entity_update_parameter_batch(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     parameter_batch: &RecordBatch,
 ) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    if let Some(results) = try_execute_direct_path_value_replacement_batch(
+        ctx,
+        plan,
+        EntityInsertParameterBatch::Arrow(parameter_batch),
+    )
+    .await?
+    {
+        return Ok(Some(results));
+    }
+
     let BoundWriteTarget::Entity(EntityWriteSurface::Base { schema_key }) = &plan.bound.target
     else {
         return Ok(None);
     };
-    if plan.bound.op != BoundWriteOp::Update
-        || !matches!(plan.bound.input, BoundWriteInput::None)
+    if plan.bound.op != BoundWriteOp::Update {
+        return Ok(None);
+    }
+    if !matches!(plan.bound.input, BoundWriteInput::None)
         || plan.bound.conflict.is_some()
         || plan.bound.returning.is_some()
         || !matches!(plan.bound.branch_scope, BranchScope::Active { .. })
@@ -648,6 +682,282 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
                 executions.set(executions.get() + 1);
             });
         }
+    }
+    Ok(Some(
+        affected_by_statement
+            .into_iter()
+            .map(SqlWriteResult::affected)
+            .collect(),
+    ))
+}
+
+/// Lowers the dominant JSON-pointer replacement shape directly from borrowed
+/// public parameters into one canonical row-content arena.
+///
+/// This deliberately accepts only strictly ordered, unique, ordinary tracked
+/// identities. Anything else retains the generic sequential path and its full
+/// plugin/constraint semantics.
+async fn try_execute_direct_path_value_replacement_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    parameter_batch: EntityInsertParameterBatch<'_>,
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    let BoundWriteTarget::Entity(EntityWriteSurface::Base { schema_key }) = &plan.bound.target
+    else {
+        return Ok(None);
+    };
+    if plan.bound.op != BoundWriteOp::Update {
+        return Ok(None);
+    }
+    #[cfg(feature = "storage-benches")]
+    let record_value_certificate = matches!(parameter_batch, EntityInsertParameterBatch::Values(_));
+    #[cfg(feature = "storage-benches")]
+    if record_value_certificate {
+        crate::storage_bench::record_certified_entity_update_value_batch_attempt();
+    }
+    if !matches!(plan.bound.input, BoundWriteInput::None)
+        || plan.bound.conflict.is_some()
+        || plan.bound.returning.is_some()
+        || !matches!(plan.bound.branch_scope, BranchScope::Active { .. })
+        || !matches!(plan.filters.rows, FilterSet::All)
+        || plan_references_active_branch_commit_id(plan)
+    {
+        return Ok(None);
+    }
+
+    let spec = entity_spec(ctx, schema_key)?;
+    if spec.has_inter_row_constraints
+        || plan.bound.assignments.iter().any(|assignment| {
+            spec.primary_key_paths
+                .iter()
+                .any(|path| path.as_slice() == [assignment.column.name.as_str()])
+        })
+    {
+        return Ok(None);
+    }
+    validate_bound_write_supported(plan, &spec)?;
+    let Some(primary_key_param_index) =
+        bound_single_text_primary_key_param(&spec, &plan.bound.predicate)
+    else {
+        return Ok(None);
+    };
+    let Some(replacement) =
+        direct_path_value_replacement(&spec, plan, Some(primary_key_param_index))
+    else {
+        return Ok(None);
+    };
+    if !parameter_batch.column_matches(primary_key_param_index, EntityColumnType::String)
+        || !parameter_batch.column_matches(replacement.value_param_index, EntityColumnType::String)
+    {
+        return Ok(None);
+    }
+    let Some(schema_catalog) = ctx.schema_catalog_snapshot() else {
+        return Ok(None);
+    };
+    let Some((schema_plan_id, schema_plan)) = schema_catalog.plan_for_key(&spec.schema_key) else {
+        return Ok(None);
+    };
+    if !schema_plan.accepts_canonical_certificate() {
+        return Ok(None);
+    }
+
+    let row_count = parameter_batch.num_rows();
+    let mut primary_key_arena = Vec::new();
+    let mut primary_key_offsets = Vec::with_capacity(row_count);
+    let mut previous_row = None;
+    for statement_index in 0..row_count {
+        let DirectParameterValue::String(primary_key) =
+            parameter_batch.value(primary_key_param_index, statement_index)
+        else {
+            return Ok(None);
+        };
+        if let Some(previous_row) = previous_row {
+            let DirectParameterValue::String(previous) =
+                parameter_batch.value(primary_key_param_index, previous_row)
+            else {
+                unreachable!("the previous primary-key parameter was certified as text")
+            };
+            if previous >= primary_key {
+                return Ok(None);
+            }
+        }
+        previous_row = Some(statement_index);
+        let start = primary_key_arena.len();
+        primary_key_arena.extend_from_slice(primary_key.as_bytes());
+        primary_key_offsets.push((start, primary_key_arena.len()));
+    }
+    let primary_key_arena = SharedStr::from_utf8(bytes::Bytes::from(primary_key_arena))
+        .map_err(|_| LixError::unknown("certified replacement primary-key arena is not UTF-8"))?;
+    let entity_pks = primary_key_offsets
+        .into_iter()
+        .map(|(start, end)| {
+            EntityPk::from_validated_shared_string(
+                primary_key_arena
+                    .slice(start..end)
+                    .expect("certified replacement primary-key offsets preserve UTF-8"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let active_branch_id = ctx.active_branch_id().to_owned();
+    let collection_generation = ctx
+        .load_collection_generation(
+            &active_branch_id,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: &spec.schema_key,
+                file_id: None,
+            },
+        )
+        .await?;
+    let certified_generation_identity = collection_generation.is_some_and(|generation| {
+        generation.live_count == row_count as u64
+            && generation.ordered_identity_digest.is_some()
+            && generation.ordered_identity_digest
+                == crate::collection_generation::ordered_single_string_identity_digest(
+                    entity_pks.iter(),
+                )
+    });
+    #[cfg(test)]
+    if certified_generation_identity {
+        CERTIFIED_GENERATION_IDENTITY_REPLACEMENTS.with(|executions| {
+            executions.set(executions.get().saturating_add(1));
+        });
+    }
+    let candidates = if certified_generation_identity {
+        MaterializedLiveStateBatch::default()
+    } else {
+        let candidates = scan_entity_candidates_for_pks(ctx, plan, &spec, entity_pks.clone(), true)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.entity_update_value_batch.candidate_scan",
+                row_count
+            ))
+            .await?;
+        if candidates.iter().any(|candidate| {
+            candidate.untracked()
+                || candidate.global()
+                || candidate.file_id().is_some()
+                || candidate.metadata().is_some()
+        }) {
+            return Ok(None);
+        }
+        candidates
+    };
+    let complete_collection_replacement = certified_generation_identity
+        || (candidates.len() == row_count
+            && collection_generation
+                .is_some_and(|generation| generation.live_count == row_count as u64));
+
+    let estimated_row_bytes = entity_pks
+        .iter()
+        .map(|entity_pk| {
+            entity_pk
+                .as_single_string()
+                .map_or(32, |path| path.len().saturating_add(32))
+        })
+        .sum::<usize>();
+    let mut normalized = Vec::with_capacity(estimated_row_bytes);
+    let replacement_capacity = if certified_generation_identity {
+        row_count
+    } else {
+        candidates.len()
+    };
+    let mut snapshot_offsets = Vec::with_capacity(replacement_capacity);
+    let mut replacement_entity_pks = Vec::with_capacity(replacement_capacity);
+    let mut affected_by_statement = vec![0_u64; row_count];
+    let mut candidate_index = 0;
+    for (statement_index, entity_pk) in entity_pks.iter().enumerate() {
+        if !certified_generation_identity {
+            while candidate_index < candidates.len()
+                && candidates.row(candidate_index).entity_pk() < entity_pk
+            {
+                candidate_index += 1;
+            }
+            if candidate_index == candidates.len()
+                || candidates.row(candidate_index).entity_pk() != entity_pk
+            {
+                continue;
+            }
+        }
+
+        let start = normalized.len();
+        normalized.extend_from_slice(b"{\"path\":");
+        append_canonical_json_string(&mut normalized, entity_pk.as_single_string()?)
+            .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
+        normalized.extend_from_slice(b",\"value\":");
+        match parameter_batch.value(replacement.value_param_index, statement_index) {
+            DirectParameterValue::Null => normalized.extend_from_slice(b"null"),
+            DirectParameterValue::String(raw) => {
+                let value = serde_json::from_str::<JsonValue>(raw).map_err(|error| {
+                    with_parameter_batch_statement_index(
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("lix_json argument is not valid JSON: {error}"),
+                        ),
+                        statement_index,
+                    )
+                })?;
+                serde_json::to_writer(&mut normalized, &value).map_err(|error| {
+                    with_parameter_batch_statement_index(
+                        LixError::unknown(format!(
+                            "certified replacement value failed to serialize: {error}"
+                        )),
+                        statement_index,
+                    )
+                })?;
+            }
+            DirectParameterValue::Boolean(_) => {
+                unreachable!("the certified replacement value parameter is text")
+            }
+        }
+        normalized.push(b'}');
+        snapshot_offsets.push((start, normalized.len()));
+        replacement_entity_pks.push(entity_pk.clone());
+        affected_by_statement[statement_index] = 1;
+        if !certified_generation_identity {
+            candidate_index += 1;
+        }
+    }
+
+    if !replacement_entity_pks.is_empty() {
+        let snapshots =
+            TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
+        let rows = RawWriteBatch::from_certified_parameter_replacement(
+            replacement_entity_pks,
+            snapshots,
+            spec.schema_key.as_str().into(),
+            active_branch_id.into(),
+            CertifiedRawWriteBatchPreparation {
+                schema_plan_id,
+                facts: PreparedRowFacts {
+                    row_content_validated: true,
+                    requires_transaction_validation: false,
+                },
+                tracked_keys_strictly_ordered: true,
+                complete_collection_replacement,
+            },
+        )?;
+        ctx.stage_parameter_batch_replace(rows)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.entity_update_value_batch.stage_rows",
+                row_count
+            ))
+            .await?;
+    }
+
+    #[cfg(test)]
+    {
+        ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+            executions.set(executions.get().saturating_add(1));
+        });
+        CERTIFIED_REPLACEMENT_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+            executions.set(executions.get().saturating_add(1));
+        });
+    }
+    #[cfg(feature = "storage-benches")]
+    if record_value_certificate {
+        crate::storage_bench::record_certified_entity_update_value_batch_hit(row_count);
     }
     Ok(Some(
         affected_by_statement
@@ -3115,6 +3425,17 @@ fn certified_direct_parameter_insert_batch(
         return Ok(None);
     }
 
+    if let Some(rows) = certified_direct_path_value_insert_batch(
+        ctx,
+        spec,
+        layout,
+        row,
+        parameter_batch,
+        schema_plan_id,
+    )? {
+        return Ok(Some(rows));
+    }
+
     let mut columns = Vec::with_capacity(layout.columns.len());
     for (layout_index, (expr, target)) in row.iter().zip(&layout.columns).enumerate() {
         let BoundExpr::Param(param) = expr else {
@@ -3425,6 +3746,7 @@ fn certified_direct_parameter_insert_batch(
             requires_transaction_validation: false,
         },
         tracked_keys_strictly_ordered,
+        complete_collection_replacement: false,
     };
     let rows = RawWriteBatch::from_certified_parameter_insert(
         entity_pks,
@@ -3434,6 +3756,144 @@ fn certified_direct_parameter_insert_batch(
         certificate,
     )?;
     Ok(Some(rows))
+}
+
+fn certified_direct_path_value_insert_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    spec: &EntitySurfaceSpec,
+    layout: &InsertRowLayout,
+    row: &[BoundExpr],
+    parameter_batch: EntityInsertParameterBatch<'_>,
+    schema_plan_id: SchemaPlanId,
+) -> Result<Option<RawWriteBatch>, LixError> {
+    if !spec.certifies_path_value_replacement || row.len() != 2 || layout.columns.len() != 2 {
+        return Ok(None);
+    }
+    let mut path_param_index = None;
+    let mut value_param_index = None;
+    for (expr, target) in row.iter().zip(&layout.columns) {
+        match (expr, target) {
+            (
+                BoundExpr::Param(param),
+                InsertColumnTarget::Visible {
+                    name,
+                    column_type: EntityColumnType::String,
+                    ..
+                },
+            ) if name == "path" => path_param_index = Some(param.index.saturating_sub(1)),
+            (
+                BoundExpr::Function { name, args },
+                InsertColumnTarget::Visible {
+                    name: column_name,
+                    column_type: EntityColumnType::Json,
+                    ..
+                },
+            ) if name == "lix_json" && column_name == "value" => {
+                let [BoundExpr::Param(param)] = args.as_slice() else {
+                    return Ok(None);
+                };
+                value_param_index = Some(param.index.saturating_sub(1));
+            }
+            _ => return Ok(None),
+        }
+    }
+    let (Some(path_param_index), Some(value_param_index)) = (path_param_index, value_param_index)
+    else {
+        return Ok(None);
+    };
+    if !parameter_batch.column_matches(path_param_index, EntityColumnType::String)
+        || !parameter_batch.column_matches(value_param_index, EntityColumnType::String)
+    {
+        return Ok(None);
+    }
+
+    let row_count = parameter_batch.num_rows();
+    let mut path_arena = Vec::new();
+    let mut path_offsets = Vec::with_capacity(row_count);
+    let mut normalized = Vec::new();
+    let mut snapshot_offsets = Vec::with_capacity(row_count);
+    let mut previous_row = None;
+    for statement_index in 0..row_count {
+        let DirectParameterValue::String(path) =
+            parameter_batch.value(path_param_index, statement_index)
+        else {
+            return Ok(None);
+        };
+        if let Some(previous_row) = previous_row {
+            let DirectParameterValue::String(previous) =
+                parameter_batch.value(path_param_index, previous_row)
+            else {
+                unreachable!("the previous certified path parameter was text")
+            };
+            if previous >= path {
+                return Ok(None);
+            }
+        }
+        previous_row = Some(statement_index);
+        let path_start = path_arena.len();
+        path_arena.extend_from_slice(path.as_bytes());
+        path_offsets.push((path_start, path_arena.len()));
+
+        let snapshot_start = normalized.len();
+        normalized.extend_from_slice(b"{\"path\":");
+        append_canonical_json_string(&mut normalized, path)
+            .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
+        normalized.extend_from_slice(b",\"value\":");
+        let DirectParameterValue::String(raw_value) =
+            parameter_batch.value(value_param_index, statement_index)
+        else {
+            return Ok(None);
+        };
+        let value = serde_json::from_str::<JsonValue>(raw_value).map_err(|error| {
+            with_parameter_batch_statement_index(
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("lix_json argument is not valid JSON: {error}"),
+                ),
+                statement_index,
+            )
+        })?;
+        serde_json::to_writer(&mut normalized, &value).map_err(|error| {
+            with_parameter_batch_statement_index(
+                LixError::unknown(format!(
+                    "certified INSERT value failed to serialize: {error}"
+                )),
+                statement_index,
+            )
+        })?;
+        normalized.push(b'}');
+        snapshot_offsets.push((snapshot_start, normalized.len()));
+    }
+
+    let path_arena = SharedStr::from_utf8(bytes::Bytes::from(path_arena))
+        .map_err(|_| LixError::unknown("certified INSERT path arena is not UTF-8"))?;
+    let entity_pks = path_offsets
+        .into_iter()
+        .map(|(start, end)| {
+            EntityPk::from_validated_shared_string(
+                path_arena
+                    .slice(start..end)
+                    .expect("certified INSERT path offsets preserve UTF-8"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let snapshots =
+        TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
+    Ok(Some(RawWriteBatch::from_certified_parameter_insert(
+        entity_pks,
+        snapshots,
+        layout.schema_key.as_str().into(),
+        ctx.active_branch_id().into(),
+        CertifiedRawWriteBatchPreparation {
+            schema_plan_id,
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+            tracked_keys_strictly_ordered: true,
+            complete_collection_replacement: false,
+        },
+    )?))
 }
 
 fn certified_entity_insert_rows<'a>(

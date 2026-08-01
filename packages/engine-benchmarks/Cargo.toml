@@ -18,6 +18,12 @@ rocksdb = ["dep:lix_rocksdb_storage"]
 sqlite = ["dep:lix_sqlite_storage", "dep:rusqlite"]
 slatedb = ["dep:lix_slatedb_storage", "dep:object_store", "dep:slatedb", "dep:ulid"]
 storage-benches = ["lix_engine/storage-benches", "rocksdb", "sqlite"]
+# Opt-in profiling build that routes Rust allocations through libc so tools
+# such as heaptrack can attribute transient allocation churn to call stacks.
+# Normal tracked-CRUD builds wrap mimalloc with byte accounting so latency
+# remains comparable with the existing benchmark. This feature removes that
+# allocator entirely so heap profilers and RSS controls use libc directly.
+system-allocation-profiler = []
 
 [dependencies]
 lix_engine = { workspace = true }

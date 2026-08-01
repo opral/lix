@@ -1117,6 +1117,50 @@ where
         )
     }
 
+    /// Stages a certified dense replacement without re-entering plugin,
+    /// storage-scope, or filesystem-path preparation for every logical SQL
+    /// statement. The producer only issues this certificate for existing,
+    /// ordinary tracked, unfiled rows in one active-branch entity collection.
+    async fn stage_certified_parameter_batch_replace(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        let row_count = rows.len();
+        if row_count == 0 {
+            return Ok(TransactionWriteOutcome { count: 0 });
+        }
+        debug_assert!(rows.certified_preparation().is_some());
+        self.ensure_plugin_generation_read_guard().await;
+
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_transaction_rows_staged(row_count);
+            crate::storage_bench::record_transaction_untracked_rows(0);
+        }
+        let prepared = self
+            .prepare_transaction_rows(rows)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.transaction_prepare_rows"
+            ))
+            .await?;
+        if prepared.len() != row_count {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified parameter replacement preparation changed row cardinality",
+            ));
+        }
+        tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage").in_scope(
+            || {
+                self.staged_writes
+                    .stage_write(PreparedTransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
+                        rows: prepared,
+                    })
+            },
+        )
+    }
+
     async fn stage_write_inner(
         &mut self,
         write: TransactionWrite,
@@ -7128,6 +7172,23 @@ where
                 rows,
             },
             statement_indices,
+        )
+        .await
+    }
+
+    async fn stage_parameter_batch_replace(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        if rows.certified_preparation().is_some() {
+            return self.stage_certified_parameter_batch_replace(rows).await;
+        }
+        Self::stage_write(
+            self,
+            TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows,
+            },
         )
         .await
     }

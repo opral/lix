@@ -24,6 +24,7 @@ use datafusion::sql::sqlparser::ast::{
     Value as SqlValue, Visit, Visitor,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use tracing::Instrument as _;
 
 use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext, SessionWriteAccess};
@@ -1130,8 +1131,105 @@ where
         &self,
         statements: &[ExecuteBatchStatement],
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.execute_batch_with_options(statements, ExecuteOptions::default())
-            .await
+        Box::pin(self.execute_batch_with_options(statements, ExecuteOptions::default())).await
+    }
+
+    /// Executes one write shape over a shared, homogeneous parameter page.
+    ///
+    /// Unlike [`Self::execute_batch`], this API does not duplicate the SQL
+    /// text and owned parameter strings into one statement object per row.
+    /// It is deliberately a hard, generated-write boundary: the bound write
+    /// must accept either the borrowed-value certificate or the physical
+    /// parameter-batch route. Shapes that require sequential statement
+    /// semantics remain on `execute_batch`.
+    pub async fn execute_homogeneous_write_batch(
+        &self,
+        sql: Arc<str>,
+        parameter_rows: Arc<[Arc<[Value]>]>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        Box::pin(self.execute_homogeneous_write_batch_inner(sql, parameter_rows)).await
+    }
+
+    async fn execute_homogeneous_write_batch_inner(
+        &self,
+        sql: Arc<str>,
+        parameter_rows: Arc<[Arc<[Value]>]>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.ensure_open()?;
+        if parameter_rows.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "execute_homogeneous_write_batch requires at least one parameter row",
+            ));
+        }
+        let parameter_count = parameter_rows[0].len();
+        if parameter_rows
+            .iter()
+            .any(|parameters| parameters.len() != parameter_count)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "execute_homogeneous_write_batch requires a rectangular parameter page",
+            ));
+        }
+        let statement = self.sql_planning_cache.parse_statement(&sql)?;
+        if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Write {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "execute_homogeneous_write_batch requires a write statement",
+            ));
+        }
+
+        let sql_for_error = Arc::clone(&sql);
+        let result = self
+            .with_write_transaction(move |transaction| {
+                Box::pin(async move {
+                    let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
+                    let parameter_refs = parameter_rows
+                        .iter()
+                        .map(|parameters| parameters.as_ref())
+                        .collect::<Vec<_>>();
+                    let results = if let Some(results) =
+                        sql2::execute_write_logical_plan_value_batch(
+                            transaction,
+                            &plan,
+                            &parameter_refs,
+                        )
+                        .await?
+                    {
+                        Some(results)
+                    } else {
+                        let Some(parameter_batch) = sql2::parameter_record_batch(&parameter_refs)?
+                        else {
+                            return Err(LixError::new(
+                                LixError::CODE_INVALID_PARAM,
+                                "homogeneous write parameters cannot be lowered as one batch",
+                            ));
+                        };
+                        sql2::execute_write_logical_plan_parameter_batch(
+                            transaction,
+                            plan,
+                            &parameter_batch,
+                        )
+                        .await?
+                    };
+                    results
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INVALID_PARAM,
+                                "write shape requires sequential execute_batch semantics",
+                            )
+                        })
+                        .map(|results| {
+                            results
+                                .into_iter()
+                                .map(ExecuteResult::from_sql_write_result)
+                                .collect()
+                        })
+                })
+            })
+            .await;
+        result.map_err(|error| normalize_sql_surface_error(error, &sql_for_error))
     }
 
     pub async fn execute_batch_with_options(
@@ -1139,11 +1237,11 @@ where
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.execute_batch_with_options_and_metadata(
+        Box::pin(self.execute_batch_with_options_and_metadata(
             statements,
             options,
             vec![ExecuteStatementMetadata::default(); statements.len()],
-        )
+        ))
         .await
     }
 
@@ -1154,13 +1252,13 @@ where
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.execute_batch_with_options_and_metadata_inner(
+        Box::pin(self.execute_batch_with_options_and_metadata_inner(
             statements,
             options,
             statement_metadata,
             None,
             false,
-        )
+        ))
         .await
     }
 
@@ -1757,7 +1855,13 @@ where
         LixError,
     > {
         let file_view_collector = acknowledge_file_views.then(sql2::SessionFileViews::default);
-        let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+        let active_branch_id = self
+            .active_branch_id_from_reader(&read_store)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.public_read.active_branch"
+            ))
+            .await?;
         if let Some(exact_filesystem_read) = exact_filesystem_read {
             let query = match exact_filesystem_read {
                 ExactFilesystemRead::RootFileListing => {
@@ -5161,6 +5265,123 @@ mod tests {
         assert_eq!(
             rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
             serde_json::json!({"nested": [1, true, "x"]})
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_replacement_publishes_packed_current_base_and_accepts_later_overlays() {
+        const ROW_COUNT: usize = 1_024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "packed_replacement_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": [
+                        "object", "array", "string", "number", "integer", "boolean", "null"
+                    ]
+                }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        let insert_sql =
+            "INSERT INTO packed_replacement_probe (path, value) VALUES ($1, lix_json($2))";
+        let inserts = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: insert_sql.to_string(),
+                params: vec![
+                    Value::Text(format!("/{row_index:04}")),
+                    Value::Text(format!(r#"{{"old":{row_index}}}"#)),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session.execute_batch(&inserts).await.unwrap();
+
+        crate::transaction::take_complete_replacement_packed_current_base_publications();
+        sql2::take_certified_generation_identity_replacements();
+        let update_sql = "UPDATE packed_replacement_probe SET value = lix_json($1) WHERE path = $2";
+        let updates = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: update_sql.to_string(),
+                params: vec![
+                    Value::Text(format!(r#"{{"updated":{row_index}}}"#)),
+                    Value::Text(format!("/{row_index:04}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let affected = session
+            .execute_batch(&updates)
+            .await
+            .unwrap()
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
+        assert_eq!(affected, ROW_COUNT as u64);
+        assert_eq!(
+            sql2::take_certified_generation_identity_replacements(),
+            1,
+            "the untouched packed generation must prove the complete identity set without a row scan"
+        );
+        assert_eq!(
+            crate::transaction::take_complete_replacement_packed_current_base_publications(),
+            1,
+            "the certified full replacement must publish one packed current base"
+        );
+
+        let rows = session
+            .execute(
+                "SELECT path, value FROM packed_replacement_probe WHERE path IN ('/0000', '/1023') ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!({"updated": 0})
+        );
+        assert_eq!(
+            rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!({"updated": 1023})
+        );
+
+        session
+            .execute(
+                "UPDATE packed_replacement_probe SET value = lix_json('{\"overlay\":true}') WHERE path = '/0000'",
+                &[],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "DELETE FROM packed_replacement_probe WHERE path = '/1023'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let rows = session
+            .execute(
+                "SELECT path, value FROM packed_replacement_probe WHERE path IN ('/0000', '/1023') ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.rows()[0].get::<String>("path").unwrap(), "/0000");
+        assert_eq!(
+            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!({"overlay": true})
         );
     }
 

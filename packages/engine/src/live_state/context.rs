@@ -5,6 +5,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::NullableKeyFilter;
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlContext};
+use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
@@ -25,9 +26,102 @@ use crate::tracked_state::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
+use std::mem::size_of;
 
 const BRANCH_READ_CONCURRENCY: usize = 8;
+const ENTITY_POINT_SNAPSHOT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const ENTITY_POINT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4_096;
 type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
+
+#[derive(Debug, PartialEq, Eq)]
+struct EntityPointSnapshotCacheKey {
+    branch_id: String,
+    generation: CommitId,
+    current_state_revision: u64,
+    schema_key: String,
+    entity_pk: EntityPk,
+}
+
+#[derive(Debug)]
+struct EntityPointSnapshotCacheEntry {
+    key: EntityPointSnapshotCacheKey,
+    snapshots: Vec<Option<Bytes>>,
+    bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct EntityPointSnapshotCache {
+    entries: std::sync::Mutex<Vec<EntityPointSnapshotCacheEntry>>,
+}
+
+impl EntityPointSnapshotCache {
+    fn get(&self, key: &EntityPointSnapshotCacheKey) -> Option<Vec<Option<Bytes>>> {
+        if entity_point_snapshot_cache_disabled_for_profile() {
+            return None;
+        }
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("entity point snapshot cache lock poisoned");
+        let position = entries.iter().position(|entry| entry.key == *key)?;
+        let entry = entries.remove(position);
+        let result = entry.snapshots.clone();
+        entries.push(entry);
+        Some(result)
+    }
+
+    fn insert(
+        &self,
+        key: EntityPointSnapshotCacheKey,
+        snapshots: Vec<Option<Bytes>>,
+    ) -> Vec<Option<Bytes>> {
+        if entity_point_snapshot_cache_disabled_for_profile() {
+            return snapshots;
+        }
+        let bytes = size_of::<EntityPointSnapshotCacheEntry>()
+            + key.branch_id.capacity()
+            + key.schema_key.capacity()
+            + snapshots.capacity() * size_of::<Option<Bytes>>()
+            + snapshots.iter().flatten().map(Bytes::len).sum::<usize>();
+        let result = snapshots.clone();
+        if bytes > ENTITY_POINT_SNAPSHOT_CACHE_MAX_BYTES {
+            return result;
+        }
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("entity point snapshot cache lock poisoned");
+        entries.retain(|entry| {
+            entry.key.branch_id != key.branch_id
+                || entry.key.schema_key != key.schema_key
+                || entry.key.entity_pk != key.entity_pk
+        });
+        entries.push(EntityPointSnapshotCacheEntry {
+            key,
+            snapshots,
+            bytes,
+        });
+        let mut resident_bytes = entries.iter().map(|entry| entry.bytes).sum::<usize>();
+        while resident_bytes > ENTITY_POINT_SNAPSHOT_CACHE_MAX_BYTES
+            || entries.len() > ENTITY_POINT_SNAPSHOT_CACHE_MAX_ENTRIES
+        {
+            resident_bytes = resident_bytes.saturating_sub(entries.remove(0).bytes);
+        }
+        result
+    }
+}
+
+#[cfg(feature = "storage-benches")]
+fn entity_point_snapshot_cache_disabled_for_profile() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED
+        .get_or_init(|| std::env::var_os("LIX_TRACKED_STATE_CRUD_DISABLE_POINT_CACHE").is_some())
+}
+
+#[cfg(not(feature = "storage-benches"))]
+const fn entity_point_snapshot_cache_disabled_for_profile() -> bool {
+    false
+}
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
@@ -42,6 +136,7 @@ pub(crate) struct LiveStateContext {
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
     entity_field_index_cache: std::sync::Arc<EntitySnapshotFieldIndexCache>,
+    entity_point_snapshot_cache: std::sync::Arc<EntityPointSnapshotCache>,
 }
 
 impl LiveStateContext {
@@ -54,6 +149,7 @@ impl LiveStateContext {
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
             entity_field_index_cache: std::sync::Arc::new(EntitySnapshotFieldIndexCache::default()),
+            entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
         }
     }
 
@@ -68,6 +164,7 @@ impl LiveStateContext {
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
             entity_field_index_cache: std::sync::Arc::clone(&self.entity_field_index_cache),
+            entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
         }
     }
 
@@ -89,6 +186,7 @@ pub(crate) struct LiveStateStoreReader<S> {
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
     entity_field_index_cache: std::sync::Arc<EntitySnapshotFieldIndexCache>,
+    entity_point_snapshot_cache: std::sync::Arc<EntityPointSnapshotCache>,
 }
 
 impl<S> LiveStateStoreReader<S>
@@ -110,18 +208,42 @@ where
         else {
             return Ok(None);
         };
-        Ok(Some(
-            self.tracked_head
-                .reader(&self.store)
-                .scan_entity_snapshots(
-                    &requested_branch_id,
-                    requested_control,
-                    &schema_key,
-                    &request.filter.entity_pks,
-                    request.limit,
-                )
-                .await?,
-        ))
+        let point_key = match (request.filter.entity_pks.as_slice(), request.limit) {
+            ([entity_pk], None | Some(1..)) => Some(EntityPointSnapshotCacheKey {
+                branch_id: requested_branch_id.clone(),
+                generation: requested_control.generation,
+                current_state_revision: requested_control.current_state_revision,
+                schema_key: schema_key.clone(),
+                entity_pk: entity_pk.clone(),
+            }),
+            _ => None,
+        };
+        if let Some(key) = point_key.as_ref()
+            && let Some(snapshots) = self.entity_point_snapshot_cache.get(key)
+        {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_entity_point_snapshot_cache_hit();
+            return Ok(Some(snapshots));
+        }
+        if point_key.is_some() {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_entity_point_snapshot_cache_miss();
+        }
+        let snapshots = self
+            .tracked_head
+            .reader(&self.store)
+            .scan_entity_snapshots(
+                &requested_branch_id,
+                requested_control,
+                &schema_key,
+                &request.filter.entity_pks,
+                request.limit,
+            )
+            .await?;
+        Ok(Some(match point_key {
+            Some(key) => self.entity_point_snapshot_cache.insert(key, snapshots),
+            None => snapshots,
+        }))
     }
 
     pub(crate) async fn scan_direct_entity_snapshots_by_string_field(

@@ -1,23 +1,31 @@
-use std::fmt::Write as _;
+use std::sync::Arc;
 
-use lix_engine::{Engine, ExecuteBatchStatement, ExecuteResult, SessionContext, Storage, Value};
+use lix_engine::{Engine, ExecuteResult, SessionContext, Storage, Value};
 
 #[cfg(feature = "slatedb")]
 use crate::storage::SlateDB;
 use crate::storage::{ProfileStorage, RocksDB, SQLite, StorageProfile};
-use crate::workload::{WorkloadRow, sql_string};
+use crate::workload::{UpdateWorkloadRow, WorkloadRow, sql_string};
 
-const SQL_CHUNK_SIZE: usize = 500;
 const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
 const BOUND_INSERT_ALL_SQL: &str = "INSERT INTO tracked_crud_insert (path, value) VALUES ($1, $2)";
+const BOUND_SEED_JSON_SQL: &str =
+    "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))";
 const BOUND_UPDATE_ALL_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
 const UNTRACKED_PROBE_PATH: &str = "/__lix_untracked_probe";
+type SharedParameterBatch = Arc<[Arc<[Value]>]>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UntrackedFixture {
     None,
     OneUnrelated,
     OneReadManyMember,
+}
+
+#[derive(Clone, Copy)]
+enum FixtureShape {
+    FullCrud,
+    BoundUpdate,
 }
 
 impl UntrackedFixture {
@@ -41,14 +49,14 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
     visible_row_count: usize,
     untracked_fixture: UntrackedFixture,
     read_many_by_pk_count: usize,
-    bound_insert_all_batch: Vec<ExecuteBatchStatement>,
-    seed_sql_chunks: Vec<String>,
+    bound_insert_all_batch: SharedParameterBatch,
+    bound_seed_json_batch: SharedParameterBatch,
     select_all_sql: String,
     select_many_by_pk_sql: String,
     select_one_by_pk_sql: String,
     update_one_by_pk_sql: String,
     update_all_sql_rows: Vec<String>,
-    bound_update_all_batch: Vec<ExecuteBatchStatement>,
+    bound_update_all_batch: SharedParameterBatch,
     delete_all_sql: String,
     delete_one_by_pk_sql: String,
     // Keep the storage path alive until after the session/storage is dropped.
@@ -67,6 +75,15 @@ pub(crate) async fn empty_fixture_with_read_many_pk_count(
     rows: &[WorkloadRow],
     read_many_by_pk_count: usize,
 ) -> SqlFixture {
+    empty_fixture_with_shape(profile, rows, read_many_by_pk_count, FixtureShape::FullCrud).await
+}
+
+async fn empty_fixture_with_shape(
+    profile: StorageProfile,
+    rows: &[WorkloadRow],
+    read_many_by_pk_count: usize,
+    shape: FixtureShape,
+) -> SqlFixture {
     assert!(
         (1..=rows.len()).contains(&read_many_by_pk_count),
         "read-many primary-key count must be between 1 and {}, got {read_many_by_pk_count}",
@@ -79,6 +96,7 @@ pub(crate) async fn empty_fixture_with_read_many_pk_count(
             rows,
             read_many_by_pk_count,
             untracked_fixture,
+            shape,
             dir,
         )),
         ProfileStorage::RocksDB { storage, _dir: dir } => SqlFixture::RocksDB(fixture_for_session(
@@ -86,6 +104,7 @@ pub(crate) async fn empty_fixture_with_read_many_pk_count(
             rows,
             read_many_by_pk_count,
             untracked_fixture,
+            shape,
             dir,
         )),
         #[cfg(feature = "slatedb")]
@@ -94,6 +113,7 @@ pub(crate) async fn empty_fixture_with_read_many_pk_count(
             rows,
             read_many_by_pk_count,
             untracked_fixture,
+            shape,
             dir,
         )),
     }
@@ -114,7 +134,55 @@ pub(crate) async fn seeded_fixture_with_read_many_pk_count(
     fixture
 }
 
+pub(crate) async fn seeded_bound_update_fixture_with_read_many_pk_count(
+    profile: StorageProfile,
+    rows: Vec<WorkloadRow>,
+    read_many_by_pk_count: usize,
+) -> SqlFixture {
+    let row_count = rows.len();
+    let mut fixture = empty_fixture_with_shape(
+        profile,
+        &rows,
+        read_many_by_pk_count,
+        FixtureShape::BoundUpdate,
+    )
+    .await;
+    fixture.install_bound_seed_batch(rows);
+    fixture.seed_json_rows().await;
+    fixture.insert_untracked_probe().await;
+    fixture.release_bound_update_setup();
+    fixture.install_bound_update_batch(crate::workload::fixture_update_rows(row_count));
+    fixture
+}
+
 impl SqlFixture {
+    fn release_bound_update_setup(&mut self) {
+        match self {
+            Self::SQLite(fixture) => fixture.release_bound_update_setup(),
+            Self::RocksDB(fixture) => fixture.release_bound_update_setup(),
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.release_bound_update_setup(),
+        }
+    }
+
+    fn install_bound_seed_batch(&mut self, rows: Vec<WorkloadRow>) {
+        match self {
+            Self::SQLite(fixture) => fixture.install_bound_seed_batch(rows),
+            Self::RocksDB(fixture) => fixture.install_bound_seed_batch(rows),
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.install_bound_seed_batch(rows),
+        }
+    }
+
+    fn install_bound_update_batch(&mut self, rows: Vec<UpdateWorkloadRow>) {
+        match self {
+            Self::SQLite(fixture) => fixture.install_bound_update_batch(rows),
+            Self::RocksDB(fixture) => fixture.install_bound_update_batch(rows),
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.install_bound_update_batch(rows),
+        }
+    }
+
     pub(crate) async fn insert_all(&self) -> usize {
         match self {
             Self::SQLite(fixture) => fixture.insert_all().await,
@@ -273,13 +341,43 @@ impl<StorageImpl> GenericSqlFixture<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    fn release_bound_update_setup(&mut self) {
+        self.bound_seed_json_batch = Arc::from([]);
+    }
+
+    fn install_bound_seed_batch(&mut self, rows: Vec<WorkloadRow>) {
+        self.bound_seed_json_batch = rows
+            .into_iter()
+            .take(self.row_count)
+            .map(|row| Arc::from(vec![Value::Text(row.path), Value::Text(row.value_json)]))
+            .collect::<Vec<_>>()
+            .into();
+    }
+
+    fn install_bound_update_batch(&mut self, rows: Vec<UpdateWorkloadRow>) {
+        self.bound_update_all_batch = rows
+            .into_iter()
+            .take(self.row_count)
+            .map(|row| {
+                Arc::from(vec![
+                    Value::Text(row.updated_value_json),
+                    Value::Text(row.path),
+                ])
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+
     #[expect(clippy::cast_possible_truncation)]
     async fn insert_all(&self) -> usize {
         let _ =
             lix_engine::storage_bench::take_certified_entity_insert_parameter_batch_executions();
         let affected = self
             .session
-            .execute_batch(&self.bound_insert_all_batch)
+            .execute_homogeneous_write_batch(
+                Arc::from(BOUND_INSERT_ALL_SQL),
+                Arc::clone(&self.bound_insert_all_batch),
+            )
             .await
             .expect("execute tracked-state CRUD bound insert batch")
             .iter()
@@ -295,11 +393,17 @@ where
     }
 
     async fn seed_json_rows(&self) {
-        let affected = Box::pin(execute_many_in_transaction(
-            &self.session,
-            &self.seed_sql_chunks,
-        ))
-        .await;
+        let affected = self
+            .session
+            .execute_homogeneous_write_batch(
+                Arc::from(BOUND_SEED_JSON_SQL),
+                Arc::clone(&self.bound_seed_json_batch),
+            )
+            .await
+            .expect("execute tracked-state CRUD generated JSON seed batch")
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
         assert_eq!(affected as usize, self.row_count);
     }
 
@@ -366,9 +470,14 @@ where
             "bound update row count must be between 1 and {}, got {row_count}",
             self.row_count
         );
+        let parameter_rows = if row_count == self.bound_update_all_batch.len() {
+            Arc::clone(&self.bound_update_all_batch)
+        } else {
+            Arc::from(self.bound_update_all_batch[..row_count].to_vec())
+        };
         let results = self
             .session
-            .execute_batch(&self.bound_update_all_batch[..row_count])
+            .execute_homogeneous_write_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_rows)
             .await
             .expect("execute tracked-state CRUD bound update batch");
         let affected = results
@@ -387,16 +496,18 @@ where
             self.row_count
         );
         let last = self.row_count - 1;
-        let batch = if row_count == 1 {
-            vec![self.bound_update_all_batch[0].clone()]
+        let parameter_rows = if row_count == 1 {
+            vec![Arc::clone(&self.bound_update_all_batch[0])]
         } else {
             (0..row_count)
-                .map(|index| self.bound_update_all_batch[index * last / (row_count - 1)].clone())
+                .map(|index| {
+                    Arc::clone(&self.bound_update_all_batch[index * last / (row_count - 1)])
+                })
                 .collect::<Vec<_>>()
         };
         let results = self
             .session
-            .execute_batch(&batch)
+            .execute_homogeneous_write_batch(Arc::from(BOUND_UPDATE_ALL_SQL), parameter_rows.into())
             .await
             .expect("execute spread tracked-state CRUD bound update batch");
         let affected = results
@@ -440,6 +551,7 @@ fn fixture_for_session<StorageImpl>(
     rows: &[WorkloadRow],
     read_many_by_pk_count: usize,
     untracked_fixture: UntrackedFixture,
+    shape: FixtureShape,
     dir: tempfile::TempDir,
 ) -> GenericSqlFixture<StorageImpl>
 where
@@ -459,20 +571,34 @@ where
         visible_row_count: tracked_rows.len() + usize::from(untracked_fixture.has_untracked_row()),
         untracked_fixture,
         read_many_by_pk_count,
-        bound_insert_all_batch: tracked_rows
-            .iter()
-            .map(|row| ExecuteBatchStatement {
-                sql: BOUND_INSERT_ALL_SQL.to_string(),
-                params: vec![
-                    Value::Text(row.path.clone()),
-                    Value::Text(row.value_json.clone()),
-                ],
-            })
-            .collect(),
-        seed_sql_chunks: tracked_rows
-            .chunks(SQL_CHUNK_SIZE)
-            .map(insert_json_rows_sql)
-            .collect(),
+        bound_insert_all_batch: if matches!(shape, FixtureShape::FullCrud) {
+            tracked_rows
+                .iter()
+                .map(|row| {
+                    Arc::from(vec![
+                        Value::Text(row.path.clone()),
+                        Value::Text(row.value_json.clone()),
+                    ])
+                })
+                .collect::<Vec<_>>()
+                .into()
+        } else {
+            Arc::from([])
+        },
+        bound_seed_json_batch: if matches!(shape, FixtureShape::FullCrud) {
+            tracked_rows
+                .iter()
+                .map(|row| {
+                    Arc::from(vec![
+                        Value::Text(row.path.clone()),
+                        Value::Text(row.value_json.clone()),
+                    ])
+                })
+                .collect::<Vec<_>>()
+                .into()
+        } else {
+            Arc::from([])
+        },
         select_all_sql: "SELECT path, value FROM json_pointer ORDER BY path".to_string(),
         select_many_by_pk_sql: select_many_by_pk_sql(
             rows,
@@ -481,17 +607,25 @@ where
         ),
         select_one_by_pk_sql: select_by_pk_sql(&tracked_rows[mid..][..1]),
         update_one_by_pk_sql: update_row_sql(&tracked_rows[mid]),
-        update_all_sql_rows: tracked_rows.iter().map(update_row_sql).collect(),
-        bound_update_all_batch: tracked_rows
-            .iter()
-            .map(|row| ExecuteBatchStatement {
-                sql: BOUND_UPDATE_ALL_SQL.to_string(),
-                params: vec![
-                    Value::Text(row.updated_value_json.clone()),
-                    Value::Text(row.path.clone()),
-                ],
-            })
-            .collect(),
+        update_all_sql_rows: if matches!(shape, FixtureShape::FullCrud) {
+            tracked_rows.iter().map(update_row_sql).collect()
+        } else {
+            Vec::new()
+        },
+        bound_update_all_batch: if matches!(shape, FixtureShape::FullCrud) {
+            tracked_rows
+                .iter()
+                .map(|row| {
+                    Arc::from(vec![
+                        Value::Text(row.updated_value_json.clone()),
+                        Value::Text(row.path.clone()),
+                    ])
+                })
+                .collect::<Vec<_>>()
+                .into()
+        } else {
+            Arc::from([])
+        },
         delete_all_sql: "DELETE FROM json_pointer".to_string(),
         delete_one_by_pk_sql: format!(
             "DELETE FROM json_pointer WHERE path = '{}'",
@@ -624,22 +758,6 @@ where
         .await
         .expect("commit tracked-state CRUD transaction");
     affected
-}
-
-fn insert_json_rows_sql(rows: &[WorkloadRow]) -> String {
-    let mut sql = String::from("INSERT INTO json_pointer (path, value) VALUES ");
-    for (index, row) in rows.iter().enumerate() {
-        if index > 0 {
-            sql.push(',');
-        }
-        let _ = write!(
-            sql,
-            "('{}', lix_json('{}'))",
-            sql_string(row.path.as_str()),
-            sql_string(row.value_json.as_str())
-        );
-    }
-    sql
 }
 
 fn select_by_pk_sql(rows: &[WorkloadRow]) -> String {

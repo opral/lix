@@ -1821,6 +1821,12 @@ impl<'a> CertifiedCsvReader<'a> {
 struct HotCollectionControl {
     active_generation: CommitId,
     live_count: u64,
+    ordered_identity_digest: Option<[u8; 32]>,
+}
+
+struct PackedCollectionIncrement {
+    live_count: u64,
+    ordered_identity_digest: Option<[u8; 32]>,
 }
 
 fn hot_collection_control_key(
@@ -1856,6 +1862,7 @@ async fn load_hot_collection_control(
         Ok(HotCollectionControl {
             active_generation: branch_generation,
             live_count: 0,
+            ordered_identity_digest: None,
         }),
         |value| {
             let StorageProjectedValue::FullValue(bytes) = value else {
@@ -1898,6 +1905,7 @@ async fn load_hot_collection_controls(
                 Ok(HotCollectionControl {
                     active_generation: branch_generation,
                     live_count: 0,
+                    ordered_identity_digest: None,
                 }),
                 |value| {
                     let StorageProjectedValue::FullValue(bytes) = value else {
@@ -2002,6 +2010,25 @@ fn stage_incremental_collection_controls(
             continue;
         }
 
+        // The compact digest certifies one untouched packed generation. Any
+        // row-shaped overlay invalidates it, including a value-only update;
+        // later complete-replacement proofs then use the ordinary exact scan.
+        for scope in [
+            Some((delta.schema_key.to_string(), None)),
+            delta
+                .file_id
+                .map(|file_id| (delta.schema_key.to_string(), Some(file_id.to_string()))),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let control = controls
+                .get_mut(&scope)
+                .expect("row collection scope was loaded above");
+            control.ordered_identity_digest = None;
+            dirty_scopes.insert(scope);
+        }
+
         let previous_live = previous
             .as_ref()
             .map(CertifiedCurrentStatePredecessor::view)
@@ -2062,6 +2089,7 @@ fn stage_incremental_collection_controls(
             .live_count
             .checked_add(*increment)
             .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
+        control.ordered_identity_digest = None;
         dirty_scopes.insert(scope.clone());
     }
 
@@ -2108,6 +2136,7 @@ fn apply_incremental_collection_generation_deltas(
             .commit_id
             .ok_or_else(|| head_value_error("tracked collection-generation row lacks commit_id"))?;
         control.live_count = 0;
+        control.ordered_identity_digest = None;
     }
     Ok(())
 }
@@ -2157,6 +2186,7 @@ fn stage_complete_collection_controls(
                 HotCollectionControl {
                     active_generation,
                     live_count: 0,
+                    ordered_identity_digest: None,
                 },
             );
             continue;
@@ -2166,6 +2196,7 @@ fn stage_complete_collection_controls(
             .or_insert(HotCollectionControl {
                 active_generation: branch_generation,
                 live_count: 0,
+                ordered_identity_digest: None,
             });
         if let Some(file_id) = &identity.file_id {
             controls
@@ -2173,6 +2204,7 @@ fn stage_complete_collection_controls(
                 .or_insert(HotCollectionControl {
                     active_generation: branch_generation,
                     live_count: 0,
+                    ordered_identity_digest: None,
                 });
         }
     }
@@ -2960,6 +2992,7 @@ where
                 |control| crate::collection_generation::CollectionGeneration {
                     active_generation: control.active_generation,
                     live_count: control.live_count,
+                    ordered_identity_digest: control.ordered_identity_digest,
                 },
             )
     }
@@ -3814,7 +3847,7 @@ where
             ));
         }
         let mut previous = None::<(&str, &EntityPk)>;
-        let mut schema_increments = BTreeMap::<&str, u64>::new();
+        let mut schema_rows = BTreeMap::<&str, Vec<&EntityPk>>::new();
         for (schema_key, entity_pk) in rows {
             if previous.is_some_and(|(previous_schema, previous_entity_pk)| {
                 previous_schema
@@ -3827,11 +3860,25 @@ where
                 ));
             }
             previous = Some((schema_key, entity_pk));
-            let increment = schema_increments.entry(schema_key).or_default();
-            *increment = increment
-                .checked_add(1)
-                .ok_or_else(|| head_value_error("packed current-base row count exceeds u64"))?;
+            schema_rows.entry(schema_key).or_default().push(entity_pk);
         }
+        let schema_increments = schema_rows
+            .into_iter()
+            .map(|(schema_key, entity_pks)| {
+                let live_count = u64::try_from(entity_pks.len())
+                    .map_err(|_| head_value_error("packed current-base row count exceeds u64"))?;
+                Ok((
+                    schema_key,
+                    PackedCollectionIncrement {
+                        live_count,
+                        ordered_identity_digest:
+                            crate::collection_generation::ordered_single_string_identity_digest(
+                                entity_pks,
+                            ),
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
         self.stage_packed_insert_current_base_manifest(
             branch_id,
             generation,
@@ -3841,6 +3888,75 @@ where
             coverage,
         )
         .await
+    }
+
+    /// Publishes a commit whose ordered deltas replace every live member of
+    /// one tracked, unfiled collection as a new packed base segment.
+    ///
+    /// The prior segments remain available for other schemas. Within this
+    /// schema every previous identity is covered by the newer commit, so the
+    /// normal newest-commit overlay makes the replacement complete without
+    /// reading and rewriting the previous HOT value plane.
+    pub(crate) async fn stage_complete_collection_replacement_current_base(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        new_head: CommitId,
+        schema_key: &str,
+        row_count: usize,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<CommitId, LixError> {
+        let row_count = u64::try_from(row_count)
+            .map_err(|_| head_value_error("packed replacement row count exceeds u64"))?;
+        if row_count == 0 {
+            return Err(head_value_error(
+                "packed collection replacement requires at least one row",
+            ));
+        }
+        let control = load_hot_collection_control(
+            self.store,
+            branch_id,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: None,
+            },
+        )
+        .await?;
+        if control.live_count != row_count {
+            return Err(head_value_error(format!(
+                "packed collection replacement expected {row_count} live rows in '{schema_key}', found {}",
+                control.live_count
+            )));
+        }
+
+        let mut manifest_key = hot_scope_prefix(branch_id, generation);
+        manifest_key.reserve(16);
+        manifest_key.extend_from_slice(new_head.as_uuid().as_bytes());
+        if working_diff_capture_checkpoint_commit_id.is_some() {
+            coverage
+                .add_encoded_group_key(&manifest_key)
+                .ok_or_else(|| head_value_error("packed current-base diff count exceeds u64"))?;
+        }
+        self.writes.put(
+            PACKED_CURRENT_BASE_SPACE,
+            StorageKey(Bytes::from(manifest_key)),
+            StorageValue {
+                bytes: working_diff_capture_checkpoint_commit_id.map_or_else(
+                    || Bytes::from_static(&[0; 16]),
+                    |checkpoint| Bytes::copy_from_slice(checkpoint.as_uuid().as_bytes()),
+                ),
+            },
+        );
+        self.writes.put(
+            PACKED_CURRENT_BASE_CONTROL_SPACE,
+            StorageKey(Bytes::from(hot_scope_prefix(branch_id, generation))),
+            StorageValue {
+                bytes: Bytes::from_static(&[1]),
+            },
+        );
+        Ok(generation)
     }
 
     /// Publishes validated, tracked, unfiled creates as an immutable base.
@@ -3901,13 +4017,30 @@ where
             ));
         }
 
-        let mut schema_increments = BTreeMap::<&str, u64>::new();
+        let mut schema_rows = BTreeMap::<&str, Vec<&EntityPk>>::new();
         for delta in &sorted {
-            let increment = schema_increments.entry(delta.schema_key).or_default();
-            *increment = increment
-                .checked_add(1)
-                .ok_or_else(|| head_value_error("packed current-base row count exceeds u64"))?;
+            schema_rows
+                .entry(delta.schema_key)
+                .or_default()
+                .push(delta.entity_pk);
         }
+        let schema_increments = schema_rows
+            .into_iter()
+            .map(|(schema_key, entity_pks)| {
+                let live_count = u64::try_from(entity_pks.len())
+                    .map_err(|_| head_value_error("packed current-base row count exceeds u64"))?;
+                Ok((
+                    schema_key,
+                    PackedCollectionIncrement {
+                        live_count,
+                        ordered_identity_digest:
+                            crate::collection_generation::ordered_single_string_identity_digest(
+                                entity_pks,
+                            ),
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
         self.stage_packed_insert_current_base_manifest(
             branch_id,
             generation,
@@ -3924,7 +4057,7 @@ where
         branch_id: &str,
         generation: CommitId,
         new_head: CommitId,
-        schema_increments: BTreeMap<&str, u64>,
+        schema_increments: BTreeMap<&str, PackedCollectionIncrement>,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
@@ -3949,10 +4082,16 @@ where
         let controls =
             load_hot_collection_controls(self.store, branch_id, generation, &scopes).await?;
         for ((schema_key, increment), mut control) in schema_increments.into_iter().zip(controls) {
+            let was_empty = control.live_count == 0;
             control.live_count = control
                 .live_count
-                .checked_add(increment)
+                .checked_add(increment.live_count)
                 .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
+            control.ordered_identity_digest = if was_empty {
+                increment.ordered_identity_digest
+            } else {
+                None
+            };
             stage_hot_collection_control(
                 self.writes,
                 branch_id,

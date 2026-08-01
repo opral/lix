@@ -12,6 +12,11 @@ pub(crate) struct WorkloadRow {
     pub(crate) updated_value_json: String,
 }
 
+pub(crate) struct UpdateWorkloadRow {
+    pub(crate) path: String,
+    pub(crate) updated_value_json: String,
+}
+
 pub(crate) fn fixture_rows(row_count: usize) -> Vec<WorkloadRow> {
     assert!(row_count > 0, "tracked-state CRUD fixture cannot be empty");
     let json: JsonValue = serde_json::from_str(PNPM_LOCK_JSON).expect("parse pnpm-lock fixture");
@@ -43,6 +48,32 @@ pub(crate) fn fixture_rows(row_count: usize) -> Vec<WorkloadRow> {
     rows
 }
 
+/// Regenerates only the columns retained by the bound-update parameter page.
+/// Keeping the seed-only JSON out of this second generation makes process RSS
+/// measure the engine and the active input page, rather than dead fixture data.
+pub(crate) fn fixture_update_rows(row_count: usize) -> Vec<UpdateWorkloadRow> {
+    assert!(row_count > 0, "tracked-state CRUD fixture cannot be empty");
+    let json: JsonValue = serde_json::from_str(PNPM_LOCK_JSON).expect("parse pnpm-lock fixture");
+    let mut rows = Vec::new();
+    flatten_update_json("", &json, &mut rows);
+    rows.sort_by(|left, right| left.path.cmp(&right.path));
+    assert!(rows.len() >= REAL_WORKLOAD_ROWS);
+    if row_count <= rows.len() {
+        rows.truncate(row_count);
+        return rows;
+    }
+
+    rows.reserve(row_count - rows.len());
+    for ordinal in rows.len()..row_count {
+        rows.push(UpdateWorkloadRow {
+            path: format!("/~lix-scale/{ordinal:09}"),
+            updated_value_json: format!(r#"{{"ordinal":{ordinal},"lane":"scale","updated":true}}"#),
+        });
+    }
+    rows.sort_by(|left, right| left.path.cmp(&right.path));
+    rows
+}
+
 fn flatten_json(path: &str, value: &JsonValue, rows: &mut Vec<WorkloadRow>) {
     if !path.is_empty() {
         let value_json = serde_json::to_string(value).expect("serialize JSON pointer value");
@@ -68,6 +99,34 @@ fn flatten_json(path: &str, value: &JsonValue, rows: &mut Vec<WorkloadRow>) {
         JsonValue::Object(map) => {
             for (key, item) in map {
                 flatten_json(&format!("{path}/{}", escape_json_pointer(key)), item, rows);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn flatten_update_json(path: &str, value: &JsonValue, rows: &mut Vec<UpdateWorkloadRow>) {
+    if !path.is_empty() {
+        rows.push(UpdateWorkloadRow {
+            path: path.to_string(),
+            updated_value_json: serde_json::to_string(&serde_json::json!({
+                "path": path,
+                "value": value,
+                "updated": true
+            }))
+            .expect("serialize updated JSON pointer value"),
+        });
+    }
+
+    match value {
+        JsonValue::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                flatten_update_json(&format!("{path}/{index}"), item, rows);
+            }
+        }
+        JsonValue::Object(map) => {
+            for (key, item) in map {
+                flatten_update_json(&format!("{path}/{}", escape_json_pointer(key)), item, rows);
             }
         }
         _ => {}
