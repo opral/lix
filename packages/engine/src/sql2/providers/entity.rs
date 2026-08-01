@@ -2233,6 +2233,7 @@ mod tests {
             "lix_derived_file_ref",
             "lix_change",
             "lix_checkpoint_marker",
+            "lix_undo_redo_marker",
             "lix_collection_generation",
             "lix_directory_descriptor",
             "lix_file_descriptor",

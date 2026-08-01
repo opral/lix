@@ -151,6 +151,18 @@ export type CreateCheckpointReceipt = {
 	commitId: string;
 };
 
+export type UndoReceipt = {
+	branchId: string;
+	targetCommitId: string;
+	inverseCommitId: string;
+};
+
+export type RedoReceipt = {
+	branchId: string;
+	targetCommitId: string;
+	replayCommitId: string;
+};
+
 export type SwitchBranchOptions = {
 	branchId: string;
 };

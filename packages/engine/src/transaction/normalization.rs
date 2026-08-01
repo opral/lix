@@ -300,6 +300,7 @@ fn ensure_internal_control_schema(
     let internal = matches!(
         row.schema_key.as_str(),
         crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
+            | crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
             | crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
     );
     if !internal || schema_catalog.snapshot().schema(&row.schema_key).is_some() {

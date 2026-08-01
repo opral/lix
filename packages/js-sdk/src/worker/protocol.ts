@@ -48,6 +48,8 @@ export type WorkerOperation =
 	| { kind: "clientState.delete"; key: string }
 	| { kind: "createBranch"; options: CreateBranchOptions }
 	| { kind: "createCheckpoint" }
+	| { kind: "undo" }
+	| { kind: "redo" }
 	| { kind: "switchBranch"; options: SwitchBranchOptions }
 	| { kind: "mergeBranchPreview"; options: MergeBranchOptions }
 	| { kind: "mergeBranch"; options: MergeBranchOptions }

@@ -1231,6 +1231,15 @@ where
         diff_commits(self, left_commit_id, right_commit_id, request).await
     }
 
+    /// Loads the identities and index values authored or selected by exactly
+    /// one commit, without resolving inherited tracked state.
+    pub(crate) async fn commit_delta_members(
+        &mut self,
+        commit_id: CommitId,
+    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+        storage::scan_commit_delta_members(&self.store, commit_id).await
+    }
+
     /// True only for the sparse immutable checkpoints. A false result does
     /// not mean the commit is unreadable: ordinary v4 commits replay their
     /// first-parent changelog interval on the cold historical path.

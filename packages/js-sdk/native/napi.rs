@@ -6,9 +6,9 @@ use lix_sdk::{
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
-    ObserveEvents as RsObserveEvents, OpenLixOptions as RsOpenLixOptions, SQLite, SQLiteOptions,
-    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, TelemetrySink, Value,
-    open_lix, open_lix_with_telemetry,
+    ObserveEvents as RsObserveEvents, OpenLixOptions as RsOpenLixOptions, RedoReceipt, SQLite,
+    SQLiteOptions, SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt,
+    TelemetrySink, UndoReceipt, Value, open_lix, open_lix_with_telemetry,
 };
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
@@ -108,6 +108,8 @@ type NativeTransactionDeferred = NativeDeferred<NativeLixTransaction>;
 type NativeStringDeferred = NativeDeferred<String>;
 type NativeCreateBranchDeferred = NativeDeferred<CreateBranchReceiptDto>;
 type NativeCreateCheckpointDeferred = NativeDeferred<CreateCheckpointReceiptDto>;
+type NativeUndoDeferred = NativeDeferred<UndoReceiptDto>;
+type NativeRedoDeferred = NativeDeferred<RedoReceiptDto>;
 type NativeSwitchBranchDeferred = NativeDeferred<SwitchBranchReceiptDto>;
 type NativeMergePreviewDeferred = NativeDeferred<MergeBranchPreviewDto>;
 type NativeMergeReceiptDeferred = NativeDeferred<MergeBranchReceiptDto>;
@@ -136,6 +138,8 @@ enum LixCommand {
         deferred: NativeCreateBranchDeferred,
     },
     CreateCheckpoint(NativeCreateCheckpointDeferred),
+    Undo(NativeUndoDeferred),
+    Redo(NativeRedoDeferred),
     SwitchBranch {
         options: RsSwitchBranchOptions,
         deferred: NativeSwitchBranchDeferred,
@@ -301,6 +305,8 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std:
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateCheckpoint(deferred) => deferred.reject(to_napi_error(&error)),
+            LixCommand::Undo(deferred) => deferred.reject(to_napi_error(&error)),
+            LixCommand::Redo(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::SwitchBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::MergeBranchPreview { deferred, .. } => {
                 deferred.reject(to_napi_error(&error));
@@ -387,6 +393,16 @@ fn handle_lix_command(
             let result = rt
                 .block_on(state.lix.create_checkpoint())
                 .map(CreateCheckpointReceiptDto::from);
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::Undo(deferred) => {
+            let result = rt.block_on(state.lix.undo()).map(UndoReceiptDto::from);
+            settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::Redo(deferred) => {
+            let result = rt.block_on(state.lix.redo()).map(RedoReceiptDto::from);
             settle_deferred(deferred, result);
             false
         }
@@ -512,6 +528,8 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::CreateCheckpoint(deferred) => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
+        LixCommand::Undo(deferred) => settle_deferred(deferred, Err(lix_closed_error())),
+        LixCommand::Redo(deferred) => settle_deferred(deferred, Err(lix_closed_error())),
         LixCommand::SwitchBranch { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -623,6 +641,22 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.create_checkpoint().await,
             Self::SQLite(lix) => lix.create_checkpoint().await,
             Self::LocalFilesystem(lix, _) => lix.create_checkpoint().await,
+        }
+    }
+
+    async fn undo(&self) -> std::result::Result<UndoReceipt, LixError> {
+        match self {
+            Self::Memory(lix) => lix.undo().await,
+            Self::SQLite(lix) => lix.undo().await,
+            Self::LocalFilesystem(lix, _) => lix.undo().await,
+        }
+    }
+
+    async fn redo(&self) -> std::result::Result<RedoReceipt, LixError> {
+        match self {
+            Self::Memory(lix) => lix.redo().await,
+            Self::SQLite(lix) => lix.redo().await,
+            Self::LocalFilesystem(lix, _) => lix.redo().await,
         }
     }
 
@@ -1046,6 +1080,20 @@ impl NativeLix {
             env.create_deferred()?;
         self.actor
             .send_with_deferred(deferred, LixCommand::CreateCheckpoint);
+        Ok(promise)
+    }
+
+    #[napi(js_name = "undo")]
+    pub fn undo<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeUndoDeferred, Object<'env>) = env.create_deferred()?;
+        self.actor.send_with_deferred(deferred, LixCommand::Undo);
+        Ok(promise)
+    }
+
+    #[napi(js_name = "redo")]
+    pub fn redo<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeRedoDeferred, Object<'env>) = env.create_deferred()?;
+        self.actor.send_with_deferred(deferred, LixCommand::Redo);
         Ok(promise)
     }
 
@@ -1521,6 +1569,40 @@ impl From<CreateCheckpointReceipt> for CreateCheckpointReceiptDto {
     fn from(receipt: CreateCheckpointReceipt) -> Self {
         Self {
             commit_id: receipt.commit_id,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct UndoReceiptDto {
+    pub branch_id: String,
+    pub target_commit_id: String,
+    pub inverse_commit_id: String,
+}
+
+impl From<UndoReceipt> for UndoReceiptDto {
+    fn from(receipt: UndoReceipt) -> Self {
+        Self {
+            branch_id: receipt.branch_id,
+            target_commit_id: receipt.target_commit_id,
+            inverse_commit_id: receipt.inverse_commit_id,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct RedoReceiptDto {
+    pub branch_id: String,
+    pub target_commit_id: String,
+    pub replay_commit_id: String,
+}
+
+impl From<RedoReceipt> for RedoReceiptDto {
+    fn from(receipt: RedoReceipt) -> Self {
+        Self {
+            branch_id: receipt.branch_id,
+            target_commit_id: receipt.target_commit_id,
+            replay_commit_id: receipt.replay_commit_id,
         }
     }
 }

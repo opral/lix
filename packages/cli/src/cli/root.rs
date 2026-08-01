@@ -82,12 +82,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_undo_command_version_flag() {
+    fn parses_undo_command_branch_flag() {
         let cli =
-            Cli::try_parse_from(["lix", "undo", "--version", "branch-1"]).expect("parse succeeds");
+            Cli::try_parse_from(["lix", "undo", "--branch", "branch-1"]).expect("parse succeeds");
         match cli.command {
             Some(Command::Undo(command)) => {
-                assert_eq!(command.version.as_deref(), Some("branch-1"));
+                assert_eq!(command.branch.as_deref(), Some("branch-1"));
             }
             _ => panic!("expected undo command"),
         }
@@ -97,7 +97,7 @@ mod tests {
     fn parses_redo_command_without_version() {
         let cli = Cli::try_parse_from(["lix", "redo"]).expect("parse succeeds");
         match cli.command {
-            Some(Command::Redo(command)) => assert_eq!(command.version, None),
+            Some(Command::Redo(command)) => assert_eq!(command.branch, None),
             _ => panic!("expected redo command"),
         }
     }

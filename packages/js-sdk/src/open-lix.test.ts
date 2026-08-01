@@ -198,6 +198,32 @@ test("createCheckpoint returns the new active head through the local worker", as
 	await lix.close();
 });
 
+test("undo and redo roundtrip tracked state through the local worker", async () => {
+	const lix = await openLix();
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+		["undo-test", "present"],
+	);
+
+	const undone = await lix.undo();
+	expect(undone.branchId).toBe(await lix.activeBranchId());
+	expect(undone.inverseCommitId).not.toBe(undone.targetCommitId);
+	let result = await lix.execute(
+		"SELECT value FROM lix_key_value WHERE key = $1",
+		["undo-test"],
+	);
+	expect(result.rows).toHaveLength(0);
+
+	const redone = await lix.redo();
+	expect(redone.targetCommitId).toBe(undone.targetCommitId);
+	result = await lix.execute(
+		"SELECT value FROM lix_key_value WHERE key = $1",
+		["undo-test"],
+	);
+	expect(get(result, "value")).toBe("present");
+	await lix.close();
+});
+
 test("execute and executeBatch expose registered-entity RETURNING postimages", async () => {
 	const lix = await openLix();
 	await registerCrmTaskSchema(lix);

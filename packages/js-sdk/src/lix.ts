@@ -18,6 +18,7 @@ import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
 	CreateCheckpointReceipt,
+	RedoReceipt,
 	ExecuteOptions,
 	ExecuteResult,
 	LixBatchOptions,
@@ -30,6 +31,7 @@ import type {
 	SqlParam,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
+	UndoReceipt,
 } from "./types.js";
 
 const transactionFinalizer = new FinalizationRegistry<{
@@ -174,6 +176,14 @@ export class Lix {
 
 	async createCheckpoint(): Promise<CreateCheckpointReceipt> {
 		return this.#runOperation(() => this.binding.createCheckpoint());
+	}
+
+	async undo(): Promise<UndoReceipt> {
+		return this.#runOperation(() => this.binding.undo());
+	}
+
+	async redo(): Promise<RedoReceipt> {
+		return this.#runOperation(() => this.binding.redo());
 	}
 
 	async switchBranch(

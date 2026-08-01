@@ -1188,6 +1188,8 @@ where
             )
             .route("/lix/v1/branch/create", post(create_branch::<S>))
             .route("/lix/v1/checkpoint/create", post(create_checkpoint::<S>))
+            .route("/lix/v1/undo", post(undo::<S>))
+            .route("/lix/v1/redo", post(redo::<S>))
             .route("/lix/v1/branch/switch", post(switch_branch::<S>))
             .route("/lix/v1/observe", post(observe::<S>))
             .route("/lix/v1/observe/multiplex", post(observe_multiplex::<S>))
@@ -2265,6 +2267,38 @@ where
     }))
 }
 
+async fn undo<S>(
+    Extension(lease): Extension<SessionLease<S>>,
+) -> Result<Json<UndoResponse>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let receipt = lease
+        .run(move |lix| async move { lix.undo().await })
+        .await?;
+    Ok(Json(UndoResponse {
+        branch_id: receipt.branch_id,
+        target_commit_id: receipt.target_commit_id,
+        inverse_commit_id: receipt.inverse_commit_id,
+    }))
+}
+
+async fn redo<S>(
+    Extension(lease): Extension<SessionLease<S>>,
+) -> Result<Json<RedoResponse>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let receipt = lease
+        .run(move |lix| async move { lix.redo().await })
+        .await?;
+    Ok(Json(RedoResponse {
+        branch_id: receipt.branch_id,
+        target_commit_id: receipt.target_commit_id,
+        replay_commit_id: receipt.replay_commit_id,
+    }))
+}
+
 async fn switch_branch<S>(
     Extension(lease): Extension<SessionLease<S>>,
     Json(request): Json<SwitchBranchRequest>,
@@ -3316,6 +3350,22 @@ struct CreateBranchResponse {
 #[serde(rename_all = "camelCase")]
 struct CreateCheckpointResponse {
     commit_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UndoResponse {
+    branch_id: String,
+    target_commit_id: String,
+    inverse_commit_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RedoResponse {
+    branch_id: String,
+    target_commit_id: String,
+    replay_commit_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6667,6 +6717,37 @@ mod tests {
             response_json(head).await["rows"][0][0],
             json!({ "kind": "text", "value": checkpoint_id })
         );
+    }
+
+    #[tokio::test]
+    async fn undo_and_redo_mutate_the_pinned_branch() {
+        let app = app().await;
+        let (session_id, handshake) = new_session(&app.router).await;
+        let inserted = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('remote-undo', 'yes')"
+            })),
+        )
+        .await;
+        assert_eq!(inserted.status(), StatusCode::OK);
+
+        let undone = request(&app.router, "POST", "/lix/v1/undo", Some(&session_id), None).await;
+        assert_eq!(undone.status(), StatusCode::OK);
+        let undone = response_json(undone).await;
+        assert_eq!(undone["branchId"], handshake["activeBranchId"]);
+        assert!(undone["targetCommitId"].is_string());
+        assert!(undone["inverseCommitId"].is_string());
+
+        let redone = request(&app.router, "POST", "/lix/v1/redo", Some(&session_id), None).await;
+        assert_eq!(redone.status(), StatusCode::OK);
+        let redone = response_json(redone).await;
+        assert_eq!(redone["branchId"], handshake["activeBranchId"]);
+        assert_eq!(redone["targetCommitId"], undone["targetCommitId"]);
+        assert!(redone["replayCommitId"].is_string());
     }
 
     #[tokio::test]

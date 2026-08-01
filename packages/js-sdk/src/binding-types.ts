@@ -2,6 +2,8 @@ import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
 	CreateCheckpointReceipt,
+	UndoReceipt,
+	RedoReceipt,
 	ExecuteOptions,
 	LixBatchOptions,
 	MergeBranchOptions,
@@ -57,6 +59,8 @@ export type LixBinding = {
 	clientStateDelete?(key: string): Promise<void>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;
 	createCheckpoint(): Promise<CreateCheckpointReceipt>;
+	undo(): Promise<UndoReceipt>;
+	redo(): Promise<RedoReceipt>;
 	switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchReceipt>;
 	importFilesystemPaths(paths: string[]): Promise<void>;
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;
