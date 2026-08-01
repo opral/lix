@@ -40,6 +40,7 @@ use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{CertifiedHistoryStoreReader, Transaction, open_transaction};
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
+use crate::transaction::CommitCoordinator;
 
 pub(crate) const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 
@@ -142,6 +143,7 @@ pub struct SessionContext<StorageImpl: Storage = Memory> {
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     pub(super) deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     pub(super) collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(super) commit_coordinator: Arc<CommitCoordinator>,
     pub(super) file_views: SessionFileViews,
     pub(super) observe_coordinator: Arc<ObserveCoordinator>,
     pub(super) observe_invalidation: Arc<ObserveInvalidation>,
@@ -164,6 +166,7 @@ where
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
+        commit_coordinator: Arc<CommitCoordinator>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
@@ -188,6 +191,7 @@ where
             sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
+            commit_coordinator,
             observe_coordinator,
             observe_invalidation,
             plugin_host,
@@ -206,6 +210,7 @@ where
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
+        commit_coordinator: Arc<CommitCoordinator>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
@@ -224,6 +229,7 @@ where
             sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
+            commit_coordinator,
             observe_coordinator,
             observe_invalidation,
             plugin_host,
@@ -242,6 +248,7 @@ where
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
+        commit_coordinator: Arc<CommitCoordinator>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
@@ -258,6 +265,7 @@ where
             sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
+            commit_coordinator,
             observe_coordinator,
             observe_invalidation,
             plugin_host,
@@ -278,6 +286,7 @@ where
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
+        commit_coordinator: Arc<CommitCoordinator>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
@@ -296,6 +305,7 @@ where
             sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
+            commit_coordinator,
             file_views,
             observe_coordinator,
             observe_invalidation,

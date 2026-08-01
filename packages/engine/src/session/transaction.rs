@@ -18,6 +18,7 @@ use crate::transaction::{
 
 use super::SessionContext;
 use super::context::{SessionWriteAccess, closed_error};
+use crate::transaction::CommitCoordinator;
 
 #[expect(missing_debug_implementations)]
 pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
@@ -28,7 +29,7 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     _deterministic_runtime_guard: Option<DeterministicRuntimeGuard>,
     write_access: Option<SessionWriteAccess>,
-    collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
+    commit_coordinator: Arc<CommitCoordinator>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) has_started_statement: bool,
 }
@@ -86,7 +87,7 @@ where
             sql_planning_cache: Arc::clone(&self.sql_planning_cache),
             _deterministic_runtime_guard: deterministic_runtime_guard,
             write_access: Some(write_access),
-            collaboration_write_gate: Arc::clone(&self.collaboration_write_gate),
+            commit_coordinator: Arc::clone(&self.commit_coordinator),
             telemetry: self.telemetry.clone(),
             has_started_statement: false,
         })
@@ -118,25 +119,22 @@ where
         // their commit-time revalidation and persistence with bounded writes.
         // Deterministic transactions already retain this gate to preserve the
         // global lock order with their deterministic-runtime guard.
-        let _collaboration_write_guard = if self
+        let already_serialized = self
             .write_access
             .as_ref()
-            .is_some_and(SessionWriteAccess::serializes_collaboration_writes)
-        {
-            None
-        } else {
-            Some(
-                Arc::clone(&self.collaboration_write_gate)
-                    .lock_owned()
-                    .await,
-            )
-        };
+            .is_some_and(SessionWriteAccess::serializes_collaboration_writes);
         let operation_guard = self.begin_session_commit_operation()?;
         let transaction = self
             .transaction
             .take()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
-        let result = transaction.commit(&self.runtime_functions).await;
+        let result = if already_serialized {
+            transaction.commit(&self.runtime_functions).await
+        } else {
+            self.commit_coordinator
+                .commit(transaction, self.runtime_functions)
+                .await
+        };
         drop(operation_guard);
         let outcome = result?;
         drop(self.write_access.take());

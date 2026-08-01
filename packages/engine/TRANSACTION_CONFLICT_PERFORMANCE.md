@@ -67,6 +67,26 @@ reference format: JSON 16.201 ms p95, CSV 16.415 ms, Markdown 24.990 ms, and
 text 12.167 ms. Each run retained the exact 10% semantic-overlap workload and
 reported five resolver calls across twenty waves.
 
+## Bounded commit admission
+
+Explicit transaction commits previously contended directly on one Tokio mutex.
+That queue had no engine-owned bound, reacquired the collaboration gate for
+every transaction, and let task-local benchmark clocks start only after a task
+was polled, which could omit mutex queue time. A private FIFO coordinator now
+applies backpressure at 256 queued commits and drains at most 16 commits under
+one gate acquisition. Each transaction still revalidates, resolves, persists,
+and reports its own deterministic result; this is admission batching, not a
+change to atomicity or durability.
+
+This maintainability cut is throughput-neutral by design. On eight release
+runs of the 100-writer, 100%-overlap B3.1 stress fixture, whole-cohort p50 moved
+from 150.612 ms to 151.588 ms (+0.65%, within run variance). The corrected
+request timer now includes queue residence and reports 157.627 ms p95 for that
+pathological same-scalar workload, making the remaining serialization visible
+instead of presenting the old 1.983 ms undercount. On the practical 100-client,
+10%-overlap capacity workload, convergence p95 moved from 16.201 ms to
+16.420 ms and remains far below the 100 ms gate.
+
 ## Reproduction
 
 ```bash
@@ -78,6 +98,10 @@ cargo test -p lix_engine --release \
 
 cargo test -p lix_sdk_tests --release --test e2e \
   stale_plugin_replay_batch_benchmark_probe -- --ignored --nocapture
+
+LIX_CRDT_B3_CLIENTS=100 LIX_CRDT_SAMPLES=8 \
+cargo test -p lix_sdk_tests --release --test crdt_benchmarks_baseline \
+  crdt_benchmarks_b3_1_json_concurrent_map_sets -- --ignored --exact --nocapture
 ```
 
 The probes emit versioned machine-readable records or stable key/value output
