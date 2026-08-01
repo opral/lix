@@ -5898,6 +5898,60 @@ async fn same_base_json_transactions_resolve_overlap_and_converge() {
 }
 
 #[tokio::test]
+async fn same_base_json_file_edits_compose_disjoint_semantics_without_resolution() {
+    let archive = build_json_plugin_archive();
+    let first = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &first,
+        "plugin_json",
+        &archive,
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/disjoint-file-transactions.json";
+    write_file(&first, path, b"{\"a\":\"base\",\"b\":\"base\"}\n".to_vec())
+        .await
+        .unwrap();
+    let second = first.open_workspace_session().await.unwrap();
+    let mut first_transaction = first.begin_transaction().await.unwrap();
+    let mut second_transaction = second.begin_transaction().await.unwrap();
+    first_transaction
+        .execute(
+            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            &[
+                Value::Blob(b"{\"a\":\"first\",\"b\":\"base\"}\n".to_vec().into()),
+                Value::Text(path.to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+    second_transaction
+        .execute(
+            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            &[
+                Value::Blob(b"{\"a\":\"base\",\"b\":\"second\"}\n".to_vec().into()),
+                Value::Text(path.to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+
+    first.reset_plugin_transition_counters();
+    first_transaction.commit().await.unwrap();
+    second_transaction.commit().await.unwrap();
+    assert_eq!(
+        first.plugin_transition_counters().conflict_resolution_calls,
+        0
+    );
+    let bytes = read_file(&first, path).await.unwrap().unwrap();
+    let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(document, serde_json::json!({ "a": "first", "b": "second" }));
+    assert_eq!(read_file(&second, path).await.unwrap(), Some(bytes));
+    second.close().await.unwrap();
+    first.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn stale_json_transaction_renders_retained_same_file_edits_with_resolutions() {
     let archive = build_json_plugin_archive();
     let stale_client = open_lix(OpenLixOptions::default()).await.unwrap();

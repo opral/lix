@@ -35,6 +35,7 @@ sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 criterion = { package = "codspeed-criterion-compat", version = "4" }
 flate2 = "1"
 futures-util = "0.3"

@@ -1,0 +1,624 @@
+//! Client-observed real-time collaboration capacity workload.
+//!
+//! The ignored release-mode benchmark models 50-100 active collaborators on
+//! one hot document. Transactions arrive in five-edit waves. Four edits commit
+//! concurrently and a fifth same-base marker edit closes the wave. Every live
+//! client must observe that marker before the wave has converged.
+
+use std::fs;
+use std::io::{Cursor, Write};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use lix_sdk::{Lix, OpenLixOptions, Storage, Value, open_lix};
+
+const DEFAULT_CLIENTS: usize = 100;
+const WAVE_SIZE: usize = 5;
+const CONFLICT_WAVE_INTERVAL: usize = 4;
+const DEFAULT_ARRIVAL_INTERVAL: Duration = Duration::from_millis(50);
+const DEFAULT_GATE: Duration = Duration::from_millis(100);
+const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_SOAK_ROUNDS: usize = 10;
+const DEFAULT_RSS_GROWTH_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+enum DocumentFormat {
+    Json,
+    Csv,
+    Markdown,
+    Text,
+}
+
+impl DocumentFormat {
+    fn from_env() -> Self {
+        match std::env::var("LIX_COLLAB_FORMAT")
+            .unwrap_or_else(|_| "json".to_owned())
+            .as_str()
+        {
+            "json" => Self::Json,
+            "csv" => Self::Csv,
+            "markdown" | "md" => Self::Markdown,
+            "text" | "txt" => Self::Text,
+            value => panic!("unsupported LIX_COLLAB_FORMAT {value:?}"),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Csv => "csv",
+            Self::Markdown => "markdown",
+            Self::Text => "text",
+        }
+    }
+
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Csv => "csv",
+            Self::Markdown => "md",
+            Self::Text => "txt",
+        }
+    }
+
+    const fn plugin_key(self) -> &'static str {
+        match self {
+            Self::Json => "plugin_json",
+            Self::Csv => "plugin_csv",
+            Self::Markdown => "plugin_markdown",
+            Self::Text => "plugin_git_text",
+        }
+    }
+
+    fn plugin_archive(self) -> Vec<u8> {
+        match self {
+            Self::Json => build_json_plugin_archive(),
+            Self::Csv => build_csv_plugin_archive(),
+            Self::Markdown => build_markdown_plugin_archive(),
+            Self::Text => build_text_plugin_archive(),
+        }
+    }
+
+    fn base_document(self, slots: usize) -> Vec<u8> {
+        match self {
+            Self::Json => {
+                let object = (0..slots)
+                    .map(|slot| (format!("k{slot}"), serde_json::Value::String("base".into())))
+                    .collect::<serde_json::Map<_, _>>();
+                let mut bytes = serde_json::to_vec(&object).expect("serialize JSON base");
+                bytes.push(b'\n');
+                bytes
+            }
+            Self::Csv => {
+                let mut document = String::from("key,value\n");
+                for slot in 0..slots {
+                    document.push_str(&format!("k{slot},base\n"));
+                }
+                document.into_bytes()
+            }
+            Self::Markdown => {
+                let mut document = String::new();
+                for slot in 0..slots {
+                    document.push_str(&format!("## k{slot}\n\nbase\n\n"));
+                }
+                document.into_bytes()
+            }
+            Self::Text => (0..slots)
+                .map(|slot| format!("k{slot}=base\n"))
+                .collect::<String>()
+                .into_bytes(),
+        }
+    }
+
+    fn edit(self, base: &[u8], slot: usize, token: &str) -> Vec<u8> {
+        match self {
+            Self::Json => {
+                let mut object =
+                    serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(base)
+                        .expect("parse JSON wave base");
+                object.insert(format!("k{slot}"), serde_json::Value::String(token.into()));
+                let mut bytes = serde_json::to_vec(&object).expect("serialize JSON edit");
+                bytes.push(b'\n');
+                bytes
+            }
+            Self::Csv => replace_line(base, &format!("k{slot},"), &format!("k{slot},{token}")),
+            Self::Markdown => replace_markdown_value(base, slot, token),
+            Self::Text => replace_line(base, &format!("k{slot}="), &format!("k{slot}={token}")),
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual release-mode 50-100 collaborator capacity gate"]
+async fn realtime_collaboration_commit_to_convergence_capacity() {
+    let clients = env_usize("LIX_COLLAB_CLIENTS", DEFAULT_CLIENTS);
+    let operations = env_usize("LIX_COLLAB_OPERATIONS", clients);
+    let gate = Duration::from_millis(env_usize(
+        "LIX_COLLAB_GATE_MS",
+        usize::try_from(DEFAULT_GATE.as_millis()).expect("gate fits usize"),
+    ) as u64);
+    let arrival_interval = Duration::from_millis(env_usize(
+        "LIX_COLLAB_ARRIVAL_MS",
+        usize::try_from(DEFAULT_ARRIVAL_INTERVAL.as_millis()).expect("arrival interval fits usize"),
+    ) as u64);
+    let format = DocumentFormat::from_env();
+    assert!(
+        (50..=100).contains(&clients),
+        "capacity gate requires 50-100 clients"
+    );
+    assert!(operations >= WAVE_SIZE && operations.is_multiple_of(WAVE_SIZE));
+
+    let lix = open_lix(OpenLixOptions::default())
+        .await
+        .expect("capacity workspace should open");
+    install_plugin(&lix, format.plugin_key(), &format.plugin_archive()).await;
+    let path = format!("/collaboration-capacity.{}", format.extension());
+    write_file(&lix, &path, &format.base_document(operations + 1)).await;
+
+    let mut peers = Vec::with_capacity(clients);
+    let mut observations = Vec::with_capacity(clients);
+    for _ in 0..clients {
+        let peer = lix
+            .open_workspace_session()
+            .await
+            .expect("collaborator session should open");
+        let mut events = peer
+            .observe(
+                "SELECT data FROM lix_file WHERE path = $1",
+                &[Value::Text(path.clone())],
+            )
+            .expect("collaborator observation should open");
+        events
+            .next()
+            .await
+            .expect("initial observation should evaluate")
+            .expect("initial observation should stay open");
+        peers.push(peer);
+        observations.push(events);
+    }
+
+    lix.reset_plugin_transition_counters();
+    let mut service_latencies = Vec::with_capacity(operations);
+    let mut convergence_latencies = Vec::with_capacity(clients * operations / WAVE_SIZE);
+    let mut wave_latencies = Vec::with_capacity(operations / WAVE_SIZE);
+    let mut schedule_lags = Vec::with_capacity(operations / WAVE_SIZE);
+    let mut expected_tokens = Vec::with_capacity(operations);
+    let run_started = Instant::now();
+    let schedule_origin = run_started + arrival_interval;
+
+    for wave in 0..operations / WAVE_SIZE {
+        let base = read_file(&lix, &path).await;
+        let mut transactions = Vec::with_capacity(WAVE_SIZE);
+        let mut marker = String::new();
+        for participant in 0..WAVE_SIZE {
+            let operation = wave * WAVE_SIZE + participant;
+            let conflict = wave.is_multiple_of(CONFLICT_WAVE_INTERVAL) && participant < 2;
+            let slot = if conflict { 0 } else { operation + 1 };
+            let token = format!("wave-{wave}-client-{operation}");
+            if !conflict {
+                expected_tokens.push(token.clone());
+            }
+            if participant == WAVE_SIZE - 1 {
+                marker.clone_from(&token);
+            }
+            let mut transaction = peers[operation % clients]
+                .begin_transaction()
+                .await
+                .expect("wave transaction should open");
+            transaction
+                .execute(
+                    "UPDATE lix_file SET data = $1 WHERE path = $2",
+                    &[
+                        Value::Blob(format.edit(&base, slot, &token).into()),
+                        Value::Text(path.clone()),
+                    ],
+                )
+                .await
+                .expect("wave edit should stage");
+            transactions.push(transaction);
+        }
+
+        let wave_started = schedule_origin
+            + arrival_interval.saturating_mul(u32::try_from(wave).expect("wave fits u32"));
+        tokio::time::sleep_until(tokio::time::Instant::from_std(wave_started)).await;
+        schedule_lags.push(wave_started.elapsed());
+        let wave_marker = marker.into_bytes();
+        let local = tokio::task::LocalSet::new();
+        let wave_result = local
+            .run_until(async move {
+                let marker_transaction = transactions
+                    .pop()
+                    .expect("wave should contain marker transaction");
+                let mut commit_tasks = tokio::task::JoinSet::new();
+                for transaction in transactions {
+                    commit_tasks.spawn_local(async move {
+                        let started = Instant::now();
+                        let result = transaction.commit().await;
+                        (started.elapsed(), result)
+                    });
+                }
+                let mut services = Vec::with_capacity(WAVE_SIZE);
+                while let Some(joined) = commit_tasks.join_next().await {
+                    let (elapsed, result) = joined.expect("commit task should not panic");
+                    result.expect("concurrent wave edit should commit");
+                    services.push(elapsed);
+                }
+                let marker_started = Instant::now();
+                marker_transaction
+                    .commit()
+                    .await
+                    .expect("same-base marker edit should commit");
+                services.push(marker_started.elapsed());
+
+                // A Lix session deliberately rejects reads while its explicit
+                // transaction is active. Start client delivery immediately
+                // after every transaction in the wave reaches a terminal
+                // state; the wall clock still begins before commit scheduling.
+                let mut observer_tasks = tokio::task::JoinSet::new();
+                for mut events in observations {
+                    let marker = wave_marker.clone();
+                    observer_tasks.spawn_local(async move {
+                        loop {
+                            let event = tokio::time::timeout(OBSERVE_TIMEOUT, events.next())
+                                .await
+                                .expect("observation timed out")
+                                .expect("observation should evaluate")
+                                .expect("observation should stay open");
+                            let data = event.rows.rows()[0]
+                                .get::<Vec<u8>>("data")
+                                .expect("observed file data should be bytes");
+                            if data.windows(marker.len()).any(|window| window == marker) {
+                                return (events, wave_started.elapsed());
+                            }
+                        }
+                    });
+                }
+                let mut next_observations = Vec::with_capacity(clients);
+                let mut convergences = Vec::with_capacity(clients);
+                while let Some(joined) = observer_tasks.join_next().await {
+                    let (events, elapsed) = joined.expect("observer task should not panic");
+                    next_observations.push(events);
+                    convergences.push(elapsed);
+                }
+                (next_observations, services, convergences)
+            })
+            .await;
+        observations = wave_result.0;
+        service_latencies.extend(wave_result.1);
+        convergence_latencies.extend(wave_result.2.iter().copied());
+        wave_latencies.push(
+            wave_result
+                .2
+                .into_iter()
+                .max()
+                .expect("wave should have convergence samples"),
+        );
+    }
+
+    let final_bytes = read_file(&lix, &path).await;
+    for token in &expected_tokens {
+        assert!(
+            final_bytes
+                .windows(token.len())
+                .any(|window| window == token.as_bytes()),
+            "non-overlapping edit {token} was not retained"
+        );
+    }
+    for peer in &peers {
+        assert_eq!(read_file(peer, &path).await, final_bytes);
+    }
+    let counters = lix.plugin_transition_counters();
+    assert!(
+        counters.conflict_resolution_calls > 0,
+        "10% overlap workload must invoke the plugin resolver"
+    );
+
+    service_latencies.sort_unstable();
+    convergence_latencies.sort_unstable();
+    wave_latencies.sort_unstable();
+    schedule_lags.sort_unstable();
+    let service_p95 = percentile(&service_latencies, 95);
+    let convergence_p50 = percentile(&convergence_latencies, 50);
+    let convergence_p95 = percentile(&convergence_latencies, 95);
+    let convergence_p99 = percentile(&convergence_latencies, 99);
+    let wave_p95 = percentile(&wave_latencies, 95);
+    let schedule_lag_p95 = percentile(&schedule_lags, 95);
+    eprintln!(
+        "realtime_collaboration_capacity format={} clients={clients} operations={operations} \
+         wave_size={WAVE_SIZE} arrival_ms={:.3} overlap_percent=10 service_p95_ms={:.3} \
+         convergence_p50_ms={:.3} convergence_p95_ms={:.3} convergence_p99_ms={:.3} \
+         wave_p95_ms={:.3} schedule_lag_p95_ms={:.3} total_ms={:.3} resolver_calls={}",
+        format.name(),
+        millis(arrival_interval),
+        millis(service_p95),
+        millis(convergence_p50),
+        millis(convergence_p95),
+        millis(convergence_p99),
+        millis(wave_p95),
+        millis(schedule_lag_p95),
+        millis(run_started.elapsed()),
+        counters.conflict_resolution_calls,
+    );
+    assert!(
+        convergence_p95 < gate,
+        "{} {clients}-client commit-to-convergence p95 {:.3} ms exceeded {:.3} ms",
+        format.name(),
+        millis(convergence_p95),
+        millis(gate),
+    );
+
+    drop(observations);
+    for peer in peers {
+        peer.close().await.expect("collaborator should close");
+    }
+    lix.close().await.expect("capacity workspace should close");
+}
+
+#[tokio::test]
+#[ignore = "manual release-mode abandoned transaction and session soak"]
+async fn abandoned_transactions_and_sessions_release_resources() {
+    let clients = env_usize("LIX_COLLAB_CLIENTS", DEFAULT_CLIENTS);
+    let rounds = env_usize("LIX_COLLAB_SOAK_ROUNDS", DEFAULT_SOAK_ROUNDS);
+    let rss_limit = env_usize(
+        "LIX_COLLAB_RSS_GROWTH_LIMIT_BYTES",
+        usize::try_from(DEFAULT_RSS_GROWTH_LIMIT_BYTES).expect("RSS limit fits usize"),
+    ) as u64;
+    assert!((50..=100).contains(&clients));
+    assert!(
+        rounds >= 2,
+        "soak needs a warmup and at least one measured round"
+    );
+
+    let lix = open_lix(OpenLixOptions::default())
+        .await
+        .expect("soak workspace should open");
+    install_plugin(&lix, "plugin_json", &build_json_plugin_archive()).await;
+    let path = "/abandoned-transaction-soak.json";
+    let base = br#"{"value":"base"}
+"#;
+    write_file(&lix, path, base).await;
+    let mut warm_rss = None;
+    let mut peak_rss = resident_set_bytes();
+
+    for round in 0..rounds {
+        let mut peers = Vec::with_capacity(clients);
+        let mut transactions = Vec::with_capacity(clients);
+        for client in 0..clients {
+            let peer = lix
+                .open_workspace_session()
+                .await
+                .expect("soak session should open");
+            let mut transaction = peer
+                .begin_transaction()
+                .await
+                .expect("soak transaction should open");
+            let edit = format!("{{\"value\":\"round-{round}-client-{client}\"}}\n");
+            transaction
+                .execute(
+                    "UPDATE lix_file SET data = $1 WHERE path = $2",
+                    &[
+                        Value::Blob(edit.into_bytes().into()),
+                        Value::Text(path.to_owned()),
+                    ],
+                )
+                .await
+                .expect("abandoned edit should stage");
+            peers.push(peer);
+            transactions.push(transaction);
+        }
+        peak_rss = peak_rss.max(resident_set_bytes());
+        drop(transactions);
+        for peer in peers {
+            peer.close().await.expect("abandoned session should close");
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(read_file(&lix, path).await, base);
+        if round == 0 {
+            warm_rss = Some(resident_set_bytes());
+        }
+    }
+
+    let final_rss = resident_set_bytes();
+    let warm_rss = warm_rss.expect("warmup RSS should be captured");
+    let growth = final_rss.saturating_sub(warm_rss);
+    eprintln!(
+        "realtime_collaboration_soak clients={clients} rounds={rounds} abandoned_transactions={} \
+         warm_rss_bytes={warm_rss} peak_rss_bytes={peak_rss} final_rss_bytes={final_rss} \
+         post_warmup_growth_bytes={growth} growth_limit_bytes={rss_limit}",
+        clients * rounds,
+    );
+    assert!(
+        growth <= rss_limit,
+        "post-warmup RSS grew by {growth} bytes, above {rss_limit} bytes"
+    );
+    lix.close().await.expect("soak workspace should close");
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("{key} should be numeric"))
+        })
+        .unwrap_or(default)
+}
+
+fn percentile(samples: &[Duration], percentile: usize) -> Duration {
+    assert!(!samples.is_empty());
+    samples[(samples.len() * percentile).div_ceil(100).saturating_sub(1)]
+}
+
+fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn resident_set_bytes() -> u64 {
+    let status = fs::read_to_string("/proc/self/status").expect("Linux procfs should expose RSS");
+    let rss_kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_ascii_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("VmRSS should be numeric");
+    rss_kib * 1024
+}
+
+fn replace_line(base: &[u8], prefix: &str, replacement: &str) -> Vec<u8> {
+    let source = std::str::from_utf8(base).expect("document should be UTF-8");
+    let mut found = false;
+    let mut output = String::with_capacity(source.len() + replacement.len());
+    for line in source.lines() {
+        if line.starts_with(prefix) {
+            output.push_str(replacement);
+            found = true;
+        } else {
+            output.push_str(line);
+        }
+        output.push('\n');
+    }
+    assert!(found, "slot line {prefix:?} should exist");
+    output.into_bytes()
+}
+
+fn replace_markdown_value(base: &[u8], slot: usize, token: &str) -> Vec<u8> {
+    let source = std::str::from_utf8(base).expect("Markdown should be UTF-8");
+    let heading = format!("## k{slot}\n\n");
+    let offset = source.find(&heading).expect("Markdown slot should exist") + heading.len();
+    let value_end = source[offset..]
+        .find('\n')
+        .map(|relative| offset + relative)
+        .expect("Markdown slot value should end");
+    let mut output = String::with_capacity(source.len() + token.len());
+    output.push_str(&source[..offset]);
+    output.push_str(token);
+    output.push_str(&source[value_end..]);
+    output.into_bytes()
+}
+
+async fn install_plugin<StorageImpl>(lix: &Lix<StorageImpl>, key: &str, archive: &[u8])
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[
+            Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
+            Value::Blob(archive.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("reference plugin should install");
+}
+
+async fn write_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str, bytes: &[u8])
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[
+            Value::Text(path.to_owned()),
+            Value::Blob(bytes.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("capacity document should write");
+}
+
+async fn read_file<StorageImpl>(lix: &Lix<StorageImpl>, path: &str) -> Vec<u8>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute(
+        "SELECT data FROM lix_file WHERE path = $1",
+        &[Value::Text(path.to_owned())],
+    )
+    .await
+    .expect("capacity document should read")
+    .rows()[0]
+        .get::<Vec<u8>>("data")
+        .expect("capacity document should contain bytes")
+}
+
+fn build_json_plugin_archive() -> Vec<u8> {
+    build_plugin_archive(
+        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json")),
+        include_str!("../../../plugins/json/manifest.json"),
+        &[
+            (
+                "schema/json_root.json",
+                include_str!("../../../plugins/json/schema/json_root.json"),
+            ),
+            (
+                "schema/json_object_member.json",
+                include_str!("../../../plugins/json/schema/json_object_member.json"),
+            ),
+            (
+                "schema/json_array_item.json",
+                include_str!("../../../plugins/json/schema/json_array_item.json"),
+            ),
+        ],
+    )
+}
+
+fn build_csv_plugin_archive() -> Vec<u8> {
+    build_plugin_archive(
+        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv")),
+        include_str!("../../../plugins/csv/manifest.json"),
+        &[
+            (
+                "schema/csv_v2_table.json",
+                include_str!("../../../plugins/csv/schema/csv_v2_table.json"),
+            ),
+            (
+                "schema/csv_v2_row.json",
+                include_str!("../../../plugins/csv/schema/csv_v2_row.json"),
+            ),
+        ],
+    )
+}
+
+fn build_markdown_plugin_archive() -> Vec<u8> {
+    build_plugin_archive(
+        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown")),
+        include_str!("../../../plugins/markdown/manifest.json"),
+        &[(
+            "schema/markdown_node_v2.json",
+            include_str!("../../../plugins/markdown/schema/markdown_node_v2.json"),
+        )],
+    )
+}
+
+fn build_text_plugin_archive() -> Vec<u8> {
+    build_plugin_archive(
+        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text")),
+        include_str!("../../../plugins/text/manifest.json"),
+        &[(
+            "schema/git_text_line_v2.json",
+            include_str!("../../../plugins/text/schema/git_text_line_v2.json"),
+        )],
+    )
+}
+
+fn build_plugin_archive(wasm_path: &Path, manifest: &str, schemas: &[(&str, &str)]) -> Vec<u8> {
+    let wasm = fs::read(wasm_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read plugin component at {}: {error}",
+            wasm_path.display()
+        )
+    });
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file("manifest.json", options).unwrap();
+    writer.write_all(manifest.as_bytes()).unwrap();
+    for (path, schema) in schemas {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(schema.as_bytes()).unwrap();
+    }
+    writer.start_file("plugin.wasm", options).unwrap();
+    writer.write_all(&wasm).unwrap();
+    writer.finish().unwrap().into_inner()
+}

@@ -3493,6 +3493,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "codspeed-criterion-compat",
  "flate2",
  "futures-core",

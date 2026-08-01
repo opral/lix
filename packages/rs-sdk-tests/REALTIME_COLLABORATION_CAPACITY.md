@@ -1,0 +1,118 @@
+# Real-time collaboration capacity
+
+Measured 2026-08-01 in optimized Rust `release` builds on the same machine as
+the CRDT baseline. The capacity gate is client-observed commit-to-convergence
+p95 below 100 ms with 50-100 active collaborators on one document.
+
+## Workload
+
+- 50 or 100 independent Lix sessions keep a live observation on one hot file.
+- The run performs one edit per collaborator in waves of five edits.
+- Waves are scheduled on one absolute clock 50 ms apart. Four same-base edits
+  commit concurrently; a fifth same-base marker edit closes the wave. A slow
+  wave cannot move later deadlines: missed-deadline lag is included in the
+  next wave's convergence latency.
+- Two writers overlap in every fourth wave. That is exactly 10% overlapping
+  operations; the other 90% target distinct semantic entities.
+- A wave converges only after every client observes the marker through its own
+  query stream. The timer begins before commits are scheduled, so it includes
+  commit queueing, stale conflict discovery, plugin reconciliation, the
+  in-memory storage commit, invalidation, query reevaluation, and observation
+  fan-out.
+- Per-commit service latency is retained as a diagnostic, but it is not the
+  capacity gate.
+- Every non-overlapping edit must survive, conflict waves must invoke the
+  owning plugin resolver, final bytes must parse, and all clients must agree.
+
+## Results
+
+Each row reports the worst value observed across the initial measurement and
+five fresh-process repetitions. This avoids selecting the fastest sample.
+
+| Adapter / format | Clients | Service p95 | Client-observed convergence p95 | p99 | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Local / JSON | 50 | 4.182 ms | **14.813 ms** | 14.909 ms | pass |
+| Local / JSON | 100 | 5.073 ms | **18.095 ms** | 19.462 ms | pass |
+| Local / CSV | 100 | 5.484 ms | **23.108 ms** | 23.818 ms | pass |
+| Local / Markdown | 100 | 7.952 ms | **24.780 ms** | 28.850 ms | pass |
+| Local / text | 100 | 5.520 ms | **20.922 ms** | 21.276 ms | pass |
+| Server protocol / JSON | 100 | 13.787 ms | **25.977 ms** | not recorded | pass |
+
+The server-protocol row runs 100 independent protocol sessions and 100 SSE
+streams through the canonical Axum router. It covers wire value decoding,
+transaction capability routing, response serialization, and SSE delivery, but
+uses the in-process router and therefore excludes TCP and deployment network
+RTT. Production SLOs must add measured network latency; this result must not be
+presented as a public-internet end-to-end number.
+
+Both capacity rows use Lix's canonical in-memory storage so they isolate the
+engine and transport paths. A deployment using SQLite, RocksDB, SlateDB, or a
+remote object store must run the same gate on that storage before claiming its
+own production capacity.
+
+## Profile and change
+
+The first realistic run failed before producing a latency result. Same-file
+byte edits that touched disjoint semantic entities overlapped in file-storage
+bookkeeping, and the stale transaction path classified that bookkeeping as an
+unsafe non-plugin conflict. This made the 90% disjoint workload return
+`LIX_TRANSACTION_CONFLICT`.
+
+The commit path now identifies the stable plugin-owned file from its overlapping
+bookkeeping rows, rebases the retained semantic edits through the existing
+plugin actor, keeps the final combined rendering, and commits once. Disjoint
+edits do not call the conflict resolver. Actual semantic overlaps remain
+grouped by file and invoke the resolver once for the accumulated conflict set.
+
+Across the corrected six-run matrix, worst local service p95 was 7.952 ms and
+worst local convergence p95 was 24.780 ms. Absolute-deadline schedule-lag p95
+never exceeded 2.081 ms, proving the workload sustained five edits every 50 ms
+instead of moving arrivals after convergence. The in-process server protocol's
+worst service and convergence p95 values were 13.787 ms and 25.977 ms, with
+schedule-lag p95 at or below 1.768 ms. These endpoint measurements identify
+protocol processing and fan-out as the remaining larger slices; a production
+network measurement is still required for a deployment-specific SLO.
+
+## Resource soak
+
+The ignored soak opens, stages, abandons, and closes 100 transactions and
+sessions per round. Ten rounds cover 1,000 abandoned transactions. No staged
+write becomes visible. On the measured run:
+
+- warm post-cleanup RSS: 84,520,960 bytes
+- peak RSS: 84,520,960 bytes
+- final RSS: 84,520,960 bytes
+- post-warmup growth: **0 bytes**
+- allowed post-warmup growth: 67,108,864 bytes
+
+RSS is allocator- and platform-dependent, so the bound detects unbounded
+retention rather than promising a fixed production memory footprint.
+
+## Reproduction
+
+```bash
+for format in json csv markdown text; do
+  LIX_COLLAB_CLIENTS=100 \
+  LIX_COLLAB_OPERATIONS=100 \
+  LIX_COLLAB_ARRIVAL_MS=50 \
+  LIX_COLLAB_FORMAT="$format" \
+  cargo test -p lix_sdk_tests \
+    --test realtime_collaboration_capacity --release \
+    realtime_collaboration_commit_to_convergence_capacity \
+    -- --ignored --exact --nocapture
+done
+
+LIX_COLLAB_CLIENTS=100 \
+LIX_COLLAB_SOAK_ROUNDS=10 \
+cargo test -p lix_sdk_tests \
+  --test realtime_collaboration_capacity --release \
+  abandoned_transactions_and_sessions_release_resources \
+  -- --ignored --exact --nocapture
+
+cargo test -p lix_server_protocol --release \
+  tests::remote_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95 \
+  -- --ignored --exact --nocapture
+```
+
+`LIX_COLLAB_GATE_MS` defaults to 100. The benchmark asserts the gate rather than
+only printing it.

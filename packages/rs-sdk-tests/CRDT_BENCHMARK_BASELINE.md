@@ -57,7 +57,7 @@ The B3.1 Lix row contains 1,540 per-client service observations from one full
 cardinality run. It passes the 100-ms service gate with 78.153 ms of headroom.
 The complete test, including workspace/plugin setup, opening and staging 1,540
 transactions, committing, convergence reads, and cleanup, finished in 18.61 s.
-The 18.133-second commit batch means this implementation does **not** provide
+The 17.668-second commit batch means this implementation does **not** provide
 sub-100-ms all-client convergence when 1,540 commits arrive simultaneously;
 both numbers are retained so service latency cannot hide queueing.
 
@@ -107,3 +107,8 @@ LIX_CRDT_SAMPLES=1 cargo test -p lix_sdk_tests \
 
 `LIX_CRDT_B3_CLIENTS` overrides the default 1,540-client cardinality and
 `LIX_CRDT_SAMPLES` controls independent workspace samples.
+
+The separate [`REALTIME_COLLABORATION_CAPACITY.md`](REALTIME_COLLABORATION_CAPACITY.md)
+defines the realistic 50-100 collaborator, gradual-arrival, client-observed
+capacity gate. The 1,540-client B3.1 burst remains a saturation comparison and
+is not substituted for that real-time workload.
