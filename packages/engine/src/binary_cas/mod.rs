@@ -13,7 +13,8 @@ pub(crate) use chunking::BinaryCasChunking;
 pub(crate) use codec::encode_binary_cas_manifest;
 #[cfg(feature = "storage-benches")]
 pub(crate) use codec::{
-    BinaryCasManifest, decode_binary_cas_manifest, decode_binary_cas_manifest_chunk,
+    BinaryCasManifest, StorageBinaryCasDeltaBaseLayout, decode_binary_cas_manifest,
+    decode_binary_cas_manifest_chunk,
 };
 pub(crate) use context::{BinaryCasContext, BlobDataReader};
 pub(crate) use kv::load_bytes_many;

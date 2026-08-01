@@ -331,6 +331,16 @@ pub struct BinaryCasPayloadInventoryEntry {
     pub encoded_manifest_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CurrentImageCasOracleAccounting {
+    pub current_file_images: u64,
+    pub retained_manifests: u64,
+    pub removed_manifests: u64,
+    pub current_cas_row_bytes: u64,
+    pub retained_cas_row_bytes: u64,
+    pub reclaimable_cas_row_bytes: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BinaryCasOwnerLayoutAccounting {
     pub owner: String,
@@ -635,6 +645,203 @@ where
         }
     }
     Ok(entries)
+}
+
+/// Computes the exact logical CAS rows required by a current-image layout.
+///
+/// Current file images and binary/unclassified values remain ordinary CAS
+/// payloads. Superseded payloads eligible for the catch-all WASM text plugin
+/// are reconstructible from semantic history and may be removed. Dependency
+/// traversal retains shared chunks, chunk manifests, delta bases, and presence
+/// rows, so the result does not count unreachable manifest bytes as payload
+/// savings.
+pub async fn current_image_cas_oracle_accounting<R>(
+    read: &R,
+) -> Result<CurrentImageCasOracleAccounting, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    use crate::live_state::LiveStateScanRequest;
+
+    let live_state = crate::live_state::LiveStateContext::new(
+        crate::tracked_state::TrackedStateContext::new(),
+        crate::commit_graph::CommitGraphContext::new(),
+    );
+    let current_rows = live_state
+        .reader(read)
+        .scan_batch(&LiveStateScanRequest {
+            filter: crate::live_state::LiveStateFilter {
+                schema_keys: vec!["lix_binary_blob_ref".to_owned()],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await?;
+    let mut current_file_hashes = std::collections::BTreeSet::new();
+    for row in current_rows.iter() {
+        let Some(snapshot) = row.snapshot_content() else {
+            continue;
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    format!("current-image oracle found invalid blob reference: {error}"),
+                )
+            })?;
+        let Some(hash) = value.get("blob_hash").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        current_file_hashes.insert(crate::binary_cas::BlobHash::from_hex(hash)?);
+    }
+
+    let payloads = binary_cas_payload_inventory(read).await?;
+    let mut retained_blobs = std::collections::BTreeSet::new();
+    for payload in &payloads {
+        let hash = crate::binary_cas::BlobHash::from_bytes(payload.hash);
+        let plugin_selectable = !payload.bytes.iter().take(8_000).any(|byte| *byte == 0);
+        if current_file_hashes.contains(&hash) || !plugin_selectable {
+            retained_blobs.insert(hash);
+        }
+    }
+
+    let manifest_entries =
+        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE).await;
+    let manifest_chunk_entries =
+        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE).await;
+    let chunk_entries =
+        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE).await;
+    let presence_entries =
+        scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_CHUNK_PRESENCE_SPACE).await;
+
+    let mut manifest_chunks = std::collections::BTreeMap::<
+        crate::binary_cas::BlobHash,
+        Vec<(crate::binary_cas::BlobHash, u64)>,
+    >::new();
+    for entry in &manifest_chunk_entries {
+        let blob_hash = hash_from_key_prefix(&entry.key.0, "manifest chunk")?;
+        let StorageProjectedValue::FullValue(value) = &entry.value else {
+            unreachable!("current-image oracle requests full manifest chunks");
+        };
+        let (chunk_hash, _) = crate::binary_cas::decode_binary_cas_manifest_chunk(value)?;
+        manifest_chunks.entry(blob_hash).or_default().push((
+            crate::binary_cas::BlobHash::from_bytes(chunk_hash),
+            storage_entry_bytes(entry),
+        ));
+    }
+
+    let mut retained_chunks = std::collections::BTreeSet::new();
+    let mut retained_manifest_chunk_owners = std::collections::BTreeSet::new();
+    let mut retained_manifest_bytes = 0u64;
+    for entry in &manifest_entries {
+        let blob_hash = hash_from_key_prefix(&entry.key.0, "manifest")?;
+        if !retained_blobs.contains(&blob_hash) {
+            continue;
+        }
+        retained_manifest_bytes += storage_entry_bytes(entry);
+        let StorageProjectedValue::FullValue(value) = &entry.value else {
+            unreachable!("current-image oracle requests full manifests");
+        };
+        match crate::binary_cas::decode_binary_cas_manifest(value)? {
+            crate::binary_cas::BinaryCasManifest::Empty { .. } => {}
+            crate::binary_cas::BinaryCasManifest::SingleChunk { chunk_hash, .. } => {
+                retained_chunks.insert(crate::binary_cas::BlobHash::from_bytes(chunk_hash));
+            }
+            crate::binary_cas::BinaryCasManifest::Chunked { .. } => {
+                retained_manifest_chunk_owners.insert(blob_hash);
+                retained_chunks.extend(
+                    manifest_chunks
+                        .get(&blob_hash)
+                        .into_iter()
+                        .flatten()
+                        .map(|(hash, _)| *hash),
+                );
+            }
+            crate::binary_cas::BinaryCasManifest::Delta {
+                base_blob_hash,
+                base_layout,
+                ..
+            } => match base_layout {
+                crate::binary_cas::StorageBinaryCasDeltaBaseLayout::SingleChunk { chunk_hash } => {
+                    retained_chunks.insert(crate::binary_cas::BlobHash::from_bytes(chunk_hash));
+                }
+                crate::binary_cas::StorageBinaryCasDeltaBaseLayout::Chunked { .. } => {
+                    let base_hash = crate::binary_cas::BlobHash::from_bytes(base_blob_hash);
+                    retained_manifest_chunk_owners.insert(base_hash);
+                    retained_chunks.extend(
+                        manifest_chunks
+                            .get(&base_hash)
+                            .into_iter()
+                            .flatten()
+                            .map(|(hash, _)| *hash),
+                    );
+                }
+            },
+        }
+    }
+    let retained_manifest_chunk_bytes = retained_manifest_chunk_owners
+        .iter()
+        .flat_map(|hash| manifest_chunks.get(hash).into_iter().flatten())
+        .map(|(_, bytes)| *bytes)
+        .sum::<u64>();
+    let mut retained_chunk_bytes = 0u64;
+    for entry in &chunk_entries {
+        let hash = hash_from_key_prefix(&entry.key.0, "chunk")?;
+        if retained_chunks.contains(&hash) {
+            retained_chunk_bytes += storage_entry_bytes(entry);
+        }
+    }
+    let mut retained_presence_bytes = 0u64;
+    for entry in &presence_entries {
+        let hash = hash_from_key_prefix(&entry.key.0, "chunk presence")?;
+        if retained_chunks.contains(&hash) {
+            retained_presence_bytes += storage_entry_bytes(entry);
+        }
+    }
+    let current_cas_row_bytes = manifest_entries
+        .iter()
+        .chain(manifest_chunk_entries.iter())
+        .chain(chunk_entries.iter())
+        .chain(presence_entries.iter())
+        .map(storage_entry_bytes)
+        .sum::<u64>();
+    let retained_cas_row_bytes = retained_manifest_bytes
+        + retained_manifest_chunk_bytes
+        + retained_chunk_bytes
+        + retained_presence_bytes;
+    Ok(CurrentImageCasOracleAccounting {
+        current_file_images: current_file_hashes.len() as u64,
+        retained_manifests: retained_blobs.len() as u64,
+        removed_manifests: payloads.len().saturating_sub(retained_blobs.len()) as u64,
+        current_cas_row_bytes,
+        retained_cas_row_bytes,
+        reclaimable_cas_row_bytes: current_cas_row_bytes.saturating_sub(retained_cas_row_bytes),
+    })
+}
+
+fn hash_from_key_prefix(
+    key: &Bytes,
+    label: &str,
+) -> Result<crate::binary_cas::BlobHash, crate::LixError> {
+    let hash: [u8; 32] = key
+        .get(..32)
+        .ok_or_else(|| {
+            crate::LixError::new(
+                crate::LixError::CODE_INTERNAL_ERROR,
+                format!("current-image oracle {label} key is shorter than one hash"),
+            )
+        })?
+        .try_into()
+        .expect("checked hash slice length");
+    Ok(crate::binary_cas::BlobHash::from_bytes(hash))
+}
+
+fn storage_entry_bytes(entry: &crate::storage_adapter::StorageReadEntry) -> u64 {
+    4 + entry.key.0.len() as u64
+        + match &entry.value {
+            StorageProjectedValue::FullValue(value) => value.len() as u64,
+            StorageProjectedValue::KeyOnly => 0,
+        }
 }
 
 /// Attributes every binary-CAS manifest to the durable JSON field which owns it.

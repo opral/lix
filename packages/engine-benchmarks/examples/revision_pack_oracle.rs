@@ -6,11 +6,16 @@ use std::time::Instant;
 use std::{collections::HashMap, ffi::OsStr};
 
 use lix_engine::storage_adapter::{StorageAdapter, StorageReadOptions};
-use lix_engine::storage_bench::{binary_cas_payload_inventory, layout_accounting};
+use lix_engine::storage_bench::{
+    binary_cas_payload_inventory, current_image_cas_oracle_accounting, layout_accounting,
+};
 use lix_slatedb_storage::SlateDB;
 
 #[tokio::main]
 async fn main() {
+    let current_image_only = std::env::args_os()
+        .nth(2)
+        .is_some_and(|argument| argument == "--current-image-only");
     let path = std::env::args_os()
         .nth(1)
         .expect("usage: revision_pack_oracle <slatedb-path>");
@@ -31,6 +36,21 @@ async fn main() {
         .await
         .expect("reconstruct binary CAS inventory");
     let reconstruction_ms = started.elapsed().as_millis();
+    let current_image = current_image_cas_oracle_accounting(&read)
+        .await
+        .expect("compute current-image CAS oracle");
+    println!(
+        "CURRENT_IMAGE_ORACLE\tcurrent_file_images={}\tretained_manifests={}\tremoved_manifests={}\tcurrent_cas_row_bytes={}\tretained_cas_row_bytes={}\treclaimable_cas_row_bytes={}",
+        current_image.current_file_images,
+        current_image.retained_manifests,
+        current_image.removed_manifests,
+        current_image.current_cas_row_bytes,
+        current_image.retained_cas_row_bytes,
+        current_image.reclaimable_cas_row_bytes,
+    );
+    if current_image_only {
+        return;
+    }
 
     let logical_bytes = payloads
         .iter()
