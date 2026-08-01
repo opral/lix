@@ -8,7 +8,7 @@
 //! file-first row index.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -841,6 +841,7 @@ fn certified_external_page_plan(
     bytes: &[u8],
     content_key: &[u8],
     request: &TrackedStateScanRequest,
+    filter_index: &CertifiedScanFilterIndex,
 ) -> Result<Option<Vec<(u32, StorageKey)>>, LixError> {
     let mut input = CertifiedBatchReader::new(bytes)?;
     if !input.external_pages {
@@ -852,26 +853,10 @@ fn certified_external_page_plan(
         schema_keys.push(input.text()?);
     }
     let file_id = input.text()?;
-    if !request.filter.schema_keys.is_empty()
-        && !request
-            .filter
-            .schema_keys
-            .iter()
-            .any(|candidate| schema_keys.contains(&candidate.as_str()))
-    {
+    if !filter_index.includes_any_schema(&schema_keys) {
         return Ok(Some(Vec::new()));
     }
-    if !request.filter.file_ids.is_empty()
-        && !request
-            .filter
-            .file_ids
-            .iter()
-            .any(|candidate| match candidate {
-                NullableKeyFilter::Any => true,
-                NullableKeyFilter::Null => false,
-                NullableKeyFilter::Value(candidate) => candidate == file_id,
-            })
-    {
+    if !filter_index.includes_file(file_id) {
         return Ok(Some(Vec::new()));
     }
     let _commit_id = input.bytes(16)?;
@@ -1019,6 +1004,7 @@ async fn scan_certified_entity_batch_rows(
             .columns
             .iter()
             .any(|column| column == "snapshot_content");
+    let filter_index = CertifiedScanFilterIndex::new(request);
     let mut decode_inputs = Vec::with_capacity(content_keys.len());
     let mut page_routes = Vec::new();
     let mut page_keys = Vec::new();
@@ -1027,7 +1013,8 @@ async fn scan_certified_entity_batch_rows(
             continue;
         };
         let value = full_value_bytes(value)?;
-        let external_plan = certified_external_page_plan(&value, content_key.0.as_ref(), request)?;
+        let external_plan =
+            certified_external_page_plan(&value, content_key.0.as_ref(), request, &filter_index)?;
         let input_index = decode_inputs.len();
         let external_pages = external_plan
             .as_ref()
@@ -1064,6 +1051,7 @@ async fn scan_certified_entity_batch_rows(
             external_pages.as_deref(),
             branch_id,
             request,
+            &filter_index,
             needs_snapshot,
             decode_limit,
             &mut builder,
@@ -1115,6 +1103,7 @@ pub(crate) async fn scan_certified_history_rows(
         .columns
         .iter()
         .any(|column| column == "snapshot_content");
+    let filter_index = CertifiedScanFilterIndex::new(request);
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(commit_ids.len() * 1024);
     for commit_id in commit_ids {
         let plan = ScanPlan::prefix(
@@ -1141,8 +1130,12 @@ pub(crate) async fn scan_certified_history_rows(
                 if certified_batch_commit_id(&value)? != *commit_id {
                     continue;
                 }
-                let external_plan =
-                    certified_external_page_plan(&value, entry.key.0.as_ref(), request)?;
+                let external_plan = certified_external_page_plan(
+                    &value,
+                    entry.key.0.as_ref(),
+                    request,
+                    &filter_index,
+                )?;
                 let external_pages = if let Some(plan) = &external_plan {
                     let keys = plan.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
                     let values = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_PAGE_SPACE, &keys)
@@ -1168,6 +1161,7 @@ pub(crate) async fn scan_certified_history_rows(
                     external_pages.as_deref(),
                     "",
                     request,
+                    &filter_index,
                     needs_snapshot,
                     None,
                     &mut builder,
@@ -1199,11 +1193,77 @@ fn certified_batch_commit_id(bytes: &[u8]) -> Result<CommitId, LixError> {
     ))
 }
 
+struct CertifiedScanFilterIndex {
+    schema_keys: Option<HashSet<String>>,
+    file_ids: Option<HashSet<String>>,
+    entity_pks: Option<HashSet<EntityPk>>,
+}
+
+impl CertifiedScanFilterIndex {
+    fn new(request: &TrackedStateScanRequest) -> Self {
+        let file_ids = if request.filter.file_ids.is_empty()
+            || request
+                .filter
+                .file_ids
+                .iter()
+                .any(|file_id| matches!(file_id, NullableKeyFilter::Any))
+        {
+            None
+        } else {
+            Some(
+                request
+                    .filter
+                    .file_ids
+                    .iter()
+                    .filter_map(|file_id| match file_id {
+                        NullableKeyFilter::Value(file_id) => Some(file_id.clone()),
+                        NullableKeyFilter::Any | NullableKeyFilter::Null => None,
+                    })
+                    .collect(),
+            )
+        };
+        Self {
+            schema_keys: (!request.filter.schema_keys.is_empty())
+                .then(|| request.filter.schema_keys.iter().cloned().collect()),
+            file_ids,
+            entity_pks: (!request.filter.entity_pks.is_empty())
+                .then(|| request.filter.entity_pks.iter().cloned().collect()),
+        }
+    }
+
+    fn includes_any_schema(&self, schema_keys: &[&str]) -> bool {
+        self.schema_keys.as_ref().is_none_or(|selected| {
+            schema_keys
+                .iter()
+                .any(|schema_key| selected.contains(*schema_key))
+        })
+    }
+
+    fn includes_schema(&self, schema_key: &str) -> bool {
+        self.schema_keys
+            .as_ref()
+            .is_none_or(|selected| selected.contains(schema_key))
+    }
+
+    fn includes_file(&self, file_id: &str) -> bool {
+        self.file_ids
+            .as_ref()
+            .is_none_or(|selected| selected.contains(file_id))
+    }
+
+    fn includes_entity(&self, entity_pk: &EntityPk) -> bool {
+        self.entity_pks
+            .as_ref()
+            .is_none_or(|selected| selected.contains(entity_pk))
+    }
+}
+
 fn decode_certified_entity_batch_rows(
     bytes: &[u8],
     external_pages: Option<&[(u32, Bytes)]>,
     branch_id: &str,
     request: &TrackedStateScanRequest,
+    filter_index: &CertifiedScanFilterIndex,
     needs_snapshot: bool,
     limit: Option<usize>,
     builder: &mut MaterializedLiveStateBatchBuilder,
@@ -1266,26 +1326,10 @@ fn decode_certified_entity_batch_rows(
                 .collect::<BTreeSet<_>>()
         });
     let page_count = input.u32()?;
-    if !request.filter.schema_keys.is_empty()
-        && !request
-            .filter
-            .schema_keys
-            .iter()
-            .any(|candidate| schema_keys.contains(&candidate.as_str()))
-    {
+    if !filter_index.includes_any_schema(&schema_keys) {
         return Ok(());
     }
-    if !request.filter.file_ids.is_empty()
-        && !request
-            .filter
-            .file_ids
-            .iter()
-            .any(|candidate| match candidate {
-                NullableKeyFilter::Any => true,
-                NullableKeyFilter::Null => false,
-                NullableKeyFilter::Value(candidate) => candidate == file_id,
-            })
-    {
+    if !filter_index.includes_file(file_id) {
         return Ok(());
     }
 
@@ -1333,7 +1377,7 @@ fn decode_certified_entity_batch_rows(
                 timestamp,
                 branch_id,
                 file_id,
-                request,
+                filter_index,
                 needs_snapshot,
                 limit,
                 decoded_rows,
@@ -1474,7 +1518,7 @@ fn decode_certified_packet_rows(
     timestamp: LixTimestamp,
     branch_id: &str,
     file_id: &str,
-    request: &TrackedStateScanRequest,
+    filter_index: &CertifiedScanFilterIndex,
     needs_snapshot: bool,
     limit: Option<usize>,
     base_ordinal: u64,
@@ -1548,18 +1592,8 @@ fn decode_certified_packet_rows(
             ));
         }
         decoded = decoded.saturating_add(1);
-        let selected = (request.filter.schema_keys.is_empty()
-            || request
-                .filter
-                .schema_keys
-                .iter()
-                .any(|candidate| candidate == schema_key))
-            && (request.filter.entity_pks.is_empty()
-                || request
-                    .filter
-                    .entity_pks
-                    .iter()
-                    .any(|candidate| candidate == &entity_pk));
+        let selected =
+            filter_index.includes_schema(schema_key) && filter_index.includes_entity(&entity_pk);
         if !selected {
             continue;
         }
