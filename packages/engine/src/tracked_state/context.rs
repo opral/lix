@@ -1240,6 +1240,17 @@ where
         storage::scan_commit_delta_members(&self.store, commit_id).await
     }
 
+    /// Loads only the requested schema ranges from one commit delta. Semantic
+    /// classification uses this to avoid hydrating unrelated commit members.
+    pub(crate) async fn commit_delta_values_for_schemas(
+        &mut self,
+        commit_id: CommitId,
+        schema_keys: &[String],
+    ) -> Result<storage::DecodedCommitDeltaBatch, LixError> {
+        self.scan_replayed_commit_delta_values(commit_id, schema_keys)
+            .await
+    }
+
     /// True only for the sparse immutable checkpoints. A false result does
     /// not mean the commit is unreadable: ordinary v4 commits replay their
     /// first-parent changelog interval on the cold historical path.

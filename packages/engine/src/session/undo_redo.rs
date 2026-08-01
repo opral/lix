@@ -187,9 +187,70 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let record = load_commit_record(transaction, commit_id).await?;
-    semantic_state_for_record(transaction, branch_id, commit_id, &record)
-        .await
-        .map(|(state, _)| state)
+    if record.parent_commit_ids.len() != 1 {
+        return Ok(SemanticState::default());
+    }
+    let keys = semantic_keys(branch_id)?;
+    let marker_schemas = [
+        CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
+        UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
+    ];
+    let marker_delta = {
+        let mut tracked = transaction.tracked_state_reader().await;
+        tracked
+            .commit_delta_values_for_schemas(commit_id, &marker_schemas)
+            .await?
+    };
+    let mut has_checkpoint = false;
+    let mut has_foreign_operation = false;
+    let mut has_local_operation = false;
+    for row in marker_delta.iter().filter(|row| !row.value().deleted) {
+        let key = row.key_ref();
+        match key.schema_key {
+            CHECKPOINT_MARKER_SCHEMA_KEY => has_checkpoint = true,
+            UNDO_REDO_MARKER_SCHEMA_KEY if key.entity_pk == &keys[1].entity_pk => {
+                has_local_operation = true;
+            }
+            UNDO_REDO_MARKER_SCHEMA_KEY => has_foreign_operation = true,
+            _ => {}
+        }
+    }
+    if has_checkpoint || has_foreign_operation {
+        return Ok(SemanticState::default());
+    }
+    if !has_local_operation {
+        return Ok(SemanticState {
+            undo_top: Some(commit_id),
+            redo_top: None,
+            redo_target: None,
+            redo_next: None,
+        });
+    }
+    let marker = operation_marker_at(transaction, branch_id, commit_id)
+        .await?
+        .ok_or_else(|| missing_operation_marker(commit_id))?;
+    Ok(semantic_state_from_marker(marker, commit_id))
+}
+
+fn semantic_keys(branch_id: &str) -> Result<[TrackedStateKey; 2], LixError> {
+    let branch_pk = EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("undo branch id must be a canonical UUID: {error}"),
+        )
+    })?;
+    Ok([
+        TrackedStateKey {
+            schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
+            file_id: None,
+            entity_pk: branch_pk.clone(),
+        },
+        TrackedStateKey {
+            schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
+            file_id: None,
+            entity_pk: branch_pk,
+        },
+    ])
 }
 
 async fn semantic_state_for_record<S>(
@@ -211,24 +272,7 @@ where
         return Ok((SemanticState::default(), Vec::new()));
     }
 
-    let branch_pk = EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            format!("undo branch id must be a canonical UUID: {error}"),
-        )
-    })?;
-    let keys = [
-        TrackedStateKey {
-            schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
-            file_id: None,
-            entity_pk: branch_pk.clone(),
-        },
-        TrackedStateKey {
-            schema_key: UNDO_REDO_MARKER_SCHEMA_KEY.to_string(),
-            file_id: None,
-            entity_pk: branch_pk,
-        },
-    ];
+    let keys = semantic_keys(branch_id)?;
     let delta = load_commit_delta(transaction, commit_id).await?;
     if delta
         .iter()
@@ -273,7 +317,12 @@ where
         return Err(missing_operation_marker(commit_id));
     }
     let marker = parse_marker(row.snapshot_content(), commit_id)?;
-    let state = match marker.kind {
+    let state = semantic_state_from_marker(marker, commit_id);
+    Ok((state, delta))
+}
+
+fn semantic_state_from_marker(marker: UndoRedoMarker, commit_id: CommitId) -> SemanticState {
+    match marker.kind {
         UndoRedoKind::Undo => SemanticState {
             undo_top: marker.undo_target_after,
             redo_top: Some(commit_id),
@@ -286,8 +335,7 @@ where
             redo_target: None,
             redo_next: None,
         },
-    };
-    Ok((state, delta))
+    }
 }
 
 async fn operation_marker_at<S>(
