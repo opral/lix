@@ -1035,32 +1035,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_rejects_active_transaction_read_blocked_in_storage_read() {
-        let (session, gate) = open_blocking_read_session().await;
+    async fn explicit_transaction_reads_reuse_the_opening_storage_snapshot() {
+        let (session, _gate) = open_blocking_read_session().await;
         let mut transaction = session
             .begin_transaction()
             .await
             .expect("transaction should begin");
 
-        gate.block_next();
-        let reader = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .expect("test runtime should build");
-            runtime.block_on(async move { transaction.execute("SELECT 1", &[]).await })
-        });
-        gate.wait_until_blocked();
+        let result = transaction
+            .execute("SELECT 1", &[])
+            .await
+            .expect("transaction read should use the retained opening snapshot");
+        assert_eq!(result.len(), 1);
 
         let close_error = session
             .close()
             .await
-            .expect_err("close should reject an active explicit transaction read");
+            .expect_err("close should reject an active explicit transaction");
         assert_eq!(close_error.code, "LIX_INVALID_TRANSACTION_STATE");
-
-        gate.release();
-        let result = join_thread(reader, "blocked transaction reader")
-            .expect("in-flight transaction read should finish after rejected close");
-        assert_eq!(result.len(), 1);
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
+        session.close().await.expect("session should close");
     }
 
     #[tokio::test]

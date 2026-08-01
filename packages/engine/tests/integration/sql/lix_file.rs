@@ -3935,7 +3935,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_transaction_path_index_cache_rejects_stale_other_session_snapshot,
+    lix_file_transaction_path_index_cache_retains_other_session_snapshot,
     options = crate::support::simulation_test::engine::SimulationOptions {
         deterministic: false,
     },
@@ -3987,14 +3987,14 @@ simulation_test!(
             .await
             .expect("other session file should commit");
 
-        let error = transaction
+        let still_missing = transaction
             .execute(
                 "SELECT id, path FROM lix_file WHERE path = '/other-session.md'",
                 &[],
             )
             .await
-            .expect_err("stale transaction lookup should reject the newer committed revision");
-        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+            .expect("transaction lookup should retain its opening snapshot");
+        assert_eq!(still_missing.len(), 0);
 
         transaction
             .rollback()
@@ -4028,7 +4028,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_transaction_path_index_cache_rejects_stale_merge_snapshot,
+    lix_file_transaction_path_index_cache_retains_pre_merge_snapshot,
     options = crate::support::simulation_test::engine::SimulationOptions {
         deterministic: false,
     },
@@ -4105,14 +4105,14 @@ simulation_test!(
             .expect("merge should succeed");
         assert_eq!(receipt.outcome, MergeBranchOutcome::MergeCommitted);
 
-        let error = transaction
+        let still_missing = transaction
             .execute(
                 "SELECT id, path FROM lix_file WHERE path = '/merged.md'",
                 &[],
             )
             .await
-            .expect_err("stale transaction lookup should reject merged reachable descriptors");
-        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+            .expect("transaction lookup should retain its pre-merge snapshot");
+        assert_eq!(still_missing.len(), 0);
 
         transaction
             .rollback()

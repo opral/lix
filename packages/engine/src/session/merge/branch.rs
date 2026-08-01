@@ -188,11 +188,8 @@ where
                     derived_plugin_blob_conflicts(&mut reader, &analysis).await?
                 };
 
-                let resolvable_plugin_conflicts = {
-                    let mut reader = transaction.tracked_state_reader().await;
-                    resolvable_plugin_conflict_keys(&mut reader, &analysis, &derived_blob_files)
-                        .await?
-                };
+                let resolvable_plugin_conflicts =
+                    resolvable_plugin_conflict_keys(&analysis, &derived_blob_files);
 
                 let plugin_resolution_stats = if analysis.outcome == MergeOutcome::MergeCommitted {
                     let plugin_conflict_groups = {
@@ -353,28 +350,25 @@ where
                 // conflicts before constructing a Component Store. A merge
                 // with an unrelated unresolved row must not pay for (or be
                 // masked by) a plugin resolver invocation.
-                let resolvable_plugin_conflicts = async {
-                    let mut reader = transaction.tracked_state_reader().await;
-                    resolvable_plugin_conflict_keys(&mut reader, &analysis, &derived_blob_files)
-                        .await
-                }
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.merge_plugin_conflict_preflight"
-                ))
-                .await?;
-                let effective_conflicts = analysis
-                    .conflict_batch()
-                    .expect("mergeCommitted analysis should include a conflict batch")
-                    .iter()
-                    .filter(|conflict| {
-                        !is_derived_blob_conflict(conflict.tracked(), &derived_blob_files)
-                            && !is_resolvable_plugin_semantic_conflict(
-                                conflict.tracked(),
-                                &resolvable_plugin_conflicts,
-                            )
-                    })
-                    .collect::<Vec<_>>();
+                let resolvable_plugin_conflicts =
+                    resolvable_plugin_conflict_keys(&analysis, &derived_blob_files);
+                let effective_conflicts = if resolvable_plugin_conflicts
+                    .covers_all_with_derived_blobs(merge_plan.conflicts.len(), &derived_blob_files)
+                {
+                    Vec::new()
+                } else {
+                    analysis
+                        .conflict_batch()
+                        .expect("mergeCommitted analysis should include a conflict batch")
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, conflict)| {
+                            !is_derived_blob_conflict(conflict.tracked(), &derived_blob_files)
+                                && !resolvable_plugin_conflicts.contains_index(*index)
+                        })
+                        .map(|(_, conflict)| conflict)
+                        .collect::<Vec<_>>()
+                };
                 if !effective_conflicts.is_empty() {
                     return Err(merge_conflict_error(
                         &effective_conflicts
@@ -505,10 +499,45 @@ const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
+#[derive(Debug, Clone)]
+struct DerivedPluginFileConflict {
+    plugin: PluginRegistryEntry,
+    descriptor: WasmFileDescriptor,
+    conflict_indices: Vec<usize>,
+    derived_blob_conflict_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DerivedPluginConflictIndex {
+    owners: BTreeMap<String, PluginFileOwner>,
+    files: BTreeMap<String, DerivedPluginFileConflict>,
+}
+
+impl DerivedPluginConflictIndex {
+    fn context(&self, file_id: &str) -> Option<&DerivedPluginFileConflict> {
+        self.files.get(file_id)
+    }
+
+    fn owner(&self, file_id: &str) -> Option<&PluginFileOwner> {
+        self.owners.get(file_id)
+    }
+
+    fn contains_file(&self, file_id: &str) -> bool {
+        self.owners.contains_key(file_id)
+    }
+
+    fn derived_blob_conflict_count(&self) -> usize {
+        self.files
+            .values()
+            .map(|context| context.derived_blob_conflict_count)
+            .sum()
+    }
+}
+
 async fn derived_plugin_blob_conflicts<S>(
     reader: &mut TrackedStateStoreReader<S>,
     analysis: &super::analysis::MergeAnalysis,
-) -> Result<BTreeMap<String, PluginFileOwner>, LixError>
+) -> Result<DerivedPluginConflictIndex, LixError>
 where
     S: crate::storage_adapter::StorageAdapterRead,
 {
@@ -522,14 +551,24 @@ where
     // row with a deleted file owner. Keep the whole conflict visible until a
     // first-class lifecycle conflict model exists.
     let Some(conflicts) = analysis.conflict_batch() else {
-        return Ok(BTreeMap::new());
+        return Ok(DerivedPluginConflictIndex::default());
     };
-    let file_ids = conflicts
-        .iter()
-        .filter_map(|conflict| conflict.file_id().map(str::to_owned))
+    let mut conflict_indices_by_file = BTreeMap::<String, Vec<usize>>::new();
+    for (index, conflict) in conflicts.iter().enumerate() {
+        let Some(file_id) = conflict.file_id() else {
+            continue;
+        };
+        conflict_indices_by_file
+            .entry(file_id.to_owned())
+            .or_default()
+            .push(index);
+    }
+    let file_ids = conflict_indices_by_file
+        .keys()
+        .cloned()
         .collect::<BTreeSet<_>>();
     if file_ids.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok(DerivedPluginConflictIndex::default());
     }
 
     let owner_keys = file_ids
@@ -574,7 +613,7 @@ where
         common_owners.insert(file_id, owner);
     }
     if common_owners.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok(DerivedPluginConflictIndex::default());
     }
 
     // Semantic resolution regenerates the derived blob through the target
@@ -614,23 +653,58 @@ where
     .await?;
 
     let mut derived = BTreeMap::new();
+    let mut derived_owners = BTreeMap::new();
     for (file_id, owner) in common_owners {
-        if common_descriptors
-            .get(&file_id)
-            .is_some_and(|(path, _)| path.is_some())
-            && pinned_conflict_plugin_entry(
-                &owner,
-                &base_registry,
-                &target_registry,
-                &source_registry,
-                &file_id,
-            )
-            .is_ok()
-        {
-            derived.insert(file_id, owner);
-        }
+        let Some((path @ Some(_), media_type)) = common_descriptors.get(&file_id).cloned() else {
+            continue;
+        };
+        let Ok(plugin) = pinned_conflict_plugin_entry(
+            &owner,
+            &base_registry,
+            &target_registry,
+            &source_registry,
+            &file_id,
+        ) else {
+            continue;
+        };
+        let descriptor = WasmFileDescriptor {
+            path,
+            media_type,
+            plugin: WasmPluginSelection {
+                plugin_key: plugin.key().to_owned(),
+                generation: plugin.archive_blob_hash().to_owned(),
+            },
+        };
+        let conflict_indices = conflict_indices_by_file
+            .remove(&file_id)
+            .unwrap_or_default();
+        let merge_plan = analysis
+            .merge_plan()
+            .expect("derived plugin conflicts require a merge plan");
+        let derived_blob_conflict_count = conflict_indices
+            .iter()
+            .filter(|&&index| {
+                matches!(
+                    merge_plan.conflicts[index].identity.schema_key(),
+                    BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
+                )
+            })
+            .count();
+        derived.insert(
+            file_id.clone(),
+            DerivedPluginFileConflict {
+                plugin,
+                descriptor,
+                conflict_indices,
+                derived_blob_conflict_count,
+            },
+        );
+        derived_owners.insert(file_id, owner);
     }
-    Ok(derived)
+    Ok(DerivedPluginConflictIndex {
+        owners: derived_owners,
+        files: derived,
+    })
 }
 
 fn common_live_plugin_owner_ref(
@@ -705,7 +779,7 @@ fn common_live_plugin_owner(
 
 fn is_derived_blob_conflict(
     conflict: &TrackedStateMergeConflict,
-    derived_blob_files: &BTreeMap<String, PluginFileOwner>,
+    derived_blob_files: &DerivedPluginConflictIndex,
 ) -> bool {
     matches!(
         conflict.identity.schema_key(),
@@ -713,17 +787,17 @@ fn is_derived_blob_conflict(
     ) && conflict
         .identity
         .file_id()
-        .is_some_and(|file_id| derived_blob_files.contains_key(file_id))
+        .is_some_and(|file_id| derived_blob_files.contains_file(file_id))
 }
 
 fn pick_is_derived_plugin_state(
     pick: &TrackedStateMergePick,
-    derived_blob_files: &BTreeMap<String, PluginFileOwner>,
+    derived_blob_files: &DerivedPluginConflictIndex,
 ) -> bool {
     let Some(file_id) = pick.selected_row.file_id() else {
         return false;
     };
-    let Some(owner) = derived_blob_files.get(file_id) else {
+    let Some(owner) = derived_blob_files.owner(file_id) else {
         return false;
     };
     matches!(
@@ -785,104 +859,67 @@ struct PluginMergeConflictGroup {
     conflicts: PluginMergeConflictBatch,
 }
 
-fn is_resolvable_plugin_semantic_conflict(
-    conflict: &TrackedStateMergeConflict,
-    resolvable_plugin_conflicts: &BTreeSet<TrackedStateDiffIdentity>,
-) -> bool {
-    resolvable_plugin_conflicts.contains(&conflict.identity)
+#[derive(Debug, Clone, Default)]
+struct ResolvablePluginConflicts {
+    indices: Vec<usize>,
+}
+
+impl ResolvablePluginConflicts {
+    fn contains_index(&self, index: usize) -> bool {
+        self.indices.binary_search(&index).is_ok()
+    }
+
+    fn covers_all_with_derived_blobs(
+        &self,
+        conflict_count: usize,
+        derived: &DerivedPluginConflictIndex,
+    ) -> bool {
+        self.indices
+            .len()
+            .checked_add(derived.derived_blob_conflict_count())
+            == Some(conflict_count)
+    }
 }
 
 /// Returns exactly the semantic conflict identities that can be handed to a
 /// static resolver. This deliberately does not execute Wasm: callers use it
 /// both to make merge preview honest and to reject ordinary conflicts before
 /// allocating a Component Store.
-async fn resolvable_plugin_conflict_keys<S>(
-    reader: &mut TrackedStateStoreReader<S>,
+fn resolvable_plugin_conflict_keys(
     analysis: &super::analysis::MergeAnalysis,
-    derived_blob_files: &BTreeMap<String, PluginFileOwner>,
-) -> Result<BTreeSet<TrackedStateDiffIdentity>, LixError>
-where
-    S: crate::storage_adapter::StorageAdapterRead,
-{
+    derived_blob_files: &DerivedPluginConflictIndex,
+) -> ResolvablePluginConflicts {
     let Some(merge_plan) = analysis.merge_plan() else {
-        return Ok(BTreeSet::new());
+        return ResolvablePluginConflicts::default();
     };
-    let semantic_conflicts = merge_plan
-        .conflicts
-        .iter()
-        .filter(|conflict| {
-            let Some(file_id) = conflict.identity.file_id() else {
-                return false;
-            };
-            derived_blob_files.get(file_id).is_some_and(|owner| {
-                owner
-                    .schema_keys()
-                    .iter()
-                    .any(|schema_key| schema_key == conflict.identity.schema_key())
-            })
-        })
-        .collect::<Vec<_>>();
-    if semantic_conflicts.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-
-    let registry_key = TrackedStateKey {
-        schema_key: "lix_key_value".to_owned(),
-        file_id: None,
-        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
-    };
-    let base_registry = load_historical_plugin_registry(
-        reader,
-        &analysis.commits.base_commit_id.to_string(),
-        &registry_key,
-    )
-    .await?;
-    let target_registry = load_historical_plugin_registry(
-        reader,
-        &analysis.commits.target_commit_id.to_string(),
-        &registry_key,
-    )
-    .await?;
-    let source_registry = load_historical_plugin_registry(
-        reader,
-        &analysis.commits.source_commit_id.to_string(),
-        &registry_key,
-    )
-    .await?;
-
-    let mut eligible = BTreeSet::new();
-    for conflict in semantic_conflicts {
-        let file_id = conflict
-            .identity
-            .file_id()
-            .expect("semantic plugin conflicts have a file id");
+    let mut eligible = ResolvablePluginConflicts::default();
+    for (file_id, context) in &derived_blob_files.files {
         let owner = derived_blob_files
-            .get(file_id)
-            .expect("semantic plugin conflicts have a derived owner");
-        // An unavailable, mismatched, or upgraded historical entry is not a
-        // fatal preflight error. Leave that row visible as an ordinary merge
-        // conflict in both preview and merge instead of claiming it was
-        // resolved. Corrupt registry snapshots were rejected while loading.
-        if pinned_conflict_plugin_entry(
-            owner,
-            &base_registry,
-            &target_registry,
-            &source_registry,
-            file_id,
-        )
-        .is_ok()
-        {
-            eligible.insert(conflict.identity.clone());
+            .owner(file_id)
+            .expect("derived plugin context has an owner");
+        for &index in &context.conflict_indices {
+            let conflict = &merge_plan.conflicts[index];
+            if !matches!(
+                conflict.identity.schema_key(),
+                BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
+            ) && owner
+                .schema_keys()
+                .iter()
+                .any(|schema_key| schema_key == conflict.identity.schema_key())
+            {
+                eligible.indices.push(index);
+            }
         }
     }
-    Ok(eligible)
+    eligible.indices.sort_unstable();
+    eligible
 }
 
 async fn plugin_merge_conflict_groups<S>(
     reader: &mut TrackedStateStoreReader<S>,
     analysis: &super::analysis::MergeAnalysis,
-    derived_blob_files: &BTreeMap<String, PluginFileOwner>,
-    resolvable_plugin_conflicts: &BTreeSet<TrackedStateDiffIdentity>,
+    derived_blob_files: &DerivedPluginConflictIndex,
+    resolvable_plugin_conflicts: &ResolvablePluginConflicts,
 ) -> Result<Vec<PluginMergeConflictGroup>, LixError>
 where
     S: crate::storage_adapter::StorageAdapterRead,
@@ -890,45 +927,14 @@ where
     let merge_plan = analysis
         .merge_plan()
         .expect("plugin conflict resolution requires a merge plan");
-    let semantic_conflicts = merge_plan
-        .conflicts
+    let semantic_conflicts = resolvable_plugin_conflicts
+        .indices
         .iter()
-        .filter(|conflict| resolvable_plugin_conflicts.contains(&conflict.identity))
+        .map(|&index| &merge_plan.conflicts[index])
         .collect::<Vec<_>>();
     if semantic_conflicts.is_empty() {
         return Ok(Vec::new());
     }
-
-    let semantic_file_ids = semantic_conflicts
-        .iter()
-        .filter_map(|conflict| conflict.identity.file_id().map(str::to_owned))
-        .collect::<BTreeSet<_>>();
-    let historical_descriptors =
-        historical_conflict_file_descriptors(reader, analysis, &semantic_file_ids).await?;
-
-    let registry_key = TrackedStateKey {
-        schema_key: "lix_key_value".to_owned(),
-        file_id: None,
-        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
-    };
-    let base_registry = load_historical_plugin_registry(
-        reader,
-        &analysis.commits.base_commit_id.to_string(),
-        &registry_key,
-    )
-    .await?;
-    let target_registry = load_historical_plugin_registry(
-        reader,
-        &analysis.commits.target_commit_id.to_string(),
-        &registry_key,
-    )
-    .await?;
-    let source_registry = load_historical_plugin_registry(
-        reader,
-        &analysis.commits.source_commit_id.to_string(),
-        &registry_key,
-    )
-    .await?;
 
     let keys = semantic_conflicts
         .iter()
@@ -970,16 +976,10 @@ where
             .file_id()
             .expect("semantic plugin conflicts have a file id")
             .to_owned();
-        let owner = derived_blob_files
-            .get(&file_id)
+        let context = derived_blob_files
+            .context(&file_id)
             .expect("semantic plugin conflicts have a derived owner");
-        let plugin = pinned_conflict_plugin_entry(
-            owner,
-            &base_registry,
-            &target_registry,
-            &source_registry,
-            &file_id,
-        )?;
+        let plugin = context.plugin.clone();
         verify_historical_conflict_row_ref(base, conflict.target.before.as_ref(), "base")?;
         verify_historical_conflict_row_ref(target, conflict.target.after.as_ref(), "target")?;
         verify_historical_conflict_row_ref(source, conflict.source.after.as_ref(), "source")?;
@@ -991,22 +991,7 @@ where
             a: historical_live_payload_ref(a)?,
             b: historical_live_payload_ref(b)?,
         };
-        let (path, media_type) = historical_descriptors
-            .get(&file_id)
-            .cloned()
-            .unwrap_or((None, None));
-        let descriptor = WasmFileDescriptor {
-            // The historical file descriptor is not resolver authority, but
-            // a common path/media identity lets one plugin support multiple
-            // formats without guessing from a semantic row. Rename-divergent
-            // or unavailable descriptors deliberately remain `None`.
-            path,
-            media_type,
-            plugin: WasmPluginSelection {
-                plugin_key: plugin.key().to_owned(),
-                generation: plugin.archive_blob_hash().to_owned(),
-            },
-        };
+        let descriptor = context.descriptor.clone();
         match groups.get_mut(&file_id) {
             Some(group) => {
                 if group.plugin != plugin || group.descriptor != descriptor {
@@ -1706,7 +1691,7 @@ fn push_transaction_row_from_tracked_row_ref(
 async fn materialized_plugin_merge_rows<S>(
     reader: &mut TrackedStateStoreReader<S>,
     analysis: &super::analysis::MergeAnalysis,
-    derived_blob_files: &BTreeMap<String, PluginFileOwner>,
+    derived_blob_files: &DerivedPluginConflictIndex,
     target_branch_id: &SharedStr,
     resolved_plugin_rows: RawWriteBatch,
 ) -> Result<RawWriteBatch, LixError>
@@ -1721,7 +1706,7 @@ where
         .iter()
         .filter(|pick| {
             pick.selected_row.file_id().is_some_and(|file_id| {
-                derived_blob_files.get(file_id).is_some_and(|owner| {
+                derived_blob_files.owner(file_id).is_some_and(|owner| {
                     owner
                         .schema_keys()
                         .iter()
@@ -1735,7 +1720,7 @@ where
         let Some(file_id) = pick.selected_row.file_id() else {
             continue;
         };
-        if !derived_blob_files.get(file_id).is_some_and(|owner| {
+        if !derived_blob_files.owner(file_id).is_some_and(|owner| {
             owner
                 .schema_keys()
                 .iter()
@@ -1875,27 +1860,34 @@ fn preview_from_analysis(
     target_branch_id: &str,
     source_branch_id: &str,
     analysis: &super::analysis::MergeAnalysis,
-    derived_blob_files: &BTreeMap<String, PluginFileOwner>,
-    resolvable_plugin_conflicts: &BTreeSet<TrackedStateDiffIdentity>,
+    derived_blob_files: &DerivedPluginConflictIndex,
+    resolvable_plugin_conflicts: &ResolvablePluginConflicts,
     plugin_resolution_stats: &MergeChangeStats,
 ) -> Result<MergeBranchPreview, LixError> {
-    let conflicts = analysis
-        .conflict_batch()
-        .map(|batch| {
-            batch
-                .iter()
-                .filter(|conflict| {
-                    !is_derived_blob_conflict(conflict.tracked(), derived_blob_files)
-                        && !is_resolvable_plugin_semantic_conflict(
-                            conflict.tracked(),
-                            resolvable_plugin_conflicts,
-                        )
-                })
-                .map(merge_conflict_from_analysis)
-                .collect::<Result<Vec<_>, LixError>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let conflicts = match analysis.merge_plan() {
+        Some(plan)
+            if resolvable_plugin_conflicts
+                .covers_all_with_derived_blobs(plan.conflicts.len(), derived_blob_files) =>
+        {
+            Vec::new()
+        }
+        _ => analysis
+            .conflict_batch()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, conflict)| {
+                        !is_derived_blob_conflict(conflict.tracked(), derived_blob_files)
+                            && !resolvable_plugin_conflicts.contains_index(*index)
+                    })
+                    .map(|(_, conflict)| conflict)
+                    .map(merge_conflict_from_analysis)
+                    .collect::<Result<Vec<_>, LixError>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+    };
     Ok(MergeBranchPreview {
         outcome: merge_branch_outcome_from_analysis(analysis.outcome),
         target_branch_id: target_branch_id.to_string(),
@@ -2183,12 +2175,15 @@ mod tests {
         }
     }
 
-    fn derived_file_owner(file_id: &str) -> BTreeMap<String, PluginFileOwner> {
-        BTreeMap::from([(
-            file_id.to_owned(),
-            PluginFileOwner::new(file_id, "plugin_git_text", vec!["git_text_line".to_owned()])
-                .unwrap(),
-        )])
+    fn derived_file_owner(file_id: &str) -> DerivedPluginConflictIndex {
+        DerivedPluginConflictIndex {
+            owners: BTreeMap::from([(
+                file_id.to_owned(),
+                PluginFileOwner::new(file_id, "plugin_git_text", vec!["git_text_line".to_owned()])
+                    .unwrap(),
+            )]),
+            files: BTreeMap::new(),
+        }
     }
 
     #[test]

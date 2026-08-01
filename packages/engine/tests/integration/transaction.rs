@@ -48,7 +48,7 @@ where
 }
 
 #[tokio::test]
-async fn stale_transaction_cannot_publish_over_newer_commit() {
+async fn stale_transaction_composes_disjoint_semantic_writes() {
     let storage = Memory::new();
     Engine::initialize(storage.clone())
         .await
@@ -85,17 +85,10 @@ async fn stale_transaction_cannot_publish_over_newer_commit() {
         .await
         .expect("newer transaction should commit");
 
-    let read_error = stale
-        .execute("SELECT key FROM lix_key_value", &[])
-        .await
-        .expect_err("stale transaction must not observe a newer snapshot");
-    assert_eq!(read_error.code, "LIX_TRANSACTION_CONFLICT");
-
-    let error = stale
+    stale
         .commit()
         .await
-        .expect_err("stale transaction must not publish");
-    assert_eq!(error.code, "LIX_TRANSACTION_CONFLICT");
+        .expect("disjoint stale transaction should compose onto the current head");
 
     let result = winner_session
         .execute(
@@ -105,8 +98,134 @@ async fn stale_transaction_cannot_publish_over_newer_commit() {
         )
         .await
         .expect("committed state should remain readable");
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(result.rows()[0].get::<String>("key").unwrap(), "stale-key");
+    assert_eq!(result.rows()[1].get::<String>("key").unwrap(), "winner-key");
+}
+
+#[tokio::test]
+async fn stale_transaction_reports_overlapping_ordinary_insert_atomically() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
+        .await
+        .expect("initialized storage should create an engine");
+    let stale_session = engine
+        .open_workspace_session()
+        .await
+        .expect("stale session should open");
+    let winner_session = engine
+        .open_workspace_session()
+        .await
+        .expect("winner session should open");
+
+    let mut stale = stale_session
+        .begin_transaction()
+        .await
+        .expect("stale transaction should begin");
+    stale
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('same-key', 'stale')",
+            &[],
+        )
+        .await
+        .expect("stale transaction should stage its write");
+    winner_session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('same-key', 'winner')",
+            &[],
+        )
+        .await
+        .expect("winner transaction should commit");
+
+    let error = stale
+        .commit()
+        .await
+        .expect_err("overlapping ordinary rows must remain conservative");
+    assert_eq!(error.code, "LIX_ERROR_UNIQUE");
+    let result = winner_session
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'same-key'",
+            &[],
+        )
+        .await
+        .expect("winner state should remain readable");
     assert_eq!(result.rows().len(), 1);
-    assert_eq!(result.rows()[0].get::<String>("key").unwrap(), "winner-key");
+    assert_eq!(
+        result.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!("winner")
+    );
+}
+
+#[tokio::test]
+async fn explicit_transaction_reads_stable_snapshot_and_own_writes() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
+    let transaction_session = engine.open_workspace_session().await.unwrap();
+    let concurrent_session = engine.open_workspace_session().await.unwrap();
+    concurrent_session
+        .execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+             VALUES ('snapshot-key', 'base', false)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let mut transaction = transaction_session.begin_transaction().await.unwrap();
+    let opening = transaction
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'snapshot-key'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        opening.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!("base")
+    );
+    concurrent_session
+        .execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+             VALUES ('snapshot-key', 'concurrent', false) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let stable = transaction
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'snapshot-key'",
+            &[],
+        )
+        .await
+        .expect("concurrent commits must not invalidate transaction reads");
+    assert_eq!(
+        stable.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!("base")
+    );
+    transaction
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('own-key', 'own')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let own = transaction
+        .execute("SELECT value FROM lix_key_value WHERE key = 'own-key'", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        own.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!("own")
+    );
+    transaction.rollback().await.unwrap();
 }
 
 #[tokio::test]

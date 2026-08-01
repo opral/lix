@@ -9,7 +9,7 @@
 )]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use smallvec::SmallVec;
@@ -715,6 +715,46 @@ impl<'a> PreparedWriteValidationSet<'a> {
 }
 
 impl PreparedWriteSet {
+    pub(crate) fn replace_reconciled_file_writes(
+        &mut self,
+        mut replacement: PreparedWriteSet,
+        file_ids: &BTreeSet<String>,
+    ) {
+        let replacement_keys = replacement
+            .state_rows
+            .iter()
+            .map(PreparedStateRowIdentity::from)
+            .collect::<BTreeSet<_>>();
+        let retained = self
+            .state_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                (!replacement_keys.contains(&PreparedStateRowIdentity::from(row))).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        self.insert_selection.select_rows(&retained);
+        self.state_rows.select_rows(&retained);
+        let replacement_count = replacement.state_rows.len();
+        self.state_rows.append(replacement.state_rows);
+        self.insert_selection
+            .resize_rows(self.state_rows.len().saturating_sub(replacement_count));
+        for _ in 0..replacement_count {
+            self.insert_selection.push_not_insert();
+        }
+        self.file_data_writes
+            .retain(|write| !file_ids.contains(&write.file_id));
+        self.file_data_writes
+            .append(&mut replacement.file_data_writes);
+        for change_refs in self.commit_change_refs_by_branch.values_mut() {
+            change_refs.tracked_change_count = self
+                .state_rows
+                .iter()
+                .filter(|row| !row.untracked && row.branch_id.as_str() != GLOBAL_BRANCH_ID)
+                .count();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn validation_rows(&self) -> impl Iterator<Item = PreparedValidationRow<'_>> + '_ {
         self.state_rows.iter().map(PreparedValidationRow::State)

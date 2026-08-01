@@ -17,8 +17,9 @@ use axum::{
 };
 use lix_sdk::{
     Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions,
-    ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, ObserveEvent,
-    ObserveEvents, Storage, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
+    ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction,
+    ObserveEvent, ObserveEvents, Storage, SwitchBranchOptions, Value, VerifiedRequestBlob,
+    WireValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -58,6 +59,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const SESSION_ID_HEADER: &str = "lix-session-id";
 /// Standard request identity for replay-safe SQL mutations.
 pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+/// Internal capability binding requests to one remote transaction lifecycle.
+pub const TRANSACTION_ID_HEADER: &str = "lix-transaction-id";
 /// Header distinguishing a missing file from a present empty file on the raw
 /// binary file-read endpoint.
 pub const FILE_FOUND_HEADER: &str = "lix-file-found";
@@ -94,6 +97,7 @@ const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
 
 const SESSION_TOKEN_BYTES: usize = 32;
 const SESSION_TOKEN_HEX_LEN: usize = SESSION_TOKEN_BYTES * 2;
+const MAX_COMPLETED_REMOTE_TRANSACTIONS: usize = 8;
 const MAX_IDEMPOTENCY_COMPONENT_BYTES: usize = 255;
 const SESSION_OPEN_GATE_CLOSING: usize = 1 << (usize::BITS - 1);
 const SESSION_OPEN_GATE_COUNT_MASK: usize = !SESSION_OPEN_GATE_CLOSING;
@@ -276,10 +280,52 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     lix: Arc<AsyncRwLock<Arc<Lix<S>>>>,
+    transactions: AsyncMutex<RemoteTransactionRegistry<S>>,
     last_used: Mutex<Instant>,
     leases: AtomicUsize,
+    transaction_active: std::sync::atomic::AtomicBool,
     request_blobs: Mutex<RequestBlobCache>,
     max_reconstructed_request_blob_bytes: usize,
+}
+
+struct RemoteTransactionRegistry<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    active: Option<ActiveRemoteTransaction<S>>,
+    completed: VecDeque<CompletedRemoteTransaction>,
+}
+
+struct ActiveRemoteTransaction<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    id: String,
+    transaction: LixTransaction<S>,
+}
+
+#[derive(Clone)]
+struct CompletedRemoteTransaction {
+    id: String,
+    result: Result<RemoteTransactionOutcome, LixError>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RemoteTransactionOutcome {
+    Committed,
+    RolledBack,
+}
+
+impl<S> Default for RemoteTransactionRegistry<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    fn default() -> Self {
+        Self {
+            active: None,
+            completed: VecDeque::new(),
+        }
+    }
 }
 
 struct RequestBlobCacheBudget {
@@ -440,8 +486,10 @@ where
     ) -> Self {
         Self {
             lix: Arc::new(AsyncRwLock::new(Arc::new(lix))),
+            transactions: AsyncMutex::new(RemoteTransactionRegistry::default()),
             last_used: Mutex::new(now),
             leases: AtomicUsize::new(0),
+            transaction_active: std::sync::atomic::AtomicBool::new(false),
             request_blobs: Mutex::new(RequestBlobCache::new(request_blob_budget)),
             max_reconstructed_request_blob_bytes,
         }
@@ -476,7 +524,9 @@ where
     }
 
     fn is_idle_expired(&self, now: Instant, timeout: Duration) -> bool {
-        self.lease_count() == 0 && now.saturating_duration_since(self.last_used()) >= timeout
+        self.lease_count() == 0
+            && !self.transaction_active.load(Ordering::Acquire)
+            && now.saturating_duration_since(self.last_used()) >= timeout
     }
 
     fn request_blob(&self, sha256: &str) -> Option<VerifiedRequestBlob> {
@@ -710,6 +760,128 @@ where
         }
     }
 
+    async fn begin_transaction(&self) -> Result<String, LixError> {
+        let mut transactions = self.record.transactions.lock().await;
+        if transactions.active.is_some() {
+            return Err(remote_transaction_state_error(
+                "Lix session already has an active transaction",
+            ));
+        }
+        let lix = Arc::clone(&*self.record.lix.read().await);
+        let id = generate_capability_id()?;
+        transactions.active = Some(ActiveRemoteTransaction {
+            id: id.clone(),
+            transaction: lix.begin_transaction().await?,
+        });
+        self.record
+            .transaction_active
+            .store(true, Ordering::Release);
+        Ok(id)
+    }
+
+    async fn transaction_execute(
+        &self,
+        transaction_id: String,
+        sql: String,
+        params: Vec<Value>,
+        options: ExecuteOptions,
+    ) -> Result<ExecuteResult, LixError> {
+        let mut transactions = self.record.transactions.lock().await;
+        let mut active = transactions.active.take().ok_or_else(|| {
+            completed_transaction_error(&transactions, &transaction_id).unwrap_or_else(|| {
+                remote_transaction_state_error("Lix session has no active transaction")
+            })
+        })?;
+        if active.id != transaction_id {
+            transactions.active = Some(active);
+            return Err(remote_transaction_state_error(
+                "remote transaction capability does not match the active transaction",
+            ));
+        }
+        let runtime = Handle::try_current().map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("access Lix server runtime: {error}"),
+            )
+        })?;
+        let operation_lease = self.clone();
+        let parent = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let joined = tokio::task::spawn_blocking(move || {
+            let _operation_lease = operation_lease;
+            let result = tracing::dispatcher::with_default(&dispatch, || {
+                parent.in_scope(|| {
+                    runtime.block_on(async {
+                        active
+                            .transaction
+                            .execute_with_options(&sql, &params, options)
+                            .await
+                    })
+                })
+            });
+            (active, result)
+        })
+        .await
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("join Lix server transaction operation: {error}"),
+            )
+        })?;
+        transactions.active = Some(joined.0);
+        joined.1
+    }
+
+    async fn commit_transaction(&self, transaction_id: String) -> Result<(), LixError> {
+        self.finish_transaction(transaction_id, RemoteTransactionOutcome::Committed)
+            .await
+    }
+
+    async fn rollback_transaction(&self, transaction_id: String) -> Result<(), LixError> {
+        self.finish_transaction(transaction_id, RemoteTransactionOutcome::RolledBack)
+            .await
+    }
+
+    async fn finish_transaction(
+        &self,
+        transaction_id: String,
+        requested: RemoteTransactionOutcome,
+    ) -> Result<(), LixError> {
+        let mut transactions = self.record.transactions.lock().await;
+        let Some(active) = transactions.active.take() else {
+            return completed_transaction_result(&transactions, &transaction_id, requested);
+        };
+        if active.id != transaction_id {
+            transactions.active = Some(active);
+            return Err(remote_transaction_state_error(
+                "remote transaction capability does not match the active transaction",
+            ));
+        }
+        let result = match requested {
+            RemoteTransactionOutcome::Committed => self
+                .run(move |_| async move { active.transaction.commit().await })
+                .await
+                .map(|()| RemoteTransactionOutcome::Committed),
+            RemoteTransactionOutcome::RolledBack => self
+                .run(move |_| async move { active.transaction.rollback().await })
+                .await
+                .map(|()| RemoteTransactionOutcome::RolledBack),
+        };
+        transactions
+            .completed
+            .push_back(CompletedRemoteTransaction {
+                id: transaction_id,
+                result: result.clone(),
+            });
+        while transactions.completed.len() > MAX_COMPLETED_REMOTE_TRANSACTIONS {
+            transactions.completed.pop_front();
+        }
+        self.record
+            .transaction_active
+            .store(false, Ordering::Release);
+        result.map(|_| ())
+    }
+
     async fn switch_branch(
         &self,
         options: SwitchBranchOptions,
@@ -762,6 +934,46 @@ where
             events: Arc::new(Mutex::new(lix.observe(sql, params)?)),
             terminal_sender,
         })
+    }
+}
+
+fn remote_transaction_state_error(message: impl Into<String>) -> LixError {
+    LixError::new("LIX_INVALID_TRANSACTION_STATE", message)
+}
+
+fn completed_transaction_error<S>(
+    transactions: &RemoteTransactionRegistry<S>,
+    transaction_id: &str,
+) -> Option<LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    transactions
+        .completed
+        .iter()
+        .any(|completed| completed.id == transaction_id)
+        .then(|| remote_transaction_state_error("Lix transaction is closed"))
+}
+
+fn completed_transaction_result<S>(
+    transactions: &RemoteTransactionRegistry<S>,
+    transaction_id: &str,
+    requested: RemoteTransactionOutcome,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let completed = transactions
+        .completed
+        .iter()
+        .find(|completed| completed.id == transaction_id)
+        .ok_or_else(|| remote_transaction_state_error("Lix session has no such transaction"))?;
+    match &completed.result {
+        Ok(actual) if *actual == requested => Ok(()),
+        Ok(_) => Err(remote_transaction_state_error(
+            "Lix transaction already completed with a different outcome",
+        )),
+        Err(error) => Err(error.clone()),
     }
 }
 
@@ -951,6 +1163,16 @@ where
         let protected = Router::new()
             .route("/lix/v1/execute", post(execute::<S>))
             .route("/lix/v1/execute-batch", post(execute_batch::<S>))
+            .route("/lix/v1/transaction/begin", post(begin_transaction::<S>))
+            .route(
+                "/lix/v1/transaction/execute",
+                post(transaction_execute::<S>),
+            )
+            .route("/lix/v1/transaction/commit", post(commit_transaction::<S>))
+            .route(
+                "/lix/v1/transaction/rollback",
+                post(rollback_transaction::<S>),
+            )
             .route("/lix/v1/file", get(read_file_data::<S>))
             .route("/lix/v1/file/upsert", post(upsert_file_data::<S>))
             .route(
@@ -1145,7 +1367,9 @@ where
             let lru_idle_id = registry
                 .sessions
                 .iter()
-                .filter(|(_, record)| record.lease_count() == 0)
+                .filter(|(_, record)| {
+                    record.lease_count() == 0 && !record.transaction_active.load(Ordering::Acquire)
+                })
                 .min_by_key(|(_, record)| record.last_used())
                 .map(|(session_id, _)| session_id.clone());
             let Some(lru_idle_id) = lru_idle_id else {
@@ -1225,8 +1449,14 @@ async fn close_session_record<S>(record: &SessionRecord<S>) -> Result<(), LixErr
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let rollback_result = match record.transactions.lock().await.active.take() {
+        Some(active) => active.transaction.rollback().await,
+        None => Ok(()),
+    };
+    record.transaction_active.store(false, Ordering::Release);
     let lix = record.lix.write().await;
-    lix.close().await
+    let close_result = lix.close().await;
+    rollback_result.and(close_result)
 }
 
 async fn close_removed_session<S>(record: Arc<SessionRecord<S>>)
@@ -1256,12 +1486,16 @@ where
 }
 
 fn generate_session_id() -> Result<String, ApiError> {
+    generate_capability_id().map_err(ApiError::from)
+}
+
+fn generate_capability_id() -> Result<String, LixError> {
     let mut bytes = [0_u8; SESSION_TOKEN_BYTES];
     getrandom::fill(&mut bytes).map_err(|error| {
-        ApiError::from(LixError::new(
+        LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("generate Lix protocol session identifier: {error}"),
-        ))
+        )
     })?;
     let mut encoded = String::with_capacity(SESSION_TOKEN_HEX_LEN);
     for byte in bytes {
@@ -1306,6 +1540,35 @@ fn optional_session_id(headers: &HeaderMap) -> Result<Option<String>, ApiError> 
 
 fn required_session_id(headers: &HeaderMap) -> Result<String, ApiError> {
     optional_session_id(headers)?.ok_or_else(ApiError::session_required)
+}
+
+fn required_transaction_id(headers: &HeaderMap) -> Result<String, ApiError> {
+    let mut values = headers.get_all(TRANSACTION_ID_HEADER).iter();
+    let value = values.next().ok_or_else(|| {
+        ApiError::from(remote_transaction_state_error(
+            "Lix-Transaction-Id is required",
+        ))
+    })?;
+    if values.next().is_some() {
+        return Err(ApiError::from(remote_transaction_state_error(
+            "Lix-Transaction-Id must be sent exactly once",
+        )));
+    }
+    let value = value.to_str().map_err(|_| {
+        ApiError::from(remote_transaction_state_error(
+            "Lix-Transaction-Id must contain visible ASCII",
+        ))
+    })?;
+    if value.len() != SESSION_TOKEN_HEX_LEN
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ApiError::from(remote_transaction_state_error(
+            "Lix-Transaction-Id has an invalid format",
+        )));
+    }
+    Ok(value.to_owned())
 }
 
 async fn require_session<S>(
@@ -1508,6 +1771,77 @@ where
             .map(ExecuteResponse::try_from)
             .collect::<Result<Vec<_>, _>>()?,
     ))
+}
+
+async fn begin_transaction<S>(
+    Extension(lease): Extension<SessionLease<S>>,
+) -> Result<Json<BeginTransactionResponse>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    Ok(Json(BeginTransactionResponse {
+        transaction_id: lease.begin_transaction().await?,
+    }))
+}
+
+async fn transaction_execute<S>(
+    Extension(lease): Extension<SessionLease<S>>,
+    headers: HeaderMap,
+    Json(request): Json<ExecuteRequest>,
+) -> Result<Json<ExecuteResponse>, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let sql = required_non_empty(request.sql, "sql")?;
+    let reconstructed_bytes_limit = lease.record.max_reconstructed_request_blob_bytes;
+    let mut reconstructed_bytes_remaining = reconstructed_bytes_limit;
+    let mut cache_candidate_bytes_remaining = 0;
+    let mut cache_candidates = Vec::new();
+    let decoded = decode_request_params(
+        request.params,
+        None,
+        false,
+        reconstructed_bytes_limit,
+        &mut reconstructed_bytes_remaining,
+        &mut cache_candidate_bytes_remaining,
+        &mut cache_candidates,
+        |sha256| lease.record.request_blob(sha256),
+    )?;
+    let result = lease
+        .transaction_execute(
+            required_transaction_id(&headers)?,
+            sql,
+            decoded.values,
+            request.options.into(),
+        )
+        .await?;
+    Ok(Json(ExecuteResponse::try_from(result)?))
+}
+
+async fn commit_transaction<S>(
+    Extension(lease): Extension<SessionLease<S>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    lease
+        .commit_transaction(required_transaction_id(&headers)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn rollback_transaction<S>(
+    Extension(lease): Extension<SessionLease<S>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    lease
+        .rollback_transaction(required_transaction_id(&headers)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Upserts one file from an octet-stream body.
@@ -2552,6 +2886,12 @@ struct HandshakeResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct BeginTransactionResponse {
+    transaction_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 // These are independently negotiated wire capabilities; grouping them would
 // change the flat handshake response without reducing protocol complexity.
 #[allow(clippy::struct_excessive_bools)]
@@ -3212,7 +3552,8 @@ mod tests {
     use object_store::memory::InMemory as ObjectStoreMemory;
     use serde_json::{Value as JsonValue, json};
     use std::{
-        io::{Read as _, Write as _},
+        io::{Cursor, Read as _, Write as _},
+        path::Path,
         sync::{Arc, Mutex, atomic::AtomicBool},
     };
     use tower::ServiceExt as _;
@@ -4721,6 +5062,72 @@ mod tests {
         request_with_headers(app, method, uri, session_id, &idempotency_headers, body).await
     }
 
+    async fn begin_remote_transaction(app: &Router, session_id: &str) -> String {
+        let response = request(
+            app,
+            "POST",
+            "/lix/v1/transaction/begin",
+            Some(session_id),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await["transactionId"]
+            .as_str()
+            .expect("transaction ID")
+            .to_owned()
+    }
+
+    async fn remote_transaction_request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        session_id: &str,
+        transaction_id: &str,
+        body: Option<JsonValue>,
+    ) -> Response {
+        request_with_headers(
+            app,
+            method,
+            uri,
+            Some(session_id),
+            &[(TRANSACTION_ID_HEADER, transaction_id)],
+            body,
+        )
+        .await
+    }
+
+    fn build_json_plugin_archive() -> Vec<u8> {
+        let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"));
+        let wasm = std::fs::read(wasm_path).expect("JSON plugin component should be built");
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (path, bytes) in [
+            (
+                "manifest.json",
+                include_str!("../../../plugins/json/manifest.json").as_bytes(),
+            ),
+            (
+                "schema/json_root.json",
+                include_str!("../../../plugins/json/schema/json_root.json").as_bytes(),
+            ),
+            (
+                "schema/json_object_member.json",
+                include_str!("../../../plugins/json/schema/json_object_member.json").as_bytes(),
+            ),
+            (
+                "schema/json_array_item.json",
+                include_str!("../../../plugins/json/schema/json_array_item.json").as_bytes(),
+            ),
+            ("plugin.wasm", wasm.as_slice()),
+        ] {
+            writer.start_file(path, options).expect("archive entry");
+            writer.write_all(bytes).expect("archive bytes");
+        }
+        writer.finish().expect("JSON plugin archive").into_inner()
+    }
+
     async fn request_with_headers(
         app: &Router,
         method: &str,
@@ -5984,6 +6391,296 @@ mod tests {
         assert_eq!(body.as_array().map(Vec::len), Some(2));
         assert_eq!(body[0]["rows"][0][0], json!({ "kind": "int", "value": 1 }));
         assert_eq!(body[1]["rows"][0][0], json!({ "kind": "int", "value": 2 }));
+    }
+
+    #[tokio::test]
+    async fn remote_transaction_commit_and_rollback_preserve_one_session_snapshot() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+
+        let transaction_id = begin_remote_transaction(&app.router, &session_id).await;
+        let staged = remote_transaction_request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/execute",
+            &session_id,
+            &transaction_id,
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('remote-tx', 'committed')"
+            })),
+        )
+        .await;
+        assert_eq!(staged.status(), StatusCode::OK);
+        let outside = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({ "sql": "SELECT 1" })),
+        )
+        .await;
+        assert_eq!(outside.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(outside).await["error"]["code"],
+            "LIX_INVALID_TRANSACTION_STATE"
+        );
+        let committed = remote_transaction_request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/commit",
+            &session_id,
+            &transaction_id,
+            None,
+        )
+        .await;
+        assert_eq!(committed.status(), StatusCode::NO_CONTENT);
+        let replayed_commit = remote_transaction_request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/commit",
+            &session_id,
+            &transaction_id,
+            None,
+        )
+        .await;
+        assert_eq!(replayed_commit.status(), StatusCode::NO_CONTENT);
+
+        let transaction_id = begin_remote_transaction(&app.router, &session_id).await;
+        let staged = remote_transaction_request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/execute",
+            &session_id,
+            &transaction_id,
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('remote-rollback', 'discarded')"
+            })),
+        )
+        .await;
+        assert_eq!(staged.status(), StatusCode::OK);
+        let rolled_back = remote_transaction_request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/rollback",
+            &session_id,
+            &transaction_id,
+            None,
+        )
+        .await;
+        assert_eq!(rolled_back.status(), StatusCode::NO_CONTENT);
+
+        let visible = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT key FROM lix_key_value WHERE key IN ('remote-tx', 'remote-rollback') ORDER BY key"
+            })),
+        )
+        .await;
+        assert_eq!(visible.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(visible).await["rows"],
+            json!([[{ "kind": "text", "value": "remote-tx" }]])
+        );
+    }
+
+    #[tokio::test]
+    async fn same_base_remote_transactions_compose_disjoint_semantic_writes() {
+        let app = app().await;
+        let (first, _) = new_session(&app.router).await;
+        let (second, _) = new_session(&app.router).await;
+        let first_transaction = begin_remote_transaction(&app.router, &first).await;
+        let second_transaction = begin_remote_transaction(&app.router, &second).await;
+        for (session_id, transaction_id, key) in [
+            (&first, &first_transaction, "first-disjoint"),
+            (&second, &second_transaction, "second-disjoint"),
+        ] {
+            let staged = remote_transaction_request(
+                &app.router,
+                "POST",
+                "/lix/v1/transaction/execute",
+                session_id,
+                transaction_id,
+                Some(json!({
+                    "sql": "INSERT INTO lix_key_value (key, value) VALUES ($1, $1)",
+                    "params": [{ "kind": "text", "value": key }]
+                })),
+            )
+            .await;
+            assert_eq!(staged.status(), StatusCode::OK);
+        }
+        for (session_id, transaction_id) in
+            [(&first, &first_transaction), (&second, &second_transaction)]
+        {
+            let committed = remote_transaction_request(
+                &app.router,
+                "POST",
+                "/lix/v1/transaction/commit",
+                session_id,
+                transaction_id,
+                None,
+            )
+            .await;
+            assert_eq!(committed.status(), StatusCode::NO_CONTENT);
+        }
+
+        let visible = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&first),
+            Some(json!({
+                "sql": "SELECT key FROM lix_key_value WHERE key LIKE '%-disjoint' ORDER BY key"
+            })),
+        )
+        .await;
+        assert_eq!(visible.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(visible).await["rows"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn same_base_remote_plugin_writes_resolve_and_converge() {
+        let app = app().await;
+        let root = &app.server.inner.root;
+        root.execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            &[
+                Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
+                Value::Blob(build_json_plugin_archive().into()),
+            ],
+        )
+        .await
+        .expect("JSON plugin should install");
+        root.execute(
+            "INSERT INTO lix_file (path, data) VALUES ('/remote-conflict.json', $1)",
+            &[Value::Blob(
+                br#"{"value":"base"}
+"#
+                .to_vec()
+                .into(),
+            )],
+        )
+        .await
+        .expect("base JSON file should import");
+
+        let (first, _) = new_session(&app.router).await;
+        let (second, _) = new_session(&app.router).await;
+        let first_transaction = begin_remote_transaction(&app.router, &first).await;
+        let second_transaction = begin_remote_transaction(&app.router, &second).await;
+        for (session_id, transaction_id, base64) in [
+            (&first, &first_transaction, "eyJ2YWx1ZSI6ImZpcnN0In0K"),
+            (&second, &second_transaction, "eyJ2YWx1ZSI6InNlY29uZCJ9Cg=="),
+        ] {
+            let staged = remote_transaction_request(
+                &app.router,
+                "POST",
+                "/lix/v1/transaction/execute",
+                session_id,
+                transaction_id,
+                Some(json!({
+                    "sql": "UPDATE lix_file SET data = $1 WHERE path = '/remote-conflict.json'",
+                    "params": [{
+                        "kind": "blob",
+                        "base64": base64
+                    }]
+                })),
+            )
+            .await;
+            assert_eq!(staged.status(), StatusCode::OK);
+        }
+
+        root.reset_plugin_transition_counters();
+        for (session_id, transaction_id) in
+            [(&first, &first_transaction), (&second, &second_transaction)]
+        {
+            let committed = remote_transaction_request(
+                &app.router,
+                "POST",
+                "/lix/v1/transaction/commit",
+                session_id,
+                transaction_id,
+                None,
+            )
+            .await;
+            assert_eq!(committed.status(), StatusCode::NO_CONTENT);
+        }
+        assert!(root.plugin_transition_counters().conflict_resolution_calls > 0);
+
+        let mut converged_rows = Vec::new();
+        for session_id in [&first, &second] {
+            let visible = request(
+                &app.router,
+                "POST",
+                "/lix/v1/execute",
+                Some(session_id),
+                Some(json!({
+                    "sql": "SELECT data FROM lix_file WHERE path = '/remote-conflict.json'"
+                })),
+            )
+            .await;
+            assert_eq!(visible.status(), StatusCode::OK);
+            converged_rows.push(response_json(visible).await["rows"].clone());
+        }
+        assert_eq!(converged_rows[0], converged_rows[1]);
+    }
+
+    #[tokio::test]
+    async fn same_base_remote_transactions_report_the_existing_commit_conflict() {
+        let app = app().await;
+        let (first, _) = new_session(&app.router).await;
+        let (second, _) = new_session(&app.router).await;
+        let first_transaction = begin_remote_transaction(&app.router, &first).await;
+        let second_transaction = begin_remote_transaction(&app.router, &second).await;
+        for (session_id, transaction_id, value) in [
+            (&first, &first_transaction, "first"),
+            (&second, &second_transaction, "second"),
+        ] {
+            let staged = remote_transaction_request(
+                &app.router,
+                "POST",
+                "/lix/v1/transaction/execute",
+                session_id,
+                transaction_id,
+                Some(json!({
+                    "sql": "INSERT INTO lix_key_value (key, value) VALUES ('same-base', $1)",
+                    "params": [{ "kind": "text", "value": value }]
+                })),
+            )
+            .await;
+            assert_eq!(staged.status(), StatusCode::OK);
+        }
+
+        let first_commit = remote_transaction_request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/commit",
+            &first,
+            &first_transaction,
+            None,
+        )
+        .await;
+        assert_eq!(first_commit.status(), StatusCode::NO_CONTENT);
+        let second_commit = remote_transaction_request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/commit",
+            &second,
+            &second_transaction,
+            None,
+        )
+        .await;
+        assert_eq!(second_commit.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(second_commit).await["error"]["code"],
+            LixError::CODE_UNIQUE
+        );
     }
 
     #[tokio::test]
@@ -7551,6 +8248,49 @@ mod tests {
         );
 
         drop(observe_response);
+        let replacement = request(&app.router, "GET", "/lix/v1", None, None).await;
+        assert_eq!(replacement.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn active_remote_transaction_pins_session_until_terminal_request() {
+        let app = app_with_options(ProtocolServerOptions {
+            max_sessions: 1,
+            session_idle_timeout: Duration::from_mins(1),
+            ..ProtocolServerOptions::default()
+        })
+        .await;
+        let (session_id, _) = new_session(&app.router).await;
+        let transaction_id = begin_remote_transaction(&app.router, &session_id).await;
+        let record = app
+            .server
+            .inner
+            .registry
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .expect("transaction session should remain registered");
+        *record
+            .last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Instant::now() - Duration::from_mins(2);
+
+        let at_capacity = request(&app.router, "GET", "/lix/v1", None, None).await;
+        assert_eq!(at_capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let rolled_back = remote_transaction_request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/rollback",
+            &session_id,
+            &transaction_id,
+            None,
+        )
+        .await;
+        assert_eq!(rolled_back.status(), StatusCode::NO_CONTENT);
+
         let replacement = request(&app.router, "GET", "/lix/v1", None, None).await;
         assert_eq!(replacement.status(), StatusCode::OK);
     }
