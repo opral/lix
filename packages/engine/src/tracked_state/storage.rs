@@ -2308,14 +2308,14 @@ async fn hydrate_certified_members(
     if pending.is_empty() {
         return Ok(());
     }
-    let mut pending_by_commit = BTreeMap::<CommitId, Vec<usize>>::new();
-    for (pending_index, (_, commit_id, _, _)) in pending.iter().enumerate() {
-        pending_by_commit
-            .entry(*commit_id)
+    let mut pending_by_commit_file = BTreeMap::<(CommitId, Option<String>), Vec<usize>>::new();
+    for (pending_index, (_, commit_id, _, key)) in pending.iter().enumerate() {
+        pending_by_commit_file
+            .entry((*commit_id, key.file_id.clone()))
             .or_default()
             .push(pending_index);
     }
-    for (commit_id, pending_indexes) in pending_by_commit {
+    for ((commit_id, file_id), pending_indexes) in pending_by_commit_file {
         let keys = pending_indexes
             .iter()
             .map(|pending_index| &pending[*pending_index].3)
@@ -2324,15 +2324,10 @@ async fn hydrate_certified_members(
             filter: crate::tracked_state::TrackedStateFilter {
                 schema_keys: keys.iter().map(|key| key.schema_key.clone()).collect(),
                 entity_pks: keys.iter().map(|key| key.entity_pk.clone()).collect(),
-                file_ids: keys
-                    .iter()
-                    .map(|key| {
-                        key.file_id.clone().map_or(
-                            crate::NullableKeyFilter::Null,
-                            crate::NullableKeyFilter::Value,
-                        )
-                    })
-                    .collect(),
+                file_ids: vec![file_id.map_or(
+                    crate::NullableKeyFilter::Null,
+                    crate::NullableKeyFilter::Value,
+                )],
                 include_tombstones: true,
             },
             read_columns: crate::tracked_state::TrackedStateReadColumns {
