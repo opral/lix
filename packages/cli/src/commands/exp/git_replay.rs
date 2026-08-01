@@ -1,4 +1,4 @@
-use crate::cli::exp::{ExpGitReplayArgs, GitReplayPlugins, GitReplayStorage};
+use crate::cli::exp::{ExpGitReplayArgs, GitReplayParentTree, GitReplayPlugins, GitReplayStorage};
 use crate::db;
 use crate::error::CliError;
 use lix_rocksdb_storage::RocksDB;
@@ -337,12 +337,22 @@ fn run_with_storage<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let replay_scope = collect_replay_scope(&repo_path, &commits)?;
+    let baseline_seed_parent = commits
+        .first()
+        .and_then(|commit| commit.first_parent.clone());
+    let mut replay_scope = collect_replay_scope(&repo_path, &commits)?;
+    if args.parent_tree == GitReplayParentTree::Full
+        && let Some(parent) = baseline_seed_parent.as_deref()
+    {
+        extend_replay_scope_with_tree(&repo_path, parent, &mut replay_scope)?;
+    }
     let history_scope = if commits
         .first()
         .is_some_and(|commit| commit.first_parent.is_none())
     {
         "complete"
+    } else if args.parent_tree == GitReplayParentTree::Full {
+        "full-parent-window"
     } else {
         "window"
     };
@@ -362,9 +372,6 @@ where
     let plugin_install_ms = duration_to_ms(plugin_install_started.elapsed());
 
     let mut state = ReplayState::default();
-    let baseline_seed_parent = commits
-        .first()
-        .and_then(|commit| commit.first_parent.clone());
     let mut baseline_seed_ms = 0.0;
     let mut baseline_seed_files = 0usize;
     let mut baseline_seed_batches = 0usize;
@@ -817,6 +824,19 @@ fn collect_replay_scope(
     }
     reader.finish()?;
     Ok(scope)
+}
+
+fn extend_replay_scope_with_tree(
+    repo_path: &Path,
+    commit: &str,
+    scope: &mut HashSet<GitPath>,
+) -> Result<(), CliError> {
+    for change in read_tree_snapshot_changes(repo_path, commit)? {
+        if let Some(path) = change.new_path {
+            scope.insert(path);
+        }
+    }
+    Ok(())
 }
 
 fn seed_parent_tree<StorageImpl>(
@@ -2641,6 +2661,7 @@ mod tests {
             plugins: GitReplayPlugins::None,
             branch: "main".to_string(),
             from_commit: None,
+            parent_tree: GitReplayParentTree::Window,
             num_commits: None,
             checkpoint_every: None,
             force: false,
@@ -2743,7 +2764,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_scope_contains_rename_history_but_not_untouched_parent_paths() {
+    fn full_parent_tree_extends_window_scope_with_untouched_paths() {
         let fixture = unique_temp_dir();
         let repo = fixture.join("repo");
         fs::create_dir_all(&repo).expect("fixture repository should be created");
@@ -2767,7 +2788,7 @@ mod tests {
                 .expect("rename commit should resolve");
         let commits = list_linear_commits(&repo, "main", Some(rename_commit.trim()), None)
             .expect("rename window should select");
-        let scope = collect_replay_scope(&repo, &commits).expect("scope should collect");
+        let mut scope = collect_replay_scope(&repo, &commits).expect("scope should collect");
 
         assert_eq!(
             scope,
@@ -2777,6 +2798,13 @@ mod tests {
             ])
         );
         assert!(!scope.contains(&git_path(b"untouched.txt")));
+        let parent = commits[0]
+            .first_parent
+            .as_deref()
+            .expect("rename window should have a parent");
+        extend_replay_scope_with_tree(&repo, parent, &mut scope)
+            .expect("full parent tree should extend scope");
+        assert!(scope.contains(&git_path(b"untouched.txt")));
         fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
     }
 
@@ -2968,6 +2996,7 @@ mod tests {
             plugins: GitReplayPlugins::All,
             branch: "missing-ref".to_string(),
             from_commit: None,
+            parent_tree: GitReplayParentTree::Window,
             num_commits: None,
             checkpoint_every: None,
             force: true,
@@ -3270,6 +3299,7 @@ mod tests {
             plugins: GitReplayPlugins::All,
             branch: "main".to_string(),
             from_commit: None,
+            parent_tree: GitReplayParentTree::Window,
             num_commits: None,
             checkpoint_every: Some(1),
             force: false,
@@ -3385,6 +3415,7 @@ mod tests {
                     plugins,
                     branch: "main".to_string(),
                     from_commit: None,
+                    parent_tree: GitReplayParentTree::Window,
                     num_commits: Some(1),
                     checkpoint_every: None,
                     force: false,
@@ -3486,6 +3517,7 @@ mod tests {
             plugins: GitReplayPlugins::All,
             branch: "main".to_string(),
             from_commit: None,
+            parent_tree: GitReplayParentTree::Window,
             num_commits: Some(100),
             checkpoint_every: None,
             force: false,
@@ -3632,6 +3664,7 @@ mod tests {
             plugins: GitReplayPlugins::All,
             branch: "main".to_string(),
             from_commit: None,
+            parent_tree: GitReplayParentTree::Window,
             num_commits: Some(2),
             checkpoint_every: None,
             force: false,

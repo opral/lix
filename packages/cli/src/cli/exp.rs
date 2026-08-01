@@ -43,6 +43,14 @@ impl GitReplayPlugins {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GitReplayParentTree {
+    /// Seed only parent-tree paths touched by the selected commit window.
+    Window,
+    /// Seed the complete parent tree before replaying the selected window.
+    Full,
+}
+
 #[derive(Debug, Args)]
 pub struct ExpGitReplayArgs {
     /// Path to the git repository to replay.
@@ -65,10 +73,13 @@ pub struct ExpGitReplayArgs {
     #[arg(long, default_value = "main")]
     pub branch: String,
 
-    /// Start replay from this commit (inclusive). Before timed replay, seed only parent-tree
-    /// paths touched by the selected commit window; untouched parent files are omitted.
+    /// Start replay from this commit (inclusive).
     #[arg(long)]
     pub from_commit: Option<String>,
+
+    /// Parent-tree paths seeded before timed replay.
+    #[arg(long, value_enum, default_value_t = GitReplayParentTree::Window)]
+    pub parent_tree: GitReplayParentTree,
 
     /// Maximum number of commits to replay (after applying --from-commit, if set).
     #[arg(long, value_parser = value_parser!(u32).range(1..))]
