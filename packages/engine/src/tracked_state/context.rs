@@ -27,9 +27,9 @@ use crate::tracked_state::codec::{
     decode_key_shared, encode_key, encode_key_ref_into, encode_value_ref,
 };
 use crate::tracked_state::diff::{
-    TrackedStateDiff, TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStatePayloadBatch,
-    TrackedStateTreeDiffBatch, TrackedStateTreeDiffBatchBuilder, TrackedStateTreeDiffRowRef,
-    diff_commits,
+    TrackedStateDiff, TrackedStateDiffIdentity, TrackedStateDiffRequest, TrackedStateDiffRow,
+    TrackedStatePayloadBatch, TrackedStateTreeDiffBatch, TrackedStateTreeDiffBatchBuilder,
+    TrackedStateTreeDiffRowRef, diff_commits,
 };
 #[cfg(test)]
 use crate::tracked_state::merge::{self, TrackedStateMergePlan};
@@ -2322,6 +2322,59 @@ where
         entries.finish()
     }
 
+    /// Returns the compact write-set union for an ancestor/descendant
+    /// first-parent interval.
+    ///
+    /// Stale transaction admission needs to know whether a prepared identity
+    /// was touched, not the endpoint payload or before value. Reading the
+    /// immutable per-commit delta generations directly avoids tree diffing,
+    /// ancestor point reads, and changelog payload hydration. `None` means the
+    /// pair is not representable by the rootless first-parent journal and the
+    /// caller must use the general commit diff.
+    pub(crate) async fn changed_identities_in_first_parent_interval(
+        &mut self,
+        ancestor_commit_id: &str,
+        descendant_commit_id: &str,
+    ) -> Result<Option<Vec<TrackedStateDiffIdentity>>, LixError> {
+        let Some(interval) = self
+            .first_parent_interval_between(ancestor_commit_id, descendant_commit_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut batches = Vec::with_capacity(interval.len());
+        for commit_id in interval {
+            batches.push(
+                self.scan_replayed_commit_delta_values(commit_id, &[])
+                    .await?,
+            );
+        }
+        let row_count = batches
+            .iter()
+            .try_fold(0usize, |count, batch| count.checked_add(batch.len()))
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "first-parent write-set row count overflows usize",
+                )
+            })?;
+        let mut seen = HashSet::with_capacity(row_count);
+        let mut keys = Vec::with_capacity(row_count);
+        for batch in &batches {
+            for row in batch.iter() {
+                let key = row.key_ref();
+                if seen.insert(key) {
+                    keys.push(key);
+                }
+            }
+        }
+        keys.sort_unstable();
+        Ok(Some(TrackedStateDiffIdentity::from_key_refs(
+            keys.len(),
+            |index| keys[index],
+        )?))
+    }
+
     /// Diffs an ancestor/descendant pair from immutable per-commit deltas.
     ///
     /// Merge always compares its merge base with each head. Walking only that
@@ -4125,6 +4178,8 @@ fn nullable_key_filter_allows(filters: &[NullableKeyFilter<String>], value: Opti
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::NullableKeyFilter;
     use crate::branch::BranchHeadControl;
@@ -6948,6 +7003,151 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("rootless commit should commit");
+    }
+
+    #[tokio::test]
+    async fn first_parent_generation_write_set_deduplicates_touched_identities() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-a", "base-a", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        write_rootless_commit_for_test(
+            &storage,
+            "generation-1",
+            "base",
+            &[
+                row_with_value("entity-a", "generation-1-a", "generation-1", "middle"),
+                row_with_value("entity-b", "generation-1-b", "generation-1", "created"),
+            ],
+        )
+        .await;
+        write_rootless_commit_for_test(
+            &storage,
+            "generation-2",
+            "generation-1",
+            &[
+                // The endpoint payload returns to the base value, but stale
+                // admission must still know that this identity was touched.
+                row_with_value("entity-a", "generation-2-a", "generation-2", "base"),
+                row_with_value("entity-c", "generation-2-c", "generation-2", "created"),
+            ],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("write-set read should open");
+        let identities = tracked_state
+            .reader(read)
+            .changed_identities_in_first_parent_interval("base", "generation-2")
+            .await
+            .expect("generation write set should load")
+            .expect("rootless first-parent interval should be supported");
+        assert_eq!(
+            identities
+                .iter()
+                .map(|identity| { identity.entity_pk().as_single_string().unwrap().to_owned() })
+                .collect::<Vec<_>>(),
+            ["entity-a", "entity-b", "entity-c"]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "release-only generation write-set benchmark probe"]
+    async fn generation_write_set_benchmark_probe() {
+        let rows = std::env::var("LIX_GENERATION_WRITE_SET_BENCH_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5_000);
+        let rounds = std::env::var("LIX_GENERATION_WRITE_SET_BENCH_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8);
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let base_rows = (0..rows)
+            .map(|index| {
+                row_with_value(
+                    &format!("entity-{index:05}"),
+                    &format!("base-change-{index:05}"),
+                    "base",
+                    "base",
+                )
+            })
+            .collect::<Vec<_>>();
+        write_root_for_test(&storage, &tracked_state, "base", None, &base_rows)
+            .await
+            .expect("benchmark base should write");
+        let changed_rows = (0..rows)
+            .map(|index| {
+                row_with_value(
+                    &format!("entity-{index:05}"),
+                    &format!("changed-{index:05}"),
+                    "after",
+                    "after",
+                )
+            })
+            .collect::<Vec<_>>();
+        write_rootless_commit_for_test(&storage, "after", "base", &changed_rows).await;
+
+        let mut write_set_samples = Vec::with_capacity(rounds);
+        let mut diff_samples = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("write-set benchmark read should open");
+            let started = Instant::now();
+            let identities = tracked_state
+                .reader(read)
+                .changed_identities_in_first_parent_interval("base", "after")
+                .await
+                .expect("generation write set should load")
+                .expect("benchmark interval should be rootless");
+            write_set_samples.push(started.elapsed());
+            assert_eq!(identities.len(), rows);
+
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("diff benchmark read should open");
+            let started = Instant::now();
+            let diff = tracked_state
+                .reader(read)
+                .diff_commits("base", "after", &TrackedStateDiffRequest::default())
+                .await
+                .expect("general diff should load");
+            diff_samples.push(started.elapsed());
+            assert_eq!(diff.entries.len(), rows);
+        }
+        write_set_samples.sort_unstable();
+        diff_samples.sort_unstable();
+        let p50 = |samples: &[std::time::Duration]| samples[(samples.len() - 1) / 2];
+        let write_set_p50 = p50(&write_set_samples);
+        let diff_p50 = p50(&diff_samples);
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "lix.generation-write-set.v1",
+                "rows": rows,
+                "rounds": rounds,
+                "general_diff_p50_us": diff_p50.as_micros(),
+                "generation_write_set_p50_us": write_set_p50.as_micros(),
+                "speedup": diff_p50.as_secs_f64() / write_set_p50.as_secs_f64(),
+            })
+        );
+        assert!(
+            write_set_p50 < diff_p50,
+            "generation write-set discovery should beat general endpoint diffing"
+        );
     }
 
     #[tokio::test]

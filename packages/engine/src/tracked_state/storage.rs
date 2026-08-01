@@ -832,8 +832,8 @@ impl DecodedCommitDeltaBatch {
     }
 }
 
-impl DecodedCommitDeltaRowRef<'_> {
-    pub(crate) fn key_ref(&self) -> TrackedStateKeyRef<'_> {
+impl<'a> DecodedCommitDeltaRowRef<'a> {
+    pub(crate) fn key_ref(self) -> TrackedStateKeyRef<'a> {
         let row = &self.batch.rows[self.ordinal];
         TrackedStateKeyRef {
             schema_key: self.batch.schema_keys[row.schema_key_ordinal as usize].as_str(),
@@ -843,7 +843,7 @@ impl DecodedCommitDeltaRowRef<'_> {
         }
     }
 
-    pub(crate) fn value(&self) -> &TrackedStateIndexValue {
+    pub(crate) fn value(self) -> &'a TrackedStateIndexValue {
         &self.batch.values[self.ordinal]
     }
 
