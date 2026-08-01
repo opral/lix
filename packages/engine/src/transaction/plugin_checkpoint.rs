@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::binary_cas::BlobHash;
+use crate::binary_cas::BlobId;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
     StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
@@ -26,11 +26,11 @@ pub(crate) fn stage_current_plugin_checkpoint(
     file_id: &str,
     generation: &str,
     semantic_root: &str,
-    blob_hash: BlobHash,
+    blob_hash: BlobId,
     runtime: &[u8],
     authority: &[u8],
 ) -> Result<(), LixError> {
-    let generation = BlobHash::from_hex(generation)?;
+    let generation = BlobId::from_hex(generation)?;
     let semantic_root = parse_semantic_root(semantic_root)?;
     let runtime_len = u32::try_from(runtime.len()).map_err(|_| checkpoint_too_large())?;
     let authority_len = u32::try_from(authority.len()).map_err(|_| checkpoint_too_large())?;
@@ -143,9 +143,9 @@ pub(crate) async fn load_current_plugin_checkpoint(
     file_id: &str,
     generation: &str,
     semantic_root: &str,
-    blob_hash: BlobHash,
+    blob_hash: BlobId,
 ) -> Result<Option<CurrentPluginCheckpoint>, LixError> {
-    let expected_generation = BlobHash::from_hex(generation)?;
+    let expected_generation = BlobId::from_hex(generation)?;
     let expected_semantic_root = parse_semantic_root(semantic_root)?;
     let values = PointReadPlan::new(
         PLUGIN_CHECKPOINT_SPACE,
@@ -240,9 +240,9 @@ mod tests {
     #[tokio::test]
     async fn current_checkpoint_overwrites_and_is_bound_to_generation_blob_and_semantic_root() {
         let storage = StorageAdapter::new(Memory::new());
-        let generation = BlobHash::from_content(b"generation");
-        let first_blob = BlobHash::from_content(b"first");
-        let second_blob = BlobHash::from_content(b"second");
+        let generation = BlobId::from_content(b"generation");
+        let first_blob = BlobId::from_content(b"first");
+        let second_blob = BlobId::from_content(b"second");
 
         for (blob_hash, runtime, authority) in [
             (
@@ -296,7 +296,7 @@ mod tests {
                 &read,
                 BRANCH_ID,
                 FILE_ID,
-                &BlobHash::from_content(b"other-generation").to_hex(),
+                &BlobId::from_content(b"other-generation").to_hex(),
                 SEMANTIC_ROOT,
                 second_blob,
             )
@@ -335,8 +335,8 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_cleanup_follows_file_and_branch_lifetimes() {
         let storage = StorageAdapter::new(Memory::new());
-        let generation = BlobHash::from_content(b"generation");
-        let blob_hash = BlobHash::from_content(b"file");
+        let generation = BlobId::from_content(b"generation");
+        let blob_hash = BlobId::from_content(b"file");
         let mut writes = storage.new_write_set();
         for branch_id in [BRANCH_ID, OTHER_BRANCH_ID] {
             stage_current_plugin_checkpoint(

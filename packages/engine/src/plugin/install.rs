@@ -112,7 +112,7 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     use crate::LixError;
-    use crate::binary_cas::BlobHash;
+    use crate::binary_cas::BlobId;
 
     use super::plugin_install_plan_from_archive_path;
 
@@ -146,7 +146,7 @@ mod tests {
         assert_eq!(plan.parsed.manifest.key, "plugin_test");
         assert_eq!(plan.parsed.schema_keys, ["plugin_test_note"]);
         assert_eq!(plan.parsed.wasm_bytes, WASM);
-        assert_eq!(plan.parsed.wasm_hash, BlobHash::from_content(WASM));
+        assert_eq!(plan.parsed.wasm_hash, BlobId::from_content(WASM));
         assert_eq!(plan.schema_rows.len(), 1);
         let schema_row = plan.schema_rows.row(0);
         assert_eq!(schema_row.schema_key, "lix_registered_schema");

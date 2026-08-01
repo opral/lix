@@ -245,9 +245,12 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                 debug_assert!(write.auxiliary_payloads().is_empty());
                 continue;
             }
+            let payload = write
+                .inline_payload()
+                .expect("only inline file content is staged during commit");
             blob_writer
                 .stage_file_payload(
-                    write.payload(),
+                    payload,
                     write.same_length_blob_splice(),
                     write.edit_blob_splice(),
                 )
@@ -269,9 +272,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                     &write.file_id,
                     &checkpoint.generation,
                     &checkpoint.semantic_root,
-                    write
-                        .blob_hash()
-                        .unwrap_or_else(|| crate::binary_cas::BlobHash::from_content(write.data())),
+                    write.blob_hash().unwrap_or_else(|| {
+                        crate::binary_cas::BlobId::from_content(
+                            write
+                                .inline_data()
+                                .expect("plugin checkpoints require inline file content"),
+                        )
+                    }),
                     &checkpoint.runtime,
                     &checkpoint.authority,
                 )?;

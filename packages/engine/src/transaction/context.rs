@@ -19,7 +19,7 @@ use serde_json::Value as JsonValue;
 use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobHash};
+use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobId};
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchLifecycle,
     BranchOperation, BranchRefReader, BranchReferenceRole, branch_ref_stage_row,
@@ -300,7 +300,7 @@ struct VisibleMaterialization {
 #[derive(Debug, Clone)]
 enum VisibleMaterializationBytes {
     Blob {
-        hash: BlobHash,
+        hash: BlobId,
     },
     Derived {
         path: String,
@@ -374,7 +374,7 @@ fn decode_visible_materialization_parts(
                 ));
             }
             VisibleMaterializationBytes::Blob {
-                hash: BlobHash::from_hex(&snapshot.blob_hash)?,
+                hash: BlobId::from_hex(&snapshot.blob_hash)?,
             }
         }
         DERIVED_FILE_REF_SCHEMA_KEY => {
@@ -2071,7 +2071,7 @@ where
         let expected_count = conflicts.len();
         let limits = conflict_resolution_limits(expected_count)?;
         let source = VecEntityConflictSource::new(conflicts, limits)?;
-        let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
+        let wasm_hash = BlobId::from_hex(plugin.wasm_blob_hash())?;
         let factory = match self
             .plugin_host
             .cached_plugin_factory(plugin.key(), wasm_hash)?
@@ -2869,9 +2869,13 @@ where
                             })?;
                         BlobRefRowInput {
                             file_id: file_key.file_id.clone(),
-                            blob_hash: payload
-                                .blob_hash()
-                                .unwrap_or_else(|| BlobHash::from_content(payload.data())),
+                            blob_hash: payload.blob_hash().unwrap_or_else(|| {
+                                BlobId::from_content(
+                                    payload.inline_data().expect(
+                                        "plugin materializations require inline file content",
+                                    ),
+                                )
+                            }),
                             size_bytes: payload.len(),
                             context: FilesystemRowContext {
                                 branch_id: file_key.branch_id.clone(),
@@ -2976,9 +2980,13 @@ where
                             })?;
                         BlobRefRowInput {
                             file_id: file_key.file_id.clone(),
-                            blob_hash: payload
-                                .blob_hash()
-                                .unwrap_or_else(|| BlobHash::from_content(payload.data())),
+                            blob_hash: payload.blob_hash().unwrap_or_else(|| {
+                                BlobId::from_content(
+                                    payload.inline_data().expect(
+                                        "plugin materializations require inline file content",
+                                    ),
+                                )
+                            }),
                             size_bytes: payload.len(),
                             context: FilesystemRowContext {
                                 branch_id: file_key.branch_id.clone(),
@@ -3113,13 +3121,25 @@ where
         let mut lifecycle_schema_rows = RawWriteBatch::new();
         let mut current_install_schema_definitions =
             BTreeMap::<PluginLifecycleKey, BTreeMap<String, JsonValue>>::new();
-        let mut current_install_wasm = BTreeMap::<BlobHash, Vec<u8>>::new();
+        let mut current_install_wasm = BTreeMap::<BlobId, Vec<u8>>::new();
         let mut branch_ids = BTreeSet::<String>::new();
 
         // Parse each archive exactly once. The original ZIP remains the file
         // payload; the extracted component is staged as a second CAS payload.
         for write in file_data.iter_mut() {
             let Some(path) = write.path.as_deref() else {
+                continue;
+            };
+            let Some(data) = write.inline_data() else {
+                if is_plugin_storage_path(path) {
+                    return Err(LixError::new(
+                        LixError::CODE_CONSTRAINT_VIOLATION,
+                        "prepared CAS content cannot install a plugin archive",
+                    ));
+                }
+                if !write.global && !write.untracked {
+                    branch_ids.insert(write.branch_id.clone());
+                }
                 continue;
             };
             if !is_plugin_storage_path(path) {
@@ -3130,7 +3150,7 @@ where
             }
             let plan = plugin_install_plan_from_archive_path(
                 path,
-                write.data(),
+                data,
                 &write.branch_id,
                 write.global,
                 write.untracked,
@@ -3596,6 +3616,9 @@ where
             {
                 continue;
             }
+            if write.inline_data().is_none() {
+                continue;
+            }
             candidate_file_keys.insert(PluginFileWriteKey::from(write));
         }
         for key in deleted_file_keys.keys() {
@@ -3871,6 +3894,9 @@ where
             {
                 continue;
             }
+            let Some(write_data) = write.inline_data() else {
+                continue;
+            };
             let file_key = PluginFileWriteKey::from(write);
             let catalog = catalogs
                 .get(&write.branch_id)
@@ -3905,14 +3931,14 @@ where
                         write.splice_provenance().is_some_and(|provenance| {
                             observation.bytes_sha256().is_some_and(|digest| {
                                 digest.matches_lower_hex(provenance.base_sha256())
-                            }) && transport_splice_preserves_utf8(write.data(), provenance)
+                            }) && transport_splice_preserves_utf8(write_data, provenance)
                         })
                     }
                     Some(PluginContentType::GitText) => {
                         write.splice_provenance().is_some_and(|provenance| {
                             observation.bytes_sha256().is_some_and(|digest| {
                                 digest.matches_lower_hex(provenance.base_sha256())
-                            }) && transport_splice_preserves_git_text(write.data(), provenance)
+                            }) && transport_splice_preserves_git_text(write_data, provenance)
                         })
                     }
                     Some(PluginContentType::Binary) => false,
@@ -3921,7 +3947,7 @@ where
             });
 
             let (plugin, classified_bytes) = warm_owned_plugin.map_or_else(
-                || catalog.select_for_bytes_with_classification_work(path, write.data()),
+                || catalog.select_for_bytes_with_classification_work(path, write_data),
                 |plugin| (Some(plugin), 0),
             );
             if classified_bytes != 0 {
@@ -4096,7 +4122,7 @@ where
             BTreeMap::<PluginBranchEntryKey, Arc<dyn WasmComponentFactory>>::new();
         let mut cold_entries = BTreeMap::<PluginBranchEntryKey, PluginRegistryEntry>::new();
         for (key, entry) in selected_entries {
-            let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
+            let hash = BlobId::from_hex(entry.wasm_blob_hash())?;
             let cached_factory = self.plugin_host.cached_plugin_factory(entry.key(), hash)?;
             if let Some(factory) = cached_factory {
                 component_factories.insert(key, factory);
@@ -4106,9 +4132,9 @@ where
         }
 
         let mut wasm_by_hash = current_install_wasm;
-        let mut missing_hashes = Vec::<BlobHash>::new();
+        let mut missing_hashes = Vec::<BlobId>::new();
         for entry in cold_entries.values() {
-            let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
+            let hash = BlobId::from_hex(entry.wasm_blob_hash())?;
             if !wasm_by_hash.contains_key(&hash) && !missing_hashes.contains(&hash) {
                 missing_hashes.push(hash);
             }
@@ -4136,7 +4162,7 @@ where
             }
         }
         for (key, entry) in cold_entries {
-            let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
+            let hash = BlobId::from_hex(entry.wasm_blob_hash())?;
             let wasm = wasm_by_hash.get(&hash).cloned().ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
@@ -4252,7 +4278,10 @@ where
                 });
                 let create_context = BoundCreateContext::bind(mutation_identity, &actor_key)?;
                 let materialization_version = self.functions.call_uuid_v7().to_string();
-                let submitted_bytes = write.payload().shared_bytes();
+                let submitted_bytes = write
+                    .inline_payload()
+                    .expect("selected plugin writes require inline content")
+                    .shared_bytes();
                 let cold_limits = WasmTransitionLimits::for_cold_file_bytes(
                     u64::try_from(submitted_bytes.len()).unwrap_or(u64::MAX),
                 );
@@ -4659,7 +4688,10 @@ where
                     }
                 };
             let materialization_version = self.functions.call_uuid_v7().to_string();
-            let submitted_bytes = write.payload().shared_bytes();
+            let submitted_bytes = write
+                .inline_payload()
+                .expect("selected plugin writes require inline content")
+                .shared_bytes();
             let limits = WasmTransitionLimits::for_file_bytes(
                 u64::try_from(submitted_bytes.len()).unwrap_or(u64::MAX),
             );
@@ -4766,7 +4798,9 @@ where
                                         build_file_update_splices(
                                             &before_bytes,
                                             Some(FileBytesSha256::compute(&before_bytes)),
-                                            write.data(),
+                                            write.inline_data().expect(
+                                                "selected plugin writes require inline content",
+                                            ),
                                             write.splice_provenance(),
                                             cold_limits,
                                         )
@@ -5213,7 +5247,9 @@ where
                         build_file_update_splices(
                             &observed_bytes,
                             lease.observed_bytes_sha256(),
-                            write.data(),
+                            write
+                                .inline_data()
+                                .expect("selected plugin writes require inline content"),
                             write.splice_provenance(),
                             limits,
                         )
@@ -5582,7 +5618,11 @@ where
             }
             match selected.materialization() {
                 PluginMaterialization::Blob => {
-                    if materialized_bytes.as_ref() != write.data() {
+                    if materialized_bytes.as_ref()
+                        != write
+                            .inline_data()
+                            .expect("selected plugin writes require inline content")
+                    {
                         write.replace_data(materialized_bytes);
                     } else {
                         if let Some((visible_base_blob_hash, offset, length)) =
@@ -7211,7 +7251,7 @@ struct TransactionBlobDataReader {
 
 #[async_trait]
 impl BlobDataReader for TransactionBlobDataReader {
-    async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+    async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
         load_transaction_blob_bytes(self.base.as_ref(), &self.staged_writes, hashes).await
     }
 }
@@ -7219,7 +7259,7 @@ impl BlobDataReader for TransactionBlobDataReader {
 async fn load_transaction_blob_bytes(
     base: &dyn BlobDataReader,
     staged_writes: &TransactionWriteBuffer,
-    hashes: &[BlobHash],
+    hashes: &[BlobId],
 ) -> Result<BlobBytesBatch, LixError> {
     let mut entries = staged_writes
         .load_staged_file_bytes_many(hashes)?
@@ -7634,7 +7674,7 @@ where
         None
     }
 
-    async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+    async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
         let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
@@ -9179,7 +9219,7 @@ fn semantic_rendered_file_data(
     path: String,
     filename: String,
     branch_id: String,
-    base_blob_hash: BlobHash,
+    base_blob_hash: BlobId,
     rendered_bytes: crate::Blob,
     same_length_output_splice: Option<ValidatedSameLengthOutputSplice>,
 ) -> TransactionFileData {
@@ -9969,7 +10009,7 @@ async fn preflight_owned_generation_upgrades(
     base_blob_reader: &dyn BlobDataReader,
     staged_writes: &TransactionWriteBuffer,
     upgrades: &[PluginGenerationUpgrade],
-    install_wasm: &BTreeMap<BlobHash, Vec<u8>>,
+    install_wasm: &BTreeMap<BlobId, Vec<u8>>,
     install_schema_definitions: &BTreeMap<PluginLifecycleKey, BTreeMap<String, JsonValue>>,
 ) -> Result<(), LixError> {
     let branch_ids = upgrades
@@ -10270,7 +10310,7 @@ async fn preflight_owned_generation_upgrades(
             },
         )
         .await?;
-        let mut materialized_hash_by_file = BTreeMap::<String, BlobHash>::new();
+        let mut materialized_hash_by_file = BTreeMap::<String, BlobId>::new();
         for row in blob_rows.iter() {
             let Some(file_id) = row.file_id() else {
                 continue;
@@ -10302,7 +10342,7 @@ async fn preflight_owned_generation_upgrades(
                     ),
                 ));
             }
-            let hash = BlobHash::from_hex(&snapshot.blob_hash)
+            let hash = BlobId::from_hex(&snapshot.blob_hash)
                 .map_err(|error| plugin_upgrade_error(upgrade, file_id, error))?;
             if materialized_hash_by_file
                 .insert(file_id.to_string(), hash)
@@ -10348,7 +10388,7 @@ async fn preflight_owned_generation_upgrades(
             ));
         }
 
-        let wasm_hash = BlobHash::from_hex(upgrade.replacement.wasm_blob_hash())?;
+        let wasm_hash = BlobId::from_hex(upgrade.replacement.wasm_blob_hash())?;
         let wasm = install_wasm.get(&wasm_hash).cloned().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
@@ -11059,7 +11099,7 @@ mod tests {
 
     #[test]
     fn visible_materialization_requires_a_matching_blob_ref_identity() {
-        let blob_hash = BlobHash::from_content(b"base");
+        let blob_hash = BlobId::from_content(b"base");
         let row = |snapshot_id: &str| MaterializedLiveStateRow {
             entity_pk: EntityPk::single("01920000-0000-7000-8000-0000000000a2"),
             schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
@@ -11102,7 +11142,7 @@ mod tests {
 
     #[test]
     fn semantic_renderer_splice_provenance_is_bound_to_its_visible_blob() {
-        let base_blob_hash = BlobHash::from_content(b"abcdef");
+        let base_blob_hash = BlobId::from_content(b"abcdef");
         let rendered = semantic_rendered_file_data(
             "01920000-0000-7000-8000-0000000000a2".to_string(),
             "/document.md".to_string(),

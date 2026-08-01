@@ -2589,7 +2589,7 @@ mod tests {
     impl BlobDataReader for CapturingWriteContext {
         async fn load_bytes_many(
             &self,
-            hashes: &[crate::binary_cas::BlobHash],
+            hashes: &[crate::binary_cas::BlobId],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
             Ok(crate::binary_cas::BlobBytesBatch::new(vec![
                 None;
@@ -2614,7 +2614,7 @@ mod tests {
 
         async fn load_bytes_many(
             &mut self,
-            hashes: &[crate::binary_cas::BlobHash],
+            hashes: &[crate::binary_cas::BlobId],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
             BlobDataReader::load_bytes_many(self, hashes).await
         }

@@ -11,7 +11,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::LixError;
-use crate::binary_cas::BlobHash;
+use crate::binary_cas::BlobId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
@@ -576,7 +576,7 @@ impl FilesystemPathIndex {
         store: &impl StorageAdapterRead,
     ) -> Result<Self, LixError> {
         let mut requests =
-            BTreeMap::<String, (BlobHash, usize, Vec<Arc<FilesystemPathEntry>>)>::new();
+            BTreeMap::<String, (BlobId, usize, Vec<Arc<FilesystemPathEntry>>)>::new();
         let mut reserved_cache_bytes = 0usize;
         for entry in self.entries() {
             let Some(row) = entry.blob_ref.as_ref() else {
@@ -601,7 +601,7 @@ impl FilesystemPathIndex {
             else {
                 continue;
             };
-            let hash = BlobHash::from_hex(&snapshot.blob_hash)?;
+            let hash = BlobId::from_hex(&snapshot.blob_hash)?;
             requests
                 .entry(snapshot.blob_hash)
                 .or_insert_with(|| (hash, size_bytes, Vec::new()))
@@ -635,7 +635,7 @@ impl FilesystemPathIndex {
             let Some(data) = data else {
                 continue;
             };
-            if data.len() != size_bytes || BlobHash::from_content(&data) != hash {
+            if data.len() != size_bytes || BlobId::from_content(&data) != hash {
                 continue;
             }
             let data = crate::Blob::from(data);

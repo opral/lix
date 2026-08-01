@@ -6,7 +6,7 @@ use zip::CompressionMethod;
 use zip::read::{ArchiveOffset, Config, ZipArchive};
 
 use crate::LixError;
-use crate::binary_cas::BlobHash;
+use crate::binary_cas::BlobId;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 
 #[cfg(test)]
@@ -26,7 +26,7 @@ pub(crate) struct ParsedPluginArchive {
     pub schema_keys: Vec<String>,
     pub create_schema_keys: Vec<String>,
     pub wasm_bytes: Vec<u8>,
-    pub wasm_hash: BlobHash,
+    pub wasm_hash: BlobId,
 }
 
 const KIB: u64 = 1024;
@@ -117,7 +117,7 @@ pub(crate) fn parse_plugin_archive_for_install(
     let wasm_bytes = loaded
         .wasm
         .expect("full plugin archive load should include WASM bytes");
-    let wasm_hash = BlobHash::from_content(&wasm_bytes);
+    let wasm_hash = BlobId::from_content(&wasm_bytes);
     Ok(ParsedPluginArchive {
         manifest: loaded.manifest,
         normalized_manifest_json: loaded.normalized_manifest_json,
@@ -145,7 +145,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
     let wasm = loaded
         .wasm
         .expect("full plugin archive load should include WASM bytes");
-    let wasm_hash = BlobHash::from_content(&wasm);
+    let wasm_hash = BlobId::from_content(&wasm);
 
     Ok(InstalledPlugin {
         key: loaded.manifest.key,
@@ -1102,7 +1102,7 @@ mod tests {
     use zip::{CompressionMethod, ZipWriter};
 
     use crate::LixError;
-    use crate::binary_cas::BlobHash;
+    use crate::binary_cas::BlobId;
 
     use super::{
         BoundedPluginArchive, PluginArchiveLimits, PluginArchiveReadKind, declared_zip_entry_count,
@@ -1209,7 +1209,7 @@ mod tests {
             assert_eq!(parsed.schemas.len(), 1);
             assert_eq!(parsed.schema_keys, ["plugin_test_note"]);
             assert_eq!(parsed.wasm_bytes, WASM);
-            assert_eq!(parsed.wasm_hash, BlobHash::from_content(WASM));
+            assert_eq!(parsed.wasm_hash, BlobId::from_content(WASM));
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&parsed.normalized_manifest_json)
                     .expect("normalized manifest should remain JSON")["key"],
@@ -1221,7 +1221,7 @@ mod tests {
                 &archive,
             )
             .expect("canonical plugin archive should materialize");
-            assert_eq!(installed.wasm_hash, BlobHash::from_content(WASM));
+            assert_eq!(installed.wasm_hash, BlobId::from_content(WASM));
         }
     }
 

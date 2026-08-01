@@ -10,8 +10,8 @@ use crate::binary_cas::codec::{
 };
 use crate::binary_cas::{
     BinaryCasChunking, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,
-    BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobRangeBytes, BlobRangeBytesBatch,
-    BlobSameLengthSplice, BlobWriteReceipt,
+    BlobId, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobRangeBytes, BlobRangeBytesBatch,
+    BlobSameLengthSplice, BlobWriteReceipt, ChunkHash,
 };
 #[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
@@ -56,7 +56,7 @@ pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::n
 
 #[derive(Debug)]
 struct BlobWritePlan {
-    blob_hash: BlobHash,
+    blob_hash: BlobId,
     chunk_ranges: Vec<(usize, usize)>,
     layout: BlobLayout,
     receipt: BlobWriteReceipt,
@@ -66,7 +66,7 @@ struct BlobWritePlan {
 struct PreparedChunk {
     start: usize,
     end: usize,
-    hash: BlobHash,
+    hash: ChunkHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +86,7 @@ pub(crate) struct KvChunk {
 #[cfg(test)]
 async fn load_manifest(
     store: &impl StorageAdapterRead,
-    blob_hash: BlobHash,
+    blob_hash: BlobId,
 ) -> Result<Option<BinaryCasManifest>, LixError> {
     let Some(bytes) = get_one(store, BINARY_CAS_MANIFEST_SPACE, manifest_key(blob_hash)).await?
     else {
@@ -97,7 +97,7 @@ async fn load_manifest(
 
 pub(crate) fn stage_manifest(
     writes: &mut StorageWriteSet,
-    blob_hash: BlobHash,
+    blob_hash: BlobId,
     manifest: &BinaryCasManifest,
 ) {
     writes.put(
@@ -110,7 +110,7 @@ pub(crate) fn stage_manifest(
 #[cfg(test)]
 pub(crate) async fn scan_manifest_chunks(
     store: &impl StorageAdapterRead,
-    blob_hash: BlobHash,
+    blob_hash: BlobId,
 ) -> Result<Vec<KvBlobManifestChunk>, LixError> {
     scan_all_values(
         store,
@@ -138,7 +138,7 @@ pub(crate) async fn scan_manifest_chunks(
 /// rejects missing declared rows by comparing the resulting count.
 async fn load_declared_manifest_chunks(
     store: &(impl StorageAdapterRead + ?Sized),
-    blob_hash: BlobHash,
+    blob_hash: BlobId,
     chunk_count: u32,
 ) -> Result<Vec<KvBlobManifestChunk>, LixError> {
     if chunk_count == 0 {
@@ -167,7 +167,7 @@ async fn load_declared_manifest_chunks(
 
 pub(crate) fn stage_manifest_chunk(
     writes: &mut StorageWriteSet,
-    blob_hash: BlobHash,
+    blob_hash: BlobId,
     chunk_index: u64,
     chunk: &KvBlobManifestChunk,
 ) {
@@ -184,7 +184,7 @@ pub(crate) fn stage_manifest_chunk(
 #[cfg(test)]
 async fn load_chunk(
     store: &impl StorageAdapterRead,
-    chunk_hash: BlobHash,
+    chunk_hash: ChunkHash,
 ) -> Result<Option<KvChunk>, LixError> {
     let Some(bytes) = get_one(store, BINARY_CAS_CHUNK_SPACE, chunk_key(chunk_hash)).await? else {
         return Ok(None);
@@ -199,7 +199,7 @@ async fn load_chunk(
 
 pub(crate) fn stage_chunk(
     writes: &mut StorageWriteSet,
-    chunk_hash: BlobHash,
+    chunk_hash: ChunkHash,
     codec: BinaryChunkCodec,
     uncompressed_len: u64,
     payload: &[u8],
@@ -223,7 +223,7 @@ pub(crate) fn stage_chunk(
 
 fn stage_content_chunk(
     writes: &mut StorageWriteSet,
-    chunk_hash: BlobHash,
+    chunk_hash: ChunkHash,
     chunk_data: &[u8],
 ) -> Result<(), LixError> {
     stage_chunk(
@@ -251,7 +251,7 @@ pub(in crate::binary_cas) async fn stage_fixed_part_skipping_existing(
     let receipts = bytes
         .chunks(crate::binary_cas::chunking::MEDIA_CHUNK_BYTES)
         .map(|chunk| crate::binary_cas::BlobChunkReceipt {
-            hash: BlobHash::from_content(chunk),
+            hash: ChunkHash::from_content(chunk),
             size_bytes: chunk.len() as u64,
         })
         .collect::<Vec<_>>();
@@ -312,15 +312,15 @@ pub(in crate::binary_cas) fn stage_fixed_manifest(
     }
 
     let (hash, layout) = match chunks {
-        [] => (BlobHash::from_content(&[]), BlobLayout::Empty),
+        [] => (BlobId::from_content(&[]), BlobLayout::Empty),
         [chunk] => (
-            chunk.hash,
+            BlobId::from_single_chunk(chunk.hash),
             BlobLayout::SingleChunk {
                 chunk_hash: chunk.hash,
             },
         ),
         _ => (
-            BlobHash::from_chunks(
+            BlobId::from_chunks(
                 size_bytes,
                 chunks.iter().map(|chunk| (chunk.hash, chunk.size_bytes)),
             ),
@@ -433,7 +433,7 @@ async fn scan_all_values_for_plan(
 
 pub(crate) async fn load_metadata_many(
     store: &(impl StorageAdapterRead + ?Sized),
-    hashes: &[BlobHash],
+    hashes: &[BlobId],
 ) -> Result<BlobMetadataBatch, LixError> {
     if hashes.is_empty() {
         return Ok(BlobMetadataBatch::new(Vec::new()));
@@ -470,11 +470,11 @@ pub(crate) async fn load_metadata_many(
 
 pub(crate) async fn load_bytes_many(
     store: &(impl StorageAdapterRead + ?Sized),
-    hashes: &[BlobHash],
+    hashes: &[BlobId],
 ) -> Result<BlobBytesBatch, LixError> {
     let metadata = load_metadata_many(store, hashes).await?.into_vec();
-    let mut delta_bases = HashMap::<BlobHash, BlobMetadata>::new();
-    let mut delta_base_order = Vec::<BlobHash>::new();
+    let mut delta_bases = HashMap::<BlobId, BlobMetadata>::new();
+    let mut delta_base_order = Vec::<BlobId>::new();
     for entry in metadata.iter().flatten() {
         if let BlobLayout::Delta {
             base_blob_hash,
@@ -613,7 +613,7 @@ pub(crate) async fn load_bytes_many(
                             )
                         })?;
                 for manifest_chunk in manifest_chunks {
-                    let chunk_hash = BlobHash::from_bytes(manifest_chunk.chunk_hash);
+                    let chunk_hash = ChunkHash::from_bytes(manifest_chunk.chunk_hash);
                     if seen_chunks.insert(chunk_hash) {
                         requested_chunks.push(chunk_hash);
                     }
@@ -629,7 +629,7 @@ pub(crate) async fn load_bytes_many(
         .zip(chunk_rows)
         .collect::<HashMap<_, _>>();
 
-    let mut full_bytes_by_hash = HashMap::<BlobHash, Vec<u8>>::new();
+    let mut full_bytes_by_hash = HashMap::<BlobId, Vec<u8>>::new();
     for metadata in physical_metadata {
         let hash = metadata.hash;
         let bytes = assemble_blob_bytes(
@@ -677,7 +677,7 @@ pub(crate) async fn load_bytes_many(
 
 pub(crate) async fn load_ranges_many(
     store: &(impl StorageAdapterRead + ?Sized),
-    requests: &[(BlobHash, Range<u64>)],
+    requests: &[(BlobId, Range<u64>)],
 ) -> Result<BlobRangeBytesBatch, LixError> {
     let hashes = requests.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
     let metadata = load_metadata_many(store, &hashes).await?.into_vec();
@@ -757,7 +757,7 @@ async fn load_blob_range(
             }
             let hashes = selected
                 .iter()
-                .map(|(_, chunk)| BlobHash::from_bytes(chunk.chunk_hash))
+                .map(|(_, chunk)| ChunkHash::from_bytes(chunk.chunk_hash))
                 .collect::<Vec<_>>();
             let rows = load_chunk_rows(store, &hashes).await?;
             let capacity =
@@ -821,11 +821,11 @@ async fn load_blob_range(
 }
 
 fn apply_flat_delta(
-    blob_hash: BlobHash,
+    blob_hash: BlobId,
     size_bytes: u64,
-    base_blob_hash: BlobHash,
+    base_blob_hash: BlobId,
     segments: &[BlobDeltaSegment],
-    full_bytes_by_hash: &HashMap<BlobHash, Vec<u8>>,
+    full_bytes_by_hash: &HashMap<BlobId, Vec<u8>>,
 ) -> Result<Vec<u8>, LixError> {
     let expected_size = persisted_size_to_usize(size_bytes, "binary CAS delta")?;
     let Some(base) = full_bytes_by_hash.get(&base_blob_hash) else {
@@ -887,7 +887,7 @@ fn apply_flat_delta(
             ),
         ));
     }
-    if BlobHash::from_content(&out) != blob_hash {
+    if BlobId::from_content(&out) != blob_hash {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
@@ -901,7 +901,7 @@ fn apply_flat_delta(
 
 async fn load_chunk_rows(
     store: &(impl StorageAdapterRead + ?Sized),
-    hashes: &[BlobHash],
+    hashes: &[ChunkHash],
 ) -> Result<Vec<Option<Bytes>>, LixError> {
     if hashes.is_empty() {
         return Ok(Vec::new());
@@ -952,13 +952,13 @@ fn full_value(value: StorageProjectedValue) -> Option<Bytes> {
 
 fn assemble_blob_bytes(
     metadata: BlobMetadata,
-    chunk_rows_by_hash: &HashMap<BlobHash, Option<Bytes>>,
+    chunk_rows_by_hash: &HashMap<ChunkHash, Option<Bytes>>,
     chunked_manifest: Option<&Vec<KvBlobManifestChunk>>,
 ) -> Result<Vec<u8>, LixError> {
     let expected_blob_size = persisted_size_to_usize(metadata.size_bytes, "binary CAS blob")?;
     let bytes = match &metadata.layout {
         BlobLayout::Empty => {
-            if cfg!(debug_assertions) && metadata.hash != BlobHash::from_content(&[]) {
+            if cfg!(debug_assertions) && metadata.hash != BlobId::from_content(&[]) {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
@@ -977,8 +977,8 @@ fn assemble_blob_bytes(
                 expected_blob_size,
             )?;
             if cfg!(debug_assertions)
-                && *chunk_hash != metadata.hash
-                && BlobHash::from_content(&chunk) != metadata.hash
+                && BlobId::from_single_chunk(*chunk_hash) != metadata.hash
+                && BlobId::from_content(&chunk) != metadata.hash
             {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -1013,7 +1013,7 @@ fn assemble_blob_bytes(
             }
             let mut out = Vec::with_capacity(expected_blob_size);
             for manifest_chunk in manifest_chunks {
-                let chunk_hash = BlobHash::from_bytes(manifest_chunk.chunk_hash);
+                let chunk_hash = ChunkHash::from_bytes(manifest_chunk.chunk_hash);
                 let expected_chunk_size =
                     persisted_size_to_usize(manifest_chunk.chunk_size, "binary CAS chunk")?;
                 let chunk = decode_chunk_from_map(
@@ -1035,7 +1035,7 @@ fn assemble_blob_bytes(
                     ),
                 ));
             }
-            if cfg!(debug_assertions) && BlobHash::from_content(&out) != metadata.hash {
+            if cfg!(debug_assertions) && BlobId::from_content(&out) != metadata.hash {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
@@ -1054,9 +1054,9 @@ fn assemble_blob_bytes(
 }
 
 fn decode_chunk_from_map(
-    chunk_rows_by_hash: &HashMap<BlobHash, Option<Bytes>>,
-    blob_hash: BlobHash,
-    chunk_hash: BlobHash,
+    chunk_rows_by_hash: &HashMap<ChunkHash, Option<Bytes>>,
+    blob_hash: BlobId,
+    chunk_hash: ChunkHash,
     expected_chunk_size: usize,
 ) -> Result<Cow<'_, [u8]>, LixError> {
     let Some(Some(chunk_bytes)) = chunk_rows_by_hash.get(&chunk_hash) else {
@@ -1075,8 +1075,8 @@ fn decode_chunk_from_map(
 fn decode_and_verify_chunk(
     chunk_bytes: &[u8],
     expected_chunk_size: usize,
-    blob_hash: BlobHash,
-    chunk_hash: BlobHash,
+    blob_hash: BlobId,
+    chunk_hash: ChunkHash,
 ) -> Result<Cow<'_, [u8]>, LixError> {
     let (codec, uncompressed_len, chunk_payload) = decode_binary_cas_chunk(chunk_bytes)?;
     decode_and_verify_payload(
@@ -1094,8 +1094,8 @@ fn decode_and_verify_payload(
     uncompressed_len: u64,
     chunk_payload: Cow<'_, [u8]>,
     expected_chunk_size: usize,
-    blob_hash: BlobHash,
-    chunk_hash: BlobHash,
+    blob_hash: BlobId,
+    chunk_hash: ChunkHash,
 ) -> Result<Cow<'_, [u8]>, LixError> {
     if expected_chunk_size > MAX_BINARY_CAS_CHUNK_BYTES
         || uncompressed_len > MAX_BINARY_CAS_CHUNK_BYTES as u64
@@ -1140,7 +1140,7 @@ fn decode_and_verify_payload(
     // The immutable sidecar and its range cache are not independently
     // authenticated. Verify raw and decoded compressed bytes against the CAS
     // key in every build before returning them.
-    if BlobHash::from_content(&decoded) != chunk_hash {
+    if ChunkHash::from_content(&decoded) != chunk_hash {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
@@ -1160,7 +1160,7 @@ pub(in crate::binary_cas) async fn stage_blob_write_skipping_existing_chunks<S>(
     blob_hashes: &mut HashSet<[u8; 32]>,
     chunk_keys: &mut HashSet<Vec<u8>>,
     bytes: &[u8],
-    precomputed_hash: Option<BlobHash>,
+    precomputed_hash: Option<BlobId>,
 ) -> Result<BlobWriteReceipt, LixError>
 where
     S: StorageAdapterRead + ?Sized,
@@ -1217,7 +1217,7 @@ pub(in crate::binary_cas) async fn try_stage_blob_write_reusing_same_length_spli
     blob_hashes: &mut HashSet<[u8; 32]>,
     chunk_keys: &mut HashSet<Vec<u8>>,
     bytes: &[u8],
-    precomputed_hash: Option<BlobHash>,
+    precomputed_hash: Option<BlobId>,
     splice: BlobSameLengthSplice,
 ) -> Result<bool, LixError>
 where
@@ -1281,9 +1281,9 @@ where
             start: cursor,
             end,
             hash: if changed {
-                BlobHash::from_content(&bytes[cursor..end])
+                ChunkHash::from_content(&bytes[cursor..end])
             } else {
-                BlobHash::from_bytes(base_chunk.chunk_hash)
+                ChunkHash::from_bytes(base_chunk.chunk_hash)
             },
         };
         if changed {
@@ -1340,7 +1340,7 @@ pub(in crate::binary_cas) async fn try_stage_blob_write_as_flat_delta<S>(
     writes: &mut StorageWriteSet,
     blob_hashes: &mut HashSet<[u8; 32]>,
     bytes: &[u8],
-    precomputed_hash: Option<BlobHash>,
+    precomputed_hash: Option<BlobId>,
     splice: BlobEditSplice,
 ) -> Result<bool, LixError>
 where
@@ -1553,12 +1553,12 @@ fn normalize_delta_segments(segments: Vec<BlobDeltaSegment>) -> Vec<BlobDeltaSeg
 fn prepare_blob_write(
     chunking: BinaryCasChunking,
     bytes: &[u8],
-    precomputed_hash: Option<BlobHash>,
+    precomputed_hash: Option<BlobId>,
 ) -> Result<BlobWritePlan, LixError> {
-    let blob_hash = precomputed_hash.unwrap_or_else(|| BlobHash::from_content(bytes));
+    let blob_hash = precomputed_hash.unwrap_or_else(|| BlobId::from_content(bytes));
     if cfg!(debug_assertions)
         && precomputed_hash.is_some()
-        && BlobHash::from_content(bytes) != blob_hash
+        && BlobId::from_content(bytes) != blob_hash
     {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -1572,11 +1572,7 @@ fn prepare_blob_write(
         let layout = match chunk_ranges.as_slice() {
             [] => unreachable!("non-empty blobs always have at least one chunk"),
             [(start, end)] => BlobLayout::SingleChunk {
-                chunk_hash: if *start == 0 && *end == bytes.len() {
-                    blob_hash
-                } else {
-                    BlobHash::from_content(&bytes[*start..*end])
-                },
+                chunk_hash: ChunkHash::from_content(&bytes[*start..*end]),
             },
             _ => BlobLayout::Chunked {
                 chunk_count: u32::try_from(chunk_ranges.len()).map_err(|_| {
@@ -1614,9 +1610,9 @@ fn prepare_chunks(bytes: &[u8], plan: &BlobWritePlan) -> Vec<PreparedChunk> {
             start,
             end,
             hash: if start == 0 && end == bytes.len() {
-                plan.blob_hash
+                ChunkHash::from_content(bytes)
             } else {
-                BlobHash::from_content(&bytes[start..end])
+                ChunkHash::from_content(&bytes[start..end])
             },
         })
         .collect()
@@ -1627,7 +1623,7 @@ fn stage_prepared_blob_write(
     bytes: &[u8],
     plan: &BlobWritePlan,
     chunks: &[PreparedChunk],
-    mut should_stage_chunk: impl FnMut(BlobHash) -> Result<bool, LixError>,
+    mut should_stage_chunk: impl FnMut(ChunkHash) -> Result<bool, LixError>,
 ) -> Result<(), LixError> {
     match &plan.layout {
         BlobLayout::Empty => {
@@ -1691,8 +1687,8 @@ async fn missing_chunk_hashes(
     transaction_chunk_keys: &mut HashSet<Vec<u8>>,
     plan: &BlobWritePlan,
     chunks: &[PreparedChunk],
-) -> Result<HashSet<BlobHash>, LixError> {
-    let mut candidates = Vec::<(BlobHash, StorageKey)>::new();
+) -> Result<HashSet<ChunkHash>, LixError> {
+    let mut candidates = Vec::<(ChunkHash, StorageKey)>::new();
     match &plan.layout {
         BlobLayout::Empty => {}
         BlobLayout::SingleChunk { chunk_hash } => {
@@ -1728,8 +1724,8 @@ async fn missing_chunk_hashes_for_chunks(
     store: &(impl StorageAdapterRead + ?Sized),
     transaction_chunk_keys: &mut HashSet<Vec<u8>>,
     chunks: &[PreparedChunk],
-) -> Result<HashSet<BlobHash>, LixError> {
-    let mut candidates = Vec::<(BlobHash, StorageKey)>::new();
+) -> Result<HashSet<ChunkHash>, LixError> {
+    let mut candidates = Vec::<(ChunkHash, StorageKey)>::new();
     for chunk in chunks {
         collect_chunk_lookup_candidate(chunk.hash, transaction_chunk_keys, &mut candidates);
     }
@@ -1749,9 +1745,9 @@ async fn missing_chunk_hashes_for_chunks(
 }
 
 fn collect_chunk_lookup_candidate(
-    chunk_hash: BlobHash,
+    chunk_hash: ChunkHash,
     transaction_chunk_keys: &mut HashSet<Vec<u8>>,
-    candidates: &mut Vec<(BlobHash, StorageKey)>,
+    candidates: &mut Vec<(ChunkHash, StorageKey)>,
 ) {
     let key = chunk_key(chunk_hash);
     if !transaction_chunk_keys.insert(key.clone()) {
@@ -1790,7 +1786,7 @@ async fn chunk_keys_exist(
 }
 
 fn metadata_from_manifest(
-    hash: BlobHash,
+    hash: BlobId,
     manifest: BinaryCasManifest,
 ) -> Result<BlobMetadata, LixError> {
     let size_bytes = manifest.size_bytes();
@@ -1808,7 +1804,7 @@ fn metadata_from_manifest(
             BlobLayout::Empty
         }
         BinaryCasManifest::SingleChunk { chunk_hash, .. } => BlobLayout::SingleChunk {
-            chunk_hash: BlobHash::from_bytes(chunk_hash),
+            chunk_hash: ChunkHash::from_bytes(chunk_hash),
         },
         BinaryCasManifest::Chunked { chunk_count, .. } => BlobLayout::Chunked { chunk_count },
         BinaryCasManifest::Delta {
@@ -1820,12 +1816,12 @@ fn metadata_from_manifest(
         } => {
             validate_storage_delta_manifest(hash, size_bytes, base_size_bytes, &segments)?;
             BlobLayout::Delta {
-                base_blob_hash: BlobHash::from_bytes(base_blob_hash),
+                base_blob_hash: BlobId::from_bytes(base_blob_hash),
                 base_size_bytes,
                 base_layout: match base_layout {
                     StorageBinaryCasDeltaBaseLayout::SingleChunk { chunk_hash } => {
                         BlobDeltaBaseLayout::SingleChunk {
-                            chunk_hash: BlobHash::from_bytes(chunk_hash),
+                            chunk_hash: ChunkHash::from_bytes(chunk_hash),
                         }
                     }
                     StorageBinaryCasDeltaBaseLayout::Chunked { chunk_count } => {
@@ -1854,7 +1850,7 @@ fn metadata_from_manifest(
 }
 
 fn validate_storage_delta_manifest(
-    hash: BlobHash,
+    hash: BlobId,
     size_bytes: u64,
     base_size_bytes: u64,
     segments: &[StorageBinaryCasDeltaSegment],
@@ -1929,23 +1925,23 @@ fn validate_storage_delta_manifest(
     Ok(())
 }
 
-fn manifest_key(blob_hash: BlobHash) -> Vec<u8> {
+fn manifest_key(blob_hash: BlobId) -> Vec<u8> {
     blob_hash.as_bytes().to_vec()
 }
 
 #[cfg(test)]
-fn manifest_chunk_prefix(blob_hash: BlobHash) -> Vec<u8> {
+fn manifest_chunk_prefix(blob_hash: BlobId) -> Vec<u8> {
     blob_hash.as_bytes().to_vec()
 }
 
-fn manifest_chunk_key(blob_hash: BlobHash, chunk_index: u64) -> Vec<u8> {
+fn manifest_chunk_key(blob_hash: BlobId, chunk_index: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(40);
     out.extend_from_slice(blob_hash.as_bytes());
     out.extend_from_slice(&chunk_index.to_be_bytes());
     out
 }
 
-fn chunk_key(chunk_hash: BlobHash) -> Vec<u8> {
+fn chunk_key(chunk_hash: ChunkHash) -> Vec<u8> {
     chunk_hash.as_bytes().to_vec()
 }
 
@@ -1984,7 +1980,7 @@ mod tests {
     struct DelayedManifestScanRead<R> {
         inner: R,
         default_manifest_delay: Duration,
-        blocked_manifest: Option<(BlobHash, BlobHash)>,
+        blocked_manifest: Option<(BlobId, BlobId)>,
         blocked_manifest_release: Notify,
         active_manifest_scans: AtomicUsize,
         max_active_manifest_scans: AtomicUsize,
@@ -1993,7 +1989,7 @@ mod tests {
         chunk_get_many_calls: AtomicUsize,
         presence_get_many_calls: AtomicUsize,
         chunk_keys_requested: AtomicUsize,
-        completed_manifest_hashes: Mutex<Vec<BlobHash>>,
+        completed_manifest_hashes: Mutex<Vec<BlobId>>,
     }
 
     impl<R> DelayedManifestScanRead<R> {
@@ -2016,8 +2012,8 @@ mod tests {
 
         fn block_manifest_until(
             mut self,
-            blocked_manifest: BlobHash,
-            completed_manifest: BlobHash,
+            blocked_manifest: BlobId,
+            completed_manifest: BlobId,
         ) -> Self {
             self.blocked_manifest = Some((blocked_manifest, completed_manifest));
             self
@@ -2096,19 +2092,19 @@ mod tests {
         }
     }
 
-    fn manifest_hash_from_range(range: &StorageKeyRange) -> Option<BlobHash> {
+    fn manifest_hash_from_range(range: &StorageKeyRange) -> Option<BlobId> {
         let Bound::Included(StorageKey(bytes)) = &range.lower else {
             return None;
         };
         let hash = <[u8; 32]>::try_from(bytes.get(..32)?).ok()?;
-        Some(BlobHash::from_bytes(hash))
+        Some(BlobId::from_bytes(hash))
     }
 
-    fn stage_two_chunk_blob(writes: &mut StorageWriteSet, ordinal: usize) -> (BlobHash, Vec<u8>) {
+    fn stage_two_chunk_blob(writes: &mut StorageWriteSet, ordinal: usize) -> (BlobId, Vec<u8>) {
         let left = format!("blob-{ordinal}-left").into_bytes();
         let right = format!("blob-{ordinal}-right").into_bytes();
         let bytes = [left.as_slice(), right.as_slice()].concat();
-        let blob_hash = BlobHash::from_content(&bytes);
+        let blob_hash = BlobId::from_content(&bytes);
         let chunks = [left, right];
 
         stage_manifest(
@@ -2121,7 +2117,7 @@ mod tests {
             },
         );
         for (index, chunk) in chunks.iter().enumerate() {
-            let chunk_hash = BlobHash::from_content(chunk);
+            let chunk_hash = ChunkHash::from_content(chunk);
             stage_manifest_chunk(
                 writes,
                 blob_hash,
@@ -2146,9 +2142,9 @@ mod tests {
         writes: &mut StorageWriteSet,
         label: &[u8],
         declared_chunk_count: u32,
-    ) -> BlobHash {
-        let blob_hash = BlobHash::from_content(label);
-        let chunk_hash = BlobHash::from_content(label);
+    ) -> BlobId {
+        let blob_hash = BlobId::from_content(label);
+        let chunk_hash = BlobId::from_content(label);
         stage_manifest(
             writes,
             blob_hash,
@@ -2215,7 +2211,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let bytes = definitely_multi_chunk_blob_bytes();
         let payload = BlobPayload::from_bytes(bytes.clone());
-        let expected_hash = BlobHash::from_content(&bytes);
+        let expected_hash = BlobId::from_content(&bytes);
 
         let mut initial = storage.new_write_set();
         let initial_receipt = stage_test_payload(&storage, &mut initial, &payload).await;
@@ -2238,9 +2234,9 @@ mod tests {
     #[tokio::test]
     async fn stores_manifest_chunks_in_scan_order() {
         let storage = StorageAdapter::new(Memory::new());
-        let blob_hash = BlobHash::from_content(b"blob-a");
-        let chunk_a_hash = BlobHash::from_content(b"chunk-a").into_bytes();
-        let chunk_b_hash = BlobHash::from_content(b"chunk-b").into_bytes();
+        let blob_hash = BlobId::from_content(b"blob-a");
+        let chunk_a_hash = BlobId::from_content(b"chunk-a").into_bytes();
+        let chunk_b_hash = BlobId::from_content(b"chunk-b").into_bytes();
 
         {
             let mut writes = storage.new_write_set();
@@ -2321,7 +2317,7 @@ mod tests {
                 fixture.0,
                 2,
                 &KvBlobManifestChunk {
-                    chunk_hash: BlobHash::from_content(b"stale manifest suffix").into_bytes(),
+                    chunk_hash: ChunkHash::from_content(b"stale manifest suffix").into_bytes(),
                     chunk_size: 1,
                 },
             );
@@ -2419,7 +2415,7 @@ mod tests {
                 .expect("chunked blob fixture should commit");
             fixture
         };
-        let missing_hash = BlobHash::from_content(b"missing duplicate fixture");
+        let missing_hash = BlobId::from_content(b"missing duplicate fixture");
 
         let store = storage
             .begin_read(StorageReadOptions::default())
@@ -2559,7 +2555,7 @@ mod tests {
             uncompressed_len: 5,
             data: b"hello".to_vec(),
         };
-        let chunk_hash = BlobHash::from_content(b"chunk-a");
+        let chunk_hash = ChunkHash::from_content(b"chunk-a");
 
         {
             let mut writes = storage.new_write_set();
@@ -2590,9 +2586,9 @@ mod tests {
 
     #[test]
     fn binary_hash_keys_are_compact_and_manifest_chunks_sort_by_index() {
-        let blob_hash = BlobHash::from_content(b"blob");
+        let blob_hash = BlobId::from_content(b"blob");
         let manifest_key = manifest_key(blob_hash);
-        let chunk_key = chunk_key(BlobHash::from_content(b"chunk"));
+        let chunk_key = chunk_key(ChunkHash::from_content(b"chunk"));
         let first = manifest_chunk_key(blob_hash, 1);
         let second = manifest_chunk_key(blob_hash, 2);
         let later = manifest_chunk_key(blob_hash, 10);
@@ -2606,15 +2602,15 @@ mod tests {
 
     #[test]
     fn delta_manifest_rejects_out_of_bounds_copy_program() {
-        let hash = BlobHash::from_content(b"invalid delta result");
+        let hash = BlobId::from_content(b"invalid delta result");
         let error = metadata_from_manifest(
             hash,
             BinaryCasManifest::Delta {
                 size_bytes: 10,
-                base_blob_hash: BlobHash::from_content(b"base").into_bytes(),
+                base_blob_hash: BlobId::from_content(b"base").into_bytes(),
                 base_size_bytes: 4,
                 base_layout: StorageBinaryCasDeltaBaseLayout::SingleChunk {
-                    chunk_hash: BlobHash::from_content(b"base").into_bytes(),
+                    chunk_hash: ChunkHash::from_content(b"base").into_bytes(),
                 },
                 segments: vec![StorageBinaryCasDeltaSegment::Copy {
                     offset: 0,
@@ -2644,7 +2640,7 @@ mod tests {
     async fn public_kv_api_roundtrips_blob_bytes() {
         let storage = StorageAdapter::new(Memory::new());
         let data = b"hello chunked kv cas";
-        let blob_hash = BlobHash::from_content(data);
+        let blob_hash = BlobId::from_content(data);
 
         {
             let mut writes = storage.new_write_set();
@@ -2697,7 +2693,7 @@ mod tests {
         let data = (0..(3 * 1024 * 1024))
             .map(|index| ((index * 131 + 17) % 251) as u8)
             .collect::<Vec<_>>();
-        let blob_hash = BlobHash::from_content(&data);
+        let blob_hash = BlobId::from_content(&data);
         {
             let mut writes = storage.new_write_set();
             stage_test_bytes(&storage, &mut writes, &data).await;
@@ -2737,7 +2733,7 @@ mod tests {
         assert!(chunk_ranges.len() > 1);
         let chunk_hashes = chunk_ranges
             .iter()
-            .map(|(start, end)| BlobHash::from_content(&data[*start..*end]))
+            .map(|(start, end)| BlobId::from_content(&data[*start..*end]))
             .collect::<HashSet<_>>();
 
         {
@@ -2801,7 +2797,7 @@ mod tests {
     async fn same_length_splice_writer_reuses_unchanged_manifest_chunks_and_roundtrips() {
         let storage = StorageAdapter::new(Memory::new());
         let before = definitely_multi_chunk_blob_bytes();
-        let base_blob_hash = BlobHash::from_content(&before);
+        let base_blob_hash = BlobId::from_content(&before);
 
         {
             let mut writes = storage.new_write_set();
@@ -2833,7 +2829,7 @@ mod tests {
         let edit_offset = changed_chunk_start + changed_chunk_len / 2;
         let mut after = before.clone();
         after[edit_offset] ^= 0xff;
-        let after_blob_hash = BlobHash::from_content(&after);
+        let after_blob_hash = BlobId::from_content(&after);
         let after_payload = BlobPayload::from_bytes(after.clone());
 
         {
@@ -2889,7 +2885,7 @@ mod tests {
     async fn flat_delta_writer_merges_edits_against_one_full_base_and_roundtrips() {
         let storage = StorageAdapter::new(Memory::new());
         let before = b"a representative text line with stable compression boundaries\n".repeat(512);
-        let full_base_hash = BlobHash::from_content(&before);
+        let full_base_hash = BlobId::from_content(&before);
         {
             let mut writes = storage.new_write_set();
             stage_test_bytes(&storage, &mut writes, &before).await;
@@ -2902,7 +2898,7 @@ mod tests {
         let first_offset = before.len() / 3;
         let mut first = before.clone();
         first[first_offset] ^= 1;
-        let first_hash = BlobHash::from_content(&first);
+        let first_hash = BlobId::from_content(&first);
         {
             let payload = BlobPayload::from_bytes(first.clone());
             let store = storage
@@ -2934,7 +2930,7 @@ mod tests {
         let second_offset = before.len() * 2 / 3;
         let mut second = first.clone();
         second[second_offset] ^= 1;
-        let second_hash = BlobHash::from_content(&second);
+        let second_hash = BlobId::from_content(&second);
         {
             let payload = BlobPayload::from_bytes(second.clone());
             let store = storage
@@ -2967,7 +2963,7 @@ mod tests {
         let inserted = b"inserted";
         let mut third = second.clone();
         third.splice(third_offset..third_offset, inserted.iter().copied());
-        let third_hash = BlobHash::from_content(&third);
+        let third_hash = BlobId::from_content(&third);
         {
             let payload = BlobPayload::from_bytes(third.clone());
             let store = storage
@@ -3030,7 +3026,7 @@ mod tests {
     async fn same_length_splice_writer_falls_back_when_result_length_changes() {
         let storage = StorageAdapter::new(Memory::new());
         let before = definitely_multi_chunk_blob_bytes();
-        let base_blob_hash = BlobHash::from_content(&before);
+        let base_blob_hash = BlobId::from_content(&before);
 
         {
             let mut writes = storage.new_write_set();
@@ -3044,7 +3040,7 @@ mod tests {
         let edit_offset = before.len() / 2;
         let mut after = before.clone();
         after.insert(edit_offset, b'!');
-        let after_blob_hash = BlobHash::from_content(&after);
+        let after_blob_hash = BlobId::from_content(&after);
         let after_payload = BlobPayload::from_bytes(after.clone());
         {
             let mut writes = storage.new_write_set();
@@ -3067,7 +3063,7 @@ mod tests {
             .expect("result read should open");
         let expected_hashes = crate::binary_cas::chunking::fastcdc_chunk_ranges(&after)
             .into_iter()
-            .map(|(start, end)| BlobHash::from_content(&after[start..end]).into_bytes())
+            .map(|(start, end)| BlobId::from_content(&after[start..end]).into_bytes())
             .collect::<Vec<_>>();
         let actual_hashes = scan_manifest_chunks(&store, after_blob_hash)
             .await
@@ -3091,8 +3087,8 @@ mod tests {
     #[test]
     fn prepared_blob_write_stages_duplicate_chunk_payload_once() {
         let data = b"abcabc";
-        let blob_hash = BlobHash::from_content(data);
-        let chunk_hash = BlobHash::from_content(b"abc");
+        let blob_hash = BlobId::from_content(data);
+        let chunk_hash = ChunkHash::from_content(b"abc");
         let plan = BlobWritePlan {
             blob_hash,
             chunk_ranges: vec![(0, 3), (3, 6)],
@@ -3174,7 +3170,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let data = b"same length";
         let corrupted = b"SAME length";
-        let blob_hash = BlobHash::from_content(data);
+        let blob_hash = BlobId::from_content(data);
 
         {
             let mut writes = storage.new_write_set();
@@ -3189,7 +3185,7 @@ mod tests {
             let mut writes = storage.new_write_set();
             stage_chunk(
                 &mut writes,
-                blob_hash,
+                ChunkHash::from_content(data),
                 BinaryChunkCodec::Raw,
                 corrupted.len() as u64,
                 corrupted,
@@ -3218,12 +3214,17 @@ mod tests {
         let expected = vec![b'a'; 128 * 1024];
         let substituted = vec![b'b'; expected.len()];
         assert_eq!(expected.len(), substituted.len());
-        let expected_hash = BlobHash::from_content(&expected);
+        let expected_hash = BlobId::from_content(&expected);
         let row =
             encode_binary_cas_chunk(BinaryChunkCodec::Raw, expected.len() as u64, &substituted);
 
-        let error = decode_and_verify_chunk(&row, expected.len(), expected_hash, expected_hash)
-            .expect_err("raw bytes for a different hash should be rejected");
+        let error = decode_and_verify_chunk(
+            &row,
+            expected.len(),
+            expected_hash,
+            ChunkHash::from_content(&expected),
+        )
+        .expect_err("raw bytes for a different hash should be rejected");
 
         assert!(
             error
@@ -3235,11 +3236,12 @@ mod tests {
     #[test]
     fn decode_rejects_chunks_above_the_format_maximum_before_payload_validation() {
         let data = b"valid raw content".repeat(4096);
-        let chunk_hash = BlobHash::from_content(&data);
+        let chunk_hash = ChunkHash::from_content(&data);
+        let blob_hash = BlobId::from_single_chunk(chunk_hash);
         let oversized_len = MAX_BINARY_CAS_CHUNK_BYTES + 1;
         let row = encode_binary_cas_chunk(BinaryChunkCodec::Raw, oversized_len as u64, &data);
 
-        let error = decode_and_verify_chunk(&row, oversized_len, chunk_hash, chunk_hash)
+        let error = decode_and_verify_chunk(&row, oversized_len, blob_hash, chunk_hash)
             .expect_err("oversized chunk metadata should be rejected");
 
         assert!(error.message.contains("exceeds"));
@@ -3252,8 +3254,8 @@ mod tests {
         let expected = b"expected bytes";
         let substituted = b"different byte";
         assert_eq!(expected.len(), substituted.len());
-        let expected_blob_hash = BlobHash::from_content(expected);
-        let substituted_chunk_hash = BlobHash::from_content(substituted);
+        let expected_blob_hash = BlobId::from_content(expected);
+        let substituted_chunk_hash = ChunkHash::from_content(substituted);
 
         {
             let mut writes = storage.new_write_set();
@@ -3270,7 +3272,7 @@ mod tests {
                 expected_blob_hash,
                 0,
                 &KvBlobManifestChunk {
-                    chunk_hash: BlobHash::from_content(substituted).into_bytes(),
+                    chunk_hash: substituted_chunk_hash.into_bytes(),
                     chunk_size: substituted.len() as u64,
                 },
             );
@@ -3305,7 +3307,7 @@ mod tests {
     async fn public_kv_api_roundtrips_empty_blob() {
         let storage = StorageAdapter::new(Memory::new());
         let data = b"";
-        let blob_hash = BlobHash::from_content(data);
+        let blob_hash = BlobId::from_content(data);
 
         {
             let mut writes = storage.new_write_set();
@@ -3343,7 +3345,7 @@ mod tests {
     async fn public_kv_api_roundtrips_multi_chunk_blob() {
         let storage = StorageAdapter::new(Memory::new());
         let data = definitely_multi_chunk_blob_bytes();
-        let blob_hash = BlobHash::from_content(&data);
+        let blob_hash = BlobId::from_content(&data);
 
         {
             let mut writes = storage.new_write_set();

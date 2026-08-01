@@ -14,7 +14,7 @@ use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 
-use crate::binary_cas::BlobHash;
+use crate::binary_cas::BlobId;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::tracked_state::MaterializedTrackedStateRowRef;
@@ -186,7 +186,7 @@ impl PluginRegistryEntry {
     }
 
     pub(crate) fn to_installed_plugin(&self, wasm: Vec<u8>) -> Result<InstalledPlugin, LixError> {
-        let wasm_hash = BlobHash::from_content(&wasm);
+        let wasm_hash = BlobId::from_content(&wasm);
         let actual_hash = wasm_hash.to_hex();
         if actual_hash != self.wasm_blob_hash {
             return Err(invalid_registry(format!(
@@ -1445,7 +1445,7 @@ mod tests {
             archive_file_id: plugin_storage_archive_file_id("plugin_a"),
             archive_path: plugin_storage_archive_path("plugin_a"),
             archive_blob_hash: hash('a'),
-            wasm_blob_hash: BlobHash::from_content(&wasm).to_hex(),
+            wasm_blob_hash: BlobId::from_content(&wasm).to_hex(),
         };
         let registry_entry = PluginRegistryEntry::new(input.clone()).unwrap();
         let installed = registry_entry
@@ -1453,7 +1453,7 @@ mod tests {
             .expect("matching extracted WASM should materialize");
         assert_eq!(installed.key, "plugin_a");
         assert_eq!(installed.content_type, Some(PluginContentType::Text));
-        assert_eq!(installed.wasm_hash, BlobHash::from_content(&wasm));
+        assert_eq!(installed.wasm_hash, BlobId::from_content(&wasm));
         assert_eq!(installed.wasm, wasm);
 
         input.wasm_blob_hash = hash('b');

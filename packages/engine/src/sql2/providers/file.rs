@@ -31,7 +31,7 @@ use datafusion::prelude::SessionContext;
 use futures_util::{FutureExt, future::try_join_all};
 use serde::Deserialize;
 
-use crate::binary_cas::{BlobDataReader, BlobHash, BlobRangeBytes};
+use crate::binary_cas::{BlobDataReader, BlobId, BlobRangeBytes};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
 use crate::entity_pk::EntityPk;
@@ -102,7 +102,7 @@ use crate::sql2::{
     SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
 };
 use crate::transaction::types::{
-    LogicalPrimaryKey, TransactionFileData, TransactionWrite, TransactionWriteMode,
+    FileContent, LogicalPrimaryKey, TransactionFileData, TransactionWrite, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin,
 };
 
@@ -2732,13 +2732,7 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
         writes
             .into_iter()
             .map(|(path, data, metadata, splice)| {
-                (
-                    None,
-                    path,
-                    FastFileWriteData::Inline(data),
-                    metadata,
-                    splice,
-                )
+                (None, path, FileContent::inline(data), metadata, splice)
             })
             .collect(),
         conflict,
@@ -2764,7 +2758,7 @@ pub(crate) async fn execute_fast_lix_file_id_path_writes(
         writes
             .into_iter()
             .map(|(id, path, data, metadata, splice)| {
-                (id, path, FastFileWriteData::Inline(data), metadata, splice)
+                (id, path, FileContent::inline(data), metadata, splice)
             })
             .collect(),
         conflict,
@@ -2780,7 +2774,7 @@ pub(crate) async fn execute_fast_lix_file_prepared_path_write(
 ) -> Result<Option<u64>, LixError> {
     execute_fast_lix_file_id_path_writes_inner(
         ctx,
-        vec![(None, path, FastFileWriteData::Prepared(receipt), None, None)],
+        vec![(None, path, FileContent::PreparedCas(receipt), None, None)],
         FastLixFilePathWriteConflict::UpdateData,
         None,
     )
@@ -2792,7 +2786,7 @@ async fn execute_fast_lix_file_id_path_writes_inner(
     writes: Vec<(
         Option<String>,
         String,
-        FastFileWriteData,
+        FileContent,
         Option<TransactionJson>,
         Option<RequestBlobSpliceProvenance>,
     )>,
@@ -2852,13 +2846,12 @@ async fn execute_fast_lix_file_id_path_writes_inner(
     let mut staged = LixFileStagedBatch::with_row_capacity(parsed_writes.len().saturating_mul(3));
 
     for write in parsed_writes {
-        let prepared_blob = write.data.prepared().cloned();
-        let planning_data = write.data.planning_bytes();
+        let content = write.data.clone();
         if let Some(existing) = filesystem.file_entry(&write.parsed.path).cloned() {
             let base_blob_hash = existing
                 .blob_hash
                 .as_deref()
-                .and_then(|hash| BlobHash::from_hex(hash).ok());
+                .and_then(|hash| BlobId::from_hex(hash).ok());
             if conflict != FastLixFilePathWriteConflict::None {
                 validate_fast_lix_file_path_conflict_pair(
                     existing.scope.untracked,
@@ -2875,17 +2868,14 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                         file_id: None,
                         metadata: write.metadata,
                     };
-                    let mut plan = plan_parsed_file_path_write_with_resolvers(
+                    let plan = plan_parsed_file_path_write_with_resolvers(
                         &mut path_resolvers,
                         write.parsed.parsed_path,
                         Some(file_id),
-                        Some(planning_data),
+                        Some(content.clone()),
                         context,
                         &mut || ctx.functions().call_uuid_v7().to_string(),
                     )?;
-                    if let Some(receipt) = prepared_blob {
-                        apply_prepared_file_data(&mut plan.rows, &mut plan.file_data, 0, receipt)?;
-                    }
                     staged.extend_filesystem_plan(plan)?;
                 }
                 FastLixFilePathWriteConflict::DoNothing
@@ -2902,7 +2892,7 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                         existing.id.clone(),
                         Some(write.parsed.path),
                         Some(existing.name.clone()),
-                        planning_data,
+                        content.clone(),
                         context,
                         existing.blob_hash.is_some(),
                         existing.has_derived_file_ref,
@@ -2910,14 +2900,6 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                         None,
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
-                    if let Some(receipt) = prepared_blob {
-                        apply_prepared_file_data(
-                            &mut staged.state_rows,
-                            &mut staged.file_data_writes,
-                            file_data_start,
-                            receipt,
-                        )?;
-                    }
                     attach_fast_file_write_metadata(
                         &mut staged.file_data_writes[file_data_start..],
                         write.splice_provenance,
@@ -2945,7 +2927,7 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                         existing.id.clone(),
                         Some(write.parsed.path),
                         Some(existing.name.clone()),
-                        planning_data,
+                        content.clone(),
                         context,
                         existing.blob_hash.is_some(),
                         existing.has_derived_file_ref,
@@ -2953,14 +2935,6 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                         None,
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
-                    if let Some(receipt) = prepared_blob {
-                        apply_prepared_file_data(
-                            &mut staged.state_rows,
-                            &mut staged.file_data_writes,
-                            file_data_start,
-                            receipt,
-                        )?;
-                    }
                     attach_fast_file_write_metadata(
                         &mut staged.file_data_writes[file_data_start..],
                         write.splice_provenance,
@@ -2982,13 +2956,10 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                 &mut path_resolvers,
                 write.parsed.parsed_path,
                 Some(file_id.clone()),
-                Some(planning_data),
+                Some(content),
                 context,
                 &mut || ctx.functions().call_uuid_v7().to_string(),
             )?;
-            if let Some(receipt) = prepared_blob {
-                apply_prepared_file_data(&mut plan.rows, &mut plan.file_data, 0, receipt)?;
-            }
             attach_fast_file_write_metadata(
                 &mut plan.file_data,
                 write.splice_provenance,
@@ -3152,8 +3123,7 @@ async fn stage_indexed_file_path_writes(
     let mut staged = LixFileStagedBatch::with_row_capacity(writes.len().saturating_mul(3));
 
     for (write, entry) in writes.into_iter().zip(indexed.existing) {
-        let prepared_blob = write.data.prepared().cloned();
-        let planning_data = write.data.planning_bytes();
+        let content = write.data.clone();
         if let Some(entry) = entry {
             if conflict == FastLixFilePathWriteConflict::IdDoNothing {
                 continue;
@@ -3209,7 +3179,7 @@ async fn stage_indexed_file_path_writes(
                 entry.id().to_string(),
                 Some(update_path),
                 Some(entry.name.clone()),
-                planning_data,
+                content,
                 context,
                 materialization.has_blob_ref,
                 materialization.has_derived_file_ref,
@@ -3217,14 +3187,6 @@ async fn stage_indexed_file_path_writes(
                 None,
             )
             .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
-            if let Some(receipt) = prepared_blob {
-                apply_prepared_file_data(
-                    &mut staged.state_rows,
-                    &mut staged.file_data_writes,
-                    file_data_start,
-                    receipt,
-                )?;
-            }
             attach_fast_file_write_metadata(
                 &mut staged.file_data_writes[file_data_start..],
                 write.splice_provenance,
@@ -3247,13 +3209,10 @@ async fn stage_indexed_file_path_writes(
                     .expect("missing indexed path should have directory resolvers"),
                 write.parsed.parsed_path,
                 Some(file_id.clone()),
-                Some(planning_data),
+                Some(content),
                 context,
                 &mut || ctx.functions().call_uuid_v7().to_string(),
             )?;
-            if let Some(receipt) = prepared_blob {
-                apply_prepared_file_data(&mut plan.rows, &mut plan.file_data, 0, receipt)?;
-            }
             attach_fast_file_write_metadata(
                 &mut plan.file_data,
                 write.splice_provenance,
@@ -3271,7 +3230,7 @@ async fn stage_indexed_file_path_writes(
 struct ExistingFileMaterialization {
     has_blob_ref: bool,
     has_derived_file_ref: bool,
-    blob_hash: Option<BlobHash>,
+    blob_hash: Option<BlobId>,
 }
 
 async fn load_exact_existing_materializations(
@@ -3331,7 +3290,7 @@ async fn load_exact_existing_materializations(
             .map(|snapshot| snapshot.as_str())
             .and_then(|snapshot| serde_json::from_str::<BlobRefSnapshot>(snapshot).ok())
             .filter(|snapshot| snapshot.id == request.file_id.as_deref().unwrap_or_default())
-            .and_then(|snapshot| BlobHash::from_hex(&snapshot.blob_hash).ok());
+            .and_then(|snapshot| BlobId::from_hex(&snapshot.blob_hash).ok());
     }
 
     let derived_requests = unique
@@ -3493,7 +3452,7 @@ async fn execute_fast_lix_file_data_update_by_id_impl(
                 .expect("prepared lix_file descriptor should have a path");
             let base_blob_hash = blob_rows
                 .get(&blob_ref_key)
-                .and_then(|row| BlobHash::from_hex(&row.blob_hash).ok());
+                .and_then(|row| BlobId::from_hex(&row.blob_hash).ok());
             let has_blob_ref = blob_rows.contains_key(&blob_ref_key);
             let has_derived_file_ref = derived_rows.contains_key(&blob_ref_key);
             (
@@ -3552,94 +3511,16 @@ async fn execute_fast_lix_file_data_update_by_id_impl(
 struct FastLixFilePathWrite {
     id: Option<String>,
     parsed: ParsedFileWritePath,
-    data: FastFileWriteData,
+    data: FileContent,
     metadata: Option<TransactionJson>,
     splice_provenance: Option<RequestBlobSpliceProvenance>,
-}
-
-#[derive(Clone)]
-enum FastFileWriteData {
-    Inline(crate::Blob),
-    Prepared(crate::binary_cas::BlobWriteReceipt),
-}
-
-impl FastFileWriteData {
-    fn planning_bytes(&self) -> crate::Blob {
-        match self {
-            Self::Inline(data) => data.clone(),
-            // A present byte makes the ordinary planner create a blob-ref row;
-            // `apply_prepared_file_data` replaces its identity and size before
-            // transaction validation observes it.
-            Self::Prepared(_) => vec![0].into(),
-        }
-    }
-
-    fn prepared(&self) -> Option<&crate::binary_cas::BlobWriteReceipt> {
-        match self {
-            Self::Prepared(receipt) => Some(receipt),
-            Self::Inline(_) => None,
-        }
-    }
-}
-
-fn apply_prepared_file_data(
-    rows: &mut RawWriteBatch,
-    file_data: &mut [TransactionFileData],
-    start: usize,
-    receipt: crate::binary_cas::BlobWriteReceipt,
-) -> Result<(), LixError> {
-    let affected_ids = file_data[start..]
-        .iter()
-        .map(|write| write.file_id.clone())
-        .collect::<BTreeSet<_>>();
-    if affected_ids.is_empty() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "prepared file write did not produce file data",
-        ));
-    }
-    for write in &mut file_data[start..] {
-        write.use_prepared_blob(receipt.clone());
-    }
-    let size_bytes = usize::try_from(receipt.size_bytes).map_err(|_| {
-        LixError::new(
-            LixError::CODE_INVALID_PARAM,
-            "prepared file size exceeds this platform",
-        )
-    })?;
-    for index in 0..rows.len() {
-        let row = rows.row(index);
-        if row.schema_key.as_str() != BLOB_REF_SCHEMA_KEY
-            || row
-                .file_id
-                .is_none_or(|id| !affected_ids.contains(id.as_str()))
-        {
-            continue;
-        }
-        let file_id = row
-            .file_id
-            .expect("checked prepared blob-ref file id")
-            .to_string();
-        rows.set_snapshot(
-            index,
-            Some(TransactionJson::from_value(
-                serde_json::json!({
-                    "id": file_id,
-                    "blob_hash": receipt.hash.to_hex(),
-                    "size_bytes": size_bytes,
-                }),
-                "prepared binary blob ref",
-            )?),
-        );
-    }
-    Ok(())
 }
 
 fn parse_fast_lix_file_path_writes(
     writes: Vec<(
         Option<String>,
         String,
-        FastFileWriteData,
+        FileContent,
         Option<TransactionJson>,
         Option<RequestBlobSpliceProvenance>,
     )>,
@@ -4537,7 +4418,7 @@ fn stage_lix_file_data_insert_write(
     file_id: String,
     path: Option<String>,
     filename: Option<String>,
-    data: impl Into<crate::Blob>,
+    content: impl Into<FileContent>,
     context: FilesystemRowContext,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
@@ -4548,7 +4429,7 @@ fn stage_lix_file_data_insert_write(
         context.branch_id.clone(),
         context.global,
         context.untracked,
-        data,
+        content,
     );
     if !file_payload.is_empty() {
         stage_lix_file_data_blob_ref_write(staged, &file_payload, &context, origin)?;
@@ -4562,11 +4443,11 @@ fn stage_lix_file_data_update_write(
     file_id: String,
     path: Option<String>,
     filename: Option<String>,
-    data: impl Into<crate::Blob>,
+    content: impl Into<FileContent>,
     context: FilesystemRowContext,
     has_blob_ref: bool,
     has_derived_file_ref: bool,
-    base_blob_hash: Option<BlobHash>,
+    base_blob_hash: Option<BlobId>,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
     let file_payload = TransactionFileData::new(
@@ -4576,7 +4457,7 @@ fn stage_lix_file_data_update_write(
         context.branch_id.clone(),
         context.global,
         context.untracked,
-        data,
+        content,
     )
     .with_had_blob_ref(has_blob_ref)
     .with_base_blob_hash(base_blob_hash);
@@ -5654,7 +5535,7 @@ async fn load_blob_ranges_for_files(
                     );
                 } else {
                     keys.push(key);
-                    requests.push((BlobHash::from_hex(&row.blob_hash)?, range.clone()));
+                    requests.push((BlobId::from_hex(&row.blob_hash)?, range.clone()));
                 }
             }
             *remaining += 1;
@@ -5702,7 +5583,7 @@ async fn load_blob_bytes_for_files(
                     bytes_by_key.insert(key.clone(), Some(data.clone()));
                 } else {
                     keys.push(key);
-                    hashes.push(BlobHash::from_hex(&row.blob_hash)?);
+                    hashes.push(BlobId::from_hex(&row.blob_hash)?);
                 }
             }
             *remaining += 1;
@@ -5890,7 +5771,7 @@ async fn render_derived_file_for_sql(
     });
     let limits = WasmTransitionLimits::default();
     let source = VecEntitySource::new(v2_read_host_entities(rows, limits)?, limits)?;
-    let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
+    let wasm_hash = BlobId::from_hex(plugin.wasm_blob_hash())?;
     let factory = match plugin_render
         .host
         .cached_plugin_factory(plugin.key(), wasm_hash)?
@@ -7684,7 +7565,9 @@ mod tests {
     use datafusion::physical_expr::expressions::Literal;
     use serde_json::Value as JsonValue;
 
-    use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
+    use crate::binary_cas::{
+        BlobBytesBatch, BlobDataReader, BlobId, BlobLayout, BlobWriteReceipt, ChunkHash,
+    };
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
@@ -8585,7 +8468,7 @@ mod tests {
                     "01920000-0000-7000-8000-0000000000d2",
                     "01920000-0000-7000-8000-0000000000b1",
                     "01920000-0000-7000-8000-0000000000d2",
-                    &BlobHash::from_content(&data).to_hex(),
+                    &BlobId::from_content(&data).to_hex(),
                     data.len(),
                 ),
             ])
@@ -8634,11 +8517,11 @@ mod tests {
     async fn lower_path_contains_scan_loads_blob_rows_only_for_the_matching_find_files_projection()
     {
         let selected_data = b"selected contents".to_vec();
-        let selected_blob_hash = BlobHash::from_content(&selected_data).to_hex();
+        let selected_blob_hash = BlobId::from_content(&selected_data).to_hex();
         let changelog_data = b"changelog contents".to_vec();
-        let changelog_blob_hash = BlobHash::from_content(&changelog_data).to_hex();
+        let changelog_blob_hash = BlobId::from_content(&changelog_data).to_hex();
         let outside_data = b"outside contents".to_vec();
-        let outside_blob_hash = BlobHash::from_content(&outside_data).to_hex();
+        let outside_blob_hash = BlobId::from_content(&outside_data).to_hex();
         let selected_change_id = ChangeId::for_test_label("selected-search-blob");
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
         let mut selected_blob = live_blob_ref_row(
@@ -8792,9 +8675,9 @@ mod tests {
     #[tokio::test]
     async fn file_directory_id_scan_uses_indexed_descriptors_and_blob_rows() {
         let data = b"docs contents".to_vec();
-        let blob_hash = BlobHash::from_content(&data).to_hex();
+        let blob_hash = BlobId::from_content(&data).to_hex();
         let other_data = b"other contents".to_vec();
-        let other_blob_hash = BlobHash::from_content(&other_data).to_hex();
+        let other_blob_hash = BlobId::from_content(&other_data).to_hex();
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
@@ -8954,7 +8837,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000122",
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000122",
-            &BlobHash::from_content(&tracked_data).to_hex(),
+            &BlobId::from_content(&tracked_data).to_hex(),
             tracked_data.len(),
         );
         tracked_blob.change_id = Some(ChangeId::for_test_label("tracked-blob"));
@@ -8963,7 +8846,7 @@ mod tests {
             // Path-index rows are already projected into the requested branch.
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000112",
-            &BlobHash::from_content(&global_data).to_hex(),
+            &BlobId::from_content(&global_data).to_hex(),
             global_data.len(),
         );
         global_blob.global = true;
@@ -8972,7 +8855,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000132",
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000132",
-            &BlobHash::from_content(&untracked_data).to_hex(),
+            &BlobId::from_content(&untracked_data).to_hex(),
             untracked_data.len(),
         );
         untracked_blob.untracked = true;
@@ -8983,7 +8866,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000122",
             "01920000-0000-7000-8000-0000000000b1",
             "different-file-id",
-            &BlobHash::from_content(&misplaced_data).to_hex(),
+            &BlobId::from_content(&misplaced_data).to_hex(),
             misplaced_data.len(),
         );
         misplaced_blob.change_id = Some(ChangeId::for_test_label("misplaced-blob"));
@@ -9084,9 +8967,9 @@ mod tests {
     #[tokio::test]
     async fn file_root_directory_scan_uses_indexed_descriptors_and_root_blob_rows() {
         let root_data = b"root contents".to_vec();
-        let root_blob_hash = BlobHash::from_content(&root_data).to_hex();
+        let root_blob_hash = BlobId::from_content(&root_data).to_hex();
         let nested_data = b"nested contents".to_vec();
-        let nested_blob_hash = BlobHash::from_content(&nested_data).to_hex();
+        let nested_blob_hash = BlobId::from_content(&nested_data).to_hex();
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
@@ -9284,7 +9167,7 @@ mod tests {
     #[derive(Default)]
     struct CapturingWriteContext {
         rows: Vec<MaterializedLiveStateRow>,
-        blob_bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
+        blob_bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
         writes: Vec<TransactionWrite>,
         scan_count: usize,
         path_index_count: usize,
@@ -9300,12 +9183,12 @@ mod tests {
     }
 
     struct StaticBlobReader {
-        bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
+        bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
     }
 
     struct ExactBlobReader {
-        expected_hashes: Vec<BlobHash>,
-        bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
+        expected_hashes: Vec<BlobId>,
+        bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
     }
 
     impl StaticBlobReader {
@@ -9313,7 +9196,7 @@ mod tests {
             Self {
                 bytes_by_hash: blobs
                     .into_iter()
-                    .map(|bytes| (BlobHash::from_content(&bytes), bytes))
+                    .map(|bytes| (BlobId::from_content(&bytes), bytes))
                     .collect(),
             }
         }
@@ -9321,7 +9204,7 @@ mod tests {
 
     #[async_trait]
     impl BlobDataReader for CapturingWriteContext {
-        async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+        async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
             Ok(BlobBytesBatch::new(
                 hashes
                     .iter()
@@ -9333,7 +9216,7 @@ mod tests {
 
     #[async_trait]
     impl BlobDataReader for StaticBlobReader {
-        async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+        async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
             Ok(BlobBytesBatch::new(
                 hashes
                     .iter()
@@ -9345,7 +9228,7 @@ mod tests {
 
     #[async_trait]
     impl BlobDataReader for ExactBlobReader {
-        async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+        async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
             assert_eq!(hashes, self.expected_hashes.as_slice());
             Ok(BlobBytesBatch::new(
                 hashes
@@ -9370,10 +9253,7 @@ mod tests {
             Ok(Vec::new().into())
         }
 
-        async fn load_bytes_many(
-            &mut self,
-            hashes: &[BlobHash],
-        ) -> Result<BlobBytesBatch, LixError> {
+        async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
             BlobDataReader::load_bytes_many(self, hashes).await
         }
 
@@ -9475,10 +9355,7 @@ mod tests {
             Ok(Vec::new().into())
         }
 
-        async fn load_bytes_many(
-            &mut self,
-            hashes: &[BlobHash],
-        ) -> Result<BlobBytesBatch, LixError> {
+        async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
             Ok(BlobBytesBatch::new(vec![None; hashes.len()]))
         }
 
@@ -9891,8 +9768,8 @@ mod tests {
             manifest_json,
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
-            archive_blob_hash: BlobHash::from_content(format!("archive-{key}").as_bytes()).to_hex(),
-            wasm_blob_hash: BlobHash::from_content(wasm).to_hex(),
+            archive_blob_hash: BlobId::from_content(format!("archive-{key}").as_bytes()).to_hex(),
+            wasm_blob_hash: BlobId::from_content(wasm).to_hex(),
         })
         .expect("test plugin registry entry should be valid")
     }
@@ -10377,7 +10254,7 @@ mod tests {
         let file_id = "01920000-0000-7000-8000-0000000000e2";
         let branch_id = "01920000-0000-7000-8000-0000000000b1";
         let data = b"indexed contents";
-        let blob_hash = BlobHash::from_content(data);
+        let blob_hash = BlobId::from_content(data);
         let index = Arc::new(
             path_index_from_rows(vec![
                 live_file_row(
@@ -10433,8 +10310,8 @@ mod tests {
     async fn file_path_predicate_filters_before_blob_and_plugin_hydration() {
         let selected_data = b"selected".to_vec();
         let other_data = b"other".to_vec();
-        let selected_hash = BlobHash::from_content(&selected_data);
-        let other_hash = BlobHash::from_content(&other_data);
+        let selected_hash = BlobId::from_content(&selected_data);
+        let other_hash = BlobId::from_content(&other_data);
         let rows = vec![
             live_file_row(
                 "01920000-0000-7000-8000-0000000000e2",
@@ -10503,7 +10380,7 @@ mod tests {
     #[test]
     fn file_path_predicate_only_discovers_plugins_for_selected_blobless_files() {
         let blob_data = b"stored".to_vec();
-        let blob_hash = BlobHash::from_content(&blob_data);
+        let blob_hash = BlobId::from_content(&blob_data);
         let rows = vec![
             live_file_row(
                 "01920000-0000-7000-8000-000000000512",
@@ -10572,7 +10449,7 @@ mod tests {
     #[tokio::test]
     async fn file_projection_matches_blob_ref_by_descriptor_file_id() {
         let data = b"shared data".to_vec();
-        let blob_hash = BlobHash::from_content(&data).to_hex();
+        let blob_hash = BlobId::from_content(&data).to_hex();
         let blob_reader =
             Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])) as Arc<dyn BlobDataReader>;
         let batch = super::lix_file_record_batch(
@@ -11618,7 +11495,7 @@ mod tests {
             snapshot["blob_hash"].as_str(),
             staged.file_data_writes[0]
                 .blob_hash()
-                .map(BlobHash::to_hex)
+                .map(BlobId::to_hex)
                 .as_deref()
         );
     }
@@ -11786,7 +11663,7 @@ mod tests {
             snapshot["blob_hash"].as_str(),
             staged.file_data_writes[0]
                 .blob_hash()
-                .map(BlobHash::to_hex)
+                .map(BlobId::to_hex)
                 .as_deref()
         );
     }
@@ -12247,7 +12124,7 @@ mod tests {
     #[tokio::test]
     async fn file_id_conflict_probe_uses_path_index_and_exact_blob_batch() {
         let data = b"hello".to_vec();
-        let blob_hash = BlobHash::from_content(&data);
+        let blob_hash = BlobId::from_content(&data);
         let rows = vec![
             live_file_row(
                 "01920000-0000-7000-8000-0000000000d2",
@@ -12312,7 +12189,7 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobHash::from_content(old_data).to_hex(),
+                &BlobId::from_content(old_data).to_hex(),
                 old_data.len(),
             )],
             writes: Vec::new(),
@@ -12403,7 +12280,7 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobHash::from_content(old_data).to_hex(),
+                &BlobId::from_content(old_data).to_hex(),
                 old_data.len(),
             ),
         ];
@@ -12445,7 +12322,7 @@ mod tests {
         assert!(file_data[0].had_blob_ref);
         assert_eq!(
             file_data[0].base_blob_hash(),
-            Some(BlobHash::from_content(old_data)),
+            Some(BlobId::from_content(old_data)),
             "the exact indexed blob hash should be retained for optional CAS reuse",
         );
         let descriptor = rows
@@ -12458,6 +12335,70 @@ mod tests {
                 serde_json::json!({"source": "upload"})
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_cas_path_write_is_first_class_transaction_content() {
+        let old_payload = b"old media payload";
+        let rows = vec![
+            live_file_row(
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"proxy.mov"}"#,
+            ),
+            live_blob_ref_row(
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000d2",
+                &BlobId::from_content(old_payload).to_hex(),
+                old_payload.len(),
+            ),
+        ];
+        let mut write_context = CapturingWriteContext {
+            rows,
+            ..CapturingWriteContext::default()
+        };
+        let payload = b"durable media payload";
+        let size_bytes = payload.len() as u64;
+        let chunk_hash = ChunkHash::from_content(payload);
+        let blob_id = BlobId::from_single_chunk(chunk_hash);
+        let receipt = BlobWriteReceipt {
+            hash: blob_id,
+            size_bytes,
+            layout: BlobLayout::SingleChunk { chunk_hash },
+        };
+
+        let outcome = super::execute_fast_lix_file_prepared_path_write(
+            &mut write_context,
+            "/proxy.mov".to_string(),
+            receipt,
+        )
+        .await
+        .expect("prepared path write should stage");
+
+        assert!(outcome.is_some());
+        let TransactionWrite::RowsWithFileData {
+            rows, file_data, ..
+        } = &write_context.writes[0]
+        else {
+            panic!("prepared path write should use ordinary file transaction rows");
+        };
+        assert_eq!(file_data.len(), 1);
+        assert!(file_data[0].inline_data().is_none());
+        assert_eq!(file_data[0].blob_hash(), Some(blob_id));
+        assert_eq!(file_data[0].len(), payload.len());
+        let blob_ref = rows
+            .iter()
+            .find(|row| row.schema_key == super::BLOB_REF_SCHEMA_KEY)
+            .expect("prepared path write should stage its final blob reference directly");
+        let snapshot = blob_ref
+            .snapshot
+            .as_ref()
+            .expect("prepared blob ref should have a snapshot")
+            .value();
+        let blob_id_hex = blob_id.to_hex();
+        assert_eq!(snapshot["blob_hash"].as_str(), Some(blob_id_hex.as_str()));
+        assert_eq!(snapshot["size_bytes"].as_u64(), Some(size_bytes));
     }
 
     #[tokio::test]
@@ -12490,7 +12431,7 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobHash::from_content(old_data).to_hex(),
+                &BlobId::from_content(old_data).to_hex(),
                 old_data.len(),
             ),
         ];
@@ -12667,7 +12608,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000442",
             crate::GLOBAL_BRANCH_ID,
             "01920000-0000-7000-8000-000000000442",
-            &BlobHash::from_content(b"global").to_hex(),
+            &BlobId::from_content(b"global").to_hex(),
             6,
         );
         global_fallback.global = true;
@@ -12682,7 +12623,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000112",
             "01920000-0000-7000-8000-0000000000b1",
             "01920000-0000-7000-8000-000000000112",
-            &BlobHash::from_content(b"branch").to_hex(),
+            &BlobId::from_content(b"branch").to_hex(),
             6,
         );
         let mut write_context = CapturingWriteContext {
@@ -12750,7 +12691,7 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
                 "01920000-0000-7000-8000-0000000000b1",
                 "01920000-0000-7000-8000-0000000000d2",
-                &BlobHash::from_content(old_data).to_hex(),
+                &BlobId::from_content(old_data).to_hex(),
                 old_data.len(),
             ),
         ];

@@ -89,7 +89,7 @@ pub(crate) struct InstalledPlugin {
     /// Content-addressed identity computed while the component bytes are
     /// already in hand. Warm component-cache lookups must use this fixed-size
     /// value instead of rehashing or comparing the full WASM payload.
-    pub wasm_hash: crate::binary_cas::BlobHash,
+    pub wasm_hash: crate::binary_cas::BlobId,
     pub wasm: Vec<u8>,
 }
 

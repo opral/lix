@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::LixError;
 use crate::binary_cas::BinaryCasChunking;
 use crate::binary_cas::{
-    BlobBytesBatch, BlobChunkReceipt, BlobEditSplice, BlobHash, BlobPayload, BlobRangeBytes,
+    BlobBytesBatch, BlobChunkReceipt, BlobEditSplice, BlobId, BlobPayload, BlobRangeBytes,
     BlobRangeBytesBatch, BlobSameLengthSplice, BlobWriteReceipt,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
@@ -11,11 +11,11 @@ use std::collections::HashSet;
 
 #[async_trait]
 pub(crate) trait BlobDataReader: Send + Sync {
-    async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError>;
+    async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError>;
 
     async fn load_ranges_many(
         &self,
-        requests: &[(BlobHash, std::ops::Range<u64>)],
+        requests: &[(BlobId, std::ops::Range<u64>)],
     ) -> Result<BlobRangeBytesBatch, LixError> {
         let hashes = requests.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
         let values = self.load_bytes_many(&hashes).await?.into_vec();
@@ -113,7 +113,7 @@ impl<S> BlobDataReader for BinaryCasStoreReader<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
-    async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+    async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
         let mut reader = Self {
             store: self.store.clone(),
         };
@@ -122,7 +122,7 @@ where
 
     async fn load_ranges_many(
         &self,
-        requests: &[(BlobHash, std::ops::Range<u64>)],
+        requests: &[(BlobId, std::ops::Range<u64>)],
     ) -> Result<BlobRangeBytesBatch, LixError> {
         crate::binary_cas::kv::load_ranges_many(&self.store, requests).await
     }
@@ -140,7 +140,7 @@ where
     #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn load_bytes_many(
         &mut self,
-        hashes: &[BlobHash],
+        hashes: &[BlobId],
     ) -> Result<BlobBytesBatch, LixError> {
         crate::binary_cas::kv::load_bytes_many(&self.store, hashes).await
     }

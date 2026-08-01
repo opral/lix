@@ -349,7 +349,7 @@ where
     StorageImpl: Storage,
 {
     let read = storage.begin_read(ReadOptions::default()).await?;
-    let hash = crate::binary_cas::BlobHash::from_hex(hash_hex)?;
+    let hash = crate::binary_cas::BlobId::from_hex(hash_hex)?;
     let mut entries = crate::binary_cas::BinaryCasContext::new()
         .reader(read)
         .load_bytes_many(&[hash])
@@ -698,7 +698,7 @@ where
                         "benchmark binary CAS manifest key is not one hash",
                     )
                 })?;
-                Ok(crate::binary_cas::BlobHash::from_bytes(hash))
+                Ok(crate::binary_cas::BlobId::from_bytes(hash))
             })
             .collect::<Result<Vec<_>, crate::LixError>>()?;
         let payloads = crate::binary_cas::load_bytes_many(read, &hashes)
@@ -772,13 +772,13 @@ where
         let Some(hash) = value.get("blob_hash").and_then(serde_json::Value::as_str) else {
             continue;
         };
-        current_file_hashes.insert(crate::binary_cas::BlobHash::from_hex(hash)?);
+        current_file_hashes.insert(crate::binary_cas::BlobId::from_hex(hash)?);
     }
 
     let payloads = binary_cas_payload_inventory(read).await?;
     let mut retained_blobs = std::collections::BTreeSet::new();
     for payload in &payloads {
-        let hash = crate::binary_cas::BlobHash::from_bytes(payload.hash);
+        let hash = crate::binary_cas::BlobId::from_bytes(payload.hash);
         let plugin_selectable = !payload.bytes.iter().take(8_000).any(|byte| *byte == 0);
         if current_file_hashes.contains(&hash) || !plugin_selectable {
             retained_blobs.insert(hash);
@@ -795,8 +795,8 @@ where
         scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_CHUNK_PRESENCE_SPACE).await;
 
     let mut manifest_chunks = std::collections::BTreeMap::<
-        crate::binary_cas::BlobHash,
-        Vec<(crate::binary_cas::BlobHash, u64)>,
+        crate::binary_cas::BlobId,
+        Vec<(crate::binary_cas::BlobId, u64)>,
     >::new();
     for entry in &manifest_chunk_entries {
         let blob_hash = hash_from_key_prefix(&entry.key.0, "manifest chunk")?;
@@ -805,7 +805,7 @@ where
         };
         let (chunk_hash, _) = crate::binary_cas::decode_binary_cas_manifest_chunk(value)?;
         manifest_chunks.entry(blob_hash).or_default().push((
-            crate::binary_cas::BlobHash::from_bytes(chunk_hash),
+            crate::binary_cas::BlobId::from_bytes(chunk_hash),
             storage_entry_bytes(entry),
         ));
     }
@@ -825,7 +825,7 @@ where
         match crate::binary_cas::decode_binary_cas_manifest(value)? {
             crate::binary_cas::BinaryCasManifest::Empty { .. } => {}
             crate::binary_cas::BinaryCasManifest::SingleChunk { chunk_hash, .. } => {
-                retained_chunks.insert(crate::binary_cas::BlobHash::from_bytes(chunk_hash));
+                retained_chunks.insert(crate::binary_cas::BlobId::from_bytes(chunk_hash));
             }
             crate::binary_cas::BinaryCasManifest::Chunked { .. } => {
                 retained_manifest_chunk_owners.insert(blob_hash);
@@ -843,10 +843,10 @@ where
                 ..
             } => match base_layout {
                 crate::binary_cas::StorageBinaryCasDeltaBaseLayout::SingleChunk { chunk_hash } => {
-                    retained_chunks.insert(crate::binary_cas::BlobHash::from_bytes(chunk_hash));
+                    retained_chunks.insert(crate::binary_cas::BlobId::from_bytes(chunk_hash));
                 }
                 crate::binary_cas::StorageBinaryCasDeltaBaseLayout::Chunked { .. } => {
-                    let base_hash = crate::binary_cas::BlobHash::from_bytes(base_blob_hash);
+                    let base_hash = crate::binary_cas::BlobId::from_bytes(base_blob_hash);
                     retained_manifest_chunk_owners.insert(base_hash);
                     retained_chunks.extend(
                         manifest_chunks
@@ -902,7 +902,7 @@ where
 fn hash_from_key_prefix(
     key: &Bytes,
     label: &str,
-) -> Result<crate::binary_cas::BlobHash, crate::LixError> {
+) -> Result<crate::binary_cas::BlobId, crate::LixError> {
     let hash: [u8; 32] = key
         .get(..32)
         .ok_or_else(|| {
@@ -913,7 +913,7 @@ fn hash_from_key_prefix(
         })?
         .try_into()
         .expect("checked hash slice length");
-    Ok(crate::binary_cas::BlobHash::from_bytes(hash))
+    Ok(crate::binary_cas::BlobId::from_bytes(hash))
 }
 
 fn storage_entry_bytes(entry: &crate::storage_adapter::StorageReadEntry) -> u64 {
@@ -940,7 +940,7 @@ where
     let inventory = crate::tracked_state::scan_commit_delta_inventory(read).await?;
     let mut seen_changes = std::collections::BTreeSet::new();
     let mut references = std::collections::BTreeMap::<String, u64>::new();
-    let mut owners = std::collections::BTreeMap::<crate::binary_cas::BlobHash, String>::new();
+    let mut owners = std::collections::BTreeMap::<crate::binary_cas::BlobId, String>::new();
     let mut json_ref_hashes = std::collections::BTreeSet::new();
     for member in inventory
         .commits
@@ -984,8 +984,8 @@ where
     let manifest_chunk_entries =
         scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE).await;
     let mut manifest_chunks = std::collections::BTreeMap::<
-        crate::binary_cas::BlobHash,
-        Vec<crate::binary_cas::BlobHash>,
+        crate::binary_cas::BlobId,
+        Vec<crate::binary_cas::BlobId>,
     >::new();
     for entry in manifest_chunk_entries {
         let blob_hash: [u8; 32] = entry
@@ -1005,21 +1005,21 @@ where
         };
         let (chunk_hash, _) = crate::binary_cas::decode_binary_cas_manifest_chunk(&value)?;
         manifest_chunks
-            .entry(crate::binary_cas::BlobHash::from_bytes(blob_hash))
+            .entry(crate::binary_cas::BlobId::from_bytes(blob_hash))
             .or_default()
-            .push(crate::binary_cas::BlobHash::from_bytes(chunk_hash));
+            .push(crate::binary_cas::BlobId::from_bytes(chunk_hash));
     }
 
     let entries = scan_layout_entries(read, crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE).await;
     let mut accounting =
         std::collections::BTreeMap::<String, BinaryCasOwnerLayoutAccounting>::new();
     let mut chunk_owners = std::collections::BTreeMap::<
-        crate::binary_cas::BlobHash,
+        crate::binary_cas::BlobId,
         std::collections::BTreeSet<String>,
     >::new();
     let mut blob_chunks = std::collections::BTreeMap::<
-        crate::binary_cas::BlobHash,
-        Vec<crate::binary_cas::BlobHash>,
+        crate::binary_cas::BlobId,
+        Vec<crate::binary_cas::BlobId>,
     >::new();
     let mut delta_bases = Vec::new();
     for entry in entries {
@@ -1030,7 +1030,7 @@ where
             )
         })?;
         let owner = owners
-            .get(&crate::binary_cas::BlobHash::from_bytes(hash_bytes))
+            .get(&crate::binary_cas::BlobId::from_bytes(hash_bytes))
             .cloned()
             .unwrap_or_else(|| "unowned".to_owned());
         let StorageProjectedValue::FullValue(value) = entry.value else {
@@ -1053,16 +1053,16 @@ where
             crate::binary_cas::BinaryCasManifest::Empty { .. } => row.empty_manifests += 1,
             crate::binary_cas::BinaryCasManifest::SingleChunk { chunk_hash, .. } => {
                 row.single_chunk_manifests += 1;
-                let chunk_hash = crate::binary_cas::BlobHash::from_bytes(chunk_hash);
+                let chunk_hash = crate::binary_cas::BlobId::from_bytes(chunk_hash);
                 blob_chunks.insert(
-                    crate::binary_cas::BlobHash::from_bytes(hash_bytes),
+                    crate::binary_cas::BlobId::from_bytes(hash_bytes),
                     vec![chunk_hash],
                 );
                 chunk_owners.entry(chunk_hash).or_default().insert(owner);
             }
             crate::binary_cas::BinaryCasManifest::Chunked { .. } => {
                 row.chunked_manifests += 1;
-                let blob_hash = crate::binary_cas::BlobHash::from_bytes(hash_bytes);
+                let blob_hash = crate::binary_cas::BlobId::from_bytes(hash_bytes);
                 let chunks = manifest_chunks.get(&blob_hash).cloned().unwrap_or_default();
                 for chunk_hash in &chunks {
                     chunk_owners
@@ -1074,10 +1074,7 @@ where
             }
             crate::binary_cas::BinaryCasManifest::Delta { base_blob_hash, .. } => {
                 row.delta_manifests += 1;
-                delta_bases.push((
-                    owner,
-                    crate::binary_cas::BlobHash::from_bytes(base_blob_hash),
-                ));
+                delta_bases.push((owner, crate::binary_cas::BlobId::from_bytes(base_blob_hash)));
             }
         }
     }
@@ -1103,7 +1100,7 @@ where
         let StorageProjectedValue::FullValue(value) = entry.value else {
             unreachable!("binary chunk owner scan requests full values");
         };
-        let owners = chunk_owners.get(&crate::binary_cas::BlobHash::from_bytes(chunk_hash));
+        let owners = chunk_owners.get(&crate::binary_cas::BlobId::from_bytes(chunk_hash));
         let owner = match owners {
             None => "unowned_chunk".to_owned(),
             Some(owners) if owners.len() == 1 => owners.first().expect("one chunk owner").clone(),
@@ -1128,14 +1125,14 @@ where
 fn collect_binary_cas_json_owners(
     value: &serde_json::Value,
     references: &mut std::collections::BTreeMap<String, u64>,
-    owners: &mut std::collections::BTreeMap<crate::binary_cas::BlobHash, String>,
+    owners: &mut std::collections::BTreeMap<crate::binary_cas::BlobId, String>,
 ) {
     match value {
         serde_json::Value::Object(object) => {
             for (field, value) in object {
                 if field.ends_with("hash") {
                     if let Some(value) = value.as_str() {
-                        if let Ok(hash) = crate::binary_cas::BlobHash::from_hex(value) {
+                        if let Ok(hash) = crate::binary_cas::BlobId::from_hex(value) {
                             let owner = match field.as_str() {
                                 "blob_hash" => "file_blob",
                                 "plugin_state_checkpoint_hash" => "plugin_runtime_checkpoint",

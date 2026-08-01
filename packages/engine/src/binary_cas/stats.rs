@@ -121,11 +121,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binary_cas::BlobHash;
     use crate::binary_cas::codec::BinaryChunkCodec;
     use crate::binary_cas::kv::{
         KvBlobManifestChunk, stage_chunk, stage_manifest, stage_manifest_chunk,
     };
+    use crate::binary_cas::{BlobId, ChunkHash};
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     #[tokio::test]
@@ -134,15 +134,15 @@ mod tests {
         let storage = StorageAdapter::new(storage);
         let mut writes = storage.new_write_set();
 
-        let empty_hash = BlobHash::from_content(b"empty");
+        let empty_hash = BlobId::from_content(b"empty");
         stage_manifest(
             &mut writes,
             empty_hash,
             &BinaryCasManifest::Empty { size_bytes: 0 },
         );
 
-        let single_hash = BlobHash::from_content(b"single blob");
-        let single_chunk_hash = BlobHash::from_content(b"single");
+        let single_hash = BlobId::from_content(b"single blob");
+        let single_chunk_hash = ChunkHash::from_content(b"single");
         stage_manifest(
             &mut writes,
             single_hash,
@@ -159,7 +159,7 @@ mod tests {
             b"single",
         );
 
-        let chunked_hash = BlobHash::from_content(b"chunked blob");
+        let chunked_hash = BlobId::from_content(b"chunked blob");
         stage_manifest(
             &mut writes,
             chunked_hash,
@@ -172,7 +172,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let chunk_hash = BlobHash::from_content(payload);
+            let chunk_hash = ChunkHash::from_content(payload);
             stage_manifest_chunk(
                 &mut writes,
                 chunked_hash,

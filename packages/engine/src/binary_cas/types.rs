@@ -5,28 +5,32 @@ use crate::binary_cas::codec::{binary_blob_hash_bytes, hash_bytes_to_hex, hash_h
 use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct BlobHash([u8; 32]);
+pub(crate) struct BlobId([u8; 32]);
 
-impl BlobHash {
+impl BlobId {
     pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
     pub(crate) fn from_content(content: &[u8]) -> Self {
         if content.len() <= MEDIA_CHUNK_BYTES {
-            return Self(binary_blob_hash_bytes(content));
+            return Self::from_single_chunk(ChunkHash::from_content(content));
         }
         let chunks = content
             .chunks(MEDIA_CHUNK_BYTES)
-            .map(|chunk| (Self(binary_blob_hash_bytes(chunk)), chunk.len() as u64));
+            .map(|chunk| (ChunkHash::from_content(chunk), chunk.len() as u64));
         Self::from_chunks(content.len() as u64, chunks)
+    }
+
+    pub(crate) fn from_single_chunk(chunk_hash: ChunkHash) -> Self {
+        Self(chunk_hash.into_bytes())
     }
 
     /// Computes the canonical identity of a fixed-chunk blob without opening
     /// its payload. Upload recovery persists precisely these bounded receipts.
     pub(crate) fn from_chunks(
         size_bytes: u64,
-        chunks: impl IntoIterator<Item = (Self, u64)>,
+        chunks: impl IntoIterator<Item = (ChunkHash, u64)>,
     ) -> Self {
         let mut hasher = blake3::Hasher::new_derive_key("lix binary cas fixed manifest v3");
         hasher.update(&size_bytes.to_le_bytes());
@@ -54,6 +58,36 @@ impl BlobHash {
     }
 }
 
+/// The raw content hash of one immutable CAS chunk.
+///
+/// A `ChunkHash` can equal a small blob's `BlobId` byte-for-byte, but it is
+/// deliberately a distinct type: chunk keys must never be accepted where a
+/// manifest identity is required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct ChunkHash([u8; 32]);
+
+impl ChunkHash {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn from_content(content: &[u8]) -> Self {
+        Self(binary_blob_hash_bytes(content))
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub(crate) fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub(crate) fn to_hex(self) -> String {
+        hash_bytes_to_hex(&self.0)
+    }
+}
+
 /// A host-verified fixed-width replacement in an already materialized blob.
 ///
 /// The ordinary SQL surface still submits complete replacement bytes. The
@@ -63,21 +97,21 @@ impl BlobHash {
 /// non-overlapping chunk instead of rechunking the complete replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlobSameLengthSplice {
-    pub(crate) base_blob_hash: BlobHash,
+    pub(crate) base_blob_hash: BlobId,
     pub(crate) offset: usize,
     pub(crate) length: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlobEditSplice {
-    pub(crate) base_blob_hash: BlobHash,
+    pub(crate) base_blob_hash: BlobId,
     pub(crate) offset: usize,
     pub(crate) delete_len: usize,
     pub(crate) insert_len: usize,
 }
 
 impl BlobSameLengthSplice {
-    pub(crate) fn new(base_blob_hash: BlobHash, offset: usize, length: usize) -> Self {
+    pub(crate) fn new(base_blob_hash: BlobId, offset: usize, length: usize) -> Self {
         Self {
             base_blob_hash,
             offset,
@@ -93,13 +127,13 @@ impl BlobSameLengthSplice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobPayload {
     bytes: crate::Blob,
-    hash: Option<BlobHash>,
+    hash: Option<BlobId>,
 }
 
 impl BlobPayload {
     pub(crate) fn from_bytes(bytes: impl Into<crate::Blob>) -> Self {
         let bytes = bytes.into();
-        let hash = (!bytes.is_empty()).then(|| BlobHash::from_content(&bytes));
+        let hash = (!bytes.is_empty()).then(|| BlobId::from_content(&bytes));
         Self { bytes, hash }
     }
 
@@ -111,7 +145,7 @@ impl BlobPayload {
         self.bytes.clone()
     }
 
-    pub(crate) fn hash(&self) -> Option<BlobHash> {
+    pub(crate) fn hash(&self) -> Option<BlobId> {
         self.hash
     }
 
@@ -132,7 +166,7 @@ pub(crate) enum BlobDeltaSegment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlobDeltaBaseLayout {
-    SingleChunk { chunk_hash: BlobHash },
+    SingleChunk { chunk_hash: ChunkHash },
     Chunked { chunk_count: u32 },
 }
 
@@ -140,7 +174,7 @@ pub(crate) enum BlobDeltaBaseLayout {
 pub(crate) enum BlobLayout {
     Empty,
     SingleChunk {
-        chunk_hash: BlobHash,
+        chunk_hash: ChunkHash,
     },
     Chunked {
         chunk_count: u32,
@@ -148,7 +182,7 @@ pub(crate) enum BlobLayout {
     /// One-level, flattened copy/insert program against a canonical full blob,
     /// so reads never walk a history chain.
     Delta {
-        base_blob_hash: BlobHash,
+        base_blob_hash: BlobId,
         base_size_bytes: u64,
         base_layout: BlobDeltaBaseLayout,
         segments: Vec<BlobDeltaSegment>,
@@ -157,7 +191,7 @@ pub(crate) enum BlobLayout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobMetadata {
-    pub(crate) hash: BlobHash,
+    pub(crate) hash: BlobId,
     pub(crate) size_bytes: u64,
     pub(crate) layout: BlobLayout,
 }
@@ -216,14 +250,14 @@ impl BlobBytesBatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobWriteReceipt {
-    pub(crate) hash: BlobHash,
+    pub(crate) hash: BlobId,
     pub(crate) size_bytes: u64,
     pub(crate) layout: BlobLayout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlobChunkReceipt {
-    pub(crate) hash: BlobHash,
+    pub(crate) hash: ChunkHash,
     pub(crate) size_bytes: u64,
 }
 

@@ -8,7 +8,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::binary_cas::BlobHash;
+use crate::binary_cas::BlobId;
 use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
@@ -25,7 +25,7 @@ use super::{DirectoryPathRecord, derive_directory_paths};
 #[cfg(test)]
 use crate::transaction::types::TransactionWriteRow;
 use crate::transaction::types::{
-    LogicalPrimaryKey, RawWriteBatch, TransactionFileData, TransactionJson,
+    FileContent, LogicalPrimaryKey, RawWriteBatch, TransactionFileData, TransactionJson,
     TransactionWriteOperation, TransactionWriteOrigin,
 };
 
@@ -356,7 +356,7 @@ impl FileDescriptorWriteIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobRefRowInput {
     pub(crate) file_id: String,
-    pub(crate) blob_hash: BlobHash,
+    pub(crate) blob_hash: BlobId,
     pub(crate) size_bytes: usize,
     pub(crate) context: FilesystemRowContext,
 }
@@ -1114,7 +1114,7 @@ pub(crate) fn plan_parsed_file_path_write_with_resolvers(
     resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     parsed: LixPath,
     id: Option<String>,
-    data: Option<crate::Blob>,
+    content: Option<FileContent>,
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
@@ -1125,7 +1125,7 @@ pub(crate) fn plan_parsed_file_path_write_with_resolvers(
         fallback.as_ref(),
         parsed,
         id,
-        data,
+        content,
         context,
         generate_directory_id,
     )
@@ -1136,7 +1136,7 @@ fn plan_parsed_file_path_write_with_fallback(
     fallback: Option<&DirectoryPathResolver>,
     parsed: LixPath,
     id: Option<String>,
-    data: Option<crate::Blob>,
+    content: Option<FileContent>,
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
@@ -1176,7 +1176,7 @@ fn plan_parsed_file_path_write_with_fallback(
     .append_to(&mut rows);
 
     let mut file_data = Vec::new();
-    if let Some(data) = data {
+    if let Some(content) = content {
         let file_payload = TransactionFileData::new(
             file_id.clone(),
             Some(file_path),
@@ -1184,7 +1184,7 @@ fn plan_parsed_file_path_write_with_fallback(
             context.branch_id.clone(),
             context.global,
             context.untracked,
-            data,
+            content,
         );
         if !file_payload.is_empty() {
             BlobRefRowInput {
@@ -1242,7 +1242,7 @@ pub(crate) fn plan_file_descriptor_write(
             input.context.branch_id.clone(),
             input.context.global,
             input.context.untracked,
-            data,
+            FileContent::inline(data),
         );
         if !file_payload.is_empty() {
             BlobRefRowInput {
@@ -1823,7 +1823,7 @@ mod tests {
     use serde_json::{Value as JsonValue, json};
 
     use crate::GLOBAL_BRANCH_ID;
-    use crate::binary_cas::BlobHash;
+    use crate::binary_cas::BlobId;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey};
@@ -2015,7 +2015,7 @@ mod tests {
     fn blob_ref_row_builds_state_row() {
         let row = blob_ref_row(BlobRefRowInput {
             file_id: "01920000-0000-7000-8000-0000000000d2".to_string(),
-            blob_hash: BlobHash::from_content(b"Hello"),
+            blob_hash: BlobId::from_content(b"Hello"),
             size_bytes: 5,
             context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         })
@@ -2035,7 +2035,7 @@ mod tests {
         assert_eq!(snapshot["size_bytes"], 5);
         assert_eq!(
             snapshot["blob_hash"].as_str(),
-            Some(BlobHash::from_content(b"Hello").to_hex().as_str())
+            Some(BlobId::from_content(b"Hello").to_hex().as_str())
         );
     }
 
