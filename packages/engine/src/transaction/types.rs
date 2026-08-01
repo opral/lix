@@ -1515,11 +1515,13 @@ impl TransactionFileData {
     pub(crate) fn set_plugin_checkpoint(
         &mut self,
         generation: String,
+        semantic_root: String,
         runtime: impl Into<crate::Blob>,
         authority: impl Into<crate::Blob>,
     ) {
         self.plugin_checkpoint = Some(PluginCheckpointWrite {
             generation,
+            semantic_root,
             runtime: runtime.into(),
             authority: authority.into(),
         });
@@ -1648,6 +1650,7 @@ impl TransactionFileData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PluginCheckpointWrite {
     pub(crate) generation: String,
+    pub(crate) semantic_root: String,
     pub(crate) runtime: crate::Blob,
     pub(crate) authority: crate::Blob,
 }

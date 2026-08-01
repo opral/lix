@@ -3,10 +3,11 @@
 This hard cut moves rebuildable plugin checkpoints out of immutable repository
 history. A checkpoint is now one current value keyed by the raw 16-byte branch
 UUID and 16-byte file UUID. Each update overwrites that value atomically with
-the file, semantic rows, and branch head. Generation and file-blob hashes in
-the value fence stale state; malformed or mismatched cache data is ignored and
-rebuilt. Raw writes and file deletion remove the exact owner key, while branch
-deletion removes its UUID-prefixed key range.
+the file, semantic rows, and branch head. The plugin generation, file-blob
+hash, and raw 16-byte Lix semantic-root UUID fence stale state; malformed or
+mismatched cache data is ignored and rebuilt. Raw writes and file deletion
+remove the exact owner key, while branch deletion removes its UUID-prefixed key
+range.
 
 The boundary is format-neutral. The engine stores opaque runtime and authority
 bytes produced by any WASM component plugin. It contains no Git, text, binary,
@@ -33,7 +34,7 @@ This follows established database practice:
 ## Git replay corpus
 
 The baseline is `main` at `3a792c12d`; the candidate release binary SHA-256 is
-`41826a32edb748412bf4ef48246f7ce598f333c5613137025d5bf0669b4c32ec`.
+`10e9285f746800ae86ff303296a962aa7b803bbcbf7d464d453310d6576df239`.
 Every successful run used `lix exp git-replay --plugins all`, a scoped parent
 bootstrap, periodic checkpoints, explicit adapter flush, and final Git-tree
 verification. RocksDB bytes are the closed database directory. SlateDB bytes
@@ -42,13 +43,13 @@ close-timing-dependent WAL and manifest control files.
 
 | repository | adapter | replay before | replay after | time delta | bytes before | bytes after | size delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `microsoft/vscode-docs`, 100 commits | RocksDB | 4668.278 ms | 4496.238 ms | -3.69% | 72,622,119 | 60,044,560 | -17.32% |
-| `microsoft/vscode-docs`, 100 commits | SlateDB | 4809.890 ms | 4761.489 ms | -1.01% | 72,151,959 | 56,906,626 | -21.13% |
-| `home-assistant/brands`, 80 commits | RocksDB | 313.681 ms | 309.614 ms | -1.30% | 15,853,294 | 15,840,929 | -0.08% |
-| `home-assistant/brands`, 80 commits | SlateDB | 374.387 ms | 377.196 ms | +0.75% | 15,727,248 | 15,715,604 | -0.07% |
-| `wesnoth/wesnoth`, 15 commits | RocksDB | 121.232 ms | 124.242 ms | +2.48% | 4,345,582 | 4,233,493 | -2.58% |
-| `wesnoth/wesnoth`, 15 commits | SlateDB | 124.612 ms | 123.935 ms | -0.54% | 4,303,176 | 4,193,333 | -2.55% |
-| **aggregate** | | **10412.081 ms** | **10192.712 ms** | **-2.11%** | **185,003,378** | **156,934,545** | **-15.17%** |
+| `microsoft/vscode-docs`, 100 commits | RocksDB | 4668.278 ms | 4500.058 ms | -3.60% | 72,622,119 | 60,051,838 | -17.31% |
+| `microsoft/vscode-docs`, 100 commits | SlateDB | 4809.890 ms | 4695.012 ms | -2.39% | 72,151,959 | 56,912,396 | -21.12% |
+| `home-assistant/brands`, 80 commits | RocksDB | 313.681 ms | 311.152 ms | -0.81% | 15,853,294 | 15,841,120 | -0.08% |
+| `home-assistant/brands`, 80 commits | SlateDB | 374.387 ms | 370.679 ms | -0.99% | 15,727,248 | 15,715,693 | -0.07% |
+| `wesnoth/wesnoth`, 15 commits | RocksDB | 121.232 ms | 121.650 ms | +0.34% | 4,345,582 | 4,234,177 | -2.56% |
+| `wesnoth/wesnoth`, 15 commits | SlateDB | 124.612 ms | 126.817 ms | +1.77% | 4,303,176 | 4,194,632 | -2.52% |
+| **aggregate** | | **10412.081 ms** | **10125.368 ms** | **-2.75%** | **185,003,378** | **156,949,856** | **-15.16%** |
 
 All six final trees verified. VS Code materialized the same 97 unique Git LFS
 objects and 42,011,887 logical LFS bytes; Brands and Wesnoth materialized none.
@@ -77,11 +78,11 @@ every binary-CAS manifest to its owning hash field, and emits an explicit
 Before the hard cut, VS Code had 1,967 runtime-checkpoint manifests carrying
 17,653,016 logical bytes and 886 authority-checkpoint manifests carrying
 2,053,864 bytes. The candidate removes all 2,853 historical manifests. It
-retains 360 current checkpoint rows with 3,141,505 runtime bytes and 133,544
+retains 360 current checkpoint rows with 3,141,586 runtime bytes and 133,544
 authority bytes. All 360 runtime payloads are unique; 358 authority payloads
 are unique, and the only exact duplicates total 40 bytes. Immutable binary-CAS
 chunk values fall from 67,267,601 to 49,402,074 bytes. The current checkpoint
-space occupies 3,238,123 compressed physical bytes. All 689 encoded chunk
+space occupies 3,244,227 compressed physical bytes. All 689 encoded chunk
 values are reachable from exactly one reported owner category; none is orphaned
 or shared across categories.
 

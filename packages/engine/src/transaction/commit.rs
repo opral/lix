@@ -243,6 +243,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                     &write.branch_id,
                     &write.file_id,
                     &checkpoint.generation,
+                    &checkpoint.semantic_root,
                     write
                         .blob_hash()
                         .unwrap_or_else(|| crate::binary_cas::BlobHash::from_content(write.data())),
