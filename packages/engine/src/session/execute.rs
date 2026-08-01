@@ -6726,6 +6726,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_transaction_certified_json_pointer_updates_observe_staged_rows() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "json_pointer",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("json pointer schema should register");
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))",
+                &[
+                    Value::Text("/certified".to_string()),
+                    Value::Text("{\"step\":0}".to_string()),
+                ],
+            )
+            .await
+            .expect("json pointer seed should commit");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        assert_eq!(sql2::take_certified_single_path_value_replacements(), 0);
+        let sql = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
+        for step in [1, 2] {
+            let result = transaction
+                .execute(
+                    sql,
+                    &[
+                        Value::Text(format!("{{\"step\":{step}}}")),
+                        Value::Text("/certified".to_string()),
+                    ],
+                )
+                .await
+                .expect("certified replacement should stage");
+            assert_eq!(result.rows_affected(), 1);
+        }
+        let missing = transaction
+            .execute(
+                sql,
+                &[
+                    Value::Text("{\"step\":3}".to_string()),
+                    Value::Text("/missing".to_string()),
+                ],
+            )
+            .await
+            .expect("missing certified replacement should succeed");
+        assert_eq!(missing.rows_affected(), 0);
+        assert_eq!(sql2::take_certified_single_path_value_replacements(), 2);
+        transaction
+            .commit()
+            .await
+            .expect("certified replacements should commit atomically");
+
+        let result = session
+            .execute(
+                "SELECT value FROM json_pointer WHERE path = $1",
+                &[Value::Text("/certified".to_string())],
+            )
+            .await
+            .expect("committed json pointer should be visible");
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("JSON value should decode"),
+            serde_json::json!({"step": 2})
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_transaction_origin_key_survives_addressable_change_assignment() {
         let session = open_session().await;
         session

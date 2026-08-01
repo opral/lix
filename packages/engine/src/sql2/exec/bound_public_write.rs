@@ -51,6 +51,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static CERTIFIED_GENERATION_IDENTITY_REPLACEMENTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -76,6 +78,11 @@ pub(crate) fn take_certified_entity_insert_parameter_batch_executions() -> usize
 #[cfg(test)]
 pub(crate) fn take_certified_generation_identity_replacements() -> usize {
     CERTIFIED_GENERATION_IDENTITY_REPLACEMENTS.with(|executions| executions.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_certified_single_path_value_replacements() -> usize {
+    CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| executions.replace(0))
 }
 
 #[cfg(test)]
@@ -2168,6 +2175,10 @@ async fn entity_update(
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<SqlWriteResult, LixError> {
+    if let Some(result) = try_execute_direct_path_value_replacement(ctx, plan, spec, params).await?
+    {
+        return Ok(result);
+    }
     let constraints_unchanged = update_assignments_preserve_constraints(ctx, plan, spec);
     let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
     let mut write_rows = RawWriteBatch::with_capacity(candidates.len());
@@ -2195,6 +2206,131 @@ async fn entity_update(
         write_rows,
     )
     .await
+}
+
+/// Stages one ordinary `json_pointer(path, value)` point replacement through
+/// the same canonical certificate used by dense parameter batches.
+///
+/// Explicit SQL transactions commonly issue one UPDATE per row because each
+/// call must report its affected-row count immediately. The generic entity
+/// route re-enters plugin reconciliation, schema normalization, and constraint
+/// preparation for every such call even though this exact schema and plan
+/// prove those passes redundant. A visible-row lookup still preserves
+/// statement ordering and transaction-overlay semantics; only ordinary
+/// tracked, branch-local, unfiled rows without metadata take the certificate.
+async fn try_execute_direct_path_value_replacement(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
+    params: &[Value],
+) -> Result<Option<SqlWriteResult>, LixError> {
+    if spec.has_inter_row_constraints
+        || !matches!(plan.bound.input, BoundWriteInput::None)
+        || plan.bound.conflict.is_some()
+        || plan.bound.returning.is_some()
+        || !matches!(plan.bound.branch_scope, BranchScope::Active { .. })
+        || !matches!(plan.filters.rows, FilterSet::All)
+        || plan_references_active_branch_commit_id(plan)
+        || plan.bound.assignments.iter().any(|assignment| {
+            spec.primary_key_paths
+                .iter()
+                .any(|path| path.as_slice() == [assignment.column.name.as_str()])
+        })
+    {
+        return Ok(None);
+    }
+    let Some(primary_key_param_index) =
+        bound_single_text_primary_key_param(spec, &plan.bound.predicate)
+    else {
+        return Ok(None);
+    };
+    let Some(replacement) =
+        direct_path_value_replacement(spec, plan, Some(primary_key_param_index))
+    else {
+        return Ok(None);
+    };
+    let Some(Value::Text(primary_key)) = params.get(primary_key_param_index) else {
+        return Ok(None);
+    };
+    let replacement_value = match params.get(replacement.value_param_index) {
+        Some(Value::Text(value)) => Some(value.as_str()),
+        Some(Value::Null) => None,
+        _ => return Ok(None),
+    };
+    let Some(schema_catalog) = ctx.schema_catalog_snapshot() else {
+        return Ok(None);
+    };
+    let Some((schema_plan_id, schema_plan)) = schema_catalog.plan_for_key(&spec.schema_key) else {
+        return Ok(None);
+    };
+    if !schema_plan.accepts_canonical_certificate() {
+        return Ok(None);
+    }
+
+    let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
+    if candidates.is_empty() {
+        return Ok(Some(SqlWriteResult::affected(0)));
+    }
+    if candidates.len() != 1 {
+        return Ok(None);
+    }
+    let candidate = candidates.row(0);
+    if candidate.untracked()
+        || candidate.global()
+        || candidate.file_id().is_some()
+        || candidate.metadata().is_some()
+        || candidate.branch_id() != ctx.active_branch_id()
+    {
+        return Ok(None);
+    }
+
+    let mut normalized = Vec::with_capacity(primary_key.len().saturating_add(32));
+    normalized.extend_from_slice(b"{\"path\":");
+    append_canonical_json_string(&mut normalized, primary_key)?;
+    normalized.extend_from_slice(b",\"value\":");
+    match replacement_value {
+        None => normalized.extend_from_slice(b"null"),
+        Some(raw) => {
+            let value = serde_json::from_str::<JsonValue>(raw).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("lix_json argument is not valid JSON: {error}"),
+                )
+            })?;
+            serde_json::to_writer(&mut normalized, &value).map_err(|error| {
+                LixError::unknown(format!(
+                    "certified replacement value failed to serialize: {error}"
+                ))
+            })?;
+        }
+    }
+    normalized.push(b'}');
+    let normalized_len = normalized.len();
+    let snapshot =
+        TransactionJson::from_certified_row_content_arena(normalized, vec![(0, normalized_len)])?
+            .pop()
+            .expect("one certified replacement snapshot");
+    let rows = RawWriteBatch::from_certified_parameter_replacement(
+        vec![EntityPk::single(primary_key.clone())],
+        vec![snapshot],
+        spec.schema_key.as_str().into(),
+        ctx.active_branch_id().into(),
+        CertifiedRawWriteBatchPreparation {
+            schema_plan_id,
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+            tracked_keys_strictly_ordered: true,
+            complete_collection_replacement: false,
+        },
+    )?;
+    ctx.stage_parameter_batch_replace(rows).await?;
+    #[cfg(test)]
+    CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| {
+        executions.set(executions.get().saturating_add(1));
+    });
+    Ok(Some(SqlWriteResult::affected(1)))
 }
 
 /// Stage entity INSERT/UPDATE rows and, when requested, retain their final

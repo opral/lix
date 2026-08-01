@@ -1004,15 +1004,33 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged writes lock",
             )
         })?;
-        let rows = match &*rows {
-            StagedPreparedRows::AppendOnly { rows, .. }
-            | StagedPreparedRows::Indexed { rows, .. } => rows,
+        let registered_schema_key = crate::transaction::normalization::REGISTERED_SCHEMA_KEY;
+        let (rows, candidate_slots) = match &*rows {
+            StagedPreparedRows::AppendOnly { rows, .. } => (rows, None),
+            StagedPreparedRows::Indexed {
+                rows, by_candidate, ..
+            } => (
+                rows,
+                Some(
+                    by_candidate
+                        .slots_by_schema
+                        .get(registered_schema_key)
+                        .map(SmallVec::as_slice)
+                        .unwrap_or(&[]),
+                ),
+            ),
         };
-        Ok(rows.iter().any(|row| {
-            row.schema_key.as_str() == crate::transaction::normalization::REGISTERED_SCHEMA_KEY
+        let matches_domain = |row: PreparedStateRowRef<'_>| {
+            row.schema_key.as_str() == registered_schema_key
                 && row.branch_id.as_str() == domain.branch_id()
                 && (row.untracked == domain.untracked() || (domain.untracked() && !row.untracked))
-        }))
+        };
+        Ok(match candidate_slots {
+            Some(slots) => slots.iter().any(|slot| match slot {
+                RowSlot::State(index) => matches_domain(rows.row(*index)),
+            }),
+            None => rows.iter().any(matches_domain),
+        })
     }
 
     /// Promotes the compact ordered journal into the existing identity overlay
@@ -3028,6 +3046,62 @@ mod tests {
         assert!(
             staged_writes.uses_identity_index_for_tests(),
             "reads keep the single materialized index rather than rebuilding it"
+        );
+    }
+
+    #[test]
+    fn indexed_schema_catalog_probe_uses_schema_candidates_and_preserves_domains() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let staged_writes = test_staged_writes();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows![tracked_append_row("entity-a", "ordinary")],
+            })
+            .expect("ordinary row should stage");
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("overlay should build");
+        assert!(
+            overlay
+                .load_exact(&exact_request_for_branch_key(branch_id, "entity-a"))
+                .is_some()
+        );
+        assert!(staged_writes.uses_identity_index_for_tests());
+
+        let tracked_domain = Domain::schema_catalog(branch_id, false);
+        assert!(
+            !staged_writes
+                .has_staged_schema_catalog_change(&tracked_domain)
+                .expect("indexed catalog probe should succeed")
+        );
+
+        let mut schema_row = tracked_append_row("schema-a", "schema");
+        schema_row.schema_key = crate::transaction::normalization::REGISTERED_SCHEMA_KEY.into();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows![schema_row],
+            })
+            .expect("registered schema row should stage into the index");
+
+        assert!(
+            staged_writes
+                .has_staged_schema_catalog_change(&tracked_domain)
+                .expect("tracked catalog change should be detected")
+        );
+        assert!(
+            staged_writes
+                .has_staged_schema_catalog_change(&Domain::schema_catalog(branch_id, true))
+                .expect("untracked catalog includes tracked schema definitions")
+        );
+        assert!(
+            !staged_writes
+                .has_staged_schema_catalog_change(&Domain::schema_catalog(
+                    "01920000-0000-7000-8000-0000000000b1",
+                    false,
+                ))
+                .expect("other branch should remain independent")
         );
     }
 
