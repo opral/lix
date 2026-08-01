@@ -12,7 +12,7 @@ use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, build_path_index, load_path_index_revision,
 };
-use crate::live_state::tracked_head::TrackedHeadContext;
+use crate::live_state::tracked_head::{HotStateTransactionCache, TrackedHeadContext};
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateReader, LiveStateRowFilter, LiveStateRowRequest,
     LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
@@ -45,6 +45,7 @@ type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
 #[derive(Default)]
 pub(crate) struct BranchHeadControlCache {
     controls: StdMutex<std::collections::BTreeMap<String, Option<BranchHeadControl>>>,
+    hot_state: std::sync::Arc<HotStateTransactionCache>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -563,9 +564,14 @@ where
             return Ok(Some(MaterializedLiveStateBatch::default()));
         }
         let tracked_request = tracked_scan_request_from_live(request);
-        let rows_by_branch = self
-            .tracked_head
-            .reader(&self.store)
+        let tracked_head = self.branch_head_control_cache.as_ref().map_or_else(
+            || self.tracked_head.reader(&self.store),
+            |cache| {
+                self.tracked_head
+                    .transaction_reader(&self.store, std::sync::Arc::clone(&cache.hot_state))
+            },
+        );
+        let rows_by_branch = tracked_head
             .scan_live_batches_for_controls(&controls, &tracked_request)
             .await?;
         let rows = concat_live_state_batches(
