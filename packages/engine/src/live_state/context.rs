@@ -27,11 +27,25 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use std::mem::size_of;
+use std::sync::Mutex as StdMutex;
 
 const BRANCH_READ_CONCURRENCY: usize = 8;
 const ENTITY_POINT_SNAPSHOT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const ENTITY_POINT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4_096;
+const TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES: usize = 64;
 type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
+
+/// Transaction-local branch publication controls.
+///
+/// A transaction is fenced by the tracked mutation revision observed when it
+/// opens, so repeatedly loading the same immutable generation selector only
+/// adds storage round trips. Missing controls are cached as well: branch
+/// creation rotates that revision and therefore conflicts with the pinned
+/// transaction before commit.
+#[derive(Default)]
+pub(crate) struct BranchHeadControlCache {
+    controls: StdMutex<std::collections::BTreeMap<String, Option<BranchHeadControl>>>,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct EntityPointSnapshotCacheKey {
@@ -165,6 +179,28 @@ impl LiveStateContext {
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
             entity_field_index_cache: std::sync::Arc::clone(&self.entity_field_index_cache),
             entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
+            branch_head_control_cache: None,
+        }
+    }
+
+    /// Creates a reader whose branch generation selectors are pinned to one
+    /// transaction-local cache.
+    pub(crate) fn transaction_reader<S>(
+        &self,
+        store: S,
+        branch_head_control_cache: std::sync::Arc<BranchHeadControlCache>,
+    ) -> LiveStateStoreReader<S>
+    where
+        S: StorageAdapterRead,
+    {
+        LiveStateStoreReader {
+            store,
+            tracked_head: self.tracked_head,
+            commit_graph: self.commit_graph.clone(),
+            filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
+            entity_field_index_cache: std::sync::Arc::clone(&self.entity_field_index_cache),
+            entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
+            branch_head_control_cache: Some(branch_head_control_cache),
         }
     }
 
@@ -182,6 +218,7 @@ impl LiveStateContext {
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
             entity_field_index_cache: std::sync::Arc::new(EntitySnapshotFieldIndexCache::default()),
             entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
+            branch_head_control_cache: None,
         }
     }
 
@@ -204,6 +241,7 @@ pub(crate) struct LiveStateStoreReader<S> {
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
     entity_field_index_cache: std::sync::Arc<EntitySnapshotFieldIndexCache>,
     entity_point_snapshot_cache: std::sync::Arc<EntityPointSnapshotCache>,
+    branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
 }
 
 impl<S> LiveStateStoreReader<S>
@@ -334,7 +372,13 @@ where
         let [schema_key] = request.filter.schema_keys.as_slice() else {
             return Ok(None);
         };
-        let scope = scan_scope(&self.store, request, true).await?;
+        let scope = scan_scope(
+            &self.store,
+            request,
+            true,
+            self.branch_head_control_cache.as_deref(),
+        )
+        .await?;
         let [requested_branch_id] = scope.projection_branch_ids.as_slice() else {
             return Ok(None);
         };
@@ -378,7 +422,13 @@ where
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let store = &self.store;
         let reads_tracked = !is_commit_derived_only_request(request);
-        let scope = scan_scope(store, request, reads_tracked).await?;
+        let scope = scan_scope(
+            store,
+            request,
+            reads_tracked,
+            self.branch_head_control_cache.as_deref(),
+        )
+        .await?;
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
             return Ok(MaterializedLiveStateBatch::default());
         }
@@ -495,9 +545,23 @@ where
                     .map(|control| (branch_id.clone(), control))
             })
             .collect::<Option<Vec<_>>>();
-        let Some(controls) = controls else {
+        let Some(mut controls) = controls else {
             return Ok(None);
         };
+        // Branch-head schema membership is an atomic, no-false-negative
+        // publication filter. Apply it per generation before a finite PK
+        // lookup so an absent global schema does not pay the complete hot,
+        // packed, and certified point-read stack for every active-branch row.
+        controls.retain(|(_, control)| {
+            request
+                .filter
+                .schema_keys
+                .iter()
+                .any(|schema_key| control.may_have_schema(schema_key))
+        });
+        if controls.is_empty() {
+            return Ok(Some(MaterializedLiveStateBatch::default()));
+        }
         let tracked_request = tracked_scan_request_from_live(request);
         let rows_by_branch = self
             .tracked_head
@@ -598,7 +662,13 @@ where
         // controls that select the active generation; treating that request
         // as "not tracked" used to skip the controls entirely and made the
         // workspace selector (an untracked row) invisible after hot-index init.
-        let scope = scan_scope(&self.store, &scope_request, true).await?;
+        let scope = scan_scope(
+            &self.store,
+            &scope_request,
+            true,
+            self.branch_head_control_cache.as_deref(),
+        )
+        .await?;
         let visible_branch_ids = scope
             .projection_branch_ids
             .iter()
@@ -756,7 +826,13 @@ where
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let store = &self.store;
         let reads_tracked = !is_commit_derived_only_request(request);
-        let scope = scan_scope(store, request, reads_tracked).await?;
+        let scope = scan_scope(
+            store,
+            request,
+            reads_tracked,
+            self.branch_head_control_cache.as_deref(),
+        )
+        .await?;
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
             return Ok(MaterializedLiveStateBatch::default());
         }
@@ -879,7 +955,12 @@ where
         branch_id: &str,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
-        let controls = load_branch_head_controls(&self.store, &[branch_id.to_owned()]).await?;
+        let controls = load_branch_head_controls(
+            &self.store,
+            &[branch_id.to_owned()],
+            self.branch_head_control_cache.as_deref(),
+        )
+        .await?;
         let Some(control) = controls.get(branch_id).copied() else {
             return Ok(None);
         };
@@ -1322,10 +1403,11 @@ async fn scan_scope(
     store: &(impl StorageAdapterRead + ?Sized),
     request: &LiveStateScanRequest,
     resolve_branch_heads: bool,
+    branch_head_control_cache: Option<&BranchHeadControlCache>,
 ) -> Result<LiveStateScanScope, LixError> {
     if request.filter.branch_ids.is_empty() {
         if resolve_branch_heads {
-            let branch_heads = load_branch_head_controls(store, &[]).await?;
+            let branch_heads = load_branch_head_controls(store, &[], None).await?;
             return Ok(LiveStateScanScope {
                 storage_branch_ids: branch_heads.keys().cloned().collect(),
                 projection_branch_ids: Vec::new(),
@@ -1341,7 +1423,9 @@ async fn scan_scope(
 
     if resolve_branch_heads {
         let candidate_branch_ids = expanded_branch_ids(&request.filter.branch_ids);
-        let branch_heads = load_branch_head_controls(store, &candidate_branch_ids).await?;
+        let branch_heads =
+            load_branch_head_controls(store, &candidate_branch_ids, branch_head_control_cache)
+                .await?;
         let projection_branch_ids = request
             .filter
             .branch_ids
@@ -1383,17 +1467,66 @@ async fn scan_scope(
 async fn load_branch_head_controls(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_ids: &[String],
+    cache: Option<&BranchHeadControlCache>,
 ) -> Result<BranchHeads, LixError> {
     let reader = BranchHeadControlContext::new().reader(store);
     if branch_ids.is_empty() {
         return Ok(reader.scan().await?.into_iter().collect());
     }
-    let controls = reader.load_many(branch_ids).await?;
+    let Some(cache) = cache else {
+        let controls = reader.load_many(branch_ids).await?;
+        return Ok(branch_ids
+            .iter()
+            .cloned()
+            .zip(controls)
+            .filter_map(|(branch_id, control)| control.map(|control| (branch_id, control)))
+            .collect());
+    };
+    let missing = {
+        let controls = cache.controls.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction branch-head control cache lock is poisoned",
+            )
+        })?;
+        branch_ids
+            .iter()
+            .filter(|branch_id| !controls.contains_key(*branch_id))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut loaded_by_branch = std::collections::BTreeMap::new();
+    if !missing.is_empty() {
+        let loaded = reader.load_many(&missing).await?;
+        let mut controls = cache.controls.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction branch-head control cache lock is poisoned",
+            )
+        })?;
+        for (branch_id, control) in missing.into_iter().zip(loaded) {
+            if controls.len() < TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES {
+                controls.entry(branch_id.clone()).or_insert(control);
+            }
+            loaded_by_branch.insert(branch_id, control);
+        }
+    }
+    let controls = cache.controls.lock().map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "transaction branch-head control cache lock is poisoned",
+        )
+    })?;
     Ok(branch_ids
         .iter()
-        .cloned()
-        .zip(controls)
-        .filter_map(|(branch_id, control)| control.map(|control| (branch_id, control)))
+        .filter_map(|branch_id| {
+            controls
+                .get(branch_id)
+                .copied()
+                .or_else(|| loaded_by_branch.get(branch_id).copied())
+                .flatten()
+                .map(|control| (branch_id.clone(), control))
+        })
         .collect())
 }
 
@@ -1602,11 +1735,97 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open direct hot-state scan read");
-        let scope = scan_scope(&read, request, true).await?;
+        let scope = scan_scope(&read, request, true, None).await?;
         live_state
             .reader(read)
             .scan_direct_entity_pk_rows(request, &scope)
             .await
+    }
+
+    #[tokio::test]
+    async fn transaction_branch_head_control_cache_pins_loaded_generation() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "ffffffff-ffff-7fff-bfff-ffffffffffff";
+        let entity_pk = EntityPk::single("cached-control-row");
+        stage_direct_entity_head(
+            &storage,
+            branch_id,
+            CommitId::for_test_label("cached-control-head"),
+            "schema",
+            &entity_pk,
+            r#"{"value":"one"}"#,
+        )
+        .await;
+
+        let cache = BranchHeadControlCache::default();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open first branch-control read");
+        let first = load_branch_head_controls(&read, &[branch_id.to_string()], Some(&cache))
+            .await
+            .expect("first branch control should load")[branch_id];
+        drop(read);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open branch-control update read");
+        let mut current = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(branch_id)
+            .await
+            .expect("branch control should load")
+            .expect("branch control should exist");
+        current.current_state_revision += 1;
+        let mut writes = StorageWriteSet::new();
+        crate::branch::stage_branch_head_control(&mut writes, branch_id, current)
+            .expect("updated branch control should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("updated branch control should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open repeated branch-control read");
+        let pinned = load_branch_head_controls(&read, &[branch_id.to_string()], Some(&cache))
+            .await
+            .expect("cached branch control should load")[branch_id];
+        let uncached = load_branch_head_controls(&read, &[branch_id.to_string()], None)
+            .await
+            .expect("uncached branch control should load")[branch_id];
+        assert_eq!(pinned, first);
+        assert_eq!(uncached, current);
+        assert_ne!(
+            pinned.current_state_revision,
+            uncached.current_state_revision
+        );
+
+        let full_cache = BranchHeadControlCache::default();
+        {
+            let mut controls = full_cache
+                .controls
+                .lock()
+                .expect("branch-control cache lock should not be poisoned");
+            for index in 0..TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES {
+                controls.insert(format!("uncached-branch-{index}"), None);
+            }
+        }
+        let overflow =
+            load_branch_head_controls(&read, &[branch_id.to_string()], Some(&full_cache))
+                .await
+                .expect("control beyond the cache capacity should still load")[branch_id];
+        assert_eq!(overflow, current);
+        assert!(
+            !full_cache
+                .controls
+                .lock()
+                .expect("branch-control cache lock should not be poisoned")
+                .contains_key(branch_id)
+        );
     }
 
     async fn scan_rows_for_test(
