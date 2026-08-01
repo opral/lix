@@ -1885,6 +1885,7 @@ struct HotCollectionControl {
 }
 
 const TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES: usize = 64;
+const TRANSACTION_PACKED_POINT_CACHE_MIN_OBSERVATIONS: u8 = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct HotCollectionCacheKey {
@@ -1899,9 +1900,61 @@ struct HotCollectionCacheKey {
 pub(crate) struct HotStateTransactionCache {
     collection_controls: StdMutex<BTreeMap<HotCollectionCacheKey, HotCollectionControl>>,
     certified_absent_generations: StdMutex<BTreeSet<CommitId>>,
+    packed_point_generation_observations: StdMutex<SmallVec<[(CommitId, u8); 4]>>,
+    packed_current_base_refs: StdMutex<BTreeMap<(String, CommitId), Vec<PackedCurrentBaseRef>>>,
+    commit_delta_points: crate::tracked_state::CommitDeltaPointReadCache,
 }
 
 impl HotStateTransactionCache {
+    fn should_reuse_packed_points(&self, generation: CommitId) -> Result<bool, LixError> {
+        let mut generations = self
+            .packed_point_generation_observations
+            .lock()
+            .map_err(|_| hot_state_cache_lock_error())?;
+        if let Some((_, observations)) = generations
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == generation)
+        {
+            *observations = observations.saturating_add(1);
+            return Ok(*observations >= TRANSACTION_PACKED_POINT_CACHE_MIN_OBSERVATIONS);
+        }
+        if generations.len() < TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES {
+            generations.push((generation, 1));
+        }
+        Ok(false)
+    }
+
+    fn packed_current_base_refs(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+    ) -> Result<Option<Vec<PackedCurrentBaseRef>>, LixError> {
+        Ok(self
+            .packed_current_base_refs
+            .lock()
+            .map_err(|_| hot_state_cache_lock_error())?
+            .get(&(branch_id.to_owned(), generation))
+            .cloned())
+    }
+
+    fn remember_packed_current_base_refs(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        refs: &[PackedCurrentBaseRef],
+    ) -> Result<(), LixError> {
+        let mut entries = self
+            .packed_current_base_refs
+            .lock()
+            .map_err(|_| hot_state_cache_lock_error())?;
+        if entries.len() < TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES {
+            entries
+                .entry((branch_id.to_owned(), generation))
+                .or_insert_with(|| refs.to_vec());
+        }
+        Ok(())
+    }
+
     fn collection_control(
         &self,
         key: &HotCollectionCacheKey,
@@ -2399,6 +2452,7 @@ fn stage_complete_collection_controls(
     Ok(())
 }
 
+#[derive(Clone)]
 struct PackedCurrentBaseRef {
     commit_id: CommitId,
     checkpoint_commit_id: Option<CommitId>,
@@ -2948,6 +3002,7 @@ async fn load_packed_current_base_exact(
     active_checkpoint_commit_id: Option<CommitId>,
     keys: &[TrackedStateKeyRef<'_>],
     projection: ChangeRecordProjection,
+    transaction_cache: Option<&HotStateTransactionCache>,
 ) -> Result<MaterializedLiveStateExactBatch, LixError> {
     if keys.is_empty() {
         return MaterializedLiveStateExactBatch::new(
@@ -2955,8 +3010,14 @@ async fn load_packed_current_base_exact(
             Vec::new(),
         );
     }
-    let winners =
-        load_packed_current_base_exact_entries(store, branch_id, generation, keys).await?;
+    let winners = load_packed_current_base_exact_entries(
+        store,
+        branch_id,
+        generation,
+        keys,
+        transaction_cache,
+    )
+    .await?;
 
     let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
     let mut slots = Vec::with_capacity(keys.len());
@@ -3049,6 +3110,7 @@ async fn load_packed_current_base_exact_entries(
     branch_id: &str,
     generation: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
+    transaction_cache: Option<&HotStateTransactionCache>,
 ) -> Result<
     Vec<
         Option<(
@@ -3061,7 +3123,24 @@ async fn load_packed_current_base_exact_entries(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let base_refs = packed_current_base_refs(store, branch_id, generation).await?;
+    let transaction_cache = match transaction_cache {
+        Some(cache) if cache.should_reuse_packed_points(generation)? => Some(cache),
+        Some(_) | None => None,
+    };
+    let base_refs = match transaction_cache
+        .map(|cache| cache.packed_current_base_refs(branch_id, generation))
+        .transpose()?
+        .flatten()
+    {
+        Some(refs) => refs,
+        None => {
+            let refs = packed_current_base_refs(store, branch_id, generation).await?;
+            if let Some(cache) = transaction_cache {
+                cache.remember_packed_current_base_refs(branch_id, generation, &refs)?;
+            }
+            refs
+        }
+    };
     if base_refs.is_empty() {
         return Ok((0..keys.len()).map(|_| None).collect());
     }
@@ -3071,6 +3150,7 @@ async fn load_packed_current_base_exact_entries(
                 store,
                 base_ref.commit_id,
                 keys,
+                transaction_cache.map(|cache| &cache.commit_delta_points),
             )
             .await?
             .into_iter()
@@ -3087,7 +3167,7 @@ async fn load_packed_current_base_exact_entries(
         })
         .collect::<Vec<_>>();
     let mut requests = Vec::with_capacity(base_refs.len().saturating_mul(keys.len()));
-    for base_ref in &base_refs {
+    for base_ref in base_refs.iter() {
         requests.extend(
             owned_keys
                 .iter()
@@ -3506,6 +3586,7 @@ where
                 active_checkpoint_commit_id,
                 &key_refs,
                 projection,
+                self.transaction_cache.as_deref(),
             )
             .await?
             .into_present_batch()
@@ -3805,6 +3886,7 @@ where
             active_checkpoint_commit_id,
             keys,
             *projection,
+            self.transaction_cache.as_deref(),
         )
         .await?;
         let mut resolved = Vec::with_capacity(keys.len());
@@ -4928,6 +5010,7 @@ where
             branch_id,
             generation,
             &packed_previous_keys,
+            None,
         ))
         .await?;
         for (index, packed_previous) in packed_previous_indices.into_iter().zip(packed_previous) {
@@ -8921,6 +9004,31 @@ mod tests {
             cache
                 .remember_certified_generation_absent(generation)
                 .expect("remember absent certified generation");
+            cache
+                .remember_packed_current_base_refs(
+                    &format!("packed-branch-{index}"),
+                    generation,
+                    &[PackedCurrentBaseRef {
+                        commit_id: generation,
+                        checkpoint_commit_id: None,
+                        coverage_key: Bytes::new(),
+                    }],
+                )
+                .expect("remember packed current-base refs");
+            assert!(
+                !cache
+                    .should_reuse_packed_points(generation)
+                    .expect("observe first packed point scope")
+            );
+            for observation in 2..=TRANSACTION_PACKED_POINT_CACHE_MIN_OBSERVATIONS {
+                assert_eq!(
+                    cache
+                        .should_reuse_packed_points(generation)
+                        .expect("observe packed point scope"),
+                    index < TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES
+                        && observation == TRANSACTION_PACKED_POINT_CACHE_MIN_OBSERVATIONS,
+                );
+            }
         }
         assert_eq!(
             cache.collection_controls.lock().unwrap().len(),
@@ -8928,6 +9036,18 @@ mod tests {
         );
         assert_eq!(
             cache.certified_absent_generations.lock().unwrap().len(),
+            TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES
+        );
+        assert_eq!(
+            cache.packed_current_base_refs.lock().unwrap().len(),
+            TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES
+        );
+        assert_eq!(
+            cache
+                .packed_point_generation_observations
+                .lock()
+                .unwrap()
+                .len(),
             TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES
         );
     }
@@ -9204,25 +9324,78 @@ mod tests {
             .expect("publish packed system-schema fixture");
 
         let json_get_many_calls = Arc::new(AtomicUsize::new(0));
+        let get_many_calls = Arc::new(AtomicUsize::new(0));
+        let scan_calls = Arc::new(AtomicUsize::new(0));
         let read = JsonCountingRead {
-            inner: storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("open packed fixture read"),
+            inner: CountingRead {
+                inner: storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("open packed fixture read"),
+                get_many_calls: Arc::clone(&get_many_calls),
+                scan_calls: Some(Arc::clone(&scan_calls)),
+            },
             json_get_many_calls: Arc::clone(&json_get_many_calls),
         };
+        let transaction_cache = Arc::new(HotStateTransactionCache::default());
+        let request_keys = [TrackedStateKeyRef {
+            schema_key: "lix_key_value",
+            entity_pk: &entity_pk,
+            file_id: None,
+        }];
         let entries = load_packed_current_base_exact_entries(
             &read,
             crate::GLOBAL_BRANCH_ID,
             generation,
-            &[TrackedStateKeyRef {
-                schema_key: "lix_key_value",
-                entity_pk: &entity_pk,
-                file_id: None,
-            }],
+            &request_keys,
+            Some(transaction_cache.as_ref()),
         )
         .await
         .expect("load packed mutation predecessor");
+        for _ in 2..=TRANSACTION_PACKED_POINT_CACHE_MIN_OBSERVATIONS {
+            let observed = load_packed_current_base_exact_entries(
+                &read,
+                crate::GLOBAL_BRANCH_ID,
+                generation,
+                &request_keys,
+                Some(transaction_cache.as_ref()),
+            )
+            .await
+            .expect("observe repeated packed mutation predecessor");
+            assert!(observed[0].is_some());
+        }
+        let admitted = load_packed_current_base_exact_entries(
+            &read,
+            crate::GLOBAL_BRANCH_ID,
+            generation,
+            &request_keys,
+            Some(transaction_cache.as_ref()),
+        )
+        .await
+        .expect("admit repeated packed mutation predecessor");
+        assert!(admitted[0].is_some());
+        let admitted_read_counts = (
+            get_many_calls.load(Ordering::Relaxed),
+            scan_calls.load(Ordering::Relaxed),
+        );
+        let reused = load_packed_current_base_exact_entries(
+            &read,
+            crate::GLOBAL_BRANCH_ID,
+            generation,
+            &request_keys,
+            Some(transaction_cache.as_ref()),
+        )
+        .await
+        .expect("reuse admitted packed mutation predecessor");
+        assert!(reused[0].is_some());
+        assert_eq!(
+            (
+                get_many_calls.load(Ordering::Relaxed),
+                scan_calls.load(Ordering::Relaxed),
+            ),
+            admitted_read_counts,
+            "a transaction snapshot must reuse an admitted packed segment by immutable address"
+        );
         let (_, change) = entries[0].as_ref().expect("packed predecessor exists");
         assert!(
             matches!(change.snapshot, JsonSlot::Ref(_)),
@@ -9236,7 +9409,7 @@ mod tests {
 
         let reader = HotStateStoreReader {
             store: read,
-            transaction_cache: None,
+            transaction_cache: Some(transaction_cache),
         };
         let control = BranchHeadControl {
             head_commit_id: generation,

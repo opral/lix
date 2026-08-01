@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ops::{Bound, Range};
+use std::ops::{Bound, Deref, Range};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::changelog::CommitId;
@@ -88,6 +88,8 @@ const DECODED_COMMIT_DELTA_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const DECODED_COMMIT_DELTA_CACHE_MAX_ENTRIES: usize = 8;
 const DECODED_COMMIT_DELTA_CACHE_ADMISSION_ENTRIES: usize = 32;
 const DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS: usize = 16;
+const TRANSACTION_COMMIT_DELTA_POINT_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const TRANSACTION_COMMIT_DELTA_POINT_CACHE_MAX_ENTRIES: usize = 2;
 
 enum CommitDeltaSegmentEncodeError {
     SidecarTooLarge,
@@ -575,6 +577,193 @@ impl DecodedCommitDeltaCache {
 fn decoded_commit_delta_cache() -> &'static Mutex<DecodedCommitDeltaCache> {
     static CACHE: OnceLock<Mutex<DecodedCommitDeltaCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(DecodedCommitDeltaCache::default()))
+}
+
+/// Bounded immutable-address cache for repeated point reads in one storage
+/// snapshot. Unlike the process-wide content cache, this may trust
+/// `(commit_id, segment_index)` because a transaction cannot cross repositories
+/// or observe a rewritten value at that address.
+#[derive(Default)]
+pub(crate) struct CommitDeltaPointReadCache {
+    inner: Mutex<CommitDeltaPointReadCacheInner>,
+}
+
+#[derive(Default)]
+struct CommitDeltaPointReadCacheInner {
+    manifests: VecDeque<(CommitId, Arc<CommitDeltaManifest>)>,
+    segments: VecDeque<((CommitId, usize), Arc<DecodedCommitDeltaSegment>)>,
+    recent_segment_misses: VecDeque<(CommitId, usize)>,
+    segment_resident_bytes: usize,
+}
+
+impl CommitDeltaPointReadCache {
+    fn should_admit_segment(
+        &self,
+        commit_id: CommitId,
+        segment_index: usize,
+    ) -> Result<bool, LixError> {
+        let address = (commit_id, segment_index);
+        let mut cache = self.inner.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction commit-delta point cache lock is poisoned",
+            )
+        })?;
+        if let Some(position) = cache
+            .recent_segment_misses
+            .iter()
+            .position(|candidate| *candidate == address)
+        {
+            cache.recent_segment_misses.remove(position);
+            return Ok(true);
+        }
+        cache.recent_segment_misses.push_back(address);
+        while cache.recent_segment_misses.len() > DECODED_COMMIT_DELTA_CACHE_ADMISSION_ENTRIES {
+            cache.recent_segment_misses.pop_front();
+        }
+        Ok(false)
+    }
+
+    fn manifest(&self, commit_id: CommitId) -> Result<Option<Arc<CommitDeltaManifest>>, LixError> {
+        let mut cache = self.inner.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction commit-delta point cache lock is poisoned",
+            )
+        })?;
+        let Some(position) = cache
+            .manifests
+            .iter()
+            .position(|(cached_commit_id, _)| *cached_commit_id == commit_id)
+        else {
+            return Ok(None);
+        };
+        let entry = cache
+            .manifests
+            .remove(position)
+            .expect("located transaction commit-delta manifest cache entry");
+        let manifest = Arc::clone(&entry.1);
+        cache.manifests.push_back(entry);
+        Ok(Some(manifest))
+    }
+
+    fn remember_manifest(
+        &self,
+        commit_id: CommitId,
+        manifest: Arc<CommitDeltaManifest>,
+    ) -> Result<(), LixError> {
+        let mut cache = self.inner.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction commit-delta point cache lock is poisoned",
+            )
+        })?;
+        if let Some(position) = cache
+            .manifests
+            .iter()
+            .position(|(cached_commit_id, _)| *cached_commit_id == commit_id)
+        {
+            cache.manifests.remove(position);
+        }
+        cache.manifests.push_back((commit_id, manifest));
+        while cache.manifests.len() > DECODED_COMMIT_DELTA_CACHE_MAX_ENTRIES {
+            cache.manifests.pop_front();
+        }
+        Ok(())
+    }
+
+    fn segment(
+        &self,
+        commit_id: CommitId,
+        segment_index: usize,
+        expected_bounds: Option<&CommitDeltaSegmentBounds>,
+    ) -> Result<Option<Arc<DecodedCommitDeltaSegment>>, LixError> {
+        let mut cache = self.inner.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction commit-delta point cache lock is poisoned",
+            )
+        })?;
+        let Some(position) = cache
+            .segments
+            .iter()
+            .position(|(address, _)| *address == (commit_id, segment_index))
+        else {
+            return Ok(None);
+        };
+        validate_decoded_commit_delta_bounds(&cache.segments[position].1.leaf, expected_bounds)?;
+        let entry = cache
+            .segments
+            .remove(position)
+            .expect("located transaction commit-delta segment cache entry");
+        let decoded = Arc::clone(&entry.1);
+        cache.segments.push_back(entry);
+        Ok(Some(decoded))
+    }
+
+    fn remember_segment(
+        &self,
+        commit_id: CommitId,
+        segment_index: usize,
+        decoded: Arc<DecodedCommitDeltaSegment>,
+    ) -> Result<(), LixError> {
+        if decoded.resident_bytes > TRANSACTION_COMMIT_DELTA_POINT_CACHE_MAX_BYTES {
+            return Ok(());
+        }
+        let mut cache = self.inner.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction commit-delta point cache lock is poisoned",
+            )
+        })?;
+        if let Some(position) = cache
+            .segments
+            .iter()
+            .position(|(address, _)| *address == (commit_id, segment_index))
+        {
+            let previous = cache
+                .segments
+                .remove(position)
+                .expect("located transaction commit-delta segment cache entry");
+            cache.segment_resident_bytes = cache
+                .segment_resident_bytes
+                .saturating_sub(previous.1.resident_bytes);
+        }
+        cache.segment_resident_bytes = cache
+            .segment_resident_bytes
+            .saturating_add(decoded.resident_bytes);
+        cache
+            .segments
+            .push_back(((commit_id, segment_index), decoded));
+        while cache.segment_resident_bytes > TRANSACTION_COMMIT_DELTA_POINT_CACHE_MAX_BYTES
+            || cache.segments.len() > TRANSACTION_COMMIT_DELTA_POINT_CACHE_MAX_ENTRIES
+        {
+            let evicted = cache
+                .segments
+                .pop_front()
+                .expect("over-budget transaction commit-delta cache is non-empty");
+            cache.segment_resident_bytes = cache
+                .segment_resident_bytes
+                .saturating_sub(evicted.1.resident_bytes);
+        }
+        Ok(())
+    }
+}
+
+enum PointReadCommitDeltaManifest {
+    Owned(CommitDeltaManifest),
+    Cached(Arc<CommitDeltaManifest>),
+}
+
+impl Deref for PointReadCommitDeltaManifest {
+    type Target = CommitDeltaManifest;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(manifest) => manifest,
+            Self::Cached(manifest) => manifest,
+        }
+    }
 }
 
 const COMMIT_DELTA_SMALL_STRING_DICTIONARY_LIMIT: usize = 32;
@@ -2662,6 +2851,7 @@ pub(crate) async fn load_owned_commit_delta_entries_one_ordered_ref(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
+    point_cache: Option<&CommitDeltaPointReadCache>,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     if keys.is_empty() {
         return Ok(Vec::new());
@@ -2672,7 +2862,8 @@ pub(crate) async fn load_owned_commit_delta_entries_one_ordered_ref(
     });
     if strictly_ordered {
         let output =
-            load_local_owned_commit_delta_entries_one_ordered(store, commit_id, keys).await?;
+            load_local_owned_commit_delta_entries_one_ordered(store, commit_id, keys, point_cache)
+                .await?;
         if output.iter().all(Option::is_some) {
             return Ok(output);
         }
@@ -2716,6 +2907,7 @@ async fn load_local_owned_commit_delta_entries(
             store,
             requests[0].0,
             &keys,
+            None,
         ))
         .await;
     }
@@ -2842,26 +3034,82 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
+    point_cache: Option<&CommitDeltaPointReadCache>,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
-    let manifest_key = StorageKey(Bytes::from(commit_delta_manifest_key(commit_id)));
-    let manifest_values = PointReadPlan::new(
-        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
-        std::slice::from_ref(&manifest_key),
-    )
-    .materialize(store, StorageGetOptions::default())
-    .await?;
-    let Some(bytes) = manifest_values
-        .value
-        .into_iter()
-        .next()
+    let manifest = match point_cache
+        .map(|cache| cache.manifest(commit_id))
+        .transpose()?
         .flatten()
-        .and_then(full_value_bytes)
-    else {
-        return Ok((0..keys.len()).map(|_| None).collect());
+    {
+        Some(manifest) => PointReadCommitDeltaManifest::Cached(manifest),
+        None => {
+            let manifest_key = StorageKey(Bytes::from(commit_delta_manifest_key(commit_id)));
+            let manifest_values = PointReadPlan::new(
+                TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+                std::slice::from_ref(&manifest_key),
+            )
+            .materialize(store, StorageGetOptions::default())
+            .await?;
+            let Some(bytes) = manifest_values
+                .value
+                .into_iter()
+                .next()
+                .flatten()
+                .and_then(full_value_bytes)
+            else {
+                return Ok((0..keys.len()).map(|_| None).collect());
+            };
+            let manifest = decode_commit_delta_manifest(&bytes)?;
+            match point_cache {
+                Some(cache) => {
+                    let manifest = Arc::new(manifest);
+                    cache.remember_manifest(commit_id, Arc::clone(&manifest))?;
+                    PointReadCommitDeltaManifest::Cached(manifest)
+                }
+                None => PointReadCommitDeltaManifest::Owned(manifest),
+            }
+        }
     };
-    let manifest = decode_commit_delta_manifest(&bytes)?;
     let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
     if let Some(inline_segment) = manifest.inline_segment() {
+        if keys.len() <= DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS
+            && let Some(cache) = point_cache
+        {
+            let decoded = match cache.segment(commit_id, 0, None)? {
+                Some(decoded) => decoded,
+                None => {
+                    if !cache.should_admit_segment(commit_id, 0)? {
+                        let (leaf, payloads) =
+                            decode_commit_delta_with_payloads(inline_segment, None)?;
+                        for (request_index, &key) in keys.iter().enumerate() {
+                            let encoded_key = encode_key_ref(key);
+                            output[request_index] = find_loaded_commit_delta_entry(
+                                &leaf,
+                                &payloads,
+                                &encoded_key,
+                                commit_id,
+                            )?;
+                        }
+                        hydrate_selected_loaded_entries(store, &mut output).await?;
+                        return Ok(output);
+                    }
+                    let decoded = decode_owned_commit_delta_segment(inline_segment, None)?;
+                    cache.remember_segment(commit_id, 0, Arc::clone(&decoded))?;
+                    decoded
+                }
+            };
+            for (request_index, &key) in keys.iter().enumerate() {
+                let encoded_key = encode_key_ref(key);
+                output[request_index] = find_loaded_commit_delta_entry(
+                    &decoded.leaf,
+                    &decoded.payloads,
+                    &encoded_key,
+                    commit_id,
+                )?;
+            }
+            hydrate_selected_loaded_entries(store, &mut output).await?;
+            return Ok(output);
+        }
         if keys.len() <= DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS {
             if let Some(decoded) = decode_commit_delta_with_payloads_cached(inline_segment, None)? {
                 for (request_index, &key) in keys.iter().enumerate() {
@@ -2915,6 +3163,106 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
             segment_indices.push(segment_index);
         }
         routed.push((request_index, segment_index, encoded_key));
+    }
+    if keys.len() <= DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS
+        && let Some(cache) = point_cache
+    {
+        let mut decoded_segments = Vec::with_capacity(segment_indices.len());
+        let mut missing_indices = Vec::new();
+        let mut missing_keys = Vec::new();
+        for &segment_index in &segment_indices {
+            let bounds = manifest.segments.get(segment_index).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state commit_delta manifest for commit '{commit_id}' has no segment {segment_index}"
+                    ),
+                )
+            })?;
+            match cache.segment(commit_id, segment_index, Some(bounds))? {
+                Some(decoded) => decoded_segments.push(Some(decoded)),
+                None => {
+                    decoded_segments.push(None);
+                    missing_indices.push(segment_index);
+                    missing_keys.push(StorageKey(Bytes::from(commit_delta_segment_key(
+                        commit_id,
+                        segment_index,
+                    )?)));
+                }
+            }
+        }
+        let missing_values =
+            PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &missing_keys)
+                .materialize(store, StorageGetOptions::default())
+                .await?;
+        let mut missing = missing_indices.into_iter().zip(missing_values.value);
+        let mut routed = routed.into_iter().peekable();
+        for (segment_position, segment_index) in segment_indices.into_iter().enumerate() {
+            let decoded = match decoded_segments[segment_position].take() {
+                Some(decoded) => decoded,
+                None => {
+                    let (missing_index, value) = missing
+                        .next()
+                        .expect("every uncached commit-delta segment has a point-read result");
+                    debug_assert_eq!(missing_index, segment_index);
+                    let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "tracked_state commit_delta manifest for commit '{commit_id}' references missing segment {segment_index}"
+                            ),
+                        )
+                    })?;
+                    let bounds = manifest.segments.get(segment_index).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "tracked_state commit_delta manifest for commit '{commit_id}' has no segment {segment_index}"
+                            ),
+                        )
+                    })?;
+                    if !cache.should_admit_segment(commit_id, segment_index)? {
+                        let (leaf, payloads) =
+                            decode_commit_delta_with_payloads(&bytes, Some(bounds))?;
+                        while routed
+                            .peek()
+                            .is_some_and(|(_, routed_segment, _)| *routed_segment == segment_index)
+                        {
+                            let (request_index, _, encoded_key) = routed
+                                .next()
+                                .expect("peeked routed lookup remains available");
+                            output[request_index] = find_loaded_commit_delta_entry(
+                                &leaf,
+                                &payloads,
+                                &encoded_keys[encoded_key],
+                                commit_id,
+                            )?;
+                        }
+                        continue;
+                    }
+                    let decoded = decode_owned_commit_delta_segment(&bytes, Some(bounds))?;
+                    cache.remember_segment(commit_id, segment_index, Arc::clone(&decoded))?;
+                    decoded
+                }
+            };
+            while routed
+                .peek()
+                .is_some_and(|(_, routed_segment, _)| *routed_segment == segment_index)
+            {
+                let (request_index, _, encoded_key) = routed
+                    .next()
+                    .expect("peeked routed lookup remains available");
+                output[request_index] = find_loaded_commit_delta_entry(
+                    &decoded.leaf,
+                    &decoded.payloads,
+                    &encoded_keys[encoded_key],
+                    commit_id,
+                )?;
+            }
+        }
+        debug_assert!(missing.next().is_none());
+        hydrate_selected_loaded_entries(store, &mut output).await?;
+        return Ok(output);
     }
     let segment_keys = segment_indices
         .iter()
@@ -4624,20 +4972,27 @@ fn decode_commit_delta_with_payloads_cached(
         return Ok(None);
     }
 
-    let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
-    let payloads = payloads.into_owned();
-    let resident_bytes =
-        size_of::<DecodedCommitDeltaSegment>() + leaf.resident_bytes() + payloads.resident_bytes();
-    let decoded = Arc::new(DecodedCommitDeltaSegment {
-        leaf,
-        payloads,
-        resident_bytes,
-    });
+    let decoded = decode_owned_commit_delta_segment(bytes, expected_bounds)?;
     decoded_commit_delta_cache()
         .lock()
         .expect("decoded commit-delta cache lock poisoned")
         .insert(digest, Bytes::copy_from_slice(bytes), Arc::clone(&decoded));
     Ok(Some(decoded))
+}
+
+fn decode_owned_commit_delta_segment(
+    bytes: &[u8],
+    expected_bounds: Option<&CommitDeltaSegmentBounds>,
+) -> Result<Arc<DecodedCommitDeltaSegment>, LixError> {
+    let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
+    let payloads = payloads.into_owned();
+    let resident_bytes =
+        size_of::<DecodedCommitDeltaSegment>() + leaf.resident_bytes() + payloads.resident_bytes();
+    Ok(Arc::new(DecodedCommitDeltaSegment {
+        leaf,
+        payloads,
+        resident_bytes,
+    }))
 }
 
 fn decode_commit_delta_segment(
@@ -5174,6 +5529,26 @@ mod tests {
         assert_eq!(cache.entries.len(), 1);
         assert!(cache.resident_bytes > 0);
         assert!(cache.resident_bytes <= super::DECODED_COMMIT_DELTA_CACHE_MAX_BYTES);
+
+        let transaction_cache = super::CommitDeltaPointReadCache::default();
+        for index in 0..=super::TRANSACTION_COMMIT_DELTA_POINT_CACHE_MAX_ENTRIES {
+            transaction_cache
+                .remember_segment(
+                    CommitId::for_test_label(&format!("transaction-point-cache-{index}")),
+                    index,
+                    std::sync::Arc::clone(&decoded),
+                )
+                .expect("remember transaction-addressed decoded segment");
+        }
+        let transaction_cache = transaction_cache.inner.lock().unwrap();
+        assert!(
+            transaction_cache.segments.len()
+                <= super::TRANSACTION_COMMIT_DELTA_POINT_CACHE_MAX_ENTRIES
+        );
+        assert!(
+            transaction_cache.segment_resident_bytes
+                <= super::TRANSACTION_COMMIT_DELTA_POINT_CACHE_MAX_BYTES
+        );
     }
 
     #[derive(Clone)]
