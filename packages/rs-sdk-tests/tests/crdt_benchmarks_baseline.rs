@@ -143,8 +143,8 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
             .run_until(async move {
                 let mut commits = tokio::task::JoinSet::new();
                 for transaction in transactions {
+                    let started = Instant::now();
                     commits.spawn_local(async move {
-                        let started = Instant::now();
                         let result = transaction.commit().await;
                         (started.elapsed(), result)
                     });
