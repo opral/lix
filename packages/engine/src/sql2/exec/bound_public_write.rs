@@ -800,23 +800,26 @@ async fn try_execute_direct_path_value_replacement_batch(
         .collect::<Vec<_>>();
 
     let active_branch_id = ctx.active_branch_id().to_owned();
+    let scope = crate::collection_generation::CollectionScopeRef {
+        schema_key: &spec.schema_key,
+        file_id: None,
+    };
+    // Generation controls describe committed HOT state. Any staged member can
+    // change the effective identity set, so it must force the overlay-aware
+    // candidate scan instead of certifying the committed digest.
+    let has_staged_collection_rows = ctx.has_staged_collection_rows(&active_branch_id, scope)?;
     let collection_generation = ctx
-        .load_collection_generation(
-            &active_branch_id,
-            crate::collection_generation::CollectionScopeRef {
-                schema_key: &spec.schema_key,
-                file_id: None,
-            },
-        )
+        .load_collection_generation(&active_branch_id, scope)
         .await?;
-    let certified_generation_identity = collection_generation.is_some_and(|generation| {
-        generation.live_count == row_count as u64
-            && generation.ordered_identity_digest.is_some()
-            && generation.ordered_identity_digest
-                == crate::collection_generation::ordered_single_string_identity_digest(
-                    entity_pks.iter(),
-                )
-    });
+    let certified_generation_identity = !has_staged_collection_rows
+        && collection_generation.is_some_and(|generation| {
+            generation.live_count == row_count as u64
+                && generation.ordered_identity_digest.is_some()
+                && generation.ordered_identity_digest
+                    == crate::collection_generation::ordered_single_string_identity_digest(
+                        entity_pks.iter(),
+                    )
+        });
     #[cfg(test)]
     if certified_generation_identity {
         CERTIFIED_GENERATION_IDENTITY_REPLACEMENTS.with(|executions| {

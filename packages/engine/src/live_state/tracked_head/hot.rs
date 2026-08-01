@@ -1818,6 +1818,9 @@ impl<'a> CertifiedCsvReader<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
+// The digest is the third positional field in repository protocol v40. Older
+// two-field controls belong to v39 repositories, which Engine::new rejects at
+// the protocol boundary before any HOT control is decoded.
 struct HotCollectionControl {
     active_generation: CommitId,
     live_count: u64,

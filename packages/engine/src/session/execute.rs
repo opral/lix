@@ -5386,6 +5386,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staged_delete_disables_generation_identity_replacement() {
+        const ROW_COUNT: usize = 16;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "staged_generation_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": { "type": "object" }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        let insert_sql =
+            "INSERT INTO staged_generation_probe (path, value) VALUES ($1, lix_json($2))";
+        let inserts = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: insert_sql.to_string(),
+                params: vec![
+                    Value::Text(format!("/{row_index:04}")),
+                    Value::Text(format!(r#"{{"old":{row_index}}}"#)),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session.execute_batch(&inserts).await.unwrap();
+
+        let mut transaction = session.begin_transaction().await.unwrap();
+        transaction
+            .execute(
+                "DELETE FROM staged_generation_probe WHERE path = '/0000'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let update_sql = "UPDATE staged_generation_probe SET value = lix_json($1) WHERE path = $2";
+        let updates = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: update_sql.to_string(),
+                params: vec![
+                    Value::Text(format!(r#"{{"updated":{row_index}}}"#)),
+                    Value::Text(format!("/{row_index:04}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let parsed = TransactionBatchStatements::Shared {
+            statement: sql2::parse_statement(update_sql).unwrap(),
+            len: updates.len(),
+        };
+        sql2::take_certified_generation_identity_replacements();
+        let results = try_execute_transaction_parameter_batch(
+            transaction.transaction_mut().unwrap(),
+            &updates,
+            &parsed,
+            &ExecuteOptions::default(),
+            &vec![ExecuteStatementMetadata::default(); updates.len()],
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap()
+        .expect("the overlay-aware parameter batch should execute");
+        assert_eq!(
+            results
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .sum::<u64>(),
+            (ROW_COUNT - 1) as u64
+        );
+        assert_eq!(sql2::take_certified_generation_identity_replacements(), 0);
+        transaction.commit().await.unwrap();
+
+        let deleted = session
+            .execute(
+                "SELECT path FROM staged_generation_probe WHERE path = '/0000'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted.len(),
+            0,
+            "the staged delete must not be resurrected"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_batch_keeps_repeated_entity_identity_sequential() {
         let session = open_session().await;
         let schema = serde_json::json!({
