@@ -2784,25 +2784,16 @@ async fn load_packed_current_base_exact_entries(
         return Ok((0..keys.len()).map(|_| None).collect());
     }
     if let [base_ref] = base_refs.as_slice() {
-        let requests = keys
-            .iter()
-            .map(|key| {
-                (
-                    base_ref.commit_id,
-                    TrackedStateKey {
-                        schema_key: key.schema_key.to_owned(),
-                        file_id: key.file_id.map(str::to_owned),
-                        entity_pk: key.entity_pk.clone(),
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
         return Ok(
-            crate::tracked_state::load_owned_commit_delta_entries(store, &requests)
-                .await?
-                .into_iter()
-                .map(|entry| entry.map(|entry| (entry.value, entry.change_record)))
-                .collect(),
+            crate::tracked_state::load_owned_commit_delta_entries_one_ordered_ref(
+                store,
+                base_ref.commit_id,
+                keys,
+            )
+            .await?
+            .into_iter()
+            .map(|entry| entry.map(|entry| (entry.value, entry.change_record)))
+            .collect(),
         );
     }
     let owned_keys = keys
@@ -2901,9 +2892,15 @@ fn compare_materialized_live_identity_refs(
 /// Merge two identity-ordered materialized batches without expanding their
 /// dictionary and payload columns into row-owned DTOs.
 fn merge_ordered_live_batches(
-    left: &MaterializedLiveStateBatch,
-    right: &MaterializedLiveStateBatch,
+    left: MaterializedLiveStateBatch,
+    right: MaterializedLiveStateBatch,
 ) -> MaterializedLiveStateBatch {
+    if left.is_empty() {
+        return right;
+    }
+    if right.is_empty() {
+        return left;
+    }
     let mut merged =
         MaterializedLiveStateBatchBuilder::with_capacity(left.len().saturating_add(right.len()));
     let mut left_index = 0usize;
@@ -3323,8 +3320,8 @@ where
                 None,
             )
         };
-        let combined = merge_ordered_live_batches(&rows, &packed_rows);
-        let rows = merge_ordered_live_batches(&combined, &certified_rows);
+        let combined = merge_ordered_live_batches(rows, packed_rows);
+        let rows = merge_ordered_live_batches(combined, certified_rows);
         if request.filter.include_tombstones
             && request.limit.is_none()
             && replaced_generation.is_none()
