@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Bound, Range};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::changelog::CommitId;
 use crate::common::SharedStr;
@@ -83,6 +84,10 @@ const COMMIT_DELTA_SIDECAR_ZSTD: u8 = 1;
 // Tiny history records are faster and usually smaller once stored raw: the
 // zstd frame/header and compressor call cannot amortize over a point write.
 const COMMIT_DELTA_MIN_COMPRESS_BYTES: usize = 1024;
+const DECODED_COMMIT_DELTA_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const DECODED_COMMIT_DELTA_CACHE_MAX_ENTRIES: usize = 8;
+const DECODED_COMMIT_DELTA_CACHE_ADMISSION_ENTRIES: usize = 32;
+const DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS: usize = 16;
 
 enum CommitDeltaSegmentEncodeError {
     SidecarTooLarge,
@@ -173,21 +178,27 @@ impl CommitDeltaPayload {
     }
 }
 
-/// Borrowed fixed-width directory over independently encoded payload records.
+/// Fixed-width directory over independently encoded payload records.
 ///
 /// A pair of equal offsets means that the corresponding identity has no
 /// authoritative payload. Non-empty ranges contain exactly one musli-encoded
 /// [`CommitDeltaPayload`], so a point lookup decodes only the requested row
 /// instead of reconstructing every payload in the segment.
 #[derive(Debug)]
-struct CommitDeltaPayloadIndexRef<'a> {
-    sidecar: Cow<'a, [u8]>,
+struct CommitDeltaPayloadIndex<S> {
+    sidecar: S,
     offsets: Range<usize>,
     payload_start: usize,
     entry_count: usize,
 }
 
-impl<'a> CommitDeltaPayloadIndexRef<'a> {
+type CommitDeltaPayloadIndexRef<'a> = CommitDeltaPayloadIndex<Cow<'a, [u8]>>;
+type OwnedCommitDeltaPayloadIndex = CommitDeltaPayloadIndex<Bytes>;
+
+impl<S> CommitDeltaPayloadIndex<S>
+where
+    S: AsRef<[u8]>,
+{
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entry_count
@@ -240,6 +251,10 @@ impl<'a> CommitDeltaPayloadIndexRef<'a> {
         }
     }
 
+    fn resident_bytes(&self) -> usize {
+        size_of::<Self>() + self.sidecar.as_ref().len()
+    }
+
     fn payload_range(&self, entry_index: usize) -> Result<&[u8], LixError> {
         if entry_index >= self.entry_count {
             return Err(LixError::new(
@@ -250,6 +265,7 @@ impl<'a> CommitDeltaPayloadIndexRef<'a> {
         let start = self.offset(entry_index)?;
         let end = self.offset(entry_index + 1)?;
         self.sidecar
+            .as_ref()
             .get(self.payload_start + start..self.payload_start + end)
             .ok_or_else(|| {
                 LixError::new(
@@ -270,6 +286,7 @@ impl<'a> CommitDeltaPayloadIndexRef<'a> {
             })?;
         let bytes = self
             .sidecar
+            .as_ref()
             .get(
                 self.offsets.start + byte_start
                     ..self.offsets.start + byte_start + COMMIT_DELTA_PAYLOAD_OFFSET_BYTES,
@@ -284,6 +301,20 @@ impl<'a> CommitDeltaPayloadIndexRef<'a> {
             bytes.try_into().expect("fixed payload offset"),
         ))
         .expect("u32 fits usize"))
+    }
+}
+
+impl CommitDeltaPayloadIndexRef<'_> {
+    fn into_owned(self) -> OwnedCommitDeltaPayloadIndex {
+        OwnedCommitDeltaPayloadIndex {
+            sidecar: match self.sidecar {
+                Cow::Borrowed(bytes) => Bytes::copy_from_slice(bytes),
+                Cow::Owned(bytes) => Bytes::from(bytes),
+            },
+            offsets: self.offsets,
+            payload_start: self.payload_start,
+            entry_count: self.entry_count,
+        }
     }
 }
 
@@ -426,6 +457,124 @@ struct CommitDeltaSegmentBounds {
     first_key: Vec<u8>,
     #[musli(bytes)]
     last_key: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct DecodedCommitDeltaSegment {
+    leaf: DecodedLeafNodeRef,
+    payloads: OwnedCommitDeltaPayloadIndex,
+    resident_bytes: usize,
+}
+
+#[derive(Debug)]
+struct DecodedCommitDeltaCacheEntry {
+    digest: [u8; 32],
+    encoded: Bytes,
+    decoded: Arc<DecodedCommitDeltaSegment>,
+}
+
+impl DecodedCommitDeltaCacheEntry {
+    fn resident_bytes(&self) -> usize {
+        size_of::<Self>() + self.encoded.len() + self.decoded.resident_bytes
+    }
+}
+
+#[derive(Debug, Default)]
+struct DecodedCommitDeltaCache {
+    entries: VecDeque<DecodedCommitDeltaCacheEntry>,
+    recent_misses: VecDeque<([u8; 32], usize)>,
+    resident_bytes: usize,
+}
+
+impl DecodedCommitDeltaCache {
+    fn get(
+        &mut self,
+        digest: [u8; 32],
+        bytes: &[u8],
+        expected_bounds: Option<&CommitDeltaSegmentBounds>,
+    ) -> Result<Option<Arc<DecodedCommitDeltaSegment>>, LixError> {
+        let Some(position) = self
+            .entries
+            .iter()
+            .position(|entry| entry.digest == digest && entry.encoded.as_ref() == bytes)
+        else {
+            return Ok(None);
+        };
+        validate_decoded_commit_delta_bounds(
+            &self.entries[position].decoded.leaf,
+            expected_bounds,
+        )?;
+        let entry = self
+            .entries
+            .remove(position)
+            .expect("located decoded commit-delta cache entry");
+        let decoded = Arc::clone(&entry.decoded);
+        self.entries.push_back(entry);
+        Ok(Some(decoded))
+    }
+
+    fn insert(
+        &mut self,
+        digest: [u8; 32],
+        encoded: Bytes,
+        decoded: Arc<DecodedCommitDeltaSegment>,
+    ) {
+        let entry = DecodedCommitDeltaCacheEntry {
+            digest,
+            encoded,
+            decoded,
+        };
+        let entry_bytes = entry.resident_bytes();
+        if entry_bytes > DECODED_COMMIT_DELTA_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some(position) = self.entries.iter().position(|existing| {
+            existing.digest == entry.digest && existing.encoded == entry.encoded
+        }) {
+            let previous = self
+                .entries
+                .remove(position)
+                .expect("located raced decoded commit-delta cache entry");
+            self.resident_bytes = self
+                .resident_bytes
+                .saturating_sub(previous.resident_bytes());
+        }
+        self.resident_bytes = self.resident_bytes.saturating_add(entry_bytes);
+        self.entries.push_back(entry);
+        while self.resident_bytes > DECODED_COMMIT_DELTA_CACHE_MAX_BYTES
+            || self.entries.len() > DECODED_COMMIT_DELTA_CACHE_MAX_ENTRIES
+        {
+            let evicted = self
+                .entries
+                .pop_front()
+                .expect("over-budget decoded commit-delta cache is non-empty");
+            self.resident_bytes = self.resident_bytes.saturating_sub(evicted.resident_bytes());
+        }
+    }
+
+    /// Admit an immutable block only after a second observation. Cold point
+    /// reads otherwise pay the hash but retain neither encoded nor decoded
+    /// bytes, while transaction update loops promote their shared base block.
+    fn should_admit(&mut self, digest: [u8; 32], encoded_len: usize) -> bool {
+        if let Some(position) = self
+            .recent_misses
+            .iter()
+            .position(|candidate| *candidate == (digest, encoded_len))
+        {
+            self.recent_misses.remove(position);
+            return true;
+        }
+        self.recent_misses.push_back((digest, encoded_len));
+        while self.recent_misses.len() > DECODED_COMMIT_DELTA_CACHE_ADMISSION_ENTRIES {
+            self.recent_misses.pop_front();
+        }
+        false
+    }
+}
+
+fn decoded_commit_delta_cache() -> &'static Mutex<DecodedCommitDeltaCache> {
+    static CACHE: OnceLock<Mutex<DecodedCommitDeltaCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(DecodedCommitDeltaCache::default()))
 }
 
 const COMMIT_DELTA_SMALL_STRING_DICTIONARY_LIMIT: usize = 32;
@@ -1662,11 +1811,14 @@ fn decode_change_at_locator(
     decode_change_at_locator_from_decoded(&leaf, &payloads, locator)
 }
 
-fn decode_change_at_locator_from_decoded(
+fn decode_change_at_locator_from_decoded<S>(
     leaf: &DecodedLeafNodeRef,
-    payloads: &CommitDeltaPayloadIndexRef<'_>,
+    payloads: &CommitDeltaPayloadIndex<S>,
     locator: CommitDeltaChangeLocator,
-) -> Result<LoadedCommitDeltaEntry, LixError> {
+) -> Result<LoadedCommitDeltaEntry, LixError>
+where
+    S: AsRef<[u8]>,
+{
     let change_id = locator.change_id;
     let ordinal = usize::from(locator.ordinal);
     let entry = leaf.entry(ordinal)?.ok_or_else(|| {
@@ -2710,6 +2862,29 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
     let manifest = decode_commit_delta_manifest(&bytes)?;
     let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
     if let Some(inline_segment) = manifest.inline_segment() {
+        if keys.len() <= DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS {
+            if let Some(decoded) = decode_commit_delta_with_payloads_cached(inline_segment, None)? {
+                for (request_index, &key) in keys.iter().enumerate() {
+                    let encoded_key = encode_key_ref(key);
+                    output[request_index] = find_loaded_commit_delta_entry(
+                        &decoded.leaf,
+                        &decoded.payloads,
+                        &encoded_key,
+                        commit_id,
+                    )?;
+                }
+                hydrate_selected_loaded_entries(store, &mut output).await?;
+                return Ok(output);
+            }
+            let (leaf, payloads) = decode_commit_delta_with_payloads(inline_segment, None)?;
+            for (request_index, &key) in keys.iter().enumerate() {
+                let encoded_key = encode_key_ref(key);
+                output[request_index] =
+                    find_loaded_commit_delta_entry(&leaf, &payloads, &encoded_key, commit_id)?;
+            }
+            hydrate_selected_loaded_entries(store, &mut output).await?;
+            return Ok(output);
+        }
         let (leaf, payloads) = decode_commit_delta_with_payloads(inline_segment, None)?;
         for (request_index, &key) in keys.iter().enumerate() {
             let encoded_key = encode_key_ref(key);
@@ -2770,6 +2945,44 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                 ),
             )
         })?;
+        if keys.len() <= DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS {
+            let decoded = decode_commit_delta_with_payloads_cached(&bytes, Some(bounds))?;
+            let (leaf, payloads) = if let Some(decoded) = decoded.as_ref() {
+                (&decoded.leaf, &decoded.payloads)
+            } else {
+                let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(bounds))?;
+                while routed
+                    .peek()
+                    .is_some_and(|(_, routed_segment, _)| *routed_segment == segment_index)
+                {
+                    let (request_index, _, encoded_key) = routed
+                        .next()
+                        .expect("peeked routed lookup remains available");
+                    output[request_index] = find_loaded_commit_delta_entry(
+                        &leaf,
+                        &payloads,
+                        &encoded_keys[encoded_key],
+                        commit_id,
+                    )?;
+                }
+                continue;
+            };
+            while routed
+                .peek()
+                .is_some_and(|(_, routed_segment, _)| *routed_segment == segment_index)
+            {
+                let (request_index, _, encoded_key) = routed
+                    .next()
+                    .expect("peeked routed lookup remains available");
+                output[request_index] = find_loaded_commit_delta_entry(
+                    leaf,
+                    payloads,
+                    &encoded_keys[encoded_key],
+                    commit_id,
+                )?;
+            }
+            continue;
+        }
         let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(bounds))?;
         let mut leaf_index = 0usize;
         while routed
@@ -4377,6 +4590,56 @@ fn decode_commit_delta_with_payloads<'a>(
     Ok((leaf, index))
 }
 
+fn validate_decoded_commit_delta_bounds(
+    leaf: &DecodedLeafNodeRef,
+    expected_bounds: Option<&CommitDeltaSegmentBounds>,
+) -> Result<(), LixError> {
+    if let Some(expected_bounds) = expected_bounds
+        && (leaf.first_key() != Some(expected_bounds.first_key.as_slice())
+            || leaf.last_key() != Some(expected_bounds.last_key.as_slice()))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_delta segment does not match its manifest bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_commit_delta_with_payloads_cached(
+    bytes: &[u8],
+    expected_bounds: Option<&CommitDeltaSegmentBounds>,
+) -> Result<Option<Arc<DecodedCommitDeltaSegment>>, LixError> {
+    let digest = *blake3::hash(bytes).as_bytes();
+    let should_admit = {
+        let mut cache = decoded_commit_delta_cache()
+            .lock()
+            .expect("decoded commit-delta cache lock poisoned");
+        if let Some(decoded) = cache.get(digest, bytes, expected_bounds)? {
+            return Ok(Some(decoded));
+        }
+        cache.should_admit(digest, bytes.len())
+    };
+    if !should_admit {
+        return Ok(None);
+    }
+
+    let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
+    let payloads = payloads.into_owned();
+    let resident_bytes =
+        size_of::<DecodedCommitDeltaSegment>() + leaf.resident_bytes() + payloads.resident_bytes();
+    let decoded = Arc::new(DecodedCommitDeltaSegment {
+        leaf,
+        payloads,
+        resident_bytes,
+    });
+    decoded_commit_delta_cache()
+        .lock()
+        .expect("decoded commit-delta cache lock poisoned")
+        .insert(digest, Bytes::copy_from_slice(bytes), Arc::clone(&decoded));
+    Ok(Some(decoded))
+}
+
 fn decode_commit_delta_segment(
     bytes: &[u8],
     expected_bounds: Option<&CommitDeltaSegmentBounds>,
@@ -4453,12 +4716,15 @@ fn find_commit_delta_value(
     Ok(Some(value))
 }
 
-fn find_loaded_commit_delta_entry(
+fn find_loaded_commit_delta_entry<S>(
     leaf: &DecodedLeafNodeRef,
-    payloads: &CommitDeltaPayloadIndexRef<'_>,
+    payloads: &CommitDeltaPayloadIndex<S>,
     target_key: &[u8],
     expected_commit_id: CommitId,
-) -> Result<Option<LoadedCommitDeltaEntry>, LixError> {
+) -> Result<Option<LoadedCommitDeltaEntry>, LixError>
+where
+    S: AsRef<[u8]>,
+{
     let Some(index) = find_commit_delta_entry_index(leaf, target_key)? else {
         return Ok(None);
     };
@@ -4470,12 +4736,15 @@ fn find_loaded_commit_delta_entry(
     )?))
 }
 
-fn load_commit_delta_entry_at_index(
+fn load_commit_delta_entry_at_index<S>(
     leaf: &DecodedLeafNodeRef,
-    payloads: &CommitDeltaPayloadIndexRef<'_>,
+    payloads: &CommitDeltaPayloadIndex<S>,
     index: usize,
     expected_commit_id: CommitId,
-) -> Result<LoadedCommitDeltaEntry, LixError> {
+) -> Result<LoadedCommitDeltaEntry, LixError>
+where
+    S: AsRef<[u8]>,
+{
     let entry = leaf.entry(index)?.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -4827,7 +5096,8 @@ mod tests {
 
     use super::{
         COMMIT_DELTA_FORMAT_MAGIC, CommitDeltaChangeLocator, CommitDeltaManifest,
-        CommitDeltaPayloadRef, DecodedCommitDeltaBatch, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
+        CommitDeltaPayloadRef, DecodedCommitDeltaBatch, DecodedCommitDeltaCache,
+        DecodedCommitDeltaSegment, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
         TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
         TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_MAGIC,
         TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay,
@@ -4842,6 +5112,69 @@ mod tests {
         stage_addressable_commit_deltas_with_selected_source, stage_change_locators,
         stage_commit_deltas, stage_delete_commit_delta_inventory_entry, value,
     };
+
+    #[test]
+    fn decoded_commit_delta_point_cache_reuses_an_immutable_segment() {
+        let commit_id = CommitId::for_test_label("decoded-point-cache");
+        let fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let entries = fixtures
+            .iter()
+            .map(|fixture| EncodedLeafEntry {
+                key: encode_key_ref(TrackedStateKeyRef {
+                    schema_key: &fixture.schema_key,
+                    file_id: fixture.file_id.as_deref(),
+                    entity_pk: &fixture.entity_pk,
+                })
+                .into(),
+                value: encode_value_ref(TrackedStateIndexValueRef {
+                    change_id: fixture.change_id,
+                    commit_id,
+                    deleted: fixture.deleted,
+                    created_at: fixture.created_at,
+                    updated_at: fixture.updated_at,
+                })
+                .into(),
+            })
+            .collect::<Vec<_>>();
+        let encoded = encode_commit_delta_segment(&entries);
+        let (leaf, payloads) =
+            decode_commit_delta_with_payloads(&encoded, None).expect("decode point-cache segment");
+        let payloads = payloads.into_owned();
+        let decoded = std::sync::Arc::new(DecodedCommitDeltaSegment {
+            resident_bytes: leaf.resident_bytes() + payloads.resident_bytes(),
+            leaf,
+            payloads,
+        });
+        let digest = *blake3::hash(&encoded).as_bytes();
+        let mut cache = DecodedCommitDeltaCache::default();
+        assert!(
+            !cache.should_admit(digest, encoded.len()),
+            "a one-off point read should not retain a decoded block"
+        );
+        assert!(
+            cache.should_admit(digest, encoded.len()),
+            "a repeated point read should promote its decoded block"
+        );
+        cache.insert(
+            digest,
+            encoded.clone().into(),
+            std::sync::Arc::clone(&decoded),
+        );
+        let reused = cache
+            .get(digest, &encoded, None)
+            .expect("read point-cache entry")
+            .expect("point-cache entry should exist");
+        assert!(
+            std::sync::Arc::ptr_eq(&decoded, &reused),
+            "the same immutable bytes should reuse one decoded block"
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.resident_bytes > 0);
+        assert!(cache.resident_bytes <= super::DECODED_COMMIT_DELTA_CACHE_MAX_BYTES);
+    }
 
     #[derive(Clone)]
     struct CommitDeltaFixture {
