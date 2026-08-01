@@ -1005,8 +1005,12 @@ impl TransactionWriteBuffer {
             )
         })?;
         let registered_schema_key = crate::transaction::normalization::REGISTERED_SCHEMA_KEY;
-        let (rows, candidate_slots) = match &*rows {
-            StagedPreparedRows::AppendOnly { rows, .. } => (rows, None),
+        let (rows, candidate_slots, ordered_range) = match &*rows {
+            StagedPreparedRows::AppendOnly { rows, .. } => (
+                rows,
+                None,
+                Some(ordered_schema_row_range(rows, registered_schema_key)),
+            ),
             StagedPreparedRows::Indexed {
                 rows, by_candidate, ..
             } => (
@@ -1018,6 +1022,7 @@ impl TransactionWriteBuffer {
                         .map(SmallVec::as_slice)
                         .unwrap_or(&[]),
                 ),
+                None,
             ),
         };
         let matches_domain = |row: PreparedStateRowRef<'_>| {
@@ -1029,7 +1034,9 @@ impl TransactionWriteBuffer {
             Some(slots) => slots.iter().any(|slot| match slot {
                 RowSlot::State(index) => matches_domain(rows.row(*index)),
             }),
-            None => rows.iter().any(matches_domain),
+            None => ordered_range
+                .expect("append-only rows carry their ordered schema range")
+                .any(|index| matches_domain(rows.row(index))),
         })
     }
 
@@ -1074,6 +1081,92 @@ impl TransactionWriteBuffer {
             by_candidate,
         };
         Ok(())
+    }
+
+    /// Proves that an exact read lies strictly after an ordered tracked
+    /// journal without materializing its identity indexes.
+    ///
+    /// Append-only rows are normal tracked rows in tracked-tree order. If
+    /// every requested key is greater than the journal tail, none can overlap
+    /// a staged row. Sequential point updates use exactly this shape: the next
+    /// key probes committed state, then extends the same compact journal.
+    fn append_only_exact_batch_is_definitely_absent(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<bool, LixError> {
+        let guard = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let StagedPreparedRows::AppendOnly { rows, last_key, .. } = &*guard else {
+            return Ok(false);
+        };
+        if rows.is_empty() || request.untracked == Some(true) {
+            return Ok(true);
+        }
+        let Some(last_key) = last_key else {
+            return Ok(false);
+        };
+        Ok(request.rows.iter().all(|row| {
+            compare_tracked_key_to_exact_request(last_key, row) == std::cmp::Ordering::Less
+        }))
+    }
+
+    /// Proves a keyed scan lies after the ordered journal tail.
+    ///
+    /// Scan identity vectors form a Cartesian product. Comparing the minimum
+    /// possible tracked key is therefore sufficient: if it is after the tail,
+    /// every requested identity is after the tail. An empty or `Any` file
+    /// filter includes `NULL`, which is the minimum file component.
+    fn append_only_scan_is_definitely_absent(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<bool, LixError> {
+        let guard = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let StagedPreparedRows::AppendOnly { rows, last_key, .. } = &*guard else {
+            return Ok(false);
+        };
+        if rows.is_empty() || request.filter.untracked == Some(true) {
+            return Ok(true);
+        }
+        let Some(last_key) = last_key else {
+            return Ok(false);
+        };
+        let Some(schema_key) = request.filter.schema_keys.iter().min() else {
+            return Ok(false);
+        };
+        let Some(entity_pk) = request.filter.entity_pks.iter().min() else {
+            return Ok(false);
+        };
+        let file_id =
+            if request.filter.file_ids.is_empty()
+                || request.filter.file_ids.iter().any(|file_id| {
+                    matches!(file_id, NullableKeyFilter::Any | NullableKeyFilter::Null)
+                })
+            {
+                None
+            } else {
+                request
+                    .filter
+                    .file_ids
+                    .iter()
+                    .filter_map(|file_id| match file_id {
+                        NullableKeyFilter::Value(value) => Some(value.as_str()),
+                        NullableKeyFilter::Any | NullableKeyFilter::Null => None,
+                    })
+                    .min()
+            };
+        Ok(
+            compare_tracked_key_to_parts(last_key, schema_key, file_id, entity_pk)
+                == std::cmp::Ordering::Less,
+        )
     }
 
     /// Takes the normal tracked write lane directly into the transaction
@@ -2060,6 +2153,31 @@ fn compare_tracked_key_to_row(
         .then_with(|| left.entity_pk.cmp(right.entity_pk))
 }
 
+fn compare_tracked_key_to_exact_request(
+    left: &TrackedStateKey,
+    right: &LiveStateExactRowRequest,
+) -> std::cmp::Ordering {
+    compare_tracked_key_to_parts(
+        left,
+        right.schema_key.as_str(),
+        right.file_id.as_deref(),
+        &right.entity_pk,
+    )
+}
+
+fn compare_tracked_key_to_parts(
+    left: &TrackedStateKey,
+    schema_key: &str,
+    file_id: Option<&str>,
+    entity_pk: &EntityPk,
+) -> std::cmp::Ordering {
+    left.schema_key
+        .as_str()
+        .cmp(schema_key)
+        .then_with(|| left.file_id.as_ref().map(SharedStr::as_str).cmp(&file_id))
+        .then_with(|| left.entity_pk.cmp(entity_pk))
+}
+
 fn reorder_rows_by_source_permutation(
     rows: &mut PreparedStateBatch,
     source_by_destination: &mut [usize],
@@ -2154,6 +2272,13 @@ impl PreparedStateRowOverlay {
             request.filter.rows,
             crate::live_state::LiveStateRowFilter::None
         ) {
+            return Ok(MaterializedLiveStateBatch::default());
+        }
+
+        if self
+            .staged_writes
+            .append_only_scan_is_definitely_absent(request)?
+        {
             return Ok(MaterializedLiveStateBatch::default());
         }
 
@@ -2254,6 +2379,15 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
         if request.rows.is_empty() {
             return Ok(MaterializedLiveStateExactBatch::default());
         }
+        if self
+            .staged_writes
+            .append_only_exact_batch_is_definitely_absent(request)?
+        {
+            return MaterializedLiveStateExactBatch::new(
+                MaterializedLiveStateBatch::default(),
+                vec![None; request.rows.len()],
+            );
+        }
         self.staged_writes.ensure_identity_index(false)?;
         let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
             LixError::new(
@@ -2308,23 +2442,26 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
         schema_key: &str,
         file_id: Option<&str>,
     ) -> Result<bool, LixError> {
-        self.staged_writes.ensure_identity_index(false)?;
         let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged writes lock",
             )
         })?;
-        let StagedPreparedRows::Indexed {
-            rows, by_candidate, ..
-        } = &*rows_guard
-        else {
-            return Ok(false);
+        let (rows, marker_slots) = match &*rows_guard {
+            StagedPreparedRows::AppendOnly { rows, .. } => {
+                return append_only_collection_replaced(rows, branch_id, schema_key, file_id);
+            }
+            StagedPreparedRows::Indexed {
+                rows, by_candidate, ..
+            } => (
+                rows,
+                by_candidate
+                    .slots_by_schema
+                    .get(crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY),
+            ),
         };
-        let Some(marker_slots) = by_candidate
-            .slots_by_schema
-            .get(crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY)
-        else {
+        let Some(marker_slots) = marker_slots else {
             return Ok(false);
         };
         for slot in marker_slots {
@@ -2345,6 +2482,58 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
         }
         Ok(false)
     }
+}
+
+/// Answers the uncommon collection-generation probe directly from the sorted
+/// journal. Promoting every normal point-write transaction to the identity
+/// index just to prove that no marker exists defeats append-only staging.
+fn append_only_collection_replaced(
+    rows: &PreparedStateBatch,
+    branch_id: &str,
+    schema_key: &str,
+    file_id: Option<&str>,
+) -> Result<bool, LixError> {
+    let marker_schema = crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY;
+    for row_index in ordered_schema_row_range(rows, marker_schema) {
+        let row = rows.row(row_index);
+        if row.branch_id.as_str() != branch_id || row.snapshot.is_none() {
+            continue;
+        }
+        let (target_schema_key, target_file_id) =
+            crate::collection_generation::collection_scope_from_entity_pk(row.entity_pk)?;
+        if target_schema_key == schema_key
+            && (target_file_id.is_none() || target_file_id.as_deref() == file_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Locates one schema's contiguous slice in tracked-key order without
+/// constructing transaction-wide identity or candidate indexes.
+fn ordered_schema_row_range(rows: &PreparedStateBatch, schema_key: &str) -> std::ops::Range<usize> {
+    let mut lower = 0;
+    let mut upper = rows.len();
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        if rows.row(middle).schema_key.as_str() < schema_key {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    let start = lower;
+    upper = rows.len();
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        if rows.row(middle).schema_key.as_str() <= schema_key {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    start..lower
 }
 
 #[cfg(test)]
@@ -2846,6 +3035,132 @@ mod tests {
     }
 
     #[test]
+    fn future_exact_reads_keep_ordered_tracked_journal_append_only() {
+        let staged_writes = test_staged_writes();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows![tracked_append_row("entity-a", "first")],
+            })
+            .expect("first ordered replacement should stage");
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("ordered journal overlay should build");
+        let exact = |entity: &str| LiveStateExactRowRequest {
+            schema_key: "lix_key_value".into(),
+            branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
+            entity_pk: EntityPk::single(entity),
+            file_id: None,
+        };
+
+        let future_scan = overlay
+            .scan(&scan_request_for_key("entity-b", false))
+            .expect("future keyed scan should be proven absent");
+        assert!(future_scan.is_empty());
+        assert!(
+            !staged_writes.uses_identity_index_for_tests(),
+            "a keyed scan after the journal tail must not materialize read indexes"
+        );
+
+        let future = StagedLiveStateRows::load_exact_batch(
+            &overlay,
+            &LiveStateExactBatchRequest {
+                rows: vec![exact("entity-b")],
+                ..Default::default()
+            },
+        )
+        .expect("future exact row should be proven absent");
+        assert!(future.row(0).is_none());
+        assert!(
+            !staged_writes.uses_identity_index_for_tests(),
+            "a key after the journal tail must not materialize read indexes"
+        );
+
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows![tracked_append_row("entity-b", "second")],
+            })
+            .expect("future ordered replacement should extend the journal");
+        assert!(
+            !staged_writes.uses_identity_index_for_tests(),
+            "future exact absence proof must preserve append-only staging"
+        );
+
+        let overlap = StagedLiveStateRows::load_exact_batch(
+            &overlay,
+            &LiveStateExactBatchRequest {
+                rows: vec![exact("entity-a")],
+                ..Default::default()
+            },
+        )
+        .expect("overlapping exact row should load from the journal");
+        assert!(overlap.row(0).is_some());
+        assert!(
+            staged_writes.uses_identity_index_for_tests(),
+            "an overlapping read must retain normal read-your-writes semantics"
+        );
+    }
+
+    #[test]
+    fn collection_marker_probe_does_not_promote_ordered_journal() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let ordinary_writes = test_staged_writes();
+        ordinary_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows![tracked_append_row("entity-a", "first")],
+            })
+            .expect("ordinary replacement should stage");
+        let ordinary_overlay = ordinary_writes
+            .staging_overlay()
+            .expect("ordinary overlay should build");
+        assert!(
+            !StagedLiveStateRows::collection_replaced(
+                &ordinary_overlay,
+                branch_id,
+                "json_pointer",
+                None,
+            )
+            .expect("ordinary journal marker probe should succeed")
+        );
+        assert!(
+            !ordinary_writes.uses_identity_index_for_tests(),
+            "proving that an ordered journal has no marker must not build identity indexes"
+        );
+
+        let marker_writes = test_staged_writes();
+        marker_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows![
+                    state_row("[\"json_pointer\",null]", "marker")
+                        .with_schema(crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY)
+                        .with_tracked()
+                        .with_branch(branch_id)
+                        .with_change_id("collection-marker")
+                ],
+            })
+            .expect("collection marker should stage");
+        let marker_overlay = marker_writes
+            .staging_overlay()
+            .expect("marker overlay should build");
+        assert!(
+            StagedLiveStateRows::collection_replaced(
+                &marker_overlay,
+                branch_id,
+                "json_pointer",
+                None,
+            )
+            .expect("marker journal probe should succeed")
+        );
+        assert!(
+            !marker_writes.uses_identity_index_for_tests(),
+            "reading a sorted collection marker must not build identity indexes"
+        );
+    }
+
+    #[test]
     fn ordered_tracked_insert_batches_stay_append_only_with_absence_guards() {
         let staged_writes = test_staged_writes();
         for rows in [
@@ -3102,6 +3417,47 @@ mod tests {
                     false,
                 ))
                 .expect("other branch should remain independent")
+        );
+    }
+
+    #[test]
+    fn schema_catalog_probe_binary_searches_ordered_journal() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let tracked_domain = Domain::schema_catalog(branch_id, false);
+        let ordinary_writes = test_staged_writes();
+        ordinary_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows![tracked_append_row("entity-a", "ordinary")],
+            })
+            .expect("ordinary row should stage");
+        assert!(
+            !ordinary_writes
+                .has_staged_schema_catalog_change(&tracked_domain)
+                .expect("ordered catalog absence probe should succeed")
+        );
+        assert!(
+            !ordinary_writes.uses_identity_index_for_tests(),
+            "catalog absence must not promote the ordered journal"
+        );
+
+        let schema_writes = test_staged_writes();
+        let mut schema_row = tracked_append_row("schema-a", "schema");
+        schema_row.schema_key = crate::transaction::normalization::REGISTERED_SCHEMA_KEY.into();
+        schema_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows![schema_row],
+            })
+            .expect("registered schema row should stage");
+        assert!(
+            schema_writes
+                .has_staged_schema_catalog_change(&tracked_domain)
+                .expect("ordered catalog marker probe should succeed")
+        );
+        assert!(
+            !schema_writes.uses_identity_index_for_tests(),
+            "catalog detection must preserve ordered journal storage"
         );
     }
 
