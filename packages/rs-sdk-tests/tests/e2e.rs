@@ -2702,7 +2702,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
     assert!(
         direct_structure_error
             .message
-            .contains("one existing scalar value only")
+            .contains("existing scalar values only")
     );
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(lww));
     lix.execute(
@@ -2721,27 +2721,23 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
         read_file(&lix, path).await.unwrap(),
         Some(scalar_after_direct_reject.clone())
     );
-    let direct_batch_error = lix
-        .execute(
-            "UPDATE json_object_member SET scalar_json = $1 \
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND lixcol_file_id = $2",
-            &[
-                Value::Text(r#""BULK""#.to_owned()),
-                Value::Text(file_id.clone()),
-            ],
-        )
-        .await
-        .expect_err("a direct JSON semantic transition must contain one scalar change");
-    assert_eq!(direct_batch_error.code, LixError::CODE_INVALID_PLUGIN);
-    assert!(
-        direct_batch_error
-            .message
-            .contains("one existing scalar value only")
-    );
+        &[
+            Value::Text(r#""BULK""#.to_owned()),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .expect("a direct JSON semantic transition accepts an existing-scalar batch");
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
-        Some(scalar_after_direct_reject.clone())
+        Some(b"{\"left\":\"BULK\",\"right\":\"BULK\",\"gone\":\"BULK\"}".to_vec())
     );
+    write_file(&lix, path, scalar_after_direct_reject.clone())
+        .await
+        .unwrap();
 
     // Structure is byte-owned. A stale scalar delta is not allowed to
     // recreate an entity after another writer removes its containing slot.
@@ -2767,7 +2763,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
     .await
     .expect_err("a stale scalar must not resurrect a byte-deleted JSON node");
     assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
-    assert!(error.message.contains("one existing scalar value only"));
+    assert!(error.message.contains("existing scalar values only"));
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(without_gone.clone())
