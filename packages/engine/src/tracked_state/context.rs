@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::changelog::{
@@ -947,7 +948,7 @@ pub(crate) struct TrackedStateStoreReader<S> {
     /// Reused by one reader's repeated historical point probes. SQL history
     /// providers often resolve a descriptor, its ancestors, and plugin state
     /// at the same observed commit.
-    point_replay_intervals: HashMap<String, (Vec<CommitId>, Option<TrackedStateRootId>)>,
+    point_replay_intervals: HashMap<CommitId, PointReplayInterval>,
     point_value_cache: HashMap<(String, TrackedStateKey), Option<TrackedStateIndexValue>>,
     /// Reuses direct delta lookups when several observed commits share a
     /// rootless first-parent interval. This stays identity-routed: a cache
@@ -972,6 +973,40 @@ struct PointReplayCommit {
     parent_commit_id: Option<CommitId>,
     root_id: Option<TrackedStateRootId>,
     rootless: bool,
+}
+
+/// One immutable first-parent interval shared by every cached suffix view.
+/// A reader that discovers `n` commits retains `n` commit ids, not the
+/// `n * (n + 1) / 2` ids required by cloning every suffix.
+#[derive(Clone)]
+struct PointReplayInterval {
+    commits: Arc<[CommitId]>,
+    start: usize,
+    baseline_root: Option<TrackedStateRootId>,
+}
+
+impl PointReplayInterval {
+    fn new(commits: Vec<CommitId>, baseline_root: Option<TrackedStateRootId>) -> Self {
+        Self {
+            commits: commits.into(),
+            start: 0,
+            baseline_root,
+        }
+    }
+
+    fn commits(&self) -> &[CommitId] {
+        &self.commits[self.start..]
+    }
+
+    fn cache_suffixes(&self, cache: &mut HashMap<CommitId, Self>) {
+        for (offset, commit_id) in self.commits().iter().copied().enumerate() {
+            cache.entry(commit_id).or_insert_with(|| Self {
+                commits: Arc::clone(&self.commits),
+                start: self.start + offset,
+                baseline_root: self.baseline_root.clone(),
+            });
+        }
+    }
 }
 
 impl DiffCommitRootValidationCache {
@@ -2594,13 +2629,14 @@ where
         commit_id: &str,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<RootlessReplayBatch, LixError> {
-        let (commits, baseline_root) = self.point_replay_interval(commit_id).await?;
+        let interval = self.point_replay_interval(commit_id).await?;
+        let commits = interval.commits();
         let scanned_schema_keys = schema_keys_with_file_descriptors(&request.schema_keys);
         let mut decoded_batches = Vec::with_capacity(commits.len());
         let mut delta_rows = 0usize;
         let mut encoded_key_bytes = 0usize;
         let mut cascade_capacity = 0usize;
-        for replay_commit_id in &commits {
+        for replay_commit_id in commits {
             let batch = self
                 .scan_replayed_commit_delta_values(*replay_commit_id, &scanned_schema_keys)
                 .await?;
@@ -2632,9 +2668,9 @@ where
             limit: None,
             ..request.clone()
         };
-        let baseline = if let Some(root_id) = baseline_root {
+        let baseline = if let Some(root_id) = interval.baseline_root.as_ref() {
             self.tree
-                .scan(&self.store, &root_id, &baseline_request)
+                .scan(&self.store, root_id, &baseline_request)
                 .await?
         } else {
             Vec::new()
@@ -3068,24 +3104,45 @@ where
     async fn point_replay_interval(
         &mut self,
         commit_id: &str,
-    ) -> Result<(Vec<CommitId>, Option<TrackedStateRootId>), LixError> {
-        if let Some(interval) = self.point_replay_intervals.get(commit_id) {
+    ) -> Result<PointReplayInterval, LixError> {
+        let requested_commit_id =
+            CommitId::parse_lix(commit_id, "tracked-state point replay commit_id")?;
+        if let Some(interval) = self.point_replay_intervals.get(&requested_commit_id) {
             return Ok(interval.clone());
         }
-        let interval =
-            crate::tracked_state::commit_root_rebuild::load_first_parent_point_replay_interval(
-                &self.store,
-                commit_id,
-                &self.point_replay_intervals,
-            )
-            .await?;
-        for index in 0..interval.0.len() {
-            self.point_replay_intervals
-                .entry(interval.0[index].to_string())
-                .or_insert_with(|| (interval.0[index..].to_vec(), interval.1.clone()));
-        }
+
+        let mut commits = Vec::new();
+        let mut current_commit_id = requested_commit_id;
+        let mut seen_commit_ids = HashSet::new();
+        let baseline_root = loop {
+            if !seen_commit_ids.insert(current_commit_id) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot point-replay tracked_state commit '{commit_id}': first-parent cycle includes commit '{current_commit_id}'"
+                    ),
+                ));
+            }
+            let replay_commit = self.load_point_replay_commit(current_commit_id).await?;
+            if !replay_commit.rootless
+                && let Some(root_id) = replay_commit.root_id
+            {
+                break Some(root_id);
+            }
+            commits.push(current_commit_id);
+            let Some(parent_commit_id) = replay_commit.parent_commit_id else {
+                break None;
+            };
+            if let Some(tail) = self.point_replay_intervals.get(&parent_commit_id) {
+                commits.extend_from_slice(tail.commits());
+                break tail.baseline_root.clone();
+            }
+            current_commit_id = parent_commit_id;
+        };
+        let interval = PointReplayInterval::new(commits, baseline_root);
+        interval.cache_suffixes(&mut self.point_replay_intervals);
         self.point_replay_intervals
-            .entry(commit_id.to_string())
+            .entry(requested_commit_id)
             .or_insert_with(|| interval.clone());
         Ok(interval)
     }
@@ -4076,6 +4133,84 @@ mod tests {
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::wasm::{WasmCertifiedEntityBatch, WasmCreateContext};
+
+    #[test]
+    fn point_replay_interval_suffixes_share_one_backing_buffer() {
+        const COMMIT_COUNT: usize = 1_024;
+        let commits = (0..COMMIT_COUNT)
+            .map(|index| CommitId::for_test_label(&format!("replay-interval-{index}")))
+            .collect::<Vec<_>>();
+        let interval = PointReplayInterval::new(commits.clone(), None);
+        let mut cache = HashMap::new();
+
+        interval.cache_suffixes(&mut cache);
+
+        assert_eq!(cache.len(), COMMIT_COUNT);
+        let backing_buffers = cache
+            .values()
+            .map(|suffix| suffix.commits.as_ptr())
+            .collect::<HashSet<_>>();
+        assert_eq!(backing_buffers.len(), 1);
+        assert_eq!(interval.commits.len(), COMMIT_COUNT);
+        assert_eq!(
+            cache
+                .values()
+                .map(|suffix| suffix.commits().len())
+                .sum::<usize>(),
+            COMMIT_COUNT * (COMMIT_COUNT + 1) / 2,
+            "logical suffix coverage must not require physical suffix copies"
+        );
+        for (index, commit_id) in commits.iter().enumerate() {
+            assert_eq!(cache[commit_id].commits(), &commits[index..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn point_replay_interval_reuses_cached_suffix_and_commit_topology() {
+        const COMMIT_COUNT: usize = 32;
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(&storage, &tracked_state, "interval-base", None, &[])
+            .await
+            .expect("baseline root should write");
+        let mut parent = "interval-base".to_string();
+        let mut commits = Vec::with_capacity(COMMIT_COUNT);
+        for index in 0..COMMIT_COUNT {
+            let commit = format!("interval-rootless-{index}");
+            write_rootless_commit_for_test(&storage, &commit, &parent, &[]).await;
+            commits.push(CommitId::for_test_label(&commit));
+            parent = commit;
+        }
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("interval read should open"),
+        );
+
+        let head = reader
+            .point_replay_interval(&parent)
+            .await
+            .expect("head interval should load");
+        assert_eq!(head.commits().len(), COMMIT_COUNT);
+        assert!(head.baseline_root.is_some());
+        assert_eq!(reader.point_replay_intervals.len(), COMMIT_COUNT);
+        assert_eq!(reader.point_replay_commits.len(), COMMIT_COUNT + 1);
+
+        let middle_commit = commits[COMMIT_COUNT / 2];
+        let middle_offset = head
+            .commits()
+            .iter()
+            .position(|commit_id| *commit_id == middle_commit)
+            .expect("middle commit should belong to the head interval");
+        let middle = reader
+            .point_replay_interval(&middle_commit.to_string())
+            .await
+            .expect("cached suffix should load");
+        assert_eq!(middle.commits(), &head.commits()[middle_offset..]);
+        assert!(Arc::ptr_eq(&head.commits, &middle.commits));
+        assert_eq!(reader.point_replay_commits.len(), COMMIT_COUNT + 1);
+    }
 
     fn commit_root_key(label: &str) -> crate::storage_adapter::StorageKey {
         crate::storage_adapter::StorageKey(Bytes::copy_from_slice(
