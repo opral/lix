@@ -324,10 +324,11 @@ where
 
     async fn native_read(&self, path: String) -> Blob {
         self.session
-            .read_file_data(path)
+            .read_file_data(path, None)
             .await
             .expect("execute native file read")
             .expect("seeded timed file must exist")
+            .into_data()
     }
 
     async fn visible_commit_count(&self) -> usize {

@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use crate::LixError;
 use crate::binary_cas::BinaryCasChunking;
 use crate::binary_cas::{
-    BlobBytesBatch, BlobEditSplice, BlobHash, BlobPayload, BlobSameLengthSplice, BlobWriteReceipt,
+    BlobBytesBatch, BlobChunkReceipt, BlobEditSplice, BlobHash, BlobPayload, BlobRangeBytes,
+    BlobRangeBytesBatch, BlobSameLengthSplice, BlobWriteReceipt,
 };
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use std::collections::HashSet;
@@ -11,6 +12,60 @@ use std::collections::HashSet;
 #[async_trait]
 pub(crate) trait BlobDataReader: Send + Sync {
     async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError>;
+
+    async fn load_ranges_many(
+        &self,
+        requests: &[(BlobHash, std::ops::Range<u64>)],
+    ) -> Result<BlobRangeBytesBatch, LixError> {
+        let hashes = requests.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+        let values = self.load_bytes_many(&hashes).await?.into_vec();
+        let entries = values
+            .into_iter()
+            .zip(requests)
+            .map(|(value, (_, requested))| {
+                value
+                    .map(|bytes| materialize_blob_range(bytes, requested.clone()))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(BlobRangeBytesBatch::new(entries))
+    }
+}
+
+fn materialize_blob_range(
+    bytes: Vec<u8>,
+    requested: std::ops::Range<u64>,
+) -> Result<BlobRangeBytes, LixError> {
+    let total_size = u64::try_from(bytes.len()).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "binary CAS blob size exceeds u64",
+        )
+    })?;
+    if requested.start >= requested.end || requested.start >= total_size {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "binary CAS range is not satisfiable",
+        ));
+    }
+    let range = requested.start..requested.end.min(total_size);
+    let start = usize::try_from(range.start).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "binary CAS range is too large",
+        )
+    })?;
+    let end = usize::try_from(range.end).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "binary CAS range is too large",
+        )
+    })?;
+    Ok(BlobRangeBytes {
+        bytes: bytes[start..end].to_vec(),
+        total_size,
+        range,
+    })
 }
 
 /// Long-lived Binary CAS context factory.
@@ -63,6 +118,13 @@ where
             store: self.store.clone(),
         };
         Self::load_bytes_many(&mut reader, hashes).await
+    }
+
+    async fn load_ranges_many(
+        &self,
+        requests: &[(BlobHash, std::ops::Range<u64>)],
+    ) -> Result<BlobRangeBytesBatch, LixError> {
+        crate::binary_cas::kv::load_ranges_many(&self.store, requests).await
     }
 }
 
@@ -125,6 +187,26 @@ where
             payload.hash(),
         )
         .await
+    }
+
+    pub(crate) async fn stage_fixed_part(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Vec<BlobChunkReceipt>, LixError> {
+        crate::binary_cas::kv::stage_fixed_part_skipping_existing(
+            self.store,
+            self.writes,
+            &mut self.chunk_keys,
+            bytes,
+        )
+        .await
+    }
+
+    pub(crate) fn stage_fixed_manifest(
+        &mut self,
+        chunks: &[BlobChunkReceipt],
+    ) -> Result<BlobWriteReceipt, LixError> {
+        crate::binary_cas::kv::stage_fixed_manifest(self.writes, chunks)
     }
 
     /// Stages a normal file payload, opportunistically retaining unchanged

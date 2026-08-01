@@ -1,6 +1,8 @@
 use crate::LixError;
+use crate::binary_cas::chunking::MEDIA_CHUNK_BYTES;
 use crate::binary_cas::codec::BinaryChunkCodec;
 use crate::binary_cas::codec::{binary_blob_hash_bytes, hash_bytes_to_hex, hash_hex_to_bytes};
+use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct BlobHash([u8; 32]);
@@ -11,7 +13,28 @@ impl BlobHash {
     }
 
     pub(crate) fn from_content(content: &[u8]) -> Self {
-        Self(binary_blob_hash_bytes(content))
+        if content.len() <= MEDIA_CHUNK_BYTES {
+            return Self(binary_blob_hash_bytes(content));
+        }
+        let chunks = content
+            .chunks(MEDIA_CHUNK_BYTES)
+            .map(|chunk| (Self(binary_blob_hash_bytes(chunk)), chunk.len() as u64));
+        Self::from_chunks(content.len() as u64, chunks)
+    }
+
+    /// Computes the canonical identity of a fixed-chunk blob without opening
+    /// its payload. Upload recovery persists precisely these bounded receipts.
+    pub(crate) fn from_chunks(
+        size_bytes: u64,
+        chunks: impl IntoIterator<Item = (Self, u64)>,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key("lix binary cas fixed manifest v3");
+        hasher.update(&size_bytes.to_le_bytes());
+        for (hash, size) in chunks {
+            hasher.update(&size.to_le_bytes());
+            hasher.update(hash.as_bytes());
+        }
+        Self(*hasher.finalize().as_bytes())
     }
 
     pub(crate) fn from_hex(hash_hex: &str) -> Result<Self, LixError> {
@@ -159,6 +182,28 @@ pub(crate) struct BlobBytesBatch {
     entries: Vec<Option<Vec<u8>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlobRangeBytes {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) total_size: u64,
+    pub(crate) range: Range<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlobRangeBytesBatch {
+    entries: Vec<Option<BlobRangeBytes>>,
+}
+
+impl BlobRangeBytesBatch {
+    pub(crate) fn new(entries: Vec<Option<BlobRangeBytes>>) -> Self {
+        Self { entries }
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<Option<BlobRangeBytes>> {
+        self.entries
+    }
+}
+
 impl BlobBytesBatch {
     pub(crate) fn new(entries: Vec<Option<Vec<u8>>>) -> Self {
         Self { entries }
@@ -174,6 +219,12 @@ pub(crate) struct BlobWriteReceipt {
     pub(crate) hash: BlobHash,
     pub(crate) size_bytes: u64,
     pub(crate) layout: BlobLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlobChunkReceipt {
+    pub(crate) hash: BlobHash,
+    pub(crate) size_bytes: u64,
 }
 
 #[derive(musli::Decode)]

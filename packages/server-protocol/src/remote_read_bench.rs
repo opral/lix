@@ -938,10 +938,11 @@ async fn run_direct(lix: &Lix<SlateDB>, operation: Operation) {
         }
         _ => {
             let data = lix
-                .read_file_data(operation.path())
+                .read_file_data(operation.path(), None)
                 .await
                 .expect("direct file read")
-                .expect("seeded direct file");
+                .expect("seeded direct file")
+                .into_data();
             assert_eq!(
                 data.len(),
                 operation.payload_bytes().expect("payload operation")

@@ -8,10 +8,10 @@ use crate::binary_cas::codec::{
     decode_binary_cas_manifest_chunk, encode_binary_cas_chunk, encode_binary_cas_manifest,
     encode_binary_cas_manifest_chunk,
 };
-use crate::binary_cas::compression::{decode_zstd_chunk, encode_chunk_payload};
 use crate::binary_cas::{
     BinaryCasChunking, BlobBytesBatch, BlobDeltaBaseLayout, BlobDeltaSegment, BlobEditSplice,
-    BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobSameLengthSplice, BlobWriteReceipt,
+    BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobRangeBytes, BlobRangeBytesBatch,
+    BlobSameLengthSplice, BlobWriteReceipt,
 };
 #[cfg(test)]
 use crate::storage_adapter::StoragePrefix;
@@ -26,7 +26,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::ops::Bound;
+use std::ops::{Bound, Range};
 use web_time::Instant;
 
 // Keep independent manifest scans bounded so large blob batches do not create
@@ -226,15 +226,145 @@ fn stage_content_chunk(
     chunk_hash: BlobHash,
     chunk_data: &[u8],
 ) -> Result<(), LixError> {
-    let encoded = encode_chunk_payload(chunk_hash, chunk_data)?;
     stage_chunk(
         writes,
         chunk_hash,
-        encoded.codec,
+        BinaryChunkCodec::Raw,
         chunk_data.len() as u64,
-        &encoded.data,
+        chunk_data,
     );
     Ok(())
+}
+
+pub(in crate::binary_cas) async fn stage_fixed_part_skipping_existing(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    transaction_chunk_keys: &mut HashSet<Vec<u8>>,
+    bytes: &[u8],
+) -> Result<Vec<crate::binary_cas::BlobChunkReceipt>, LixError> {
+    if bytes.is_empty() || bytes.len() > 16 * 1024 * 1024 {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "resumable CAS parts must contain 1 byte through 16 MiB",
+        ));
+    }
+    let receipts = bytes
+        .chunks(crate::binary_cas::chunking::MEDIA_CHUNK_BYTES)
+        .map(|chunk| crate::binary_cas::BlobChunkReceipt {
+            hash: BlobHash::from_content(chunk),
+            size_bytes: chunk.len() as u64,
+        })
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::with_capacity(receipts.len());
+    for receipt in &receipts {
+        collect_chunk_lookup_candidate(receipt.hash, transaction_chunk_keys, &mut candidates);
+    }
+    let keys = candidates
+        .iter()
+        .map(|(_, key)| key.clone())
+        .collect::<Vec<_>>();
+    let existing = chunk_keys_exist(store, keys).await?;
+    let mut missing = candidates
+        .into_iter()
+        .zip(existing)
+        .filter_map(|((hash, _), exists)| (!exists).then_some(hash))
+        .collect::<HashSet<_>>();
+    for (chunk, receipt) in bytes
+        .chunks(crate::binary_cas::chunking::MEDIA_CHUNK_BYTES)
+        .zip(&receipts)
+    {
+        if missing.remove(&receipt.hash) {
+            stage_content_chunk(writes, receipt.hash, chunk)?;
+        }
+    }
+    Ok(receipts)
+}
+
+pub(in crate::binary_cas) fn stage_fixed_manifest(
+    writes: &mut StorageWriteSet,
+    chunks: &[crate::binary_cas::BlobChunkReceipt],
+) -> Result<BlobWriteReceipt, LixError> {
+    let chunk_count = u32::try_from(chunks.len()).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "resumable file has too many chunks",
+        )
+    })?;
+    let mut size_bytes = 0u64;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let is_last = index + 1 == chunks.len();
+        if chunk.size_bytes == 0
+            || chunk.size_bytes > crate::binary_cas::chunking::MEDIA_CHUNK_BYTES as u64
+            || (!is_last
+                && chunk.size_bytes != crate::binary_cas::chunking::MEDIA_CHUNK_BYTES as u64)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "resumable file receipts are not canonical fixed chunks",
+            ));
+        }
+        size_bytes = size_bytes.checked_add(chunk.size_bytes).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "resumable file size exceeds u64",
+            )
+        })?;
+    }
+
+    let (hash, layout) = match chunks {
+        [] => (BlobHash::from_content(&[]), BlobLayout::Empty),
+        [chunk] => (
+            chunk.hash,
+            BlobLayout::SingleChunk {
+                chunk_hash: chunk.hash,
+            },
+        ),
+        _ => (
+            BlobHash::from_chunks(
+                size_bytes,
+                chunks.iter().map(|chunk| (chunk.hash, chunk.size_bytes)),
+            ),
+            BlobLayout::Chunked { chunk_count },
+        ),
+    };
+    match &layout {
+        BlobLayout::Empty => stage_manifest(writes, hash, &BinaryCasManifest::Empty { size_bytes }),
+        BlobLayout::SingleChunk { chunk_hash } => stage_manifest(
+            writes,
+            hash,
+            &BinaryCasManifest::SingleChunk {
+                size_bytes,
+                chunk_hash: chunk_hash.into_bytes(),
+            },
+        ),
+        BlobLayout::Chunked { chunk_count } => {
+            stage_manifest(
+                writes,
+                hash,
+                &BinaryCasManifest::Chunked {
+                    size_bytes,
+                    chunk_count: *chunk_count,
+                },
+            );
+            for (index, chunk) in chunks.iter().enumerate() {
+                stage_manifest_chunk(
+                    writes,
+                    hash,
+                    index as u64,
+                    &KvBlobManifestChunk {
+                        chunk_hash: chunk.hash.into_bytes(),
+                        chunk_size: chunk.size_bytes,
+                    },
+                );
+            }
+        }
+        BlobLayout::Delta { .. } => unreachable!("fixed upload cannot produce delta layout"),
+    }
+    Ok(BlobWriteReceipt {
+        hash,
+        size_bytes,
+        layout,
+    })
 }
 
 #[cfg(test)]
@@ -545,6 +675,151 @@ pub(crate) async fn load_bytes_many(
     Ok(BlobBytesBatch::new(entries))
 }
 
+pub(crate) async fn load_ranges_many(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[(BlobHash, Range<u64>)],
+) -> Result<BlobRangeBytesBatch, LixError> {
+    let hashes = requests.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+    let metadata = load_metadata_many(store, &hashes).await?.into_vec();
+    let mut entries = Vec::with_capacity(requests.len());
+    for (metadata, (_, requested)) in metadata.into_iter().zip(requests) {
+        entries.push(match metadata {
+            Some(metadata) => Some(load_blob_range(store, metadata, requested.clone()).await?),
+            None => None,
+        });
+    }
+    Ok(BlobRangeBytesBatch::new(entries))
+}
+
+async fn load_blob_range(
+    store: &(impl StorageAdapterRead + ?Sized),
+    metadata: BlobMetadata,
+    requested: Range<u64>,
+) -> Result<BlobRangeBytes, LixError> {
+    if requested.start >= requested.end || requested.start >= metadata.size_bytes {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "binary CAS range is not satisfiable",
+        ));
+    }
+    let range = requested.start..requested.end.min(metadata.size_bytes);
+    let bytes = match &metadata.layout {
+        BlobLayout::Empty => unreachable!("a non-empty range cannot select an empty blob"),
+        BlobLayout::SingleChunk { chunk_hash } => {
+            let rows = load_chunk_rows(store, &[*chunk_hash]).await?;
+            let row = rows.into_iter().next().flatten().ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS chunk '{}' is missing for blob '{}'",
+                        chunk_hash.to_hex(),
+                        metadata.hash.to_hex()
+                    ),
+                )
+            })?;
+            let decoded = decode_and_verify_chunk(
+                &row,
+                persisted_size_to_usize(metadata.size_bytes, "binary CAS blob")?,
+                metadata.hash,
+                *chunk_hash,
+            )?;
+            let start = persisted_size_to_usize(range.start, "binary CAS range start")?;
+            let end = persisted_size_to_usize(range.end, "binary CAS range end")?;
+            decoded[start..end].to_vec()
+        }
+        BlobLayout::Chunked { chunk_count } => {
+            let manifest =
+                load_declared_manifest_chunks(store, metadata.hash, *chunk_count).await?;
+            if manifest.len() != *chunk_count as usize {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS blob '{}' expected {} chunks, found {}",
+                        metadata.hash.to_hex(),
+                        chunk_count,
+                        manifest.len()
+                    ),
+                ));
+            }
+            let mut selected = Vec::new();
+            let mut offset = 0u64;
+            for chunk in manifest {
+                let chunk_end = offset.checked_add(chunk.chunk_size).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "binary CAS chunk offsets overflow u64")
+                })?;
+                if offset < range.end && chunk_end > range.start {
+                    selected.push((offset, chunk));
+                }
+                offset = chunk_end;
+                if offset >= range.end {
+                    break;
+                }
+            }
+            let hashes = selected
+                .iter()
+                .map(|(_, chunk)| BlobHash::from_bytes(chunk.chunk_hash))
+                .collect::<Vec<_>>();
+            let rows = load_chunk_rows(store, &hashes).await?;
+            let capacity =
+                persisted_size_to_usize(range.end - range.start, "binary CAS selected range")?;
+            let mut out = Vec::with_capacity(capacity);
+            for (((chunk_start, chunk), chunk_hash), row) in
+                selected.into_iter().zip(hashes).zip(rows)
+            {
+                let row = row.ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "binary CAS chunk '{}' is missing for blob '{}'",
+                            chunk_hash.to_hex(),
+                            metadata.hash.to_hex()
+                        ),
+                    )
+                })?;
+                let expected_size = persisted_size_to_usize(chunk.chunk_size, "binary CAS chunk")?;
+                let decoded =
+                    decode_and_verify_chunk(&row, expected_size, metadata.hash, chunk_hash)?;
+                let selected_start = range.start.saturating_sub(chunk_start);
+                let selected_end = (range.end - chunk_start).min(chunk.chunk_size);
+                let selected_start =
+                    persisted_size_to_usize(selected_start, "binary CAS chunk range start")?;
+                let selected_end =
+                    persisted_size_to_usize(selected_end, "binary CAS chunk range end")?;
+                out.extend_from_slice(&decoded[selected_start..selected_end]);
+            }
+            if out.len() != capacity {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "binary CAS range did not reconstruct its declared byte count",
+                ));
+            }
+            out
+        }
+        BlobLayout::Delta { .. } => {
+            // Flat deltas are optimized for localized document edits, not
+            // immutable media. Keep their established reconstruction path
+            // instead of complicating the media range reader.
+            let full = load_bytes_many(store, &[metadata.hash])
+                .await?
+                .into_vec()
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "binary CAS delta base is missing")
+                })?;
+            let start = persisted_size_to_usize(range.start, "binary CAS range start")?;
+            let end = persisted_size_to_usize(range.end, "binary CAS range end")?;
+            full[start..end].to_vec()
+        }
+    };
+    Ok(BlobRangeBytes {
+        bytes,
+        total_size: metadata.size_bytes,
+        range,
+    })
+}
+
 fn apply_flat_delta(
     blob_hash: BlobHash,
     size_bytes: u64,
@@ -849,11 +1124,6 @@ fn decode_and_verify_payload(
     }
     let decoded = match codec {
         BinaryChunkCodec::Raw => chunk_payload,
-        BinaryChunkCodec::Zstd => Cow::Owned(decode_zstd_chunk(
-            chunk_hash,
-            &chunk_payload,
-            expected_chunk_size,
-        )?),
     };
     if decoded.len() != expected_chunk_size {
         return Err(LixError::new(
@@ -2420,6 +2690,43 @@ mod tests {
             Vec::<KvBlobManifestChunk>::new()
         );
     }
+
+    #[tokio::test]
+    async fn ranged_kv_read_reconstructs_only_the_selected_chunk_span() {
+        let storage = StorageAdapter::new(Memory::new());
+        let data = (0..(3 * 1024 * 1024))
+            .map(|index| ((index * 131 + 17) % 251) as u8)
+            .collect::<Vec<_>>();
+        let blob_hash = BlobHash::from_content(&data);
+        {
+            let mut writes = storage.new_write_set();
+            stage_test_bytes(&storage, &mut writes, &data).await;
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("ranged blob fixture should commit");
+        }
+
+        let requested = 900_000..1_300_000;
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("ranged read should open");
+        let actual = load_ranges_many(&store, &[(blob_hash, requested.clone())])
+            .await
+            .expect("blob range should load")
+            .into_vec()
+            .pop()
+            .flatten()
+            .expect("blob range should exist");
+
+        assert_eq!(actual.total_size, data.len() as u64);
+        assert_eq!(actual.range, requested.clone());
+        assert_eq!(
+            actual.bytes,
+            data[requested.start as usize..requested.end as usize]
+        );
+    }
     #[tokio::test]
     async fn existing_chunk_aware_writer_batches_persisted_chunk_checks_without_a_hash() {
         let storage = StorageAdapter::new(Memory::new());
@@ -2907,20 +3214,16 @@ mod tests {
         );
     }
     #[test]
-    fn decode_rejects_same_length_valid_zstd_frame_for_wrong_hash() {
+    fn decode_rejects_same_length_raw_bytes_for_wrong_hash() {
         let expected = vec![b'a'; 128 * 1024];
         let substituted = vec![b'b'; expected.len()];
         assert_eq!(expected.len(), substituted.len());
         let expected_hash = BlobHash::from_content(&expected);
-        let substituted_hash = BlobHash::from_content(&substituted);
-        let encoded = encode_chunk_payload(substituted_hash, &substituted)
-            .expect("substituted chunk should encode");
-        assert_eq!(encoded.codec, BinaryChunkCodec::Zstd);
         let row =
-            encode_binary_cas_chunk(BinaryChunkCodec::Zstd, expected.len() as u64, &encoded.data);
+            encode_binary_cas_chunk(BinaryChunkCodec::Raw, expected.len() as u64, &substituted);
 
         let error = decode_and_verify_chunk(&row, expected.len(), expected_hash, expected_hash)
-            .expect_err("valid zstd frame for different bytes should be rejected");
+            .expect_err("raw bytes for a different hash should be rejected");
 
         assert!(
             error
@@ -2930,14 +3233,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_chunks_above_the_format_maximum_before_decompression() {
-        let data = b"valid compressed content".repeat(4096);
+    fn decode_rejects_chunks_above_the_format_maximum_before_payload_validation() {
+        let data = b"valid raw content".repeat(4096);
         let chunk_hash = BlobHash::from_content(&data);
-        let encoded = encode_chunk_payload(chunk_hash, &data).expect("chunk should encode");
-        assert_eq!(encoded.codec, BinaryChunkCodec::Zstd);
         let oversized_len = MAX_BINARY_CAS_CHUNK_BYTES + 1;
-        let row =
-            encode_binary_cas_chunk(BinaryChunkCodec::Zstd, oversized_len as u64, &encoded.data);
+        let row = encode_binary_cas_chunk(BinaryChunkCodec::Raw, oversized_len as u64, &data);
 
         let error = decode_and_verify_chunk(&row, oversized_len, chunk_hash, chunk_hash)
             .expect_err("oversized chunk metadata should be rejected");

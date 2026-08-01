@@ -16,6 +16,7 @@ mod create_branch;
 mod execute;
 mod gc;
 pub(crate) mod idempotency;
+mod media_upload;
 mod merge;
 pub(crate) mod observe;
 mod switch_branch;
@@ -30,12 +31,13 @@ pub(crate) use context::SessionMode;
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{
     CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ExecutionDisposition,
-    Row, RowRef, TryFromValue,
+    FileRead, Row, RowRef, TryFromValue,
 };
 pub use idempotency::ExecuteIdempotency;
 pub(crate) use idempotency::{
     EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotencyReceipt, encode_receipt,
 };
+pub use media_upload::{FILE_UPLOAD_PART_BYTES, FileUploadProgress};
 pub use merge::{
     MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
     MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,

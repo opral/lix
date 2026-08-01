@@ -1513,6 +1513,11 @@ pub(crate) struct TransactionFileData {
     /// identity.
     mutation_identity: Option<MutationIdentity>,
     payload: BlobPayload,
+    /// A complete CAS object whose chunks and manifest were durably staged by
+    /// the resumable transfer path before this history transaction began.
+    /// The file row still publishes through the ordinary transaction path;
+    /// it simply does not retain the multi-gigabyte payload again.
+    prepared_blob: Option<crate::binary_cas::BlobWriteReceipt>,
     /// Content-addressed payloads produced while validating this file write.
     /// Plugin installation uses this for the extracted WASM component so
     /// steady-state reads can load it directly without reopening the archive.
@@ -1550,6 +1555,7 @@ impl TransactionFileData {
             splice_provenance: None,
             mutation_identity: None,
             payload: BlobPayload::from_bytes(data),
+            prepared_blob: None,
             auxiliary_payloads: Vec::new(),
             plugin_checkpoint: None,
             stage_payload_at_commit: true,
@@ -1622,6 +1628,16 @@ impl TransactionFileData {
         self.stage_payload_at_commit = false;
     }
 
+    pub(crate) fn use_prepared_blob(&mut self, receipt: crate::binary_cas::BlobWriteReceipt) {
+        self.payload = BlobPayload::from_bytes(Vec::new());
+        self.prepared_blob = Some(receipt);
+        self.stage_payload_at_commit = false;
+        self.splice_provenance = None;
+        self.base_blob_hash = None;
+        self.same_length_blob_splice = None;
+        self.edit_blob_splice = None;
+    }
+
     pub(crate) fn stage_payload_at_commit(&self) -> bool {
         self.stage_payload_at_commit
     }
@@ -1632,6 +1648,7 @@ impl TransactionFileData {
 
     pub(crate) fn replace_data(&mut self, data: impl Into<crate::Blob>) {
         self.payload = BlobPayload::from_bytes(data);
+        self.prepared_blob = None;
         // Transport provenance describes the replaced request payload. Once a
         // plugin renderer materializes merged bytes, it no longer applies.
         self.splice_provenance = None;
@@ -1693,11 +1710,17 @@ impl TransactionFileData {
     }
 
     pub(crate) fn blob_hash(&self) -> Option<BlobHash> {
-        self.payload.hash()
+        self.prepared_blob
+            .as_ref()
+            .map(|receipt| receipt.hash)
+            .or_else(|| self.payload.hash())
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.payload.len()
+        self.prepared_blob.as_ref().map_or_else(
+            || self.payload.len(),
+            |receipt| usize::try_from(receipt.size_bytes).unwrap_or(usize::MAX),
+        )
     }
 
     pub(crate) fn payload(&self) -> &BlobPayload {
@@ -1722,7 +1745,10 @@ impl TransactionFileData {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.payload.is_empty()
+        self.prepared_blob.as_ref().map_or_else(
+            || self.payload.is_empty(),
+            |receipt| receipt.size_bytes == 0,
+        )
     }
 }
 

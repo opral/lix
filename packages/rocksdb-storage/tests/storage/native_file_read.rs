@@ -26,7 +26,7 @@ where
 
     assert_eq!(
         session
-            .read_file_data("/native/missing.bin".to_string())
+            .read_file_data("/native/missing.bin".to_string(), None)
             .await
             .expect("read missing file"),
         None
@@ -40,6 +40,14 @@ where
         .await
         .expect("create native file");
     assert_file_data(&session, "/native/deep/payload.bin", Some(b"payload")).await;
+    let range = session
+        .read_file_data("/native/deep/payload.bin".to_string(), Some(1..5))
+        .await
+        .expect("read native file range")
+        .expect("ranged native file should exist");
+    assert_eq!(range.data().as_ref(), b"aylo");
+    assert_eq!(range.range(), 1..5);
+    assert_eq!(range.total_size(), 7);
 
     session
         .upsert_file_data("/native/empty.bin".to_string(), Vec::new().into())
@@ -88,9 +96,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let actual = session
-        .read_file_data(path.to_string())
+        .read_file_data(path.to_string(), None)
         .await
         .expect("read native file")
-        .map(|data| data.to_vec());
+        .map(|read| read.into_data().to_vec());
     assert_eq!(actual.as_deref(), expected);
 }

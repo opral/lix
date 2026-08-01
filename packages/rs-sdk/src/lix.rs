@@ -243,6 +243,27 @@ where
             .await
     }
 
+    /// Sends one sequential resumable part through the same logical file
+    /// upsert. The final part atomically publishes the ordinary file version.
+    pub async fn upsert_file_data_part(
+        &self,
+        upload_id: impl Into<String>,
+        path: impl Into<String>,
+        start: u64,
+        total_size: u64,
+        data: impl Into<Blob>,
+    ) -> Result<lix_engine::FileUploadProgress, LixError> {
+        self.session
+            .upsert_file_data_part(
+                upload_id.into(),
+                path.into(),
+                start,
+                total_size,
+                data.into(),
+            )
+            .await
+    }
+
     /// Upserts a non-empty batch of files atomically without parsing SQL for
     /// normal filesystem layouts.
     ///
@@ -260,8 +281,12 @@ where
     ///
     /// The returned `None` means the file is absent; `Some` with an empty
     /// [`Blob`] means a present empty file.
-    pub async fn read_file_data(&self, path: impl Into<String>) -> Result<Option<Blob>, LixError> {
-        self.session.read_file_data(path.into()).await
+    pub async fn read_file_data(
+        &self,
+        path: impl Into<String>,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<Option<lix_engine::FileRead>, LixError> {
+        self.session.read_file_data(path.into(), range).await
     }
 
     #[doc(hidden)]

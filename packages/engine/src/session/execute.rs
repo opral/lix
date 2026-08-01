@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::ControlFlow;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -71,6 +72,36 @@ pub struct CoherentReadBatch {
     pub active_branch_commit_id: String,
     pub storage_mutation_revision: Option<Vec<u8>>,
     pub results: Vec<ExecuteResult>,
+}
+
+/// One materialized file read and the logical range it represents.
+///
+/// The result shape is independent of how the bytes are stored. Large-file
+/// backends can therefore satisfy a bounded range without changing the
+/// session API or exposing CAS chunks to callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRead {
+    data: Blob,
+    total_size: u64,
+    range: Range<u64>,
+}
+
+impl FileRead {
+    pub fn data(&self) -> &Blob {
+        &self.data
+    }
+
+    pub fn into_data(self) -> Blob {
+        self.data
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.total_size
+    }
+
+    pub fn range(&self) -> Range<u64> {
+        self.range.clone()
+    }
 }
 
 impl ExecuteResult {
@@ -732,7 +763,11 @@ where
     /// active-branch file selection, plugin rendering, and session file-view
     /// acknowledgement as `SELECT data FROM lix_file WHERE path = $1`, while
     /// avoiding SQL parsing, planning, and a JSON-shaped result envelope.
-    pub async fn read_file_data(&self, path: String) -> Result<Option<Blob>, LixError> {
+    pub async fn read_file_data(
+        &self,
+        path: String,
+        requested_range: Option<Range<u64>>,
+    ) -> Result<Option<FileRead>, LixError> {
         self.ensure_open()?;
         // Keep the structured API's path contract aligned with native writes.
         // SQL remains available for callers that intentionally need broader
@@ -772,9 +807,10 @@ where
                     Some(file_view_collector.clone()),
                     plugin_cache_snapshot,
                     &paths,
+                    requested_range.clone(),
                 )
                 .await?;
-                let data = native_file_data_from_exact_result(result, &paths)?;
+                let data = native_file_read_from_exact_result(result, &paths, requested_range)?;
                 Ok((data, file_view_collector.plugin_file_mutations()))
             },
         )
@@ -1926,6 +1962,7 @@ where
                                 file_view_collector.clone(),
                                 None,
                                 &paths,
+                                None,
                             )
                             .await?
                         }
@@ -2027,6 +2064,85 @@ where
     }
 }
 
+fn native_file_read_from_exact_result(
+    result: SqlQueryResult,
+    requested_paths: &BTreeSet<String>,
+    requested_range: Option<Range<u64>>,
+) -> Result<Option<FileRead>, LixError> {
+    if requested_range.is_none() {
+        return native_file_data_from_exact_result(result, requested_paths)?
+            .map(|data| materialize_file_read(data, None))
+            .transpose();
+    }
+    if result.columns.as_slice() != ["path", "data", "total_size", "range_start", "range_end"] {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native ranged file read returned an unexpected result schema",
+        ));
+    }
+    let mut rows = result.rows.into_iter();
+    let Some(mut row) = rows.next() else {
+        return Ok(None);
+    };
+    if rows.next().is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native ranged file read returned more than one path",
+        ));
+    }
+    let [
+        Value::Text(path),
+        data,
+        Value::Integer(total_size),
+        Value::Integer(range_start),
+        Value::Integer(range_end),
+    ] = row.as_mut_slice()
+    else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native ranged file read returned an invalid row",
+        ));
+    };
+    if !requested_paths.contains(path.as_str()) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native ranged file read returned an unrequested path",
+        ));
+    }
+    let data = match std::mem::replace(data, Value::Null) {
+        Value::Blob(data) => data,
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "native ranged file read returned non-binary data",
+            ));
+        }
+    };
+    let total_size = u64::try_from(*total_size).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native file size is negative",
+        )
+    })?;
+    let range_start = u64::try_from(*range_start).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native file range is negative",
+        )
+    })?;
+    let range_end = u64::try_from(*range_end).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native file range is negative",
+        )
+    })?;
+    Ok(Some(FileRead {
+        data,
+        total_size,
+        range: range_start..range_end,
+    }))
+}
+
 fn native_file_data_from_exact_result(
     result: SqlQueryResult,
     requested_paths: &BTreeSet<String>,
@@ -2073,6 +2189,45 @@ fn native_file_data_from_exact_result(
         }
     };
     Ok(Some(data))
+}
+
+fn materialize_file_read(
+    data: Blob,
+    requested_range: Option<Range<u64>>,
+) -> Result<FileRead, LixError> {
+    let total_size = u64::try_from(data.len()).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native file size does not fit the public 64-bit range",
+        )
+    })?;
+    let range = match requested_range {
+        None => 0..total_size,
+        Some(range) => {
+            if range.start >= range.end || range.start >= total_size {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "file read range is not satisfiable",
+                )
+                .with_details(serde_json::json!({
+                    "rangeStart": range.start,
+                    "rangeEnd": range.end,
+                    "totalSize": total_size,
+                })));
+            }
+            range.start..range.end.min(total_size)
+        }
+    };
+    let start = usize::try_from(range.start)
+        .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "file read range is too large"))?;
+    let end = usize::try_from(range.end)
+        .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "file read range is too large"))?;
+    let data = Blob::from(data.as_bytes().slice(start..end));
+    Ok(FileRead {
+        data,
+        total_size,
+        range,
+    })
 }
 
 fn validate_execute_statement_metadata(
@@ -2135,6 +2290,7 @@ async fn hydrate_lix_file_data_result(
         session_file_views,
         None,
         &paths,
+        None,
     )
     .await?;
     let mut data_by_path = BTreeMap::new();

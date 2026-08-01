@@ -7,7 +7,10 @@ use axum::{
     Extension, Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Query, Request, State},
-    http::{HeaderMap, HeaderName, StatusCode, header::CACHE_CONTROL},
+    http::{
+        HeaderMap, HeaderName, StatusCode,
+        header::{ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
+    },
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -15,6 +18,8 @@ use axum::{
     },
     routing::{delete, get, post},
 };
+#[cfg(test)]
+use lix_sdk::FILE_UPLOAD_PART_BYTES;
 use lix_sdk::{
     Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions,
     ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction,
@@ -64,6 +69,8 @@ pub const TRANSACTION_ID_HEADER: &str = "lix-transaction-id";
 /// Header distinguishing a missing file from a present empty file on the raw
 /// binary file-read endpoint.
 pub const FILE_FOUND_HEADER: &str = "lix-file-found";
+/// Client-generated identity for sequential resumable file parts.
+pub const FILE_UPLOAD_ID_HEADER: &str = "lix-upload-id";
 /// Default maximum number of live remote sessions for one workspace.
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 /// Default idle lifetime for a remote session.
@@ -1852,18 +1859,104 @@ where
 async fn upsert_file_data<S>(
     Extension(lease): Extension<SessionLease<S>>,
     Query(request): Query<BinaryFileUpdateRequest>,
+    headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<ExecuteResponse>, ApiError>
+) -> Result<Response, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let path = required_non_empty(request.path, "path")?;
+    if let Some(content_range) = parse_file_upload_content_range(&headers, body.len())? {
+        let upload_id = headers
+            .get(FILE_UPLOAD_ID_HEADER)
+            .ok_or_else(|| ApiError::bad_request("Content-Range requires Lix-Upload-Id"))?
+            .to_str()
+            .map_err(|_| ApiError::bad_request("Lix-Upload-Id must be ASCII"))?
+            .to_owned();
+        let progress = lease
+            .run(move |lix| async move {
+                lix.upsert_file_data_part(
+                    upload_id,
+                    path,
+                    content_range.start,
+                    content_range.total,
+                    body,
+                )
+                .await
+            })
+            .await?;
+        let mut response = Json(ExecuteResponse::try_from(
+            ExecuteResult::from_rows_affected(u64::from(progress.finalized)),
+        )?)
+        .into_response();
+        if !progress.finalized {
+            *response.status_mut() = StatusCode::PERMANENT_REDIRECT;
+            if progress.next_offset > 0 {
+                response.headers_mut().insert(
+                    RANGE,
+                    axum::http::HeaderValue::from_str(&format!(
+                        "bytes=0-{}",
+                        progress.next_offset - 1
+                    ))
+                    .map_err(|_| ApiError::bad_request("upload offset cannot be encoded"))?,
+                );
+            }
+        }
+        return Ok(response);
+    }
     let result = lease
         .run(move |lix| async move { lix.upsert_file_data(path, body).await })
         .await?;
     Ok(Json(ExecuteResponse::try_from(
         ExecuteResult::from_rows_affected(result),
-    )?))
+    )?)
+    .into_response())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileUploadContentRange {
+    start: u64,
+    total: u64,
+}
+
+fn parse_file_upload_content_range(
+    headers: &HeaderMap,
+    body_len: usize,
+) -> Result<Option<FileUploadContentRange>, ApiError> {
+    let Some(value) = headers.get(CONTENT_RANGE) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("Content-Range must be ASCII"))?;
+    let value = value
+        .strip_prefix("bytes ")
+        .ok_or_else(|| ApiError::bad_request("Content-Range must use bytes"))?;
+    let (range, total) = value
+        .split_once('/')
+        .ok_or_else(|| ApiError::bad_request("invalid Content-Range"))?;
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| ApiError::bad_request("invalid Content-Range"))?;
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| ApiError::bad_request("invalid Content-Range start"))?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| ApiError::bad_request("invalid Content-Range end"))?;
+    let total = total
+        .parse::<u64>()
+        .map_err(|_| ApiError::bad_request("invalid Content-Range total"))?;
+    let declared_len = end
+        .checked_sub(start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(|| ApiError::bad_request("invalid Content-Range bounds"))?;
+    if declared_len != body_len as u64 || end >= total {
+        return Err(ApiError::bad_request(
+            "Content-Range does not match the request body or total size",
+        ));
+    }
+    Ok(Some(FileUploadContentRange { start, total }))
 }
 
 /// Upserts a bounded batch of files from one deterministic octet-stream frame.
@@ -2025,19 +2118,35 @@ fn take_binary_file_upsert_batch_range(
 async fn read_file_data<S>(
     Extension(lease): Extension<SessionLease<S>>,
     Query(request): Query<BinaryFileReadRequest>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let path = required_non_empty(request.path, "path")?;
+    let requested_range = parse_single_file_range(&headers)?;
+    let partial = requested_range.is_some();
     let data = lease
-        .run_cancellable_read(move |lix| async move { lix.read_file_data(path).await })
+        .run_cancellable_read(
+            move |lix| async move { lix.read_file_data(path, requested_range).await },
+        )
         .await?;
-    let (found, body) = data.map_or_else(
-        || ("false", Bytes::new()),
-        |data| ("true", data.into_bytes()),
+    let (found, body, file_range) = data.map_or_else(
+        || ("false", Bytes::new(), None),
+        |read| {
+            let range = read.range();
+            let total_size = read.total_size();
+            (
+                "true",
+                read.into_data().into_bytes(),
+                Some((range, total_size)),
+            )
+        },
     );
     let mut response = Response::new(axum::body::Body::from(body));
+    if partial && file_range.is_some() {
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+    }
     let headers = response.headers_mut();
     headers.insert(
         CACHE_CONTROL,
@@ -2051,7 +2160,72 @@ where
         HeaderName::from_static(FILE_FOUND_HEADER),
         axum::http::HeaderValue::from_static(found),
     );
+    headers.insert(ACCEPT_RANGES, axum::http::HeaderValue::from_static("bytes"));
+    if let Some((range, total_size)) = file_range {
+        let body_length = range.end - range.start;
+        headers.insert(
+            CONTENT_LENGTH,
+            axum::http::HeaderValue::from_str(&body_length.to_string())
+                .map_err(|_| ApiError::bad_request("file range length is invalid"))?,
+        );
+        if partial {
+            let value = format!(
+                "bytes {}-{}/{}",
+                range.start,
+                range.end.saturating_sub(1),
+                total_size
+            );
+            headers.insert(
+                CONTENT_RANGE,
+                axum::http::HeaderValue::from_str(&value)
+                    .map_err(|_| ApiError::bad_request("file content range is invalid"))?,
+            );
+        }
+    }
     Ok(response)
+}
+
+/// Parses the common single, forward byte range. Multipart and suffix ranges
+/// are deliberately outside the media happy path and would force a more
+/// complicated response shape.
+fn parse_single_file_range(headers: &HeaderMap) -> Result<Option<std::ops::Range<u64>>, ApiError> {
+    let Some(value) = headers.get(RANGE) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("Range must be valid ASCII"))?;
+    let value = value
+        .strip_prefix("bytes=")
+        .ok_or_else(|| ApiError::bad_request("only byte ranges are supported"))?;
+    if value.contains(',') {
+        return Err(ApiError::bad_request(
+            "multiple file ranges are not supported",
+        ));
+    }
+    let (start, end) = value
+        .split_once('-')
+        .ok_or_else(|| ApiError::bad_request("Range must use start-end form"))?;
+    if start.is_empty() {
+        return Err(ApiError::bad_request(
+            "suffix file ranges are not supported",
+        ));
+    }
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| ApiError::bad_request("Range start must be an unsigned integer"))?;
+    let end_exclusive = if end.is_empty() {
+        u64::MAX
+    } else {
+        end.parse::<u64>()
+            .map_err(|_| ApiError::bad_request("Range end must be an unsigned integer"))?
+            .checked_add(1)
+            .ok_or_else(|| ApiError::bad_request("Range end is too large"))?
+    };
+    if start >= end_exclusive {
+        return Err(ApiError::bad_request("Range start must not exceed its end"));
+    }
+    Ok(Some(start..end_exclusive))
 }
 
 async fn create_branch<S>(
@@ -5714,6 +5888,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn binary_file_upsert_resumes_with_content_range_and_publishes_on_final_part() {
+        let app = app().await;
+        let (first_session, _) = new_session(&app.router).await;
+        let first = vec![0x41; FILE_UPLOAD_PART_BYTES];
+        let tail = vec![0x42; 9];
+        let total = first.len() + tail.len();
+        let first_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/file/upsert?path=%2Fproxy.mov")
+                    .header(SESSION_ID_HEADER, &first_session)
+                    .header(FILE_UPLOAD_ID_HEADER, "proxy-upload-1")
+                    .header(
+                        CONTENT_RANGE,
+                        format!("bytes 0-{}/{total}", first.len() - 1),
+                    )
+                    .body(Body::from(first))
+                    .expect("first upload part"),
+            )
+            .await
+            .expect("first upload response");
+        assert_eq!(first_response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            first_response.headers()[RANGE],
+            format!("bytes=0-{}", FILE_UPLOAD_PART_BYTES - 1)
+        );
+
+        // The durable upload receipt is repository state, not session memory.
+        let (resumed_session, _) = new_session(&app.router).await;
+        let final_response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/file/upsert?path=%2Fproxy.mov")
+                    .header(SESSION_ID_HEADER, &resumed_session)
+                    .header(FILE_UPLOAD_ID_HEADER, "proxy-upload-1")
+                    .header(
+                        CONTENT_RANGE,
+                        format!("bytes {}-{}/{total}", FILE_UPLOAD_PART_BYTES, total - 1),
+                    )
+                    .body(Body::from(tail))
+                    .expect("final upload part"),
+            )
+            .await
+            .expect("final upload response");
+        assert_eq!(final_response.status(), StatusCode::OK);
+        assert_eq!(response_json(final_response).await["rowsAffected"], 1);
+
+        let boundary = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/lix/v1/file?path=%2Fproxy.mov")
+                    .header(SESSION_ID_HEADER, &resumed_session)
+                    .header(
+                        RANGE,
+                        format!(
+                            "bytes={}-{}",
+                            FILE_UPLOAD_PART_BYTES - 2,
+                            FILE_UPLOAD_PART_BYTES + 1
+                        ),
+                    )
+                    .body(Body::empty())
+                    .expect("boundary range read"),
+            )
+            .await
+            .expect("boundary range response");
+        assert_eq!(boundary.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            boundary
+                .into_body()
+                .collect()
+                .await
+                .expect("boundary body")
+                .to_bytes()
+                .as_ref(),
+            b"AABB"
+        );
+    }
+
+    #[tokio::test]
     async fn binary_file_read_returns_raw_bytes_and_distinguishes_empty_and_missing() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
@@ -5771,6 +6033,40 @@ mod tests {
                 .to_bytes()
                 .as_ref(),
             payload.as_slice()
+        );
+
+        let ranged = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/lix/v1/file?path=%2Fpayload.bin")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .header(RANGE, "bytes=1-3")
+                    .body(Body::empty())
+                    .expect("ranged binary file read request"),
+            )
+            .await
+            .expect("ranged binary file read response");
+        assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            ranged.headers().get(ACCEPT_RANGES),
+            Some(&axum::http::HeaderValue::from_static("bytes"))
+        );
+        assert_eq!(
+            ranged.headers().get(CONTENT_RANGE),
+            Some(&axum::http::HeaderValue::from_static("bytes 1-3/5"))
+        );
+        assert_eq!(
+            ranged
+                .into_body()
+                .collect()
+                .await
+                .expect("ranged read body")
+                .to_bytes()
+                .as_ref(),
+            &payload[1..4]
         );
 
         let emptied = app

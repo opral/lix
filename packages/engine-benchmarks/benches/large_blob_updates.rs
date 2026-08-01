@@ -4,11 +4,13 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use lix_engine::storage_adapter::{StorageAdapter, StorageSpace};
 use lix_engine::storage_bench::{binary_cas_write_accounting, reset_binary_cas_write_accounting};
 use lix_engine::{
-    CoreProjection, Engine, KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue, ReadOptions, ScanOptions,
-    SessionContext, SpaceId, Storage, StorageRead, Value,
+    CoreProjection, Engine, Key, KeyRange, MAX_SCAN_PAGE_ROWS, ProjectedValue, ReadOptions,
+    ScanOptions, SessionContext, SpaceId, Storage, StorageRead, StoredValue, Value, WriteOptions,
 };
 use lix_rocksdb_storage::RocksDB;
 use lix_slatedb_storage::SlateDB;
@@ -20,6 +22,8 @@ const OPERATIONS: &[Operation] = &[
     Operation::LocalizedUpdate,
     Operation::FullRewrite,
     Operation::InitialWrite,
+    Operation::ResumableInitialWrite,
+    Operation::RawBackendInitialWrite,
 ];
 const LOCAL_EDIT_BYTES: usize = 4 << 10;
 const MANIFEST_SPACE: SpaceId = SpaceId(0x0005_0001);
@@ -49,6 +53,8 @@ enum Operation {
     LocalizedUpdate,
     FullRewrite,
     InitialWrite,
+    ResumableInitialWrite,
+    RawBackendInitialWrite,
 }
 
 impl Display for Operation {
@@ -57,6 +63,8 @@ impl Display for Operation {
             Self::LocalizedUpdate => formatter.write_str("localized_4k_update"),
             Self::FullRewrite => formatter.write_str("full_rewrite"),
             Self::InitialWrite => formatter.write_str("initial_write"),
+            Self::ResumableInitialWrite => formatter.write_str("resumable_initial_write"),
+            Self::RawBackendInitialWrite => formatter.write_str("raw_backend_initial_write"),
         }
     }
 }
@@ -119,10 +127,7 @@ async fn print_accounting() {
         if !selected("LIX_LARGE_BLOB_BACKENDS", &backend.to_string()) {
             continue;
         }
-        for &size in SIZES {
-            if !selected("LIX_LARGE_BLOB_SIZES_MIB", &(size >> 20).to_string()) {
-                continue;
-            }
+        for size in accounting_sizes() {
             for &operation in OPERATIONS {
                 if !selected("LIX_LARGE_BLOB_OPERATIONS", &operation.to_string()) {
                     continue;
@@ -143,10 +148,28 @@ async fn print_accounting() {
 
                 fixture.flush().await;
                 let storage_bytes_after = directory_bytes(fixture.root());
-                let manifest = fixture.space_accounting(MANIFEST_SPACE).await;
-                let manifest_chunk = fixture.space_accounting(MANIFEST_CHUNK_SPACE).await;
-                let payload = fixture.space_accounting(PAYLOAD_SPACE).await;
-                let presence = fixture.space_accounting(PRESENCE_SPACE).await;
+                let skip_space_accounting =
+                    std::env::var_os("LIX_LARGE_BLOB_SKIP_SPACE_ACCOUNTING").is_some();
+                let manifest = if skip_space_accounting {
+                    SpaceAccounting::default()
+                } else {
+                    fixture.space_accounting(MANIFEST_SPACE).await
+                };
+                let manifest_chunk = if skip_space_accounting {
+                    SpaceAccounting::default()
+                } else {
+                    fixture.space_accounting(MANIFEST_CHUNK_SPACE).await
+                };
+                let payload = if skip_space_accounting {
+                    SpaceAccounting::default()
+                } else {
+                    fixture.space_accounting(PAYLOAD_SPACE).await
+                };
+                let presence = if skip_space_accounting {
+                    SpaceAccounting::default()
+                } else {
+                    fixture.space_accounting(PRESENCE_SPACE).await
+                };
                 timings.sort_unstable();
 
                 println!(
@@ -182,6 +205,30 @@ async fn print_accounting() {
     }
 }
 
+fn accounting_sizes() -> Vec<usize> {
+    let Ok(selection) = std::env::var("LIX_LARGE_BLOB_SIZES_MIB") else {
+        return SIZES.to_vec();
+    };
+    let sizes = selection
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .ok()
+                .and_then(|mib| mib.checked_mul(1 << 20))
+                .filter(|bytes| *bytes > 0)
+                .unwrap_or_else(|| panic!("invalid LIX_LARGE_BLOB_SIZES_MIB value '{value}'"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !sizes.is_empty(),
+        "LIX_LARGE_BLOB_SIZES_MIB must select at least one positive size"
+    );
+    sizes
+}
+
 fn selected(variable: &str, candidate: &str) -> bool {
     std::env::var(variable).map_or(true, |selection| {
         selection
@@ -199,6 +246,7 @@ fn percentile(sorted: &[Duration], numerator: usize, denominator: usize) -> Dura
 struct PreparedWrite {
     path: String,
     data: Vec<u8>,
+    version: u64,
 }
 
 struct WorkloadState {
@@ -213,17 +261,27 @@ impl WorkloadState {
         Self {
             size,
             operation,
-            base: deterministic_bytes(size, 0),
+            base: if matches!(
+                operation,
+                Operation::LocalizedUpdate | Operation::FullRewrite
+            ) {
+                deterministic_bytes(size, 0)
+            } else {
+                Vec::new()
+            },
             version: 1,
         }
     }
 
     fn seed(&self) -> Option<PreparedWrite> {
         match self.operation {
-            Operation::InitialWrite => None,
+            Operation::InitialWrite
+            | Operation::ResumableInitialWrite
+            | Operation::RawBackendInitialWrite => None,
             Operation::LocalizedUpdate | Operation::FullRewrite => Some(PreparedWrite {
                 path: "/large.bin".to_owned(),
                 data: self.base.clone(),
+                version: 0,
             }),
         }
     }
@@ -243,15 +301,28 @@ impl WorkloadState {
                 PreparedWrite {
                     path: "/large.bin".to_owned(),
                     data,
+                    version,
                 }
             }
             Operation::FullRewrite => PreparedWrite {
                 path: "/large.bin".to_owned(),
                 data: deterministic_bytes(self.size, version),
+                version,
             },
             Operation::InitialWrite => PreparedWrite {
                 path: format!("/large-{version}.bin"),
                 data: deterministic_bytes(self.size, version),
+                version,
+            },
+            Operation::ResumableInitialWrite => PreparedWrite {
+                path: format!("/large-resumable-{version}.bin"),
+                data: Vec::new(),
+                version,
+            },
+            Operation::RawBackendInitialWrite => PreparedWrite {
+                path: String::new(),
+                data: Vec::new(),
+                version,
             },
         }
     }
@@ -300,6 +371,61 @@ where
     }
 
     async fn write(&self, prepared: PreparedWrite) -> u64 {
+        if matches!(self.workload.operation, Operation::RawBackendInitialWrite) {
+            let adapter = StorageAdapter::new(self.storage.clone());
+            let payload_space = StorageSpace::new(SpaceId(0x0005_0003), "bench.raw_payload");
+            let mut offset = 0usize;
+            while offset < self.workload.size {
+                let len = (self.workload.size - offset).min(lix_engine::FILE_UPLOAD_PART_BYTES);
+                let data = Bytes::from(deterministic_bytes(len, prepared.version ^ offset as u64));
+                let mut writes = adapter.new_write_set();
+                for (part_index, chunk) in data.chunks(1024 * 1024).enumerate() {
+                    let chunk_start = part_index * 1024 * 1024;
+                    writes.put(
+                        payload_space,
+                        Key(Bytes::copy_from_slice(
+                            blake3::hash(&(offset + chunk_start).to_be_bytes()).as_bytes(),
+                        )),
+                        StoredValue {
+                            bytes: data.slice(chunk_start..chunk_start + chunk.len()),
+                        },
+                    );
+                }
+                let prepared_write = adapter
+                    .prepare_write_set(writes, WriteOptions::default())
+                    .await
+                    .expect("prepare raw backend write");
+                prepared_write
+                    .commit()
+                    .await
+                    .expect("commit raw backend payload");
+                offset += len;
+            }
+            return 1;
+        }
+        if matches!(self.workload.operation, Operation::ResumableInitialWrite) {
+            let total_size = self.workload.size as u64;
+            let upload_id = format!("large-blob-bench-{}", prepared.version);
+            let mut offset = 0usize;
+            while offset < self.workload.size {
+                let len = (self.workload.size - offset).min(lix_engine::FILE_UPLOAD_PART_BYTES);
+                let data = deterministic_bytes(len, prepared.version ^ offset as u64);
+                let progress = self
+                    .session
+                    .upsert_file_data_part(
+                        upload_id.clone(),
+                        prepared.path.clone(),
+                        offset as u64,
+                        total_size,
+                        data.into(),
+                    )
+                    .await
+                    .expect("write resumable benchmark blob part");
+                offset += len;
+                assert_eq!(progress.next_offset, offset as u64);
+            }
+            return 1;
+        }
         let result = self
             .session
             .execute(

@@ -75,6 +75,11 @@ name = "tracked_state_crud_public_result"
 path = "tests/tracked_state_crud_public_result.rs"
 required-features = ["storage-benches"]
 
+[[test]]
+name = "movie_workspace_qualification"
+path = "tests/movie_workspace_qualification.rs"
+required-features = ["storage-benches", "slatedb"]
+
 [[bench]]
 name = "storage_v2"
 path = "benches/storage_v2.rs"

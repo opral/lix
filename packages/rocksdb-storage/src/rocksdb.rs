@@ -25,7 +25,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const DEFAULT_BLOB_MIN_SIZE: u64 = 32 * 1024;
 const DEFAULT_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
-const DEFAULT_BLOB_GC_AGE_CUTOFF: f64 = 0.25;
+const BLOB_GC_FORCE_THRESHOLD: f64 = 0.5;
 
 #[derive(Debug)]
 pub struct RocksDBFactory {
@@ -651,8 +651,13 @@ fn open_rocksdb(path: &Path) -> Result<DB, StorageError> {
     options.set_min_blob_size(DEFAULT_BLOB_MIN_SIZE);
     options.set_blob_file_size(DEFAULT_BLOB_FILE_SIZE);
     options.set_blob_compression_type(rocksdb::DBCompressionType::Zstd);
+    // Lix payloads are immutable CAS objects and repository GC owns their
+    // reachability lifecycle. Do not relocate merely old live blobs during
+    // ordinary compaction (over 10x physical writes in the 20 GiB run), but
+    // retain physical reclamation once a blob file is at least half garbage.
     options.set_enable_blob_gc(true);
-    options.set_blob_gc_age_cutoff(DEFAULT_BLOB_GC_AGE_CUTOFF);
+    options.set_blob_gc_age_cutoff(0.0);
+    options.set_blob_gc_force_threshold(BLOB_GC_FORCE_THRESHOLD);
     DB::open(&options, path).map_err(|error| rocksdb_open_error(error, path))
 }
 
