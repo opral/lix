@@ -28,7 +28,6 @@ pub(crate) fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     fastcdc_chunk_ranges_with_chunking(data, BinaryCasChunking::default())
 }
 
-#[expect(clippy::cast_possible_truncation)]
 pub(crate) fn fastcdc_chunk_ranges_with_chunking(
     data: &[u8],
     chunking: BinaryCasChunking,
