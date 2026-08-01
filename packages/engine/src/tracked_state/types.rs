@@ -29,7 +29,7 @@ pub(crate) struct TrackedStateKey {
 }
 
 /// Zero-copy view of primary tracked-state key.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TrackedStateKeyRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,

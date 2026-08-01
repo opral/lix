@@ -6,6 +6,7 @@ mod normalization;
 pub(crate) mod plugin_checkpoint;
 mod schema_resolver;
 mod staging;
+mod stale_commit;
 pub(crate) mod types;
 mod validation;
 

@@ -61,7 +61,7 @@ use crate::live_state::{
     overlay_load_exact_batch, overlay_scan_batch,
 };
 use crate::plugin::{
-    ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256,
+    ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
     LiveBatchEntitySource, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorCache,
     PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
     PluginActorStagedCheckpoint, PluginActorStore, PluginActorStorePermit,
@@ -113,6 +113,9 @@ use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{
     PreparedStateRowOverlay, PreparedWriteSet, TransactionWriteBuffer,
     TransactionWriteBufferCheckpoint,
+};
+use crate::transaction::stale_commit::{
+    StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
 use crate::transaction::types::{
     PreparedRowFacts, PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
@@ -757,40 +760,22 @@ where
                 &TrackedStateDiffRequest::default(),
             )
             .await?;
-        let overlapping_row_indices = prepared_writes
-            .state_rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, row)| {
-                concurrent
-                    .entries
-                    .iter()
-                    .any(|entry| {
-                        row.schema_key.as_str() == entry.identity.schema_key()
-                            && row.file_id.map(SharedStr::as_str) == entry.identity.file_id()
-                            && row.entity_pk == entry.identity.entity_pk()
-                    })
-                    .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        if !overlapping_row_indices.is_empty() {
-            // Ordinary INSERT races keep their established constraint surface:
-            // commit-time validation reports the exact UNIQUE/statement-index
-            // error from the current snapshot. Updates and file-scoped semantic
-            // rows cannot safely use that absence-check lane.
-            let ordinary_insert_race = overlapping_row_indices.iter().all(|&index| {
-                prepared_writes.insert_selection.contains(index)
-                    && prepared_writes.state_rows.row(index).file_id.is_none()
-            });
-            if !ordinary_insert_race {
-                self.resolve_stale_plugin_overlaps(
+        match classify_stale_commit(prepared_writes, &concurrent) {
+            StaleCommitPlan::Direct | StaleCommitPlan::RevalidateOrdinaryInsert => {}
+            StaleCommitPlan::ReconcilePlugin(plan) => {
+                self.reconcile_stale_plugin_writes(
                     read,
                     prepared_writes,
-                    &concurrent,
+                    plan,
                     opening_head,
                     current_head,
                 )
                 .await?;
+            }
+            StaleCommitPlan::Unsafe => {
+                return Err(conflict(
+                    "concurrent transaction changed an overlapping entity outside a stable plugin-owned file",
+                ));
             }
         }
 
@@ -799,11 +784,11 @@ where
         Ok(())
     }
 
-    async fn resolve_stale_plugin_overlaps<S>(
+    async fn reconcile_stale_plugin_writes<S>(
         &mut self,
         read: &S,
         prepared_writes: &mut PreparedWriteSet,
-        concurrent: &crate::tracked_state::TrackedStateDiff,
+        plan: StalePluginReconciliationPlan,
         opening_head: CommitId,
         current_head: CommitId,
     ) -> Result<(), LixError>
@@ -817,65 +802,10 @@ where
             )
             .with_hint("Retry the transaction against the latest committed state.")
         };
-        let concurrent_keys = concurrent
-            .entries
-            .iter()
-            .map(|entry| TrackedStateKey {
-                schema_key: entry.identity.schema_key().to_owned(),
-                file_id: entry.identity.file_id().map(str::to_owned),
-                entity_pk: entry.identity.entity_pk().clone(),
-            })
-            .collect::<BTreeSet<_>>();
-        let overlapping_indices = prepared_writes
-            .state_rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, row)| {
-                let key = TrackedStateKey {
-                    schema_key: row.schema_key.to_string(),
-                    file_id: row.file_id.map(|file_id| file_id.to_string()),
-                    entity_pk: row.entity_pk.clone(),
-                };
-                concurrent_keys.contains(&key).then_some(index)
-            })
-            .collect::<Vec<_>>();
-        let candidate_indices = overlapping_indices
-            .iter()
-            .copied()
-            .filter(|&index| {
-                let row = prepared_writes.state_rows.row(index);
-                row.file_id.is_some()
-                    && !matches!(
-                        row.schema_key.as_str(),
-                        BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
-                    )
-            })
-            .collect::<Vec<_>>();
-        let file_ids = overlapping_indices
-            .iter()
-            .filter_map(|&index| {
-                prepared_writes
-                    .state_rows
-                    .row(index)
-                    .file_id
-                    .map(ToString::to_string)
-            })
-            .collect::<BTreeSet<_>>();
-        if file_ids.is_empty()
-            || overlapping_indices.iter().any(|&index| {
-                let row = prepared_writes.state_rows.row(index);
-                let Some(file_id) = row.file_id.map(SharedStr::as_str) else {
-                    return true;
-                };
-                !file_ids.contains(file_id)
-                    || (!matches!(
-                        row.schema_key.as_str(),
-                        BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
-                    ) && !candidate_indices.contains(&index))
-            })
-        {
-            return Err(conflict_error());
-        }
+        let StalePluginReconciliationPlan {
+            semantic_conflict_indices: candidate_indices,
+            file_ids,
+        } = plan;
 
         let owner_keys = file_ids
             .iter()
@@ -1038,9 +968,10 @@ where
                     "staged tracked plugin row is missing change_id",
                 )
             })?;
-            let source_order = (source.updated_at, source_change_id);
-            let target_order = target.map(|row| (row.updated_at(), row.change_id()));
-            let (a, b) = if target_order.is_some_and(|order| order < source_order) {
+            let source_rank = ConflictRank::new(source.updated_at, source_change_id);
+            let target_rank =
+                target.map(|row| ConflictRank::new(row.updated_at(), row.change_id()));
+            let (a, b) = if target_rank.is_some_and(|rank| rank < source_rank) {
                 (target_payload, source_payload)
             } else {
                 (source_payload, target_payload)
