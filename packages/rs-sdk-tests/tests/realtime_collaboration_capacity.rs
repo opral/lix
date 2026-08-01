@@ -305,15 +305,30 @@ impl CollaborationCapacityBackend for LocalCapacityBackend {
         // A Lix session deliberately rejects reads while its explicit
         // transaction is active. Delivery begins as soon as the wave reaches
         // terminal commit states; the clock still starts at scheduled arrival.
-        let observations = std::mem::take(&mut self.observations);
+        let mut observations = std::mem::take(&mut self.observations);
         let clients = self.peers.len();
         let marker = marker.to_vec();
         let local = tokio::task::LocalSet::new();
         let (next_observations, convergences) = local
             .run_until(async move {
+                let mut receipt_events = observations
+                    .pop()
+                    .expect("capacity workload has an observation");
+                let (receipt_generation, receipt_elapsed) = loop {
+                    let event = tokio::time::timeout(OBSERVE_TIMEOUT, receipt_events.next())
+                        .await
+                        .expect("receipt observation timed out")
+                        .expect("receipt observation should evaluate")
+                        .expect("receipt observation should stay open");
+                    let data = event.rows.rows()[0]
+                        .get::<Vec<u8>>("data")
+                        .expect("receipt file data should be bytes");
+                    if data.windows(marker.len()).any(|window| window == marker) {
+                        break (event.mutation_sequence, wave_started.elapsed());
+                    }
+                };
                 let mut observer_tasks = tokio::task::JoinSet::new();
                 for mut events in observations {
-                    let marker = marker.clone();
                     observer_tasks.spawn_local(async move {
                         loop {
                             let event = tokio::time::timeout(OBSERVE_TIMEOUT, events.next())
@@ -321,10 +336,7 @@ impl CollaborationCapacityBackend for LocalCapacityBackend {
                                 .expect("observation timed out")
                                 .expect("observation should evaluate")
                                 .expect("observation should stay open");
-                            let data = event.rows.rows()[0]
-                                .get::<Vec<u8>>("data")
-                                .expect("observed file data should be bytes");
-                            if data.windows(marker.len()).any(|window| window == marker) {
+                            if event.mutation_sequence >= receipt_generation {
                                 return (events, wave_started.elapsed());
                             }
                         }
@@ -332,6 +344,8 @@ impl CollaborationCapacityBackend for LocalCapacityBackend {
                 }
                 let mut next_observations = Vec::with_capacity(clients);
                 let mut convergences = Vec::with_capacity(clients);
+                next_observations.push(receipt_events);
+                convergences.push(receipt_elapsed);
                 while let Some(joined) = observer_tasks.join_next().await {
                     let (events, elapsed) = joined.expect("observer task should not panic");
                     next_observations.push(events);

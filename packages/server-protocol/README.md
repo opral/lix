@@ -108,6 +108,23 @@ Contiguous later snapshots may instead carry a sequence-based blob or row
 splice against the immediately preceding transport snapshot. A client that
 does not have that exact base must reconnect and begin again with a full
 snapshot; it must never apply a splice to an arbitrary cached result.
+Subscriptions with byte-identical SQL and wire parameters share one engine
+observation, one transport base, and one encoded delta payload inside the
+multiplex request. Subscription identifiers remain independent, but adding an
+identical subscriber no longer repeats query evaluation, blob comparison, or
+Base64 conversion. Distinct SQL or parameter payloads remain separate groups.
+
+The ignored release diagnostic compares the former repeated conversion with
+the shared fanout path:
+
+```sh
+cargo test --release -p lix_server_protocol \
+  multiplex_blob_delta_fanout_perf -- --ignored --nocapture
+```
+
+For a localized edit in a 10 MiB blob, 16-subscriber p50 conversion fell from
+6,979 microseconds to 428 microseconds (16.28x). Four-subscriber p50 fell from
+1,658 microseconds to 402 microseconds (4.12x). One subscriber remains neutral.
 
 ## Binary file upsert
 

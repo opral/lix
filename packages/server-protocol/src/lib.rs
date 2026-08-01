@@ -2441,21 +2441,17 @@ where
             "subscriptions must contain at most {MAX_MULTIPLEX_SUBSCRIPTIONS} entries"
         )));
     }
+    let groups = group_multiplex_subscriptions(request.subscriptions)?;
     let (sender, mut receiver) = mpsc::channel::<MultiplexObserveMessage>(64);
     let (terminal_sender, terminal_signal) = TerminalStorageStreamSignal::new();
-    // Own every task before validating the next subscription. Dropping a bare
-    // JoinHandle detaches it, which could otherwise leave an abandoned
-    // observation (and its terminal-storage sender) alive if validation fails
-    // or the response body is never polled.
-    let mut task_guard = Some(ObserveTaskGuard(Vec::with_capacity(
-        request.subscriptions.len(),
-    )));
-    for subscription in request.subscriptions {
-        let subscription_id = required_non_empty(subscription.id, "subscriptions[].id")?;
-        let sql = required_non_empty(subscription.sql, "subscriptions[].sql")?;
-        let params = decode_params(subscription.params)?;
+    // Own each group task while opening the remaining observations. Dropping a
+    // bare JoinHandle detaches it, which could otherwise leave an abandoned
+    // observation (and its terminal-storage sender) alive if a later open
+    // fails or the response body is never polled.
+    let mut task_guard = Some(ObserveTaskGuard(Vec::with_capacity(groups.len())));
+    for group in groups {
         let events = lease
-            .observe(&sql, &params, terminal_sender.clone())
+            .observe(&group.sql, &group.params, terminal_sender.clone())
             .await?;
         let sender = sender.clone();
         let terminal_sender = terminal_sender.clone();
@@ -2467,41 +2463,59 @@ where
             .push(tokio::spawn(
                 async move {
                     let mut delta_base = None;
-                    loop {
-                        let message = match events.next().await {
+                    'events: loop {
+                        let messages = match events.next().await {
                             Ok(Some(event)) => {
                                 match multiplex_observe_payload(event, delta_base.as_ref()) {
                                     Ok((payload, next_delta_base)) => {
-                                        let message = MultiplexObserveMessage::Next {
-                                            subscription_id: subscription_id.clone(),
-                                            payload,
-                                        };
-                                        if sender.send(message).await.is_err() {
-                                            break;
-                                        }
                                         delta_base = next_delta_base;
-                                        continue;
+                                        let payload = Arc::new(payload);
+                                        group
+                                            .subscription_ids
+                                            .iter()
+                                            .map(|subscription_id| MultiplexObserveMessage::Next {
+                                                subscription_id: subscription_id.clone(),
+                                                payload: Arc::clone(&payload),
+                                            })
+                                            .collect::<Vec<_>>()
                                     }
                                     Err(error) => {
                                         terminal_sender.signal_if_terminal(&error);
-                                        MultiplexObserveMessage::Error {
-                                            subscription_id: subscription_id.clone(),
-                                            error: ErrorEnvelope::from_lix_error(&error),
-                                        }
+                                        let error = ErrorEnvelope::from_lix_error(&error);
+                                        group
+                                            .subscription_ids
+                                            .iter()
+                                            .map(|subscription_id| MultiplexObserveMessage::Error {
+                                                subscription_id: subscription_id.clone(),
+                                                error: error.clone(),
+                                            })
+                                            .collect()
                                     }
                                 }
                             }
                             Ok(None) => break,
                             Err(error) => {
                                 terminal_sender.signal_if_terminal(&error);
-                                MultiplexObserveMessage::Error {
-                                    subscription_id: subscription_id.clone(),
-                                    error: ErrorEnvelope::from_lix_error(&error),
-                                }
+                                let error = ErrorEnvelope::from_lix_error(&error);
+                                group
+                                    .subscription_ids
+                                    .iter()
+                                    .map(|subscription_id| MultiplexObserveMessage::Error {
+                                        subscription_id: subscription_id.clone(),
+                                        error: error.clone(),
+                                    })
+                                    .collect()
                             }
                         };
-                        let terminal = matches!(message, MultiplexObserveMessage::Error { .. });
-                        if sender.send(message).await.is_err() || terminal {
+                        let terminal = messages.first().is_some_and(|message| {
+                            matches!(message, MultiplexObserveMessage::Error { .. })
+                        });
+                        for message in messages {
+                            if sender.send(message).await.is_err() {
+                                break 'events;
+                            }
+                        }
+                        if terminal {
                             break;
                         }
                     }
@@ -2519,11 +2533,8 @@ where
             match message {
                 MultiplexObserveMessage::Next { subscription_id, payload } => {
                     yield Ok::<Event, Infallible>(sse_json_event("next", &MultiplexObserveEventResponse {
-                        subscription_id,
-                        sequence: payload.sequence,
-                        mutation_sequence: payload.mutation_sequence,
-                        result: payload.result,
-                        delta: payload.delta,
+                        subscription_id: &subscription_id,
+                        payload: payload.as_ref(),
                     }));
                 }
                 MultiplexObserveMessage::Error { subscription_id, error } => {
@@ -3070,12 +3081,12 @@ pub fn terminal_storage_stream_signal(response: &Response) -> Option<TerminalSto
         .cloned()
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct ErrorEnvelope {
     error: ErrorBody,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct ErrorBody {
     code: String,
     message: String,
@@ -3466,6 +3477,51 @@ struct MultiplexObserveSubscription {
     params: Vec<WireValue>,
 }
 
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct MultiplexObserveGroupKey {
+    sql: String,
+    params_json: String,
+}
+
+struct MultiplexObserveGroup {
+    subscription_ids: Vec<String>,
+    sql: String,
+    params: Vec<Value>,
+}
+
+fn group_multiplex_subscriptions(
+    subscriptions: Vec<MultiplexObserveSubscription>,
+) -> Result<Vec<MultiplexObserveGroup>, ApiError> {
+    let mut group_indexes = HashMap::<MultiplexObserveGroupKey, usize>::new();
+    let mut groups = Vec::<MultiplexObserveGroup>::new();
+    for subscription in subscriptions {
+        let subscription_id = required_non_empty(subscription.id, "subscriptions[].id")?;
+        let sql = required_non_empty(subscription.sql, "subscriptions[].sql")?;
+        let params_json = serde_json::to_string(&subscription.params).map_err(|error| {
+            ApiError::from(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("encode multiplex observation parameters: {error}"),
+            ))
+        })?;
+        let key = MultiplexObserveGroupKey {
+            sql: sql.clone(),
+            params_json,
+        };
+        if let Some(index) = group_indexes.get(&key).copied() {
+            groups[index].subscription_ids.push(subscription_id);
+            continue;
+        }
+        let index = groups.len();
+        groups.push(MultiplexObserveGroup {
+            subscription_ids: vec![subscription_id],
+            sql,
+            params: decode_params(subscription.params)?,
+        });
+        group_indexes.insert(key, index);
+    }
+    Ok(groups)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ObserveEventResponse {
@@ -3489,7 +3545,7 @@ impl TryFrom<ObserveEvent> for ObserveEventResponse {
 enum MultiplexObserveMessage {
     Next {
         subscription_id: String,
-        payload: MultiplexObservePayload,
+        payload: Arc<MultiplexObservePayload>,
     },
     Error {
         subscription_id: String,
@@ -3544,14 +3600,10 @@ struct RowSplice {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MultiplexObserveEventResponse {
-    subscription_id: String,
-    sequence: u64,
-    mutation_sequence: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<ExecuteResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    delta: Option<ObserveDelta>,
+struct MultiplexObserveEventResponse<'a> {
+    subscription_id: &'a str,
+    #[serde(flatten)]
+    payload: &'a MultiplexObservePayload,
 }
 
 const MIN_BLOB_DELTA_BYTES: usize = 32 * 1024;
@@ -7375,28 +7427,44 @@ mod tests {
             marker: &[u8],
             wave_started: Instant,
         ) -> Vec<Duration> {
-            let observations = std::mem::take(&mut self.observations);
-            let clients = self.sessions.len();
+            let mut observations = std::mem::take(&mut self.observations);
             let marker = marker.to_vec();
+            let mut receipt_stream = observations
+                .pop()
+                .expect("capacity workload has an observation");
+            let (receipt_generation, receipt_elapsed) = loop {
+                let event = receipt_stream.next().await;
+                let encoded = event["result"]["rows"][0][0]["base64"]
+                    .as_str()
+                    .expect("receipt file should be a blob");
+                let bytes = BASE64_STANDARD
+                    .decode(encoded)
+                    .expect("receipt blob should decode");
+                if bytes.windows(marker.len()).any(|window| window == marker) {
+                    break (
+                        event["mutationSequence"]
+                            .as_u64()
+                            .expect("receipt carries a mutation generation"),
+                        wave_started.elapsed(),
+                    );
+                }
+            };
             let mut deliveries = tokio::task::JoinSet::new();
             for mut stream in observations {
-                let marker = marker.clone();
                 deliveries.spawn(async move {
                     loop {
                         let event = stream.next().await;
-                        let encoded = event["result"]["rows"][0][0]["base64"]
-                            .as_str()
-                            .expect("observed file should be a blob");
-                        let bytes = BASE64_STANDARD
-                            .decode(encoded)
-                            .expect("observed blob should decode");
-                        if bytes.windows(marker.len()).any(|window| window == marker) {
+                        let generation = event["mutationSequence"]
+                            .as_u64()
+                            .expect("observation carries a mutation generation");
+                        if generation >= receipt_generation {
                             return (stream, wave_started.elapsed());
                         }
                     }
                 });
             }
-            let mut convergences = Vec::with_capacity(clients);
+            let mut convergences = vec![receipt_elapsed];
+            self.observations.push(receipt_stream);
             while let Some(joined) = deliveries.join_next().await {
                 let (stream, elapsed) = joined.expect("delivery task should not panic");
                 self.observations.push(stream);
@@ -8357,6 +8425,81 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn multiplex_observe_fans_one_identical_snapshot_to_each_subscription() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/observe/multiplex",
+            Some(&session_id),
+            Some(json!({
+                "subscriptions": [
+                    {
+                        "id": "first",
+                        "sql": "SELECT $1 AS value",
+                        "params": [{ "kind": "text", "value": "shared" }]
+                    },
+                    {
+                        "id": "second",
+                        "sql": "SELECT $1 AS value",
+                        "params": [{ "kind": "text", "value": "shared" }]
+                    }
+                ]
+            })),
+        )
+        .await;
+        let mut events = TestSseStream::new(response);
+        let first = events.next().await;
+        let second = events.next().await;
+
+        assert_eq!(
+            [
+                first["subscriptionId"].as_str(),
+                second["subscriptionId"].as_str()
+            ],
+            [Some("first"), Some("second")]
+        );
+        for event in [first, second] {
+            assert_eq!(event["sequence"], 0);
+            assert_eq!(event["result"]["rows"][0][0]["value"], "shared");
+        }
+    }
+
+    #[test]
+    fn multiplex_observe_groups_identical_queries_for_shared_fanout() {
+        let subscriptions = vec![
+            MultiplexObserveSubscription {
+                id: Some("first".to_owned()),
+                sql: Some("SELECT $1".to_owned()),
+                params: vec![WireValue::Text {
+                    value: "same".to_owned(),
+                }],
+            },
+            MultiplexObserveSubscription {
+                id: Some("second".to_owned()),
+                sql: Some("SELECT $1".to_owned()),
+                params: vec![WireValue::Text {
+                    value: "same".to_owned(),
+                }],
+            },
+            MultiplexObserveSubscription {
+                id: Some("different".to_owned()),
+                sql: Some("SELECT $1".to_owned()),
+                params: vec![WireValue::Text {
+                    value: "other".to_owned(),
+                }],
+            },
+        ];
+
+        let groups = group_multiplex_subscriptions(subscriptions).expect("valid subscriptions");
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].subscription_ids, ["first", "second"]);
+        assert_eq!(groups[1].subscription_ids, ["different"]);
+    }
+
     fn point_blob_event(sequence: u64, bytes: Vec<u8>) -> ObserveEvent {
         ObserveEvent {
             sequence,
@@ -8718,7 +8861,8 @@ mod tests {
                             .expect("blob base")
                     })
                     .collect::<Vec<_>>();
-                let mut samples = Vec::with_capacity(SAMPLES);
+                let mut repeated_samples = Vec::with_capacity(SAMPLES);
+                let mut shared_samples = Vec::with_capacity(SAMPLES);
                 for _ in 0..SAMPLES {
                     let started = Instant::now();
                     for base in &bases {
@@ -8727,21 +8871,36 @@ mod tests {
                                 .expect("delta payload"),
                         );
                     }
-                    samples.push(started.elapsed());
+                    repeated_samples.push(started.elapsed());
+
+                    let started = Instant::now();
+                    let (payload, _) = multiplex_observe_payload(event.clone(), bases.first())
+                        .expect("shared delta payload");
+                    let payload = Arc::new(payload);
+                    for _ in 0..fanout {
+                        black_box(Arc::clone(&payload));
+                    }
+                    shared_samples.push(started.elapsed());
                 }
-                samples.sort_unstable();
-                let p50 = samples[SAMPLES / 2];
-                let p95 = samples[SAMPLES * 95 / 100];
+                repeated_samples.sort_unstable();
+                shared_samples.sort_unstable();
+                let repeated_p50 = repeated_samples[SAMPLES / 2];
+                let repeated_p95 = repeated_samples[SAMPLES * 95 / 100];
+                let shared_p50 = shared_samples[SAMPLES / 2];
+                let shared_p95 = shared_samples[SAMPLES * 95 / 100];
                 let total_bytes = u32::try_from(size_mib * 1024 * 1024 * fanout)
                     .expect("diagnostic byte count should fit u32");
                 let throughput = |elapsed: Duration| {
                     f64::from(total_bytes) / elapsed.as_secs_f64() / (1024.0 * 1024.0)
                 };
                 eprintln!(
-                    "observe_fanout size_mib={size_mib} subscribers={fanout} p50_us={} p95_us={} logical_mib_s_p50={:.1}",
-                    p50.as_micros(),
-                    p95.as_micros(),
-                    throughput(p50),
+                    "observe_fanout size_mib={size_mib} subscribers={fanout} repeated_p50_us={} repeated_p95_us={} shared_p50_us={} shared_p95_us={} speedup_p50={:.2} logical_mib_s_p50={:.1}",
+                    repeated_p50.as_micros(),
+                    repeated_p95.as_micros(),
+                    shared_p50.as_micros(),
+                    shared_p95.as_micros(),
+                    repeated_p50.as_secs_f64() / shared_p50.as_secs_f64(),
+                    throughput(shared_p50),
                 );
             }
         }
