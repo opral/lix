@@ -150,6 +150,10 @@ impl DecodedLeafNodeRef {
         self.entries.len()
     }
 
+    pub(crate) fn resident_bytes(&self) -> usize {
+        size_of::<Self>() + self.arena.len() + self.entries.capacity() * size_of::<LeafEntrySpan>()
+    }
+
     pub(crate) fn first_key(&self) -> Option<&[u8]> {
         self.entries
             .first()
