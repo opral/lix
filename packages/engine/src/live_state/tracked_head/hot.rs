@@ -60,6 +60,15 @@ pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace:
     StorageSpaceId(0x0004_0025),
     "live_state.packed_current_base_control.v1",
 );
+/// Generation-local index of packed bases containing exactly one schema.
+///
+/// Complete collection replacements retire every indexed predecessor for the
+/// schema without inspecting or risking packed bases shared by unrelated
+/// schemas.
+pub(crate) const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0027),
+    "live_state.packed_current_exclusive_schema_base.v1",
+);
 const HOT_DENSE_SCAN_MIN_IDENTITIES: usize = 64;
 const HOT_DENSE_SCAN_MAX_OVERREAD: usize = 2;
 const HOT_DIFF_SEGMENT_VERSION: u8 = 1;
@@ -2276,6 +2285,99 @@ struct PackedCurrentBaseRef {
     coverage_key: Bytes,
 }
 
+struct PackedExclusiveSchemaBaseRef {
+    commit_id: CommitId,
+    index_key: Bytes,
+}
+
+fn packed_exclusive_schema_base_prefix(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+) -> Vec<u8> {
+    let mut prefix = hot_scope_prefix(branch_id, generation);
+    write_key_string(&mut prefix, schema_key, KEY_PART_MORE);
+    prefix
+}
+
+fn packed_exclusive_schema_base_key(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    commit_id: CommitId,
+) -> Vec<u8> {
+    let mut key = packed_exclusive_schema_base_prefix(branch_id, generation, schema_key);
+    key.reserve(16);
+    key.extend_from_slice(commit_id.as_uuid().as_bytes());
+    key
+}
+
+async fn packed_exclusive_schema_base_refs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+) -> Result<Vec<PackedExclusiveSchemaBaseRef>, LixError> {
+    let prefix = packed_exclusive_schema_base_prefix(branch_id, generation, schema_key);
+    let plan = ScanPlan::prefix(
+        PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+        StoragePrefix {
+            bytes: Bytes::copy_from_slice(&prefix),
+        },
+    );
+    let mut refs = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let bytes = entry.key.0.as_ref();
+            if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
+                return Err(head_value_error(
+                    "packed exclusive-schema base index has an invalid key",
+                ));
+            }
+            refs.push(PackedExclusiveSchemaBaseRef {
+                commit_id: CommitId::new(
+                    uuid::Uuid::from_slice(&bytes[prefix.len()..])
+                        .map_err(|error| head_value_error(error.to_string()))?,
+                ),
+                index_key: entry.key.0,
+            });
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(refs)
+}
+
+fn stage_packed_exclusive_schema_base_ref(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    commit_id: CommitId,
+) {
+    writes.put(
+        PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+        StorageKey(Bytes::from(packed_exclusive_schema_base_key(
+            branch_id, generation, schema_key, commit_id,
+        ))),
+        StorageValue {
+            bytes: Bytes::from_static(&[1]),
+        },
+    );
+}
+
 async fn packed_current_base_refs(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -2369,6 +2471,31 @@ async fn stage_retire_packed_current_bases(
     }
     for base_ref in packed_current_base_refs(store, branch_id, generation).await? {
         writes.delete(PACKED_CURRENT_BASE_SPACE, StorageKey(base_ref.coverage_key));
+    }
+    let index_plan = ScanPlan::prefix(
+        PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+        StoragePrefix {
+            bytes: Bytes::copy_from_slice(&control_key.0),
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let page = index_plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            writes.delete(PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, entry.key);
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
     }
     writes.delete(PACKED_CURRENT_BASE_CONTROL_SPACE, control_key);
     Ok(())
@@ -3896,10 +4023,9 @@ where
     /// Publishes a commit whose ordered deltas replace every live member of
     /// one tracked, unfiled collection as a new packed base segment.
     ///
-    /// The prior segments remain available for other schemas. Within this
-    /// schema every previous identity is covered by the newer commit, so the
-    /// normal newest-commit overlay makes the replacement complete without
-    /// reading and rewriting the previous HOT value plane.
+    /// Packed bases shared by other schemas remain available. Bases indexed
+    /// as exclusive to this schema are superseded completely and retired, so
+    /// repeated replacements retain the single-base read shape.
     pub(crate) async fn stage_complete_collection_replacement_current_base(
         &mut self,
         branch_id: &str,
@@ -3909,7 +4035,7 @@ where
         row_count: usize,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<CommitId, LixError> {
+    ) -> Result<(CommitId, bool), LixError> {
         let row_count = u64::try_from(row_count)
             .map_err(|_| head_value_error("packed replacement row count exceeds u64"))?;
         if row_count == 0 {
@@ -3934,23 +4060,90 @@ where
             )));
         }
 
+        let replaced =
+            packed_exclusive_schema_base_refs(self.store, branch_id, generation, schema_key)
+                .await?;
+        if replaced
+            .iter()
+            .any(|base_ref| base_ref.commit_id == new_head)
+        {
+            return Err(head_value_error(
+                "packed collection replacement must publish a new commit",
+            ));
+        }
         let mut manifest_key = hot_scope_prefix(branch_id, generation);
         manifest_key.reserve(16);
         manifest_key.extend_from_slice(new_head.as_uuid().as_bytes());
-        if working_diff_capture_checkpoint_commit_id.is_some() {
-            coverage
-                .add_encoded_group_key(&manifest_key)
-                .ok_or_else(|| head_value_error("packed current-base diff count exceeds u64"))?;
+        let expected_checkpoint = working_diff_capture_checkpoint_commit_id
+            .map_or([0; 16], |checkpoint| *checkpoint.as_uuid().as_bytes());
+        if replaced.is_empty() {
+            if working_diff_capture_checkpoint_commit_id.is_some() {
+                coverage
+                    .add_encoded_group_key(&manifest_key)
+                    .ok_or_else(|| {
+                        head_value_error("packed current-base diff count exceeds u64")
+                    })?;
+            }
+        } else {
+            let base_keys = replaced
+                .iter()
+                .map(|base_ref| {
+                    let mut key = hot_scope_prefix(branch_id, generation);
+                    key.reserve(16);
+                    key.extend_from_slice(base_ref.commit_id.as_uuid().as_bytes());
+                    StorageKey(Bytes::from(key))
+                })
+                .collect::<Vec<_>>();
+            let base_values = PointReadPlan::new(PACKED_CURRENT_BASE_SPACE, &base_keys)
+                .materialize(self.store, StorageGetOptions::default())
+                .await?
+                .value;
+            for ((base_ref, base_key), value) in replaced.iter().zip(&base_keys).zip(base_values) {
+                let value = value.ok_or_else(|| {
+                    head_value_error(
+                        "exclusive-schema index references an inactive packed current base",
+                    )
+                })?;
+                if full_value_bytes(value)?.as_ref() != expected_checkpoint {
+                    return Err(head_value_error(
+                        "packed collection replacement has a different working-diff owner",
+                    ));
+                }
+                if working_diff_capture_checkpoint_commit_id.is_some() {
+                    coverage
+                        .remove_encoded_group_key(&base_key.0)
+                        .ok_or_else(|| {
+                            head_value_error("packed current-base diff coverage underflow")
+                        })?;
+                }
+                self.writes
+                    .delete(PACKED_CURRENT_BASE_SPACE, base_key.clone());
+                self.writes.delete(
+                    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+                    StorageKey(base_ref.index_key.clone()),
+                );
+            }
+            if working_diff_capture_checkpoint_commit_id.is_some() {
+                coverage
+                    .add_encoded_group_key(&manifest_key)
+                    .ok_or_else(|| {
+                        head_value_error("packed current-base diff count exceeds u64")
+                    })?;
+            }
         }
         self.writes.put(
             PACKED_CURRENT_BASE_SPACE,
             StorageKey(Bytes::from(manifest_key)),
             StorageValue {
-                bytes: working_diff_capture_checkpoint_commit_id.map_or_else(
-                    || Bytes::from_static(&[0; 16]),
-                    |checkpoint| Bytes::copy_from_slice(checkpoint.as_uuid().as_bytes()),
-                ),
+                bytes: Bytes::copy_from_slice(&expected_checkpoint),
             },
+        );
+        stage_packed_exclusive_schema_base_ref(
+            self.writes,
+            branch_id,
+            generation,
+            schema_key,
+            new_head,
         );
         self.writes.put(
             PACKED_CURRENT_BASE_CONTROL_SPACE,
@@ -3959,7 +4152,7 @@ where
                 bytes: Bytes::from_static(&[1]),
             },
         );
-        Ok(generation)
+        Ok((generation, !replaced.is_empty()))
     }
 
     /// Publishes validated, tracked, unfiled creates as an immutable base.
@@ -4064,6 +4257,12 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
+        let exclusive_schema_key = (schema_increments.len() == 1).then(|| {
+            *schema_increments
+                .keys()
+                .next()
+                .expect("one schema increment")
+        });
         let mut manifest_key = hot_scope_prefix(branch_id, generation);
         manifest_key.reserve(16);
         manifest_key.extend_from_slice(new_head.as_uuid().as_bytes());
@@ -4116,6 +4315,15 @@ where
                 ),
             },
         );
+        if let Some(schema_key) = exclusive_schema_key {
+            stage_packed_exclusive_schema_base_ref(
+                self.writes,
+                branch_id,
+                generation,
+                schema_key,
+                new_head,
+            );
+        }
         self.writes.put(
             PACKED_CURRENT_BASE_CONTROL_SPACE,
             StorageKey(Bytes::from(hot_scope_prefix(branch_id, generation))),
@@ -8280,7 +8488,7 @@ where
         &mut stale_untracked_refs,
     )
     .await?;
-    stage_collect_stale_hot_space(
+    let stale_packed_bases = stage_collect_stale_hot_space(
         store,
         writes,
         PACKED_CURRENT_BASE_SPACE,
@@ -8289,7 +8497,7 @@ where
         &mut stale_untracked_refs,
     )
     .await?;
-    stage_collect_stale_hot_space(
+    let stale_packed_controls = stage_collect_stale_hot_space(
         store,
         writes,
         PACKED_CURRENT_BASE_CONTROL_SPACE,
@@ -8298,6 +8506,17 @@ where
         &mut stale_untracked_refs,
     )
     .await?;
+    if stale_packed_bases || stale_packed_controls {
+        stage_collect_stale_hot_space(
+            store,
+            writes,
+            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+            decode_hot_collection_control_scope,
+            &active,
+            &mut stale_untracked_refs,
+        )
+        .await?;
+    }
     stage_collect_stale_hot_collection_controls(store, writes, &active).await?;
     Ok(stale_untracked_refs
         .into_iter()
@@ -8361,13 +8580,14 @@ async fn stage_collect_stale_hot_space(
     decode_key: fn(&[u8]) -> Result<(String, CommitId), LixError>,
     active: &BTreeSet<(String, CommitId)>,
     stale_untracked_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
-) -> Result<(), LixError> {
+) -> Result<bool, LixError> {
     let plan = ScanPlan::prefix(
         space,
         StoragePrefix {
             bytes: Bytes::new(),
         },
     );
+    let mut deleted_any = false;
     let mut resume_after = None;
     loop {
         let page = plan
@@ -8386,6 +8606,7 @@ async fn stage_collect_stale_hot_space(
             if active_generation {
                 continue;
             }
+            deleted_any = true;
             if let StorageProjectedValue::FullValue(bytes) = &entry.value
                 && let Ok(value) = decode_head_value(bytes)
             {
@@ -8397,7 +8618,7 @@ async fn stage_collect_stale_hot_space(
             break;
         }
     }
-    Ok(())
+    Ok(deleted_any)
 }
 
 pub(crate) async fn stage_collect_stale_hot_diff_records<S>(
@@ -8762,6 +8983,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_replacement_retires_only_exclusive_schema_bases() {
+        const BRANCH_ID: &str = "exclusive-schema-replacement";
+        const SCHEMA_KEY: &str = "target_schema";
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("exclusive-generation");
+        let shared_head = CommitId::for_test_label("shared-base");
+        let exclusive_head = CommitId::for_test_label("exclusive-base");
+        let replacement_head = CommitId::for_test_label("replacement-base");
+        let mut fixture_writes = StorageWriteSet::new();
+        stage_hot_collection_control(
+            &mut fixture_writes,
+            BRANCH_ID,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: SCHEMA_KEY,
+                file_id: None,
+            },
+            HotCollectionControl {
+                active_generation: generation,
+                live_count: 1_024,
+                ordered_identity_digest: None,
+            },
+        )
+        .expect("stage replacement collection control");
+        for head in [shared_head, exclusive_head] {
+            let mut key = hot_scope_prefix(BRANCH_ID, generation);
+            key.extend_from_slice(head.as_uuid().as_bytes());
+            fixture_writes.put(
+                PACKED_CURRENT_BASE_SPACE,
+                StorageKey(Bytes::from(key)),
+                StorageValue {
+                    bytes: Bytes::from_static(&[0; 16]),
+                },
+            );
+        }
+        fixture_writes.put(
+            PACKED_CURRENT_BASE_CONTROL_SPACE,
+            StorageKey(Bytes::from(hot_scope_prefix(BRANCH_ID, generation))),
+            StorageValue {
+                bytes: Bytes::from_static(&[1]),
+            },
+        );
+        stage_packed_exclusive_schema_base_ref(
+            &mut fixture_writes,
+            BRANCH_ID,
+            generation,
+            SCHEMA_KEY,
+            exclusive_head,
+        );
+        storage
+            .commit_write_set(fixture_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit packed replacement fixture");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open packed replacement read");
+        let mut writes = StorageWriteSet::new();
+        let mut coverage = WorkingDiffIndexCoverage::default();
+        let (_, retired) = HotStateWriter {
+            store: &read,
+            writes: &mut writes,
+        }
+        .stage_complete_collection_replacement_current_base(
+            BRANCH_ID,
+            generation,
+            replacement_head,
+            SCHEMA_KEY,
+            1_024,
+            None,
+            &mut coverage,
+        )
+        .await
+        .expect("stage complete packed replacement");
+        assert!(retired);
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit complete packed replacement");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verify complete packed replacement");
+        let base_keys = [shared_head, exclusive_head, replacement_head]
+            .into_iter()
+            .map(|head| {
+                let mut key = hot_scope_prefix(BRANCH_ID, generation);
+                key.extend_from_slice(head.as_uuid().as_bytes());
+                StorageKey(Bytes::from(key))
+            })
+            .collect::<Vec<_>>();
+        let bases = PointReadPlan::new(PACKED_CURRENT_BASE_SPACE, &base_keys)
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .expect("read replacement bases")
+            .value;
+        assert!(
+            bases[0].is_some(),
+            "a shared-schema base must remain visible"
+        );
+        assert!(bases[1].is_none(), "the exclusive predecessor must retire");
+        assert!(bases[2].is_some(), "the replacement base must publish");
+    }
+
+    #[tokio::test]
     async fn current_state_gc_sweeps_stale_packed_generations() {
         let storage = StorageAdapter::new(Memory::new());
         let active_generation = CommitId::for_test_label("active-packed-generation");
@@ -8769,9 +9098,21 @@ mod tests {
         let mut active_manifest = hot_scope_prefix("active-packed", active_generation);
         active_manifest.extend_from_slice(active_generation.as_uuid().as_bytes());
         let active_control = hot_scope_prefix("active-packed", active_generation);
+        let active_index = packed_exclusive_schema_base_key(
+            "active-packed",
+            active_generation,
+            "schema",
+            active_generation,
+        );
         let mut stale_manifest = hot_scope_prefix("stale-packed", stale_generation);
         stale_manifest.extend_from_slice(stale_generation.as_uuid().as_bytes());
         let stale_control = hot_scope_prefix("stale-packed", stale_generation);
+        let stale_index = packed_exclusive_schema_base_key(
+            "stale-packed",
+            stale_generation,
+            "schema",
+            stale_generation,
+        );
         let mut writes = StorageWriteSet::new();
         for (space, key, value) in [
             (
@@ -8792,6 +9133,16 @@ mod tests {
             (
                 PACKED_CURRENT_BASE_CONTROL_SPACE,
                 stale_control.clone(),
+                Bytes::from_static(&[1]),
+            ),
+            (
+                PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+                active_index.clone(),
+                Bytes::from_static(&[1]),
+            ),
+            (
+                PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+                stale_index.clone(),
                 Bytes::from_static(&[1]),
             ),
         ] {
@@ -8864,6 +9215,19 @@ mod tests {
         assert!(manifests[1].is_none());
         assert!(controls[0].is_some());
         assert!(controls[1].is_none());
+        let indexes = PointReadPlan::new(
+            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+            &[
+                StorageKey(Bytes::from(active_index)),
+                StorageKey(Bytes::from(stale_index)),
+            ],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("read packed exclusive-schema indexes")
+        .value;
+        assert!(indexes[0].is_some());
+        assert!(indexes[1].is_none());
     }
 
     #[tokio::test]
@@ -8897,6 +9261,8 @@ mod tests {
         let mut manifest_key = hot_scope_prefix(BRANCH_ID, generation);
         manifest_key.extend_from_slice(generation.as_uuid().as_bytes());
         let control_key = hot_scope_prefix(BRANCH_ID, generation);
+        let index_key =
+            packed_exclusive_schema_base_key(BRANCH_ID, generation, SCHEMA_KEY, generation);
         let mut fixture_writes = StorageWriteSet::new();
         fixture_writes.delete(
             HOT_ROW_SPACE,
@@ -8918,6 +9284,13 @@ mod tests {
         fixture_writes.put(
             PACKED_CURRENT_BASE_CONTROL_SPACE,
             StorageKey(Bytes::from(control_key.clone())),
+            StorageValue {
+                bytes: Bytes::from_static(&[1]),
+            },
+        );
+        fixture_writes.put(
+            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+            StorageKey(Bytes::from(index_key.clone())),
             StorageValue {
                 bytes: Bytes::from_static(&[1]),
             },
@@ -8992,6 +9365,15 @@ mod tests {
         .value;
         assert!(packed[0].is_none());
         assert!(control[0].is_none());
+        let index = PointReadPlan::new(
+            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+            &[StorageKey(Bytes::from(index_key))],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("read retired packed exclusive-schema index")
+        .value;
+        assert!(index[0].is_none());
         let hot = PointReadPlan::new(
             HOT_ROW_SPACE,
             &[StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
