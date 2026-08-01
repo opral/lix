@@ -719,30 +719,71 @@ where
         };
 
         let mut tracked = self.tracked_state.reader(read);
-        let concurrent = tracked
-            .diff_commits(
-                &opening_head.to_string(),
-                &current_head.to_string(),
-                &TrackedStateDiffRequest::default(),
-            )
+        let opening_head_text = opening_head.to_string();
+        let current_head_text = current_head.to_string();
+        let generation_write_set = tracked
+            .changed_identities_in_first_parent_interval(&opening_head_text, &current_head_text)
             .instrument(tracing::debug_span!(
                 target: "lix_transaction",
-                "lix.transaction.stale.diff"
+                "lix.transaction.stale.generation_write_set"
             ))
             .await?;
-        let plan = {
-            let span = tracing::debug_span!(
-                target: "lix_transaction",
-                "lix.transaction.stale.classify",
-                prepared_rows = prepared_writes.state_rows.len(),
-                concurrent_changes = concurrent.entries.len(),
-            );
-            let _entered = span.enter();
-            classify_stale_commit(prepared_writes, &concurrent)
+        let (plan, concurrent_change_count, discovery) = match generation_write_set {
+            Some(identities) => {
+                let count = identities.len();
+                let plan = {
+                    let span = tracing::debug_span!(
+                        target: "lix_transaction",
+                        "lix.transaction.stale.classify",
+                        prepared_rows = prepared_writes.state_rows.len(),
+                        concurrent_changes = count,
+                    );
+                    let _entered = span.enter();
+                    classify_stale_commit(
+                        prepared_writes,
+                        identities.iter().map(|identity| identity.as_key_ref()),
+                    )
+                };
+                (plan, count, "generation_write_set")
+            }
+            None => {
+                let concurrent = tracked
+                    .diff_commits(
+                        &opening_head_text,
+                        &current_head_text,
+                        &TrackedStateDiffRequest::default(),
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_transaction",
+                        "lix.transaction.stale.general_diff"
+                    ))
+                    .await?;
+                let count = concurrent.entries.len();
+                let plan = {
+                    let span = tracing::debug_span!(
+                        target: "lix_transaction",
+                        "lix.transaction.stale.classify",
+                        prepared_rows = prepared_writes.state_rows.len(),
+                        concurrent_changes = count,
+                    );
+                    let _entered = span.enter();
+                    classify_stale_commit(
+                        prepared_writes,
+                        concurrent
+                            .entries
+                            .iter()
+                            .map(|entry| entry.identity.as_key_ref()),
+                    )
+                };
+                (plan, count, "general_diff")
+            }
         };
         tracing::debug!(
             target: "lix_transaction",
             plan = plan.kind(),
+            discovery,
+            prepared_rows = prepared_writes.state_rows.len(),
+            concurrent_changes = concurrent_change_count,
             "classified stale transaction commit"
         );
         match plan {
