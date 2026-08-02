@@ -16,6 +16,9 @@ mod workload;
 
 use workload::WorkloadRow;
 
+static CERTIFIED_INSERT_COUNTER_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 #[test]
 fn typed_olap_queries_are_structurally_ineligible_for_strict_native_reads() {
     use datafusion::sql::parser::DFParser;
@@ -190,6 +193,7 @@ async fn standalone_sqlite_public_results_match_every_lix_adapter_async() {
 
 #[tokio::test]
 async fn insert_benchmark_hits_certified_parameter_batch_on_every_adapter() {
+    let _counter_guard = CERTIFIED_INSERT_COUNTER_TEST_LOCK.lock().await;
     let rows = [
         WorkloadRow {
             path: "/alpha".to_string(),
@@ -208,6 +212,26 @@ async fn insert_benchmark_hits_certified_parameter_batch_on_every_adapter() {
             sql_session::empty_fixture_with_read_many_pk_count(profile, &rows, rows.len()).await;
         assert_eq!(fixture.insert_all().await, rows.len());
     }
+}
+
+/// Regression for the automatic-write future retaining SlateDB's large
+/// adapter-specific open and commit futures on Tokio's default test stack.
+#[cfg(feature = "slatedb")]
+#[tokio::test]
+async fn slatedb_automatic_write_runs_on_default_stack() {
+    let _counter_guard = CERTIFIED_INSERT_COUNTER_TEST_LOCK.lock().await;
+    let rows = [WorkloadRow {
+        path: "/default-stack".to_string(),
+        value_json: r#"{"enabled":true}"#.to_string(),
+        updated_value_json: r#"{"enabled":false}"#.to_string(),
+    }];
+    let fixture = sql_session::empty_fixture_with_read_many_pk_count(
+        storage::StorageProfile::SlateDB,
+        &rows,
+        rows.len(),
+    )
+    .await;
+    assert_eq!(fixture.insert_all().await, rows.len());
 }
 
 #[test]
