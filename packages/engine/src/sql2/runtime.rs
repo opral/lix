@@ -19,14 +19,36 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
+#[cfg(feature = "storage-benches")]
+use std::time::Instant;
 use tokio::sync::OnceCell;
 
 use super::providers::{SpecScanExec, StatementScanKey};
 
 pub(crate) async fn collect_dataframe(dataframe: DataFrame) -> Result<Vec<RecordBatch>> {
     let task_ctx = Arc::new(dataframe.task_ctx());
+    #[cfg(feature = "storage-benches")]
+    let started = crate::sql_profile::is_active().then(Instant::now);
     let plan = dataframe.create_physical_plan().await?;
-    collect_input_plan(plan, task_ctx).await
+    let plan = adapt_runtime_plan(plan)?;
+    #[cfg(feature = "storage-benches")]
+    if let Some(started) = started {
+        crate::sql_profile::record_phase(
+            crate::sql_profile::Phase::PhysicalPlanning,
+            started.elapsed(),
+        );
+    }
+    #[cfg(feature = "storage-benches")]
+    let started = crate::sql_profile::is_active().then(Instant::now);
+    let result = collect_adapted_input_plan(plan, task_ctx).await;
+    #[cfg(feature = "storage-benches")]
+    if let Some(started) = started {
+        crate::sql_profile::record_phase(
+            crate::sql_profile::Phase::ArrowExecution,
+            started.elapsed(),
+        );
+    }
+    result
 }
 
 pub(crate) async fn collect_input_plan(
@@ -34,6 +56,13 @@ pub(crate) async fn collect_input_plan(
     task_ctx: Arc<TaskContext>,
 ) -> Result<Vec<RecordBatch>> {
     let plan = adapt_runtime_plan(plan)?;
+    collect_adapted_input_plan(plan, task_ctx).await
+}
+
+async fn collect_adapted_input_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+) -> Result<Vec<RecordBatch>> {
     let partition_count = plan.output_partitioning().partition_count();
     let mut batches = Vec::new();
     for partition in 0..partition_count {

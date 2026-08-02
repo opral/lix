@@ -38,6 +38,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     Statistics,
 };
+#[cfg(feature = "storage-benches")]
+use futures_util::Stream;
 use futures_util::future::BoxFuture;
 use futures_util::{TryStreamExt, stream};
 
@@ -1122,10 +1124,10 @@ impl ExecutionPlan for SpecScanExec {
             .collect::<Result<Vec<_>>>()?;
         let fragments =
             stream::iter(fragments.into_iter().map(Ok::<_, DataFusionError>)).try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&self.schema),
-            fragments,
-        )))
+        let stream = RecordBatchStreamAdapter::new(Arc::clone(&self.schema), fragments);
+        #[cfg(feature = "storage-benches")]
+        let stream = ProfiledScanStream::new(stream);
+        Ok(Box::pin(stream))
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
@@ -1150,6 +1152,57 @@ impl ExecutionPlan for SpecScanExec {
                 }
             },
         }
+    }
+}
+
+#[cfg(feature = "storage-benches")]
+struct ProfiledScanStream<S> {
+    inner: S,
+}
+
+#[cfg(feature = "storage-benches")]
+impl<S> ProfiledScanStream<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+#[cfg(feature = "storage-benches")]
+impl<S> Stream for ProfiledScanStream<S>
+where
+    S: Stream<Item = Result<RecordBatch>> + Unpin,
+{
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let started = crate::sql_profile::is_active().then(std::time::Instant::now);
+        let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        if let Some(started) = started {
+            let elapsed = started.elapsed();
+            match &polled {
+                std::task::Poll::Ready(Some(Ok(batch))) => crate::sql_profile::record_scan(
+                    batch.num_rows(),
+                    1,
+                    batch.get_array_memory_size(),
+                    elapsed,
+                ),
+                _ => crate::sql_profile::record_scan(0, 0, 0, elapsed),
+            }
+        }
+        polled
+    }
+}
+
+#[cfg(feature = "storage-benches")]
+impl<S> datafusion::physical_plan::RecordBatchStream for ProfiledScanStream<S>
+where
+    S: datafusion::physical_plan::RecordBatchStream + Unpin,
+{
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
     }
 }
 

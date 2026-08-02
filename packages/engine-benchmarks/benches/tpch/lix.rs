@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use lix_engine::{Engine, ExecuteResult, SessionContext, Storage, Value};
+use lix_engine::{Engine, ExecuteResult, SessionContext, SqlReadProfile, Storage, Value};
 use lix_rocksdb_storage::RocksDB;
 #[cfg(feature = "slatedb")]
 use lix_slatedb_storage::SlateDB;
@@ -268,6 +268,14 @@ impl Fixture {
         }
     }
 
+    pub(crate) async fn query_profiled(&self, sql: &str) -> (ExecuteResult, SqlReadProfile) {
+        match self {
+            Self::RocksDB { session, .. } => execute_profiled(session, sql).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { session, .. } => execute_profiled(session, sql).await,
+        }
+    }
+
     pub(crate) async fn explain_analyze(&self, sql: &str) -> String {
         let result = self.query(&format!("EXPLAIN ANALYZE VERBOSE {sql}")).await;
         result
@@ -286,6 +294,19 @@ impl Fixture {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+async fn execute_profiled<S>(
+    session: &SessionContext<S>,
+    sql: &str,
+) -> (ExecuteResult, SqlReadProfile)
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    session
+        .execute_profiled(sql, &[])
+        .await
+        .expect("execute profiled Lix TPC-H query")
 }
 
 async fn prepare<S>(storage: S, scale_factor: f64, overlay_rowkeys: &[String]) -> SessionContext<S>

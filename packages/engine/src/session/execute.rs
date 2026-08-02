@@ -149,7 +149,17 @@ impl FileRead {
 
 impl ExecuteResult {
     fn from_sql_query_result(result: SqlQueryResult) -> Self {
-        Self::from_query_parts(result.columns, result.rows, 0, result.notices)
+        #[cfg(feature = "storage-benches")]
+        let started = crate::sql_profile::is_active().then(std::time::Instant::now);
+        let result = Self::from_query_parts(result.columns, result.rows, 0, result.notices);
+        #[cfg(feature = "storage-benches")]
+        if let Some(started) = started {
+            crate::sql_profile::record_phase(
+                crate::sql_profile::Phase::PublicResultMaterialization,
+                started.elapsed(),
+            );
+        }
+        result
     }
 
     fn from_sql_write_result(result: sql2::SqlWriteResult) -> Self {
@@ -658,6 +668,20 @@ where
     /// catalog inspection. Lix owns transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
+    }
+
+    /// Executes one statement and reports neutral analytical phase timings.
+    ///
+    /// This diagnostic API is available only to storage benchmarks. It uses
+    /// the normal public execution path and does not alter query semantics.
+    #[cfg(feature = "storage-benches")]
+    pub async fn execute_profiled(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(ExecuteResult, crate::SqlReadProfile), LixError> {
+        let (result, profile) = crate::sql_profile::scope(self.execute(sql, params)).await;
+        result.map(|result| (result, profile))
     }
 
     pub async fn execute_with_options(
