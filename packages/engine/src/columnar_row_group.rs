@@ -27,7 +27,7 @@ use crate::storage_adapter::{
     StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
 };
 
-pub(crate) const ROW_GROUP_MAX_ROWS: usize = 16 * 1024;
+pub(crate) const ROW_GROUP_MAX_ROWS: usize = 64 * 1024;
 pub(crate) const ROW_GROUP_MANIFEST_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_0029),
     "analytical.row_group_manifest.v1",
@@ -37,9 +37,10 @@ pub(crate) const ROW_GROUP_COLUMN_SPACE: StorageSpace = StorageSpace::immutable(
     "analytical.row_group_column.v1",
 );
 
-const MANIFEST_MAGIC: &[u8; 8] = b"LXRGM001";
+const MANIFEST_MAGIC: &[u8; 8] = b"LXRGM003";
 const COLUMN_MAGIC: &[u8; 8] = b"LXRGC001";
 const COMPRESSED_MAGIC: &[u8; 8] = b"LXRGZ001";
+const BLAKE3_DIGEST_LEN: usize = 32;
 const MAX_DECODED_COLUMN_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -89,7 +90,7 @@ impl RowGroupDataType {
         }
     }
 
-    fn to_arrow(self) -> DataType {
+    pub(crate) fn to_arrow(self) -> DataType {
         match self {
             Self::String => DataType::Utf8,
             Self::Int64 => DataType::Int64,
@@ -138,12 +139,14 @@ pub(crate) struct RowGroupColumnStatistics {
     pub(crate) null_count: u32,
     pub(crate) min: Option<RowGroupScalar>,
     pub(crate) max: Option<RowGroupScalar>,
+    pub(crate) sum: Option<RowGroupScalar>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RowGroupStatistics {
     pub(crate) row_count: u32,
     pub(crate) columns: Vec<RowGroupColumnStatistics>,
+    column_digests: Vec<[u8; BLAKE3_DIGEST_LEN]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +210,23 @@ pub(crate) fn encode_row_group_set(
     schema: SchemaRef,
     batches: &[RecordBatch],
 ) -> Result<EncodedRowGroupSet, LixError> {
+    encode_row_group_set_impl(namespace.into(), schema, batches, false)
+}
+
+pub(crate) fn encode_row_group_set_preserving_batches(
+    namespace: impl Into<String>,
+    schema: SchemaRef,
+    batches: &[RecordBatch],
+) -> Result<EncodedRowGroupSet, LixError> {
+    encode_row_group_set_impl(namespace.into(), schema, batches, true)
+}
+
+fn encode_row_group_set_impl(
+    namespace: String,
+    schema: SchemaRef,
+    batches: &[RecordBatch],
+    preserve_batch_boundaries: bool,
+) -> Result<EncodedRowGroupSet, LixError> {
     validate_input_batches(&schema, batches)?;
     let fields = schema
         .fields()
@@ -226,17 +246,19 @@ pub(crate) fn encode_row_group_set(
         ));
     }
 
-    let row_groups = partition_batches(&schema, batches)?;
+    let row_groups = partition_batches(&schema, batches, preserve_batch_boundaries)?;
     let mut groups = Vec::with_capacity(row_groups.len());
     let mut columns = Vec::with_capacity(row_groups.len().saturating_mul(fields.len()));
     for (group_index, batch) in row_groups.iter().enumerate() {
         let row_count = u32::try_from(batch.num_rows())
             .map_err(|_| row_group_error("row-group row count exceeds u32"))?;
         let mut statistics = Vec::with_capacity(fields.len());
+        let mut column_digests = Vec::with_capacity(fields.len());
         for (column_index, (array, field)) in batch.columns().iter().zip(&fields).enumerate() {
             let stats = column_statistics(array, field.data_type)?;
             let encoded = encode_column(array, field.data_type)?;
             statistics.push(stats);
+            column_digests.push(*blake3::hash(&encoded).as_bytes());
             columns.push(EncodedColumn {
                 group_index,
                 column_index,
@@ -246,10 +268,11 @@ pub(crate) fn encode_row_group_set(
         groups.push(RowGroupStatistics {
             row_count,
             columns: statistics,
+            column_digests,
         });
     }
     let manifest = RowGroupManifest {
-        namespace: namespace.into(),
+        namespace,
         metadata: schema.metadata().clone(),
         fields,
         groups,
@@ -302,6 +325,29 @@ pub(crate) async fn load_row_group_manifest(
         return Err(row_group_error("row-group manifest read omitted its value"));
     };
     decode_manifest(&bytes).map(Some)
+}
+
+/// Stages deletion of one immutable set and every addressed column. The
+/// owning commit remains the lifecycle authority; repository GC invokes this
+/// only after that commit leaves the reachable history graph.
+pub(crate) async fn stage_delete_row_group_set(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    id: RowGroupSetId,
+) -> Result<(), LixError> {
+    let Some(manifest) = load_row_group_manifest(store, id).await? else {
+        return Ok(());
+    };
+    writes.delete(ROW_GROUP_MANIFEST_SPACE, id.manifest_key());
+    for group_index in 0..manifest.groups.len() {
+        for column_index in 0..manifest.fields.len() {
+            writes.delete(
+                ROW_GROUP_COLUMN_SPACE,
+                id.column_key(group_index, column_index)?,
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn load_row_group_set(
@@ -368,13 +414,12 @@ pub(crate) async fn load_row_group_batch(
             return Err(row_group_error("row-group column read omitted its value"));
         };
         let field = &manifest.fields[column_index];
-        let array = decode_column(&bytes, field.data_type, group.row_count as usize)?;
-        let observed = column_statistics(&array, field.data_type)?;
-        if observed != group.columns[column_index] {
-            return Err(row_group_error(format!(
-                "row-group {group_index} column {column_index} statistics do not match the manifest"
-            )));
-        }
+        let array = decode_verified_column(
+            &bytes,
+            group.column_digests[column_index],
+            field.data_type,
+            group.row_count as usize,
+        )?;
         arrays.push(array);
     }
     if values.next().is_some() {
@@ -398,7 +443,17 @@ fn validate_input_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Result
 fn partition_batches(
     schema: &SchemaRef,
     batches: &[RecordBatch],
+    preserve_batch_boundaries: bool,
 ) -> Result<Vec<RecordBatch>, LixError> {
+    if preserve_batch_boundaries {
+        let mut groups = Vec::new();
+        for batch in batches {
+            for offset in (0..batch.num_rows()).step_by(ROW_GROUP_MAX_ROWS) {
+                groups.push(batch.slice(offset, ROW_GROUP_MAX_ROWS.min(batch.num_rows() - offset)));
+            }
+        }
+        return Ok(groups);
+    }
     let mut groups = Vec::new();
     let mut pending = Vec::new();
     let mut pending_rows = 0;
@@ -631,6 +686,20 @@ fn decode_column(
     Ok(array)
 }
 
+fn decode_verified_column(
+    encoded: &[u8],
+    expected_digest: [u8; BLAKE3_DIGEST_LEN],
+    expected_type: RowGroupDataType,
+    expected_rows: usize,
+) -> Result<ArrayRef, LixError> {
+    if blake3::hash(encoded).as_bytes() != &expected_digest {
+        return Err(row_group_error(
+            "row-group compressed column digest does not match the manifest",
+        ));
+    }
+    decode_column(encoded, expected_type, expected_rows)
+}
+
 fn encode_validity(array: &dyn Array) -> Vec<u8> {
     let mut validity = vec![0_u8; array.len().div_ceil(8)];
     for index in 0..array.len() {
@@ -665,7 +734,7 @@ fn column_statistics(
 ) -> Result<RowGroupColumnStatistics, LixError> {
     let null_count = u32::try_from(array.null_count())
         .map_err(|_| row_group_error("row-group null count exceeds u32"))?;
-    let (min, max) = match data_type {
+    let (min, max, sum) = match data_type {
         RowGroupDataType::String => {
             let values = array
                 .as_any()
@@ -677,6 +746,7 @@ fn column_statistics(
                     null_count,
                     min: None,
                     max: None,
+                    sum: None,
                 });
             };
             let (mut min, mut max) = (first, first);
@@ -691,6 +761,7 @@ fn column_statistics(
             (
                 Some(RowGroupScalar::String(min.to_owned())),
                 Some(RowGroupScalar::String(max.to_owned())),
+                None,
             )
         }
         RowGroupDataType::Int64 => {
@@ -704,16 +775,19 @@ fn column_statistics(
                     null_count,
                     min: None,
                     max: None,
+                    sum: None,
                 });
             };
-            let (mut min, mut max) = (first, first);
+            let (mut min, mut max, mut sum) = (first, first, Some(first));
             for value in observed {
                 min = min.min(value);
                 max = max.max(value);
+                sum = sum.and_then(|sum| sum.checked_add(value));
             }
             (
                 Some(RowGroupScalar::Int64(min)),
                 Some(RowGroupScalar::Int64(max)),
+                sum.map(RowGroupScalar::Int64),
             )
         }
         RowGroupDataType::Float64 => {
@@ -727,9 +801,10 @@ fn column_statistics(
                     null_count,
                     min: None,
                     max: None,
+                    sum: None,
                 });
             };
-            let (mut min, mut max) = (first, first);
+            let (mut min, mut max, mut sum) = (first, first, first);
             for value in observed {
                 if value.total_cmp(&min).is_lt() {
                     min = value;
@@ -737,10 +812,12 @@ fn column_statistics(
                 if value.total_cmp(&max).is_gt() {
                     max = value;
                 }
+                sum += value;
             }
             (
                 Some(RowGroupScalar::Float64(min)),
                 Some(RowGroupScalar::Float64(max)),
+                Some(RowGroupScalar::Float64(sum)),
             )
         }
         RowGroupDataType::Boolean => {
@@ -754,6 +831,7 @@ fn column_statistics(
                     null_count,
                     min: None,
                     max: None,
+                    sum: None,
                 });
             };
             let (mut min, mut max) = (first, first);
@@ -764,6 +842,7 @@ fn column_statistics(
             (
                 Some(RowGroupScalar::Boolean(min)),
                 Some(RowGroupScalar::Boolean(max)),
+                None,
             )
         }
     };
@@ -771,10 +850,16 @@ fn column_statistics(
         null_count,
         min,
         max,
+        sum,
     })
 }
 
 fn compress_column(raw: &[u8]) -> Result<Vec<u8>, LixError> {
+    if raw.len() > MAX_DECODED_COLUMN_BYTES {
+        return Err(row_group_error(
+            "row-group decoded column exceeds the safety limit",
+        ));
+    }
     let compressed = crate::compression::compress_zstd_level_1(raw)
         .map_err(|error| row_group_error(format!("row-group compression failed: {error}")))?;
     let mut output = Vec::with_capacity(12 + compressed.len());
@@ -824,17 +909,39 @@ fn encode_manifest(manifest: &RowGroupManifest) -> Result<Vec<u8>, LixError> {
                 "manifest statistics width does not match its schema",
             ));
         }
-        for (stats, field) in group.columns.iter().zip(&manifest.fields) {
+        if group.column_digests.len() != manifest.fields.len() {
+            return Err(row_group_error(
+                "manifest column digest width does not match its schema",
+            ));
+        }
+        for ((stats, digest), field) in group
+            .columns
+            .iter()
+            .zip(&group.column_digests)
+            .zip(&manifest.fields)
+        {
+            output.extend_from_slice(digest);
             output.extend_from_slice(&stats.null_count.to_le_bytes());
             put_optional_scalar(&mut output, stats.min.as_ref(), field.data_type)?;
             put_optional_scalar(&mut output, stats.max.as_ref(), field.data_type)?;
+            put_optional_scalar(&mut output, stats.sum.as_ref(), field.data_type)?;
         }
     }
+    let checksum = blake3::hash(&output);
+    output.extend_from_slice(checksum.as_bytes());
     Ok(output)
 }
 
 fn decode_manifest(encoded: &[u8]) -> Result<RowGroupManifest, LixError> {
-    let mut cursor = Cursor::new(encoded);
+    let body_len = encoded
+        .len()
+        .checked_sub(BLAKE3_DIGEST_LEN)
+        .ok_or_else(|| row_group_error("row-group manifest checksum is missing"))?;
+    let (body, encoded_checksum) = encoded.split_at(body_len);
+    if blake3::hash(body).as_bytes() != encoded_checksum {
+        return Err(row_group_error("row-group manifest checksum mismatch"));
+    }
+    let mut cursor = Cursor::new(body);
     cursor.expect_magic(MANIFEST_MAGIC, "row-group manifest")?;
     let namespace = cursor.string()?;
     let metadata = cursor.metadata()?;
@@ -865,7 +972,10 @@ fn decode_manifest(encoded: &[u8]) -> Result<RowGroupManifest, LixError> {
             ));
         }
         let mut columns = Vec::with_capacity(field_count);
+        let mut column_digests = Vec::with_capacity(field_count);
         for field in &fields {
+            let digest = <[u8; BLAKE3_DIGEST_LEN]>::try_from(cursor.bytes(BLAKE3_DIGEST_LEN)?)
+                .map_err(|_| row_group_error("row-group column digest has an invalid length"))?;
             let null_count = cursor.u32_le()?;
             if null_count > row_count {
                 return Err(row_group_error(
@@ -874,6 +984,7 @@ fn decode_manifest(encoded: &[u8]) -> Result<RowGroupManifest, LixError> {
             }
             let min = cursor.optional_scalar(field.data_type)?;
             let max = cursor.optional_scalar(field.data_type)?;
+            let sum = cursor.optional_scalar(field.data_type)?;
             if (min.is_none() || max.is_none()) != (null_count == row_count) {
                 return Err(row_group_error(
                     "row-group min/max presence contradicts null count",
@@ -883,9 +994,15 @@ fn decode_manifest(encoded: &[u8]) -> Result<RowGroupManifest, LixError> {
                 null_count,
                 min,
                 max,
+                sum,
             });
+            column_digests.push(digest);
         }
-        groups.push(RowGroupStatistics { row_count, columns });
+        groups.push(RowGroupStatistics {
+            row_count,
+            columns,
+            column_digests,
+        });
     }
     if !cursor.is_empty() {
         return Err(row_group_error("row-group manifest has trailing bytes"));
@@ -1134,6 +1251,10 @@ mod tests {
         assert_eq!(encoded.manifest.groups[1].row_count, 9);
         assert_eq!(encoded.manifest.row_count(), rows as u64);
         assert_eq!(encoded.manifest.schema().as_ref(), schema.as_ref());
+        assert_eq!(
+            decode_manifest(&encoded.manifest_bytes).expect("decode manifest"),
+            encoded.manifest
+        );
         assert!(
             encoded.manifest.groups[0]
                 .columns
@@ -1208,13 +1329,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn lifecycle_delete_removes_manifest_and_columns() {
+        let (schema, batches) = fixture(ROW_GROUP_MAX_ROWS + 3);
+        let encoded = encode_row_group_set("fixture", schema, &batches).expect("encode");
+        let adapter = StorageAdapter::new(Memory::new());
+        let id = RowGroupSetId::new(*b"row-group-set-03");
+        let mut writes = adapter.new_write_set();
+        stage_row_group_set(&mut writes, id, &encoded).expect("stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit");
+
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read");
+        let mut deletes = adapter.new_write_set();
+        stage_delete_row_group_set(&read, &mut deletes, id)
+            .await
+            .expect("stage lifecycle delete");
+        drop(read);
+        adapter
+            .commit_write_set(deletes, StorageWriteOptions::default())
+            .await
+            .expect("commit lifecycle delete");
+
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verify read");
+        assert!(
+            load_row_group_manifest(&read, id)
+                .await
+                .expect("load deleted manifest")
+                .is_none()
+        );
+        let column_keys = encoded
+            .columns
+            .iter()
+            .map(|column| {
+                id.column_key(column.group_index, column.column_index)
+                    .expect("key")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            PointReadPlan::new(ROW_GROUP_COLUMN_SPACE, &column_keys)
+                .materialize(&read, StorageGetOptions::default())
+                .await
+                .expect("load deleted columns")
+                .value
+                .into_iter()
+                .all(|value| value.is_none())
+        );
+    }
+
     #[test]
     fn corrupt_values_fail_closed() {
         let (schema, batches) = fixture(32);
         let encoded = encode_row_group_set("fixture", schema, &batches).expect("encode");
+
         let mut bad_manifest = encoded.manifest_bytes.to_vec();
         bad_manifest[0] ^= 0xff;
         assert!(decode_manifest(&bad_manifest).is_err());
+
+        let mut bad_manifest_checksum = encoded.manifest_bytes.to_vec();
+        let checksum_index = bad_manifest_checksum.len() - 1;
+        bad_manifest_checksum[checksum_index] ^= 0xff;
+        assert!(decode_manifest(&bad_manifest_checksum).is_err());
 
         let mut truncated = encoded.columns[0].bytes.to_vec();
         truncated.truncate(truncated.len() / 2);
@@ -1224,6 +1407,53 @@ mod tests {
         oversized.extend_from_slice(&u32::MAX.to_le_bytes());
         oversized.extend_from_slice(b"not-zstd");
         assert!(decode_column(&oversized, RowGroupDataType::String, 32).is_err());
+    }
+
+    #[test]
+    fn manifest_stat_corruption_fails_closed() {
+        let (schema, batches) = fixture(32);
+        let encoded = encode_row_group_set("fixture", schema, &batches).expect("encode");
+
+        // The final byte before the checksum is part of the final column's
+        // persisted statistics. The checksum rejects the modified statistic
+        // before the manifest parser can trust it.
+        let mut bad_manifest_stat = encoded.manifest_bytes.to_vec();
+        let stat_index = bad_manifest_stat.len() - BLAKE3_DIGEST_LEN - 1;
+        bad_manifest_stat[stat_index] ^= 0xff;
+        assert!(decode_manifest(&bad_manifest_stat).is_err());
+    }
+
+    #[tokio::test]
+    async fn column_byte_corruption_fails_closed_during_load() {
+        let (schema, batches) = fixture(32);
+        let mut encoded = encode_row_group_set("fixture", schema, &batches).expect("encode");
+
+        let mut corrupt_column = encoded.columns[0].bytes.to_vec();
+        let corrupt_index = corrupt_column.len() - 1;
+        corrupt_column[corrupt_index] ^= 0xff;
+        encoded.columns[0].bytes = Bytes::from(corrupt_column);
+
+        let adapter = StorageAdapter::new(Memory::new());
+        let id = RowGroupSetId::new(*b"row-group-set-02");
+        let mut writes = adapter.new_write_set();
+        stage_row_group_set(&mut writes, id, &encoded).expect("stage corrupt column");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit corrupt column");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read");
+        let manifest = load_row_group_manifest(&read, id)
+            .await
+            .expect("load authenticated manifest")
+            .expect("manifest present");
+        assert!(
+            load_row_group_batch(&read, id, &manifest, 0, &[0])
+                .await
+                .is_err()
+        );
     }
 
     #[test]

@@ -32,8 +32,8 @@ simulation_test!(
             "plan should scan pushdown_note:\n{plan}"
         );
         assert!(
-            plan.contains("full_filters=[pushdown_note.kind = Utf8(\"todo\")]"),
-            "payload equality should be pushed into the table scan:\n{plan}"
+            plan.contains("partial_filters=[pushdown_note.kind = Utf8(\"todo\")]"),
+            "payload equality should reach the table scan while retaining a DataFusion residual:\n{plan}"
         );
     }
 );

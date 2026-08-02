@@ -1,5 +1,6 @@
 mod context;
 mod derived;
+mod entity_columnar;
 mod entity_field_index;
 mod reader;
 mod tracked_head;
@@ -8,6 +9,9 @@ pub(crate) mod visibility;
 
 #[allow(unused_imports)]
 pub(crate) use context::{BranchHeadControlCache, LiveStateContext, LiveStateStoreReader};
+pub(crate) use entity_columnar::{
+    EntityColumnarWriteSets, encode_entity_scalar_row_groups, entity_row_group_set_id,
+};
 pub(crate) use entity_field_index::EntitySnapshotFieldIndexCache;
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;

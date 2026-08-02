@@ -68,6 +68,29 @@ async fn typed_olap_shapes_validate_exact_results_on_every_adapter() {
     }
 }
 
+#[tokio::test]
+async fn typed_olap_shapes_validate_above_columnar_publication_threshold() {
+    let rows = workload::fixture_rows(2_048);
+    for &profile in storage::STORAGE_PROFILES {
+        let fixture = sql_session::seeded_olap_fixture(profile, &rows).await;
+        for shape in sql_session::OlapReadShape::ALL {
+            let expected_rows = match shape {
+                sql_session::OlapReadShape::Scan => rows.len(),
+                sql_session::OlapReadShape::Filter => 86,
+                sql_session::OlapReadShape::Sort => 1_365,
+                sql_session::OlapReadShape::Group => 32,
+                sql_session::OlapReadShape::Aggregate => 1,
+            };
+            assert_eq!(
+                fixture.read_olap(shape).await,
+                expected_rows,
+                "{}",
+                shape.label()
+            );
+        }
+    }
+}
+
 #[test]
 fn standalone_sqlite_public_results_match_every_lix_adapter() {
     std::thread::Builder::new()

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use datafusion::common::stats::{ColumnStatistics, Precision};
 use datafusion::common::{DataFusionError, Result, ScalarValue, not_impl_err};
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::expr::InList;
@@ -46,11 +47,13 @@ use crate::transaction::types::{
 
 use super::ProviderSelection;
 use super::entity_history::register_entity_history_surface;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{ExecutionPlan, Statistics};
+use futures_util::stream;
 
 use super::spec::{
-    InsertApply, PlannedDml, PlannedScan, TableSpec, projected_schema, register_spec_table,
-    row_source, scan_row_source,
+    InsertApply, PlannedDml, PlannedScan, TableSpec, batch_stream_source_with_statistics,
+    projected_schema, register_spec_table, row_source, scan_row_source,
 };
 use super::values::{
     optional_bool_value, optional_string_value, required_string_value, string_expr_literal,
@@ -316,9 +319,17 @@ impl TableSpec for EntitySpec {
         let row_filter_analyzer = EntityRowFilterAnalyzer::new(&self.spec);
         if ExactBranchIdFilterAnalyzer.supports(filter)
             || primary_key_analyzer.supports(filter)
-            || row_filter_analyzer.supports(filter)
+            || row_filter_analyzer
+                .analyze(filter)
+                .is_some_and(|filter| filter.exact_boolean_equality().is_some())
         {
             TableProviderFilterPushDown::Exact
+        } else if row_filter_analyzer.supports(filter) {
+            // Retain a DataFusion residual even when the row-shaped fallback
+            // also evaluates the predicate. Immutable columnar layouts use
+            // this residual for general typed filtering without a query-shape
+            // recognizer; later row-group pruning remains an inexact subset.
+            TableProviderFilterPushDown::Inexact
         } else {
             TableProviderFilterPushDown::Unsupported
         }
@@ -339,6 +350,29 @@ impl TableSpec for EntitySpec {
             .flatten();
         let direct_primary_key_projection =
             direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
+        if let Some(reader) = self.entity_snapshot_reader.as_ref()
+            && entity_columnar_projection_eligible(&schema, &request)
+            && let Some(layout) = reader
+                .plan_entity_columnar_scan(request.clone())
+                .await
+                .map_err(lix_error_to_datafusion_error)?
+            && let Some(projection) =
+                entity_columnar_projection(&layout.manifest, &schema, &self.spec)
+            && let Some(group_indices) =
+                entity_columnar_group_indices(&layout.manifest, &row_filters)
+        {
+            return Ok(PlannedScan {
+                schema: Arc::clone(&schema),
+                ordering: None,
+                source: entity_columnar_scan_source(
+                    Arc::clone(reader),
+                    layout,
+                    projection,
+                    group_indices,
+                    schema,
+                ),
+            });
+        }
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -503,6 +537,171 @@ impl TableSpec for EntitySpec {
     ) -> Result<PlannedDml> {
         not_impl_err!("raw DataFusion UPDATE is disabled; use the sql2 bound write pipeline")
     }
+}
+
+fn entity_columnar_projection_eligible(schema: &Schema, request: &LiveStateScanRequest) -> bool {
+    !schema.fields().is_empty()
+        && request.filter.entity_pks.is_empty()
+        && request.limit.is_none()
+        && schema
+            .fields()
+            .iter()
+            .all(|field| !field.name().starts_with("lixcol_"))
+}
+
+fn entity_columnar_projection(
+    manifest: &crate::columnar_row_group::RowGroupManifest,
+    schema: &Schema,
+    spec: &EntitySurfaceSpec,
+) -> Option<Vec<usize>> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            // JSON is exposed as canonical JSON text on the SQL surface, so
+            // its Arrow Utf8 type is not equivalent to a scalar JSON string.
+            // Until sidecars are compiled from the registered schema, retain
+            // the authoritative decoder for every JSON projection.
+            if spec.visible_column(field.name())?.column_type == EntityColumnType::Json {
+                return None;
+            }
+            manifest.fields.iter().position(|candidate| {
+                candidate.name == *field.name()
+                    && candidate.data_type.to_arrow() == *field.data_type()
+            })
+        })
+        .collect()
+}
+
+fn entity_columnar_scan_source(
+    reader: Arc<dyn EntitySnapshotReader>,
+    layout: crate::sql2::entity_batch::EntityColumnarScanLayout,
+    projection: Vec<usize>,
+    group_indices: Vec<usize>,
+    schema: SchemaRef,
+) -> super::spec::ScanSource {
+    let statistics = group_indices
+        .iter()
+        .map(|&group_index| {
+            entity_columnar_group_statistics(
+                &layout.manifest.groups[group_index],
+                &projection,
+                schema.as_ref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let partition_count = statistics.len();
+    let stream_schema = Arc::clone(&schema);
+    batch_stream_source_with_statistics(
+        Arc::clone(&schema),
+        statistics,
+        move |partition, _context| {
+            debug_assert!(partition < partition_count);
+            let reader = Arc::clone(&reader);
+            let layout = layout.clone();
+            let projection = projection.clone();
+            let group_index = group_indices[partition];
+            let schema = Arc::clone(&stream_schema);
+            let batch_schema = Arc::clone(&schema);
+            let batches = stream::once(async move {
+                let batch = reader
+                    .load_entity_columnar_group(layout, group_index, projection)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                RecordBatch::try_new(batch_schema, batch.columns().to_vec())
+                    .map_err(DataFusionError::from)
+            });
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
+        },
+    )
+}
+
+fn entity_columnar_group_indices(
+    manifest: &crate::columnar_row_group::RowGroupManifest,
+    row_filters: &[EntityRowFilter],
+) -> Option<Vec<usize>> {
+    let mut exact_booleans = Vec::new();
+    for filter in row_filters {
+        filter.collect_conjunctive_boolean_equalities(&mut exact_booleans);
+    }
+    if exact_booleans.is_empty() {
+        return Some((0..manifest.groups.len()).collect());
+    }
+    let exact_booleans = exact_booleans
+        .into_iter()
+        .map(|(column, expected)| {
+            manifest
+                .fields
+                .iter()
+                .position(|field| field.name == column)
+                .map(|column_index| (column_index, expected))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let mut selected = Vec::new();
+    for (group_index, group) in manifest.groups.iter().enumerate() {
+        let mut matches = true;
+        for &(column_index, expected) in &exact_booleans {
+            let statistics = &group.columns[column_index];
+            let (
+                Some(crate::columnar_row_group::RowGroupScalar::Boolean(min)),
+                Some(crate::columnar_row_group::RowGroupScalar::Boolean(max)),
+            ) = (&statistics.min, &statistics.max)
+            else {
+                return None;
+            };
+            if statistics.null_count != 0 || min != max {
+                return None;
+            }
+            matches &= *min == expected;
+        }
+        if matches {
+            selected.push(group_index);
+        }
+    }
+    (!selected.is_empty()).then_some(selected)
+}
+
+fn entity_columnar_group_statistics(
+    group: &crate::columnar_row_group::RowGroupStatistics,
+    projection: &[usize],
+    schema: &Schema,
+) -> Statistics {
+    let column_statistics = projection
+        .iter()
+        .map(|&index| {
+            let source = &group.columns[index];
+            ColumnStatistics::new_unknown()
+                .with_null_count(Precision::Exact(source.null_count as usize))
+                .with_min_value(entity_columnar_scalar_precision(source.min.as_ref()))
+                .with_max_value(entity_columnar_scalar_precision(source.max.as_ref()))
+                .with_sum_value(entity_columnar_scalar_precision(source.sum.as_ref()))
+        })
+        .collect();
+    let mut statistics = Statistics::new_unknown(schema);
+    statistics.num_rows = Precision::Exact(group.row_count as usize);
+    statistics.column_statistics = column_statistics;
+    statistics
+}
+
+fn entity_columnar_scalar_precision(
+    value: Option<&crate::columnar_row_group::RowGroupScalar>,
+) -> Precision<ScalarValue> {
+    let value = match value {
+        Some(crate::columnar_row_group::RowGroupScalar::String(value)) => {
+            ScalarValue::Utf8(Some(value.clone()))
+        }
+        Some(crate::columnar_row_group::RowGroupScalar::Int64(value)) => {
+            ScalarValue::Int64(Some(*value))
+        }
+        Some(crate::columnar_row_group::RowGroupScalar::Float64(value)) => {
+            ScalarValue::Float64(Some(*value))
+        }
+        Some(crate::columnar_row_group::RowGroupScalar::Boolean(value)) => {
+            ScalarValue::Boolean(Some(*value))
+        }
+        None => return Precision::Absent,
+    };
+    Precision::Exact(value)
 }
 
 fn contains_like_filter(expr: &Expr) -> bool {
@@ -940,6 +1139,17 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
 
     fn analyze(&self, expr: &Expr) -> Option<EntityRowFilter> {
         match expr {
+            Expr::Column(column) => {
+                let column_name = self.filterable_column_name(&column.name)?;
+                let column = self.spec.visible_column(column_name)?;
+                (column.column_type == EntityColumnType::Boolean).then(|| {
+                    EntityRowFilter::ColumnEq {
+                        column: column_name.to_string(),
+                        column_type: EntityColumnType::Boolean,
+                        value: EntityFilterValue::Boolean(true),
+                    }
+                })
+            }
             Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
                 let left = self.analyze(&binary_expr.left)?;
                 let right = self.analyze(&binary_expr.right)?;
@@ -1050,6 +1260,31 @@ enum EntityRowFilter {
 }
 
 impl EntityRowFilter {
+    fn exact_boolean_equality(&self) -> Option<(&str, bool)> {
+        match self {
+            Self::ColumnEq {
+                column,
+                column_type: EntityColumnType::Boolean,
+                value: EntityFilterValue::Boolean(value),
+            } => Some((column, *value)),
+            _ => None,
+        }
+    }
+
+    fn collect_conjunctive_boolean_equalities<'a>(&'a self, output: &mut Vec<(&'a str, bool)>) {
+        match self {
+            Self::And(left, right) => {
+                left.collect_conjunctive_boolean_equalities(output);
+                right.collect_conjunctive_boolean_equalities(output);
+            }
+            filter => {
+                if let Some(equality) = filter.exact_boolean_equality() {
+                    output.push(equality);
+                }
+            }
+        }
+    }
+
     fn matches_snapshot(&self, snapshot: Option<&JsonValue>, schema_key: &str) -> Result<bool> {
         match self {
             Self::ColumnEq {
@@ -3167,5 +3402,76 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
         assert!(error.message.contains("count"), "{error:?}");
         assert!(error.message.contains("BIGINT"), "{error:?}");
+    }
+
+    #[test]
+    fn columnar_pruning_applies_exact_boolean_conjunct_with_residual_filter() {
+        let snapshots = [
+            serde_json::json!({"active": true, "lane": "a"}),
+            serde_json::json!({"active": false, "lane": "a"}),
+            serde_json::json!({"active": true, "lane": "b"}),
+            serde_json::json!({"active": false, "lane": "b"}),
+        ];
+        let encoded =
+            crate::live_state::encode_entity_scalar_row_groups("fixture", snapshots.iter())
+                .expect("encode")
+                .expect("scalar sidecar");
+        let filters = vec![
+            super::EntityRowFilter::ColumnEq {
+                column: "active".to_string(),
+                column_type: EntityColumnType::Boolean,
+                value: super::EntityFilterValue::Boolean(true),
+            },
+            super::EntityRowFilter::ColumnIn {
+                column: "lane".to_string(),
+                column_type: EntityColumnType::String,
+                values: vec![super::EntityFilterValue::String("a".to_string())],
+            },
+        ];
+
+        let selected = super::entity_columnar_group_indices(&encoded.manifest, &filters)
+            .expect("boolean groups are exact");
+        assert!(!selected.is_empty());
+        let active_index = encoded
+            .manifest
+            .fields
+            .iter()
+            .position(|field| field.name == "active")
+            .expect("active column");
+        assert!(selected.into_iter().all(|group_index| {
+            matches!(
+                encoded.manifest.groups[group_index].columns[active_index].min,
+                Some(crate::columnar_row_group::RowGroupScalar::Boolean(true))
+            )
+        }));
+    }
+
+    #[test]
+    fn columnar_projection_rejects_raw_utf8_for_json_surface_column() {
+        let spec = derive_entity_surface_spec_from_schema(&serde_json::json!({
+            "x-lix-key": "json_payload",
+            "type": "object",
+            "properties": { "payload": { "type": ["string", "object", "null"] } }
+        }))
+        .expect("schema");
+        let snapshot = serde_json::json!({"payload": "literal"});
+        let encoded = crate::live_state::encode_entity_scalar_row_groups(
+            "json_payload",
+            std::iter::once(&snapshot),
+        )
+        .expect("encode")
+        .expect("observed scalar layout");
+        let full_schema = entity_surface_schema(&spec, EntitySurfaceShape::Active);
+        let payload_schema = Arc::new(Schema::new(vec![
+            full_schema
+                .field_with_name("payload")
+                .expect("payload field")
+                .clone(),
+        ]));
+
+        assert!(
+            super::entity_columnar_projection(&encoded.manifest, &payload_schema, &spec).is_none(),
+            "canonical JSON text must continue through the authoritative decoder"
+        );
     }
 }
