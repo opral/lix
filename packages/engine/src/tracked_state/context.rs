@@ -5157,33 +5157,36 @@ mod tests {
 
     #[tokio::test]
     async fn dense_ordered_parent_merge_is_canonical_and_reads_staged_parent_chunks() {
+        const PARENT_ROW_COUNT: usize = 8_194;
+        const UPDATED_ROW_COUNT: usize = 4_097;
+        const NEW_ROW_COUNT: usize = 4_097;
         let bulk_storage = StorageAdapter::new(Memory::new());
         let generic_storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let parent_commit_id = CommitId::for_test_label("dense-parent").to_string();
         let child_commit_id = CommitId::for_test_label("dense-child").to_string();
 
-        let parent_rows = (0..192)
+        let parent_rows = (0..PARENT_ROW_COUNT)
             .map(|index| {
                 row(
-                    &format!("entity-{index:03}"),
-                    &format!("change-parent-{index:03}"),
+                    &format!("entity-{index:05}"),
+                    &format!("change-parent-{index:05}"),
                     "dense-parent",
                 )
             })
             .collect::<Vec<_>>();
-        let mut child_rows = (0..96)
+        let mut child_rows = (0..UPDATED_ROW_COUNT)
             .map(|index| {
                 row(
-                    &format!("entity-{index:03}"),
-                    &format!("change-child-{index:03}"),
+                    &format!("entity-{index:05}"),
+                    &format!("change-child-{index:05}"),
                     "dense-child",
                 )
             })
-            .chain((0..96).map(|index| {
+            .chain((0..NEW_ROW_COUNT).map(|index| {
                 row(
-                    &format!("entity-{index:03}-new"),
-                    &format!("change-child-new-{index:03}"),
+                    &format!("entity-{index:05}-new"),
+                    &format!("change-child-new-{index:05}"),
                     "dense-child",
                 )
             }))
@@ -5302,7 +5305,7 @@ mod tests {
                 &TrackedStateKey {
                     schema_key: "test_schema".to_string(),
                     file_id: None,
-                    entity_pk: EntityPk::single("entity-000"),
+                    entity_pk: EntityPk::single("entity-00000"),
                 },
             )
             .await
