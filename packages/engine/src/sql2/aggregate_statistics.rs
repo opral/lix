@@ -80,6 +80,11 @@ fn optimizable_partial_aggregate(plan: &dyn ExecutionPlan) -> Option<Arc<dyn Exe
             && partial.mode().input_mode() == AggregateInputMode::Raw
             && partial.group_expr().is_empty()
             && partial.filter_expr().iter().all(Option::is_none)
+            // An operator tree that changes rows can expose exact-looking
+            // column statistics that do not prove the aggregate over its
+            // output. Restrict this shortcut to a leaf source whose
+            // statistics apply directly to every consumed row.
+            && partial.input().children().is_empty()
         {
             return Some(child);
         }

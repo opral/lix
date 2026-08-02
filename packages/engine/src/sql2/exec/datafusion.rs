@@ -3859,6 +3859,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filtered_sum_does_not_use_unfiltered_exact_statistics() {
+        let storage = Memory::new();
+        let init_receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage).await.expect("engine should open");
+        let session = engine
+            .open_session(init_receipt.main_branch_id)
+            .await
+            .expect("session should open");
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"aggregate_filter_test\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"integer\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}'),\
+                 false, false)",
+                &[],
+            )
+            .await
+            .expect("test schema should register");
+        session
+            .execute(
+                "INSERT INTO aggregate_filter_test (id, value) VALUES ('a', 10), ('b', 20)",
+                &[],
+            )
+            .await
+            .expect("test rows should insert");
+
+        let result = session
+            .execute(
+                "SELECT SUM(value) AS total, AVG(value) AS average \
+                 FROM aggregate_filter_test WHERE value < 0",
+                &[],
+            )
+            .await
+            .expect("filtered aggregate should execute");
+
+        assert_eq!(result.rows()[0].values(), &[Value::Null, Value::Null]);
+    }
+
+    #[tokio::test]
     async fn execute_sql_rejects_extra_parameters() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
