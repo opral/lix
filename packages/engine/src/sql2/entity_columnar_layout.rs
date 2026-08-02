@@ -82,6 +82,134 @@ where
     ))
 }
 
+/// Encodes the certified `{path, value}` replacement shape directly from its
+/// typed identity column and canonical JSON-value arena. This is physically
+/// equivalent to projecting the completed snapshot objects below, without a
+/// second JSON parse of every row at commit time.
+pub(crate) fn encode_certified_path_value_row_groups(
+    spec: &EntitySurfaceSpec,
+    entity_pks: &[EntityPk],
+    canonical_value_arena: &[u8],
+    value_offsets: &[(usize, usize)],
+) -> Result<Option<EncodedEntityRowGroups>, LixError> {
+    if entity_pks.is_empty() {
+        return Ok(None);
+    }
+    if !spec.certifies_path_value_replacement
+        || entity_pks.len() != value_offsets.len()
+        || spec.columns.len() != 2
+        || !spec.columns.iter().any(|column| column.name == "path")
+        || !spec.columns.iter().any(|column| column.name == "value")
+    {
+        return Err(entity_columnar_error(
+            "certified path/value projection does not match its entity schema",
+        ));
+    }
+
+    // Like the generic encoder, this is only a derived acceleration
+    // structure. Once the certified shape is established, projection and
+    // physical-limit failures must fall back to the authoritative JSON rows
+    // instead of rejecting the transaction.
+    Ok(optional_derived_row_group_set(
+        encode_certified_path_value_row_groups_impl(
+            spec,
+            entity_pks,
+            canonical_value_arena,
+            value_offsets,
+        ),
+    ))
+}
+
+fn encode_certified_path_value_row_groups_impl(
+    spec: &EntitySurfaceSpec,
+    entity_pks: &[EntityPk],
+    canonical_value_arena: &[u8],
+    value_offsets: &[(usize, usize)],
+) -> Result<EncodedEntityRowGroups, LixError> {
+    let mut fields = entity_visible_fields(spec);
+    fields.push(Field::new(
+        ENTITY_COLUMNAR_ENTITY_PK_FIELD,
+        DataType::Utf8,
+        false,
+    ));
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_string(),
+        spec.columnar_layout_fingerprint(),
+    );
+    metadata.insert(
+        ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY.to_string(),
+        "true".to_owned(),
+    );
+    let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+    let mut batches = Vec::with_capacity(entity_pks.len().div_ceil(ROW_GROUP_MAX_ROWS));
+    let mut input_locations = Vec::with_capacity(entity_pks.len());
+
+    for (group_index, start) in (0..entity_pks.len())
+        .step_by(ROW_GROUP_MAX_ROWS)
+        .enumerate()
+    {
+        let end = start
+            .saturating_add(ROW_GROUP_MAX_ROWS)
+            .min(entity_pks.len());
+        let paths = entity_pks[start..end]
+            .iter()
+            .map(EntityPk::as_single_string)
+            .collect::<Result<Vec<_>, _>>()?;
+        let values = value_offsets[start..end]
+            .iter()
+            .map(|&(value_start, value_end)| {
+                canonical_value_arena
+                    .get(value_start..value_end)
+                    .ok_or_else(|| entity_columnar_error("canonical value offset is out of bounds"))
+                    .and_then(|value| {
+                        std::str::from_utf8(value).map_err(|_| {
+                            entity_columnar_error("canonical value arena is not UTF-8")
+                        })
+                    })
+                    .map(|value| (value != "null").then_some(value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let path_column: ArrayRef = Arc::new(StringArray::from(paths));
+        let value_column: ArrayRef = Arc::new(StringArray::from(values));
+        let mut columns = spec
+            .columns
+            .iter()
+            .map(|column| match column.name.as_str() {
+                "path" => Ok(Arc::clone(&path_column)),
+                "value" => Ok(Arc::clone(&value_column)),
+                _ => Err(entity_columnar_error(
+                    "certified path/value projection contains an unexpected column",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let entity_pk_json = entity_pks[start..end]
+            .iter()
+            .map(EntityPk::as_json_array_text)
+            .collect::<Result<Vec<_>, _>>()?;
+        columns.push(Arc::new(StringArray::from(entity_pk_json)));
+        batches.push(
+            RecordBatch::try_new(Arc::clone(&schema), columns)
+                .map_err(|error| entity_columnar_error(error.to_string()))?,
+        );
+        let group_index = u32::try_from(group_index)
+            .map_err(|_| entity_columnar_error("row-group index exceeds u32"))?;
+        for row_index in 0..end - start {
+            input_locations.push(RowGroupRowLocation {
+                group_index,
+                row_index: u32::try_from(row_index)
+                    .map_err(|_| entity_columnar_error("row index exceeds u32"))?,
+            });
+        }
+    }
+
+    let encoded = encode_row_group_set_preserving_batches(&spec.schema_key, schema, &batches)?;
+    Ok(EncodedEntityRowGroups {
+        encoded,
+        input_locations,
+    })
+}
+
 fn encode_registered_entity_row_groups_impl<'a, I>(
     spec: &EntitySurfaceSpec,
     rows: I,
@@ -335,6 +463,94 @@ mod tests {
         assert_eq!(
             identities,
             std::collections::BTreeSet::from([r#"["a",1]"#, r#"["b",2]"#])
+        );
+    }
+
+    #[test]
+    fn certified_path_value_projection_matches_generic_physical_layout() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "json_pointer",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        }))
+        .expect("path/value spec");
+        let identities = [
+            EntityPk::single("/a"),
+            EntityPk::single("/b"),
+            EntityPk::single("/c"),
+        ];
+        let snapshots = [
+            json!({"path":"/a","value":{"x":1}}),
+            json!({"path":"/b","value":null}),
+            json!({"path":"/c","value":"hello"}),
+        ];
+        let canonical_snapshots = snapshots
+            .iter()
+            .map(JsonValue::to_string)
+            .collect::<Vec<_>>();
+        let generic = encode_registered_entity_row_groups(
+            &spec,
+            identities
+                .iter()
+                .zip(&snapshots)
+                .zip(&canonical_snapshots)
+                .map(|((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
+                    entity_pk,
+                    snapshot_bytes: canonical.as_bytes(),
+                    snapshot_value: snapshot,
+                }),
+        )
+        .expect("generic encoding")
+        .expect("generic row groups");
+
+        let canonical_values = br#"{"x":1}null"hello""#;
+        let direct = encode_certified_path_value_row_groups(
+            &spec,
+            &identities,
+            canonical_values,
+            &[(0, 7), (7, 11), (11, 18)],
+        )
+        .expect("certified encoding")
+        .expect("certified row groups");
+
+        assert_eq!(direct.manifest, generic.manifest);
+        assert_eq!(direct.input_locations, generic.input_locations);
+    }
+
+    #[test]
+    fn certified_projection_failure_falls_back_to_authoritative_rows() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "json_pointer",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        }))
+        .expect("path/value spec");
+
+        assert!(
+            encode_certified_path_value_row_groups(
+                &spec,
+                &[EntityPk::single("/a")],
+                b"null",
+                &[(0, 5)],
+            )
+            .expect("derived projection failure must not reject the authoritative update")
+            .is_none()
         );
     }
 

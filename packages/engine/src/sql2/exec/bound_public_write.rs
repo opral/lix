@@ -31,9 +31,9 @@ use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::transaction::types::{
-    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
-    CertifiedRawWriteBatchPreparation, PreparedRowFacts, RawWriteBatch, RawWriteRowRef,
-    TransactionJson, TransactionWrite, TransactionWriteMode,
+    CertifiedEntityColumnarBatch, CertifiedParameterInsertBatch,
+    CertifiedParameterReplacementBatch, CertifiedRawWriteBatchPreparation, PreparedRowFacts,
+    RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
 use crate::wasm::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
@@ -988,6 +988,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         candidates.len()
     };
     let mut snapshot_offsets = Vec::with_capacity(replacement_capacity);
+    let mut value_offsets = Vec::with_capacity(replacement_capacity);
     let mut replacement_entity_pks = Vec::with_capacity(replacement_capacity);
     let mut affected_by_statement = vec![0_u64; row_count];
     let mut candidate_index = 0;
@@ -1029,6 +1030,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         append_canonical_json_string(&mut normalized, entity_pk.as_single_string()?)
             .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
         normalized.extend_from_slice(b",\"value\":");
+        let value_start = normalized.len();
         match parameter_batch.value(replacement.value_param_index, statement_index) {
             DirectParameterValue::Null => normalized.extend_from_slice(b"null"),
             DirectParameterValue::String(raw) => {
@@ -1040,6 +1042,7 @@ async fn try_execute_direct_path_value_replacement_batch(
                 unreachable!("the certified replacement value parameter is text")
             }
         }
+        value_offsets.push((value_start, normalized.len()));
         normalized.push(b'}');
         snapshot_offsets.push((start, normalized.len()));
         replacement_entity_pks.push(entity_pk.clone());
@@ -1055,9 +1058,34 @@ async fn try_execute_direct_path_value_replacement_batch(
         }
     }
     if !replacement_entity_pks.is_empty() {
+        const CERTIFIED_ENTITY_COLUMNAR_MIN_ROWS: usize = 1_024;
+        let entity_columnar = if complete_collection_replacement
+            && replacement_entity_pks.len() >= CERTIFIED_ENTITY_COLUMNAR_MIN_ROWS
+            && schema_catalog
+                .schema(&spec.schema_key)
+                .is_some_and(crate::schema::materializes_entity_columnar_sidecar)
+        {
+            crate::sql2::encode_certified_path_value_row_groups(
+                &spec,
+                &replacement_entity_pks,
+                &normalized,
+                &value_offsets,
+            )?
+            .map(|encoded| {
+                let (encoded, input_locations) = encoded.into_parts();
+                CertifiedEntityColumnarBatch::new(
+                    encoded,
+                    input_locations,
+                    replacement_entity_pks.len(),
+                )
+            })
+            .transpose()?
+        } else {
+            None
+        };
         let snapshots =
             TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
-        let rows = CertifiedParameterReplacementBatch::new(
+        let mut rows = CertifiedParameterReplacementBatch::new(
             replacement_entity_pks,
             snapshots,
             spec.schema_key.as_str().into(),
@@ -1072,6 +1100,9 @@ async fn try_execute_direct_path_value_replacement_batch(
                 complete_collection_replacement,
             },
         )?;
+        if let Some(entity_columnar) = entity_columnar {
+            rows = rows.with_entity_columnar(entity_columnar);
+        }
         ctx.stage_certified_parameter_batch_replace(rows)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",

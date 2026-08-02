@@ -86,6 +86,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_RETIREMENTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static CERTIFIED_ENTITY_COLUMNAR_REUSES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -102,6 +104,11 @@ pub(crate) fn take_complete_replacement_packed_current_base_publications() -> us
 #[cfg(test)]
 pub(crate) fn take_complete_replacement_packed_current_base_retirements() -> usize {
     COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_RETIREMENTS.with(|retirements| retirements.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_certified_entity_columnar_reuses() -> usize {
+    CERTIFIED_ENTITY_COLUMNAR_REUSES.with(|reuses| reuses.replace(0))
 }
 
 /// Commits prepared transaction rows into tracked history and unified current
@@ -4076,6 +4083,31 @@ fn prepare_entity_columnar_write_sets(
         state_rows.certified_complete_collection_replacement() && insert_selection.is_empty();
     if !publishes_ordered_insert && !publishes_complete_replacement {
         return Ok(crate::live_state::EntityColumnarWriteSets::new());
+    }
+    if publishes_complete_replacement
+        && let Some((commit_id, schema_key, certified)) =
+            state_rows.dense_certified_entity_columnar()
+    {
+        if certified.input_locations().len() != state_rows.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified entity columnar coordinates lost row alignment before commit",
+            ));
+        }
+        let mut encoded =
+            crate::live_state::EntityColumnarWriteSets::with_state_row_count(state_rows.len());
+        for (state_row_index, &location) in certified.input_locations().iter().enumerate() {
+            encoded.set_state_row_location(state_row_index, location);
+        }
+        encoded.insert(
+            (commit_id, schema_key.to_string()),
+            certified.encoded().clone(),
+        );
+        #[cfg(test)]
+        CERTIFIED_ENTITY_COLUMNAR_REUSES.with(|reuses| {
+            reuses.set(reuses.get().saturating_add(1));
+        });
+        return Ok(encoded);
     }
     if (publishes_ordered_insert || publishes_complete_replacement)
         && let Some((commit_id, schema_key, snapshots)) = state_rows.dense_entity_columnar_input()
