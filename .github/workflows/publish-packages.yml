@@ -101,11 +101,11 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install LLVM build dependencies
+      - name: Install Linux native build dependencies
         if: startsWith(matrix.suffix, 'linux-')
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-dev libclang-dev clang
+          sudo apt-get install -y llvm-dev libclang-dev clang mold
 
       - name: Install LLVM build dependencies (Windows)
         if: matrix.suffix == 'win32-x64'
@@ -161,10 +161,10 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install LLVM build dependencies
+      - name: Install native and WebAssembly host build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-dev libclang-dev clang
+          sudo apt-get install -y llvm-dev libclang-dev clang mold
 
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
