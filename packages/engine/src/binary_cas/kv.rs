@@ -3269,7 +3269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_rejects_chunk_bytes_that_do_not_match_manifest_hash() {
+    async fn immutable_storage_rejects_chunk_bytes_that_do_not_match_identity() {
         let storage = StorageAdapter::new(Memory::new());
         let data = b"same length";
         let corrupted = b"SAME length";
@@ -3293,24 +3293,21 @@ mod tests {
                 corrupted.len() as u64,
                 corrupted,
             );
-            storage
+            let error = storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
-                .expect("corrupt manifest should overwrite");
+                .expect_err("corrupt immutable chunk must not overwrite");
+            assert!(error.to_string().contains("immutable identity"));
         }
 
         let store = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let error = load_bytes_many(&store, &[blob_hash])
+        let loaded = load_bytes_many(&store, &[blob_hash])
             .await
-            .expect_err("corrupt chunk should be rejected");
-        assert!(
-            error
-                .message
-                .contains("failed content-address verification")
-        );
+            .expect("original chunk remains readable");
+        assert_eq!(loaded.into_vec(), vec![Some(data.to_vec())]);
     }
     #[test]
     fn decode_rejects_same_length_raw_bytes_for_wrong_hash() {

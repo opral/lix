@@ -243,7 +243,7 @@ where
 
     async fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {
@@ -274,7 +274,11 @@ impl<W> StorageWrite for CountingWrite<W>
 where
     W: StorageWrite,
 {
-    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), StorageError> {
+    async fn put_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.write_batches += 1;
@@ -288,7 +292,7 @@ where
         self.inner.put_many(space, entries).await
     }
 
-    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), StorageError> {
+    async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.write_batches += 1;
@@ -298,7 +302,11 @@ where
         self.inner.delete_many(space, keys).await
     }
 
-    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), StorageError> {
+    async fn delete_range(
+        &mut self,
+        space: StorageSpace,
+        range: KeyRange,
+    ) -> Result<(), StorageError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.write_batches += 1;

@@ -48,7 +48,7 @@ fn single_key_get_many_preserves_snapshot_and_projection_semantics() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
     let storage = RocksDB::open(&path).expect("open storage");
-    let space = StorageSpace::immutable(SpaceId(7), "test.immutable");
+    let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
     let key = Key(Bytes::from_static(b"tracked-key"));
 
     put_one(

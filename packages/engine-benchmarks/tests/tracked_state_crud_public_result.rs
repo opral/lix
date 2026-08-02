@@ -16,8 +16,24 @@ mod workload;
 
 use workload::WorkloadRow;
 
-#[tokio::test]
-async fn standalone_sqlite_public_results_match_every_lix_adapter() {
+#[test]
+fn standalone_sqlite_public_results_match_every_lix_adapter() {
+    std::thread::Builder::new()
+        .name("tracked-state-public-result".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build parity-test runtime")
+                .block_on(standalone_sqlite_public_results_match_every_lix_adapter_async());
+        })
+        .expect("spawn parity-test thread")
+        .join()
+        .expect("join parity-test thread");
+}
+
+async fn standalone_sqlite_public_results_match_every_lix_adapter_async() {
     let rows = [
         WorkloadRow {
             path: "/alpha".to_string(),
