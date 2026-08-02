@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{fmt::Write as _, ops::Range};
 
 use lix_engine::{Engine, ExecuteBatchStatement, ExecuteResult, SessionContext, Storage, Value};
 
@@ -23,6 +24,92 @@ const GENERAL_AGGREGATE_SQL: &str = "SELECT COUNT(*) AS rows, MIN(path) AS first
 type SharedParameterBatch = Arc<[Arc<[Value]>]>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OlapReadShape {
+    Scan,
+    Filter,
+    Sort,
+    Group,
+    Aggregate,
+}
+
+impl OlapReadShape {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Scan,
+        Self::Filter,
+        Self::Sort,
+        Self::Group,
+        Self::Aggregate,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Scan => "olap_scan",
+            Self::Filter => "olap_filter",
+            Self::Sort => "olap_sort",
+            Self::Group => "olap_group",
+            Self::Aggregate => "olap_aggregate",
+        }
+    }
+
+    pub(crate) const fn sql(self) -> &'static str {
+        match self {
+            Self::Scan => {
+                "WITH source AS (SELECT id, ordinal, lane, score, active FROM olap_row) \
+                 SELECT id, ordinal, lane, score, active FROM source WHERE ordinal >= 0"
+            }
+            Self::Filter => {
+                "WITH source AS (SELECT id, ordinal, lane, score, active FROM olap_row) \
+                 SELECT ordinal, lane, score FROM source \
+                 WHERE active = TRUE AND lane IN ('lane-07', 'lane-19') ORDER BY ordinal"
+            }
+            Self::Sort => {
+                "WITH source AS (SELECT id, ordinal, lane, score, active FROM olap_row) \
+                 SELECT id, ordinal, score FROM source WHERE active = TRUE \
+                 ORDER BY score DESC, ordinal ASC LIMIT 10000"
+            }
+            Self::Group => {
+                "WITH source AS (SELECT id, ordinal, lane, score, active FROM olap_row) \
+                 SELECT lane, COUNT(*) AS rows, SUM(ordinal) AS ordinal_sum, \
+                 AVG(score) AS score_avg, MIN(score) AS score_min, MAX(score) AS score_max \
+                 FROM source WHERE active = TRUE GROUP BY lane ORDER BY lane"
+            }
+            Self::Aggregate => {
+                "WITH source AS (SELECT id, ordinal, lane, score, active FROM olap_row) \
+                 SELECT COUNT(*) AS rows, SUM(ordinal) AS ordinal_sum, AVG(score) AS score_avg, \
+                 MIN(ordinal) AS min_ordinal, MAX(ordinal) AS max_ordinal \
+                 FROM source WHERE active = TRUE"
+            }
+        }
+    }
+
+    pub(crate) fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|shape| shape.label() == label)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OlapGroupExpected {
+    rows: i64,
+    ordinal_sum: i64,
+    score_sum: f64,
+    score_min: f64,
+    score_max: f64,
+}
+
+#[derive(Clone, Debug)]
+struct OlapExpected {
+    active_rows: i64,
+    active_ordinal_sum: i64,
+    active_score_sum: f64,
+    active_min_ordinal: i64,
+    active_max_ordinal: i64,
+    filtered_rows: usize,
+    filtered_first_ordinal: i64,
+    filtered_last_ordinal: i64,
+    groups: [OlapGroupExpected; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UntrackedFixture {
     None,
     OneUnrelated,
@@ -33,6 +120,7 @@ enum UntrackedFixture {
 enum FixtureShape {
     FullCrud,
     BoundUpdate,
+    Olap,
 }
 
 enum LiteralUpdateWorkload {
@@ -63,6 +151,7 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage + 'static> {
     read_many_by_pk_count: usize,
     bound_insert_all_batch: SharedParameterBatch,
     bound_seed_json_batch: SharedParameterBatch,
+    olap_expected: Option<OlapExpected>,
     select_all_sql: String,
     select_many_by_pk_sql: String,
     select_one_by_pk_sql: String,
@@ -140,9 +229,36 @@ pub(crate) async fn seeded_fixture_with_read_many_pk_count(
     rows: &[WorkloadRow],
     read_many_by_pk_count: usize,
 ) -> SqlFixture {
-    let fixture = empty_fixture_with_read_many_pk_count(profile, rows, read_many_by_pk_count).await;
-    fixture.seed_json_rows().await;
-    fixture.insert_untracked_probe().await;
+    let fixture = if selected_olap_read_shape().is_some() {
+        assert!(
+            std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_UNTRACKED").is_none(),
+            "typed OLAP profiles do not include the unrelated json_pointer overlay fixture"
+        );
+        empty_fixture_with_shape(profile, rows, read_many_by_pk_count, FixtureShape::Olap).await
+    } else {
+        empty_fixture_with_read_many_pk_count(profile, rows, read_many_by_pk_count).await
+    };
+    fixture.seed_rows().await;
+    if selected_olap_read_shape().is_none() {
+        fixture.insert_untracked_probe().await;
+    }
+    fixture
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) async fn seeded_olap_fixture(
+    profile: StorageProfile,
+    rows: &[WorkloadRow],
+) -> SqlFixture {
+    let fixture = empty_fixture_with_shape(
+        profile,
+        rows,
+        READ_MANY_PK_COUNT.min(rows.len()),
+        FixtureShape::Olap,
+    )
+    .await;
+    fixture.seed_rows().await;
     fixture
 }
 
@@ -160,7 +276,7 @@ pub(crate) async fn seeded_bound_update_fixture_with_read_many_pk_count(
     )
     .await;
     fixture.install_bound_seed_batch(rows);
-    fixture.seed_json_rows().await;
+    fixture.seed_rows().await;
     fixture.insert_untracked_probe().await;
     fixture.release_bound_update_setup();
     fixture.install_bound_update_batch(crate::workload::fixture_update_rows(row_count));
@@ -204,12 +320,12 @@ impl SqlFixture {
         }
     }
 
-    async fn seed_json_rows(&self) {
+    async fn seed_rows(&self) {
         match self {
-            Self::SQLite(fixture) => fixture.seed_json_rows().await,
-            Self::RocksDB(fixture) => fixture.seed_json_rows().await,
+            Self::SQLite(fixture) => fixture.seed_rows().await,
+            Self::RocksDB(fixture) => fixture.seed_rows().await,
             #[cfg(feature = "slatedb")]
-            Self::SlateDB(fixture) => fixture.seed_json_rows().await,
+            Self::SlateDB(fixture) => fixture.seed_rows().await,
         }
     }
 
@@ -223,13 +339,19 @@ impl SqlFixture {
     }
 
     pub(crate) async fn read_all(&self) -> usize {
-        match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE").as_deref() {
+        let shape = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE");
+        if let Ok(label) = shape.as_deref()
+            && let Some(shape) = OlapReadShape::from_label(label)
+        {
+            return self.read_olap(shape).await;
+        }
+        match shape.as_deref() {
             Ok("aggregate_count") => return self.count_all().await,
             Ok("general_filter_sort") => return self.general_filter_sort_all().await,
             Ok("general_aggregate") => return self.general_aggregate().await,
             Ok("full_result") | Err(_) => {}
             Ok(other) => panic!(
-                "unknown LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE '{other}'; expected full_result, aggregate_count, general_filter_sort, or general_aggregate"
+                "unknown LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE '{other}'; expected full_result, aggregate_count, general_filter_sort, general_aggregate, olap_scan, olap_filter, olap_sort, olap_group, or olap_aggregate"
             ),
         }
         match self {
@@ -267,6 +389,15 @@ impl SqlFixture {
             Self::RocksDB(fixture) => fixture.general_aggregate().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.general_aggregate().await,
+        }
+    }
+
+    pub(crate) async fn read_olap(&self, shape: OlapReadShape) -> usize {
+        match self {
+            Self::SQLite(fixture) => fixture.read_olap(shape).await,
+            Self::RocksDB(fixture) => fixture.read_olap(shape).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.read_olap(shape).await,
         }
     }
 
@@ -443,7 +574,11 @@ where
         affected as usize
     }
 
-    async fn seed_json_rows(&self) {
+    async fn seed_rows(&self) {
+        if self.olap_expected.is_some() {
+            self.seed_olap_rows().await;
+            return;
+        }
         let affected = self
             .session
             .execute_homogeneous_write_batch(
@@ -456,6 +591,32 @@ where
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
         assert_eq!(affected as usize, self.row_count);
+    }
+
+    async fn seed_olap_rows(&self) {
+        const ROWS_PER_STATEMENT: usize = 4_096;
+        let mut transaction = self
+            .session
+            .begin_transaction()
+            .await
+            .expect("begin typed OLAP seed transaction");
+        let mut affected = 0_u64;
+        for start in (0..self.row_count).step_by(ROWS_PER_STATEMENT) {
+            let end = (start + ROWS_PER_STATEMENT).min(self.row_count);
+            affected += transaction
+                .execute(&olap_insert_sql(start..end), &[])
+                .await
+                .expect("execute typed OLAP seed statement")
+                .rows_affected();
+        }
+        transaction
+            .commit()
+            .await
+            .expect("commit typed OLAP seed transaction");
+        assert_eq!(
+            usize::try_from(affected).expect("OLAP affected rows fit usize"),
+            self.row_count
+        );
     }
 
     async fn read_all(&self) -> usize {
@@ -492,6 +653,36 @@ where
             Some(&Value::Integer(self.visible_row_count as i64))
         );
         1
+    }
+
+    async fn read_olap(&self, shape: OlapReadShape) -> usize {
+        let expected = self
+            .olap_expected
+            .as_ref()
+            .expect("typed OLAP query requires a typed OLAP fixture");
+        let result = std::hint::black_box(execute(&self.session, shape.sql()).await);
+        match shape {
+            OlapReadShape::Scan => {
+                assert_eq!(
+                    result.columns(),
+                    ["id", "ordinal", "lane", "score", "active"]
+                );
+                assert_eq!(result.len(), self.row_count);
+            }
+            OlapReadShape::Filter => {
+                assert_eq!(result.columns(), ["ordinal", "lane", "score"]);
+                assert_eq!(result.len(), expected.filtered_rows);
+                assert_eq!(integer_at(&result, 0, 0), expected.filtered_first_ordinal);
+                assert_eq!(
+                    integer_at(&result, result.len() - 1, 0),
+                    expected.filtered_last_ordinal
+                );
+            }
+            OlapReadShape::Sort => assert_olap_sort(&result, expected),
+            OlapReadShape::Group => assert_olap_group(&result, expected),
+            OlapReadShape::Aggregate => assert_olap_aggregate(&result, expected),
+        }
+        result.len()
     }
 
     async fn insert_untracked_probe(&self) {
@@ -653,6 +844,11 @@ where
     } else {
         rows
     };
+    let olap_expected = if matches!(shape, FixtureShape::Olap) {
+        Some(olap_expected(tracked_rows.len()))
+    } else {
+        None
+    };
     let mid = tracked_rows.len() / 2;
     GenericSqlFixture {
         session,
@@ -688,6 +884,7 @@ where
         } else {
             Arc::from([])
         },
+        olap_expected,
         select_all_sql: "SELECT path, value FROM json_pointer ORDER BY path".to_string(),
         select_many_by_pk_sql: select_many_by_pk_sql(
             rows,
@@ -718,6 +915,200 @@ where
         ),
         _dir: dir,
     }
+}
+
+fn olap_expected(row_count: usize) -> OlapExpected {
+    assert!(
+        row_count >= 20,
+        "typed OLAP fixture needs at least 20 rows to populate both selected lanes"
+    );
+    let mut active_rows = 0_i64;
+    let mut active_ordinal_sum = 0_i64;
+    let mut active_score_sum = 0.0;
+    let mut active_min_ordinal = None;
+    let mut active_max_ordinal = None;
+    let mut filtered_rows = 0;
+    let mut filtered_first_ordinal = None;
+    let mut filtered_last_ordinal = None;
+    let mut groups = [OlapGroupExpected {
+        rows: 0,
+        ordinal_sum: 0,
+        score_sum: 0.0,
+        score_min: f64::INFINITY,
+        score_max: f64::NEG_INFINITY,
+    }; 32];
+
+    for index in 0..row_count {
+        let ordinal = i64::try_from(index).expect("OLAP row ordinal must fit in i64");
+        let lane_index = index % groups.len();
+        #[expect(clippy::cast_precision_loss)]
+        let score = (index % 10_000) as f64 / 8.0;
+        let active = index % 3 != 0;
+        if !active {
+            continue;
+        }
+
+        active_rows += 1;
+        active_ordinal_sum += ordinal;
+        active_score_sum += score;
+        active_min_ordinal.get_or_insert(ordinal);
+        active_max_ordinal = Some(ordinal);
+        let group = &mut groups[lane_index];
+        group.rows += 1;
+        group.ordinal_sum += ordinal;
+        group.score_sum += score;
+        group.score_min = group.score_min.min(score);
+        group.score_max = group.score_max.max(score);
+        if matches!(lane_index, 7 | 19) {
+            filtered_rows += 1;
+            filtered_first_ordinal.get_or_insert(ordinal);
+            filtered_last_ordinal = Some(ordinal);
+        }
+    }
+
+    OlapExpected {
+        active_rows,
+        active_ordinal_sum,
+        active_score_sum,
+        active_min_ordinal: active_min_ordinal.expect("OLAP fixture needs an active row"),
+        active_max_ordinal: active_max_ordinal.expect("OLAP fixture needs an active row"),
+        filtered_rows,
+        filtered_first_ordinal: filtered_first_ordinal
+            .expect("OLAP fixture needs a selected lane row"),
+        filtered_last_ordinal: filtered_last_ordinal
+            .expect("OLAP fixture needs a selected lane row"),
+        groups,
+    }
+}
+
+fn olap_insert_sql(ordinals: Range<usize>) -> String {
+    let mut sql = String::from("INSERT INTO olap_row (id, ordinal, lane, score, active) VALUES ");
+    for (position, ordinal) in ordinals.enumerate() {
+        if position != 0 {
+            sql.push(',');
+        }
+        let lane = ordinal % 32;
+        #[expect(clippy::cast_precision_loss)]
+        let score = (ordinal % 10_000) as f64 / 8.0;
+        let active = if ordinal % 3 == 0 { "FALSE" } else { "TRUE" };
+        write!(
+            sql,
+            "('/~lix-olap/{ordinal:09}', {ordinal}, 'lane-{lane:02}', {score}, {active})"
+        )
+        .expect("write typed OLAP INSERT SQL");
+    }
+    sql
+}
+
+fn assert_olap_sort(result: &ExecuteResult, expected: &OlapExpected) {
+    assert_eq!(result.columns(), ["id", "ordinal", "score"]);
+    assert_eq!(result.len(), 10_000.min(expected.active_rows as usize));
+    let mut previous = None;
+    for row_index in 0..result.len() {
+        let ordinal = integer_at(result, row_index, 1);
+        let score = real_at(result, row_index, 2);
+        assert_ne!(ordinal % 3, 0, "sorted result must retain active rows only");
+        assert_eq!(
+            text_at(result, row_index, 0),
+            format!("/~lix-olap/{ordinal:09}")
+        );
+        #[expect(clippy::cast_precision_loss)]
+        let expected_score = (ordinal.rem_euclid(10_000)) as f64 / 8.0;
+        assert_eq!(score, expected_score);
+        if let Some((previous_score, previous_ordinal)) = previous {
+            assert!(
+                previous_score > score || (previous_score == score && previous_ordinal < ordinal),
+                "OLAP top-k must be ordered by score DESC, ordinal ASC"
+            );
+        }
+        previous = Some((score, ordinal));
+    }
+}
+
+fn assert_olap_group(result: &ExecuteResult, expected: &OlapExpected) {
+    assert_eq!(
+        result.columns(),
+        [
+            "lane",
+            "rows",
+            "ordinal_sum",
+            "score_avg",
+            "score_min",
+            "score_max"
+        ]
+    );
+    assert_eq!(result.len(), expected.groups.len());
+    let mut total_rows = 0;
+    let mut total_ordinal_sum = 0;
+    for (lane_index, group) in expected.groups.iter().enumerate() {
+        assert_eq!(
+            text_at(result, lane_index, 0),
+            format!("lane-{lane_index:02}")
+        );
+        assert_eq!(integer_at(result, lane_index, 1), group.rows);
+        assert_eq!(integer_at(result, lane_index, 2), group.ordinal_sum);
+        assert_close(
+            real_at(result, lane_index, 3),
+            group.score_sum / group.rows as f64,
+        );
+        assert_eq!(real_at(result, lane_index, 4), group.score_min);
+        assert_eq!(real_at(result, lane_index, 5), group.score_max);
+        total_rows += group.rows;
+        total_ordinal_sum += group.ordinal_sum;
+    }
+    assert_eq!(total_rows, expected.active_rows);
+    assert_eq!(total_ordinal_sum, expected.active_ordinal_sum);
+}
+
+fn assert_olap_aggregate(result: &ExecuteResult, expected: &OlapExpected) {
+    assert_eq!(
+        result.columns(),
+        [
+            "rows",
+            "ordinal_sum",
+            "score_avg",
+            "min_ordinal",
+            "max_ordinal"
+        ]
+    );
+    assert_eq!(result.len(), 1);
+    assert_eq!(integer_at(result, 0, 0), expected.active_rows);
+    assert_eq!(integer_at(result, 0, 1), expected.active_ordinal_sum);
+    assert_close(
+        real_at(result, 0, 2),
+        expected.active_score_sum / expected.active_rows as f64,
+    );
+    assert_eq!(integer_at(result, 0, 3), expected.active_min_ordinal);
+    assert_eq!(integer_at(result, 0, 4), expected.active_max_ordinal);
+}
+
+fn integer_at(result: &ExecuteResult, row: usize, column: usize) -> i64 {
+    match result.rows()[row].get_index(column) {
+        Some(Value::Integer(value)) => *value,
+        value => panic!("expected integer at row {row}, column {column}, got {value:?}"),
+    }
+}
+
+fn real_at(result: &ExecuteResult, row: usize, column: usize) -> f64 {
+    match result.rows()[row].get_index(column) {
+        Some(Value::Real(value)) => *value,
+        value => panic!("expected real at row {row}, column {column}, got {value:?}"),
+    }
+}
+
+fn text_at(result: &ExecuteResult, row: usize, column: usize) -> &str {
+    match result.rows()[row].get_index(column) {
+        Some(Value::Text(value)) => value,
+        value => panic!("expected text at row {row}, column {column}, got {value:?}"),
+    }
+}
+
+fn assert_close(actual: f64, expected: f64) {
+    let tolerance = 1e-10 * expected.abs().max(1.0);
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "expected {expected} within {tolerance}, got {actual}"
+    );
 }
 
 fn literal_update_workload(shape: FixtureShape, rows: &[WorkloadRow]) -> LiteralUpdateWorkload {
@@ -756,6 +1147,13 @@ fn profile_untracked_fixture() -> UntrackedFixture {
     }
 }
 
+pub(crate) fn selected_olap_read_shape() -> Option<OlapReadShape> {
+    std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE")
+        .ok()
+        .as_deref()
+        .and_then(OlapReadShape::from_label)
+}
+
 async fn prepare_session<StorageImpl>(storage: StorageImpl) -> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -772,6 +1170,7 @@ where
         .expect("open tracked-state crud session");
     register_json_pointer_schema(&session).await;
     register_bulk_insert_schema(&session).await;
+    register_olap_schema(&session).await;
     session
 }
 
@@ -825,6 +1224,35 @@ where
         )
         .await
         .expect("register tracked_crud_insert schema")
+        .rows_affected();
+    assert_eq!(affected, 1);
+}
+
+async fn register_olap_schema<StorageImpl>(session: &SessionContext<StorageImpl>)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let schema = serde_json::json!({
+        "x-lix-key": "olap_row",
+        "x-lix-primary-key": ["/id"],
+        "type": "object",
+        "required": ["id", "ordinal", "lane", "score", "active"],
+        "properties": {
+            "id": { "type": "string" },
+            "ordinal": { "type": "integer" },
+            "lane": { "type": "string" },
+            "score": { "type": "number" },
+            "active": { "type": "boolean" }
+        },
+        "additionalProperties": false
+    });
+    let affected = session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            &[Value::Text(schema.to_string())],
+        )
+        .await
+        .expect("register olap_row schema")
         .rows_affected();
     assert_eq!(affected, 1);
 }

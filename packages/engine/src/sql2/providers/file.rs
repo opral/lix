@@ -108,7 +108,8 @@ use crate::transaction::types::{
 
 use super::spec::{
     DmlApply, DmlPlanOptions, DmlReturning, InsertApply, PlannedDml, PlannedScan, RowSource,
-    TableSpec, finish_scan_batch, register_spec_table, row_source, take_record_batch_rows,
+    TableSpec, finish_scan_batch, register_spec_table, row_source, scan_row_source,
+    take_record_batch_rows,
 };
 use super::upsert::{
     StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertReturningRow, UpsertSupport,
@@ -1142,7 +1143,8 @@ impl TableSpec for LixFileSpec {
         Ok(PlannedScan {
             schema: Arc::clone(&projected_schema),
             ordering,
-            load: row_source(
+            source: scan_row_source(
+                Arc::clone(&projected_schema),
                 (
                     Arc::clone(&self.live_state),
                     Arc::clone(&self.blob_reader),
@@ -8259,7 +8261,9 @@ mod tests {
             .plan_scan(Some(&projection), &[], None, &ExecutionProps::new())
             .await
             .expect("descriptor-only scan should plan");
-        let batch = (planned.load)()
+        let batch = planned
+            .source
+            .load_single_batch()
             .await
             .expect("descriptor-only scan should load");
 
@@ -8341,7 +8345,9 @@ mod tests {
             .await
             .expect("limited descriptor-only scan should plan");
         assert_eq!(planned.ordering.as_deref(), Some("path"));
-        let batch = (planned.load)()
+        let batch = planned
+            .source
+            .load_single_batch()
             .await
             .expect("limited descriptor-only scan should load");
 
@@ -8368,7 +8374,9 @@ mod tests {
             )
             .await
             .expect("count-style descriptor scan should plan");
-        let batch = (planned.load)()
+        let batch = planned
+            .source
+            .load_single_batch()
             .await
             .expect("count-style descriptor scan should load");
         assert_eq!(batch.num_columns(), 0);
@@ -8436,7 +8444,9 @@ mod tests {
             .plan_scan(Some(&projection), &filters, Some(1), &ExecutionProps::new())
             .await
             .expect("by-branch descriptor scan should plan");
-        let batch = (planned.load)()
+        let batch = planned
+            .source
+            .load_single_batch()
             .await
             .expect("by-branch descriptor scan should load");
 
@@ -8524,7 +8534,9 @@ mod tests {
             .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
             .await
             .expect("file-id data scan should plan");
-        let batch = (planned.load)()
+        let batch = planned
+            .source
+            .load_single_batch()
             .await
             .expect("file-id data scan should load");
 
@@ -8781,7 +8793,9 @@ mod tests {
             .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
             .await
             .expect("directory-id scan should plan");
-        let batch = (planned.load)()
+        let batch = planned
+            .source
+            .load_single_batch()
             .await
             .expect("directory-id scan should load");
 
@@ -9072,7 +9086,9 @@ mod tests {
             .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
             .await
             .expect("root-directory scan should plan");
-        let batch = (planned.load)()
+        let batch = planned
+            .source
+            .load_single_batch()
             .await
             .expect("root-directory scan should load");
 

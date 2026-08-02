@@ -20,7 +20,7 @@ use crate::tracked_state::TrackedStateContext;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
-use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
+use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
 pub(super) async fn register_checkpoint_provider<S>(
     session: &datafusion::prelude::SessionContext,
@@ -104,7 +104,8 @@ where
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
-            load: row_source(
+            source: scan_row_source(
+                Arc::clone(&schema),
                 (
                     self.active_branch_id.clone(),
                     Arc::clone(&self.branch_ref),

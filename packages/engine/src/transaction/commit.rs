@@ -240,6 +240,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     {
         deleted_checkpoint_files.remove(&(write.branch_id.clone(), write.file_id.clone()));
     }
+    let mut insert_selection = prepared_writes.insert_selection;
+    let entity_columnar_write_sets =
+        prepare_entity_columnar_write_sets(&state_rows, &insert_selection)?;
     release_validated_canonical_value_columns(&mut state_rows);
     if !prepared_writes.file_data_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
@@ -306,7 +309,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         )
         .await?;
     }
-    let mut insert_selection = prepared_writes.insert_selection;
     let finalized = finalize_commit_rows(
         prepared_writes.commit_change_refs_by_branch,
         prepared_writes.first_commit_parent_override_by_branch,
@@ -551,6 +553,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         read,
         &mut writes,
         &state_rows,
+        &entity_columnar_write_sets,
         &engine_rows,
         &row_index.tracked_row_indices_by_commit,
         &tracked_roots,
@@ -2431,6 +2434,7 @@ async fn stage_tracked_head(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &PreparedStateBatch,
+    entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
     engine_rows: &[EngineCurrentRow],
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
@@ -2747,6 +2751,7 @@ async fn stage_tracked_head(
                         .iter()
                         .map(|&row_index| state_rows.row(row_index))
                         .map(|row| (row.schema_key.as_str(), row.entity_pk)),
+                    entity_columnar_write_sets,
                     working_diff_capture_checkpoint_commit_id,
                     &mut coverage,
                 )
@@ -3847,6 +3852,51 @@ struct ExplicitBranchHeadTarget {
 
 fn release_validated_canonical_value_columns(state_rows: &mut PreparedStateBatch) {
     state_rows.release_validated_canonical_value_columns();
+}
+
+fn prepare_entity_columnar_write_sets(
+    state_rows: &PreparedStateBatch,
+    insert_selection: &PreparedInsertSelection,
+) -> Result<crate::live_state::EntityColumnarWriteSets, LixError> {
+    if state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS || insert_selection.len() != state_rows.len()
+    {
+        return Ok(BTreeMap::new());
+    }
+    let mut indices = BTreeMap::<(CommitId, String), Vec<usize>>::new();
+    for (index, row) in state_rows.iter().enumerate() {
+        if !insert_selection.contains(index) {
+            return Ok(BTreeMap::new());
+        }
+        let (Some(commit_id), Some(_snapshot)) = (row.commit_id, row.snapshot) else {
+            continue;
+        };
+        if row.untracked || row.global || row.file_id.is_some() {
+            continue;
+        }
+        indices
+            .entry((commit_id, row.schema_key.to_string()))
+            .or_default()
+            .push(index);
+    }
+    let mut encoded = BTreeMap::new();
+    for ((commit_id, schema_key), row_indices) in indices {
+        if row_indices.len() < PACKED_CURRENT_BASE_MIN_ROWS {
+            continue;
+        }
+        let snapshots = row_indices.iter().map(|&index| {
+            state_rows
+                .row(index)
+                .snapshot
+                .expect("columnar row index retained a snapshot")
+                .value()
+        });
+        if let Some(row_groups) =
+            crate::live_state::encode_entity_scalar_row_groups(&schema_key, snapshots)?
+        {
+            encoded.insert((commit_id, schema_key), row_groups);
+        }
+    }
+    Ok(encoded)
 }
 
 fn explicit_branch_head_targets(

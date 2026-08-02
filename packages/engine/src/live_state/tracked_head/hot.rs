@@ -4285,6 +4285,58 @@ where
         Ok(rows.into_identity_ordered_primary_keys())
     }
 
+    /// Plans a typed analytical scan only when one immutable packed base is
+    /// the complete current collection and its atomically staged row-group
+    /// sidecar agrees with the publication control.
+    pub(crate) async fn entity_columnar_layout(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+    ) -> Result<
+        Option<(
+            crate::columnar_row_group::RowGroupSetId,
+            crate::columnar_row_group::RowGroupManifest,
+        )>,
+        LixError,
+    > {
+        let collection = load_hot_collection_control(
+            &self.store,
+            branch_id,
+            control.generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: None,
+            },
+        )
+        .await?;
+        if collection.ordered_identity_digest.is_none() {
+            return Ok(None);
+        }
+        let base_refs = packed_exclusive_schema_base_refs(
+            &self.store,
+            branch_id,
+            control.generation,
+            schema_key,
+        )
+        .await?;
+        let [base_ref] = base_refs.as_slice() else {
+            return Ok(None);
+        };
+        let id = crate::live_state::entity_row_group_set_id(base_ref.commit_id, schema_key);
+        let Some(manifest) =
+            crate::columnar_row_group::load_row_group_manifest(&self.store, id).await?
+        else {
+            return Ok(None);
+        };
+        if manifest.namespace != schema_key || manifest.row_count() != collection.live_count {
+            return Err(head_value_error(
+                "entity columnar sidecar disagrees with its collection publication",
+            ));
+        }
+        Ok(Some((id, manifest)))
+    }
+
     #[cfg(test)]
     pub(crate) async fn scan_live_rows_if_current(
         &self,
@@ -5089,6 +5141,7 @@ where
         generation: CommitId,
         new_head: CommitId,
         rows: I,
+        entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError>
@@ -5133,6 +5186,17 @@ where
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+        for schema_key in schema_increments.keys() {
+            if let Some(encoded) =
+                entity_columnar_write_sets.get(&(new_head, (*schema_key).to_string()))
+            {
+                crate::columnar_row_group::stage_row_group_set(
+                    self.writes,
+                    crate::live_state::entity_row_group_set_id(new_head, schema_key),
+                    encoded,
+                )?;
+            }
+        }
         self.stage_packed_insert_current_base_manifest(
             branch_id,
             generation,

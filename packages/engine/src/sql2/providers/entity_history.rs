@@ -36,7 +36,7 @@ use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::entity::{EntityPrimaryKeyFilterAnalyzer, entity_pks_from_primary_key_filters};
-use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
+use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
 pub(super) fn register_entity_history_surface<S>(
     session: &SessionContext,
@@ -126,7 +126,8 @@ where
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
-            load: row_source(
+            source: scan_row_source(
+                Arc::clone(&schema),
                 (
                     Arc::clone(&self.spec),
                     Arc::clone(&self.commit_graph),

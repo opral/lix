@@ -793,6 +793,19 @@ where
     );
     for commit_id in &sweep_commits {
         if let Some(entry) = packed.commits.get(commit_id) {
+            let schema_keys = entry
+                .members
+                .iter()
+                .map(|member| member.key.schema_key.as_str())
+                .collect::<BTreeSet<_>>();
+            for schema_key in schema_keys {
+                crate::columnar_row_group::stage_delete_row_group_set(
+                    store,
+                    writes,
+                    crate::live_state::entity_row_group_set_id(*commit_id, schema_key),
+                )
+                .await?;
+            }
             crate::tracked_state::stage_delete_commit_delta_inventory_entry(
                 writes, *commit_id, entry,
             )?;
@@ -1022,6 +1035,9 @@ mod tests {
     };
     use crate::{Engine, GLOBAL_BRANCH_ID, Value};
     use bytes::Bytes;
+    use datafusion::arrow::array::StringArray;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
 
     use super::{
         CheckpointGcState, CheckpointRecoveryRef, load_checkpoint_gc_state, load_recovery_ref,
@@ -1573,6 +1589,30 @@ mod tests {
         let dead_deltas = commit_delta_refs(dead_commit, &dead_members);
         let dead_locators = stage_commit_deltas(&mut writes, &dead_deltas)
             .expect("dead packed members should stage");
+        let sidecar_schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let sidecar_batch = RecordBatch::try_new(
+            Arc::clone(&sidecar_schema),
+            vec![Arc::new(StringArray::from(vec!["value"]))],
+        )
+        .expect("sidecar batch");
+        let sidecar = crate::columnar_row_group::encode_row_group_set(
+            "authority_gc",
+            sidecar_schema,
+            &[sidecar_batch],
+        )
+        .expect("encode GC sidecar");
+        for commit_id in [live_parent, dead_commit] {
+            crate::columnar_row_group::stage_row_group_set(
+                &mut writes,
+                crate::live_state::entity_row_group_set_id(commit_id, "authority_gc"),
+                &sidecar,
+            )
+            .expect("stage GC sidecar");
+        }
         // Point the shared change at the owner about to be collected. GC must
         // relocate it to the surviving physical copy, not delete the index.
         stage_change_locators(&mut writes, &dead_locators);
@@ -1665,6 +1705,26 @@ mod tests {
             .expect("post-GC packed inventory should scan");
         assert!(inventory.commits.contains_key(&live_parent));
         assert!(!inventory.commits.contains_key(&dead_commit));
+        assert!(
+            crate::columnar_row_group::load_row_group_manifest(
+                &read,
+                crate::live_state::entity_row_group_set_id(live_parent, "authority_gc"),
+            )
+            .await
+            .expect("load live sidecar")
+            .is_some(),
+            "reachable commit sidecars must survive repository GC"
+        );
+        assert!(
+            crate::columnar_row_group::load_row_group_manifest(
+                &read,
+                crate::live_state::entity_row_group_set_id(dead_commit, "authority_gc"),
+            )
+            .await
+            .expect("load swept sidecar")
+            .is_none(),
+            "swept commit sidecars must be removed"
+        );
         drop(read);
         assert!(json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await);
         assert!(

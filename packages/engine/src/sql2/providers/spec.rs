@@ -34,6 +34,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanP
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
+    Statistics,
 };
 use futures_util::future::BoxFuture;
 use futures_util::{TryStreamExt, stream};
@@ -50,6 +51,76 @@ use super::upsert;
 /// Re-invocable: DataFusion may execute a scan node more than once.
 pub(super) type RowSource = Arc<dyn Fn() -> BoxFuture<'static, Result<RecordBatch>> + Send + Sync>;
 
+/// Re-invocable factory for scans that can produce Arrow batches incrementally.
+///
+/// Unlike [`RowSource`], this preserves storage page and row-group boundaries
+/// all the way into DataFusion. The factory itself is synchronous because scan
+/// setup belongs in the returned stream; reads and decoding remain async and
+/// backpressured by the consumer.
+pub(super) type BatchStreamSource =
+    Arc<dyn Fn(usize, Arc<TaskContext>) -> Result<SendableRecordBatchStream> + Send + Sync>;
+
+#[derive(Clone)]
+pub(super) struct ScanSource {
+    partition_count: usize,
+    statistics: Arc<Vec<Statistics>>,
+    open: BatchStreamSource,
+}
+
+impl ScanSource {
+    fn new(
+        schema: &SchemaRef,
+        statistics: Vec<Statistics>,
+        open: impl Fn(usize, Arc<TaskContext>) -> Result<SendableRecordBatchStream>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        let partition_count = statistics.len();
+        assert!(partition_count > 0, "scan source must expose a partition");
+        assert!(statistics.iter().all(|statistics| {
+            statistics.column_statistics.is_empty()
+                || statistics.column_statistics.len() == schema.fields().len()
+        }));
+        Self {
+            partition_count,
+            statistics: Arc::new(statistics),
+            open: Arc::new(open),
+        }
+    }
+
+    fn open(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition >= self.partition_count {
+            return Err(DataFusionError::Execution(format!(
+                "scan source exposes {} partitions, got {partition}",
+                self.partition_count
+            )));
+        }
+        (self.open)(partition, context)
+    }
+}
+
+#[cfg(test)]
+impl ScanSource {
+    pub(super) async fn load_single_batch(&self) -> Result<RecordBatch> {
+        let batches = self
+            .open(0, Arc::new(TaskContext::default()))?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let [batch] = batches.as_slice() else {
+            return Err(DataFusionError::Execution(format!(
+                "test expected one scan batch, got {}",
+                batches.len()
+            )));
+        };
+        Ok(batch.clone())
+    }
+}
+
 /// Build a [`RowSource`] from owned plan-time state and an async body taking
 /// that state by value. Owns the once-per-invocation clone that
 /// re-invocability requires, so specs write the load body with no capture
@@ -64,6 +135,55 @@ where
     Fut: Future<Output = Result<RecordBatch>> + Send + 'static,
 {
     Arc::new(move || Box::pin(f(state.clone())))
+}
+
+/// Adapt an existing materializing loader into a planned scan source.
+pub(super) fn scan_row_source<S, Fut>(
+    schema: SchemaRef,
+    state: S,
+    f: impl Fn(S) -> Fut + Send + Sync + 'static,
+) -> ScanSource
+where
+    S: Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<RecordBatch>> + Send + 'static,
+{
+    let load = row_source(state, f);
+    batch_stream_source(Arc::clone(&schema), 1, move |_partition, _context| {
+        let load = Arc::clone(&load);
+        let stream = stream::once(async move { load().await });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream,
+        )))
+    })
+}
+
+/// Build a storage-originating streaming scan source.
+pub(super) fn batch_stream_source(
+    schema: SchemaRef,
+    partition_count: usize,
+    factory: impl Fn(usize, Arc<TaskContext>) -> Result<SendableRecordBatchStream>
+    + Send
+    + Sync
+    + 'static,
+) -> ScanSource {
+    let statistics = (0..partition_count)
+        .map(|_| Statistics::new_unknown(schema.as_ref()))
+        .collect();
+    batch_stream_source_with_statistics(schema, statistics, factory)
+}
+
+/// Build a streaming scan whose immutable source can expose exact per-partition
+/// row and column statistics to DataFusion's generic physical optimizers.
+pub(super) fn batch_stream_source_with_statistics(
+    schema: SchemaRef,
+    statistics: Vec<Statistics>,
+    factory: impl Fn(usize, Arc<TaskContext>) -> Result<SendableRecordBatchStream>
+    + Send
+    + Sync
+    + 'static,
+) -> ScanSource {
+    ScanSource::new(&schema, statistics, factory)
 }
 
 /// Exec-time DML handler: receives the filter-matched batch, stages the
@@ -168,7 +288,7 @@ pub(super) type InsertApply =
 /// materializes it during execution.
 pub(super) struct PlannedScan {
     pub(super) schema: SchemaRef,
-    pub(super) load: RowSource,
+    pub(super) source: ScanSource,
     pub(super) ordering: Option<String>,
 }
 
@@ -804,7 +924,7 @@ impl InsertSink for PlannedInsertSink {
 struct SpecScanExec {
     table: Arc<str>,
     schema: SchemaRef,
-    load: RowSource,
+    source: ScanSource,
     properties: Arc<PlanProperties>,
 }
 
@@ -834,14 +954,14 @@ impl SpecScanExec {
             .unwrap_or_else(|| EquivalenceProperties::new(Arc::clone(&planned.schema)));
         let properties = PlanProperties::new(
             equivalence_properties,
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(planned.source.partition_count),
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
         Self {
             table,
             schema: planned.schema,
-            load: planned.load,
+            source: planned.source,
             properties: Arc::new(properties),
         }
     }
@@ -894,18 +1014,36 @@ impl ExecutionPlan for SpecScanExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
+        let stream = self.source.open(partition, context)?;
+        if stream.schema() != self.schema {
             return Err(DataFusionError::Execution(format!(
-                "SpecScanExec({}) only exposes one partition, got {partition}",
+                "SpecScanExec({}) stream schema does not match its planned schema",
                 self.table
             )));
         }
-        let load = Arc::clone(&self.load);
-        let schema = Arc::clone(&self.schema);
-        let stream = stream::once(async move { load().await });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        Ok(stream)
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        match partition {
+            Some(partition) => self
+                .source
+                .statistics
+                .get(partition)
+                .cloned()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "SpecScanExec({}) exposes {} partitions, got statistics request for {partition}",
+                        self.table, self.source.partition_count
+                    ))
+                }),
+            None => Statistics::try_merge_iter(
+                self.source.statistics.iter(),
+                self.schema.as_ref(),
+            ),
+        }
     }
 }
 
@@ -1147,4 +1285,137 @@ pub(super) fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize
         || Arc::clone(schema),
         |projection| Arc::new(schema.project(projection).expect("projection is valid")),
     )
+}
+
+#[cfg(test)]
+mod scan_source_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::common::stats::Precision;
+    use futures_util::TryStreamExt;
+
+    use super::*;
+
+    fn int_schema(name: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]))
+    }
+
+    fn int_batch(schema: SchemaRef, values: &[i64]) -> RecordBatch {
+        let values: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
+        RecordBatch::try_new(schema, vec![values]).expect("test batch should match schema")
+    }
+
+    #[tokio::test]
+    async fn streaming_scan_is_incremental_reusable_and_partition_checked() {
+        let schema = int_schema("value");
+        let source_schema = Arc::clone(&schema);
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source_opens = Arc::clone(&opens);
+        let source = batch_stream_source(Arc::clone(&schema), 1, move |_partition, _context| {
+            source_opens.fetch_add(1, Ordering::SeqCst);
+            let batches = vec![
+                Ok(int_batch(Arc::clone(&source_schema), &[1, 2])),
+                Ok(int_batch(Arc::clone(&source_schema), &[3])),
+            ];
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&source_schema),
+                stream::iter(batches),
+            )))
+        });
+        let exec = SpecScanExec::new(
+            Arc::from("stream_test"),
+            PlannedScan {
+                schema: Arc::clone(&schema),
+                source,
+                ordering: None,
+            },
+        );
+
+        for _ in 0..2 {
+            let batches = exec
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("partition zero should open")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("stream should complete");
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+            assert_eq!(batches.len(), 2);
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+        assert!(exec.execute(1, Arc::new(TaskContext::default())).is_err());
+    }
+
+    #[test]
+    fn streaming_scan_rejects_schema_drift_before_polling() {
+        let planned_schema = int_schema("expected");
+        let stream_schema = int_schema("unexpected");
+        let source = batch_stream_source(
+            Arc::clone(&planned_schema),
+            1,
+            move |_partition, _context| {
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&stream_schema),
+                    stream::empty(),
+                )))
+            },
+        );
+        let exec = SpecScanExec::new(
+            Arc::from("schema_drift_test"),
+            PlannedScan {
+                schema: planned_schema,
+                source,
+                ordering: None,
+            },
+        );
+
+        let error = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .err()
+            .expect("schema drift must fail");
+        assert!(error.to_string().contains("stream schema"));
+    }
+
+    #[test]
+    fn streaming_scan_exposes_and_merges_exact_partition_statistics() {
+        let schema = int_schema("value");
+        let statistics = [2, 3]
+            .into_iter()
+            .map(|rows| {
+                Statistics::new_unknown(schema.as_ref()).with_num_rows(Precision::Exact(rows))
+            })
+            .collect();
+        let source_schema = Arc::clone(&schema);
+        let source = batch_stream_source_with_statistics(
+            Arc::clone(&schema),
+            statistics,
+            move |_partition, _context| {
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&source_schema),
+                    stream::empty(),
+                )))
+            },
+        );
+        let exec = SpecScanExec::new(
+            Arc::from("statistics_test"),
+            PlannedScan {
+                schema,
+                source,
+                ordering: None,
+            },
+        );
+
+        assert_eq!(
+            exec.partition_statistics(Some(0))
+                .expect("partition statistics")
+                .num_rows,
+            Precision::Exact(2)
+        );
+        assert_eq!(
+            exec.partition_statistics(None)
+                .expect("merged statistics")
+                .num_rows,
+            Precision::Exact(5)
+        );
+    }
 }

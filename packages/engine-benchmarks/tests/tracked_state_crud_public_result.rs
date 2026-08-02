@@ -17,6 +17,81 @@ mod workload;
 use workload::WorkloadRow;
 
 #[test]
+fn typed_olap_queries_are_structurally_ineligible_for_strict_native_reads() {
+    use datafusion::sql::parser::DFParser;
+    use datafusion::sql::sqlparser::ast::{SetExpr, Statement as SqlStatement};
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+
+    for shape in sql_session::OlapReadShape::ALL {
+        let mut statements = DFParser::parse_sql_with_dialect(shape.sql(), &GenericDialect {})
+            .expect("typed OLAP benchmark SQL should parse");
+        let statement = statements.pop_front().expect("one OLAP statement");
+        let datafusion::sql::parser::Statement::Statement(statement) = statement else {
+            panic!("{} must remain a SELECT query", shape.label());
+        };
+        let SqlStatement::Query(query) = statement.as_ref() else {
+            panic!("{} must remain a SELECT query", shape.label());
+        };
+        assert!(
+            query.with.is_some(),
+            "{} must retain a top-level CTE: strict_single_table_select rejects query.with before any native entity recognizer can match",
+            shape.label()
+        );
+        assert!(
+            matches!(query.body.as_ref(), SetExpr::Select(_)),
+            "{} must remain a general DataFusion SELECT",
+            shape.label()
+        );
+    }
+}
+
+#[tokio::test]
+async fn typed_olap_shapes_validate_exact_results_on_every_adapter() {
+    let rows = workload::fixture_rows(128);
+    for &profile in storage::STORAGE_PROFILES {
+        let fixture = sql_session::seeded_olap_fixture(profile, &rows).await;
+        for shape in sql_session::OlapReadShape::ALL {
+            let expected_rows = match shape {
+                sql_session::OlapReadShape::Scan => rows.len(),
+                sql_session::OlapReadShape::Filter => 6,
+                sql_session::OlapReadShape::Sort => 85,
+                sql_session::OlapReadShape::Group => 32,
+                sql_session::OlapReadShape::Aggregate => 1,
+            };
+            assert_eq!(
+                fixture.read_olap(shape).await,
+                expected_rows,
+                "{}",
+                shape.label()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn typed_olap_shapes_validate_above_columnar_publication_threshold() {
+    let rows = workload::fixture_rows(2_048);
+    for &profile in storage::STORAGE_PROFILES {
+        let fixture = sql_session::seeded_olap_fixture(profile, &rows).await;
+        for shape in sql_session::OlapReadShape::ALL {
+            let expected_rows = match shape {
+                sql_session::OlapReadShape::Scan => rows.len(),
+                sql_session::OlapReadShape::Filter => 86,
+                sql_session::OlapReadShape::Sort => 1_365,
+                sql_session::OlapReadShape::Group => 32,
+                sql_session::OlapReadShape::Aggregate => 1,
+            };
+            assert_eq!(
+                fixture.read_olap(shape).await,
+                expected_rows,
+                "{}",
+                shape.label()
+            );
+        }
+    }
+}
+
+#[test]
 fn standalone_sqlite_public_results_match_every_lix_adapter() {
     std::thread::Builder::new()
         .name("tracked-state-public-result".to_string())

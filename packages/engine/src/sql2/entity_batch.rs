@@ -10,11 +10,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use datafusion::arrow::record_batch::RecordBatch;
 
 use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{LiveStateContext, LiveStateRowFilter, LiveStateScanRequest};
 use crate::storage_adapter::StorageAdapterRead;
+
+#[derive(Clone, Debug)]
+pub(crate) struct EntityColumnarScanLayout {
+    pub(crate) id: crate::columnar_row_group::RowGroupSetId,
+    pub(crate) manifest: crate::columnar_row_group::RowGroupManifest,
+}
 
 /// Optional private capability supplied only by committed read sessions.
 ///
@@ -52,6 +59,25 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
         _request: LiveStateScanRequest,
     ) -> Result<Option<Vec<EntityPk>>, LixError> {
         Ok(None)
+    }
+
+    async fn plan_entity_columnar_scan(
+        &self,
+        _request: LiveStateScanRequest,
+    ) -> Result<Option<EntityColumnarScanLayout>, LixError> {
+        Ok(None)
+    }
+
+    async fn load_entity_columnar_group(
+        &self,
+        _layout: EntityColumnarScanLayout,
+        _group_index: usize,
+        _projection: Vec<usize>,
+    ) -> Result<RecordBatch, LixError> {
+        Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "entity snapshot reader does not support columnar groups".to_string(),
+        ))
     }
 
     async fn scan_entity_snapshots_by_string_field(
@@ -117,6 +143,40 @@ where
             .reader(self.store.clone())
             .scan_direct_entity_primary_keys(&request)
             .await
+    }
+
+    async fn plan_entity_columnar_scan(
+        &self,
+        request: LiveStateScanRequest,
+    ) -> Result<Option<EntityColumnarScanLayout>, LixError> {
+        if !direct_entity_snapshot_request(&request)
+            || !request.filter.entity_pks.is_empty()
+            || request.limit.is_some()
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .live_state
+            .reader(self.store.clone())
+            .plan_direct_entity_columnar_scan(&request)
+            .await?
+            .map(|(id, manifest)| EntityColumnarScanLayout { id, manifest }))
+    }
+
+    async fn load_entity_columnar_group(
+        &self,
+        layout: EntityColumnarScanLayout,
+        group_index: usize,
+        projection: Vec<usize>,
+    ) -> Result<RecordBatch, LixError> {
+        crate::columnar_row_group::load_row_group_batch(
+            &self.store,
+            layout.id,
+            &layout.manifest,
+            group_index,
+            &projection,
+        )
+        .await
     }
 
     async fn scan_entity_snapshots_by_string_field(

@@ -364,6 +364,37 @@ where
             .map(Some)
     }
 
+    pub(crate) async fn plan_direct_entity_columnar_scan(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<
+        Option<(
+            crate::columnar_row_group::RowGroupSetId,
+            crate::columnar_row_group::RowGroupManifest,
+        )>,
+        LixError,
+    > {
+        if !request.filter.entity_pks.is_empty()
+            || request.limit.is_some()
+            || !matches!(request.filter.rows, LiveStateRowFilter::All)
+            || request.filter.include_tombstones
+            || request.filter.untracked.is_some()
+            || !request.filter.file_ids.is_empty()
+            || !request.filter.constraints.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some((branch_id, control, schema_key)) =
+            self.direct_entity_snapshot_scope(request).await?
+        else {
+            return Ok(None);
+        };
+        self.tracked_head
+            .reader(&self.store)
+            .entity_columnar_layout(&branch_id, control, &schema_key)
+            .await
+    }
+
     pub(crate) async fn scan_direct_entity_snapshots_by_string_field(
         &self,
         request: &LiveStateScanRequest,

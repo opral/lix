@@ -25,7 +25,7 @@ use crate::{LixError, NullableKeyFilter};
 use super::checkpoint::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
-use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
+use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 use crate::sql2::error::lix_error_to_datafusion_error;
 
 pub(super) async fn register_working_change_provider<S>(
@@ -107,7 +107,8 @@ where
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
-            load: row_source(
+            source: scan_row_source(
+                Arc::clone(&schema),
                 (
                     self.active_branch_id.clone(),
                     Arc::clone(&self.branch_ref),

@@ -1,3 +1,4 @@
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use std::collections::BTreeSet;
@@ -166,15 +167,29 @@ pub(crate) async fn build_write_session_with_options(
 }
 
 pub(crate) fn new_sql_session_context() -> SessionContext {
-    SessionContext::new_with_config(
-        SessionConfig::new()
-            .with_information_schema(false)
-            .with_target_partitions(1)
-            .set_bool("datafusion.optimizer.repartition_aggregations", false)
-            .set_bool("datafusion.optimizer.repartition_joins", false)
-            .set_bool("datafusion.optimizer.repartition_sorts", false)
-            .set_bool("datafusion.optimizer.repartition_windows", false)
-            .set_bool("datafusion.optimizer.repartition_file_scans", false)
-            .set_bool("datafusion.optimizer.enable_round_robin_repartition", false),
-    )
+    let config = SessionConfig::new()
+        .with_information_schema(false)
+        .with_target_partitions(1)
+        .set_bool("datafusion.optimizer.repartition_aggregations", false)
+        .set_bool("datafusion.optimizer.repartition_joins", false)
+        .set_bool("datafusion.optimizer.repartition_sorts", false)
+        .set_bool("datafusion.optimizer.repartition_windows", false)
+        .set_bool("datafusion.optimizer.repartition_file_scans", false)
+        .set_bool("datafusion.optimizer.enable_round_robin_repartition", false);
+    let base_state = SessionStateBuilder::new_with_default_features()
+        .with_config(config)
+        .build();
+    let mut physical_optimizers = base_state.physical_optimizers().to_vec();
+    let aggregate_statistics_index = physical_optimizers
+        .iter()
+        .position(|rule| rule.name() == "aggregate_statistics")
+        .expect("DataFusion default features include aggregate_statistics");
+    physical_optimizers.insert(
+        aggregate_statistics_index + 1,
+        Arc::new(super::aggregate_statistics::ExactAggregateStatistics),
+    );
+    let state = SessionStateBuilder::new_from_existing(base_state)
+        .with_physical_optimizer_rules(physical_optimizers)
+        .build();
+    SessionContext::new_with_state(state)
 }
