@@ -37,6 +37,7 @@
     },
     "name": {
       "type": "string",
+      "format": "lix-path-segment",
       "pattern": "^(?!\\.{1,2}$)[^/]+$"
     }
   },

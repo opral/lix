@@ -18,9 +18,9 @@ use crate::storage_adapter::{
     StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::tracked_state::codec::{
-    DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, PendingChunkBatch,
+    DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
     TrackedStateMutationBatchBuilder, decode_key, decode_key_shared, decode_node_ref, decode_value,
-    encode_key_ref, encode_key_ref_into, encode_leaf_node, encode_schema_key_prefix,
+    encode_key_ref, encode_key_ref_into, encode_leaf_node_refs, encode_schema_key_prefix,
     encode_value_ref,
 };
 use crate::tracked_state::types::{
@@ -81,6 +81,15 @@ const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 1024 * 1024;
 const COMMIT_DELTA_SIDECAR_RAW: u8 = 0;
 const COMMIT_DELTA_SIDECAR_ZSTD: u8 = 1;
+/// Every entry is an authored, certified reference with one shared optional
+/// origin key. The leaf already carries the entry count, so only that shared
+/// origin needs a body.
+const COMMIT_DELTA_SIDECAR_UNIFORM_CERTIFIED_REF: u8 = 2;
+/// Every entry is an authored inline snapshot with empty metadata and origin
+/// columns. The indexed body stores raw JSON ranges without per-row Musli
+/// envelopes.
+const COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_RAW: u8 = 3;
+const COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_ZSTD: u8 = 4;
 // Tiny history records are faster and usually smaller once stored raw: the
 // zstd frame/header and compressor call cannot amortize over a point write.
 const COMMIT_DELTA_MIN_COMPRESS_BYTES: usize = 1024;
@@ -192,6 +201,14 @@ struct CommitDeltaPayloadIndex<S> {
     offsets: Range<usize>,
     payload_start: usize,
     entry_count: usize,
+    layout: CommitDeltaPayloadLayout,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CommitDeltaPayloadLayout {
+    Indexed,
+    UniformCertifiedRef,
+    AuthoredInline,
 }
 
 type CommitDeltaPayloadIndexRef<'a> = CommitDeltaPayloadIndex<Cow<'a, [u8]>>;
@@ -207,6 +224,48 @@ where
     }
 
     fn decode(&self, entry_index: usize) -> Result<CommitDeltaPayload, LixError> {
+        if entry_index >= self.entry_count {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta payload index is out of bounds",
+            ));
+        }
+        match self.layout {
+            CommitDeltaPayloadLayout::UniformCertifiedRef => {
+                return Ok(CommitDeltaPayload::CertifiedRef(
+                    if self.sidecar.as_ref().is_empty() {
+                        None
+                    } else {
+                        storage_codec::decode::<CommitDeltaCertifiedPayload>(
+                            "tracked_state uniform certified commit_delta payload",
+                            self.sidecar.as_ref(),
+                        )?
+                        .origin_key
+                    },
+                ));
+            }
+            CommitDeltaPayloadLayout::AuthoredInline => {
+                let payload = self.payload_range(entry_index)?;
+                if payload.is_empty() {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state commit_delta member is missing its authoritative payload",
+                    ));
+                }
+                let json = std::str::from_utf8(payload).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state inline commit_delta payload is not UTF-8",
+                    )
+                })?;
+                return Ok(CommitDeltaPayload::Authored(CommitDeltaAuthoredPayload {
+                    snapshot: crate::json_store::JsonSlot::Inline(json.into()),
+                    metadata: crate::json_store::JsonSlot::None,
+                    origin_key: None,
+                }));
+            }
+            CommitDeltaPayloadLayout::Indexed => {}
+        }
         let range = self.payload_range(entry_index)?;
         if range.is_empty() {
             return Err(LixError::new(
@@ -316,6 +375,7 @@ impl CommitDeltaPayloadIndexRef<'_> {
             offsets: self.offsets,
             payload_start: self.payload_start,
             entry_count: self.entry_count,
+            layout: self.layout,
         }
     }
 }
@@ -1345,29 +1405,23 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
             certified: delta.certified,
         });
     }
-    let entries = entries
-        .finish()
-        .into_mutations()
-        .into_iter()
-        .map(|mutation| EncodedLeafEntry {
-            key: mutation.encoded_key,
-            value: mutation.encoded_value,
-        })
-        .collect::<Vec<_>>();
-    let bounds = CommitDeltaSegmentBounds {
-        first_key: entries
-            .first()
-            .expect("ordered commit-delta segment is nonempty")
-            .key
-            .to_vec(),
-        last_key: entries
-            .last()
-            .expect("ordered commit-delta segment is nonempty")
-            .key
-            .to_vec(),
-    };
-    let encoded = try_encode_commit_delta_segment_with_payloads(&entries, &payloads, compressor)?;
-    Ok((bounds, encoded))
+    entries.with_entry_refs(|entries| {
+        let bounds = CommitDeltaSegmentBounds {
+            first_key: entries
+                .first()
+                .expect("ordered commit-delta segment is nonempty")
+                .key
+                .to_vec(),
+            last_key: entries
+                .last()
+                .expect("ordered commit-delta segment is nonempty")
+                .key
+                .to_vec(),
+        };
+        let encoded =
+            try_encode_commit_delta_segment_with_payload_refs(entries, &payloads, compressor)?;
+        Ok((bounds, encoded))
+    })
 }
 
 fn stage_commit_deltas_inner(
@@ -4587,16 +4641,115 @@ fn try_encode_commit_delta_segment_with_payloads(
     payloads: &[CommitDeltaPayloadRef<'_>],
     compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
 ) -> Result<Vec<u8>, CommitDeltaSegmentEncodeError> {
+    let entries = entries
+        .iter()
+        .map(EncodedLeafEntry::as_ref)
+        .collect::<Vec<_>>();
+    try_encode_commit_delta_segment_with_payload_refs(&entries, payloads, compressor)
+}
+
+fn try_encode_commit_delta_segment_with_payload_refs(
+    entries: &[EncodedLeafEntryRef<'_>],
+    payloads: &[CommitDeltaPayloadRef<'_>],
+    compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
+) -> Result<Vec<u8>, CommitDeltaSegmentEncodeError> {
     encode_commit_delta_segment_layout(entries, payloads, Some(compressor))
 }
 
 fn encode_commit_delta_segment_layout(
-    entries: &[EncodedLeafEntry],
+    entries: &[EncodedLeafEntryRef<'_>],
     payloads: &[CommitDeltaPayloadRef<'_>],
     compressor: Option<&mut Option<crate::compression::ZstdLevel1Compressor>>,
 ) -> Result<Vec<u8>, CommitDeltaSegmentEncodeError> {
     debug_assert_eq!(entries.len(), payloads.len());
-    let leaf = encode_leaf_node(entries);
+    let leaf = encode_leaf_node_refs(entries);
+    let leaf_len = u32::try_from(leaf.len()).expect("commit-delta leaf fits u32");
+    let uniform_certified_origin = payloads.first().and_then(|first| {
+        payloads
+            .iter()
+            .all(|payload| {
+                payload.authored && payload.certified && payload.origin_key == first.origin_key
+            })
+            .then_some(first.origin_key)
+    });
+    if let Some(origin_key) = uniform_certified_origin {
+        let mut encoded = Vec::with_capacity(
+            COMMIT_DELTA_FORMAT_MAGIC.len() + 4 + leaf.len() + 1 + origin_key.map_or(0, str::len),
+        );
+        encoded.extend_from_slice(COMMIT_DELTA_FORMAT_MAGIC);
+        encoded.extend_from_slice(&leaf_len.to_be_bytes());
+        encoded.extend_from_slice(&leaf);
+        encoded.push(COMMIT_DELTA_SIDECAR_UNIFORM_CERTIFIED_REF);
+        if origin_key.is_some() {
+            storage_codec::append(
+                "tracked_state uniform certified commit_delta payload",
+                &mut encoded,
+                &CommitDeltaCertifiedPayloadRef { origin_key },
+            )
+            .map_err(CommitDeltaSegmentEncodeError::Codec)?;
+        }
+        return Ok(encoded);
+    }
+    let authored_inline = payloads.iter().all(|payload| {
+        payload.authored
+            && !payload.certified
+            && matches!(payload.snapshot, crate::json_store::JsonSlotRef::Inline(_))
+            && matches!(payload.metadata, crate::json_store::JsonSlotRef::None)
+            && payload.origin_key.is_none()
+    });
+    if authored_inline {
+        let entry_count = u32::try_from(entries.len()).expect("commit-delta entry count fits u32");
+        let directory_bytes = (payloads.len() + 1)
+            .checked_mul(COMMIT_DELTA_PAYLOAD_OFFSET_BYTES)
+            .ok_or(CommitDeltaSegmentEncodeError::SidecarTooLarge)?;
+        let payload_bytes = payloads.iter().try_fold(0usize, |total, payload| {
+            let crate::json_store::JsonSlotRef::Inline(json) = payload.snapshot else {
+                unreachable!("authored inline sidecar shape was checked")
+            };
+            total
+                .checked_add(json.len())
+                .ok_or(CommitDeltaSegmentEncodeError::SidecarTooLarge)
+        })?;
+        let sidecar_len = 4usize
+            .checked_add(directory_bytes)
+            .and_then(|len| len.checked_add(payload_bytes))
+            .ok_or(CommitDeltaSegmentEncodeError::SidecarTooLarge)?;
+        if sidecar_len > COMMIT_DELTA_MAX_SIDECAR_BYTES {
+            return Err(CommitDeltaSegmentEncodeError::SidecarTooLarge);
+        }
+        let mut sidecar = Vec::with_capacity(sidecar_len);
+        sidecar.extend_from_slice(&entry_count.to_be_bytes());
+        let mut offset = 0usize;
+        for payload in payloads {
+            sidecar.extend_from_slice(
+                &u32::try_from(offset)
+                    .expect("commit-delta payload sidecar fits u32")
+                    .to_be_bytes(),
+            );
+            let crate::json_store::JsonSlotRef::Inline(json) = payload.snapshot else {
+                unreachable!("authored inline sidecar shape was checked")
+            };
+            offset += json.len();
+        }
+        sidecar.extend_from_slice(
+            &u32::try_from(offset)
+                .expect("commit-delta payload sidecar fits u32")
+                .to_be_bytes(),
+        );
+        for payload in payloads {
+            let crate::json_store::JsonSlotRef::Inline(json) = payload.snapshot else {
+                unreachable!("authored inline sidecar shape was checked")
+            };
+            sidecar.extend_from_slice(json.as_bytes());
+        }
+        return finish_commit_delta_segment_with_sidecar(
+            leaf,
+            sidecar,
+            compressor,
+            COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_RAW,
+            COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_ZSTD,
+        );
+    }
     let mut payload_offsets = Vec::with_capacity(payloads.len() + 1);
     let mut payload_bytes = Vec::new();
     for (entry, payload) in entries.iter().zip(payloads) {
@@ -4645,7 +4798,6 @@ fn encode_commit_delta_segment_layout(
     }
     payload_offsets
         .push(u32::try_from(payload_bytes.len()).expect("commit-delta payload sidecar fits u32"));
-    let leaf_len = u32::try_from(leaf.len()).expect("commit-delta leaf fits u32");
     let entry_count = u32::try_from(entries.len()).expect("commit-delta entry count fits u32");
     let directory_bytes = payload_offsets.len() * COMMIT_DELTA_PAYLOAD_OFFSET_BYTES;
     let sidecar_len = 4usize
@@ -4661,6 +4813,22 @@ fn encode_commit_delta_segment_layout(
         sidecar.extend_from_slice(&offset.to_be_bytes());
     }
     sidecar.extend_from_slice(&payload_bytes);
+    finish_commit_delta_segment_with_sidecar(
+        leaf,
+        sidecar,
+        compressor,
+        COMMIT_DELTA_SIDECAR_RAW,
+        COMMIT_DELTA_SIDECAR_ZSTD,
+    )
+}
+
+fn finish_commit_delta_segment_with_sidecar(
+    leaf: Vec<u8>,
+    sidecar: Vec<u8>,
+    compressor: Option<&mut Option<crate::compression::ZstdLevel1Compressor>>,
+    raw_encoding: u8,
+    zstd_encoding: u8,
+) -> Result<Vec<u8>, CommitDeltaSegmentEncodeError> {
     let compressed = if sidecar.len() >= COMMIT_DELTA_MIN_COMPRESS_BYTES {
         if let Some(compressor) = compressor {
             if compressor.is_none() {
@@ -4696,11 +4864,10 @@ fn encode_commit_delta_segment_layout(
         None
     };
     let (sidecar_encoding, stored_sidecar) = match compressed.as_deref() {
-        Some(compressed) if compressed.len() < sidecar.len() => {
-            (COMMIT_DELTA_SIDECAR_ZSTD, compressed)
-        }
-        _ => (COMMIT_DELTA_SIDECAR_RAW, sidecar.as_slice()),
+        Some(compressed) if compressed.len() < sidecar.len() => (zstd_encoding, compressed),
+        _ => (raw_encoding, sidecar.as_slice()),
     };
+    let leaf_len = u32::try_from(leaf.len()).expect("commit-delta leaf fits u32");
     let mut encoded = Vec::with_capacity(
         COMMIT_DELTA_FORMAT_MAGIC.len() + 4 + leaf.len() + 1 + 4 + stored_sidecar.len(),
     );
@@ -4733,7 +4900,11 @@ fn encode_commit_delta_segment_with_raw_sidecar(
     entries: &[EncodedLeafEntry],
     payloads: &[CommitDeltaPayloadRef<'_>],
 ) -> Vec<u8> {
-    encode_commit_delta_segment_layout(entries, payloads, None)
+    let entries = entries
+        .iter()
+        .map(EncodedLeafEntry::as_ref)
+        .collect::<Vec<_>>();
+    encode_commit_delta_segment_layout(&entries, payloads, None)
         .map_err(CommitDeltaSegmentEncodeError::into_lix_error)
         .expect("test raw commit-delta segment should encode")
 }
@@ -4808,6 +4979,19 @@ fn decode_commit_delta_with_payloads<'a>(
             "tracked_state commit_delta sidecar is missing its encoding",
         )
     })?;
+    if encoding == COMMIT_DELTA_SIDECAR_UNIFORM_CERTIFIED_REF {
+        let entry_count = leaf.len();
+        return Ok((
+            leaf,
+            CommitDeltaPayloadIndexRef {
+                sidecar: Cow::Borrowed(encoded_sidecar),
+                offsets: 0..0,
+                payload_start: 0,
+                entry_count,
+                layout: CommitDeltaPayloadLayout::UniformCertifiedRef,
+            },
+        ));
+    }
     let (uncompressed_len, encoded_sidecar) =
         encoded_sidecar.split_at_checked(4).ok_or_else(|| {
             LixError::new(
@@ -4825,17 +5009,31 @@ fn decode_commit_delta_with_payloads<'a>(
             "tracked_state commit_delta sidecar has an invalid uncompressed length",
         ));
     }
+    let layout = match encoding {
+        COMMIT_DELTA_SIDECAR_RAW | COMMIT_DELTA_SIDECAR_ZSTD => CommitDeltaPayloadLayout::Indexed,
+        COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_RAW | COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_ZSTD => {
+            CommitDeltaPayloadLayout::AuthoredInline
+        }
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta sidecar has an unsupported encoding",
+            ));
+        }
+    };
     let sidecar = match encoding {
-        COMMIT_DELTA_SIDECAR_RAW if encoded_sidecar.len() == uncompressed_len => {
+        COMMIT_DELTA_SIDECAR_RAW | COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_RAW
+            if encoded_sidecar.len() == uncompressed_len =>
+        {
             Cow::Borrowed(encoded_sidecar)
         }
-        COMMIT_DELTA_SIDECAR_RAW => {
+        COMMIT_DELTA_SIDECAR_RAW | COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_RAW => {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state raw commit_delta sidecar length does not match its header",
             ));
         }
-        COMMIT_DELTA_SIDECAR_ZSTD => {
+        COMMIT_DELTA_SIDECAR_ZSTD | COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_ZSTD => {
             let decoded = crate::compression::decompress_zstd(encoded_sidecar, uncompressed_len)
                 .map_err(|error| {
                     LixError::new(
@@ -4853,12 +5051,7 @@ fn decode_commit_delta_with_payloads<'a>(
             }
             Cow::Owned(decoded)
         }
-        _ => {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state commit_delta sidecar has an unsupported encoding",
-            ));
-        }
+        _ => unreachable!("commit-delta sidecar encoding was classified above"),
     };
     let sidecar_bytes = sidecar.as_ref();
     let (entry_count, sidecar_body) = sidecar_bytes.split_at_checked(4).ok_or_else(|| {
@@ -4905,6 +5098,7 @@ fn decode_commit_delta_with_payloads<'a>(
         offsets,
         payload_start,
         entry_count,
+        layout,
     };
     if index.offset(0)? != 0 {
         return Err(LixError::new(
@@ -7046,12 +7240,95 @@ mod tests {
             .decode(2)
             .expect_err("a corrupt requested payload must fail");
         assert!(
-            error.to_string().contains("invalid payload tag")
+            error
+                .to_string()
+                .contains("inline commit_delta payload is not UTF-8")
+                || error.to_string().contains("invalid payload tag")
                 || error.to_string().contains(
                     "failed to decode tracked_state indexed authored commit_delta payload"
                 ),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn uniform_certified_payloads_store_shared_origin_once() {
+        let commit_id = CommitId::for_test_label("uniform-certified-sidecar");
+        let fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let entries = fixtures
+            .iter()
+            .map(|fixture| EncodedLeafEntry {
+                key: encode_key_ref(TrackedStateKeyRef {
+                    schema_key: &fixture.schema_key,
+                    file_id: fixture.file_id.as_deref(),
+                    entity_pk: &fixture.entity_pk,
+                })
+                .into(),
+                value: encode_value_ref(TrackedStateIndexValueRef {
+                    change_id: fixture.change_id,
+                    commit_id,
+                    deleted: fixture.deleted,
+                    created_at: fixture.created_at,
+                    updated_at: fixture.updated_at,
+                })
+                .into(),
+            })
+            .collect::<Vec<_>>();
+        let mut payloads = vec![
+            CommitDeltaPayloadRef {
+                snapshot: crate::json_store::JsonSlotRef::None,
+                metadata: crate::json_store::JsonSlotRef::None,
+                origin_key: None,
+                authored: true,
+                certified: true,
+            };
+            entries.len()
+        ];
+
+        let encoded = encode_commit_delta_segment_with_payloads(&entries, &payloads);
+        let leaf_len = usize::try_from(u32::from_be_bytes(
+            encoded[COMMIT_DELTA_FORMAT_MAGIC.len()..COMMIT_DELTA_FORMAT_MAGIC.len() + 4]
+                .try_into()
+                .expect("fixed leaf length"),
+        ))
+        .expect("u32 fits usize");
+        let sidecar_header = COMMIT_DELTA_FORMAT_MAGIC.len() + 4 + leaf_len;
+        assert_eq!(
+            encoded[sidecar_header],
+            super::COMMIT_DELTA_SIDECAR_UNIFORM_CERTIFIED_REF
+        );
+        assert_eq!(encoded.len(), sidecar_header + 1);
+
+        let (_, decoded) =
+            decode_commit_delta_with_payloads(&encoded, None).expect("sidecar should decode");
+        for index in 0..entries.len() {
+            assert!(matches!(
+                decoded.decode(index).expect("payload should decode"),
+                super::CommitDeltaPayload::CertifiedRef(None)
+            ));
+        }
+
+        for payload in &mut payloads {
+            payload.origin_key = Some("shared-origin");
+        }
+        let encoded = encode_commit_delta_segment_with_payloads(&entries, &payloads);
+        assert_eq!(
+            encoded[sidecar_header],
+            super::COMMIT_DELTA_SIDECAR_UNIFORM_CERTIFIED_REF
+        );
+        assert!(encoded.len() > sidecar_header + 1);
+        let (_, decoded) =
+            decode_commit_delta_with_payloads(&encoded, None).expect("sidecar should decode");
+        for index in 0..entries.len() {
+            assert!(matches!(
+                decoded.decode(index).expect("payload should decode"),
+                super::CommitDeltaPayload::CertifiedRef(Some(origin))
+                    if origin == "shared-origin"
+            ));
+        }
     }
 
     #[test]
@@ -7108,8 +7385,8 @@ mod tests {
         let sidecar_header = COMMIT_DELTA_FORMAT_MAGIC.len() + 4 + leaf_len;
         assert_eq!(
             encoded[sidecar_header],
-            super::COMMIT_DELTA_SIDECAR_ZSTD,
-            "repetitive payload sidecars should use zstd"
+            super::COMMIT_DELTA_SIDECAR_AUTHORED_INLINE_ZSTD,
+            "repetitive authored-inline payload columns should use zstd"
         );
 
         let (_, decoded) =

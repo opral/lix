@@ -86,6 +86,12 @@ async fn rs_sdk_native_file_upsert_creates_updates_and_keeps_empty_file() {
         .await
         .expect_err("relative native file path should be rejected");
     assert_eq!(error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
+
+    let error = lix
+        .upsert_file_data("/nul\0name.bin", b"invalid".as_slice())
+        .await
+        .expect_err("NUL in a native file path should be rejected by the engine");
+    assert_eq!(error.code, "LIX_ERROR_PATH_NUL");
 }
 
 #[tokio::test]
@@ -1682,7 +1688,7 @@ async fn filesystem_watcher_ignores_symlinks_created_after_open() {
 
 #[tokio::test]
 #[cfg(all(unix, feature = "local_filesystem"))]
-async fn filesystem_materialization_skips_symlink_collisions() {
+async fn filesystem_materialization_reports_symlink_collisions() {
     use std::os::unix::fs::symlink;
 
     let tempdir = tempfile::tempdir().unwrap();
@@ -1696,12 +1702,22 @@ async fn filesystem_materialization_skips_symlink_collisions() {
     symlink(outside.path(), tempdir.path().join("blocked-dir")).unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
-    write_file(&lix, "/blocked.txt", b"lix".to_vec())
+    let file_error = write_file(&lix, "/blocked.txt", b"lix".to_vec())
         .await
-        .unwrap();
-    write_file(&lix, "/blocked-dir/file.txt", b"nested".to_vec())
+        .expect_err("a symlink collision must be reported");
+    assert!(
+        file_error
+            .message
+            .contains("LIX_FILESYSTEM_UNSUPPORTED_ENTRY")
+    );
+    let directory_error = write_file(&lix, "/blocked-dir/file.txt", b"nested".to_vec())
         .await
-        .unwrap();
+        .expect_err("a symlink ancestor must be reported");
+    assert!(
+        directory_error
+            .message
+            .contains("LIX_FILESYSTEM_UNSUPPORTED_ENTRY")
+    );
 
     assert_eq!(
         read_file(&lix, "/blocked.txt").await.unwrap().as_deref(),
@@ -1749,7 +1765,7 @@ async fn filesystem_materialization_skips_symlink_collisions() {
 
 #[tokio::test]
 #[cfg(all(unix, feature = "local_filesystem"))]
-async fn filesystem_materialization_skips_special_file_collisions() {
+async fn filesystem_materialization_reports_special_file_collisions() {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
 
@@ -1758,7 +1774,10 @@ async fn filesystem_materialization_skips_special_file_collisions() {
     let listener = UnixListener::bind(&socket_path).unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
-    write_file(&lix, "/socket", b"lix".to_vec()).await.unwrap();
+    let error = write_file(&lix, "/socket", b"lix".to_vec())
+        .await
+        .expect_err("a socket collision must be reported");
+    assert!(error.message.contains("LIX_FILESYSTEM_UNSUPPORTED_ENTRY"));
 
     assert_eq!(
         read_file(&lix, "/socket").await.unwrap().as_deref(),

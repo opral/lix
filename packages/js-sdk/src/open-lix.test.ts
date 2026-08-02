@@ -1053,7 +1053,7 @@ test("fs storage with a fresh external lixDir reimports disk state without old l
 });
 
 test.skipIf(process.platform === "win32")(
-	"fs storage ignores symlinks",
+	"fs storage ignores unrelated symlinks and diagnoses materialization collisions",
 	async () => {
 		const dir = tempFsDir();
 		mkdirSync(join(dir, "docs"), { recursive: true });
@@ -1076,6 +1076,15 @@ test.skipIf(process.platform === "win32")(
 			["/docs", "/linked-docs"],
 		);
 		expect(directories.rows.map((row) => row.get("path"))).toEqual(["/docs"]);
+
+		await expect(
+			lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+				"/link.txt",
+				new TextEncoder().encode("replacement"),
+			]),
+		).rejects.toThrow("LIX_FILESYSTEM_UNSUPPORTED_ENTRY");
+		expect(readFileSync(join(dir, "target.txt"), "utf8")).toBe("target");
+		expect(readFileSync(join(dir, "link.txt"), "utf8")).toBe("target");
 		await lix.close();
 	},
 );

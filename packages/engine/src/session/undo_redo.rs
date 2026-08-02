@@ -3,12 +3,9 @@ use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
-use crate::sql2::DiffCommand;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::Storage;
-use crate::tracked_state::{
-    TrackedStateDiffRequest, TrackedStateIndexValue, TrackedStateKey, encode_diff_id,
-};
+use crate::tracked_state::{TrackedStateDiffRequest, TrackedStateIndexValue, TrackedStateKey};
 use crate::transaction::Transaction;
 use crate::transaction::types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
 use crate::undo_redo::{
@@ -486,31 +483,9 @@ where
         })
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
-    let projection = ChangeRecordProjection::from_columns(&[]);
-    let (current_rows, desired_rows) = {
-        let mut tracked = transaction.tracked_state_reader().await;
-        let current_rows = tracked
-            .load_projected_batch_at_commit(&current.to_string(), &keys, &projection)
-            .await?;
-        let desired_rows = tracked
-            .load_projected_batch_at_commit(&desired.to_string(), &keys, &projection)
-            .await?;
-        (current_rows, desired_rows)
-    };
-    let diff_ids = (0..keys.len())
-        .filter_map(|index| {
-            let before = current_rows
-                .row(index)
-                .filter(|row| !row.deleted())
-                .map(|row| row.change_id());
-            let after = desired_rows
-                .row(index)
-                .filter(|row| !row.deleted())
-                .map(|row| row.change_id());
-            (before != after).then_some(encode_diff_id(before, after))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    apply_diff_ids(transaction, current, desired, diff_ids).await
+    transaction
+        .execute_tracked_state_transition(current, desired, keys)
+        .await
 }
 
 async fn reject_untracked_descriptor_cascade<S>(
@@ -584,40 +559,21 @@ where
             )
             .await?
     };
-    let diff_ids = diff
+    let keys = diff
         .entries
         .into_iter()
         .filter(|entry| {
             entry.identity.schema_key() != CHECKPOINT_MARKER_SCHEMA_KEY
                 && entry.identity.schema_key() != UNDO_REDO_MARKER_SCHEMA_KEY
         })
-        .map(|entry| {
-            encode_diff_id(
-                entry.before.as_ref().map(|row| row.change_id),
-                entry.after.as_ref().map(|row| row.change_id),
-            )
+        .map(|entry| TrackedStateKey {
+            schema_key: entry.identity.schema_key().to_owned(),
+            file_id: entry.identity.file_id().map(str::to_owned),
+            entity_pk: entry.identity.entity_pk().clone(),
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    apply_diff_ids(transaction, current, desired, diff_ids).await
-}
-
-async fn apply_diff_ids<S>(
-    transaction: &mut Transaction<S>,
-    current: CommitId,
-    desired: CommitId,
-    diff_ids: Vec<String>,
-) -> Result<crate::sql2::DiffCommandOutcome, LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    if diff_ids.is_empty() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("undo/redo state transition from '{current}' to '{desired}' is empty"),
-        ));
-    }
+        .collect::<Vec<_>>();
     transaction
-        .execute_diff_command(DiffCommand::Apply, diff_ids)
+        .execute_tracked_state_transition(current, desired, keys)
         .await
 }
 
@@ -643,6 +599,8 @@ where
 mod tests {
     use serde_json::Value as JsonValue;
 
+    use super::{load_commit_delta, load_commit_record, only_parent};
+    use crate::sql2::SqlWriteExecutionContext;
     use crate::storage::Memory;
     use crate::{
         Blob, CreateBranchOptions, Engine, ExecuteBatchStatement, LixError, MergeBranchOptions,
@@ -712,6 +670,77 @@ mod tests {
         assert_eq!(value(&session, "theme").await.as_deref(), Some("light"));
         session.redo().await.expect("update redoes");
         assert_eq!(value(&session, "theme").await.as_deref(), Some("dark"));
+    }
+
+    #[tokio::test]
+    async fn typed_transition_rejects_duplicate_keys_and_non_head_sources() {
+        let session = setup().await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('typed', 'before')",
+                &[],
+            )
+            .await
+            .expect("insert commits");
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'typed'",
+                &[],
+            )
+            .await
+            .expect("update commits");
+
+        let duplicate = session
+            .with_write_transaction(|transaction| {
+                Box::pin(async move {
+                    let branch_id = transaction.active_branch_id().to_string();
+                    let head = transaction
+                        .load_branch_head(&branch_id)
+                        .await?
+                        .expect("branch has a head");
+                    let record = load_commit_record(transaction, head).await?;
+                    let parent = only_parent(&record.parent_commit_ids, head, "test")?;
+                    let key = load_commit_delta(transaction, head)
+                        .await?
+                        .into_iter()
+                        .find(|(key, _)| key.schema_key == "lix_key_value")
+                        .expect("update delta contains the key-value row")
+                        .0;
+                    transaction
+                        .execute_tracked_state_transition(head, parent, vec![key.clone(), key])
+                        .await
+                })
+            })
+            .await
+            .expect_err("duplicate transition identities are rejected");
+        assert_eq!(duplicate.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert_eq!(value(&session, "typed").await.as_deref(), Some("after"));
+
+        let stale = session
+            .with_write_transaction(|transaction| {
+                Box::pin(async move {
+                    let branch_id = transaction.active_branch_id().to_string();
+                    let head = transaction
+                        .load_branch_head(&branch_id)
+                        .await?
+                        .expect("branch has a head");
+                    let record = load_commit_record(transaction, head).await?;
+                    let parent = only_parent(&record.parent_commit_ids, head, "test")?;
+                    let key = load_commit_delta(transaction, head)
+                        .await?
+                        .into_iter()
+                        .find(|(key, _)| key.schema_key == "lix_key_value")
+                        .expect("update delta contains the key-value row")
+                        .0;
+                    transaction
+                        .execute_tracked_state_transition(parent, head, vec![key])
+                        .await
+                })
+            })
+            .await
+            .expect_err("non-head transition sources are rejected");
+        assert_eq!(stale.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert_eq!(value(&session, "typed").await.as_deref(), Some("after"));
     }
 
     #[tokio::test]

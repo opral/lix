@@ -41,8 +41,8 @@ pub use lix_engine::{
     CreateCheckpointReceipt as CreateCheckpointResult, ExecuteBatchStatement, ExecuteIdempotency,
     ExecuteOptions, ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition,
     FILE_UPLOAD_PART_BYTES, FileRead, FileUploadProgress, GLOBAL_BRANCH_ID, GetManyRequest,
-    GetManyResult, GetOptions, Key, KeyRange, LixError, LixNotice, MAX_SCAN_PAGE_ROWS, Memory,
-    MemoryRead, MemoryWrite, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
+    GetManyResult, GetOptions, Key, KeyRange, LixError, LixNotice, LixPath, MAX_SCAN_PAGE_ROWS,
+    Memory, MemoryRead, MemoryWrite, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeBranchReceipt as MergeBranchResult,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
     MutationIdentity, ObserveEvent, ObserveEvents, ProjectedValue, PutBatch, ReadDurability,
@@ -53,7 +53,7 @@ pub use lix_engine::{
     StoredValue, SwitchBranchOptions, SwitchBranchReceipt,
     SwitchBranchReceipt as SwitchBranchResult, TryFromValue, UndoReceipt, Value, ValueSemantics,
     VerifiedRequestBlob, WireValue, WriteOptions, WriteStats, parse_sql_script,
-    run_storage_conformance,
+    run_storage_conformance, validate_lix_path_segment,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, SQLiteFixture, SQLiteOptions};

@@ -1,5 +1,6 @@
+use crate::schema::seed_schema_definition;
 use crate::{validate_lix_schema, validate_lix_schema_definition};
-use serde_json::json;
+use serde_json::{Value as JsonValue, json};
 
 #[test]
 fn validate_lix_schema_definition_passes_for_valid_schema() {
@@ -97,6 +98,35 @@ fn validate_lix_schema_validates_both_schema_and_data_successfully() {
     });
 
     assert!(validate_lix_schema(&schema, &valid_data).is_ok());
+}
+
+#[test]
+fn filesystem_descriptor_schemas_assert_the_engine_path_segment_format() {
+    for (schema_key, parent_field) in [
+        ("lix_file_descriptor", "directory_id"),
+        ("lix_directory_descriptor", "parent_id"),
+    ] {
+        let schema = seed_schema_definition(schema_key)
+            .unwrap_or_else(|| panic!("builtin {schema_key} schema should exist"));
+        let mut valid = json!({
+            "id": "01920000-0000-7000-8000-000000000001",
+            "name": "100% @2x 日本語.txt"
+        });
+        valid[parent_field] = JsonValue::Null;
+        assert!(validate_lix_schema(schema, &valid).is_ok());
+
+        for name in ["", ".", "..", "a/b", "nul\0name"] {
+            let mut invalid = json!({
+                "id": "01920000-0000-7000-8000-000000000001",
+                "name": name
+            });
+            invalid[parent_field] = JsonValue::Null;
+            assert!(
+                validate_lix_schema(schema, &invalid).is_err(),
+                "{schema_key} name {name:?} should be rejected"
+            );
+        }
+    }
 }
 
 #[test]

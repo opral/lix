@@ -474,6 +474,11 @@ enum TransactionBatchStatements {
         statement: datafusion::sql::parser::Statement,
         len: usize,
     },
+    AutoParameterizedUpdate {
+        sql: Arc<str>,
+        statement: datafusion::sql::parser::Statement,
+        parameter_rows: Vec<Vec<Value>>,
+    },
     Distinct(Vec<datafusion::sql::parser::Statement>),
 }
 
@@ -481,14 +486,8 @@ impl TransactionBatchStatements {
     fn len(&self) -> usize {
         match self {
             Self::Shared { len, .. } => *len,
+            Self::AutoParameterizedUpdate { parameter_rows, .. } => parameter_rows.len(),
             Self::Distinct(statements) => statements.len(),
-        }
-    }
-
-    fn first(&self) -> Option<&datafusion::sql::parser::Statement> {
-        match self {
-            Self::Shared { statement, len } => (*len > 0).then_some(statement),
-            Self::Distinct(statements) => statements.first(),
         }
     }
 
@@ -497,6 +496,7 @@ impl TransactionBatchStatements {
             Self::Shared { statement, .. } => {
                 Ok(sql2::bind_statement_route(statement)? == sql2::BoundStatementRoute::Write)
             }
+            Self::AutoParameterizedUpdate { .. } => Ok(true),
             Self::Distinct(statements) => {
                 statements
                     .iter()
@@ -512,6 +512,11 @@ impl TransactionBatchStatements {
     fn into_vec(self) -> Vec<datafusion::sql::parser::Statement> {
         match self {
             Self::Shared { statement, len } => vec![statement; len],
+            Self::AutoParameterizedUpdate {
+                statement,
+                parameter_rows,
+                ..
+            } => vec![statement; parameter_rows.len()],
             Self::Distinct(statements) => statements,
         }
     }
@@ -1508,44 +1513,93 @@ where
                         return Ok(results);
                     }
                     let mut results = Vec::with_capacity(transaction_statements.len());
-                    let parsed = parsed.into_vec();
-                    for (statement_index, ((statement, parsed), metadata)) in transaction_statements
-                        .iter()
-                        .zip(parsed)
-                        .zip(statement_metadata)
-                        .enumerate()
-                    {
-                        let telemetry = SqlStatementTelemetry::start(
-                            transaction_telemetry_sink.as_ref(),
-                            &statement.sql,
-                            "batch",
-                            Some(statement_index),
-                        );
-                        let operation = async {
-                            execute_transaction_statement(
-                                transaction,
-                                &statement.sql,
-                                parsed,
-                                &statement.params,
-                                options.clone(),
-                                metadata,
-                            )
-                            .await
-                            .map_err(|error| {
-                                with_batch_statement_index(
-                                    normalize_sql_surface_error(error, &statement.sql),
-                                    statement_index,
-                                )
-                            })
-                        };
-                        let result = match telemetry.as_ref() {
-                            Some(telemetry) => telemetry.instrument(operation).await,
-                            None => operation.await,
-                        };
-                        if let Some(telemetry) = telemetry {
-                            telemetry.finish(&result);
+                    match parsed {
+                        TransactionBatchStatements::AutoParameterizedUpdate {
+                            sql,
+                            statement: parsed,
+                            parameter_rows,
+                        } => {
+                            for (statement_index, ((statement, params), metadata)) in
+                                transaction_statements
+                                    .iter()
+                                    .zip(parameter_rows)
+                                    .zip(statement_metadata)
+                                    .enumerate()
+                            {
+                                let telemetry = SqlStatementTelemetry::start(
+                                    transaction_telemetry_sink.as_ref(),
+                                    &statement.sql,
+                                    "batch",
+                                    Some(statement_index),
+                                );
+                                let operation = async {
+                                    execute_transaction_statement(
+                                        transaction,
+                                        &sql,
+                                        parsed.clone(),
+                                        &params,
+                                        options.clone(),
+                                        metadata,
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        with_batch_statement_index(
+                                            normalize_sql_surface_error(error, &statement.sql),
+                                            statement_index,
+                                        )
+                                    })
+                                };
+                                let result = match telemetry.as_ref() {
+                                    Some(telemetry) => telemetry.instrument(operation).await,
+                                    None => operation.await,
+                                };
+                                if let Some(telemetry) = telemetry {
+                                    telemetry.finish(&result);
+                                }
+                                results.push(result?);
+                            }
                         }
-                        results.push(result?);
+                        parsed => {
+                            for (statement_index, ((statement, parsed), metadata)) in
+                                transaction_statements
+                                    .iter()
+                                    .zip(parsed.into_vec())
+                                    .zip(statement_metadata)
+                                    .enumerate()
+                            {
+                                let telemetry = SqlStatementTelemetry::start(
+                                    transaction_telemetry_sink.as_ref(),
+                                    &statement.sql,
+                                    "batch",
+                                    Some(statement_index),
+                                );
+                                let operation = async {
+                                    execute_transaction_statement(
+                                        transaction,
+                                        &statement.sql,
+                                        parsed,
+                                        &statement.params,
+                                        options.clone(),
+                                        metadata,
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        with_batch_statement_index(
+                                            normalize_sql_surface_error(error, &statement.sql),
+                                            statement_index,
+                                        )
+                                    })
+                                };
+                                let result = match telemetry.as_ref() {
+                                    Some(telemetry) => telemetry.instrument(operation).await,
+                                    None => operation.await,
+                                };
+                                if let Some(telemetry) = telemetry {
+                                    telemetry.finish(&result);
+                                }
+                                results.push(result?);
+                            }
+                        }
                     }
                     if let Some(idempotency) = &idempotency {
                         let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
@@ -2582,34 +2636,48 @@ where
     if statements.len() < 2
         || parsed.len() != statements.len()
         || statement_metadata.len() != statements.len()
-        || statements
-            .iter()
-            .any(|statement| statement.sql != first_statement.sql)
         || statement_metadata
             .iter()
             .any(|metadata| metadata != &ExecuteStatementMetadata::default())
-        || sql2::bind_statement_route(
-            parsed
-                .first()
-                .expect("non-empty transaction batch has a parsed statement"),
-        )? != sql2::BoundStatementRoute::Write
     {
         return Ok(None);
     }
 
-    let parameter_rows = statements
-        .iter()
-        .map(|statement| statement.params.as_slice())
-        .collect::<Vec<_>>();
+    let (planning_sql, parsed_statement, parameter_rows) = match parsed {
+        TransactionBatchStatements::AutoParameterizedUpdate {
+            sql,
+            statement,
+            parameter_rows,
+        } => (
+            sql.as_ref(),
+            statement,
+            parameter_rows.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        ),
+        TransactionBatchStatements::Shared { statement, .. }
+            if statements
+                .iter()
+                .all(|candidate| candidate.sql == first_statement.sql) =>
+        {
+            (
+                first_statement.sql.as_str(),
+                statement,
+                statements
+                    .iter()
+                    .map(|statement| statement.params.as_slice())
+                    .collect::<Vec<_>>(),
+            )
+        }
+        TransactionBatchStatements::Shared { .. } | TransactionBatchStatements::Distinct(_) => {
+            return Ok(None);
+        }
+    };
+    if sql2::bind_statement_route(parsed_statement)? != sql2::BoundStatementRoute::Write {
+        return Ok(None);
+    }
 
     let previous_origin_key = transaction.replace_origin_key(options.origin_key.clone());
     let execution = async {
-        let plan = transaction.prepare_sql_write_logical_plan(
-            &first_statement.sql,
-            parsed
-                .first()
-                .expect("non-empty transaction batch has a parsed statement"),
-        )?;
+        let plan = transaction.prepare_sql_write_logical_plan(planning_sql, parsed_statement)?;
         if let Some(results) =
             sql2::execute_write_logical_plan_value_batch(transaction, &plan, &parameter_rows)
                 .await?
@@ -2634,7 +2702,7 @@ where
             })
         })
         .map_err(|error| {
-            let error = normalize_sql_surface_error(error, &first_statement.sql);
+            let error = normalize_sql_surface_error(error, planning_sql);
             if batch_statement_index(&error).is_some() {
                 error
             } else {
@@ -3600,6 +3668,41 @@ fn classify_execute_batch(
         };
     }
 
+    // Distinct literal UPDATE statements have the same execution shape as a
+    // homogeneous bound batch. Explicit transactions already normalize this
+    // narrow SQL subset one statement at a time; recognize the complete batch
+    // here so the ordered mutation kernel can fold repeated identities and use
+    // the certified columnar route. Shapes that have not yet been lowered into
+    // that mutation program retain their original sequential execution.
+    if statements.len() >= 2
+        && statements
+            .iter()
+            .all(|statement| statement.params.is_empty())
+        && let Some(first) = planning_cache.auto_parameterized_update(&statements[0].sql)
+    {
+        let mut parameter_rows = Vec::with_capacity(statements.len());
+        parameter_rows.push(first.params);
+        let mut same_shape = true;
+        for statement in &statements[1..] {
+            let Some(params) =
+                planning_cache.update_literal_params_for_shape(&statement.sql, first.sql.as_ref())
+            else {
+                same_shape = false;
+                break;
+            };
+            parameter_rows.push(params);
+        }
+        if same_shape {
+            return Ok(ExecuteBatchExecution::Transaction(
+                TransactionBatchStatements::AutoParameterizedUpdate {
+                    sql: first.sql,
+                    statement: first.statement,
+                    parameter_rows,
+                },
+            ));
+        }
+    }
+
     let mut parsed = Vec::with_capacity(statements.len());
     let mut is_read_only = true;
     for (statement_index, statement) in statements.iter().enumerate() {
@@ -4222,6 +4325,39 @@ mod tests {
             panic!("homogeneous durable statements should share one parsed statement");
         };
         assert_eq!(len, statements.len());
+    }
+
+    #[test]
+    fn execute_batch_auto_parameterizes_distinct_literal_update_shapes() {
+        let cache = sql2::SqlPlanningCache::default();
+        let statements = [
+            batch_statement("UPDATE notes SET value = 'first' WHERE id = 'a'"),
+            batch_statement("UPDATE notes SET value = 'second' WHERE id = 'b'"),
+        ];
+        let ExecuteBatchExecution::Transaction(
+            TransactionBatchStatements::AutoParameterizedUpdate {
+                sql,
+                parameter_rows,
+                ..
+            },
+        ) = classify_execute_batch(&statements, &cache).unwrap()
+        else {
+            panic!("literal UPDATE statements should share one parameterized shape");
+        };
+        assert_eq!(sql.as_ref(), "UPDATE notes SET value = $1 WHERE id = $2");
+        assert_eq!(
+            parameter_rows,
+            [
+                vec![
+                    Value::Text("first".to_string()),
+                    Value::Text("a".to_string())
+                ],
+                vec![
+                    Value::Text("second".to_string()),
+                    Value::Text("b".to_string())
+                ],
+            ]
+        );
     }
 
     #[tokio::test]
@@ -5370,6 +5506,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_batch_lowers_distinct_literal_entity_updates_once() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "literal_parameter_batch_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO literal_parameter_batch_probe (id, value) VALUES \
+                 ('a', 'old-a'), ('b', 'old-b')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_entity_update_parameter_batch_executions();
+        let results = session
+            .execute_batch(&[
+                batch_statement(
+                    "UPDATE literal_parameter_batch_probe SET value = 'new-a' WHERE id = 'a'",
+                ),
+                batch_statement(
+                    "UPDATE literal_parameter_batch_probe SET value = 'new-b' WHERE id = 'b'",
+                ),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        let rows = session
+            .execute(
+                "SELECT id, value FROM literal_parameter_batch_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "new-a");
+        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "new-b");
+    }
+
+    #[tokio::test]
     async fn entity_insert_values_use_one_certified_canonical_batch() {
         let session = open_session().await;
         let schema = serde_json::json!({
@@ -5559,8 +5757,29 @@ mod tests {
                 ExecuteBatchStatement {
                     sql: sql.to_string(),
                     params: vec![
+                        Value::Text(r#"{"missing":1}"#.to_string()),
+                        Value::Text("/missing".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
                         Value::Text("null".to_string()),
                         Value::Text("/a".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text(r#"{"final":"b"}"#.to_string()),
+                        Value::Text("/b".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text(r#"{"missing":2}"#.to_string()),
+                        Value::Text("/missing".to_string()),
                     ],
                 },
             ])
@@ -5576,7 +5795,7 @@ mod tests {
                 .iter()
                 .map(ExecuteResult::rows_affected)
                 .collect::<Vec<_>>(),
-            vec![1, 1]
+            vec![1, 0, 1, 1, 0]
         );
         let rows = session
             .execute(
@@ -5588,7 +5807,7 @@ mod tests {
         assert_eq!(rows.rows()[0].value("value").unwrap(), &Value::Null);
         assert_eq!(
             rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!({"nested": [1, true, "x"]})
+            serde_json::json!({"final": "b"})
         );
     }
 
@@ -5805,7 +6024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_keeps_repeated_entity_identity_sequential() {
+    async fn execute_batch_keeps_repeated_generic_entity_identity_sequential() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5894,7 +6113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_keeps_parameterless_updates_sequential() {
+    async fn execute_batch_keeps_unsupported_parameterless_updates_sequential() {
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5924,17 +6143,14 @@ mod tests {
             .unwrap();
 
         sql2::take_entity_update_parameter_batch_executions();
-        let sql = "UPDATE parameterless_batch_probe SET value = 'new' WHERE id = 'a'";
         let results = session
             .execute_batch(&[
-                ExecuteBatchStatement {
-                    sql: sql.to_string(),
-                    params: Vec::new(),
-                },
-                ExecuteBatchStatement {
-                    sql: sql.to_string(),
-                    params: Vec::new(),
-                },
+                batch_statement(
+                    "UPDATE parameterless_batch_probe SET value = 'first' WHERE id = 'a'",
+                ),
+                batch_statement(
+                    "UPDATE parameterless_batch_probe SET value = 'second' WHERE id = 'a'",
+                ),
             ])
             .await
             .unwrap();
@@ -5955,7 +6171,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(row.rows()[0].get::<String>("value").unwrap(), "new");
+        assert_eq!(row.rows()[0].get::<String>("value").unwrap(), "second");
     }
 
     #[tokio::test]

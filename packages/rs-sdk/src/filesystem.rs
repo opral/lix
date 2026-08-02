@@ -15,8 +15,8 @@ use std::time::Duration;
 use lix_engine::storage::StorageSpace;
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    CommitResult, Engine, Key, KeyRange, LixError, PutBatch, ReadOptions, SessionContext, Storage,
-    StorageError, StorageWrite, Value, WriteOptions,
+    CommitResult, Engine, Key, KeyRange, LixError, LixPath, PutBatch, ReadOptions, SessionContext,
+    Storage, StorageError, StorageWrite, Value, WriteOptions,
 };
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
@@ -1844,7 +1844,7 @@ fn create_materialized_directory(layout: &FilesystemLayout, path: &str) -> Resul
         return Ok(());
     };
     if path_contains_unmanaged_entry(layout, &local_path)? {
-        return Ok(());
+        return Err(unsupported_materialization_entry(path, &local_path));
     }
     std::fs::create_dir_all(&local_path)
         .map_err(|error| io_error("create filesystem directory", &local_path, error))
@@ -1862,20 +1862,20 @@ fn write_materialized_file(
         return Ok(());
     };
     if path_contains_unmanaged_entry(layout, &local_path)? {
-        return Ok(());
+        return Err(unsupported_materialization_entry(path, &local_path));
     }
     if let Some(parent) = local_path.parent() {
         if path_contains_unmanaged_entry(layout, parent)? {
-            return Ok(());
+            return Err(unsupported_materialization_entry(path, &local_path));
         }
         std::fs::create_dir_all(parent)
             .map_err(|error| io_error("create filesystem file parent", parent, error))?;
         if path_contains_unmanaged_entry(layout, parent)? {
-            return Ok(());
+            return Err(unsupported_materialization_entry(path, &local_path));
         }
     }
     if path_contains_unmanaged_entry(layout, &local_path)? {
-        return Ok(());
+        return Err(unsupported_materialization_entry(path, &local_path));
     }
     std::fs::write(&local_path, data)
         .map_err(|error| io_error("write filesystem file", &local_path, error))
@@ -2024,7 +2024,7 @@ fn normalize_filter_file_path(path: &str) -> Result<String, LixError> {
 }
 
 fn validate_lix_path(path: &str) -> Result<(), LixError> {
-    let _ = lix_path_to_local_path(Path::new("/"), path)?;
+    let _ = LixPath::try_from_file_path(path)?;
     Ok(())
 }
 
@@ -2065,29 +2065,15 @@ fn insert_parent_lix_directories(path: &str, snapshot: &mut Snapshot) {
 }
 
 fn lix_path_to_local_path(root: &Path, path: &str) -> Result<PathBuf, LixError> {
-    if path == "/" {
-        return Ok(root.to_path_buf());
-    }
-    let body = path
-        .strip_prefix('/')
-        .ok_or_else(|| filesystem_error(format!("Lix path {path:?} is not absolute")))?;
-    if body.is_empty() {
-        return Ok(root.to_path_buf());
-    }
+    let parsed = LixPath::try_from_directory_path(path)?;
     let mut local = root.to_path_buf();
-    for segment in body.split('/') {
+    for segment in parsed.segments() {
         push_lix_path_segment(&mut local, segment, path)?;
     }
     Ok(local)
 }
 
 fn push_lix_path_segment(local: &mut PathBuf, segment: &str, path: &str) -> Result<(), LixError> {
-    if segment.is_empty() || segment == "." || segment == ".." {
-        return Err(filesystem_error(format!(
-            "Lix path {path:?} contains unsupported segment {segment:?}"
-        )));
-    }
-
     let mut components = Path::new(segment).components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(component)), None) => {
@@ -2215,6 +2201,16 @@ fn filesystem_sync_storage_error(error: LixError) -> StorageError {
 
 fn filesystem_error(message: impl Into<String>) -> LixError {
     LixError::new("LIX_FILESYSTEM_ERROR", message)
+}
+
+fn unsupported_materialization_entry(path: &str, local_path: &Path) -> LixError {
+    LixError::new(
+        "LIX_FILESYSTEM_UNSUPPORTED_ENTRY",
+        format!(
+            "cannot materialize regular Lix path {path} at {}: the path is blocked by a symlink or another unsupported filesystem entry",
+            local_path.display()
+        ),
+    )
 }
 
 #[cfg(feature = "local_filesystem")]
@@ -2619,13 +2615,47 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn materializing_a_regular_file_reports_symlink_collisions() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().join("workspace");
+        let lix_dir = root.join(".lix");
+        std::fs::create_dir_all(&lix_dir).unwrap();
+        std::fs::write(root.join("target.txt"), b"target").unwrap();
+        symlink("target.txt", root.join("link.txt")).unwrap();
+        let layout = FilesystemLayout {
+            root,
+            lix_dir,
+            lix_dir_is_default: true,
+        };
+
+        let error = write_materialized_file(&layout, "/link.txt", b"replacement")
+            .expect_err("a symlink collision must be reported");
+
+        assert_eq!(error.code, "LIX_FILESYSTEM_UNSUPPORTED_ENTRY");
+        assert!(error.message.contains("/link.txt"));
+        assert_eq!(
+            std::fs::read(layout.root.join("target.txt")).unwrap(),
+            b"target"
+        );
+    }
+
     #[test]
     fn lix_paths_reject_structurally_unsafe_segments() {
         let root = Path::new("root");
 
-        for path in ["relative", "/a//b", "/./b", "/../b"] {
+        for (path, expected_code) in [
+            ("relative", "LIX_ERROR_PATH_MISSING_LEADING_SLASH"),
+            ("/a//b", "LIX_ERROR_PATH_EMPTY_SEGMENT"),
+            ("/./b", "LIX_ERROR_PATH_DOT_SEGMENT"),
+            ("/../b", "LIX_ERROR_PATH_DOT_SEGMENT"),
+            ("/nul\0name", "LIX_ERROR_PATH_NUL"),
+        ] {
             let error = lix_path_to_local_path(root, path).expect_err("path should fail");
-            assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
+            assert_eq!(error.code, expected_code);
         }
     }
 

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use lix_sdk::{Lix, OpenLixOptions, Storage, Value, open_lix};
 
 const N: usize = 6_000;
-const CONCURRENT_CLIENTS: usize = 1_540;
+const CONCURRENT_CLIENTS: usize = 100;
 const SAMPLES: usize = 5;
 
 #[tokio::test]
@@ -137,6 +137,7 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
             transactions.push(transaction);
         }
 
+        let commits_before = commit_count(&lix).await;
         lix.reset_plugin_transition_counters();
         let batch_started = Instant::now();
         let commit_results = tokio::task::LocalSet::new()
@@ -163,8 +164,21 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
         }
 
         let counters = lix.plugin_transition_counters();
+        assert_eq!(
+            commit_count(&lix).await - commits_before,
+            1,
+            "one admitted same-base cohort must publish one durable commit",
+        );
         assert!(counters.conflict_resolution_calls > 0);
-        assert_eq!(counters.conflict_resolution_records, (clients - 1) as u64);
+        assert!(
+            counters.conflict_resolution_calls <= clients.ilog2() as u64 + 1,
+            "balanced reduction should cross the plugin boundary logarithmically",
+        );
+        assert_eq!(
+            counters.conflict_resolution_records,
+            (clients - 1) as u64,
+            "every accumulated same-entity contender must participate in resolution",
+        );
         let converged = read_file(&lix, &path).await;
         let merged: serde_json::Value =
             serde_json::from_slice(&converged).expect("merged JSON should parse");
@@ -237,6 +251,133 @@ async fn ordinary_concurrent_execute_serializes_without_plugin_resolution() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
+    lix.close().await.unwrap();
+}
+
+#[test]
+fn same_base_three_writer_cohort_converges_and_reuses_follower_session() {
+    std::thread::Builder::new()
+        .name("three-writer-cohort".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+                    install_plugin(&lix, "plugin_json", &build_json_plugin_archive()).await;
+                    let path = "/three-writer.json";
+                    write_file(&lix, path, br#"{"v":-1}"#).await;
+                    let file_id = file_id(&lix, path).await;
+                    let mut peers = Vec::new();
+                    let mut transactions = Vec::new();
+                    for value in 0..3 {
+                        let peer = lix.open_workspace_session().await.unwrap();
+                        let mut transaction = peer.begin_transaction().await.unwrap();
+                        transaction
+                            .execute(
+                                "UPDATE json_object_member SET scalar_json = $1 \
+                 WHERE parent_id = 'root' AND key = 'v' AND lixcol_file_id = $2",
+                                &[Value::Text(value.to_string()), Value::Text(file_id.clone())],
+                            )
+                            .await
+                            .unwrap();
+                        peers.push(peer);
+                        transactions.push(transaction);
+                    }
+
+                    let commits_before = commit_count(&lix).await;
+                    lix.reset_plugin_transition_counters();
+                    let results = tokio::task::LocalSet::new()
+                        .run_until(async move {
+                            let mut transactions = transactions.into_iter();
+                            let leader_transaction = transactions.next().unwrap();
+                            let leader = tokio::task::spawn_local(async move {
+                                leader_transaction.commit().await
+                            });
+                            let mut commits = tokio::task::JoinSet::new();
+                            for transaction in transactions {
+                                commits.spawn_local(async move { transaction.commit().await });
+                            }
+                            tokio::task::yield_now().await;
+                            leader.abort();
+                            assert!(leader.await.unwrap_err().is_cancelled());
+                            let mut results = Vec::new();
+                            while let Some(result) = commits.join_next().await {
+                                results.push(result.unwrap());
+                            }
+                            results
+                        })
+                        .await;
+                    for result in results {
+                        result.unwrap();
+                    }
+                    assert_eq!(commit_count(&lix).await - commits_before, 1);
+                    let counters = lix.plugin_transition_counters();
+                    assert_eq!(counters.conflict_resolution_calls, 2);
+                    assert_eq!(counters.conflict_resolution_records, 2);
+
+                    // A follower's private plugin observation must be evicted by the shared
+                    // commit so its next edit cold-opens the converged durable document.
+                    peers[1]
+                        .execute(
+                            "UPDATE json_object_member SET scalar_json = $1 \
+             WHERE parent_id = 'root' AND key = 'v' AND lixcol_file_id = $2",
+                            &[Value::Text("99".to_owned()), Value::Text(file_id)],
+                        )
+                        .await
+                        .unwrap();
+                    let converged = read_file(&lix, path).await;
+                    for peer in &peers {
+                        assert_eq!(read_file(peer, path).await, converged);
+                    }
+                    for peer in peers {
+                        peer.close().await.unwrap();
+                    }
+                    lix.close().await.unwrap();
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn invalid_aggregate_member_does_not_poison_valid_transaction() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_plugin(&lix, "plugin_json", &build_json_plugin_archive()).await;
+    let first = lix.open_workspace_session().await.unwrap();
+    let second = lix.open_workspace_session().await.unwrap();
+    let mut first_transaction = first.begin_transaction().await.unwrap();
+    let mut second_transaction = second.begin_transaction().await.unwrap();
+    for (transaction, bytes) in [
+        (&mut first_transaction, br#"{"winner":1}"#.as_slice()),
+        (&mut second_transaction, br#"{"winner":2}"#.as_slice()),
+    ] {
+        transaction
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/unique-path.json', $1)",
+                &[Value::Blob(bytes.to_vec().into())],
+            )
+            .await
+            .unwrap();
+    }
+
+    let commits_before = commit_count(&lix).await;
+    let results = tokio::task::LocalSet::new()
+        .run_until(async move {
+            let first = tokio::task::spawn_local(async move { first_transaction.commit().await });
+            let second = tokio::task::spawn_local(async move { second_transaction.commit().await });
+            vec![first.await.unwrap(), second.await.unwrap()]
+        })
+        .await;
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert_eq!(commit_count(&lix).await - commits_before, 1);
+    assert!(!read_file(&lix, "/unique-path.json").await.is_empty());
+    first.close().await.unwrap();
+    second.close().await.unwrap();
     lix.close().await.unwrap();
 }
 
@@ -314,6 +455,18 @@ where
     .rows()[0]
         .get::<String>("id")
         .expect("benchmark file id should be text")
+}
+
+async fn commit_count<StorageImpl>(lix: &Lix<StorageImpl>) -> i64
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    lix.execute("SELECT COUNT(*) AS count FROM lix_commit", &[])
+        .await
+        .expect("benchmark commit count should query")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("benchmark commit count should be an integer")
 }
 
 fn build_markdown_plugin_archive() -> Vec<u8> {

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lix_engine::{Engine, ExecuteResult, SessionContext, Storage, Value};
+use lix_engine::{Engine, ExecuteBatchStatement, ExecuteResult, SessionContext, Storage, Value};
 
 #[cfg(feature = "slatedb")]
 use crate::storage::SlateDB;
@@ -28,6 +28,11 @@ enum FixtureShape {
     BoundUpdate,
 }
 
+enum LiteralUpdateWorkload {
+    Transaction(Vec<String>),
+    ExecuteBatch(Vec<ExecuteBatchStatement>),
+}
+
 impl UntrackedFixture {
     const fn has_untracked_row(self) -> bool {
         !matches!(self, Self::None)
@@ -41,7 +46,7 @@ pub(crate) enum SqlFixture {
     SlateDB(GenericSqlFixture<SlateDB>),
 }
 
-pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
+pub(crate) struct GenericSqlFixture<StorageImpl: Storage + 'static> {
     session: SessionContext<StorageImpl>,
     /// Number of tracked fixture rows. In mixed mode the untracked probe
     /// replaces one of the requested rows rather than adding a 10,001st row.
@@ -55,7 +60,7 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
     select_many_by_pk_sql: String,
     select_one_by_pk_sql: String,
     update_one_by_pk_sql: String,
-    update_all_sql_rows: Vec<String>,
+    update_all_workload: LiteralUpdateWorkload,
     bound_update_all_batch: SharedParameterBatch,
     delete_all_sql: String,
     delete_one_by_pk_sql: String,
@@ -450,11 +455,19 @@ where
 
     #[expect(clippy::cast_possible_truncation)]
     async fn update_all(&self) -> usize {
-        let affected = Box::pin(execute_many_in_transaction(
-            &self.session,
-            &self.update_all_sql_rows,
-        ))
-        .await;
+        let affected = match &self.update_all_workload {
+            LiteralUpdateWorkload::Transaction(statements) => {
+                Box::pin(execute_many_in_transaction(&self.session, statements)).await
+            }
+            LiteralUpdateWorkload::ExecuteBatch(statements) => self
+                .session
+                .execute_batch(statements)
+                .await
+                .expect("execute tracked-state CRUD SQL batch")
+                .into_iter()
+                .map(|result| result.rows_affected())
+                .sum(),
+        };
         assert_eq!(affected as usize, self.row_count);
         affected as usize
     }
@@ -607,11 +620,7 @@ where
         ),
         select_one_by_pk_sql: select_by_pk_sql(&tracked_rows[mid..][..1]),
         update_one_by_pk_sql: update_row_sql(&tracked_rows[mid]),
-        update_all_sql_rows: if matches!(shape, FixtureShape::FullCrud) {
-            tracked_rows.iter().map(update_row_sql).collect()
-        } else {
-            Vec::new()
-        },
+        update_all_workload: literal_update_workload(shape, tracked_rows),
         bound_update_all_batch: if matches!(shape, FixtureShape::FullCrud) {
             tracked_rows
                 .iter()
@@ -632,6 +641,26 @@ where
             sql_string(tracked_rows[mid].path.as_str())
         ),
         _dir: dir,
+    }
+}
+
+fn literal_update_workload(shape: FixtureShape, rows: &[WorkloadRow]) -> LiteralUpdateWorkload {
+    if !matches!(shape, FixtureShape::FullCrud) {
+        return LiteralUpdateWorkload::Transaction(Vec::new());
+    }
+    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_UPDATE_API").as_deref() {
+        Ok("execute_batch") => LiteralUpdateWorkload::ExecuteBatch(
+            rows.iter()
+                .map(|row| ExecuteBatchStatement {
+                    sql: update_row_sql(row),
+                    params: Vec::new(),
+                })
+                .collect(),
+        ),
+        Ok(other) => panic!(
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_UPDATE_API '{other}'; expected execute_batch"
+        ),
+        Err(_) => LiteralUpdateWorkload::Transaction(rows.iter().map(update_row_sql).collect()),
     }
 }
 

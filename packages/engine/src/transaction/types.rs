@@ -3242,6 +3242,17 @@ impl Default for StagedCommitChangeRefs {
     }
 }
 
+impl StagedCommitChangeRefs {
+    pub(crate) fn absorb_cohort_membership(&mut self, mut other: Self) {
+        self.tracked_change_count = self
+            .tracked_change_count
+            .saturating_add(other.tracked_change_count);
+        self.selected_change_batches
+            .append(&mut other.selected_change_batches);
+        self.allow_empty |= other.allow_empty;
+    }
+}
+
 /// Immutable typed columns for historical changes selected into a new commit.
 ///
 /// Identities retain the diff batch owner, so schema keys, file ids, and

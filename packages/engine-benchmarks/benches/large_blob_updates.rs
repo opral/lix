@@ -328,7 +328,7 @@ impl WorkloadState {
     }
 }
 
-struct BackendFixture<S: Storage> {
+struct BackendFixture<S: Storage + 'static> {
     session: SessionContext<S>,
     storage: S,
     _temp_dir: TempDir,

@@ -1641,9 +1641,9 @@ fn validate_conflict_order(
         }
     }
     for pair in conflicts.windows(2) {
-        if pair[0].key >= pair[1].key {
+        if pair[0].key > pair[1].key {
             return Err(invalid_input(
-                "component conflict sources must be strictly key-sorted and unique",
+                "component conflict sources must be key-sorted",
             ));
         }
     }
