@@ -1,13 +1,11 @@
-#[cfg(test)]
-use std::collections::HashSet;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 #[cfg(test)]
 use datafusion::arrow::array::Array;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
-use datafusion::arrow::compute::{concat_batches, filter_record_batch};
+use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::{ColumnStatistics, Precision};
@@ -620,7 +618,11 @@ async fn entity_columnar_scan_source(
         }
         *hasher.finalize().as_bytes()
     };
-    let shadow_identities = Arc::new(shadow_identities);
+    let shadow_identities = Arc::new(
+        shadow_identities
+            .into_iter()
+            .collect::<HashSet<_, ahash::RandomState>>(),
+    );
     let mut overlay_cache_projection = projection.clone();
     overlay_cache_projection.push(usize::MAX);
     let filter_digest = blake3::hash(format!("{row_filters:?}").as_bytes());
@@ -665,69 +667,6 @@ async fn entity_columnar_scan_source(
         batches
     };
     let overlay_batches = Arc::new(overlay_batches);
-    if !layout.overlay.is_empty() {
-        let mut snapshot_cache_projection = overlay_cache_projection;
-        snapshot_cache_projection.push(usize::MAX - 1);
-        snapshot_cache_projection.extend(group_indices.iter().copied());
-        let snapshot = if let Some(batch) = reader
-            .cached_entity_columnar_batch(
-                &layout,
-                usize::MAX - 1,
-                shadow_identity_digest,
-                &snapshot_cache_projection,
-            )
-            .await
-            .map_err(lix_error_to_datafusion_error)?
-        {
-            batch
-        } else {
-            let mut batches = Vec::with_capacity(group_indices.len() + overlay_batches.len());
-            for &group_index in &group_indices {
-                let keep = reader
-                    .entity_columnar_shadow_mask(
-                        layout.clone(),
-                        group_index,
-                        identity_column,
-                        Arc::clone(&shadow_identities),
-                        shadow_identity_digest,
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-                let batch = reader
-                    .load_entity_columnar_group(layout.clone(), group_index, projection.clone())
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-                batches.push(filter_record_batch(&batch, keep.as_ref())?);
-            }
-            batches.extend(overlay_batches.iter().cloned());
-            let batch = Arc::new(concat_batches(&schema, &batches)?);
-            reader
-                .cache_entity_columnar_batch(
-                    &layout,
-                    usize::MAX - 1,
-                    shadow_identity_digest,
-                    snapshot_cache_projection,
-                    batch,
-                )
-                .await
-                .map_err(lix_error_to_datafusion_error)?
-        };
-        let statistics = entity_columnar_record_batch_statistics(snapshot.as_ref())?;
-        let stream_schema = Arc::clone(&schema);
-        return Ok(batch_stream_source_with_statistics_and_source(
-            Arc::clone(&schema),
-            vec![statistics.clone()],
-            Some(statistics),
-            move |partition, _context| {
-                debug_assert_eq!(partition, 0);
-                let batches = stream::iter(vec![Ok(snapshot.as_ref().clone())]);
-                Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    Arc::clone(&stream_schema),
-                    batches,
-                )))
-            },
-        ));
-    }
     let mut all_reconciled_statistics_cached = true;
     let mut base_statistics_cached = Vec::with_capacity(group_indices.len());
     let mut statistics = if layout.overlay.is_empty() {
@@ -798,7 +737,13 @@ async fn entity_columnar_scan_source(
             debug_assert!(partition < partition_count);
             if partition >= base_partition_count {
                 let schema = Arc::clone(&stream_schema);
-                let batches = stream::iter(overlay_batches.as_ref().clone().into_iter().map(Ok));
+                let batch = entity_columnar_overlay_partition(
+                    overlay_batches.as_ref(),
+                    base_partition_count,
+                    partition,
+                )
+                .expect("statistics expose exactly one entry per overlay partition");
+                let batches = stream::once(async move { Ok(batch) });
                 return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)));
             }
             let reader = Arc::clone(&reader);
@@ -883,6 +828,16 @@ async fn entity_columnar_scan_source(
             Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
         },
     ))
+}
+
+fn entity_columnar_overlay_partition(
+    overlay_batches: &[RecordBatch],
+    base_partition_count: usize,
+    partition: usize,
+) -> Option<RecordBatch> {
+    overlay_batches
+        .get(partition.checked_sub(base_partition_count)?)
+        .cloned()
 }
 
 #[cfg(test)]
@@ -4161,5 +4116,45 @@ mod tests {
             "insert-c",
             "the updated row moved out of the predicate and its stale base was already shadowed"
         );
+    }
+
+    #[test]
+    fn each_overlay_batch_maps_to_exactly_one_stream_partition() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = |value| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![value]))],
+            )
+            .expect("batch")
+        };
+        let overlays = [batch(10), batch(20)];
+
+        assert!(super::entity_columnar_overlay_partition(&overlays, 3, 2).is_none());
+        assert_eq!(
+            super::entity_columnar_overlay_partition(&overlays, 3, 3)
+                .expect("first overlay")
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
+        assert_eq!(
+            super::entity_columnar_overlay_partition(&overlays, 3, 4)
+                .expect("second overlay")
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            20
+        );
+        assert!(super::entity_columnar_overlay_partition(&overlays, 3, 5).is_none());
     }
 }
