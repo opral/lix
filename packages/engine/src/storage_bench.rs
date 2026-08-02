@@ -179,6 +179,153 @@ pub struct CheckpointCommitScanBenchResult {
     pub pages: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitGraphBenchMode {
+    AllNodes,
+    LegacyAllNodes,
+    ReachableNodes,
+    LegacyReachableNodes,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CommitGraphBenchResult {
+    pub nodes: usize,
+    pub edges: usize,
+    pub member_changes: usize,
+}
+
+/// Measures topology reads against the superseded eager commit shape.
+///
+/// Legacy modes deliberately reproduce the removed work: synthesized commit
+/// changes for broad scans, plus commit-member payload hydration for graph
+/// walks. The result counts keep that work observable to the optimizer.
+#[inline(never)]
+pub async fn read_commit_graph_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    head_commit_id: &str,
+    mode: CommitGraphBenchMode,
+) -> Result<CommitGraphBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    let mut reader = crate::commit_graph::CommitGraphContext::new().reader(read);
+    let head_commit_id =
+        crate::changelog::CommitId::parse_lix(head_commit_id, "commit graph benchmark head")?;
+    let nodes = match mode {
+        CommitGraphBenchMode::AllNodes | CommitGraphBenchMode::LegacyAllNodes => {
+            reader.all_nodes().await?
+        }
+        CommitGraphBenchMode::ReachableNodes | CommitGraphBenchMode::LegacyReachableNodes => reader
+            .reachable_nodes(&head_commit_id)
+            .await?
+            .iter()
+            .map(|reachable| reachable.commit.clone())
+            .collect(),
+    };
+    let node_count = nodes.len();
+    let edges = crate::commit_graph::commit_edges(&nodes).len();
+    let mut member_changes = 0usize;
+    if matches!(
+        mode,
+        CommitGraphBenchMode::LegacyAllNodes | CommitGraphBenchMode::LegacyReachableNodes
+    ) {
+        let mut legacy_shape = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let canonical = crate::commit_graph::canonical_commit_change(&node);
+            let members = if mode == CommitGraphBenchMode::LegacyReachableNodes {
+                let members = crate::tracked_state::load_commit_delta_members_with_payloads(
+                    reader.store(),
+                    node.commit_id,
+                )
+                .await?;
+                member_changes = member_changes.saturating_add(members.len());
+                members
+            } else {
+                Vec::new()
+            };
+            let mut member_change_ids = Vec::with_capacity(members.len());
+            let member_payloads = members
+                .into_iter()
+                .map(|member| {
+                    member_change_ids.push(member.change.change_id);
+                    member.change
+                })
+                .collect::<Vec<_>>();
+            legacy_shape.push((
+                node,
+                canonical.clone(),
+                canonical,
+                member_change_ids,
+                member_payloads,
+            ));
+        }
+        std::hint::black_box(&legacy_shape);
+    }
+    Ok(CommitGraphBenchResult {
+        nodes: node_count,
+        edges,
+        member_changes,
+    })
+}
+
+/// Adds one representative tracked payload to every commit in a graph fixture.
+///
+/// The topology benchmark uses this to preserve the old reachable-commit
+/// model's payload-cache and retained-member costs instead of benchmarking an
+/// unrealistically commit-only history.
+pub async fn seed_commit_graph_members_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    commit_ids: &[String],
+) -> Result<(), crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let mut writes = storage.new_write_set();
+    let created_at = crate::common::LixTimestamp::expect_parse(
+        "commit graph benchmark timestamp",
+        "2026-05-20T00:00:00Z",
+    );
+    for (index, commit_id) in commit_ids.iter().enumerate() {
+        let commit_id = crate::changelog::CommitId::parse_lix(
+            commit_id,
+            "commit graph benchmark member commit",
+        )?;
+        let entity_pk = crate::entity_pk::EntityPk::single(format!("bench-member-{index:08}"));
+        let snapshot = crate::json_store::JsonSlot::from_json(&format!(
+            "{{\"index\":{index},\"payload\":\"{}\"}}",
+            "x".repeat(192)
+        ));
+        crate::tracked_state::stage_commit_deltas(
+            &mut writes,
+            &[crate::tracked_state::TrackedStateCommitDeltaRef {
+                delta: crate::tracked_state::TrackedStateDeltaRef {
+                    schema_key: "commit_graph_bench_member",
+                    file_id: None,
+                    entity_pk: &entity_pk,
+                    change_id: crate::changelog::ChangeId::for_test_label(&format!(
+                        "commit-graph-bench-member-{index}"
+                    )),
+                    commit_id,
+                    deleted: false,
+                    created_at,
+                    updated_at: created_at,
+                },
+                snapshot: snapshot.as_ref_slot(),
+                metadata: crate::json_store::JsonSlotRef::None,
+                origin_key: None,
+                base_coordinate: None,
+                authored: true,
+                certified: false,
+            }],
+        )?;
+    }
+    storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryGcBenchResult {
     pub live_commits: usize,
@@ -1488,7 +1635,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_gc_benchmark_plans_unreachable_commits_without_mutating() {
+    async fn repository_gc_benchmark_plans_unreachable_nodes_without_mutating() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await

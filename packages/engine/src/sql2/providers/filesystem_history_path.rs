@@ -132,7 +132,7 @@ pub(super) async fn load_history_commit_parents(
     for as_of_commit_id in as_of_commit_ids {
         let as_of_commit_id =
             CommitId::parse_lix(as_of_commit_id, "history lixcol_as_of_commit_id")?;
-        for reachable in commit_graph.reachable_commits(&as_of_commit_id).await? {
+        for reachable in commit_graph.reachable_nodes(&as_of_commit_id).await?.iter() {
             parents_by_commit.insert(
                 reachable.commit.commit_id.to_string(),
                 reachable

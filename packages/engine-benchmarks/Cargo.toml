@@ -187,6 +187,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "commit_graph_scale"
+path = "benches/commit_graph_scale.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
 name = "repository_gc_scale"
 path = "benches/repository_gc_scale.rs"
 harness = false

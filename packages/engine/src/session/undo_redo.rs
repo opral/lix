@@ -1,7 +1,6 @@
 use crate::LixError;
 use crate::changelog::{ChangeRecordProjection, CommitId};
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
-use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::Storage;
@@ -68,7 +67,7 @@ where
         .load_branch_head(&branch_id)
         .await?
         .ok_or_else(|| LixError::branch_not_found(&branch_id, "undo", "target"))?;
-    let head_record = load_commit_record(transaction, head).await?;
+    let head_record = load_node(transaction, head).await?;
     let (state, head_delta) =
         semantic_state_for_record(transaction, &branch_id, head, &head_record).await?;
     let target = state.undo_top.ok_or_else(|| {
@@ -80,7 +79,7 @@ where
     let target_record = if target == head {
         head_record
     } else {
-        load_commit_record(transaction, target).await?
+        load_node(transaction, target).await?
     };
     let parent = only_parent(&target_record.parent_commit_ids, target, "undo")?;
     let state_before_target = semantic_state_at(transaction, &branch_id, parent).await?;
@@ -126,7 +125,7 @@ where
         .load_branch_head(&branch_id)
         .await?
         .ok_or_else(|| LixError::branch_not_found(&branch_id, "redo", "target"))?;
-    let head_record = load_commit_record(transaction, head).await?;
+    let head_record = load_node(transaction, head).await?;
     let (state, _) = semantic_state_for_record(transaction, &branch_id, head, &head_record).await?;
     let redo_node = state.redo_top.ok_or_else(|| {
         LixError::new(
@@ -146,7 +145,7 @@ where
             .ok_or_else(|| missing_redo_node(redo_node))?;
         (node.target_commit_id, node.redo_next)
     };
-    let target_record = load_commit_record(transaction, target).await?;
+    let target_record = load_node(transaction, target).await?;
     only_parent(&target_record.parent_commit_ids, target, "redo")?;
 
     let target_delta = load_commit_delta(transaction, target).await?;
@@ -185,7 +184,7 @@ async fn semantic_state_at<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let record = load_commit_record(transaction, commit_id).await?;
+    let record = load_node(transaction, commit_id).await?;
     if record.parent_commit_ids.len() != 1 {
         return Ok(SemanticState::default());
     }
@@ -256,7 +255,7 @@ async fn semantic_state_for_record<S>(
     transaction: &mut Transaction<S>,
     branch_id: &str,
     commit_id: CommitId,
-    record: &crate::commit_graph::CommitGraphCommitRecord,
+    record: &crate::commit_graph::CommitGraphNode,
 ) -> Result<
     (
         SemanticState,
@@ -418,17 +417,17 @@ where
     tracked.commit_delta_members(commit_id).await
 }
 
-async fn load_commit_record<S>(
+async fn load_node<S>(
     transaction: &mut Transaction<S>,
     commit_id: CommitId,
-) -> Result<crate::commit_graph::CommitGraphCommitRecord, LixError>
+) -> Result<crate::commit_graph::CommitGraphNode, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     transaction
         .commit_graph_reader()
         .await
-        .load_commit_record(&commit_id)
+        .load_node(&commit_id)
         .await?
         .ok_or_else(|| {
             LixError::new(
@@ -574,7 +573,7 @@ where
 mod tests {
     use serde_json::Value as JsonValue;
 
-    use super::{load_commit_delta, load_commit_record, only_parent};
+    use super::{load_commit_delta, load_node, only_parent};
     use crate::sql2::SqlWriteExecutionContext;
     use crate::storage::Memory;
     use crate::{
@@ -673,7 +672,7 @@ mod tests {
                         .load_branch_head(&branch_id)
                         .await?
                         .expect("branch has a head");
-                    let record = load_commit_record(transaction, head).await?;
+                    let record = load_node(transaction, head).await?;
                     let parent = only_parent(&record.parent_commit_ids, head, "test")?;
                     let key = load_commit_delta(transaction, head)
                         .await?
@@ -699,7 +698,7 @@ mod tests {
                         .load_branch_head(&branch_id)
                         .await?
                         .expect("branch has a head");
-                    let record = load_commit_record(transaction, head).await?;
+                    let record = load_node(transaction, head).await?;
                     let parent = only_parent(&record.parent_commit_ids, head, "test")?;
                     let key = load_commit_delta(transaction, head)
                         .await?

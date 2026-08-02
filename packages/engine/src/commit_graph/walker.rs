@@ -4,10 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LixError;
 use crate::changelog::CommitId;
-use crate::commit_graph::{
-    CommitGraphCommit, CommitGraphCommitRecord, CommitGraphReader, CommitGraphStoreReader,
-    ReachableCommitGraphCommit,
-};
+use crate::commit_graph::{CommitGraphNode, CommitGraphStoreReader, ReachableCommitGraphNode};
 use crate::storage_adapter::StorageAdapterRead;
 
 /// Walks parent links from `head_commit_id` and returns reachable commits
@@ -16,14 +13,14 @@ use crate::storage_adapter::StorageAdapterRead;
 /// The walker is intentionally storage-free. It asks `CommitGraphReader` to
 /// load parsed commit facts and owns only traversal concerns: caching, cycle
 /// detection, and nearest-depth selection.
-pub(crate) async fn walk_reachable_commits<S>(
+pub(crate) async fn walk_reachable_nodes<S>(
     reader: &mut CommitGraphStoreReader<S>,
     head_commit_id: &CommitId,
-) -> Result<Vec<ReachableCommitGraphCommit>, LixError>
+) -> Result<Vec<ReachableCommitGraphNode>, LixError>
 where
     S: StorageAdapterRead,
 {
-    let mut loader = CommitTraversalLoader::new(reader);
+    let mut loader = NodeTraversalLoader::new(reader);
     loader.walk(head_commit_id).await
 }
 
@@ -50,45 +47,34 @@ pub(crate) async fn best_common_ancestors<S>(
     reader: &mut CommitGraphStoreReader<S>,
     left_commit_id: &CommitId,
     right_commit_id: &CommitId,
-) -> Result<Vec<CommitGraphCommit>, LixError>
+) -> Result<Vec<CommitGraphNode>, LixError>
 where
     S: StorageAdapterRead,
 {
-    let mut loader = CommitRecordTraversalLoader::new(reader);
+    let mut loader = NodeTraversalLoader::new(reader);
     let best = loader
         .best_common_ids(*left_commit_id, *right_commit_id)
         .await?;
-    drop(loader);
-    let mut hydrated = Vec::with_capacity(best.len());
+    let mut nodes = Vec::with_capacity(best.len());
     for commit_id in best {
-        let Some(commit) = reader.load_commit(&commit_id).await? else {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("commit_graph missing commit '{commit_id}'"),
-            ));
-        };
-        hydrated.push(commit);
+        nodes.push(loader.load_node(&commit_id).await?);
     }
-    Ok(hydrated)
+    Ok(nodes)
 }
 
-struct CommitRecordTraversalLoader<'a, S>
+struct NodeTraversalLoader<'a, S>
 where
     S: StorageAdapterRead,
 {
     reader: &'a mut CommitGraphStoreReader<S>,
-    loaded: BTreeMap<CommitId, CommitGraphCommitRecord>,
 }
 
-impl<'a, S> CommitRecordTraversalLoader<'a, S>
+impl<'a, S> NodeTraversalLoader<'a, S>
 where
     S: StorageAdapterRead,
 {
     fn new(reader: &'a mut CommitGraphStoreReader<S>) -> Self {
-        Self {
-            reader,
-            loaded: BTreeMap::new(),
-        }
+        Self { reader }
     }
 
     async fn best_common_ids(
@@ -101,8 +87,8 @@ where
         const BOTH: u8 = LEFT | RIGHT;
         const STALE: u8 = 4;
 
-        let left = self.load_commit_record(&left_commit_id).await?;
-        let right = self.load_commit_record(&right_commit_id).await?;
+        let left = self.load_node(&left_commit_id).await?;
+        let right = self.load_node(&right_commit_id).await?;
         let mut colors = BTreeMap::from([(left_commit_id, LEFT), (right_commit_id, RIGHT)]);
         if left_commit_id == right_commit_id {
             colors.insert(left_commit_id, BOTH);
@@ -120,7 +106,7 @@ where
             }
             let (generation, commit_id) = queue.pop_last().expect("queue is not empty");
             non_stale_queued.remove(&commit_id);
-            let commit = self.load_commit_record(&commit_id).await?;
+            let commit = self.load_node(&commit_id).await?;
             if commit.generation != generation {
                 return Err(LixError::unknown(format!(
                     "commit '{commit_id}' generation changed during graph walk"
@@ -133,7 +119,7 @@ where
                 colors.insert(commit_id, color);
             }
             for parent_commit_id in commit.parent_commit_ids {
-                let parent = self.load_commit_record(&parent_commit_id).await?;
+                let parent = self.load_node(&parent_commit_id).await?;
                 if parent.generation >= generation {
                     return Err(LixError::unknown(format!(
                         "commit '{commit_id}' parent '{parent_commit_id}' does not have a lower generation"
@@ -154,62 +140,21 @@ where
         Ok(best)
     }
 
-    async fn load_commit_record(
-        &mut self,
-        commit_id: &CommitId,
-    ) -> Result<CommitGraphCommitRecord, LixError> {
-        if let Some(commit) = self.loaded.get(commit_id) {
-            return Ok(commit.clone());
-        }
-        let Some(commit) = self.reader.load_commit_record(commit_id).await? else {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("commit_graph missing commit '{commit_id}'"),
-            ));
-        };
-        self.loaded.insert(*commit_id, commit.clone());
-        Ok(commit)
-    }
-}
-
-struct CommitTraversalLoader<'a, S>
-where
-    S: StorageAdapterRead,
-{
-    reader: &'a mut CommitGraphStoreReader<S>,
-    loaded: BTreeMap<CommitId, CommitGraphCommit>,
-}
-
-impl<'a, S> CommitTraversalLoader<'a, S>
-where
-    S: StorageAdapterRead,
-{
-    fn new(reader: &'a mut CommitGraphStoreReader<S>) -> Self {
-        Self {
-            reader,
-            loaded: BTreeMap::new(),
-        }
-    }
-
     async fn walk(
         &mut self,
         head_commit_id: &CommitId,
-    ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
+    ) -> Result<Vec<ReachableCommitGraphNode>, LixError> {
         let mut visiting = BTreeSet::new();
         let mut nearest_depths = BTreeMap::new();
         self.walk_commit(head_commit_id, 0, &mut visiting, &mut nearest_depths)
             .await?;
-        let mut commits = nearest_depths
-            .into_iter()
-            .map(|(commit_id, depth)| {
-                let commit = self
-                    .loaded
-                    .get(&commit_id)
-                    .expect("visited commit should be cached")
-                    .clone();
-                ReachableCommitGraphCommit { commit, depth }
-            })
-            .collect::<Vec<_>>();
+        let mut commits = Vec::with_capacity(nearest_depths.len());
+        for (commit_id, depth) in nearest_depths {
+            commits.push(ReachableCommitGraphNode {
+                commit: self.load_node(&commit_id).await?,
+                depth,
+            });
+        }
         commits.sort_by(|left, right| {
             left.depth
                 .cmp(&right.depth)
@@ -253,7 +198,7 @@ where
                 }
             }
 
-            let commit = self.load_commit(&frame.commit_id).await?;
+            let commit = self.load_node(&frame.commit_id).await?;
             nearest_depths.insert(frame.commit_id, frame.depth);
 
             visiting.insert(frame.commit_id);
@@ -273,17 +218,13 @@ where
         Ok(())
     }
 
-    async fn load_commit(&mut self, commit_id: &CommitId) -> Result<CommitGraphCommit, LixError> {
-        if let Some(commit) = self.loaded.get(commit_id) {
-            return Ok(commit.clone());
-        }
-        let Some(commit) = self.reader.load_commit(commit_id).await? else {
+    async fn load_node(&mut self, commit_id: &CommitId) -> Result<CommitGraphNode, LixError> {
+        let Some(commit) = self.reader.load_node(commit_id).await? else {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!("commit_graph missing commit '{commit_id}'"),
             ));
         };
-        self.loaded.insert(*commit_id, commit.clone());
         Ok(commit)
     }
 }
@@ -337,7 +278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachable_commits_returns_commits_nearest_first() {
+    async fn reachable_nodes_returns_commits_nearest_first() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
@@ -362,7 +303,7 @@ mod tests {
         let mut reader = graph.reader(read);
         let commit_head = commit_id("commit-head");
         let commits = reader
-            .reachable_commits(&commit_head)
+            .reachable_nodes(&commit_head)
             .await
             .expect("reachable commits should load");
 
@@ -380,7 +321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachable_commits_errors_on_missing_parent_commit() {
+    async fn reachable_nodes_errors_on_missing_parent_commit() {
         let storage = StorageAdapter::new(Memory::new());
         let error = append_changes_result(
             &storage,
@@ -402,7 +343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachable_commits_errors_on_cycle() {
+    async fn reachable_nodes_errors_on_cycle() {
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();
         for (label, parent) in [("commit-a", "commit-b"), ("commit-b", "commit-a")] {
@@ -436,7 +377,7 @@ mod tests {
         let mut reader = graph.reader(read);
         let commit_a = commit_id("commit-a");
         let error = reader
-            .reachable_commits(&commit_a)
+            .reachable_nodes(&commit_a)
             .await
             .expect_err("walker should reject parent cycles");
 
@@ -444,7 +385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachable_commits_dedupes_shared_ancestors_in_diamond() {
+    async fn reachable_nodes_dedupes_shared_ancestors_in_diamond() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
@@ -470,7 +411,7 @@ mod tests {
         let mut reader = graph.reader(read);
         let commit_head = commit_id("commit-head");
         let commits = reader
-            .reachable_commits(&commit_head)
+            .reachable_nodes(&commit_head)
             .await
             .expect("reachable commits should load");
         let mut expected = vec![(commit_id("commit-head"), 0)];
@@ -490,7 +431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachable_commits_keeps_nearest_depth_for_multiple_paths() {
+    async fn reachable_nodes_keeps_nearest_depth_for_multiple_paths() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
@@ -520,7 +461,7 @@ mod tests {
         let mut reader = graph.reader(read);
         let commit_head = commit_id("commit-head");
         let commits = reader
-            .reachable_commits(&commit_head)
+            .reachable_nodes(&commit_head)
             .await
             .expect("reachable commits should load");
 
@@ -538,7 +479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachable_commits_orders_same_depth_commits_by_id() {
+    async fn reachable_nodes_orders_same_depth_commits_by_id() {
         let storage = StorageAdapter::new(Memory::new());
         append_changes(
             &storage,
@@ -563,7 +504,7 @@ mod tests {
         let mut reader = graph.reader(read);
         let commit_head = commit_id("commit-head");
         let commits = reader
-            .reachable_commits(&commit_head)
+            .reachable_nodes(&commit_head)
             .await
             .expect("reachable commits should load");
         let mut expected = vec![(commit_id("commit-head"), 0)];
@@ -579,7 +520,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachable_commits_errors_on_missing_head_commit() {
+    async fn reachable_nodes_errors_on_missing_head_commit() {
         let storage = StorageAdapter::new(Memory::new());
         let graph = CommitGraphContext::new();
         let read = storage
@@ -590,7 +531,7 @@ mod tests {
         let missing_head = commit_id("missing-head");
 
         let error = reader
-            .reachable_commits(&missing_head)
+            .reachable_nodes(&missing_head)
             .await
             .expect_err("missing head should fail");
 
