@@ -28,6 +28,7 @@ use crate::storage_adapter::StorageAdapterRead;
 pub(crate) struct EntityColumnarScanLayout {
     pub(crate) id: crate::columnar_row_group::RowGroupSetId,
     pub(crate) manifest: Arc<crate::columnar_row_group::RowGroupManifest>,
+    pub(crate) manifest_digest: [u8; 32],
     pub(crate) overlay: Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
     pub(crate) branch_id: Arc<str>,
     pub(crate) head_commit_id: crate::changelog::CommitId,
@@ -173,15 +174,18 @@ pub(crate) struct CurrentEntitySnapshotReader<S> {
     live_state: Arc<LiveStateContext>,
     store: S,
     entity_columnar_shadow_masks: Arc<Mutex<EntityColumnarShadowMaskCache>>,
+    entity_decoded_columns: crate::live_state::EntityDecodedColumnCache,
 }
 
 impl<S> CurrentEntitySnapshotReader<S> {
     pub(crate) fn new(live_state: Arc<LiveStateContext>, store: S) -> Self {
         let entity_columnar_shadow_masks = live_state.entity_columnar_scan_cache();
+        let entity_decoded_columns = live_state.entity_decoded_column_cache();
         Self {
             live_state,
             store,
             entity_columnar_shadow_masks,
+            entity_decoded_columns,
         }
     }
 }
@@ -246,6 +250,7 @@ where
                 |(
                     id,
                     manifest,
+                    manifest_digest,
                     overlay,
                     branch_id,
                     head_commit_id,
@@ -255,6 +260,7 @@ where
                     Arc::new(EntityColumnarScanLayout {
                         id,
                         manifest,
+                        manifest_digest,
                         overlay,
                         branch_id: Arc::from(branch_id),
                         head_commit_id,
@@ -271,14 +277,41 @@ where
         group_index: usize,
         projection: Vec<usize>,
     ) -> Result<RecordBatch, LixError> {
-        crate::columnar_row_group::load_row_group_batch(
-            &self.store,
-            layout.id,
-            &layout.manifest,
-            group_index,
-            &projection,
-        )
-        .await
+        let schema =
+            crate::columnar_row_group::row_group_projected_schema(&layout.manifest, &projection)?;
+        let row_count = layout
+            .manifest
+            .groups
+            .get(group_index)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("row-group index {group_index} is outside the manifest"),
+                )
+            })?
+            .row_count as usize;
+        let arrays = self
+            .entity_decoded_columns
+            .load_projection(
+                &self.store,
+                layout.id,
+                layout.manifest_digest,
+                &layout.manifest,
+                group_index,
+                &projection,
+            )
+            .await?;
+        if projection.is_empty() {
+            return RecordBatch::try_new_with_options(
+                schema,
+                arrays,
+                &datafusion::arrow::record_batch::RecordBatchOptions::new()
+                    .with_row_count(Some(row_count)),
+            )
+            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()));
+        }
+        RecordBatch::try_new(schema, arrays)
+            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))
     }
 
     async fn entity_columnar_shadow_mask(
@@ -472,6 +505,7 @@ mod tests {
                 fields: Vec::new(),
                 groups: Vec::new(),
             }),
+            manifest_digest: [42; 32],
             overlay: Arc::new(Vec::new()),
             branch_id: Arc::from("branch-a"),
             head_commit_id: crate::changelog::CommitId::for_test_label("cache-key-head"),
