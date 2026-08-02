@@ -55,6 +55,19 @@ type RowIndex = usize;
 // amplification dominates the cost of retaining one immutable manifest.
 const PACKED_CURRENT_BASE_MIN_ROWS: usize = 1_024;
 
+// Large certified commits already retain one ordered, payload-bearing delta
+// journal and publish a packed current head. Rebuilding the same identities
+// into an immutable tree in the synchronous commit window duplicates the
+// dominant write work. Keep small commits rooted for cheap cold point reads;
+// large ordered commits and a bounded run of first-parent descendants use the
+// existing rootless replay protocol. Periodic root fences rebuild that short
+// interval, keeping cold point/history/merge work bounded without putting the
+// duplicate tree build back in every bulk commit window.
+const ROOTLESS_ORDERED_COMMIT_MIN_ROWS: usize = 32 * 1_024;
+const ROOTLESS_MAX_FIRST_PARENT_DEPTH: u16 = 32;
+const ROOTLESS_MAX_REPLAY_ROWS: u64 = 1_048_576;
+const ROOTLESS_MAX_REPLAY_BYTES: u64 = 256 * 1024 * 1024;
+
 fn compare_certified_predecessors(
     left: &crate::live_state::CertifiedCurrentStatePredecessorRef<'_>,
     right: &crate::live_state::CertifiedCurrentStatePredecessorRef<'_>,
@@ -494,6 +507,16 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     )
     .await?;
 
+    let mut rootless_ordered_commits = select_new_rootless_ordered_commits(
+        &state_rows,
+        &row_index.tracked_row_indices_by_commit,
+        &tracked_roots,
+        &ordered_addressable_commits,
+        &certified_packet_root_rows,
+    );
+    let mut durable_root_rebuild_parents = BTreeSet::new();
+    let mut staged_root_rebuild_commits = BTreeSet::new();
+
     let staged_commits = stage_changelog_commits(
         read,
         &mut writes,
@@ -501,6 +524,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &branch_head_changes,
         &engine_rows,
         &[],
+        &mut rootless_ordered_commits,
+        &mut durable_root_rebuild_parents,
+        &mut staged_root_rebuild_commits,
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
         &certified_packet_root_rows,
@@ -538,6 +564,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &state_rows,
         &row_index.tracked_row_indices_by_commit,
         &tracked_roots,
+        &rootless_ordered_commits,
+        &durable_root_rebuild_parents,
+        &staged_root_rebuild_commits,
         &staged_commits,
         &insert_selection,
         &certified_packet_root_rows,
@@ -891,6 +920,9 @@ async fn stage_changelog_commits(
     branch_head_changes: &[ChangeRecord],
     _branch_ref_rows: &[EngineCurrentRow],
     compact_change_ids: &[ChangeId],
+    rootless_commit_ids: &mut BTreeSet<CommitId>,
+    durable_root_rebuild_parents: &mut BTreeSet<CommitId>,
+    staged_root_rebuild_commits: &mut BTreeSet<CommitId>,
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     commit_rows: &[FinalizedCommitRow],
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
@@ -919,19 +951,22 @@ async fn stage_changelog_commits(
             commit_ids: &external_parent_ids,
         })
         .await?;
-    let mut generations = external_parent_records
-        .into_iter()
-        .map(|(commit_id, record)| {
-            record
-                .map(|record| (*commit_id, record.generation))
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("commit '{commit_id}' has a missing parent"),
-                    )
-                })
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let mut generations = BTreeMap::new();
+    let mut rootless_depths = BTreeMap::new();
+    let mut rootless_rows = BTreeMap::new();
+    let mut rootless_bytes = BTreeMap::new();
+    for (commit_id, record) in external_parent_records {
+        let record = record.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("commit '{commit_id}' has a missing parent"),
+            )
+        })?;
+        generations.insert(*commit_id, record.generation);
+        rootless_depths.insert(*commit_id, record.tracked_state_rootless_depth);
+        rootless_rows.insert(*commit_id, record.tracked_state_rootless_rows);
+        rootless_bytes.insert(*commit_id, record.tracked_state_rootless_bytes);
+    }
     let mut staged_parent_count = BTreeMap::<CommitId, usize>::new();
     let mut children = BTreeMap::<CommitId, Vec<CommitId>>::new();
     for commit in commit_rows {
@@ -964,6 +999,99 @@ async fn stage_changelog_commits(
                     .checked_add(1)
                     .ok_or_else(|| LixError::unknown("commit generation exceeds u64"))
             })?;
+        let selected_as_new_rootless = rootless_commit_ids.contains(&commit_id);
+        let commit_delta_rows = tracked_row_indices_by_commit
+            .get(&commit_id)
+            .map_or(0, Vec::len)
+            .checked_add(
+                certified_packet_root_rows
+                    .get(&commit_id)
+                    .map_or(0, Vec::len),
+            )
+            .and_then(|rows| {
+                rows.checked_add(selected_change_count(&commit.selected_change_batches))
+            })
+            .and_then(|rows| u64::try_from(rows).ok())
+            .ok_or_else(|| LixError::unknown("tracked-state rootless row count exceeds u64"))?;
+        let commit_delta_bytes = tracked_row_indices_by_commit
+            .get(&commit_id)
+            .into_iter()
+            .flatten()
+            .try_fold(0_u64, |bytes, &row_index| {
+                bytes
+                    .checked_add(prepared_state_row_replay_bytes(state_rows.row(row_index))?)
+                    .ok_or_else(|| {
+                        LixError::unknown("tracked-state rootless byte count exceeds u64")
+                    })
+            })?;
+        let has_unbounded_payload_sources = certified_packet_root_rows
+            .get(&commit_id)
+            .is_some_and(|rows| !rows.is_empty())
+            || selected_change_count(&commit.selected_change_batches) > 0;
+        let first_parent = commit.parent_commit_ids.first().copied();
+        let parent_rootless_depth = first_parent
+            .and_then(|parent| rootless_depths.get(&parent).copied())
+            .unwrap_or(0);
+        let parent_rootless_rows = first_parent
+            .and_then(|parent| rootless_rows.get(&parent).copied())
+            .unwrap_or(0);
+        let parent_rootless_bytes = first_parent
+            .and_then(|parent| rootless_bytes.get(&parent).copied())
+            .unwrap_or(0);
+        let next_rootless_rows = parent_rootless_rows
+            .checked_add(commit_delta_rows)
+            .ok_or_else(|| LixError::unknown("tracked-state rootless row count exceeds u64"))?;
+        let next_rootless_bytes = parent_rootless_bytes
+            .checked_add(commit_delta_bytes)
+            .ok_or_else(|| LixError::unknown("tracked-state rootless byte count exceeds u64"))?;
+        let (rootless_depth, cumulative_rootless_rows, cumulative_rootless_bytes) =
+            if parent_rootless_depth > 0 {
+                let next_depth = parent_rootless_depth
+                    .checked_add(1)
+                    .ok_or_else(|| LixError::unknown("tracked-state rootless depth exceeds u16"))?;
+                if next_depth <= ROOTLESS_MAX_FIRST_PARENT_DEPTH
+                    && next_rootless_rows <= ROOTLESS_MAX_REPLAY_ROWS
+                    && next_rootless_bytes <= ROOTLESS_MAX_REPLAY_BYTES
+                    && !has_unbounded_payload_sources
+                {
+                    rootless_commit_ids.insert(commit_id);
+                    (next_depth, next_rootless_rows, next_rootless_bytes)
+                } else {
+                    // Closing an interval wins over selecting another large bulk
+                    // commit as a fresh seed. Rebuild any staged prefix directly;
+                    // durable ancestors are replayed once before roots are staged.
+                    rootless_commit_ids.remove(&commit_id);
+                    let mut cursor = first_parent.expect("positive rootless depth has a parent");
+                    loop {
+                        if let Some(staged_parent) = commit_rows_by_id.get(&cursor) {
+                            staged_root_rebuild_commits.insert(cursor);
+                            let Some(parent) = staged_parent.parent_commit_ids.first().copied()
+                            else {
+                                break;
+                            };
+                            cursor = parent;
+                        } else {
+                            if rootless_depths.get(&cursor).copied().unwrap_or(0) > 0 {
+                                durable_root_rebuild_parents.insert(cursor);
+                            }
+                            break;
+                        }
+                    }
+                    (0, 0, 0)
+                }
+            } else if selected_as_new_rootless
+                && commit_delta_rows <= ROOTLESS_MAX_REPLAY_ROWS
+                && commit_delta_bytes <= ROOTLESS_MAX_REPLAY_BYTES
+                && !has_unbounded_payload_sources
+            {
+                (1, commit_delta_rows, commit_delta_bytes)
+            } else {
+                rootless_commit_ids.remove(&commit_id);
+                (0, 0, 0)
+            };
+        rootless_depths.insert(commit_id, rootless_depth);
+        rootless_rows.insert(commit_id, cumulative_rootless_rows);
+        rootless_bytes.insert(commit_id, cumulative_rootless_bytes);
         generations.insert(commit_id, generation);
         for child in children.get(&commit_id).into_iter().flatten() {
             let remaining = staged_parent_count
@@ -1027,7 +1155,10 @@ async fn stage_changelog_commits(
             commit_id: commit_row.commit_id,
             generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
-            tracked_state_rootless: false,
+            tracked_state_rootless: rootless_commit_ids.contains(&commit_row.commit_id),
+            tracked_state_rootless_depth: rootless_depths[&commit_row.commit_id],
+            tracked_state_rootless_rows: rootless_rows[&commit_row.commit_id],
+            tracked_state_rootless_bytes: rootless_bytes[&commit_row.commit_id],
             change_id: commit_row.change_id,
             author_account_ids: Vec::new(),
             created_at: commit_row.created_at,
@@ -1851,6 +1982,54 @@ async fn stage_tracked_commit_delta_index(
         stage_change_locators(writes, &authored_locators);
     }
     Ok(ordered_addressable_commits)
+}
+
+fn prepared_state_row_replay_bytes(row: PreparedStateRowRef<'_>) -> Result<u64, LixError> {
+    let snapshot_bytes = row.snapshot.map_or(0, |json| json.normalized().len());
+    let metadata_bytes = row.metadata.map_or(0, |json| json.normalized().len());
+    let identity_bytes = row
+        .schema_key
+        .len()
+        .checked_add(row.file_id.map_or(0, |file_id| file_id.as_str().len()))
+        .and_then(|bytes| bytes.checked_add(row.entity_pk.estimated_heap_bytes()))
+        // Fixed typed primary-key components, timestamps, ids, flags, and
+        // length prefixes are covered by one conservative per-row envelope.
+        .and_then(|bytes| bytes.checked_add(128))
+        .ok_or_else(|| LixError::unknown("tracked-state replay row bytes exceed usize"))?;
+    identity_bytes
+        .checked_add(snapshot_bytes)
+        .and_then(|bytes| bytes.checked_add(metadata_bytes))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| LixError::unknown("tracked-state replay row bytes exceed u64"))
+}
+
+fn select_new_rootless_ordered_commits(
+    state_rows: &PreparedStateBatch,
+    tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
+    tracked_roots: &[PendingTrackedRoot],
+    ordered_addressable_commits: &BTreeSet<CommitId>,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+) -> BTreeSet<CommitId> {
+    let can_start_rootless_interval = tracked_roots.len() == 1;
+    let mut rootless = BTreeSet::new();
+    for root in tracked_roots {
+        let row_indices = tracked_row_indices_by_commit
+            .get(&root.commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let starts_large_ordered_interval = can_start_rootless_interval
+            && root.publish_head
+            && row_indices.len() >= ROOTLESS_ORDERED_COMMIT_MIN_ROWS
+            && ordered_addressable_commits.contains(&root.commit_id)
+            && certified_packet_root_rows
+                .get(&root.commit_id)
+                .is_none_or(Vec::is_empty)
+            && row_indices.len() == state_rows.len();
+        if starts_large_ordered_interval {
+            rootless.insert(root.commit_id);
+        }
+    }
+    rootless
 }
 
 struct StagedHotHeads {
@@ -4189,6 +4368,9 @@ async fn stage_tracked_roots(
     state_rows: &PreparedStateBatch,
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
+    rootless_commit_ids: &BTreeSet<CommitId>,
+    durable_root_rebuild_parents: &BTreeSet<CommitId>,
+    staged_root_rebuild_commits: &BTreeSet<CommitId>,
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     insert_selection: &PreparedInsertSelection,
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
@@ -4199,9 +4381,29 @@ async fn stage_tracked_roots(
         return Ok(());
     }
     let mut tracked_writer = tracked_state.writer(read, writes);
+    let mut staged_rebuild_plan_ids = BTreeSet::new();
+    for parent_commit_id in durable_root_rebuild_parents {
+        let plans = crate::tracked_state::load_rebuild_plans_to_nearest_available_root(
+            read,
+            &parent_commit_id.to_string(),
+            true,
+        )
+        .await?;
+        for plan in plans.iter().rev() {
+            if staged_rebuild_plan_ids.insert(plan.commit_id) {
+                crate::tracked_state::stage_rebuild_plan_with_writer(&mut tracked_writer, plan)
+                    .await?;
+            }
+        }
+    }
     let empty_certified_replacement_markers = BTreeSet::new();
     for root in tracked_roots_parent_first(tracked_roots)? {
         if !root_fence_ids.contains(&root.commit_id) {
+            continue;
+        }
+        if rootless_commit_ids.contains(&root.commit_id)
+            && !staged_root_rebuild_commits.contains(&root.commit_id)
+        {
             continue;
         }
         let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
@@ -7106,6 +7308,9 @@ mod tests {
                 selected_change_batches: Vec::new(),
             },
         ];
+        let mut rootless_commit_ids = BTreeSet::from([CommitId::for_test_label("parent-commit")]);
+        let mut durable_root_rebuild_parents = BTreeSet::new();
+        let mut staged_root_rebuild_commits = BTreeSet::new();
         stage_changelog_commits(
             &mut read,
             &mut writes,
@@ -7113,6 +7318,9 @@ mod tests {
             &[],
             &[],
             &[],
+            &mut rootless_commit_ids,
+            &mut durable_root_rebuild_parents,
+            &mut staged_root_rebuild_commits,
             &BTreeMap::from([
                 (CommitId::for_test_label("parent-commit"), vec![0]),
                 (CommitId::for_test_label("child-commit"), vec![1]),
@@ -7143,11 +7351,32 @@ mod tests {
             })
             .await
             .expect("commits should load");
-        let generations = commits
-            .into_iter()
-            .map(|(_, commit)| commit.expect("commit").generation)
+        let commits = commits
+            .iter()
+            .map(|(_, record)| record.expect("commit"))
             .collect::<Vec<_>>();
-        assert_eq!(generations, [0, 1]);
+        assert_eq!(commits[0].generation, 0);
+        assert_eq!(commits[1].generation, 1);
+        assert!(
+            commits.iter().all(|record| record.tracked_state_rootless),
+            "a staged child must inherit its first parent's rootless interval"
+        );
+        assert_eq!(
+            commits
+                .iter()
+                .map(|record| record.tracked_state_rootless_depth)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(commits[0].tracked_state_rootless_bytes > 0);
+        assert!(commits[1].tracked_state_rootless_bytes > commits[0].tracked_state_rootless_bytes);
+        assert_eq!(
+            commits
+                .iter()
+                .map(|record| record.tracked_state_rootless_rows)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     #[tokio::test]

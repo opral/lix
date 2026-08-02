@@ -555,8 +555,30 @@ async fn stage_test_changelog_commit(
             commit_ids: &typed_parent_ids,
         })
         .await?;
+    let tracked_state_rootless_depth = if tracked_state_rootless {
+        parent_records
+            .iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .map_or(1, |record| {
+                record.tracked_state_rootless_depth.saturating_add(1)
+            })
+    } else {
+        0
+    };
+    let tracked_state_rootless_rows = if tracked_state_rootless {
+        parent_records
+            .iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .map_or(0, |record| record.tracked_state_rootless_rows)
+            .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX))
+    } else {
+        0
+    };
+    let tracked_state_rootless_bytes = tracked_state_rootless_rows;
     let generation = parent_records
-        .into_iter()
+        .iter()
         .map(|(_, record)| {
             record
                 .map(|record| record.generation)
@@ -595,6 +617,9 @@ async fn stage_test_changelog_commit(
         generation,
         parent_commit_ids: typed_parent_ids,
         tracked_state_rootless,
+        tracked_state_rootless_depth,
+        tracked_state_rootless_rows,
+        tracked_state_rootless_bytes,
         change_id: typed_commit_change_id,
         author_account_ids: Vec::new(),
         created_at,

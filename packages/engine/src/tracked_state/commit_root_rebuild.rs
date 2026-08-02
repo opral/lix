@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -9,7 +9,6 @@ use crate::changelog::{
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
-use crate::tracked_state::TrackedStateDeltaRef;
 use crate::tracked_state::context::{
     TrackedStateContext, TrackedStateRootRebuilder, TrackedStateWriteReport, TrackedStateWriter,
 };
@@ -17,6 +16,9 @@ use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
     TrackedStateCommitRoot, TrackedStateRootId, TrackedStateTreeScanRequest,
+};
+use crate::tracked_state::{
+    TrackedStateDeltaRef, TrackedStateKeyRef, TrackedStateRootMutationRef, encode_key_ref,
 };
 
 /// Owned delta used only by explicit commit-root rebuild.
@@ -27,8 +29,7 @@ pub(crate) struct CommitRootRebuildDelta {
     pub(crate) entity_pk: EntityPk,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
-    pub(crate) snapshot: crate::json_store::JsonSlot,
-    pub(crate) metadata: crate::json_store::JsonSlot,
+    pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
 }
@@ -219,22 +220,21 @@ where
             )
         })?;
     let commit = entry;
-    // The packed delta is the sole membership and payload authority. Preserve
-    // the identity value's original created_at independently from this
-    // mutation's updated_at while rebuilding a root.
-    let deltas = storage::load_commit_delta_members_with_payloads(store, commit.commit_id)
+    // Commit roots contain only identity/index facts. Avoid hydrating JSON
+    // sidecars while rebuilding them; the packed delta index already carries
+    // deletion, owner ids, and original timestamps.
+    let deltas = storage::scan_commit_delta_members(store, commit.commit_id)
         .await?
         .into_iter()
-        .map(|member| CommitRootRebuildDelta {
-            schema_key: member.key.schema_key,
-            file_id: member.key.file_id,
-            entity_pk: member.key.entity_pk,
-            change_id: member.value.change_id,
-            commit_id: member.value.commit_id,
-            snapshot: member.change.snapshot,
-            metadata: member.change.metadata,
-            created_at: member.value.created_at,
-            updated_at: member.value.updated_at,
+        .map(|(key, value)| CommitRootRebuildDelta {
+            schema_key: key.schema_key,
+            file_id: key.file_id,
+            entity_pk: key.entity_pk,
+            change_id: value.change_id,
+            commit_id: value.commit_id,
+            deleted: value.deleted,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
         })
         .collect();
 
@@ -261,13 +261,72 @@ where
             entity_pk: &delta.entity_pk,
             change_id: delta.change_id,
             commit_id: delta.commit_id,
-            deleted: delta.snapshot.is_none(),
+            deleted: delta.deleted,
             created_at: delta.created_at,
             updated_at: delta.updated_at,
         })
         .collect::<Vec<_>>();
     let commit_id = plan.commit_id.to_string();
     let parent_commit_id = plan.parent_commit_id.map(|commit_id| commit_id.to_string());
+    let strictly_sorted = plan.deltas.windows(2).all(|pair| {
+        pair[0]
+            .schema_key
+            .cmp(&pair[1].schema_key)
+            .then_with(|| pair[0].file_id.cmp(&pair[1].file_id))
+            .then_with(|| pair[0].entity_pk.cmp(&pair[1].entity_pk))
+            .is_lt()
+    });
+    if strictly_sorted && plan.deltas.len() >= 2 {
+        let first = &plan.deltas[0];
+        let first_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: &first.schema_key,
+            file_id: first.file_id.as_deref(),
+            entity_pk: &first.entity_pk,
+        });
+        let file_delete_cascades = plan
+            .deltas
+            .iter()
+            .filter(|delta| delta.schema_key == "lix_file_descriptor" && delta.deleted)
+            .map(|delta| {
+                Ok((
+                    delta.entity_pk.as_single_string_owned().map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("file descriptor tombstone has invalid identity: {error}"),
+                        )
+                    })?,
+                    TrackedStateDeltaRef {
+                        schema_key: &delta.schema_key,
+                        file_id: delta.file_id.as_deref(),
+                        entity_pk: &delta.entity_pk,
+                        change_id: delta.change_id,
+                        commit_id: delta.commit_id,
+                        deleted: true,
+                        created_at: delta.created_at,
+                        updated_at: delta.updated_at,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+        if let Some(report) = writer
+            .try_stage_bulk_parent_root_from_ordered_mutations(
+                &commit_id,
+                parent_commit_id.as_deref(),
+                deltas.len(),
+                &first_key,
+                &file_delete_cascades,
+                deltas.iter().copied().map(|delta| {
+                    Ok(TrackedStateRootMutationRef {
+                        delta,
+                        require_absence: false,
+                    })
+                }),
+            )
+            .await?
+        {
+            return Ok(report);
+        }
+    }
     writer
         .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
         .await
