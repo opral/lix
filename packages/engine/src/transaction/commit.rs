@@ -3907,7 +3907,7 @@ fn prepare_entity_columnar_write_sets(
             return Ok(crate::live_state::EntityColumnarWriteSets::new());
         };
         if !crate::schema::materializes_entity_columnar_sidecar(schema) {
-            return Ok(BTreeMap::new());
+            return Ok(crate::live_state::EntityColumnarWriteSets::new());
         }
         let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(schema) else {
             return Ok(crate::live_state::EntityColumnarWriteSets::new());
