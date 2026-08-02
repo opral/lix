@@ -322,6 +322,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let commit_rows = finalized.commit_rows;
     let tracked_roots = finalized.tracked_roots;
     let mut certified_packet_root_rows = BTreeMap::<CommitId, Vec<MaterializedLiveStateRow>>::new();
+    let mut certified_replacement_markers = BTreeMap::<CommitId, BTreeSet<TrackedStateKey>>::new();
     for file in prepared_writes
         .file_data_writes
         .iter()
@@ -346,11 +347,17 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                     "certified entity batch commit has no timestamp",
                 )
             })?;
-        let rows = certified_packet_root_rows
-            .entry(root.commit_id)
-            .or_default();
-        for batch in file.certified_entity_batches() {
-            rows.extend(
+        let mut expanded_rows = Vec::new();
+        let mut replacement_schemas = BTreeSet::new();
+        for batch in file
+            .certified_entity_batches()
+            .iter()
+            .filter(|batch| certified_batch_requires_root_expansion(batch))
+        {
+            if batch.complete_file_state {
+                replacement_schemas.extend(batch.schema_keys.iter().cloned());
+            }
+            expanded_rows.extend(
                 crate::live_state::materialize_certified_root_rows(
                     &file.branch_id,
                     &file.file_id,
@@ -360,6 +367,30 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                 )?
                 .into_rows(),
             );
+        }
+        for schema_key in replacement_schemas {
+            let marker = certified_collection_replacement_marker(
+                &file.branch_id,
+                &file.file_id,
+                &schema_key,
+                root.commit_id,
+                timestamp,
+            )?;
+            certified_replacement_markers
+                .entry(root.commit_id)
+                .or_default()
+                .insert(TrackedStateKey {
+                    schema_key: marker.schema_key.clone(),
+                    file_id: marker.file_id.clone(),
+                    entity_pk: marker.entity_pk.clone(),
+                });
+            expanded_rows.push(marker);
+        }
+        if !expanded_rows.is_empty() {
+            certified_packet_root_rows
+                .entry(root.commit_id)
+                .or_default()
+                .append(&mut expanded_rows);
         }
     }
     for (commit_id, rows) in &mut certified_packet_root_rows {
@@ -505,6 +536,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &staged_commits,
         &insert_selection,
         &certified_packet_root_rows,
+        &certified_replacement_markers,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -610,6 +642,63 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         stage_path_index_revision(&mut writes);
     }
     Ok((writes, preconditions))
+}
+
+fn certified_batch_requires_root_expansion(batch: &crate::wasm::WasmCertifiedEntityBatch) -> bool {
+    !matches!(
+        batch.format,
+        crate::wasm::HOST_CERTIFIED_PACKET_FORMAT | crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+    )
+}
+
+fn certified_collection_replacement_marker(
+    branch_id: &str,
+    file_id: &str,
+    schema_key: &str,
+    commit_id: CommitId,
+    timestamp: LixTimestamp,
+) -> Result<MaterializedLiveStateRow, LixError> {
+    use crate::collection_generation::{
+        COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_key,
+    };
+
+    let scope_key = collection_scope_key(CollectionScopeRef {
+        schema_key,
+        file_id: Some(file_id),
+    });
+    let snapshot = serde_json::to_string(&serde_json::json!({
+        "scope_key": scope_key,
+        "schema_key": schema_key,
+        "file_id": file_id,
+        "live_count": 0,
+    }))
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to encode certified collection replacement: {error}"),
+        )
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lix.certified.collection-replacement.v1\0");
+    hasher.update(commit_id.as_uuid().as_bytes());
+    hasher.update(scope_key.as_bytes());
+    let mut change_bytes = [0_u8; 16];
+    change_bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Ok(MaterializedLiveStateRow {
+        entity_pk: EntityPk::single(scope_key),
+        schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+        file_id: None,
+        snapshot_content: Some(snapshot.into()),
+        metadata: None,
+        deleted: false,
+        created_at: timestamp,
+        updated_at: timestamp,
+        global: false,
+        change_id: Some(ChangeId::new(uuid::Uuid::from_bytes(change_bytes))),
+        commit_id: Some(commit_id),
+        untracked: false,
+        branch_id: Arc::from(branch_id),
+    })
 }
 
 fn retain_untracked_rows_not_superseded_by_engine(
@@ -1104,11 +1193,21 @@ fn tracked_commit_delta_from_certified_root_row(
 ) -> Result<TrackedStateCommitDeltaRef<'_>, LixError> {
     Ok(TrackedStateCommitDeltaRef {
         delta: tracked_delta_from_certified_root_row(row)?,
-        snapshot: crate::json_store::JsonSlotRef::None,
-        metadata: crate::json_store::JsonSlotRef::None,
+        snapshot: row
+            .snapshot_content
+            .as_ref()
+            .map_or(crate::json_store::JsonSlotRef::None, |snapshot| {
+                crate::json_store::JsonSlotRef::Inline(snapshot.as_str())
+            }),
+        metadata: row
+            .metadata
+            .as_ref()
+            .map_or(crate::json_store::JsonSlotRef::None, |metadata| {
+                crate::json_store::JsonSlotRef::Inline(metadata.as_str())
+            }),
         origin_key: None,
         authored: true,
-        certified: true,
+        certified: row.snapshot_content.is_none() && row.metadata.is_none(),
     })
 }
 
@@ -1419,7 +1518,8 @@ async fn stage_tracked_commit_delta_index(
                 ),
             )
         })?;
-        let can_stream_ordered_addressable = !state_row_indices.is_empty()
+        let can_stream_ordered_addressable = certified_root_rows.is_empty()
+            && !state_row_indices.is_empty()
             && staged.selected_change_batches.is_empty()
             && state_row_indices
                 .iter()
@@ -1526,7 +1626,9 @@ async fn stage_tracked_commit_delta_index(
         let is_checkpoint_commit = state_row_indices.iter().any(|&row_index| {
             state_rows.row(row_index).schema_key.as_str() == CHECKPOINT_MARKER_SCHEMA_KEY
         });
-        let selected_source_alias = if is_checkpoint_commit && selected_members_by_source.len() == 1
+        let selected_source_alias = if certified_root_rows.is_empty()
+            && is_checkpoint_commit
+            && selected_members_by_source.len() == 1
         {
             let source_commit_id = *selected_members_by_source
                 .first_key_value()
@@ -3815,12 +3917,14 @@ async fn stage_tracked_roots(
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     insert_selection: &PreparedInsertSelection,
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    certified_replacement_markers_by_commit: &BTreeMap<CommitId, BTreeSet<TrackedStateKey>>,
 ) -> Result<(), LixError> {
     let root_fence_ids = tracked_root_fence_ids(tracked_roots);
     if root_fence_ids.is_empty() {
         return Ok(());
     }
     let mut tracked_writer = tracked_state.writer(read, writes);
+    let empty_certified_replacement_markers = BTreeSet::new();
     for root in tracked_roots_parent_first(tracked_roots)? {
         if !root_fence_ids.contains(&root.commit_id) {
             continue;
@@ -3842,6 +3946,9 @@ async fn stage_tracked_roots(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        let certified_replacement_markers = certified_replacement_markers_by_commit
+            .get(&root.commit_id)
+            .unwrap_or(&empty_certified_replacement_markers);
         if state_row_indices.len() > staged.change_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -3858,6 +3965,7 @@ async fn stage_tracked_roots(
         // parent/changes directly into canonical chunks instead of point
         // reading every key and materializing two more full-workload vectors.
         if certified_root_rows.is_empty()
+            && certified_replacement_markers.is_empty()
             && !state_row_indices.is_empty()
             && staged.selected_change_batches.is_empty()
             && tracked_state_rows_are_strictly_sorted(state_rows, state_row_indices)
@@ -3959,6 +4067,7 @@ async fn stage_tracked_roots(
                 parent_commit_id_text.as_deref(),
                 deltas,
                 &absence_guards,
+                certified_replacement_markers,
             )
             .await?;
     }
@@ -4466,6 +4575,27 @@ mod tests {
     }
 
     #[test]
+    fn host_dense_packets_reuse_ordinary_root_members() {
+        let batch = |format| crate::wasm::WasmCertifiedEntityBatch {
+            format,
+            schema_keys: vec!["test_schema".to_owned()],
+            row_count: 1,
+            creates: crate::wasm::WasmCreateContext { high: 0, low: 0 },
+            create_ranges: Vec::new(),
+            complete_file_state: true,
+            pages: Vec::new(),
+        };
+        assert!(!certified_batch_requires_root_expansion(&batch(
+            crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+        )));
+        assert!(!certified_batch_requires_root_expansion(&batch(
+            crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+        )));
+        assert!(certified_batch_requires_root_expansion(&batch(1)));
+        assert!(certified_batch_requires_root_expansion(&batch(2)));
+    }
+
+    #[test]
     fn lifecycle_file_delete_cascade_survives_descriptor_recreation() {
         let semantic_key = TrackedStateKey {
             schema_key: "semantic".to_string(),
@@ -4769,6 +4899,113 @@ mod tests {
             &[selected_change_batch("normal-change", "other-entity")],
         )
         .expect("different semantic identities may share one source change id");
+    }
+
+    #[tokio::test]
+    async fn ordered_commit_delta_keeps_non_overlapping_certified_packet_rows() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_4321_0000_0000,
+        ));
+        let timestamp = ts("2026-01-01T00:00:00Z");
+        let mut state_rows = PreparedStateBatch::new();
+        state_rows.push_parts_with_change_addressability(
+            SchemaPlanId::for_test(0),
+            PreparedRowFacts::default(),
+            EntityPk::single("ordinary"),
+            "ordinary_schema".into(),
+            None,
+            Some(
+                crate::transaction::types::stage_json_from_value(
+                    crate::transaction::types::TransactionJson::from_value_for_test(
+                        serde_json::json!({ "value": 1 }),
+                    ),
+                    "mixed certified ordinary snapshot",
+                )
+                .expect("ordinary snapshot should stage"),
+            ),
+            None,
+            None,
+            None,
+            timestamp,
+            timestamp,
+            true,
+            Some(ChangeId::default()),
+            true,
+            Some(commit_id),
+            false,
+            GLOBAL_BRANCH_ID.into(),
+        );
+        let certified_change_id = change_id("mixed-certified-change");
+        let certified_rows = BTreeMap::from([(
+            commit_id,
+            vec![MaterializedLiveStateRow {
+                entity_pk: EntityPk::single("certified"),
+                schema_key: "certified_schema".to_owned(),
+                file_id: Some("certified.csv".to_owned()),
+                snapshot_content: None,
+                metadata: None,
+                deleted: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+                global: true,
+                change_id: Some(certified_change_id),
+                commit_id: Some(commit_id),
+                untracked: false,
+                branch_id: Arc::from(GLOBAL_BRANCH_ID),
+            }],
+        )]);
+        let roots = [PendingTrackedRoot {
+            branch_id: GLOBAL_BRANCH_ID.to_owned(),
+            commit_id,
+            parent_commit_id: None,
+            ref_change_id: change_id("mixed-certified-ref"),
+            ref_updated_at: timestamp,
+            publish_head: true,
+        }];
+        let commits = [FinalizedCommitRow {
+            commit_id,
+            parent_commit_ids: Vec::new(),
+            created_at: timestamp,
+            change_id: change_id("mixed-certified-commit"),
+            selected_change_batches: Vec::new(),
+        }];
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("mixed certified read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_tracked_commit_delta_index(
+            &read,
+            &mut writes,
+            &mut state_rows,
+            &BTreeMap::from([(commit_id, vec![0])]),
+            &roots,
+            &commits,
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &certified_rows,
+        )
+        .await
+        .expect("mixed certified delta should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("mixed certified delta should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("mixed certified verification read should open");
+        let records = crate::tracked_state::scan_commit_delta_members(&read, commit_id)
+            .await
+            .expect("mixed certified records should load");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0.schema_key, "certified_schema");
+        assert_eq!(
+            records[0].1.change_id, certified_change_id,
+            "certified packet identity must be present in the commit delta"
+        );
+        assert_eq!(records[1].0.schema_key, "ordinary_schema");
     }
 
     #[tokio::test]

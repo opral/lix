@@ -27,8 +27,6 @@ pub(crate) use row_materialization::{
     MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
     materialize_batch_from_index_entry_refs,
 };
-#[cfg(test)]
-pub(crate) use storage::load_commit_delta_change_ids;
 pub(crate) use storage::{
     CommitDeltaChangeLocator, CommitDeltaMember, CommitDeltaPointReadCache,
     commit_delta_contains_schema, direct_change_locator, load_change_record_by_id,
@@ -47,6 +45,8 @@ pub(crate) use storage::{
     TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_SPACE,
     TRACKED_STATE_TREE_CHUNK_SPACE, decode_change_locator,
 };
+#[cfg(test)]
+pub(crate) use storage::{load_commit_delta_change_ids, scan_commit_delta_members};
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateDeltaRef,
     TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,

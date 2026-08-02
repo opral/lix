@@ -3297,6 +3297,7 @@ where
             parent_commit_id,
             deltas,
             &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .await
     }
@@ -3307,6 +3308,7 @@ where
         parent_commit_id: Option<&str>,
         deltas: I,
         absence_guards: &BTreeSet<TrackedStateKey>,
+        certified_replacement_markers: &BTreeSet<TrackedStateKey>,
     ) -> Result<TrackedStateWriteReport, LixError>
     where
         I: IntoIterator<Item = TrackedStateDeltaRef<'a>>,
@@ -3428,6 +3430,49 @@ where
                             deleted: true,
                             created_at: value.created_at(),
                             updated_at: cascade.updated_at,
+                        }),
+                    );
+                }
+            }
+            for marker in deltas.iter().filter(|delta| {
+                !delta.deleted
+                    && delta.schema_key
+                        == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    && certified_replacement_markers.contains(&TrackedStateKey {
+                        schema_key: delta.schema_key.to_owned(),
+                        file_id: delta.file_id.map(str::to_owned),
+                        entity_pk: delta.entity_pk.clone(),
+                    })
+            }) {
+                let (schema_key, file_id) =
+                    crate::collection_generation::collection_scope_from_entity_pk(
+                        marker.entity_pk,
+                    )?;
+                let rows = self
+                    .tree
+                    .scan(
+                        &staged_read,
+                        base_root,
+                        &TrackedStateTreeScanRequest {
+                            schema_keys: vec![schema_key],
+                            file_ids: file_id.into_iter().map(NullableKeyFilter::Value).collect(),
+                            include_tombstones: false,
+                            ..TrackedStateTreeScanRequest::default()
+                        },
+                    )
+                    .await?;
+                for (key, value) in rows {
+                    if explicit_keys.contains(&key) {
+                        continue;
+                    }
+                    cascade_mutations.insert(
+                        encode_key(&key),
+                        encode_value_ref(TrackedStateIndexValueRef {
+                            change_id: marker.change_id,
+                            commit_id: marker.commit_id,
+                            deleted: true,
+                            created_at: value.created_at(),
+                            updated_at: marker.updated_at,
                         }),
                     );
                 }
@@ -4419,6 +4464,171 @@ mod tests {
         assert!(metadata.tree_height >= 1);
         assert!(metadata.primary_chunk_count >= 1);
         assert!(metadata.primary_chunk_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn collection_replacement_marker_retires_omitted_file_rows() {
+        use crate::collection_generation::{
+            COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_key,
+        };
+
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut first = row("a", "replacement-a", "replacement-parent");
+        first.file_id = Some("replacement.csv".to_owned());
+        let mut second = row("b", "replacement-b", "replacement-parent");
+        second.file_id = Some("replacement.csv".to_owned());
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "replacement-parent",
+            None,
+            &[first, second],
+        )
+        .await
+        .expect("replacement parent should write");
+
+        let scope_key = collection_scope_key(CollectionScopeRef {
+            schema_key: "test_schema",
+            file_id: Some("replacement.csv"),
+        });
+        let marker = MaterializedTrackedStateRow {
+            entity_pk: EntityPk::single(scope_key),
+            schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+            file_id: None,
+            snapshot_content: Some(r#"{"live_count":1}"#.into()),
+            metadata: None,
+            deleted: false,
+            created_at: "2026-01-01T00:00:01Z".to_owned(),
+            updated_at: "2026-01-01T00:00:01Z".to_owned(),
+            change_id: ChangeId::for_test_label("replacement-marker"),
+            commit_id: CommitId::for_test_label("replacement-child"),
+        };
+        let mut retained = row("b", "replacement-b-next", "replacement-child");
+        retained.file_id = Some("replacement.csv".to_owned());
+        let marker_key = TrackedStateKey {
+            schema_key: marker.schema_key.clone(),
+            file_id: marker.file_id.clone(),
+            entity_pk: marker.entity_pk.clone(),
+        };
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("replacement child read should open");
+        let mut writes = StorageWriteSet::new();
+        crate::test_support::stage_tracked_root_from_materialized_with_certified_replacement_markers(
+            &mut read,
+            &mut writes,
+            &tracked_state,
+            "replacement-child",
+            Some("replacement-parent"),
+            &[marker, retained],
+            &BTreeSet::from([marker_key]),
+        )
+        .await
+        .expect("replacement child should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("replacement child should write");
+
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("replacement scan should open"),
+        );
+        let rows = reader
+            .scan_batch_at_commit(
+                "replacement-child",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_owned()],
+                        file_ids: vec![NullableKeyFilter::Value("replacement.csv".to_owned())],
+                        ..crate::tracked_state::TrackedStateFilter::default()
+                    },
+                    ..TrackedStateScanRequest::default()
+                },
+            )
+            .await
+            .expect("replacement child should scan")
+            .into_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_pk, EntityPk::single("b"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_collection_generation_marker_does_not_retire_omitted_file_rows() {
+        use crate::collection_generation::{
+            COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_key,
+        };
+
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut first = row("a", "ordinary-a", "ordinary-parent");
+        first.file_id = Some("ordinary.csv".to_owned());
+        let mut second = row("b", "ordinary-b", "ordinary-parent");
+        second.file_id = Some("ordinary.csv".to_owned());
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "ordinary-parent",
+            None,
+            &[first, second],
+        )
+        .await
+        .expect("ordinary parent should write");
+
+        let scope_key = collection_scope_key(CollectionScopeRef {
+            schema_key: "test_schema",
+            file_id: Some("ordinary.csv"),
+        });
+        let marker = MaterializedTrackedStateRow {
+            entity_pk: EntityPk::single(scope_key),
+            schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+            file_id: None,
+            snapshot_content: Some(r#"{"live_count":1}"#.into()),
+            metadata: None,
+            deleted: false,
+            created_at: "2026-01-01T00:00:01Z".to_owned(),
+            updated_at: "2026-01-01T00:00:01Z".to_owned(),
+            change_id: ChangeId::for_test_label("ordinary-marker"),
+            commit_id: CommitId::for_test_label("ordinary-child"),
+        };
+        let mut retained = row("b", "ordinary-b-next", "ordinary-child");
+        retained.file_id = Some("ordinary.csv".to_owned());
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "ordinary-child",
+            Some("ordinary-parent"),
+            &[marker, retained],
+        )
+        .await
+        .expect("ordinary child should write");
+
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("ordinary scan should open"),
+        );
+        let rows = reader
+            .scan_batch_at_commit(
+                "ordinary-child",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_owned()],
+                        file_ids: vec![NullableKeyFilter::Value("ordinary.csv".to_owned())],
+                        ..crate::tracked_state::TrackedStateFilter::default()
+                    },
+                    ..TrackedStateScanRequest::default()
+                },
+            )
+            .await
+            .expect("ordinary child should scan")
+            .into_rows();
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]

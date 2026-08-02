@@ -483,6 +483,17 @@ pub(crate) async fn stage_certified_entity_batches(
     observations: &BTreeMap<String, crate::branch::BranchHeadControlObservation>,
     commit_created_at: &BTreeMap<CommitId, LixTimestamp>,
 ) -> Result<(), LixError> {
+    let mut content_owners = BTreeSet::new();
+    for file in file_writes {
+        for batch in file.batches {
+            if !content_owners.insert((file.branch_id, file.file_id, batch.format)) {
+                return Err(head_value_error(format!(
+                    "certified entity batches duplicate branch '{}', file '{}', format {}",
+                    file.branch_id, file.file_id, batch.format
+                )));
+            }
+        }
+    }
     let mut complete_manifest_suffixes = BTreeMap::<String, Vec<Vec<u8>>>::new();
     for file in file_writes {
         for batch in file
@@ -1698,12 +1709,13 @@ fn decode_certified_packet_rows(
         let change_id = if let Some(id) = &created_id {
             ChangeId::new(uuid::Uuid::from_bytes(*id))
         } else {
-            let mut bytes = *commit_id.as_uuid().as_bytes();
-            let ordinal = base_ordinal.saturating_add(decoded).to_be_bytes();
-            for (target, source) in bytes[8..].iter_mut().zip(ordinal) {
-                *target ^= source;
-            }
-            ChangeId::new(uuid::Uuid::from_bytes(bytes))
+            certified_keyed_change_id(
+                commit_id,
+                schema_key,
+                file_id,
+                &entity_pk,
+                base_ordinal.saturating_add(decoded),
+            )
         };
         builder.push_materialized(
             entity_pk,
@@ -1725,6 +1737,28 @@ fn decode_certified_packet_rows(
         }
     }
     Ok(decoded)
+}
+
+fn certified_keyed_change_id(
+    commit_id: CommitId,
+    schema_key: &str,
+    file_id: &str,
+    entity_pk: &EntityPk,
+    ordinal: u64,
+) -> ChangeId {
+    let identity = crate::tracked_state::encode_key_ref(TrackedStateKeyRef {
+        schema_key,
+        file_id: Some(file_id),
+        entity_pk,
+    });
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lix.certified.keyed-change.v1\0");
+    hasher.update(commit_id.as_uuid().as_bytes());
+    hasher.update(identity.as_slice());
+    hasher.update(&ordinal.to_be_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    ChangeId::new(uuid::Uuid::from_bytes(bytes))
 }
 
 /// Inserts the generated `id` into an already validated canonical JSON object
@@ -9058,6 +9092,89 @@ mod tests {
         Memory, StorageAdapter, StorageGetManyRequest, StorageGetManyResult, StorageKeyRange,
         StorageReadOptions, StorageScanChunk, StorageScanOptions, StorageWriteOptions,
     };
+
+    #[tokio::test]
+    async fn certified_batches_reject_duplicate_content_owner() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("duplicate certified read should open");
+        let batch = WasmCertifiedEntityBatch {
+            format: 2,
+            schema_keys: vec!["test_schema".to_owned()],
+            row_count: 1,
+            creates: WasmCreateContext { high: 0, low: 0 },
+            create_ranges: Vec::new(),
+            complete_file_state: true,
+            pages: Vec::new(),
+        };
+        let batches = [batch.clone(), batch];
+        let files = [CertifiedEntityBatchFileRef {
+            branch_id: "main",
+            file_id: "duplicate.lix",
+            batches: &batches,
+        }];
+        let error = stage_certified_entity_batches(
+            &read,
+            &mut StorageWriteSet::new(),
+            &files,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect_err("duplicate certified content owners must fail");
+        assert!(error.message.contains("duplicate branch"));
+    }
+
+    #[test]
+    fn keyed_certified_change_ids_include_full_identity() {
+        let commit_id = CommitId::for_test_label("keyed-certified-change");
+        let entity_pk = EntityPk::single("same-key");
+        let first = certified_keyed_change_id(commit_id, "test_schema", "first.csv", &entity_pk, 1);
+        let second =
+            certified_keyed_change_id(commit_id, "test_schema", "second.csv", &entity_pk, 1);
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            certified_keyed_change_id(commit_id, "test_schema", "first.csv", &entity_pk, 1,)
+        );
+
+        let mut record = Vec::new();
+        record.push(0);
+        record.extend_from_slice(&("test_schema".len() as u32).to_le_bytes());
+        record.extend_from_slice(b"test_schema");
+        record.extend_from_slice(&1_u32.to_le_bytes());
+        record.extend_from_slice(&("same-key".len() as u32).to_le_bytes());
+        record.extend_from_slice(b"same-key");
+        record.push(0);
+        record.push(0);
+        record.extend_from_slice(&2_u32.to_le_bytes());
+        record.extend_from_slice(b"{}");
+        let mut page = Vec::new();
+        page.extend_from_slice(&(record.len() as u32).to_le_bytes());
+        page.extend_from_slice(&record);
+        let batch = WasmCertifiedEntityBatch {
+            format: 2,
+            schema_keys: vec!["test_schema".to_owned()],
+            row_count: 1,
+            creates: WasmCreateContext { high: 0, low: 0 },
+            create_ranges: Vec::new(),
+            complete_file_state: true,
+            pages: vec![Bytes::from(page)],
+        };
+        let materialized = |file_id| {
+            materialize_certified_root_rows("main", file_id, commit_id, timestamp(), &batch)
+                .expect("keyed packet should materialize")
+                .row(0)
+                .change_id()
+                .expect("keyed packet row should have a change id")
+        };
+        assert_eq!(materialized("first.csv"), first);
+        assert_eq!(materialized("first.csv"), materialized("first.csv"));
+        assert_ne!(materialized("first.csv"), materialized("second.csv"));
+    }
 
     #[test]
     fn transaction_hot_state_cache_is_bounded_per_metadata_lane() {

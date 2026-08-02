@@ -9,9 +9,9 @@ use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::StorageWriteSet;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateContext,
-    TrackedStateDeltaRef,
+    TrackedStateDeltaRef, TrackedStateKey,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn prepare_json_ref(value: &str) -> JsonRef {
     JsonRef::for_content(value.as_bytes())
@@ -156,7 +156,7 @@ pub(crate) async fn seed_branch_head_with_rows(
             None,
             commit_id,
             &deltas,
-            &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
             None,
             None,
             None,
@@ -195,6 +195,27 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     commit_id: &str,
     parent_commit_id: Option<&str>,
     rows: &[MaterializedTrackedStateRow],
+) -> Result<(), crate::LixError> {
+    stage_tracked_root_from_materialized_with_certified_replacement_markers(
+        read,
+        writes,
+        tracked_state,
+        commit_id,
+        parent_commit_id,
+        rows,
+        &BTreeSet::new(),
+    )
+    .await
+}
+
+pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacement_markers(
+    read: &mut (impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    tracked_state: &TrackedStateContext,
+    commit_id: &str,
+    parent_commit_id: Option<&str>,
+    rows: &[MaterializedTrackedStateRow],
+    certified_replacement_markers: &BTreeSet<TrackedStateKey>,
 ) -> Result<(), crate::LixError> {
     let commit_id = test_commit_id(commit_id);
     let commit_id_text = commit_id.to_string();
@@ -265,10 +286,12 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
     tracked_state
         .writer(read, writes)
-        .stage_commit_root(
+        .stage_commit_root_with_absence_guards(
             &commit_id_text,
             parent_commit_id_text.as_deref(),
             root_deltas,
+            &BTreeSet::new(),
+            certified_replacement_markers,
         )
         .await?;
     Ok(())
@@ -525,7 +548,7 @@ async fn stage_test_changelog_commit(
     let mut append = ChangelogAppend::default();
     let mut change_commit_ids = Vec::new();
     let mut json_payloads = Vec::new();
-    let mut seen_json_refs = std::collections::BTreeSet::new();
+    let mut seen_json_refs = BTreeSet::new();
     for &row_index in &winner_indices {
         let row = &rows[row_index];
         for (json_ref, payload) in json_payloads_from_materialized(row) {
