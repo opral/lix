@@ -84,6 +84,10 @@ name = "movie_workspace_qualification"
 path = "tests/movie_workspace_qualification.rs"
 required-features = ["storage-benches", "slatedb"]
 
+[[test]]
+name = "tpch_overlay_helpers"
+path = "tests/tpch_overlay_helpers.rs"
+
 [[bench]]
 name = "storage_v2"
 path = "benches/storage_v2.rs"

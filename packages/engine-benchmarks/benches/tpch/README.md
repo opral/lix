@@ -21,11 +21,19 @@ tables and Q1-Q22 are live. Its JSON `suite` field deliberately says
 `tpch-derived-common-types` because the shared types differ from native TPC-H
 dates and decimals.
 
+Set `LIX_TPCH_OVERLAY=sparse` to update a deterministic 0.1% sample of
+`lineitem`, or `LIX_TPCH_OVERLAY=moderate` for a 5% sample. The default is
+`pristine`. Overlay mutations are applied to both engines after their initial
+load and before validation or timing. They replace a query-visible numeric
+column, so every run verifies that DuckDB and Lix expose the same logical
+state while Lix reads its packed base plus committed transactional changes.
+The replacement value is outside TPC-H's generated quantity range, guaranteeing
+that every selected row produces a real delta.
+Each JSON record includes the exact selected row count and fraction.
+
 Q17 is a regression guard for the correlated aggregate-statistics correctness
 defect fixed by <https://github.com/opral/lix/pull/1137>.
 
 The padded storage identity columns are present in both engines and absent
 from benchmark SQL. They make the initial load deterministically ordered and
-allow Lix to publish its normal packed analytical base. Results from this
-pristine state do not qualify transactional overlays; sparse and moderate
-overlay scenarios are separate required benchmark states.
+allow Lix to publish its normal packed analytical base.

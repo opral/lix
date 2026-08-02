@@ -237,18 +237,18 @@ pub(crate) enum Fixture {
 }
 
 impl Fixture {
-    pub(crate) async fn rocksdb(scale_factor: f64) -> Self {
+    pub(crate) async fn rocksdb(scale_factor: f64, overlay_rowkeys: &[String]) -> Self {
         let dir = TempDir::new().expect("create TPC-H RocksDB directory");
         let storage = RocksDB::open(dir.path().join("tpch.rocksdb")).expect("open TPC-H RocksDB");
-        let session = prepare(storage, scale_factor).await;
+        let session = prepare(storage, scale_factor, overlay_rowkeys).await;
         Self::RocksDB { session, _dir: dir }
     }
 
     #[cfg(feature = "slatedb")]
-    pub(crate) async fn slatedb(scale_factor: f64) -> Self {
+    pub(crate) async fn slatedb(scale_factor: f64, overlay_rowkeys: &[String]) -> Self {
         let dir = TempDir::new().expect("create TPC-H SlateDB directory");
         let storage = SlateDB::open(dir.path().join("tpch.slatedb")).expect("open TPC-H SlateDB");
-        let session = prepare(storage, scale_factor).await;
+        let session = prepare(storage, scale_factor, overlay_rowkeys).await;
         Self::SlateDB { session, _dir: dir }
     }
 
@@ -288,7 +288,7 @@ impl Fixture {
     }
 }
 
-async fn prepare<S>(storage: S, scale_factor: f64) -> SessionContext<S>
+async fn prepare<S>(storage: S, scale_factor: f64, overlay_rowkeys: &[String]) -> SessionContext<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -508,6 +508,29 @@ where
         .await
         .expect("commit Lix lineitem seed");
     assert_eq!(affected, attempted, "incomplete TPC-H lineitem seed");
+    if !overlay_rowkeys.is_empty() {
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("begin Lix TPC-H overlay");
+        let mut affected = 0_u64;
+        for chunk in overlay_rowkeys.chunks(crate::overlay::ROWS_PER_STATEMENT) {
+            affected += transaction
+                .execute(&crate::overlay::lineitem_update_sql(chunk), &[])
+                .await
+                .expect("apply Lix TPC-H overlay chunk")
+                .rows_affected();
+        }
+        transaction
+            .commit()
+            .await
+            .expect("commit Lix TPC-H overlay");
+        assert_eq!(
+            affected,
+            overlay_rowkeys.len() as u64,
+            "incomplete Lix TPC-H overlay"
+        );
+    }
     session
 }
 
