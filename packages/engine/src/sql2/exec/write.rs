@@ -221,7 +221,7 @@ pub(crate) fn parameter_record_batch(rows: &[&[Value]]) -> Result<Option<RecordB
         })
 }
 
-pub(super) fn parameter_row(batch: &RecordBatch, row_index: usize) -> Result<Vec<Value>, LixError> {
+pub(crate) fn parameter_row(batch: &RecordBatch, row_index: usize) -> Result<Vec<Value>, LixError> {
     if row_index >= batch.num_rows() {
         return Err(LixError::unknown(format!(
             "SQL parameter row {row_index} is outside a {} row batch",
@@ -313,11 +313,20 @@ fn scalar_parameter_value(scalar: ScalarValue, is_json: bool) -> Result<Value, L
                 ))
             }),
         ScalarValue::Utf8(Some(value)) => Ok(Value::Text(value)),
+        ScalarValue::LargeUtf8(Some(value)) if is_json => serde_json::from_str(&value)
+            .map(Value::Json)
+            .map_err(|error| {
+                LixError::unknown(format!(
+                    "invalid JSON value in SQL parameter batch: {error}"
+                ))
+            }),
+        ScalarValue::LargeUtf8(Some(value)) => Ok(Value::Text(value)),
         ScalarValue::LargeBinary(Some(value)) => Ok(Value::Blob(value.into())),
         ScalarValue::Boolean(None)
         | ScalarValue::Int64(None)
         | ScalarValue::Float64(None)
         | ScalarValue::Utf8(None)
+        | ScalarValue::LargeUtf8(None)
         | ScalarValue::LargeBinary(None)
         | ScalarValue::Null => Ok(Value::Null),
         value => Err(LixError::unknown(format!(

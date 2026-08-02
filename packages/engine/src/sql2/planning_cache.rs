@@ -123,6 +123,15 @@ where
         (normalized_sql == normalized_shape).then_some(params)
     }
 
+    /// Checks an UPDATE template without retaining decoded literal values.
+    ///
+    /// Large heterogeneous batches use this as a cheap certification pass so
+    /// a late shape mismatch cannot leave almost an entire parameter batch in
+    /// memory before ordinary sequential classification resumes.
+    pub(crate) fn update_literal_shape_matches(&self, sql: &str, normalized_shape: &str) -> bool {
+        update_string_literals_match_shape(sql, normalized_shape)
+    }
+
     /// Returns stable public-surface metadata for one catalog generation.
     ///
     /// Callers are responsible for using a key that changes whenever any
@@ -288,6 +297,99 @@ fn normalize_update_string_literals(sql: &str) -> Option<(String, Vec<Value>)> {
     Some((normalized, params))
 }
 
+fn update_string_literals_match_shape(sql: &str, normalized_shape: &str) -> bool {
+    let trimmed = sql.trim_start();
+    let Some(update) = trimmed.get(.."UPDATE".len()) else {
+        return false;
+    };
+    if !update.eq_ignore_ascii_case("UPDATE")
+        || !trimmed
+            .as_bytes()
+            .get("UPDATE".len())
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        return false;
+    }
+
+    let bytes = sql.as_bytes();
+    let shape = normalized_shape.as_bytes();
+    let mut cursor = 0;
+    let mut copied = 0;
+    let mut shape_cursor = 0;
+    let mut param_count = 0_usize;
+    let mut quoted_identifier = false;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'"' => {
+                if quoted_identifier && bytes.get(cursor + 1) == Some(&b'"') {
+                    cursor += 2;
+                    continue;
+                }
+                quoted_identifier = !quoted_identifier;
+                cursor += 1;
+            }
+            b'-' if !quoted_identifier && bytes.get(cursor + 1) == Some(&b'-') => return false,
+            b'/' if !quoted_identifier && bytes.get(cursor + 1) == Some(&b'*') => return false,
+            b'?' | b'$' if !quoted_identifier => return false,
+            b'\'' if !quoted_identifier => {
+                if bytes[..cursor]
+                    .iter()
+                    .rposition(|byte| !byte.is_ascii_whitespace())
+                    .is_some_and(|index| {
+                        matches!(bytes[index], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+                    })
+                {
+                    return false;
+                }
+                let outside = &bytes[copied..cursor];
+                if !shape
+                    .get(shape_cursor..)
+                    .is_some_and(|remaining| remaining.starts_with(outside))
+                {
+                    return false;
+                }
+                shape_cursor += outside.len();
+                if shape.get(shape_cursor) != Some(&b'$') {
+                    return false;
+                }
+                shape_cursor += 1;
+                let digit_start = shape_cursor;
+                let mut parameter_number = 0_usize;
+                while let Some(digit @ b'0'..=b'9') = shape.get(shape_cursor) {
+                    parameter_number = parameter_number
+                        .saturating_mul(10)
+                        .saturating_add(usize::from(*digit - b'0'));
+                    shape_cursor += 1;
+                }
+                if shape_cursor == digit_start || parameter_number != param_count + 1 {
+                    return false;
+                }
+                param_count += 1;
+
+                cursor += 1;
+                loop {
+                    let Some(quote) = bytes[cursor..]
+                        .iter()
+                        .position(|byte| *byte == b'\'')
+                        .map(|offset| cursor + offset)
+                    else {
+                        return false;
+                    };
+                    if bytes.get(quote + 1) == Some(&b'\'') {
+                        cursor = quote + 2;
+                        continue;
+                    }
+                    cursor = quote + 1;
+                    copied = cursor;
+                    break;
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+    !quoted_identifier && param_count > 0 && shape.get(shape_cursor..) == Some(&bytes[copied..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +469,32 @@ mod tests {
             ]
         );
         assert_eq!(lock_or_recover(&cache.parsed_statements).len(), 1);
+    }
+
+    #[test]
+    fn literal_update_shape_matcher_streams_without_decoding_values() {
+        let cache = test_cache(8);
+        let template = cache
+            .auto_parameterized_update(
+                "UPDATE \"notes\" SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
+            )
+            .unwrap();
+
+        assert!(cache.update_literal_shape_matches(
+            "UPDATE \"notes\" SET value = lix_json('{\"text\":\"it''''s fine\"}') WHERE id = 'b'",
+            &template.sql,
+        ));
+        for different_shape in [
+            "UPDATE \"notes\" SET value = lix_json('{}') WHERE other_id = 'b'",
+            "UPDATE notes SET value = lix_json('{}') WHERE id = 'b'",
+            "UPDATE \"notes\" SET value = lix_json('{}') WHERE id = 'b' -- comment",
+            "UPDATE \"notes\" SET value = lix_json('{}') WHERE id = $1",
+        ] {
+            assert!(
+                !cache.update_literal_shape_matches(different_shape, &template.sql),
+                "{different_shape}"
+            );
+        }
     }
 
     #[test]

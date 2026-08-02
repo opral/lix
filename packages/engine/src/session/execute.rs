@@ -19,6 +19,9 @@ use crate::storage_adapter::{
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{Blob, LixError, LixNotice, SqlQueryResult, Value};
+use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, Ident, LimitClause, OrderByKind, Query, Select,
@@ -32,6 +35,40 @@ use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext, SessionWriteAccess};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::SessionTransaction;
+
+const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
+
+enum LiteralParameterBuilder {
+    Utf8(StringBuilder),
+    LargeUtf8(LargeStringBuilder),
+}
+
+impl LiteralParameterBuilder {
+    fn with_capacity(large_offsets: bool, item_capacity: usize, data_capacity: usize) -> Self {
+        if large_offsets {
+            Self::LargeUtf8(LargeStringBuilder::with_capacity(
+                item_capacity,
+                data_capacity,
+            ))
+        } else {
+            Self::Utf8(StringBuilder::with_capacity(item_capacity, data_capacity))
+        }
+    }
+
+    fn append_value(&mut self, value: &str) {
+        match self {
+            Self::Utf8(builder) => builder.append_value(value),
+            Self::LargeUtf8(builder) => builder.append_value(value),
+        }
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        match self {
+            Self::Utf8(builder) => Arc::new(builder.finish()),
+            Self::LargeUtf8(builder) => Arc::new(builder.finish()),
+        }
+    }
+}
 
 /// Result of executing one SQL statement through engine.
 ///
@@ -477,7 +514,7 @@ enum TransactionBatchStatements {
     AutoParameterizedUpdate {
         sql: Arc<str>,
         statement: datafusion::sql::parser::Statement,
-        parameter_rows: Vec<Vec<Value>>,
+        parameter_batch: RecordBatch,
     },
     Distinct(Vec<datafusion::sql::parser::Statement>),
 }
@@ -486,7 +523,9 @@ impl TransactionBatchStatements {
     fn len(&self) -> usize {
         match self {
             Self::Shared { len, .. } => *len,
-            Self::AutoParameterizedUpdate { parameter_rows, .. } => parameter_rows.len(),
+            Self::AutoParameterizedUpdate {
+                parameter_batch, ..
+            } => parameter_batch.num_rows(),
             Self::Distinct(statements) => statements.len(),
         }
     }
@@ -514,9 +553,9 @@ impl TransactionBatchStatements {
             Self::Shared { statement, len } => vec![statement; len],
             Self::AutoParameterizedUpdate {
                 statement,
-                parameter_rows,
+                parameter_batch,
                 ..
-            } => vec![statement; parameter_rows.len()],
+            } => vec![statement; parameter_batch.num_rows()],
             Self::Distinct(statements) => statements,
         }
     }
@@ -1517,15 +1556,17 @@ where
                         TransactionBatchStatements::AutoParameterizedUpdate {
                             sql,
                             statement: parsed,
-                            parameter_rows,
+                            parameter_batch,
                         } => {
-                            for (statement_index, ((statement, params), metadata)) in
-                                transaction_statements
-                                    .iter()
-                                    .zip(parameter_rows)
-                                    .zip(statement_metadata)
-                                    .enumerate()
+                            for (statement_index, (statement, metadata)) in transaction_statements
+                                .iter()
+                                .zip(statement_metadata)
+                                .enumerate()
                             {
+                                let params = sql2::parameter_row(&parameter_batch, statement_index)
+                                    .map_err(|error| {
+                                        with_batch_statement_index(error, statement_index)
+                                    })?;
                                 let telemetry = SqlStatementTelemetry::start(
                                     transaction_telemetry_sink.as_ref(),
                                     &statement.sql,
@@ -2644,15 +2685,9 @@ where
     }
 
     let (planning_sql, parsed_statement, parameter_rows) = match parsed {
-        TransactionBatchStatements::AutoParameterizedUpdate {
-            sql,
-            statement,
-            parameter_rows,
-        } => (
-            sql.as_ref(),
-            statement,
-            parameter_rows.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-        ),
+        TransactionBatchStatements::AutoParameterizedUpdate { sql, statement, .. } => {
+            (sql.as_ref(), statement, None)
+        }
         TransactionBatchStatements::Shared { statement, .. }
             if statements
                 .iter()
@@ -2661,10 +2696,12 @@ where
             (
                 first_statement.sql.as_str(),
                 statement,
-                statements
-                    .iter()
-                    .map(|statement| statement.params.as_slice())
-                    .collect::<Vec<_>>(),
+                Some(
+                    statements
+                        .iter()
+                        .map(|statement| statement.params.as_slice())
+                        .collect::<Vec<_>>(),
+                ),
             )
         }
         TransactionBatchStatements::Shared { .. } | TransactionBatchStatements::Distinct(_) => {
@@ -2678,13 +2715,26 @@ where
     let previous_origin_key = transaction.replace_origin_key(options.origin_key.clone());
     let execution = async {
         let plan = transaction.prepare_sql_write_logical_plan(planning_sql, parsed_statement)?;
+        if let TransactionBatchStatements::AutoParameterizedUpdate {
+            parameter_batch, ..
+        } = parsed
+        {
+            return sql2::execute_write_logical_plan_parameter_batch(
+                transaction,
+                plan,
+                parameter_batch,
+            )
+            .await;
+        }
+        let parameter_rows = parameter_rows
+            .as_ref()
+            .expect("shared parameter execution retains borrowed rows");
         if let Some(results) =
-            sql2::execute_write_logical_plan_value_batch(transaction, &plan, &parameter_rows)
-                .await?
+            sql2::execute_write_logical_plan_value_batch(transaction, &plan, parameter_rows).await?
         {
             return Ok(Some(results));
         }
-        let Some(parameter_batch) = sql2::parameter_record_batch(&parameter_rows)? else {
+        let Some(parameter_batch) = sql2::parameter_record_batch(parameter_rows)? else {
             return Ok(None);
         };
         sql2::execute_write_logical_plan_parameter_batch(transaction, plan, &parameter_batch).await
@@ -3679,28 +3729,69 @@ fn classify_execute_batch(
             .iter()
             .all(|statement| statement.params.is_empty())
         && let Some(first) = planning_cache.auto_parameterized_update(&statements[0].sql)
+        && statements[1..].iter().all(|statement| {
+            planning_cache.update_literal_shape_matches(&statement.sql, first.sql.as_ref())
+        })
     {
-        let mut parameter_rows = Vec::with_capacity(statements.len());
-        parameter_rows.push(first.params);
-        let mut same_shape = true;
-        for statement in &statements[1..] {
-            let Some(params) =
-                planning_cache.update_literal_params_for_shape(&statement.sql, first.sql.as_ref())
-            else {
-                same_shape = false;
-                break;
+        let mut builders = Vec::with_capacity(first.params.len());
+        // Every decoded literal is a substring of its source SQL (doubled
+        // quotes only shrink it), so total SQL bytes are a conservative proof
+        // that every parameter column fits Arrow's 32-bit Utf8 offsets.
+        let large_offsets = statements.iter().fold(0_usize, |total, statement| {
+            total.saturating_add(statement.sql.len())
+        }) > i32::MAX as usize;
+        let per_column_byte_cap = MAX_INITIAL_LITERAL_COLUMN_BYTES / first.params.len().max(1);
+        for param in &first.params {
+            let Value::Text(value) = param else {
+                unreachable!("auto-parameterized string literals produce text parameters")
             };
-            parameter_rows.push(params);
+            let mut builder = LiteralParameterBuilder::with_capacity(
+                large_offsets,
+                statements.len(),
+                value
+                    .len()
+                    .saturating_mul(statements.len())
+                    .min(per_column_byte_cap),
+            );
+            builder.append_value(value);
+            builders.push(builder);
         }
-        if same_shape {
-            return Ok(ExecuteBatchExecution::Transaction(
-                TransactionBatchStatements::AutoParameterizedUpdate {
-                    sql: first.sql,
-                    statement: first.statement,
-                    parameter_rows,
-                },
-            ));
+        for statement in &statements[1..] {
+            let params = planning_cache
+                .update_literal_params_for_shape(&statement.sql, first.sql.as_ref())
+                .expect("the non-retaining pass certified this UPDATE shape");
+            for (builder, param) in builders.iter_mut().zip(params) {
+                let Value::Text(value) = param else {
+                    unreachable!("auto-parameterized string literals produce text parameters")
+                };
+                builder.append_value(&value);
+            }
         }
+        let data_type = if large_offsets {
+            DataType::LargeUtf8
+        } else {
+            DataType::Utf8
+        };
+        let fields = (0..builders.len())
+            .map(|index| Field::new(format!("${}", index + 1), data_type.clone(), false))
+            .collect::<Vec<_>>();
+        let columns = builders
+            .iter_mut()
+            .map(LiteralParameterBuilder::finish)
+            .collect::<Vec<_>>();
+        let parameter_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|error| {
+                LixError::unknown(format!(
+                    "failed to construct literal UPDATE parameter batch: {error}"
+                ))
+            })?;
+        return Ok(ExecuteBatchExecution::Transaction(
+            TransactionBatchStatements::AutoParameterizedUpdate {
+                sql: first.sql,
+                statement: first.statement,
+                parameter_batch,
+            },
+        ));
     }
 
     let mut parsed = Vec::with_capacity(statements.len());
@@ -4337,7 +4428,7 @@ mod tests {
         let ExecuteBatchExecution::Transaction(
             TransactionBatchStatements::AutoParameterizedUpdate {
                 sql,
-                parameter_rows,
+                parameter_batch,
                 ..
             },
         ) = classify_execute_batch(&statements, &cache).unwrap()
@@ -4345,6 +4436,9 @@ mod tests {
             panic!("literal UPDATE statements should share one parameterized shape");
         };
         assert_eq!(sql.as_ref(), "UPDATE notes SET value = $1 WHERE id = $2");
+        let parameter_rows = (0..parameter_batch.num_rows())
+            .map(|row_index| sql2::parameter_row(&parameter_batch, row_index).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(
             parameter_rows,
             [
@@ -4358,6 +4452,22 @@ mod tests {
                 ],
             ]
         );
+    }
+
+    #[test]
+    fn execute_batch_declines_a_late_literal_shape_mismatch() {
+        let cache = sql2::SqlPlanningCache::default();
+        let statements = [
+            batch_statement("UPDATE notes SET value = 'first' WHERE id = 'a'"),
+            batch_statement("UPDATE notes SET value = 'second' WHERE id = 'b'"),
+            batch_statement("UPDATE notes SET other = 'third' WHERE id = 'c'"),
+        ];
+        let ExecuteBatchExecution::Transaction(TransactionBatchStatements::Distinct(parsed)) =
+            classify_execute_batch(&statements, &cache).unwrap()
+        else {
+            panic!("a heterogeneous batch must retain sequential classification");
+        };
+        assert_eq!(parsed.len(), statements.len());
     }
 
     #[tokio::test]

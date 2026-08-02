@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use datafusion::arrow::array::{Array, BooleanArray, StringArray};
+use datafusion::arrow::array::{Array, BooleanArray, LargeStringArray, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
@@ -142,7 +142,10 @@ impl<'a> EntityInsertParameterBatch<'a> {
                     return false;
                 }
                 match column_type {
-                    EntityColumnType::String => array.as_any().is::<StringArray>(),
+                    EntityColumnType::String => {
+                        array.as_any().is::<StringArray>()
+                            || array.as_any().is::<LargeStringArray>()
+                    }
                     EntityColumnType::Boolean => array.as_any().is::<BooleanArray>(),
                     _ => false,
                 }
@@ -168,6 +171,8 @@ impl<'a> EntityInsertParameterBatch<'a> {
                     return DirectParameterValue::Null;
                 }
                 if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+                    DirectParameterValue::String(array.value(row_index))
+                } else if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
                     DirectParameterValue::String(array.value(row_index))
                 } else if let Some(array) = array.as_any().downcast_ref::<BooleanArray>() {
                     DirectParameterValue::Boolean(array.value(row_index))
@@ -819,7 +824,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         });
         Some(ordinals)
     };
-    let unique_entity_pks = if let Some(ordinals) = &sorted_statement_ordinals {
+    let deduplicated_entity_pks = if let Some(ordinals) = &sorted_statement_ordinals {
         let mut unique = Vec::with_capacity(row_count);
         for &statement_index in ordinals {
             let entity_pk = &entity_pks[statement_index];
@@ -827,10 +832,13 @@ async fn try_execute_direct_path_value_replacement_batch(
                 unique.push(entity_pk.clone());
             }
         }
-        unique
+        Some(unique)
     } else {
-        entity_pks.clone()
+        None
     };
+    let unique_entity_pks = deduplicated_entity_pks
+        .as_deref()
+        .unwrap_or(entity_pks.as_slice());
     let unique_row_count = unique_entity_pks.len();
 
     let active_branch_id = ctx.active_branch_id().to_owned();
@@ -864,7 +872,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         MaterializedLiveStateBatch::default()
     } else {
         let candidates =
-            scan_entity_candidates_for_pks(ctx, plan, &spec, unique_entity_pks.clone(), true)
+            scan_entity_candidates_for_pks(ctx, plan, &spec, unique_entity_pks.to_vec(), true)
                 .instrument(tracing::debug_span!(
                     target: "lix_perf",
                     "lix.perf.entity_update_value_batch.candidate_scan",
@@ -1070,8 +1078,41 @@ struct DirectPathValueReplacement {
 
 #[derive(Clone, Copy)]
 struct DirectReplacementTextColumns<'a> {
-    primary_keys: &'a StringArray,
-    values: &'a StringArray,
+    primary_keys: DirectTextColumn<'a>,
+    values: DirectTextColumn<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum DirectTextColumn<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+}
+
+impl<'a> DirectTextColumn<'a> {
+    fn is_null(self, row_index: usize) -> bool {
+        match self {
+            Self::Utf8(array) => array.is_null(row_index),
+            Self::LargeUtf8(array) => array.is_null(row_index),
+        }
+    }
+
+    fn value(self, row_index: usize) -> &'a str {
+        match self {
+            Self::Utf8(array) => array.value(row_index),
+            Self::LargeUtf8(array) => array.value(row_index),
+        }
+    }
+}
+
+fn direct_text_column<'a>(array: &'a dyn Array) -> Option<DirectTextColumn<'a>> {
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        Some(DirectTextColumn::Utf8(array))
+    } else {
+        array
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(DirectTextColumn::LargeUtf8)
+    }
 }
 
 fn direct_replacement_text_columns<'a>(
@@ -1083,14 +1124,8 @@ fn direct_replacement_text_columns<'a>(
         return None;
     }
     Some(DirectReplacementTextColumns {
-        primary_keys: batch
-            .column(primary_key_param_index)
-            .as_any()
-            .downcast_ref::<StringArray>()?,
-        values: batch
-            .column(value_param_index)
-            .as_any()
-            .downcast_ref::<StringArray>()?,
+        primary_keys: direct_text_column(batch.column(primary_key_param_index).as_ref())?,
+        values: direct_text_column(batch.column(value_param_index).as_ref())?,
     })
 }
 
