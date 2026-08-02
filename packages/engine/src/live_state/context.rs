@@ -3,10 +3,11 @@
 use super::EntitySnapshotFieldIndexCache;
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::NullableKeyFilter;
-use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlContext};
+#[cfg(test)]
+use crate::branch::BRANCH_REF_SCHEMA_KEY;
+use crate::branch::{BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::CommitId;
-use crate::commit_graph::{CommitGraphCommitRecord, CommitGraphContext};
+use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
@@ -28,7 +29,10 @@ use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use std::mem::size_of;
 use std::sync::Mutex as StdMutex;
-use tracing::Instrument;
+
+use super::derived::{
+    is_derived_only_request, is_derived_schema, request_may_include_derived, scan_derived_rows,
+};
 
 const BRANCH_READ_CONCURRENCY: usize = 8;
 const ENTITY_POINT_SNAPSHOT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -138,9 +142,6 @@ fn entity_point_snapshot_cache_disabled_for_profile() -> bool {
 const fn entity_point_snapshot_cache_disabled_for_profile() -> bool {
     false
 }
-
-const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 
 /// Serving facade for visible live-state reads.
 ///
@@ -395,14 +396,7 @@ where
     ) -> Result<Option<(String, BranchHeadControl, String)>, LixError> {
         // The hot index carries tracked and untracked rows in one serving
         // plane, so this route never probes a separate retention index.
-        if request.filter.untracked.is_some()
-            || request_may_include_commit_derived(request)
-            || request
-                .filter
-                .schema_keys
-                .iter()
-                .any(|schema_key| schema_key == BRANCH_REF_SCHEMA_KEY)
-        {
+        if request.filter.untracked.is_some() || request_may_include_derived(request) {
             return Ok(None);
         }
         let [schema_key] = request.filter.schema_keys.as_slice() else {
@@ -457,7 +451,7 @@ where
         skip_proven_empty_schema: bool,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let store = &self.store;
-        let reads_tracked = !is_commit_derived_only_request(request);
+        let reads_tracked = !is_derived_only_request(request);
         let scope = scan_scope(
             store,
             request,
@@ -471,28 +465,22 @@ where
         if let Some(rows) = self.scan_direct_entity_pk_batch(request, &scope).await? {
             return Ok(rows);
         }
-        let commit_derived_rows = if request.filter.untracked != Some(true) {
-            MaterializedLiveStateBatch::from_rows(
-                scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?,
+        let derived_rows = MaterializedLiveStateBatch::from_rows(
+            scan_derived_rows(
+                store,
+                &self.commit_graph,
+                request,
+                &scope.projection_branch_ids,
+                &scope.storage_branch_ids,
+                request.filter.untracked,
             )
-        } else {
-            MaterializedLiveStateBatch::default()
-        };
-        let mut hot_branch_rows = if !is_commit_derived_only_request(request) {
+            .await?,
+        );
+        let mut hot_branch_rows = if !is_derived_only_request(request) {
             self.scan_hot_branch_rows(request, &scope).await?
         } else {
             Vec::new()
         };
-        if request.filter.untracked != Some(false) {
-            let branch_ref_rows = scan_direct_branch_ref_rows(store, request, &scope).await?;
-            if !branch_ref_rows.is_empty() {
-                hot_branch_rows.push(HotBranchRows {
-                    branch_id: GLOBAL_BRANCH_ID.to_string(),
-                    rows: MaterializedLiveStateBatch::from_rows(branch_ref_rows),
-                    ordered_unique: false,
-                });
-            }
-        }
         // The ordered single-branch route bypasses the generic visibility
         // resolver, so apply the retention predicate before taking that fast
         // path. Otherwise `untracked = Some(..)` accidentally returned both
@@ -505,7 +493,7 @@ where
                 );
             }
         }
-        if commit_derived_rows.is_empty()
+        if derived_rows.is_empty()
             && let Some(index) =
                 ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
         {
@@ -516,7 +504,7 @@ where
             ));
         }
         let rows = concat_live_state_batches(
-            std::iter::once(commit_derived_rows).chain(
+            std::iter::once(derived_rows).chain(
                 hot_branch_rows
                     .into_iter()
                     .map(|branch_rows| branch_rows.rows),
@@ -561,12 +549,7 @@ where
             || request.filter.entity_pks.is_empty()
             || !request.filter.file_ids.is_empty()
             || !request.filter.constraints.is_empty()
-            || request_may_include_commit_derived(request)
-            || request
-                .filter
-                .schema_keys
-                .iter()
-                .any(|schema_key| schema_key == BRANCH_REF_SCHEMA_KEY)
+            || request_may_include_derived(request)
         {
             return Ok(None);
         }
@@ -655,15 +638,14 @@ where
         if request.rows.is_empty() {
             return Ok(MaterializedLiveStateExactBatch::default());
         }
-        // Commit-derived rows are synthesized rather than stored under the
+        // Derived rows are synthesized rather than stored under the
         // requested identity. Preserve their exact scan semantics without
         // widening the optimized durable-state batch.
-        if request.rows.iter().any(|row| {
-            matches!(
-                row.schema_key.as_str(),
-                COMMIT_SCHEMA_KEY | COMMIT_EDGE_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY
-            )
-        }) {
+        if request
+            .rows
+            .iter()
+            .any(|row| is_derived_schema(&row.schema_key))
+        {
             let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
             let mut slots = Vec::with_capacity(request.rows.len());
             for row in &request.rows {
@@ -866,7 +848,7 @@ where
         skip_proven_empty_schema: bool,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let store = &self.store;
-        let reads_tracked = !is_commit_derived_only_request(request);
+        let reads_tracked = !is_derived_only_request(request);
         let scope = scan_scope(
             store,
             request,
@@ -877,10 +859,18 @@ where
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
             return Ok(MaterializedLiveStateBatch::default());
         }
-        let commit_derived_rows = MaterializedLiveStateBatch::from_rows(
-            scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?,
+        let derived_rows = MaterializedLiveStateBatch::from_rows(
+            scan_derived_rows(
+                store,
+                &self.commit_graph,
+                request,
+                &scope.projection_branch_ids,
+                &scope.storage_branch_ids,
+                Some(false),
+            )
+            .await?,
         );
-        let mut hot_branch_rows = if !is_commit_derived_only_request(request) {
+        let mut hot_branch_rows = if !is_derived_only_request(request) {
             self.scan_hot_branch_rows(request, &scope).await?
         } else {
             Vec::new()
@@ -889,7 +879,7 @@ where
             branch_rows.rows =
                 filter_current_row_retention(std::mem::take(&mut branch_rows.rows), Some(false));
         }
-        if commit_derived_rows.is_empty()
+        if derived_rows.is_empty()
             && let Some(index) =
                 ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
         {
@@ -900,7 +890,7 @@ where
             ));
         }
         let rows = concat_live_state_batches(
-            std::iter::once(commit_derived_rows).chain(
+            std::iter::once(derived_rows).chain(
                 hot_branch_rows
                     .into_iter()
                     .map(|branch_rows| branch_rows.rows),
@@ -1051,351 +1041,6 @@ where
     }
 }
 
-async fn scan_commit_derived_rows(
-    store: &(impl StorageAdapterRead + ?Sized),
-    commit_graph: &CommitGraphContext,
-    request: &LiveStateScanRequest,
-    scope: &LiveStateScanScope,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-    if request.filter.untracked == Some(true) || !request_may_include_commit_derived(request) {
-        return Ok(Vec::new());
-    }
-    if !file_filter_allows_null(&request.filter.file_ids) {
-        return Ok(Vec::new());
-    }
-
-    let branch_ids = if scope.projection_branch_ids.is_empty() {
-        vec![GLOBAL_BRANCH_ID.to_string()]
-    } else {
-        scope.projection_branch_ids.clone()
-    };
-    let mut graph = commit_graph.reader(store);
-    let include_commit = schema_filter_allows(&request.filter.schema_keys, COMMIT_SCHEMA_KEY);
-    let include_commit_edge =
-        schema_filter_allows(&request.filter.schema_keys, COMMIT_EDGE_SCHEMA_KEY);
-
-    if include_commit
-        && !request.filter.entity_pks.is_empty()
-        && request.filter.entity_pks.iter().all(|entity_pk| {
-            matches!(
-                entity_pk.components.as_slice(),
-                [crate::entity_pk::EntityPkComponent::Uuid(_)]
-            )
-        })
-    {
-        let commit_ids = request
-            .filter
-            .entity_pks
-            .iter()
-            .filter_map(|entity_pk| match entity_pk.components.as_slice() {
-                [crate::entity_pk::EntityPkComponent::Uuid(bytes)] => {
-                    Some(CommitId::new(uuid::Uuid::from_bytes(*bytes)))
-                }
-                _ => None,
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let records = graph
-            .load_commit_records(&commit_ids)
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.commit_derived.point"
-            ))
-            .await?;
-        let mut rows = Vec::with_capacity(records.len() * branch_ids.len());
-        for branch_id in &branch_ids {
-            for (requested_commit_id, record) in commit_ids.iter().zip(&records) {
-                let Some(record) = record else {
-                    continue;
-                };
-                if record.commit_id != *requested_commit_id {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "commit point lookup for {requested_commit_id} decoded record {}",
-                            record.commit_id
-                        ),
-                    ));
-                }
-                rows.push(commit_record_row(record, branch_id)?);
-            }
-        }
-        rows.retain(|row| {
-            request.filter.entity_pks.contains(&row.entity_pk)
-                && (request.filter.branch_ids.is_empty()
-                    || request
-                        .filter
-                        .branch_ids
-                        .iter()
-                        .any(|branch_id| branch_id == row.branch_id.as_ref()))
-        });
-        return Ok(rows);
-    }
-
-    let commits = graph.all_commits().await?;
-    let mut rows = Vec::new();
-    for branch_id in &branch_ids {
-        if include_commit {
-            for commit in &commits {
-                rows.push(commit_row(commit, branch_id)?);
-            }
-        }
-        if include_commit_edge {
-            for edge in graph.commit_edges(&commits) {
-                rows.push(commit_edge_row(&edge, branch_id)?);
-            }
-        }
-    }
-
-    rows.retain(|row| {
-        (request.filter.entity_pks.is_empty() || request.filter.entity_pks.contains(&row.entity_pk))
-            && (request.filter.branch_ids.is_empty()
-                || request
-                    .filter
-                    .branch_ids
-                    .iter()
-                    .any(|branch_id| branch_id == row.branch_id.as_ref()))
-    });
-    Ok(rows)
-}
-
-/// Synthesizes the public `lix_branch_ref` metadata entity from authoritative
-/// branch-head controls. The mutable live-state projection is intentionally
-/// filtered out at the caller so SQL/entity consumers keep seeing exactly one
-/// current ref per branch while lifecycle operations retain their validated
-/// changelog fact.
-async fn scan_direct_branch_ref_rows(
-    store: &(impl StorageAdapterRead + ?Sized),
-    request: &LiveStateScanRequest,
-    scope: &LiveStateScanScope,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-    if !schema_filter_allows(&request.filter.schema_keys, BRANCH_REF_SCHEMA_KEY)
-        || !file_filter_allows_null(&request.filter.file_ids)
-        || !scope
-            .storage_branch_ids
-            .iter()
-            .any(|branch_id| branch_id == GLOBAL_BRANCH_ID)
-    {
-        return Ok(Vec::new());
-    }
-
-    let requested_branch_ids = if request.filter.entity_pks.is_empty() {
-        Vec::new()
-    } else {
-        request
-            .filter
-            .entity_pks
-            .iter()
-            .filter_map(|entity_pk| entity_pk.as_single_string_owned().ok())
-            .collect::<Vec<_>>()
-    };
-    if !request.filter.entity_pks.is_empty()
-        && requested_branch_ids.len() != request.filter.entity_pks.len()
-    {
-        return Ok(Vec::new());
-    }
-    let controls = BranchHeadControlContext::new().reader(store);
-    let entries = if requested_branch_ids.is_empty() {
-        controls.scan().await?
-    } else {
-        controls
-            .load_many(&requested_branch_ids)
-            .await?
-            .into_iter()
-            .zip(requested_branch_ids)
-            .filter_map(|(control, branch_id)| control.map(|control| (branch_id, control)))
-            .collect()
-    };
-    entries
-        .into_iter()
-        .map(|(branch_id, control)| direct_branch_ref_row(&branch_id, control))
-        .collect()
-}
-
-fn direct_branch_ref_row(
-    branch_id: &str,
-    control: BranchHeadControl,
-) -> Result<MaterializedLiveStateRow, LixError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "id": branch_id,
-        "commit_id": control.head_commit_id.to_string(),
-    }))
-    .map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode direct branch-ref snapshot: {error}"),
-        )
-    })?;
-    Ok(MaterializedLiveStateRow {
-        entity_pk: EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("direct branch-ref id is not a canonical UUID: {error}"),
-            )
-        })?,
-        schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
-        file_id: None,
-        snapshot_content: Some(snapshot_content.into()),
-        metadata: None,
-        deleted: false,
-        // These read-only columns are part of every public entity surface.
-        // Preserve the same replacement semantics the old flat current row
-        // had: creation time is stable, while each ref publication gets an
-        // updated timestamp and distinct change id.
-        created_at: control.created_at,
-        updated_at: control.updated_at,
-        global: true,
-        change_id: Some(control.ref_change_id),
-        commit_id: None,
-        untracked: true,
-        branch_id: GLOBAL_BRANCH_ID.into(),
-    })
-}
-
-fn request_may_include_commit_derived(request: &LiveStateScanRequest) -> bool {
-    request.filter.schema_keys.is_empty()
-        || request
-            .filter
-            .schema_keys
-            .iter()
-            .any(|schema_key| is_commit_derived_schema(schema_key))
-}
-
-fn is_commit_derived_only_request(request: &LiveStateScanRequest) -> bool {
-    !request.filter.schema_keys.is_empty()
-        && request
-            .filter
-            .schema_keys
-            .iter()
-            .all(|schema_key| is_commit_derived_schema(schema_key))
-}
-
-fn is_commit_derived_schema(schema_key: &str) -> bool {
-    matches!(schema_key, COMMIT_SCHEMA_KEY | COMMIT_EDGE_SCHEMA_KEY)
-}
-
-fn schema_filter_allows(schema_keys: &[String], schema_key: &str) -> bool {
-    schema_keys.is_empty() || schema_keys.iter().any(|candidate| candidate == schema_key)
-}
-
-fn file_filter_allows_null(file_ids: &[NullableKeyFilter<String>]) -> bool {
-    file_ids.is_empty()
-        || file_ids
-            .iter()
-            .any(|file_id| matches!(file_id, NullableKeyFilter::Any | NullableKeyFilter::Null))
-}
-
-fn commit_row(
-    commit: &crate::commit_graph::CommitGraphCommit,
-    branch_id: &str,
-) -> Result<MaterializedLiveStateRow, LixError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "id": commit.commit_id,
-    }))
-    .map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode derived lix_commit snapshot: {error}"),
-        )
-    })?;
-    Ok(MaterializedLiveStateRow {
-        entity_pk: EntityPk::uuid_from_canonical(&commit.commit_id.to_string()).map_err(
-            |error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("derived commit id is not a canonical UUID: {error}"),
-                )
-            },
-        )?,
-        schema_key: COMMIT_SCHEMA_KEY.to_string(),
-        file_id: None,
-        snapshot_content: Some(snapshot_content.into()),
-        metadata: None,
-        deleted: false,
-        created_at: commit.change.created_at,
-        updated_at: commit.change.created_at,
-        global: true,
-        change_id: Some(commit.change.id),
-        commit_id: Some(commit.commit_id),
-        untracked: false,
-        branch_id: branch_id.into(),
-    })
-}
-
-fn commit_record_row(
-    commit: &CommitGraphCommitRecord,
-    branch_id: &str,
-) -> Result<MaterializedLiveStateRow, LixError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "id": commit.commit_id,
-    }))
-    .map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode derived lix_commit snapshot: {error}"),
-        )
-    })?;
-    Ok(MaterializedLiveStateRow {
-        entity_pk: EntityPk::uuid_from_canonical(&commit.commit_id.to_string()).map_err(
-            |error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("derived commit id is not a canonical UUID: {error}"),
-                )
-            },
-        )?,
-        schema_key: COMMIT_SCHEMA_KEY.to_string(),
-        file_id: None,
-        snapshot_content: Some(snapshot_content.into()),
-        metadata: None,
-        deleted: false,
-        created_at: commit.created_at,
-        updated_at: commit.created_at,
-        global: true,
-        change_id: Some(commit.change_id),
-        commit_id: Some(commit.commit_id),
-        untracked: false,
-        branch_id: branch_id.into(),
-    })
-}
-
-fn commit_edge_row(
-    edge: &crate::commit_graph::CommitGraphEdge,
-    branch_id: &str,
-) -> Result<MaterializedLiveStateRow, LixError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "parent_id": edge.parent_commit_id,
-        "child_id": edge.child_commit_id,
-        "parent_order": edge.parent_order,
-    }))
-    .map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode derived lix_commit_edge snapshot: {error}"),
-        )
-    })?;
-    Ok(MaterializedLiveStateRow {
-        entity_pk: EntityPk::from_components(smallvec::smallvec![
-            crate::entity_pk::EntityPkComponent::Uuid(*edge.child_commit_id.as_uuid().as_bytes()),
-            crate::entity_pk::EntityPkComponent::Integer(i64::from(edge.parent_order)),
-        ])
-        .expect("commit edge primary key has two components"),
-        schema_key: COMMIT_EDGE_SCHEMA_KEY.to_string(),
-        file_id: None,
-        snapshot_content: Some(snapshot_content.into()),
-        metadata: None,
-        deleted: false,
-        created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
-        updated_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
-        global: true,
-        change_id: None,
-        commit_id: Some(edge.child_commit_id),
-        untracked: false,
-        branch_id: branch_id.into(),
-    })
-}
-
 fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStateScanRequest {
     TrackedStateScanRequest {
         filter: TrackedStateFilter {
@@ -1525,7 +1170,7 @@ fn scope_may_have_schema_rows(request: &LiveStateScanRequest, scope: &LiveStateS
     let [schema_key] = request.filter.schema_keys.as_slice() else {
         return true;
     };
-    if schema_key == BRANCH_REF_SCHEMA_KEY || request_may_include_commit_derived(request) {
+    if is_derived_schema(schema_key) {
         return true;
     }
     scope.storage_branch_ids.iter().any(|branch_id| {
@@ -2842,10 +2487,16 @@ mod tests {
                 EntityPk::uuid_from_bytes(*missing.as_uuid().as_bytes()),
             ],
         );
-        let rows =
-            scan_commit_derived_rows(&read, &CommitGraphContext::new(), &typed_request, &scope)
-                .await
-                .expect("typed point scan should succeed");
+        let rows = scan_derived_rows(
+            &read,
+            &CommitGraphContext::new(),
+            &typed_request,
+            &scope.projection_branch_ids,
+            &scope.storage_branch_ids,
+            Some(false),
+        )
+        .await
+        .expect("typed point scan should succeed");
         assert_eq!(rows.len(), 1, "duplicates and missing keys must flatten");
         assert_eq!(rows[0].entity_pk, typed_request.filter.entity_pks[0]);
         assert_eq!(rows[0].commit_id, Some(existing));
@@ -2855,13 +2506,199 @@ mod tests {
             COMMIT_SCHEMA_KEY,
             vec![EntityPk::single(existing.to_string())],
         );
-        let rows =
-            scan_commit_derived_rows(&read, &CommitGraphContext::new(), &string_request, &scope)
-                .await
-                .expect("string-typed point scan should succeed");
+        let rows = scan_derived_rows(
+            &read,
+            &CommitGraphContext::new(),
+            &string_request,
+            &scope.projection_branch_ids,
+            &scope.storage_branch_ids,
+            Some(false),
+        )
+        .await
+        .expect("string-typed point scan should succeed");
         assert!(
             rows.is_empty(),
             "a string component must not match the UUID primary key"
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_scan_honors_proven_empty_row_filter() {
+        let storage = StorageAdapter::new(Memory::new());
+        let existing = CommitId::for_test_label("derived-empty-filter-existing");
+        let setup_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("setup read should open");
+        write_empty_commits_to_store(&storage, &setup_read, &[&existing.to_string()]).await;
+        drop(setup_read);
+
+        let scope = LiveStateScanScope {
+            storage_branch_ids: Vec::new(),
+            projection_branch_ids: vec!["test-branch".to_string()],
+            branch_heads: BranchHeads::default(),
+        };
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                rows: LiveStateRowFilter::None,
+                schema_keys: vec![COMMIT_SCHEMA_KEY.to_string()],
+                branch_ids: vec!["test-branch".to_string()],
+                ..LiveStateFilter::default()
+            },
+            ..LiveStateScanRequest::default()
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("empty-filter scan read should open");
+        let rows = scan_derived_rows(
+            &read,
+            &CommitGraphContext::new(),
+            &request,
+            &scope.projection_branch_ids,
+            &scope.storage_branch_ids,
+            Some(false),
+        )
+        .await
+        .expect("proven-empty derived scan should succeed");
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn derived_provider_point_access_preserves_branch_ref_uuid_identity() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "01920000-0000-7000-8000-0000000000d1";
+        stage_direct_tracked_head_rows(
+            &storage,
+            branch_id,
+            CommitId::for_test_label("derived-branch-ref-head"),
+            &[],
+        )
+        .await;
+        let scope = LiveStateScanScope {
+            storage_branch_ids: vec![GLOBAL_BRANCH_ID.to_string(), branch_id.to_string()],
+            projection_branch_ids: vec![branch_id.to_string()],
+            branch_heads: BranchHeads::default(),
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch-ref point read should open");
+        let typed_request = finite_pk_scan_request(
+            branch_id,
+            BRANCH_REF_SCHEMA_KEY,
+            vec![EntityPk::uuid_from_canonical(branch_id).expect("valid branch UUID")],
+        );
+        let rows = scan_derived_rows(
+            &read,
+            &CommitGraphContext::new(),
+            &typed_request,
+            &scope.projection_branch_ids,
+            &scope.storage_branch_ids,
+            Some(true),
+        )
+        .await
+        .expect("typed branch-ref point scan should succeed");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_pk, typed_request.filter.entity_pks[0]);
+
+        let string_request = finite_pk_scan_request(
+            branch_id,
+            BRANCH_REF_SCHEMA_KEY,
+            vec![EntityPk::single(branch_id)],
+        );
+        let rows = scan_derived_rows(
+            &read,
+            &CommitGraphContext::new(),
+            &string_request,
+            &scope.projection_branch_ids,
+            &scope.storage_branch_ids,
+            Some(true),
+        )
+        .await
+        .expect("string branch-ref point scan should succeed");
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mixed_derived_identities_choose_access_per_provider() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("mixed derived setup read should open");
+        let parent = CommitId::for_test_label("mixed-derived-parent");
+        let child = CommitId::for_test_label("mixed-derived-child");
+        let mut writes = storage.new_write_set();
+        crate::init::stage_repository_protocol(&mut writes);
+        let mut append = ChangelogAppend::default();
+        for (commit_id, generation, parents) in [(parent, 0, Vec::new()), (child, 1, vec![parent])]
+        {
+            append.commits.push(crate::changelog::CommitRecord {
+                format_version: 1,
+                commit_id,
+                generation,
+                parent_commit_ids: parents,
+                tracked_state_rootless: false,
+                change_id: ChangeId::for_test_label(&format!("{commit_id}:change")),
+                author_account_ids: Vec::new(),
+                created_at: ts("1970-01-01T00:00:00.000Z"),
+            });
+        }
+        let mut changelog_read = &read;
+        let mut writer = ChangelogContext::new().writer(&mut changelog_read, &mut writes);
+        crate::changelog::ChangelogWriter::stage_append(&mut writer, append)
+            .await
+            .expect("mixed derived commits should stage");
+        drop(writer);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("mixed derived commits should commit");
+        drop(read);
+
+        let branch_id = "test-branch";
+        let scope = LiveStateScanScope {
+            storage_branch_ids: Vec::new(),
+            projection_branch_ids: vec![branch_id.to_string()],
+            branch_heads: BranchHeads::default(),
+        };
+        let edge_pk = EntityPk::from_components(smallvec::smallvec![
+            crate::entity_pk::EntityPkComponent::Uuid(*child.as_uuid().as_bytes()),
+            crate::entity_pk::EntityPkComponent::Integer(0),
+        ])
+        .expect("valid edge identity");
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec!["lix_commit".to_string(), "lix_commit_edge".to_string()],
+                entity_pks: vec![
+                    EntityPk::uuid_from_bytes(*child.as_uuid().as_bytes()),
+                    edge_pk.clone(),
+                ],
+                branch_ids: vec![branch_id.to_string()],
+                ..LiveStateFilter::default()
+            },
+            ..LiveStateScanRequest::default()
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("mixed derived scan read should open");
+        let rows = scan_derived_rows(
+            &read,
+            &CommitGraphContext::new(),
+            &request,
+            &scope.projection_branch_ids,
+            &scope.storage_branch_ids,
+            Some(false),
+        )
+        .await
+        .expect("mixed derived scan should succeed");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.schema_key == "lix_commit"));
+        assert!(
+            rows.iter()
+                .any(|row| row.schema_key == "lix_commit_edge" && row.entity_pk == edge_pk)
         );
     }
 

@@ -57,6 +57,23 @@ pub(crate) struct CommitGraphEdge {
     pub(crate) parent_order: u32,
 }
 
+pub(crate) fn commit_edges(commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge> {
+    commits
+        .iter()
+        .flat_map(|commit| {
+            commit
+                .parent_commit_ids
+                .iter()
+                .enumerate()
+                .map(|(parent_order, parent_commit_id)| CommitGraphEdge {
+                    parent_commit_id: *parent_commit_id,
+                    child_commit_id: commit.commit_id,
+                    parent_order: parent_order as u32,
+                })
+        })
+        .collect()
+}
+
 /// Filter for canonical change history from a chosen traversal start commit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryRequest {
