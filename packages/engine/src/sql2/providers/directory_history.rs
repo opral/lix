@@ -40,7 +40,7 @@ use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history_util::{
     ObservedTrackedStateOrdinal, ObservedTrackedStateRows, entity_pk_json_array,
 };
-use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
+use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
@@ -119,7 +119,8 @@ where
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
-            load: row_source(
+            source: scan_row_source(
+                Arc::clone(&schema),
                 (
                     Arc::clone(&self.commit_graph),
                     self.query_source.clone(),

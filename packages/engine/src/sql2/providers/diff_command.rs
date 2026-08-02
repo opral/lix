@@ -13,7 +13,7 @@ use crate::LixError;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::{DiffCommand, SqlWriteContext, WriteAccess};
 
-use super::spec::{InsertApply, PlannedScan, TableSpec, register_spec_table, row_source};
+use super::spec::{InsertApply, PlannedScan, TableSpec, register_spec_table, scan_row_source};
 
 pub(super) async fn register_diff_command_provider(
     session: &datafusion::prelude::SessionContext,
@@ -58,7 +58,7 @@ impl TableSpec for DiffCommandSpec {
         Ok(PlannedScan {
             schema: command_schema(),
             ordering: None,
-            load: row_source(table, |table| async move {
+            source: scan_row_source(command_schema(), table, |table| async move {
                 Err(DataFusionError::Execution(format!(
                     "{table} is a command sink and cannot be read"
                 )))

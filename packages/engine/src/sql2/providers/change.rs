@@ -27,7 +27,7 @@ use crate::storage_adapter::{
 use bytes::Bytes;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
+use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
 pub(super) async fn register_lix_change_read_provider<S>(
     session: &datafusion::prelude::SessionContext,
@@ -91,7 +91,8 @@ where
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
-            load: row_source(
+            source: scan_row_source(
+                Arc::clone(&schema),
                 (self.query_source.clone(), schema),
                 move |(query_source, schema)| async move {
                     let mut json_reader = query_source.json_reader;

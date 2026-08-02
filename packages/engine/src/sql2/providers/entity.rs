@@ -50,7 +50,7 @@ use datafusion::physical_plan::ExecutionPlan;
 
 use super::spec::{
     InsertApply, PlannedDml, PlannedScan, TableSpec, projected_schema, register_spec_table,
-    row_source,
+    row_source, scan_row_source,
 };
 use super::values::{
     optional_bool_value, optional_string_value, required_string_value, string_expr_literal,
@@ -342,7 +342,8 @@ impl TableSpec for EntitySpec {
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
-            load: row_source(
+            source: scan_row_source(
+                Arc::clone(&schema),
                 (
                     Arc::clone(&self.spec),
                     Arc::clone(&self.live_state),

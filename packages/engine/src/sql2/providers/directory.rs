@@ -74,7 +74,7 @@ use super::file::{
 };
 use super::spec::{
     DmlReturning, InsertApply, PlannedDml, PlannedScan, RowSource, TableSpec, finish_scan_batch,
-    projected_schema, register_spec_table, row_source, take_record_batch_rows,
+    projected_schema, register_spec_table, row_source, scan_row_source, take_record_batch_rows,
 };
 use super::upsert::{
     StagedUpsert, UpsertConflictKind, UpsertConflictTarget, UpsertReturningRow, UpsertSupport,
@@ -594,7 +594,8 @@ impl TableSpec for LixDirectorySpec {
         Ok(PlannedScan {
             schema: Arc::clone(&output_schema),
             ordering,
-            load: row_source(
+            source: scan_row_source(
+                Arc::clone(&output_schema),
                 (
                     Arc::clone(&self.live_state),
                     Arc::clone(&self.schema),
@@ -2974,7 +2975,11 @@ mod tests {
             .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
             .await
             .expect("parent-id scan should plan");
-        let batch = (planned.load)().await.expect("parent-id scan should load");
+        let batch = planned
+            .source
+            .load_single_batch()
+            .await
+            .expect("parent-id scan should load");
 
         let paths = batch
             .column(0)
@@ -3042,7 +3047,9 @@ mod tests {
             .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
             .await
             .expect("root-directory scan should plan");
-        let batch = (planned.load)()
+        let batch = planned
+            .source
+            .load_single_batch()
             .await
             .expect("root-directory scan should load");
 

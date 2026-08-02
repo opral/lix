@@ -39,7 +39,7 @@ use crate::transaction::types::{
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{
     DmlReturning, InsertApply, PlannedDml, PlannedScan, TableSpec, projected_schema,
-    register_spec_table, row_source, take_record_batch_rows,
+    register_spec_table, row_source, scan_row_source, take_record_batch_rows,
 };
 use super::upsert::{StagedUpsert, UpsertReturningRow, UpsertSupport, materialize_omitted_column};
 use super::values::{required_bool_value, required_string_value};
@@ -119,7 +119,8 @@ impl TableSpec for BranchSpec {
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
-            load: row_source(
+            source: scan_row_source(
+                Arc::clone(&schema),
                 (
                     Arc::clone(&self.live_state),
                     Arc::clone(&self.branch_ref),

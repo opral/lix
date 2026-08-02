@@ -24,7 +24,7 @@ use crate::{LixError, NullableKeyFilter};
 use super::checkpoint::filter_conjuncts;
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
-use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, row_source};
+use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 
 pub(crate) fn register_diff_function<S>(
     session: &datafusion::prelude::SessionContext,
@@ -139,7 +139,8 @@ where
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
-            load: row_source(
+            source: scan_row_source(
+                Arc::clone(&schema),
                 (
                     self.store.clone(),
                     schema,
