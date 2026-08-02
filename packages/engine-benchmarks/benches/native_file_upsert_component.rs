@@ -259,7 +259,7 @@ impl Seed {
     }
 }
 
-struct ComponentFixture<S: Storage> {
+struct ComponentFixture<S: Storage + 'static> {
     // Keep storage before the TempDir in declaration order: SessionContext and
     // storage drop before the clone directory is removed.
     session: SessionContext<S>,

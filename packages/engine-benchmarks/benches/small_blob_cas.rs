@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use lix_engine::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, Precondition, ProjectedValue, PutBatch,
-    PutEntry, ReadDurability, ReadOptions, SpaceId, Storage, StorageWrite, StoredValue,
-    WriteOptions,
+    PutEntry, ReadDurability, ReadOptions, SpaceId, Storage, StorageSpace, StorageWrite,
+    StoredValue, WriteOptions,
 };
 use lix_engine::storage_adapter::{StorageAdapter, StorageAdapterRead};
 use lix_engine::storage_bench::{
@@ -30,11 +30,14 @@ const OPERATIONS: &[Operation] = &[
 ];
 const DEFAULT_WARMUPS: usize = 20;
 const DEFAULT_SAMPLES: usize = 200;
-const DIRECT_SINGLETON_SPACE: SpaceId = SpaceId(0x00ff_0002);
-const DIRECT_BATCH_SPACE: SpaceId = SpaceId(0x00ff_0004);
+const DIRECT_SINGLETON_SPACE: StorageSpace =
+    StorageSpace::mutable(SpaceId(0x00ff_0002), "bench.direct_singleton");
+const DIRECT_BATCH_SPACE: StorageSpace =
+    StorageSpace::mutable(SpaceId(0x00ff_0004), "bench.direct_batch");
 const DIRECT_BATCH_KEYS: usize = 1024;
 const DIRECT_BATCH_KEY_SUFFIX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
-const DIRECT_PRECONDITION_SPACE: SpaceId = SpaceId(0x00ff_0005);
+const DIRECT_PRECONDITION_SPACE: StorageSpace =
+    StorageSpace::mutable(SpaceId(0x00ff_0005), "bench.direct_precondition");
 const DIRECT_PRECONDITION_VALUE: &[u8] = b"precondition-value";
 const DIRECT_IDEMPOTENCY_RECEIPT_KEY: &[u8] = b"idempotency-receipt";
 

@@ -3,8 +3,8 @@ use std::ops::Bound;
 
 /// Single space used by most baseline fixtures; the cross-space tests at
 /// the bottom of this file pin space isolation.
-const TEST_SPACE: SpaceId = SpaceId(7);
-const OTHER_SPACE: SpaceId = SpaceId(8);
+const TEST_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(7), "storage.conformance.test");
+const OTHER_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(8), "storage.conformance.other");
 
 use bytes::Bytes;
 
@@ -16,7 +16,7 @@ use crate::storage::conformance::{
 use crate::storage::{
     CoreProjection, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Precondition, ProjectedValue,
     ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
-    StorageWrite, WriteOptions,
+    StorageSpace, StorageWrite, WriteOptions,
 };
 
 pub(crate) async fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -125,6 +125,53 @@ where
         "baseline::full_value_preserves_opaque_bytes",
         full_value_preserves_opaque_bytes
     );
+    run!(
+        "baseline::immutable_identity_is_idempotent_and_write_once",
+        immutable_identity_is_idempotent_and_write_once
+    );
+}
+
+async fn immutable_identity_is_idempotent_and_write_once<F>(factory: &F) -> ConformanceResult
+where
+    F: StorageFactory,
+{
+    let storage = open_storage(factory).await;
+    let immutable = StorageSpace::immutable(SpaceId(9), "storage.conformance.immutable");
+    let target = key("content-id");
+    for value in [
+        Bytes::from_static(b"payload"),
+        Bytes::from_static(b"payload"),
+    ] {
+        let mut write = storage
+            .begin_write(WriteOptions::default())
+            .await
+            .map_err(|error| error.to_string())?;
+        write
+            .put_many(immutable, put_batch([full_put(target.clone(), value)]))
+            .await
+            .map_err(|error| error.to_string())?;
+        write.commit().await.map_err(|error| error.to_string())?;
+    }
+
+    let mut conflicting = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .map_err(|error| error.to_string())?;
+    let staged = conflicting
+        .put_many(
+            immutable,
+            put_batch([full_put(target.clone(), Bytes::from_static(b"different"))]),
+        )
+        .await;
+    let rejected = match staged {
+        Err(StorageError::Corruption(_)) => true,
+        Err(error) => return Err(error.to_string()),
+        Ok(()) => matches!(conflicting.commit().await, Err(StorageError::Corruption(_))),
+    };
+    if !rejected {
+        return Err("immutable identity accepted different bytes".to_string());
+    }
+    Ok(())
 }
 
 async fn write_precondition_rejects_stale_value<F>(factory: &F) -> ConformanceResult
@@ -1297,7 +1344,7 @@ where
         .begin_write(WriteOptions::default())
         .await
         .map_err(|error| format!("begin write failed: {error}"))?;
-    for space in [TEST_SPACE, OTHER_SPACE, SpaceId(9)] {
+    for space in [TEST_SPACE, OTHER_SPACE, space(9)] {
         write
             .put_many(
                 space,
@@ -1369,7 +1416,7 @@ where
         .begin_write(WriteOptions::default())
         .await
         .map_err(|error| format!("begin write failed: {error}"))?;
-    for space in [TEST_SPACE, OTHER_SPACE, SpaceId(9)] {
+    for space in [TEST_SPACE, OTHER_SPACE, space(9)] {
         write
             .put_many(
                 space,
@@ -1403,7 +1450,7 @@ where
         .begin_read(ReadOptions::default())
         .await
         .map_err(|error| format!("begin read failed: {error}"))?;
-    for (space, expected) in [(TEST_SPACE, 2usize), (OTHER_SPACE, 0), (SpaceId(9), 2)] {
+    for (space, expected) in [(TEST_SPACE, 2usize), (OTHER_SPACE, 0), (space(9), 2)] {
         let rows = read
             .scan(space, full_key_range(), ScanOptions::default())
             .await
@@ -1443,7 +1490,7 @@ where
     F: StorageFactory,
 {
     let storage = open_storage(factory).await;
-    let empty = SpaceId(0x7777_7777);
+    let empty = space(0x7777_7777);
     let read = storage
         .begin_read(ReadOptions::default())
         .await
@@ -1487,7 +1534,7 @@ fn full_key_range() -> KeyRange {
 
 async fn seed_full_values<StorageImpl, I>(
     storage: &StorageImpl,
-    _test_space: SpaceId,
+    _test_space: StorageSpace,
     rows: I,
 ) -> ConformanceResult
 where
@@ -1517,7 +1564,7 @@ where
 
 async fn seed_full_byte_values<StorageImpl, I>(
     storage: &StorageImpl,
-    _test_space: SpaceId,
+    _test_space: StorageSpace,
     rows: I,
 ) -> ConformanceResult
 where
@@ -1547,7 +1594,7 @@ where
 
 async fn scan_range<R>(
     read: &R,
-    _test_space: SpaceId,
+    _test_space: StorageSpace,
     range: KeyRange,
     opts: ScanOptions,
 ) -> Result<ScanChunk, StorageError>
@@ -1559,7 +1606,7 @@ where
 
 async fn assert_get_entries<StorageImpl>(
     storage: &StorageImpl,
-    _test_space: SpaceId,
+    _test_space: StorageSpace,
     expected: &[(&str, Option<&str>)],
 ) -> ConformanceResult
 where

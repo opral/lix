@@ -9,7 +9,7 @@ use crate::storage_adapter::{
 use crate::{Blob, LixError};
 
 pub(crate) const PLUGIN_CHECKPOINT_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_0026), "plugin.current_checkpoint.v1");
+    StorageSpace::mutable(StorageSpaceId(0x0004_0026), "plugin.current_checkpoint.v1");
 
 const MAGIC: &[u8; 4] = b"LPC2";
 const HEADER_BYTES: usize = 4 + 32 + 32 + 16 + 4 + 4;

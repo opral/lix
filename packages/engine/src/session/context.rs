@@ -132,7 +132,7 @@ pub(crate) enum SessionMode {
 /// transaction handle.
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct SessionContext<StorageImpl: Storage = Memory> {
+pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) mode: SessionMode,
     pub(super) storage: StorageAdapter<StorageImpl>,
     pub(super) live_state: Arc<LiveStateContext>,
@@ -143,7 +143,7 @@ pub struct SessionContext<StorageImpl: Storage = Memory> {
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     pub(super) deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     pub(super) collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
-    pub(super) commit_coordinator: Arc<CommitCoordinator>,
+    pub(super) commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) file_views: SessionFileViews,
     pub(super) observe_coordinator: Arc<ObserveCoordinator>,
     pub(super) observe_invalidation: Arc<ObserveInvalidation>,
@@ -166,7 +166,7 @@ where
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
-        commit_coordinator: Arc<CommitCoordinator>,
+        commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
@@ -210,7 +210,7 @@ where
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
-        commit_coordinator: Arc<CommitCoordinator>,
+        commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
@@ -248,7 +248,7 @@ where
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
-        commit_coordinator: Arc<CommitCoordinator>,
+        commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,
@@ -286,7 +286,7 @@ where
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
-        commit_coordinator: Arc<CommitCoordinator>,
+        commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
         plugin_host: PluginRuntimeHost,

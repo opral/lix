@@ -4531,11 +4531,11 @@ mod tests {
     // observes the durable space rather than reaching through that module.
     const TRACKED_STATE_TREE_CHUNK_SPACE_ID: SpaceId = SpaceId(0x0004_0001);
     const TRACKED_STATE_COMMIT_ROOT_SPACE_ID: SpaceId = SpaceId(0x0004_0004);
-    const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::new(
+    const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
         TRACKED_STATE_TREE_CHUNK_SPACE_ID,
         "tracked_state.tree_chunk",
     );
-    const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::new(
+    const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::mutable(
         TRACKED_STATE_COMMIT_ROOT_SPACE_ID,
         "tracked_state.commit_root",
     );
@@ -4697,27 +4697,27 @@ mod tests {
         ) -> Result<GetManyResult, StorageError> {
             for request in requests {
                 let space = request.space;
-                if space == crate::branch::BRANCH_HEAD_CONTROL_SPACE.id {
+                if space == crate::branch::BRANCH_HEAD_CONTROL_SPACE {
                     self.counts
                         .branch_control_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if space == V10_TRACKED_HEAD_MARKER_SPACE_ID {
+                if space.id == V10_TRACKED_HEAD_MARKER_SPACE_ID {
                     self.counts
                         .v10_marker_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if space == HOT_ROW_SPACE.id || space == crate::live_state::HOT_FILE_SPACE.id {
+                if space == HOT_ROW_SPACE || space == crate::live_state::HOT_FILE_SPACE {
                     self.counts
                         .row_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if space == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
+                if space.id == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
                     self.counts
                         .tree_chunk_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if space == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
+                if space.id == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
                     self.counts
                         .commit_root_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
@@ -4728,19 +4728,19 @@ mod tests {
 
         async fn scan(
             &self,
-            space: SpaceId,
+            space: StorageSpace,
             range: KeyRange,
             opts: ScanOptions,
         ) -> Result<ScanChunk, StorageError> {
-            if space == HOT_ROW_SPACE.id || space == crate::live_state::HOT_FILE_SPACE.id {
+            if space == HOT_ROW_SPACE || space == crate::live_state::HOT_FILE_SPACE {
                 self.counts.row_scan_calls.fetch_add(1, Ordering::Relaxed);
             }
-            if space == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
+            if space.id == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
                 self.counts
                     .tree_chunk_scan_calls
                     .fetch_add(1, Ordering::Relaxed);
             }
-            if space == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
+            if space.id == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
                 self.counts
                     .commit_root_scan_calls
                     .fetch_add(1, Ordering::Relaxed);
@@ -5300,7 +5300,7 @@ mod tests {
             matches!(
                 precondition,
                 StoragePrecondition::KeyValueEquals { space, .. }
-                    if *space == crate::branch::BRANCH_HEAD_CONTROL_SPACE.id
+                    if *space == crate::branch::BRANCH_HEAD_CONTROL_SPACE
             )
         }));
 
@@ -5405,7 +5405,7 @@ mod tests {
             matches!(
                 precondition,
                 StoragePrecondition::KeyAbsent { space, .. }
-                    if *space == crate::branch::BRANCH_HEAD_CONTROL_SPACE.id
+                    if *space == crate::branch::BRANCH_HEAD_CONTROL_SPACE
             )
         }));
 
@@ -7545,7 +7545,7 @@ mod tests {
     impl StorageWrite for CountingWrite {
         async fn put_many(
             &mut self,
-            space: SpaceId,
+            space: StorageSpace,
             entries: PutBatch,
         ) -> Result<(), StorageError> {
             self.inner.put_many(space, entries).await
@@ -7553,7 +7553,7 @@ mod tests {
 
         async fn delete_many(
             &mut self,
-            space: SpaceId,
+            space: StorageSpace,
             keys: &[StorageKey],
         ) -> Result<(), StorageError> {
             self.inner.delete_many(space, keys).await
@@ -7561,7 +7561,7 @@ mod tests {
 
         async fn delete_range(
             &mut self,
-            space: SpaceId,
+            space: StorageSpace,
             range: KeyRange,
         ) -> Result<(), StorageError> {
             self.inner.delete_range(space, range).await

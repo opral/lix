@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use lix_engine::{Engine, Memory};
+use lix_engine::{Engine, ExecuteBatchStatement, Memory};
 
 fn seeded_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Vec<u8> {
     runtime.block_on(async move {
@@ -126,6 +126,53 @@ fn seeded_wide_parent_storage(runtime: &tokio::runtime::Runtime, parent_width: u
     })
 }
 
+fn seeded_wide_transition_storage(
+    runtime: &tokio::runtime::Runtime,
+    transition_width: usize,
+) -> Vec<u8> {
+    runtime.block_on(async move {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("benchmark storage initializes");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("benchmark engine opens");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("benchmark session opens");
+        let before = "b".repeat(256);
+        let values = (0..transition_width)
+            .map(|index| format!("('transition-{index}', '{before}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
+                &[],
+            )
+            .await
+            .expect("transition rows start");
+        let after = "a".repeat(256);
+        let updates = (0..transition_width)
+            .map(|index| ExecuteBatchStatement {
+                sql: format!(
+                    "UPDATE lix_key_value SET value = '{after}' WHERE key = 'transition-{index}'"
+                ),
+                params: vec![],
+            })
+            .collect::<Vec<_>>();
+        session
+            .execute_batch(&updates)
+            .await
+            .expect("wide transition commit succeeds");
+        storage
+            .export_snapshot()
+            .expect("benchmark storage snapshot exports")
+    })
+}
+
 fn open_session(
     runtime: &tokio::runtime::Runtime,
     storage: Memory,
@@ -223,6 +270,34 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                         runtime
                             .block_on(session.redo())
                             .expect("benchmarked redo succeeds");
+                        elapsed += started.elapsed();
+                    }
+                    elapsed
+                });
+            },
+        );
+    }
+    group.finish();
+
+    let mut group = criterion.benchmark_group("undo_transition_width");
+    for transition_width in [1_usize, 100, 1_000] {
+        let snapshot = seeded_wide_transition_storage(&runtime, transition_width);
+        group.bench_with_input(
+            BenchmarkId::new("undo", transition_width),
+            &transition_width,
+            |benchmark, _| {
+                benchmark.iter_custom(|iterations| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let session = open_session(
+                            &runtime,
+                            Memory::from_snapshot(&snapshot)
+                                .expect("wide-transition benchmark snapshot restores"),
+                        );
+                        let started = Instant::now();
+                        runtime
+                            .block_on(session.undo())
+                            .expect("benchmarked wide-transition undo succeeds");
                         elapsed += started.elapsed();
                     }
                     elapsed

@@ -71,7 +71,7 @@ impl ExecuteIdempotency {
 /// This is not a user table. A receipt is staged into the same storage write
 /// set as the mutation and guarded by `KeyAbsent`, so a published receipt and
 /// its mutation have one atomic storage outcome.
-pub(crate) const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const EXECUTE_IDEMPOTENCY_RECEIPT_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0007_0005),
     "session.execute_idempotency_receipt.v1",
 );
@@ -210,7 +210,7 @@ pub(crate) async fn load_receipt(
     let key = receipt_key(idempotency)?;
     let values = store
         .get_many(&[StorageGetManyRequest {
-            space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE.id,
+            space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
             keys: &[key],
             opts: StorageGetOptions {
                 projection: StorageCoreProjection::FullValue,

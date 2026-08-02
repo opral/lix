@@ -20,7 +20,7 @@ use std::collections::HashSet;
 /// with the complete live-payload set before it deletes the JSON value.
 pub(crate) const UNTRACKED_JSON_RECLAIM_CANDIDATE_NAMESPACE: &str =
     "json_store.untracked_reclaim_candidate.v1";
-pub(crate) const UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0002_0002),
     UNTRACKED_JSON_RECLAIM_CANDIDATE_NAMESPACE,
 );

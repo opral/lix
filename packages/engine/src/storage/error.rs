@@ -2,7 +2,7 @@ use std::fmt;
 
 use bytes::Bytes;
 
-use crate::storage::{Key, KeyRange, SpaceId, Support};
+use crate::storage::{Key, KeyRange, StorageSpace, Support};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
@@ -40,25 +40,25 @@ pub enum Capability {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Precondition {
     KeyAbsent {
-        space: SpaceId,
+        space: StorageSpace,
         key: Key,
     },
     KeyPresent {
-        space: SpaceId,
+        space: StorageSpace,
         key: Key,
     },
     KeyValueHashEquals {
-        space: SpaceId,
+        space: StorageSpace,
         key: Key,
         hash: [u8; 32],
     },
     KeyValueEquals {
-        space: SpaceId,
+        space: StorageSpace,
         key: Key,
         expected: Bytes,
     },
     RangeEmpty {
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
     },
     BranchEquals {

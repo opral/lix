@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use lix_engine::{
     Engine, ExecuteBatchStatement, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead,
-    MemoryWrite, ReadOptions, ScanChunk, ScanOptions, SessionContext, SpaceId, Storage,
-    StorageError, StorageRead, Value, WriteOptions,
+    MemoryWrite, ReadOptions, ScanChunk, ScanOptions, SessionContext, Storage, StorageError,
+    StorageRead, Value, WriteOptions,
 };
 
 const FILE_COUNT_ENV: &str = "LIX_EXECUTE_BATCH_BENCH_FILES";
@@ -100,7 +100,7 @@ impl StorageRead for CountingRead {
 
     async fn scan(
         &self,
-        space: SpaceId,
+        space: lix_engine::storage::StorageSpace,
         range: KeyRange,
         options: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {

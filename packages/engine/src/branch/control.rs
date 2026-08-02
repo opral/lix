@@ -21,7 +21,7 @@ use crate::storage_codec;
 
 pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v8";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_0020), BRANCH_HEAD_CONTROL_NAMESPACE);
+    StorageSpace::mutable(StorageSpaceId(0x0004_0020), BRANCH_HEAD_CONTROL_NAMESPACE);
 
 const SCHEMA_PRESENCE_BLOOM_WORDS: usize = 4;
 
@@ -290,11 +290,11 @@ pub(crate) fn branch_head_control_precondition(
     let key = StorageKey(Bytes::from(encode_key(branch_id)?));
     Ok(match expected {
         None => StoragePrecondition::KeyAbsent {
-            space: BRANCH_HEAD_CONTROL_SPACE.id,
+            space: BRANCH_HEAD_CONTROL_SPACE,
             key,
         },
         Some(expected) => StoragePrecondition::KeyValueEquals {
-            space: BRANCH_HEAD_CONTROL_SPACE.id,
+            space: BRANCH_HEAD_CONTROL_SPACE,
             key,
             expected,
         },

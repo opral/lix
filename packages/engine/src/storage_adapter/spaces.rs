@@ -2,24 +2,14 @@ use std::ops::Bound;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::storage::{Key, KeyRange, SpaceId, StorageError};
+use crate::storage::{Key, KeyRange, SpaceId, StorageError, StorageSpace};
 
 pub(crate) const MUTATION_REVISION_SPACE: StorageSpace =
-    StorageSpace::new(SpaceId(0x0007_0001), "observe.mutation_revision");
+    StorageSpace::mutable(SpaceId(0x0007_0001), "observe.mutation_revision");
 pub(crate) const TRACKED_MUTATION_REVISION_SPACE: StorageSpace =
-    StorageSpace::new(SpaceId(0x0007_0004), "transaction.tracked_revision");
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct StorageSpace {
-    pub id: SpaceId,
-    pub name: &'static str,
-}
+    StorageSpace::mutable(SpaceId(0x0007_0004), "transaction.tracked_revision");
 
 impl StorageSpace {
-    pub const fn new(id: SpaceId, name: &'static str) -> Self {
-        Self { id, name }
-    }
-
     pub const fn physical_prefix(&self) -> [u8; 4] {
         self.id.0.to_be_bytes()
     }
@@ -30,12 +20,6 @@ impl StorageSpace {
 
     pub fn encode_range(&self, range: KeyRange, resume_after: Option<&Key>) -> KeyRange {
         encode_physical_range(self.id, range, resume_after)
-    }
-}
-
-impl std::fmt::Display for StorageSpace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}({:?})", self.name, self.id)
     }
 }
 
@@ -137,16 +121,16 @@ mod tests {
 
     #[test]
     fn storage_space_preserves_id_and_name() {
-        let space = StorageSpace::new(SpaceId(7), "test.space");
+        let space = StorageSpace::mutable(SpaceId(7), "test.space");
 
         assert_eq!(space.id, SpaceId(7));
         assert_eq!(space.name, "test.space");
-        assert_eq!(space.to_string(), "test.space(SpaceId(7))");
+        assert_eq!(space.to_string(), "test.space(SpaceId(7), Mutable)");
     }
 
     #[test]
     fn physical_keys_are_prefixed_by_space_id() {
-        let space = StorageSpace::new(SpaceId(7), "test.space");
+        let space = StorageSpace::mutable(SpaceId(7), "test.space");
         let physical = space.encode_key(&Key(bytes::Bytes::from_static(b"abc")));
 
         assert_eq!(physical.0.as_ref(), b"\0\0\0\x07abc");

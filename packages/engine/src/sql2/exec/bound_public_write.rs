@@ -400,13 +400,12 @@ async fn collection_is_certifiably_empty(
         .is_some_and(|generation| generation.live_count == 0))
 }
 
-/// Executes a certified run of independent point updates as one physical
+/// Executes a certified ordered run of point updates as one physical
 /// scan/stage operation.
 ///
-/// `executeBatch` remains sequential at its public boundary. This route is
-/// narrower: every logical statement must target a distinct primary key in
-/// the same unconstrained entity surface, so evaluating them together is
-/// observationally equivalent to evaluating them one at a time.
+/// `executeBatch` remains ordered at its public boundary. This route folds
+/// repeated identities in statement order and lowers the resulting unique,
+/// identity-sorted replacements in one physical scan/stage operation.
 pub(crate) async fn try_execute_entity_update_value_batch<'a>(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
@@ -701,9 +700,10 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
 /// Lowers the dominant JSON-pointer replacement shape directly from borrowed
 /// public parameters into one canonical row-content arena.
 ///
-/// This deliberately accepts only strictly ordered, unique, ordinary tracked
-/// identities. Anything else retains the generic sequential path and its full
-/// plugin/constraint semantics.
+/// Statement order is preserved even when identities repeat or arrive out of
+/// order: each live identity reports every matching statement as affected and
+/// the last statement supplies the staged replacement. The canonical write
+/// batch itself remains identity-sorted and contains one row per identity.
 async fn try_execute_direct_path_value_replacement_batch(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
@@ -772,6 +772,7 @@ async fn try_execute_direct_path_value_replacement_batch(
     let mut primary_key_arena = Vec::new();
     let mut primary_key_offsets = Vec::with_capacity(row_count);
     let mut previous_row = None;
+    let mut primary_keys_strictly_ordered = true;
     for statement_index in 0..row_count {
         let DirectParameterValue::String(primary_key) =
             parameter_batch.value(primary_key_param_index, statement_index)
@@ -784,9 +785,7 @@ async fn try_execute_direct_path_value_replacement_batch(
             else {
                 unreachable!("the previous primary-key parameter was certified as text")
             };
-            if previous >= primary_key {
-                return Ok(None);
-            }
+            primary_keys_strictly_ordered &= previous < primary_key;
         }
         previous_row = Some(statement_index);
         let start = primary_key_arena.len();
@@ -806,6 +805,34 @@ async fn try_execute_direct_path_value_replacement_batch(
         })
         .collect::<Vec<_>>();
 
+    // Keep the already-sorted case allocation-free. Otherwise sort statement
+    // ordinals by identity and then ordinal so equal-identity groups retain
+    // SQL's sequential last-write-wins semantics.
+    let sorted_statement_ordinals = if primary_keys_strictly_ordered {
+        None
+    } else {
+        let mut ordinals = (0..row_count).collect::<Vec<_>>();
+        ordinals.sort_unstable_by(|left, right| {
+            entity_pks[*left]
+                .cmp(&entity_pks[*right])
+                .then_with(|| left.cmp(right))
+        });
+        Some(ordinals)
+    };
+    let unique_entity_pks = if let Some(ordinals) = &sorted_statement_ordinals {
+        let mut unique = Vec::with_capacity(row_count);
+        for &statement_index in ordinals {
+            let entity_pk = &entity_pks[statement_index];
+            if unique.last() != Some(entity_pk) {
+                unique.push(entity_pk.clone());
+            }
+        }
+        unique
+    } else {
+        entity_pks.clone()
+    };
+    let unique_row_count = unique_entity_pks.len();
+
     let active_branch_id = ctx.active_branch_id().to_owned();
     let scope = crate::collection_generation::CollectionScopeRef {
         schema_key: &spec.schema_key,
@@ -820,11 +847,11 @@ async fn try_execute_direct_path_value_replacement_batch(
         .await?;
     let certified_generation_identity = !has_staged_collection_rows
         && collection_generation.is_some_and(|generation| {
-            generation.live_count == row_count as u64
+            generation.live_count == unique_row_count as u64
                 && generation.ordered_identity_digest.is_some()
                 && generation.ordered_identity_digest
                     == crate::collection_generation::ordered_single_string_identity_digest(
-                        entity_pks.iter(),
+                        unique_entity_pks.iter(),
                     )
         });
     #[cfg(test)]
@@ -836,13 +863,15 @@ async fn try_execute_direct_path_value_replacement_batch(
     let candidates = if certified_generation_identity {
         MaterializedLiveStateBatch::default()
     } else {
-        let candidates = scan_entity_candidates_for_pks(ctx, plan, &spec, entity_pks.clone(), true)
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.entity_update_value_batch.candidate_scan",
-                row_count
-            ))
-            .await?;
+        let candidates =
+            scan_entity_candidates_for_pks(ctx, plan, &spec, unique_entity_pks.clone(), true)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.entity_update_value_batch.candidate_scan",
+                    row_count,
+                    unique_row_count
+                ))
+                .await?;
         if candidates.iter().any(|candidate| {
             candidate.untracked()
                 || candidate.global()
@@ -853,12 +882,59 @@ async fn try_execute_direct_path_value_replacement_batch(
         }
         candidates
     };
+    // Sorting identities changes expression evaluation order. Once this route
+    // is fully certified, validate JSON arguments for live rows in original
+    // statement order so a later replacement cannot hide an earlier error.
+    // Missing-row UPDATEs do not evaluate SET expressions, so first derive
+    // liveness from the certified generation or the exact candidate scan.
+    if !primary_keys_strictly_ordered {
+        let live_unique_identities = if certified_generation_identity {
+            None
+        } else {
+            let mut live = vec![false; unique_row_count];
+            let mut candidate_index = 0;
+            for (identity_index, entity_pk) in unique_entity_pks.iter().enumerate() {
+                while candidate_index < candidates.len()
+                    && candidates.row(candidate_index).entity_pk() < entity_pk
+                {
+                    candidate_index += 1;
+                }
+                live[identity_index] = candidate_index < candidates.len()
+                    && candidates.row(candidate_index).entity_pk() == entity_pk;
+            }
+            Some(live)
+        };
+        let mut scratch = Vec::new();
+        for (statement_index, entity_pk) in entity_pks.iter().enumerate() {
+            let identity_index = unique_entity_pks
+                .binary_search(entity_pk)
+                .expect("every statement identity belongs to the unique identity set");
+            if live_unique_identities
+                .as_ref()
+                .is_some_and(|live| !live[identity_index])
+            {
+                continue;
+            }
+            match parameter_batch.value(replacement.value_param_index, statement_index) {
+                DirectParameterValue::Null => {}
+                DirectParameterValue::String(raw) => {
+                    scratch.clear();
+                    append_canonical_json_parameter(&mut scratch, raw).map_err(|error| {
+                        with_parameter_batch_statement_index(error, statement_index)
+                    })?;
+                }
+                DirectParameterValue::Boolean(_) => {
+                    unreachable!("the certified replacement value parameter is text")
+                }
+            }
+        }
+    }
     let complete_collection_replacement = certified_generation_identity
-        || (candidates.len() == row_count
+        || (candidates.len() == unique_row_count
             && collection_generation
-                .is_some_and(|generation| generation.live_count == row_count as u64));
+                .is_some_and(|generation| generation.live_count == unique_row_count as u64));
 
-    let estimated_row_bytes = entity_pks
+    let estimated_row_bytes = unique_entity_pks
         .iter()
         .map(|entity_pk| {
             entity_pk
@@ -868,7 +944,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         .sum::<usize>();
     let mut normalized = Vec::with_capacity(estimated_row_bytes);
     let replacement_capacity = if certified_generation_identity {
-        row_count
+        unique_row_count
     } else {
         candidates.len()
     };
@@ -876,7 +952,20 @@ async fn try_execute_direct_path_value_replacement_batch(
     let mut replacement_entity_pks = Vec::with_capacity(replacement_capacity);
     let mut affected_by_statement = vec![0_u64; row_count];
     let mut candidate_index = 0;
-    for (statement_index, entity_pk) in entity_pks.iter().enumerate() {
+    let mut ordinal_index = 0;
+    for (identity_index, entity_pk) in unique_entity_pks.iter().enumerate() {
+        let (first_statement_index, last_statement_index) =
+            if let Some(ordinals) = &sorted_statement_ordinals {
+                let first = ordinal_index;
+                while ordinal_index < ordinals.len()
+                    && entity_pks[ordinals[ordinal_index]] == *entity_pk
+                {
+                    ordinal_index += 1;
+                }
+                (first, ordinal_index - 1)
+            } else {
+                (identity_index, identity_index)
+            };
         if !certified_generation_identity {
             while candidate_index < candidates.len()
                 && candidates.row(candidate_index).entity_pk() < entity_pk
@@ -889,6 +978,12 @@ async fn try_execute_direct_path_value_replacement_batch(
                 continue;
             }
         }
+
+        let statement_index = sorted_statement_ordinals
+            .as_ref()
+            .map_or(last_statement_index, |ordinals| {
+                ordinals[last_statement_index]
+            });
 
         let start = normalized.len();
         normalized.extend_from_slice(b"{\"path\":");
@@ -909,7 +1004,13 @@ async fn try_execute_direct_path_value_replacement_batch(
         normalized.push(b'}');
         snapshot_offsets.push((start, normalized.len()));
         replacement_entity_pks.push(entity_pk.clone());
-        affected_by_statement[statement_index] = 1;
+        if let Some(ordinals) = &sorted_statement_ordinals {
+            for &affected_statement in &ordinals[first_statement_index..=last_statement_index] {
+                affected_by_statement[affected_statement] = 1;
+            }
+        } else {
+            affected_by_statement[statement_index] = 1;
+        }
         if !certified_generation_identity {
             candidate_index += 1;
         }

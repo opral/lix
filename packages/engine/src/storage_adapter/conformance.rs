@@ -329,7 +329,7 @@ async fn write_set_rejects_conflicting_space_declarations() -> StorageConformanc
     let mut writes = storage.new_write_set();
     writes.put(space_one(), key("a"), value("A"));
     writes.put(
-        StorageSpace::new(SpaceId(1), "storage.conformance.renamed"),
+        StorageSpace::mutable(SpaceId(1), "storage.conformance.renamed"),
         key("b"),
         value("B"),
     );
@@ -338,11 +338,12 @@ async fn write_set_rejects_conflicting_space_declarations() -> StorageConformanc
         .commit_write_set(writes, WriteOptions::default())
         .await
     {
-        Err(StorageWriteSetError::ConflictingSpaceDeclaration {
-            id: SpaceId(1),
-            existing_name: "storage.conformance.one",
-            incoming_name: "storage.conformance.renamed",
-        }) => Ok(()),
+        Err(StorageWriteSetError::ConflictingSpaceDeclaration { existing, incoming })
+            if existing == space_one()
+                && incoming == StorageSpace::mutable(SpaceId(1), "storage.conformance.renamed") =>
+        {
+            Ok(())
+        }
         other => Err(format!(
             "expected conflicting space declaration, got {other:?}"
         )),
@@ -350,11 +351,11 @@ async fn write_set_rejects_conflicting_space_declarations() -> StorageConformanc
 }
 
 fn space_one() -> StorageSpace {
-    StorageSpace::new(SpaceId(1), "storage.conformance.one")
+    StorageSpace::mutable(SpaceId(1), "storage.conformance.one")
 }
 
 fn space_two() -> StorageSpace {
-    StorageSpace::new(SpaceId(2), "storage.conformance.two")
+    StorageSpace::mutable(SpaceId(2), "storage.conformance.two")
 }
 
 fn key(bytes: &'static str) -> Key {

@@ -33,8 +33,9 @@ the benchmark.
 
 The per-commit service timer starts when each commit future is first polled and
 stops when that client's durable commit returns. A separate commit-batch timer
-starts before any commit future is scheduled and stops after all 1,540 commits
-return. The service p95 is the real-time request-processing gate; the batch
+starts before any commit future is scheduled and stops after all 100 commits
+return. The default capacity run uses 100 concurrent clients. The service p95
+is the real-time request-processing gate; the batch
 timer exposes scheduler queueing and total convergence throughput.
 
 ## Same-machine results
@@ -44,39 +45,38 @@ milliseconds. Lix values are optimized release builds on the same machine.
 Lower is better within a column, but the Lix B3.1 cell reports both durable
 per-commit service p95 and the total commit batch window.
 
-| System | B2.1: two length-6000 Markdown prefix inserts | B3.1: 1,540 concurrent JSON map sets |
+| System | B2.1: two length-6000 Markdown prefix inserts | B3.1: concurrent JSON map sets |
 | --- | ---: | ---: |
 | Ywasm 0.27.3 | 1 ms | 45 ms total |
 | Yjs 13.6.31 | 2 ms | 64 ms total |
 | Diamond Types 1.0.2 | 3 ms | unsupported |
 | Loro 1.13.8 | 6 ms | 40 ms total |
 | Automerge 3.4.0 | 47 ms | 1,412 ms total |
-| Lix transactions + plugin resolver | **38.039 ms p50 / 39.436 ms p95** | **23.546 ms service p95; 17,668.298 ms commit batch** |
+| Lix transactions + plugin resolver | **38.039 ms p50 / 39.436 ms p95** | **10.934 ms service p95; 7.603-11.270 ms commit batch (100 clients)** |
 
-The B3.1 Lix row contains 1,540 per-client service observations from one full
-cardinality run. It passes the 100-ms service gate with 78.153 ms of headroom.
-The complete test, including workspace/plugin setup, opening and staging 1,540
-transactions, committing, convergence reads, and cleanup, finished in 18.61 s.
-The 17.668-second commit batch means this implementation does **not** provide
-sub-100-ms all-client convergence when 1,540 commits arrive simultaneously;
-both numbers are retained so service latency cannot hide queueing.
+The external B3.1 rows retain the upstream suite's 1,540-operation workload.
+The Lix row uses the product capacity target of 100 simultaneously active
+clients: eight independent workspaces produced 800 per-client observations,
+with every wave converging through one durable commit. It passes the 100-ms
+service gate with 89.066 ms of headroom. Cardinalities are shown explicitly so
+the system comparison is not mistaken for an identical persistence workload.
 
 ## Before/after
 
 | 100-client JSON adapter | Before: synthetic branch merges | After: same-base transactions |
 | --- | ---: | ---: |
 | API operations | 100 branches + 100 sequential merges | 100 existing `begin_transaction()` calls + concurrent commits |
-| Resolver scheduling | conflict discovery and plugin resolution once per merge | stale conflicts discovered at commit; one batched plugin call per affected file |
-| Measured latency | 598.560 ms total merge region | 14.703 ms commit p95 in an unoptimized diagnostic build |
+| Resolver scheduling | conflict discovery and plugin resolution once per merge | conflicts indexed once; one plugin batch per balanced reduction round |
+| Measured latency | current `main`: 151.383 ms p95 | cohort commit: 10.934 ms p95 |
 | Client convergence | inferred from one branch head | asserted from every client |
 
-At the exact upstream B3.1 cardinality, the old 1,540-branch run did not finish
-within two minutes. The corrected transaction run completes and records a
-23.546 ms release service p95. The algorithm still must inspect each conflicting
-semantic record—arbitrary exact resolution has an Ω(N) lower bound—but it no
-longer creates and merges a synthetic branch for every client. Within each
-transaction, conflicts are indexed once, grouped by owning file, passed to that
-plugin in one accumulated batch, and committed atomically.
+At the 100-client real-time target, current `main` records 151.383 ms p95 and
+fails the gate. Cohort commit records 10.934 ms p95, a 92.8% reduction (13.8x),
+and publishes one durable commit. The algorithm still must inspect each
+conflicting semantic record—arbitrary exact resolution has an Ω(N) lower
+bound—but it no longer creates one durable transition per client. Conflicts are
+indexed once, grouped by owning file, reduced in deterministic balanced batches,
+and committed atomically.
 
 ## Environment
 
@@ -105,10 +105,10 @@ LIX_CRDT_SAMPLES=1 cargo test -p lix_sdk_tests \
   -- --ignored --exact --nocapture
 ```
 
-`LIX_CRDT_B3_CLIENTS` overrides the default 1,540-client cardinality and
+`LIX_CRDT_B3_CLIENTS` overrides the default 100-client cardinality and
 `LIX_CRDT_SAMPLES` controls independent workspace samples.
 
 The separate [`REALTIME_COLLABORATION_CAPACITY.md`](REALTIME_COLLABORATION_CAPACITY.md)
 defines the realistic 50-100 collaborator, gradual-arrival, client-observed
-capacity gate. The 1,540-client B3.1 burst remains a saturation comparison and
-is not substituted for that real-time workload.
+capacity gate. Larger bursts are saturation workloads and must account for the
+coordinator's bounded cohort capacity rather than asserting one durable commit.

@@ -899,7 +899,7 @@ where
                 |(storage, batch)| {
                     let mut write = block_on(storage.begin_write(WriteOptions::default()))
                         .expect("begin direct write-order write");
-                    block_on(write.put_many(SpaceId(1), PutBatch { entries: batch }))
+                    block_on(write.put_many(space(1), PutBatch { entries: batch }))
                         .expect("put direct write-order batch");
                     let commit = block_on(write.commit()).expect("commit direct write-order batch");
                     assert_eq!(commit.stats.put_entries, WRITES as u64);
@@ -1012,7 +1012,7 @@ where
                 |storage| {
                     let mut write = block_on(storage.begin_write(WriteOptions::default()))
                         .expect("begin native delete_range write");
-                    block_on(write.delete_range(SpaceId(1), point_scan_range()))
+                    block_on(write.delete_range(space(1), point_scan_range()))
                         .expect("native delete_range");
                     let commit = block_on(write.commit()).expect("commit native delete_range");
                     assert_eq!(commit.stats.deleted_ranges, 1);
@@ -1383,7 +1383,7 @@ where
                     let read = block_on(point_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct point read");
                     let result = block_on(read.get_many(&[GetManyRequest {
-                        space: SpaceId(1),
+                        space: space(1),
                         keys: black_box(&point_keys),
                         opts: GetOptions::default(),
                     }]))
@@ -1410,7 +1410,7 @@ where
                     let read = block_on(point_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct unique point read");
                     let result = block_on(read.get_many(&[GetManyRequest {
-                        space: SpaceId(1),
+                        space: space(1),
                         keys: black_box(&point_keys),
                         opts: GetOptions::default(),
                     }]))
@@ -1445,7 +1445,7 @@ where
                     let read = block_on(point_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct unique large-value point read");
                     let result = block_on(read.get_many(&[GetManyRequest {
-                        space: SpaceId(1),
+                        space: space(1),
                         keys: black_box(&point_keys),
                         opts: GetOptions::default(),
                     }]))
@@ -1476,7 +1476,7 @@ where
                         let read = block_on(point_storage.begin_read(ReadOptions::default()))
                             .expect("begin direct missing-key point read");
                         let result = block_on(read.get_many(&[GetManyRequest {
-                            space: SpaceId(1),
+                            space: space(1),
                             keys: black_box(&point_keys),
                             opts: GetOptions::default(),
                         }]))
@@ -1501,7 +1501,7 @@ where
                     let read = block_on(point_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct unique point read");
                     let result = block_on(read.get_many(&[GetManyRequest {
-                        space: SpaceId(1),
+                        space: space(1),
                         keys: black_box(&point_keys),
                         opts: GetOptions::default(),
                     }]))
@@ -1642,19 +1642,27 @@ impl Storage for CountingStorage {
 }
 
 impl StorageWrite for CountingWrite {
-    async fn put_many(&mut self, _space: SpaceId, _entries: PutBatch) -> Result<(), StorageError> {
+    async fn put_many(
+        &mut self,
+        _space: StorageSpace,
+        _entries: PutBatch,
+    ) -> Result<(), StorageError> {
         self.state.put_many_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    async fn delete_many(&mut self, _space: SpaceId, _keys: &[Key]) -> Result<(), StorageError> {
+    async fn delete_many(
+        &mut self,
+        _space: StorageSpace,
+        _keys: &[Key],
+    ) -> Result<(), StorageError> {
         self.state.delete_many_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     async fn delete_range(
         &mut self,
-        _space: SpaceId,
+        _space: StorageSpace,
         _range: KeyRange,
     ) -> Result<(), StorageError> {
         self.state.delete_many_calls.fetch_add(1, Ordering::Relaxed);
@@ -1686,7 +1694,7 @@ impl StorageRead for EmptyRead {
 
     async fn scan(
         &self,
-        _space: SpaceId,
+        _space: StorageSpace,
         _range: KeyRange,
         _opts: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {
@@ -1791,10 +1799,10 @@ where
 {
     let mut write = storage.begin_write(WriteOptions::default()).await?;
     for (space, batch) in batches.puts {
-        write.put_many(space.id, batch).await?;
+        write.put_many(space, batch).await?;
     }
     for (space, keys) in batches.deletes {
-        write.delete_many(space.id, &keys).await?;
+        write.delete_many(space, &keys).await?;
     }
     write.commit().await
 }
@@ -1973,7 +1981,7 @@ async fn materialize_storage_scan<R>(
 where
     R: StorageRead,
 {
-    read.scan(space(1).id, range, opts).await
+    read.scan(space(1), range, opts).await
 }
 
 async fn materialize_complete_storage_scan<R>(
@@ -1989,7 +1997,7 @@ where
     loop {
         let chunk = read
             .scan(
-                space(1).id,
+                space(1),
                 range.clone(),
                 ScanOptions {
                     projection: CoreProjection::FullValue,
@@ -2187,7 +2195,7 @@ fn physical_point_scan_range(_space_id: u32) -> KeyRange {
 }
 
 fn space(id: u32) -> StorageSpace {
-    StorageSpace::new(SpaceId(id), "bench.storage_v2")
+    StorageSpace::mutable(SpaceId(id), "bench.storage_v2")
 }
 
 fn key(bytes: impl Into<String>) -> Key {

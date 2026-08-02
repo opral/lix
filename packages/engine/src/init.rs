@@ -44,7 +44,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 /// rows, per-chunk object markers, and commit-delta manifests must fail closed
 /// before any physical representation is decoded.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
+    StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"lxcd9-mandatory-tracked-roots.v41";
 

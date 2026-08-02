@@ -7,7 +7,7 @@ use crate::storage_adapter::{
 };
 
 const CATALOG_REVISION_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0007_0003), "catalog.schema_revision");
+    StorageSpace::mutable(StorageSpaceId(0x0007_0003), "catalog.schema_revision");
 const CATALOG_REVISION_KEY: &[u8] = b"global";
 
 /// Storage-snapshot identity for the visible registered-schema catalog.

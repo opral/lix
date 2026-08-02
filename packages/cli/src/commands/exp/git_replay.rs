@@ -46,8 +46,8 @@ struct Change {
 }
 
 impl Change {
-    fn new_is_blob(&self) -> bool {
-        mode_is_blob(&self.new_mode)
+    fn new_is_regular_file(&self) -> bool {
+        mode_is_regular_file(&self.new_mode)
     }
 }
 
@@ -57,8 +57,8 @@ struct ReplayCommit {
     first_parent: Option<String>,
 }
 
-/// A Git pathname is bytes, not Unicode. Keep that identity byte-exact and
-/// encode it only at the Lix filesystem boundary.
+/// `lix_file.path` is literal UTF-8. Reject Git's non-UTF-8 pathnames instead
+/// of inventing an encoded path with different identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GitPath(Vec<u8>);
 
@@ -72,11 +72,18 @@ impl GitPath {
                 "malformed git diff-tree output: Git path must be relative",
             ));
         }
+        std::str::from_utf8(token).map_err(|_| {
+            CliError::msg(
+                "unsupported Git path: lix_file paths must be valid UTF-8 and are stored literally",
+            )
+        })?;
         Ok(Self(token.to_vec()))
     }
 
     fn relative_lix_path(&self) -> String {
-        encode_git_path_bytes(&self.0)
+        std::str::from_utf8(&self.0)
+            .expect("GitPath construction validates UTF-8")
+            .to_string()
     }
 
     fn lix_path(&self) -> String {
@@ -850,15 +857,7 @@ fn seed_parent_tree<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let changes = read_tree_snapshot_changes(repo_path, parent_commit)?
-        .into_iter()
-        .filter(|change| {
-            change
-                .new_path
-                .as_ref()
-                .is_some_and(|path| replay_scope.contains(path))
-        })
-        .collect::<Vec<_>>();
+    let changes = read_scoped_tree_snapshot_changes(repo_path, parent_commit, replay_scope)?;
     let mut pending = PreparedBatch::default();
     let mut result = SeedResult::default();
     for change_batch in changes.chunks(TREE_BLOB_READ_BATCH_ROWS) {
@@ -940,13 +939,6 @@ fn read_tree_snapshot_changes(repo_path: &Path, commit_sha: &str) -> Result<Vec<
                 "malformed git ls-tree record: {header}"
             )));
         }
-        let is_blob = fields[1] == "blob" && mode_is_blob(fields[0]);
-        let is_gitlink = fields[1] == "commit" && mode_is_gitlink(fields[0]);
-        if !is_blob && !is_gitlink {
-            return Err(CliError::msg(format!(
-                "unsupported git ls-tree entry {header}; expected blob or gitlink"
-            )));
-        }
         changes.push(Change {
             status: 'A',
             old_mode: "000000".to_string(),
@@ -956,6 +948,28 @@ fn read_tree_snapshot_changes(repo_path: &Path, commit_sha: &str) -> Result<Vec<
             new_path: Some(GitPath::from_diff_token(path)?),
         });
     }
+    Ok(changes)
+}
+
+fn read_scoped_tree_snapshot_changes(
+    repo_path: &Path,
+    commit_sha: &str,
+    replay_scope: &HashSet<GitPath>,
+) -> Result<Vec<Change>, CliError> {
+    let changes = read_tree_snapshot_changes(repo_path, commit_sha)?
+        .into_iter()
+        .filter(|change| {
+            change
+                .new_path
+                .as_ref()
+                .is_some_and(|path| replay_scope.contains(path))
+        })
+        .collect::<Vec<_>>();
+
+    for change in &changes {
+        reject_unsupported_git_mode(&change.new_mode, change.new_path.as_ref())?;
+    }
+
     Ok(changes)
 }
 
@@ -1659,7 +1673,7 @@ fn git_process_error(
 fn collect_wanted_blob_ids(changes: &[Change]) -> Vec<String> {
     let mut wanted_blob_ids = BTreeSet::<String>::new();
     for change in changes {
-        if change.new_path.is_none() || !change.new_is_blob() {
+        if change.new_path.is_none() || !change.new_is_regular_file() {
             continue;
         }
         if !change.new_oid.is_empty() && !is_null_git_oid(&change.new_oid) {
@@ -1681,6 +1695,9 @@ fn prepare_commit_changes(
     for change in changes {
         let status = normalize_status(change.status);
 
+        reject_unsupported_git_mode(&change.old_mode, change.old_path.as_ref())?;
+        reject_unsupported_git_mode(&change.new_mode, change.new_path.as_ref())?;
+
         if should_delete_old_entry(change, status) {
             if let Some(deleted_id) = resolve_delete_path(state, change) {
                 delete_ids.insert(deleted_id.clone());
@@ -1693,7 +1710,7 @@ fn prepare_commit_changes(
             continue;
         }
 
-        if !mode_is_replay_file(&change.new_mode) {
+        if !mode_is_regular_file(&change.new_mode) {
             return Err(CliError::msg(format!(
                 "unsupported Git file mode {} for replayed path {}",
                 change.new_mode,
@@ -1710,23 +1727,19 @@ fn prepare_commit_changes(
         };
 
         let target = resolve_write_target(state, change)?;
-        let data = if change.new_is_blob() {
-            Some(
-                blob_by_oid
-                    .get(&change.new_oid)
-                    .ok_or_else(|| {
-                        CliError::msg(format!(
-                            "missing blob {} while applying {} {}",
-                            change.new_oid,
-                            status,
-                            new_path.lix_path()
-                        ))
-                    })?
-                    .clone(),
-            )
-        } else {
-            None
-        };
+        let data = Some(
+            blob_by_oid
+                .get(&change.new_oid)
+                .ok_or_else(|| {
+                    CliError::msg(format!(
+                        "missing blob {} while applying {} {}",
+                        change.new_oid,
+                        status,
+                        new_path.lix_path()
+                    ))
+                })?
+                .clone(),
+        );
 
         let row = WriteRow {
             id: target.id.clone(),
@@ -1763,7 +1776,7 @@ fn prepare_commit_changes(
 }
 
 fn should_delete_old_entry(change: &Change, status: char) -> bool {
-    if change.old_path.is_none() || !mode_is_replay_file(&change.old_mode) {
+    if change.old_path.is_none() || !mode_is_regular_file(&change.old_mode) {
         return false;
     }
 
@@ -1774,7 +1787,7 @@ fn should_delete_old_entry(change: &Change, status: char) -> bool {
         // in the same atomic replay revision.
         'D' | 'R' => true,
         'A' | 'C' => false,
-        _ => !mode_is_replay_file(&change.new_mode),
+        _ => !mode_is_regular_file(&change.new_mode),
     }
 }
 
@@ -1916,15 +1929,7 @@ fn verify_final_git_tree<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let tree_changes = read_tree_snapshot_changes(repo_path, commit_sha)?
-        .into_iter()
-        .filter(|change| {
-            change
-                .new_path
-                .as_ref()
-                .is_some_and(|path| replay_scope.contains(path))
-        })
-        .collect::<Vec<_>>();
+    let tree_changes = read_scoped_tree_snapshot_changes(repo_path, commit_sha, replay_scope)?;
     let mut expected_by_path = HashMap::<String, ExpectedFile>::with_capacity(tree_changes.len());
     for change_batch in tree_changes.chunks(TREE_BLOB_READ_BATCH_ROWS) {
         let blob_by_oid = blob_reader.read_blobs(&collect_wanted_blob_ids(change_batch))?;
@@ -1934,16 +1939,12 @@ where
                 .as_ref()
                 .ok_or_else(|| CliError::msg("Git tree snapshot entry has no path"))?
                 .lix_path();
-            let data = if change.new_is_blob() {
-                Some(blob_by_oid.get(&change.new_oid).ok_or_else(|| {
-                    CliError::msg(format!(
-                        "Git tree blob {} was not returned for {path}",
-                        change.new_oid
-                    ))
-                })?)
-            } else {
-                None
-            };
+            let data = Some(blob_by_oid.get(&change.new_oid).ok_or_else(|| {
+                CliError::msg(format!(
+                    "Git tree blob {} was not returned for {path}",
+                    change.new_oid
+                ))
+            })?);
             if expected_by_path.contains_key(&path) {
                 return Err(CliError::msg(format!(
                     "Git tree snapshot contains duplicate path {path}"
@@ -2056,24 +2057,16 @@ fn verify_file_manifest_entry(
     expected: &ExpectedFile,
     commit_sha: &str,
 ) -> Result<(), CliError> {
-    if mode_is_gitlink(&expected.git_mode) {
-        if data.is_some_and(|bytes| !bytes.is_empty()) {
-            return Err(CliError::msg(format!(
-                "state mismatch at {commit_sha}: gitlink {path} has non-empty synthetic payload"
-            )));
-        }
-    } else {
-        if expected.size_bytes != data.map(<[u8]>::len) {
-            return Err(CliError::msg(format!(
-                "state mismatch at {commit_sha}: byte length differs for path {path}"
-            )));
-        }
-        let hash = data.map(sha256_hex);
-        if expected.sha256 != hash {
-            return Err(CliError::msg(format!(
-                "state mismatch at {commit_sha}: hash differs for path {path}"
-            )));
-        }
+    if expected.size_bytes != data.map(<[u8]>::len) {
+        return Err(CliError::msg(format!(
+            "state mismatch at {commit_sha}: byte length differs for path {path}"
+        )));
+    }
+    let hash = data.map(sha256_hex);
+    if expected.sha256 != hash {
+        return Err(CliError::msg(format!(
+            "state mismatch at {commit_sha}: hash differs for path {path}"
+        )));
     }
     if metadata.get("git_mode").and_then(serde_json::Value::as_str) != Some(&expected.git_mode)
         || metadata.get("git_oid").and_then(serde_json::Value::as_str) != Some(&expected.git_oid)
@@ -2133,14 +2126,6 @@ fn hex_digit_lower(value: u8) -> char {
     }
 }
 
-fn hex_digit_upper(value: u8) -> char {
-    match value {
-        0..=9 => (b'0' + value) as char,
-        10..=15 => (b'A' + (value - 10)) as char,
-        _ => '0',
-    }
-}
-
 fn normalize_status(value: char) -> char {
     value.to_ascii_uppercase()
 }
@@ -2154,36 +2139,24 @@ fn stable_file_id(path: &GitPath) -> String {
     .to_string()
 }
 
-fn encode_git_path_bytes(path: &[u8]) -> String {
-    let mut encoded = String::new();
-    for byte in path {
-        if *byte == b'/' {
-            encoded.push('/');
-            continue;
-        }
-        let is_alpha_num = byte.is_ascii_alphanumeric();
-        let is_safe = matches!(*byte, b'.' | b'_' | b'~' | b'-');
-        if is_alpha_num || is_safe {
-            encoded.push(*byte as char);
-        } else {
-            encoded.push('%');
-            encoded.push(hex_digit_upper(byte >> 4));
-            encoded.push(hex_digit_upper(byte & 0x0f));
-        }
+fn reject_unsupported_git_mode(mode: &str, path: Option<&GitPath>) -> Result<(), CliError> {
+    if mode == "000000" || mode_is_regular_file(mode) {
+        return Ok(());
     }
-    encoded
+    let kind = match mode {
+        "120000" => "symbolic link",
+        "160000" => "gitlink/submodule",
+        _ => "non-regular entry",
+    };
+    Err(CliError::msg(format!(
+        "unsupported Git {kind} mode {mode} at {}; lix_file stores regular file contents only",
+        path.map(GitPath::lix_path)
+            .unwrap_or_else(|| "<missing path>".to_string())
+    )))
 }
 
-fn mode_is_blob(mode: &str) -> bool {
-    matches!(mode, "100644" | "100755" | "120000")
-}
-
-fn mode_is_gitlink(mode: &str) -> bool {
-    mode == "160000"
-}
-
-fn mode_is_replay_file(mode: &str) -> bool {
-    mode_is_blob(mode) || mode_is_gitlink(mode)
+fn mode_is_regular_file(mode: &str) -> bool {
+    matches!(mode, "100644" | "100755")
 }
 
 fn is_null_git_oid(oid: &str) -> bool {
@@ -2728,7 +2701,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_wanted_blob_ids_skips_gitlink_oids() {
+    fn collect_wanted_blob_ids_only_includes_regular_files() {
         let changes = vec![
             Change {
                 status: 'A',
@@ -2808,6 +2781,39 @@ mod tests {
         fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn scoped_tree_snapshot_ignores_unrelated_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = unique_temp_dir();
+        let repo = fixture.join("repo");
+        fs::create_dir_all(&repo).expect("fixture repository should be created");
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        git_ok(&repo, &["config", "user.email", "replay@example.test"]);
+        git_ok(&repo, &["config", "user.name", "Replay Test"]);
+        fs::write(repo.join("selected.txt"), b"selected\n").expect("fixture should write");
+        symlink("selected.txt", repo.join("unrelated-link")).expect("fixture should link");
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "root"]);
+        let commit = run_git_text(&repo, &["rev-parse".to_string(), "HEAD".to_string()], None)
+            .expect("fixture commit should resolve");
+
+        let window_scope = HashSet::from([git_path(b"selected.txt")]);
+        let changes = read_scoped_tree_snapshot_changes(&repo, commit.trim(), &window_scope)
+            .expect("an unrelated symbolic link should not fail window scope");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].new_path, Some(git_path(b"selected.txt")));
+
+        let full_scope = HashSet::from([git_path(b"selected.txt"), git_path(b"unrelated-link")]);
+        let error = read_scoped_tree_snapshot_changes(&repo, commit.trim(), &full_scope)
+            .expect_err("a symbolic link inside replay scope should be rejected");
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(error.to_string().contains("/unrelated-link"));
+
+        fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
+    }
+
     #[test]
     fn select_replay_commits_applies_limit_after_from_commit() {
         let commits = replay_commits(&["a", "b", "c", "d"]);
@@ -2832,7 +2838,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_commit_changes_typechange_blob_to_gitlink_preserves_file_identity() {
+    fn prepare_commit_changes_rejects_gitlinks() {
         let path = git_path(b"artifact/spa-prerender-repro");
         let file_id = stable_file_id(&path);
         let mut state = ReplayState::default();
@@ -2848,19 +2854,11 @@ mod tests {
             new_path: Some(git_path(b"artifact/spa-prerender-repro")),
         }];
 
-        let prepared = prepare_commit_changes(&mut state, &changes, &HashMap::new())
-            .expect("gitlink typechange should not error");
+        let error = prepare_commit_changes(&mut state, &changes, &HashMap::new())
+            .expect_err("gitlink typechange should be rejected");
 
-        assert!(prepared.deletes.is_empty());
-        assert!(prepared.inserts.is_empty());
-        assert_eq!(prepared.updates.len(), 1);
-        assert_eq!(prepared.updates[0].data, None);
-        assert_eq!(prepared.updates[0].git_mode, "160000");
-        assert!(
-            state
-                .path_to_file_id
-                .contains_key(&git_path(b"artifact/spa-prerender-repro"))
-        );
+        assert!(error.to_string().contains("gitlink/submodule"));
+        assert!(error.to_string().contains("regular file contents only"));
     }
 
     #[test]
@@ -3072,7 +3070,7 @@ mod tests {
                 id: "/src/new.ts".to_string(),
                 path: "/src/new.ts".to_string(),
                 data: Some(b"hello".to_vec()),
-                git_mode: "120000".to_string(),
+                git_mode: "100644".to_string(),
                 git_oid: "b".repeat(40),
             }],
             updates: Vec::new(),
@@ -3096,47 +3094,43 @@ mod tests {
                 Value::Text("/src/new.ts".to_string()),
                 Value::Text("/src/new.ts".to_string()),
                 Value::Blob(b"hello".to_vec().into()),
-                Value::Json(json!({"git_mode": "120000", "git_oid": "b".repeat(40)})),
+                Value::Json(json!({"git_mode": "100644", "git_oid": "b".repeat(40)})),
             ]
         );
     }
 
     #[test]
-    fn gitlink_rows_use_empty_binary_payload_and_preserve_reference_metadata() {
-        let batch = PreparedBatch {
-            deletes: Vec::new(),
-            inserts: vec![WriteRow {
-                id: "/vendor/submodule".to_string(),
-                path: "/vendor/submodule".to_string(),
-                data: None,
-                git_mode: "160000".to_string(),
-                git_oid: "c".repeat(40),
-            }],
-            updates: Vec::new(),
-        };
+    fn prepare_commit_changes_rejects_symbolic_links() {
+        let changes = vec![Change {
+            status: 'A',
+            old_mode: "000000".to_string(),
+            new_mode: "120000".to_string(),
+            new_oid: "c".repeat(40),
+            old_path: None,
+            new_path: Some(git_path(b"link.txt")),
+        }];
 
-        let statements = build_replay_commit_statements(&batch, DEFAULT_INSERT_BATCH_ROWS);
+        let error = prepare_commit_changes(&mut ReplayState::default(), &changes, &HashMap::new())
+            .expect_err("symbolic links should be rejected");
 
-        assert_eq!(statements.len(), 1);
-        assert_eq!(statements[0].params[2], Value::Blob(Vec::new().into()));
-        assert_eq!(
-            statements[0].params[3],
-            Value::Json(json!({"git_mode": "160000", "git_oid": "c".repeat(40)}))
-        );
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(error.to_string().contains("/link.txt"));
     }
 
     #[test]
-    fn raw_diff_parser_preserves_non_utf8_git_path_bytes() {
+    fn raw_diff_parser_rejects_non_utf8_git_paths() {
         let raw = b":100644 100755 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M\0dir/\xff name\0";
-        let changes = parse_raw_diff_tree(raw).expect("raw diff should parse");
+        let error = parse_raw_diff_tree(raw).expect_err("non-UTF-8 path should fail");
 
-        assert_eq!(changes.len(), 1);
-        let path = changes[0]
-            .new_path
-            .as_ref()
-            .expect("modified entry should have new path");
-        assert_eq!(path.0, b"dir/\xff name");
-        assert_eq!(path.lix_path(), "/dir/%FF%20name");
+        assert!(error.to_string().contains("valid UTF-8"));
+    }
+
+    #[test]
+    fn git_paths_are_literal_utf8() {
+        let path = GitPath::from_diff_token("docs/100% @2x/日本語.txt".as_bytes())
+            .expect("UTF-8 Git path should be accepted");
+
+        assert_eq!(path.lix_path(), "/docs/100% @2x/日本語.txt");
     }
 
     #[test]

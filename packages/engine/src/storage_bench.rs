@@ -25,6 +25,41 @@ static ENTITY_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_DELETES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
+static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
+static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
+static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
+static IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MediaStructuralAccounting {
+    pub temporary_manifest_leaf_rows: u64,
+    pub legacy_equivalent_chunk_rows: u64,
+    pub chunk_payload_hash_bytes: u64,
+    pub segment_identity_hash_bytes: u64,
+}
+
+pub(crate) fn record_media_upload_manifest_leaf(chunk_count: usize) {
+    MEDIA_UPLOAD_MANIFEST_LEAF_ROWS.fetch_add(1, Ordering::Relaxed);
+    MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS.fetch_add(chunk_count as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_media_upload_chunk_payload_hash_bytes(payload_bytes: usize) {
+    MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES.fetch_add(payload_bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_immutable_segment_identity_hash_bytes(bytes: usize) {
+    IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub fn take_media_structural_accounting() -> MediaStructuralAccounting {
+    MediaStructuralAccounting {
+        temporary_manifest_leaf_rows: MEDIA_UPLOAD_MANIFEST_LEAF_ROWS.swap(0, Ordering::Relaxed),
+        legacy_equivalent_chunk_rows: MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS.swap(0, Ordering::Relaxed),
+        chunk_payload_hash_bytes: MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES.swap(0, Ordering::Relaxed),
+        segment_identity_hash_bytes: IMMUTABLE_SEGMENT_IDENTITY_HASH_BYTES
+            .swap(0, Ordering::Relaxed),
+    }
+}
 
 pub(crate) fn record_certified_entity_insert_parameter_batch_execution() {
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, Ordering::Relaxed);

@@ -107,6 +107,22 @@ where
         })
     }
 
+    /// Extracts literal parameters when `sql` has an already validated UPDATE
+    /// shape.
+    ///
+    /// Batch classification validates and parses the first statement once.
+    /// The remaining statements only need to prove that normalization yields
+    /// the same shape; reparsing and cloning the same AST for every row would
+    /// make classification itself linear in the planner representation.
+    pub(crate) fn update_literal_params_for_shape(
+        &self,
+        sql: &str,
+        normalized_shape: &str,
+    ) -> Option<Vec<Value>> {
+        let (normalized_sql, params) = normalize_update_string_literals(sql)?;
+        (normalized_sql == normalized_shape).then_some(params)
+    }
+
     /// Returns stable public-surface metadata for one catalog generation.
     ///
     /// Callers are responsible for using a key that changes whenever any

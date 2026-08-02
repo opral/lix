@@ -81,6 +81,7 @@ pub use schema::{
 pub use common::LixError;
 pub use common::{Blob, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
+pub use common::{LixPath, validate_lix_path_segment};
 pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
 pub use engine::{Engine, EngineOptions};
@@ -108,8 +109,8 @@ pub use storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange,
     MAX_SCAN_PAGE_ROWS, Memory, MemoryFactory, MemoryFixture, MemoryRead, MemoryWrite, Prefix,
     ProjectedValue, PutBatch, PutEntry, ReadConsistency, ReadDurability, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SnapshotRef, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
-    StoredValue, WriteOptions, WriteStats,
+    ScanChunk, ScanOptions, SnapshotRef, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
+    StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };
 
 /// Reserved high UUID sentinel for repository-global state.

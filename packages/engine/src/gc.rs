@@ -28,13 +28,13 @@ use crate::storage_adapter::{
 use crate::{LixError, storage_codec};
 
 pub(crate) const CHECKPOINT_RECOVERY_REF_NAMESPACE: &str = "checkpoint.recovery_ref.v3";
-pub(crate) const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0008_0001),
     CHECKPOINT_RECOVERY_REF_NAMESPACE,
 );
 pub(crate) const CHECKPOINT_GC_STATE_NAMESPACE: &str = "checkpoint.gc_state.v1";
 pub(crate) const CHECKPOINT_GC_STATE_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0008_0002), CHECKPOINT_GC_STATE_NAMESPACE);
+    StorageSpace::mutable(StorageSpaceId(0x0008_0002), CHECKPOINT_GC_STATE_NAMESPACE);
 
 const CHECKPOINT_RECOVERY_REF_FORMAT_VERSION: u32 = 3;
 const CHECKPOINT_GC_STATE_FORMAT_VERSION: u32 = 1;

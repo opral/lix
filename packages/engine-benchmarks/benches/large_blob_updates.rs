@@ -328,7 +328,7 @@ impl WorkloadState {
     }
 }
 
-struct BackendFixture<S: Storage> {
+struct BackendFixture<S: Storage + 'static> {
     session: SessionContext<S>,
     storage: S,
     _temp_dir: TempDir,
@@ -373,7 +373,7 @@ where
     async fn write(&self, prepared: PreparedWrite) -> u64 {
         if matches!(self.workload.operation, Operation::RawBackendInitialWrite) {
             let adapter = StorageAdapter::new(self.storage.clone());
-            let payload_space = StorageSpace::new(SpaceId(0x0005_0003), "bench.raw_payload");
+            let payload_space = StorageSpace::mutable(SpaceId(0x0005_0003), "bench.raw_payload");
             let mut offset = 0usize;
             while offset < self.workload.size {
                 let len = (self.workload.size - offset).min(lix_engine::FILE_UPLOAD_PART_BYTES);
@@ -517,6 +517,11 @@ async fn space_accounting<S>(storage: &S, space: SpaceId) -> SpaceAccounting
 where
     S: Storage,
 {
+    let space = if space == PAYLOAD_SPACE {
+        StorageSpace::immutable(space, "benchmark.binary_cas_payload")
+    } else {
+        StorageSpace::mutable(space, "benchmark.binary_cas_metadata")
+    };
     let read = storage
         .begin_read(ReadOptions::default())
         .await

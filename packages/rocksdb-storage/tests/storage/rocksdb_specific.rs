@@ -7,7 +7,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use lix_engine::storage::{
     CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, PutBatch, PutEntry,
-    ReadOptions, SpaceId, Storage, StorageRead, StorageWrite, StoredValue, WriteOptions,
+    ReadOptions, SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue,
+    WriteOptions,
 };
 use lix_rocksdb_storage::RocksDB;
 
@@ -15,7 +16,7 @@ use lix_rocksdb_storage::RocksDB;
 fn same_process_open_reuses_shared_database_handle() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
-    let space = SpaceId(0x0005_0003);
+    let space = StorageSpace::immutable(SpaceId(7), "test.immutable");
     let storage_a = RocksDB::open(&path).expect("open first storage");
     let storage_b = RocksDB::open(&path).expect("open second storage");
 
@@ -47,7 +48,7 @@ fn single_key_get_many_preserves_snapshot_and_projection_semantics() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
     let storage = RocksDB::open(&path).expect("open storage");
-    let space = SpaceId(0x0005_0003);
+    let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
     let key = Key(Bytes::from_static(b"tracked-key"));
 
     put_one(
@@ -101,7 +102,7 @@ fn multi_key_delete_uses_exact_contiguous_key_ranges() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
     let storage = RocksDB::open(&path).expect("open storage");
-    let space = SpaceId(0x0005_0003);
+    let space = StorageSpace::mutable(SpaceId(7), "test.mutable");
     let keys = [
         Key(Bytes::from_static(b"delete-first")),
         Key(Bytes::from_static(b"delete-second")),
@@ -183,7 +184,7 @@ fn writes_large_values_to_blob_files() {
     let storage = RocksDB::open(&path).expect("open storage");
     put_one(
         &storage,
-        SpaceId(0x0005_0003),
+        StorageSpace::immutable(SpaceId(7), "test.immutable"),
         Key(Bytes::from_static(b"large-value")),
         Bytes::from(vec![7; 128 * 1024]),
     );
@@ -197,13 +198,13 @@ fn writes_large_values_to_blob_files() {
 }
 
 #[test]
-fn uses_fast_zstd_compression_for_sst_and_blob_files() {
+fn compresses_metadata_but_not_immutable_payloads() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
     let storage = RocksDB::open(&path).expect("open storage");
     put_one(
         &storage,
-        SpaceId(0x0005_0003),
+        StorageSpace::immutable(SpaceId(7), "test.immutable"),
         Key(Bytes::from_static(b"compressed-value")),
         Bytes::from(vec![b'a'; 64 * 1024]),
     );
@@ -217,14 +218,14 @@ fn uses_fast_zstd_compression_for_sst_and_blob_files() {
         "SST compression should use Zstd"
     );
     assert!(
-        options.contains("blob_compression_type=kZSTD"),
-        "blob compression should use Zstd"
+        options.contains("blob_compression_type=kNoCompression"),
+        "already-compressed immutable payloads should not be recompressed"
     );
     assert!(
         options.contains("compression_opts={")
             && options.contains("level=1;")
             && options.contains("window_bits=-14;"),
-        "Zstd should use the fast level-1 configuration"
+        "mutable metadata Zstd should use the fast level-1 configuration"
     );
 }
 
@@ -270,7 +271,7 @@ fn cross_process_open_helper() {
     );
 }
 
-fn put_one(storage: &RocksDB, space: SpaceId, key: Key, value: Bytes) {
+fn put_one(storage: &RocksDB, space: StorageSpace, key: Key, value: Bytes) {
     let mut write = block_on(storage.begin_write(WriteOptions::default())).expect("begin write");
     block_on(write.put_many(
         space,
@@ -285,7 +286,7 @@ fn put_one(storage: &RocksDB, space: SpaceId, key: Key, value: Bytes) {
     block_on(write.commit()).expect("commit write");
 }
 
-fn read_one(storage: &RocksDB, space: SpaceId, key: Key) -> Option<Bytes> {
+fn read_one(storage: &RocksDB, space: StorageSpace, key: Key) -> Option<Bytes> {
     let read = block_on(storage.begin_read(ReadOptions::default())).expect("begin read");
     let result = block_on(read.get_many(&[GetManyRequest {
         space,

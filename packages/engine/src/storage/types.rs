@@ -10,6 +10,53 @@ pub const MAX_SCAN_PAGE_ROWS: usize = 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SpaceId(pub u32);
 
+/// Engine-declared mutation semantics for one logical storage space.
+///
+/// Lix owns and validates these semantics. Storage implementations receive the
+/// declaration so they can choose an appropriate physical layout without
+/// exposing a second blob or object API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ValueSemantics {
+    Mutable,
+    Immutable,
+}
+
+/// A logical ordered-key space and the value semantics Lix guarantees for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StorageSpace {
+    pub id: SpaceId,
+    pub name: &'static str,
+    pub value_semantics: ValueSemantics,
+}
+
+impl StorageSpace {
+    pub const fn mutable(id: SpaceId, name: &'static str) -> Self {
+        Self {
+            id,
+            name,
+            value_semantics: ValueSemantics::Mutable,
+        }
+    }
+
+    pub const fn immutable(id: SpaceId, name: &'static str) -> Self {
+        Self {
+            id,
+            name,
+            value_semantics: ValueSemantics::Immutable,
+        }
+    }
+}
+
+impl fmt::Display for StorageSpace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}({:?}, {:?})",
+            self.name, self.id, self.value_semantics
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key(pub Bytes);
 
@@ -261,7 +308,7 @@ pub struct GetManyResult {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GetManyRequest<'a> {
-    pub space: SpaceId,
+    pub space: StorageSpace,
     pub keys: &'a [Key],
     pub opts: GetOptions,
 }

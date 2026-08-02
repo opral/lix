@@ -967,7 +967,7 @@ where
         .into_iter()
         .map(|(space, keys)| {
             (
-                space.id,
+                space,
                 keys.into_iter()
                     .map(|key| StorageKey(Bytes::from(key)))
                     .collect::<Vec<_>>(),

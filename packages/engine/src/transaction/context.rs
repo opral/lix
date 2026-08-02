@@ -183,12 +183,65 @@ use crate::wasm::{
 };
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
+mod cohort;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TransactionCommitOutcome {
     pub(crate) storage_stats: StorageWriteSetStats,
 }
 
-#[derive(Clone)]
+/// Commits one coordinator-owned cohort in queue order.
+///
+/// The coordinator is the sole explicit-transaction persistence authority.
+/// This initial execution seam deliberately lives beside `Transaction` so the
+/// cohort planner can replace per-transaction execution without reintroducing
+/// a type-erased closure queue.
+pub(crate) async fn commit_transaction_cohort<StorageImpl>(
+    cohort: Vec<(Transaction<StorageImpl>, FunctionContext)>,
+) -> Vec<Result<TransactionCommitOutcome, LixError>>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    Box::pin(cohort::commit_transaction_cohort(cohort)).await
+}
+
+pub(crate) fn transactions_can_share_cohort<StorageImpl>(
+    a: &Transaction<StorageImpl>,
+    b: &Transaction<StorageImpl>,
+    eligible_a: bool,
+    eligible_b: bool,
+) -> bool
+where
+    StorageImpl: Storage + 'static,
+{
+    a.active_branch_id == b.active_branch_id
+        && a.opening_active_branch_head == b.opening_active_branch_head
+        && a.opening_global_branch_head == b.opening_global_branch_head
+        && a.opening_tracked_mutation_revision == b.opening_tracked_mutation_revision
+        && a.idempotency_receipt.is_none()
+        && b.idempotency_receipt.is_none()
+        && a.atomic_metadata_writes.is_none()
+        && b.atomic_metadata_writes.is_none()
+        && a.atomic_metadata_preconditions.is_empty()
+        && b.atomic_metadata_preconditions.is_empty()
+        && !a.await_durable_commit
+        && !b.await_durable_commit
+        && eligible_a
+        && eligible_b
+}
+
+pub(crate) fn transaction_is_file_cohort_eligible<StorageImpl>(
+    transaction: &Transaction<StorageImpl>,
+) -> bool
+where
+    StorageImpl: Storage + 'static,
+{
+    transaction
+        .staged_writes
+        .is_file_cohort_eligible(&transaction.active_branch_id)
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct StaleConflictPayload {
     snapshot: SharedStr,
     metadata: Option<SharedStr>,
@@ -229,7 +282,16 @@ fn push_stale_conflict_resolution(
     resolution: WasmConflictResolution<WasmHostBytes>,
     branch_id: &str,
 ) -> Result<(), LixError> {
-    let (snapshot, metadata) = match resolution {
+    let payload = stale_conflict_resolution_payload(conflict, resolution)?;
+    cohort::push_cohort_payload(rows, &conflict.key, payload.as_ref(), branch_id);
+    Ok(())
+}
+
+fn stale_conflict_resolution_payload(
+    conflict: &StaleSemanticConflict,
+    resolution: WasmConflictResolution<WasmHostBytes>,
+) -> Result<Option<StaleConflictPayload>, LixError> {
+    let payload = match resolution {
         WasmConflictResolution::Take(side) => {
             let selected = match side {
                 WasmConflictTake::Base => conflict.base.as_ref(),
@@ -242,17 +304,9 @@ fn push_stale_conflict_resolution(
                     "plugin conflict resolver selected an absent value; use delete for a tombstone",
                 )
             })?;
-            (
-                Some(TransactionJson::from_unvalidated_shared_normalized_content(
-                    selected.snapshot.clone(),
-                )),
-                selected
-                    .metadata
-                    .clone()
-                    .map(TransactionJson::from_unvalidated_shared_normalized_content),
-            )
+            Some(selected.clone())
         }
-        WasmConflictResolution::Delete => (None, None),
+        WasmConflictResolution::Delete => None,
         WasmConflictResolution::Replace {
             snapshot_content,
             effect,
@@ -265,30 +319,17 @@ fn push_stale_conflict_resolution(
             };
             let metadata = match effect {
                 WasmChangeEffect::Content => None,
-                WasmChangeEffect::FormatOnly => Some(v2_format_only_metadata()),
+                WasmChangeEffect::FormatOnly => {
+                    Some(SharedStr::from_static(V2_FORMAT_ONLY_METADATA_JSON))
+                }
             };
-            (
-                Some(TransactionJson::from_canonical_batch(snapshot)),
+            Some(StaleConflictPayload {
+                snapshot: snapshot.normalized_shared(),
                 metadata,
-            )
+            })
         }
     };
-    rows.push_parts(
-        Some(conflict.key.entity_pk.clone()),
-        SharedStr::from(conflict.key.schema_key.as_str()),
-        conflict.key.file_id.as_deref().map(SharedStr::from),
-        snapshot,
-        metadata,
-        None,
-        None,
-        None,
-        false,
-        None,
-        None,
-        false,
-        SharedStr::from(branch_id),
-    );
-    Ok(())
+    Ok(payload)
 }
 
 /// The durable identity and byte proof of one plugin materialization.
@@ -519,6 +560,21 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
     plugin_generation_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     plugin_generation_upgrade_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+/// One already-resolved tracked-state transition. The expected side is
+/// certified by the active branch head and its immutable historical root;
+/// target payloads come from an exact read of the desired root.
+struct TypedStateTransition {
+    identity: TrackedStateKey,
+    expected_change_id: Option<ChangeId>,
+    target: Option<TypedStateTransitionTarget>,
+}
+
+struct TypedStateTransitionTarget {
+    change_id: ChangeId,
+    snapshot_content: Option<SharedStr>,
+    metadata: Option<SharedStr>,
 }
 
 /// State which must be restored when `RETURNING` evaluation fails after a
@@ -1064,6 +1120,11 @@ where
         discard_plugin_actor_publications(superseded).await;
         self.pending_file_view_mutations
             .retain(|key, _| !file_ids.contains(&key.file_id));
+        self.session_file_views
+            .apply_mutations(file_ids.iter().map(|file_id| {
+                let key = SessionFileViewKey::new(&self.active_branch_id, file_id);
+                SessionFileViewMutation::Remove { key }
+            }));
 
         let mut reconciliation_batches = BTreeMap::<String, RawWriteBatch>::new();
         for (file_id, group) in &groups {
@@ -1347,8 +1408,7 @@ where
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
         let mut transaction = self;
-        let commit_boundary = transaction.commit_boundary.clone();
-        let mut prepared_writes = match transaction.staged_writes.drain() {
+        let prepared_writes = match transaction.staged_writes.drain() {
             Ok(prepared_writes) => prepared_writes,
             Err(error) => {
                 transaction
@@ -1357,6 +1417,18 @@ where
                 return Err(error);
             }
         };
+        transaction
+            .commit_prepared(runtime_functions, prepared_writes)
+            .await
+    }
+
+    async fn commit_prepared(
+        mut self,
+        runtime_functions: &FunctionContext,
+        mut prepared_writes: PreparedWriteSet,
+    ) -> Result<TransactionCommitOutcome, LixError> {
+        let transaction = &mut self;
+        let commit_boundary = transaction.commit_boundary.clone();
         transaction
             .uncache_completed_plugin_actors_for_large_file_writes(&prepared_writes)
             .await;
@@ -1514,7 +1586,7 @@ where
             write_options
                 .preconditions
                 .push(StoragePrecondition::KeyAbsent {
-                    space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE.id,
+                    space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
                     key,
                 });
         }
@@ -6764,6 +6836,162 @@ where
         CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read))
     }
 
+    /// Applies a tracked-state transition resolved from two immutable commits.
+    ///
+    /// This is the internal counterpart to the public diff command. The
+    /// caller supplies typed identities instead of user-facing `diff_id`
+    /// strings. The transaction's coherent opening head certifies the current
+    /// side, so undo/redo does not need to reload visible live state after it
+    /// has already read that exact historical root.
+    pub(crate) async fn execute_tracked_state_transition(
+        &mut self,
+        current_commit_id: CommitId,
+        desired_commit_id: CommitId,
+        keys: Vec<TrackedStateKey>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        let branch_id = self.active_branch_id.clone();
+        if self.opening_active_branch_head != Some(current_commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "tracked-state transition source is no longer the active branch head",
+            ));
+        }
+        if self
+            .staged_writes
+            .commit_id_for_branch(&branch_id)?
+            .is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "typed tracked-state transitions require a clean branch transaction",
+            ));
+        }
+        if keys.is_empty() {
+            return Err(empty_state_transition(current_commit_id, desired_commit_id));
+        }
+        let unique = keys.iter().collect::<BTreeSet<_>>();
+        if unique.len() != keys.len() {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "typed tracked-state transition contains more than one row for the same entity",
+            ));
+        }
+
+        let (current_rows, desired_rows) = {
+            let mut tracked = self.tracked_state_reader().await;
+            let current_rows = tracked
+                .load_projected_batch_at_commit(
+                    &current_commit_id.to_string(),
+                    &keys,
+                    &ChangeRecordProjection::identity_only(),
+                )
+                .await?;
+            let desired_rows = tracked
+                .load_projected_batch_at_commit(
+                    &desired_commit_id.to_string(),
+                    &keys,
+                    &ChangeRecordProjection::full(),
+                )
+                .await?;
+            (current_rows, desired_rows)
+        };
+        let mut transitions = Vec::with_capacity(keys.len());
+        for (index, identity) in keys.into_iter().enumerate() {
+            let current = current_rows.row(index).filter(|row| !row.deleted());
+            let desired = desired_rows.row(index).filter(|row| !row.deleted());
+            for row in [current, desired].into_iter().flatten() {
+                if row.schema_key() != identity.schema_key
+                    || row.file_id() != identity.file_id.as_deref()
+                    || row.entity_pk() != &identity.entity_pk
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "historical exact read returned a mismatched transition identity",
+                    ));
+                }
+            }
+            let expected_change_id = current.map(|row| row.change_id());
+            let target = desired.map(|row| TypedStateTransitionTarget {
+                change_id: row.change_id(),
+                snapshot_content: row.snapshot_content().cloned(),
+                metadata: row.metadata().cloned(),
+            });
+            if expected_change_id != target.as_ref().map(|target| target.change_id) {
+                transitions.push(TypedStateTransition {
+                    identity,
+                    expected_change_id,
+                    target,
+                });
+            }
+        }
+        self.execute_typed_state_transitions(current_commit_id, desired_commit_id, transitions)
+            .await
+    }
+
+    async fn execute_typed_state_transitions(
+        &mut self,
+        current_commit_id: CommitId,
+        desired_commit_id: CommitId,
+        transitions: Vec<TypedStateTransition>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        if transitions.is_empty() {
+            return Err(empty_state_transition(current_commit_id, desired_commit_id));
+        }
+        let branch_id = self.active_branch_id.clone();
+        let rows_affected = transitions.len() as u64;
+        let mut rows = RawWriteBatch::with_capacity(transitions.len());
+        for transition in transitions {
+            if transition.expected_change_id
+                == transition.target.as_ref().map(|target| target.change_id)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "typed tracked-state transition contains an unchanged row",
+                ));
+            }
+            let (snapshot, metadata) = match transition.target {
+                Some(target) => (
+                    parse_materialized_diff_json(
+                        target.snapshot_content,
+                        "typed state transition target",
+                    )?,
+                    parse_materialized_diff_json(
+                        target.metadata,
+                        "typed state transition target metadata",
+                    )?,
+                ),
+                None => (None, None),
+            };
+            rows.push(TransactionWriteRow {
+                entity_pk: Some(transition.identity.entity_pk),
+                schema_key: transition.identity.schema_key.into(),
+                file_id: transition.identity.file_id.map(Into::into),
+                snapshot,
+                metadata,
+                origin: None,
+                created_at: None,
+                updated_at: None,
+                global: false,
+                change_id: None,
+                commit_id: None,
+                untracked: false,
+                branch_id: branch_id.clone().into(),
+            });
+        }
+        self.stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Replace,
+            rows,
+        })
+        .await?;
+        Ok(crate::sql2::DiffCommandOutcome {
+            rows_affected,
+            commit_id: self
+                .staged_writes
+                .commit_id_for_branch(&branch_id)?
+                .map(|commit_id| commit_id.to_string()),
+        })
+    }
+
     async fn execute_apply_or_revert(
         &mut self,
         command: DiffCommand,
@@ -7184,6 +7412,13 @@ fn stale_or_unknown_diff_id() -> LixError {
     LixError::new(
         LixError::CODE_CONSTRAINT_VIOLATION,
         "stale or unknown diff_id; re-evaluate the source diff and retry",
+    )
+}
+
+fn empty_state_transition(current: CommitId, desired: CommitId) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("tracked-state transition from '{current}' to '{desired}' is empty"),
     )
 }
 

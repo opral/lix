@@ -32,7 +32,7 @@ use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct Engine<StorageImpl: Storage = crate::storage_adapter::Memory> {
+pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
     storage: StorageAdapter<StorageImpl>,
     tracked_state: Arc<TrackedStateContext>,
     live_state: Arc<LiveStateContext>,
@@ -42,7 +42,7 @@ pub struct Engine<StorageImpl: Storage = crate::storage_adapter::Memory> {
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
-    commit_coordinator: Arc<CommitCoordinator>,
+    commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     observe_coordinator: Arc<ObserveCoordinator>,
     observe_invalidation: Arc<ObserveInvalidation>,
     plugin_host: PluginRuntimeHost,
@@ -173,9 +173,11 @@ where
         // overlay for writes.
 
         let collaboration_write_gate = Arc::new(tokio::sync::Mutex::new(()));
-        let commit_coordinator = Arc::new(CommitCoordinator::new(Arc::clone(
-            &collaboration_write_gate,
-        )));
+        let observe_invalidation = Arc::new(ObserveInvalidation::new());
+        let commit_coordinator = Arc::new(CommitCoordinator::new(
+            Arc::clone(&collaboration_write_gate),
+            Arc::clone(&observe_invalidation),
+        ));
         Ok(Self {
             binary_cas: Arc::new(BinaryCasContext::new()),
             storage,
@@ -188,7 +190,7 @@ where
             collaboration_write_gate,
             commit_coordinator,
             observe_coordinator: Arc::new(ObserveCoordinator::new()),
-            observe_invalidation: Arc::new(ObserveInvalidation::new()),
+            observe_invalidation,
             plugin_host,
             telemetry: options.telemetry,
         })
@@ -454,8 +456,8 @@ mod tests {
         let storage_adapter = StorageAdapter::new(storage.clone());
         let mut writes = storage_adapter.new_write_set();
         let predecessor_spaces = [
-            StorageSpace::new(StorageSpaceId(0x0001_0002), "untracked_state.row.v1"),
-            StorageSpace::new(
+            StorageSpace::mutable(StorageSpaceId(0x0001_0002), "untracked_state.row.v1"),
+            StorageSpace::mutable(
                 StorageSpaceId(0x0004_0005),
                 "live_state.index.branch_root.v1",
             ),
@@ -513,7 +515,7 @@ mod tests {
     async fn predecessor_only_repository_is_uninitialized_and_untouched() {
         let storage = Memory::new();
         let storage_adapter = StorageAdapter::new(storage.clone());
-        let predecessor_space = StorageSpace::new(
+        let predecessor_space = StorageSpace::mutable(
             StorageSpaceId(0x0004_0005),
             "live_state.index.branch_root.v1",
         );

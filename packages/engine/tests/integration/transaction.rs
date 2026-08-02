@@ -1231,15 +1231,27 @@ struct BlockingCommitWrite {
 }
 
 impl StorageWrite for BlockingCommitWrite {
-    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), StorageError> {
+    async fn put_many(
+        &mut self,
+        space: lix_engine::storage::StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
         self.inner.put_many(space, entries).await
     }
 
-    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), StorageError> {
+    async fn delete_many(
+        &mut self,
+        space: lix_engine::storage::StorageSpace,
+        keys: &[Key],
+    ) -> Result<(), StorageError> {
         self.inner.delete_many(space, keys).await
     }
 
-    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), StorageError> {
+    async fn delete_range(
+        &mut self,
+        space: lix_engine::storage::StorageSpace,
+        range: KeyRange,
+    ) -> Result<(), StorageError> {
         self.inner.delete_range(space, range).await
     }
 
@@ -1413,7 +1425,7 @@ impl StorageRead for RecordingRead {
 
     async fn scan(
         &self,
-        space: SpaceId,
+        space: lix_engine::storage::StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {
@@ -1423,16 +1435,28 @@ impl StorageRead for RecordingRead {
 }
 
 impl StorageWrite for RecordingWrite {
-    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), StorageError> {
+    async fn put_many(
+        &mut self,
+        space: lix_engine::storage::StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
         self.fail_if_space_matches(space)?;
         self.inner.put_many(space, entries).await
     }
 
-    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), StorageError> {
+    async fn delete_many(
+        &mut self,
+        space: lix_engine::storage::StorageSpace,
+        keys: &[Key],
+    ) -> Result<(), StorageError> {
         self.inner.delete_many(space, keys).await
     }
 
-    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), StorageError> {
+    async fn delete_range(
+        &mut self,
+        space: lix_engine::storage::StorageSpace,
+        range: KeyRange,
+    ) -> Result<(), StorageError> {
         self.inner.delete_range(space, range).await
     }
 
@@ -1448,10 +1472,13 @@ impl StorageWrite for RecordingWrite {
 }
 
 impl RecordingWrite {
-    fn fail_if_space_matches(&self, space: SpaceId) -> Result<(), StorageError> {
+    fn fail_if_space_matches(
+        &self,
+        space: lix_engine::storage::StorageSpace,
+    ) -> Result<(), StorageError> {
         if let Some(namespace) = self.fail_write_namespace() {
             if let Some(failing) = namespace_space(&namespace) {
-                if space == failing {
+                if space.id == failing {
                     return Err(forced_write_failure(&namespace));
                 }
             }
@@ -1468,10 +1495,13 @@ impl RecordingWrite {
 }
 
 impl RecordingRead {
-    fn fail_if_space_matches(&self, space: SpaceId) -> Result<(), StorageError> {
+    fn fail_if_space_matches(
+        &self,
+        space: lix_engine::storage::StorageSpace,
+    ) -> Result<(), StorageError> {
         if let Some(namespace) = self.fail_read_namespace() {
             if let Some(failing) = namespace_space(&namespace) {
-                if space == failing {
+                if space.id == failing {
                     return Err(forced_read_failure(&namespace));
                 }
             }

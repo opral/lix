@@ -1,9 +1,9 @@
 use bytes::Bytes;
 
-use crate::storage::{Key, PutBatch, PutEntry, SpaceId, StoredValue};
+use crate::storage::{Key, PutBatch, PutEntry, SpaceId, StorageSpace, StoredValue};
 
-pub fn space(id: u32) -> SpaceId {
-    SpaceId(id)
+pub fn space(id: u32) -> StorageSpace {
+    StorageSpace::mutable(SpaceId(id), "storage.conformance")
 }
 
 pub fn key(bytes: impl AsRef<[u8]>) -> Key {

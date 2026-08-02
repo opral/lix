@@ -3,12 +3,13 @@ use crate::storage::conformance::{
     fixtures::{full_put, key, put_batch, space},
 };
 use crate::storage::{
-    GetOptions, ProjectedValue, ReadOptions, SpaceId, Storage, StorageWrite, WriteOptions,
+    GetOptions, ProjectedValue, ReadOptions, SpaceId, Storage, StorageSpace, StorageWrite,
+    WriteOptions,
 };
 
 /// Single space used by these fixtures; cross-space isolation is pinned
 /// by the baseline cross-space tests.
-const TEST_SPACE: SpaceId = SpaceId(7);
+const TEST_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(7), "storage.persistence.test");
 
 pub(crate) async fn register<F>(report: &mut ConformanceReport, factory: &F)
 where
@@ -173,7 +174,7 @@ where
 
 async fn assert_full_values<StorageImpl>(
     storage: &StorageImpl,
-    _test_space: SpaceId,
+    _test_space: StorageSpace,
     expected: &[(crate::storage::Key, Option<&str>)],
 ) -> ConformanceResult
 where
