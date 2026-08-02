@@ -8247,10 +8247,7 @@ where
                 ))
                 .await?
         } else {
-            rows.into_dense_insert_prepared(
-                self.origin_key.as_ref(),
-                self.functions.call_timestamp(),
-            )?
+            rows.into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
         };
         if prepared.len() != row_count {
             return Err(LixError::new(
@@ -8313,7 +8310,7 @@ where
                 ))
                 .await?
         } else {
-            rows.into_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
+            rows.into_dense_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
         };
         if prepared.len() != row_count {
             return Err(LixError::new(

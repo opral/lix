@@ -449,7 +449,7 @@ fn row_local_certificates_cover_validation(staged_rows: &[PreparedValidationRow<
 /// and BTreeMap entry per row only to discover every schema scope can skip
 /// validation independently.
 pub(crate) fn prepared_tracked_rows_have_row_local_certificates(rows: &PreparedStateBatch) -> bool {
-    if let Some((facts, schema_key, _branch_id)) = rows.dense_certified_insert_summary() {
+    if let Some((facts, schema_key, _branch_id)) = rows.dense_certified_parameter_summary() {
         return !rows.is_empty()
             && facts.row_content_validated
             && !facts.requires_transaction_validation
@@ -1386,8 +1386,9 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
     live_state: &dyn LiveStateReader,
     prepared_writes: &PreparedWriteSet,
 ) -> Result<(), LixError> {
-    if let Some((_facts, schema_key, branch_id)) =
-        prepared_writes.state_rows.dense_certified_insert_summary()
+    if let Some((_facts, schema_key, branch_id)) = prepared_writes
+        .state_rows
+        .dense_certified_parameter_summary()
         && prepared_writes
             .insert_selection
             .is_complete_ordinal_selection(prepared_writes.state_rows.len())

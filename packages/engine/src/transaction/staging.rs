@@ -1291,11 +1291,12 @@ impl TransactionWriteBuffer {
         statement_indices: Option<&[u32]>,
     ) -> Result<AppendOnlyStage, LixError> {
         let inserts = mode == Some(TransactionWriteMode::Insert);
-        let certified_ordered_insert = inserts && rows.certified_ordered_insert();
+        let certified_tracked_keys_strictly_ordered =
+            inserts && rows.certified_tracked_keys_strictly_ordered();
         if !matches!(
             mode,
             Some(TransactionWriteMode::Replace | TransactionWriteMode::Insert)
-        ) || (!certified_ordered_insert
+        ) || (!certified_tracked_keys_strictly_ordered
             && inserts
             && !rows
                 .iter()
@@ -1317,7 +1318,7 @@ impl TransactionWriteBuffer {
         else {
             return Ok(AppendOnlyStage::Fallback(rows));
         };
-        let append_shape_matches = if certified_ordered_insert {
+        let append_shape_matches = if certified_tracked_keys_strictly_ordered {
             rows.first().is_none_or(|first| {
                 is_normal_tracked_append_row(first)
                     && first.snapshot.is_some()
@@ -1357,7 +1358,7 @@ impl TransactionWriteBuffer {
             change_refs.add_change_count(rows.len());
             rows.set_commit_id_all(commit_id);
         }
-        if certified_ordered_insert {
+        if certified_tracked_keys_strictly_ordered {
             insert_selection.push_certified_ordinal_inserts(rows.len());
         } else {
             insert_selection.reserve_rows(rows.len(), inserts);

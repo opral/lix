@@ -553,7 +553,7 @@ impl CertifiedParameterBatch {
         )
     }
 
-    pub(crate) fn into_dense_insert_prepared(
+    pub(crate) fn into_dense_prepared(
         self,
         origin_key: Option<&SharedStr>,
         timestamp: LixTimestamp,
@@ -602,7 +602,7 @@ impl CertifiedParameterBatch {
             .collect();
         Ok(PreparedStateBatch {
             slots: Vec::new(),
-            dense_certified_insert: Some(DenseCertifiedInsertSlots {
+            dense_certified_parameter: Some(DenseCertifiedParameterSlots {
                 len: row_count,
                 schema_plan_id: certificate.schema_plan_id,
                 facts: certificate.facts,
@@ -622,94 +622,7 @@ impl CertifiedParameterBatch {
             origin_index: HashMap::new(),
             origin_column_sets: Vec::new(),
             origin_column_index: HashMap::new(),
-            certified_ordered_insert: certificate.tracked_keys_strictly_ordered,
-            certified_complete_collection_replacement: certificate.complete_collection_replacement,
-        })
-    }
-
-    pub(crate) fn into_prepared(
-        self,
-        origin_key: Option<&SharedStr>,
-        timestamp: LixTimestamp,
-    ) -> Result<PreparedStateBatch, LixError> {
-        let Self {
-            entity_pks,
-            snapshots,
-            schema_key,
-            branch_id,
-            certificate,
-        } = self;
-        let row_count = entity_pks.len();
-        let (mut strings, schema_key_ordinal, branch_id_ordinal) = if schema_key == branch_id {
-            (vec![schema_key], 0_u32, 0_u32)
-        } else {
-            (vec![schema_key, branch_id], 0_u32, 1_u32)
-        };
-        let origin_key = origin_key.map(|value| {
-            if let Some(ordinal) = strings.iter().position(|candidate| candidate == value) {
-                return u32::try_from(ordinal)
-                    .expect("certified replacement string dictionary must fit u32");
-            }
-            let ordinal = u32::try_from(strings.len())
-                .expect("certified replacement string dictionary must fit u32");
-            strings.push(value.clone());
-            ordinal
-        });
-        let mut prepared_slots = Vec::with_capacity(row_count);
-        let mut json = Vec::with_capacity(row_count);
-        for (row_index, snapshot) in snapshots.into_iter().enumerate() {
-            json.push(stage_json_from_value(
-                snapshot,
-                "certified replacement snapshot_content",
-            )?);
-            let ordinal =
-                u32::try_from(row_index).expect("certified replacement row ordinal must fit u32");
-            prepared_slots.push(PreparedStateSlot {
-                schema_plan_id: certificate.schema_plan_id,
-                facts: certificate.facts,
-                entity_pk: ordinal,
-                schema_key: schema_key_ordinal,
-                file_id: None,
-                snapshot: Some(ordinal),
-                metadata: None,
-                origin: None,
-                origin_key,
-                created_at: timestamp,
-                updated_at: timestamp,
-                global: false,
-                change_id: Some(ChangeId::default()),
-                addressable_change_id: true,
-                commit_id: None,
-                untracked: false,
-                branch_id: branch_id_ordinal,
-                durable_predecessor: None,
-            });
-        }
-        let string_index = strings
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(ordinal, value)| {
-                (
-                    value,
-                    u32::try_from(ordinal)
-                        .expect("certified replacement string dictionary must fit u32"),
-                )
-            })
-            .collect();
-        Ok(PreparedStateBatch {
-            slots: prepared_slots,
-            dense_certified_insert: None,
-            entity_pks,
-            strings,
-            string_index,
-            json,
-            durable_predecessors: Vec::new(),
-            origins: Vec::new(),
-            origin_index: HashMap::new(),
-            origin_column_sets: Vec::new(),
-            origin_column_index: HashMap::new(),
-            certified_ordered_insert: certificate.tracked_keys_strictly_ordered,
+            certified_tracked_keys_strictly_ordered: certificate.tracked_keys_strictly_ordered,
             certified_complete_collection_replacement: certificate.complete_collection_replacement,
         })
     }
@@ -1154,7 +1067,7 @@ impl RawWriteBatch {
         }
         Ok(PreparedStateBatch {
             slots: prepared_slots,
-            dense_certified_insert: None,
+            dense_certified_parameter: None,
             entity_pks: prepared_entity_pks,
             strings,
             string_index,
@@ -1164,7 +1077,7 @@ impl RawWriteBatch {
             origin_index: HashMap::new(),
             origin_column_sets: Vec::new(),
             origin_column_index: HashMap::new(),
-            certified_ordered_insert: certificate.tracked_keys_strictly_ordered,
+            certified_tracked_keys_strictly_ordered: certificate.tracked_keys_strictly_ordered,
             certified_complete_collection_replacement: certificate.complete_collection_replacement,
         })
     }
@@ -2578,10 +2491,10 @@ impl TestPreparedStateRow {
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedStateBatch {
     slots: Vec<PreparedStateSlot>,
-    /// Fixed-shape certified INSERTs keep batch-common facts once and derive
-    /// identity/JSON ordinals from the row position. Any operation that needs
-    /// row-local topology expands this representation into `slots`.
-    dense_certified_insert: Option<DenseCertifiedInsertSlots>,
+    /// Fixed-shape certified parameter writes keep batch-common facts once and
+    /// derive identity/JSON ordinals from row position. Any operation that
+    /// needs row-local topology expands this representation into `slots`.
+    dense_certified_parameter: Option<DenseCertifiedParameterSlots>,
     entity_pks: Vec<EntityPk>,
     strings: Vec<SharedStr>,
     string_index: HashMap<SharedStr, u32>,
@@ -2591,9 +2504,9 @@ pub(crate) struct PreparedStateBatch {
     origin_index: HashMap<TransactionWriteOrigin, u32>,
     origin_column_sets: Vec<Arc<[String]>>,
     origin_column_index: HashMap<Arc<[String]>, u32>,
-    /// The typed producer proved one strictly ordered, unique, ordinary
-    /// tracked INSERT batch. Any row topology change clears this proof.
-    certified_ordered_insert: bool,
+    /// The typed producer proved strictly ordered, unique tracked keys. Any
+    /// row topology change clears this proof.
+    certified_tracked_keys_strictly_ordered: bool,
     /// A typed producer proved this batch replaces every live row in one
     /// tracked, unfiled collection under the transaction's branch snapshot.
     certified_complete_collection_replacement: bool,
@@ -2624,7 +2537,7 @@ struct PreparedStateSlot {
 }
 
 #[derive(Debug, Clone)]
-struct DenseCertifiedInsertSlots {
+struct DenseCertifiedParameterSlots {
     len: usize,
     schema_plan_id: SchemaPlanId,
     facts: PreparedRowFacts,
@@ -2697,7 +2610,7 @@ impl PreparedStateBatch {
     ) -> Self {
         Self {
             slots: Vec::with_capacity(row_capacity),
-            dense_certified_insert: None,
+            dense_certified_parameter: None,
             entity_pks: Vec::with_capacity(row_capacity),
             // Most bulk batches share schema, branch, and origin descriptors;
             // file ids are the only commonly row-cardinal string. Reserving
@@ -2715,13 +2628,13 @@ impl PreparedStateBatch {
             origin_index: HashMap::new(),
             origin_column_sets: Vec::new(),
             origin_column_index: HashMap::new(),
-            certified_ordered_insert: false,
+            certified_tracked_keys_strictly_ordered: false,
             certified_complete_collection_replacement: false,
         }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.dense_certified_insert
+        self.dense_certified_parameter
             .as_ref()
             .map_or_else(|| self.slots.len(), |dense| dense.len)
     }
@@ -2730,8 +2643,8 @@ impl PreparedStateBatch {
         self.len() == 0
     }
 
-    pub(crate) fn certified_ordered_insert(&self) -> bool {
-        self.certified_ordered_insert
+    pub(crate) fn certified_tracked_keys_strictly_ordered(&self) -> bool {
+        self.certified_tracked_keys_strictly_ordered
     }
 
     pub(crate) fn certified_complete_collection_replacement(&self) -> bool {
@@ -2751,7 +2664,7 @@ impl PreparedStateBatch {
     }
 
     pub(crate) fn get(&self, index: usize) -> Option<PreparedStateRowRef<'_>> {
-        if let Some(dense) = &self.dense_certified_insert {
+        if let Some(dense) = &self.dense_certified_parameter {
             if index >= dense.len {
                 return None;
             }
@@ -2910,7 +2823,7 @@ impl PreparedStateBatch {
         untracked: bool,
         branch_id: SharedStr,
     ) {
-        self.expand_dense_certified_insert();
+        self.expand_dense_certified_parameter();
         let entity_pk = self.push_entity_pk(entity_pk);
         let schema_key = self.intern_string(schema_key);
         let file_id = file_id.map(|value| self.intern_string(value));
@@ -2941,8 +2854,8 @@ impl PreparedStateBatch {
         });
     }
 
-    fn expand_dense_certified_insert(&mut self) {
-        let Some(dense) = self.dense_certified_insert.take() else {
+    fn expand_dense_certified_parameter(&mut self) {
+        let Some(dense) = self.dense_certified_parameter.take() else {
             return;
         };
         debug_assert!(self.slots.is_empty());
@@ -2950,8 +2863,8 @@ impl PreparedStateBatch {
         debug_assert_eq!(self.json.len(), dense.len);
         self.slots.reserve(dense.len);
         for row_index in 0..dense.len {
-            let ordinal =
-                u32::try_from(row_index).expect("dense certified INSERT row ordinal must fit u32");
+            let ordinal = u32::try_from(row_index)
+                .expect("dense certified parameter row ordinal must fit u32");
             self.slots.push(PreparedStateSlot {
                 schema_plan_id: dense.schema_plan_id,
                 facts: dense.facts,
@@ -2987,7 +2900,7 @@ impl PreparedStateBatch {
         row: usize,
         value: Option<CertifiedCurrentStatePredecessor>,
     ) {
-        self.expand_dense_certified_insert();
+        self.expand_dense_certified_parameter();
         self.slots[row].durable_predecessor = value.map(|value| {
             let index = u32::try_from(self.durable_predecessors.len())
                 .expect("prepared durable predecessor column must fit u32");
@@ -3005,9 +2918,9 @@ impl PreparedStateBatch {
             *self = other;
             return;
         }
-        self.expand_dense_certified_insert();
-        other.expand_dense_certified_insert();
-        self.certified_ordered_insert = false;
+        self.expand_dense_certified_parameter();
+        other.expand_dense_certified_parameter();
+        self.certified_tracked_keys_strictly_ordered = false;
         self.certified_complete_collection_replacement = false;
         let entity_base =
             u32::try_from(self.entity_pks.len()).expect("prepared entity column must fit u32");
@@ -3074,8 +2987,8 @@ impl PreparedStateBatch {
     }
 
     pub(crate) fn swap_rows(&mut self, left: usize, right: usize) {
-        self.expand_dense_certified_insert();
-        self.certified_ordered_insert = false;
+        self.expand_dense_certified_parameter();
+        self.certified_tracked_keys_strictly_ordered = false;
         self.certified_complete_collection_replacement = false;
         self.slots.swap(left, right);
     }
@@ -3085,7 +2998,7 @@ impl PreparedStateBatch {
     /// Only compact slots move; typed owner columns remain stable and are
     /// still shared by the selected row ordinals.
     pub(crate) fn select_rows(&mut self, source_by_destination: &[usize]) {
-        if self.dense_certified_insert.is_some()
+        if self.dense_certified_parameter.is_some()
             && source_by_destination.len() == self.len()
             && source_by_destination
                 .iter()
@@ -3094,8 +3007,8 @@ impl PreparedStateBatch {
         {
             return;
         }
-        self.expand_dense_certified_insert();
-        self.certified_ordered_insert = false;
+        self.expand_dense_certified_parameter();
+        self.certified_tracked_keys_strictly_ordered = false;
         self.certified_complete_collection_replacement = false;
         debug_assert!(
             source_by_destination
@@ -3138,12 +3051,12 @@ impl PreparedStateBatch {
     /// Unlike `select_rows`, this path allocates no O(live_rows) permutation
     /// buffers. Generic staging uses it for sparse point replacements.
     pub(crate) fn truncate_rows(&mut self, retained_len: usize) {
-        if self.dense_certified_insert.is_some() && retained_len == self.len() {
+        if self.dense_certified_parameter.is_some() && retained_len == self.len() {
             return;
         }
-        self.expand_dense_certified_insert();
+        self.expand_dense_certified_parameter();
         if retained_len != self.slots.len() {
-            self.certified_ordered_insert = false;
+            self.certified_tracked_keys_strictly_ordered = false;
             self.certified_complete_collection_replacement = false;
         }
         self.slots.truncate(retained_len);
@@ -3158,12 +3071,12 @@ impl PreparedStateBatch {
     }
 
     pub(crate) fn set_commit_id(&mut self, index: usize, commit_id: Option<CommitId>) {
-        self.expand_dense_certified_insert();
+        self.expand_dense_certified_parameter();
         self.slots[index].commit_id = commit_id;
     }
 
     pub(crate) fn set_commit_id_all(&mut self, commit_id: CommitId) {
-        if let Some(dense) = &mut self.dense_certified_insert {
+        if let Some(dense) = &mut self.dense_certified_parameter {
             dense.commit_id = Some(commit_id);
             return;
         }
@@ -3173,7 +3086,7 @@ impl PreparedStateBatch {
     }
 
     pub(crate) fn set_change_id(&mut self, index: usize, change_id: Option<ChangeId>) {
-        self.expand_dense_certified_insert();
+        self.expand_dense_certified_parameter();
         self.slots[index].change_id = change_id;
     }
 
@@ -3188,7 +3101,7 @@ impl PreparedStateBatch {
                 "ordered commit-delta assignment count changed during staging",
             ));
         }
-        if let Some(dense) = &mut self.dense_certified_insert
+        if let Some(dense) = &mut self.dense_certified_parameter
             && row_indices.len() == dense.len
             && row_indices
                 .iter()
@@ -3205,7 +3118,7 @@ impl PreparedStateBatch {
     }
 
     pub(crate) fn release_validated_canonical_value_columns(&mut self) {
-        if let Some(dense) = &self.dense_certified_insert {
+        if let Some(dense) = &self.dense_certified_parameter {
             debug_assert_eq!(dense.len, self.json.len());
         } else {
             let live_json_count = self
@@ -3311,8 +3224,10 @@ impl PreparedStateBatch {
         self.slots.as_ptr().cast()
     }
 
-    pub(crate) fn dense_certified_insert_summary(&self) -> Option<(PreparedRowFacts, &str, &str)> {
-        let dense = self.dense_certified_insert.as_ref()?;
+    pub(crate) fn dense_certified_parameter_summary(
+        &self,
+    ) -> Option<(PreparedRowFacts, &str, &str)> {
+        let dense = self.dense_certified_parameter.as_ref()?;
         Some((
             dense.facts,
             self.strings[dense.schema_key as usize].as_str(),
@@ -3321,8 +3236,8 @@ impl PreparedStateBatch {
     }
 
     #[cfg(test)]
-    pub(crate) fn is_dense_certified_insert(&self) -> bool {
-        self.dense_certified_insert.is_some()
+    pub(crate) fn is_dense_certified_parameter(&self) -> bool {
+        self.dense_certified_parameter.is_some()
     }
 
     #[cfg(test)]
@@ -3340,7 +3255,7 @@ impl PreparedStateBatch {
         index: usize,
         requires_transaction_validation: bool,
     ) {
-        self.expand_dense_certified_insert();
+        self.expand_dense_certified_parameter();
         self.slots[index].facts.requires_transaction_validation = requires_transaction_validation;
     }
 
@@ -3975,10 +3890,10 @@ mod tests {
             certificate,
         )
         .expect("certified rows should construct")
-        .into_dense_insert_prepared(None, timestamp)
+        .into_dense_prepared(None, timestamp)
         .expect("certified rows should prepare");
 
-        assert!(prepared.is_dense_certified_insert());
+        assert!(prepared.is_dense_certified_parameter());
         assert!(prepared.slots.is_empty());
         assert_eq!(prepared.len(), 2);
         assert_eq!(prepared.first().unwrap().entity_pk, &EntityPk::single("a"));
@@ -4014,13 +3929,57 @@ mod tests {
         );
 
         prepared.set_requires_transaction_validation(0, true);
-        assert!(!prepared.is_dense_certified_insert());
+        assert!(!prepared.is_dense_certified_parameter());
         assert_eq!(prepared.slots.len(), 2);
         assert!(prepared.row(0).facts.requires_transaction_validation);
         assert!(!prepared.row(1).facts.requires_transaction_validation);
         assert_eq!(prepared.row(1).commit_id, Some(commit_id));
         assert_eq!(prepared.row(0).change_id, Some(assigned[0]));
         assert_eq!(prepared.row(1).change_id, Some(assigned[1]));
+    }
+
+    #[test]
+    fn certified_replacement_keeps_dense_complete_collection_proof() {
+        let snapshots = [r#"{"id":"a"}"#, r#"{"id":"b"}"#]
+            .into_iter()
+            .map(|value| {
+                TransactionJson::from_certified_shared_normalized_row_content(value.into())
+            })
+            .collect::<Vec<_>>();
+        let mut prepared = CertifiedParameterReplacementBatch::new(
+            vec![EntityPk::single("a"), EntityPk::single("b")],
+            snapshots,
+            "dense_replacement".into(),
+            "main".into(),
+            CertifiedRawWriteBatchPreparation {
+                schema_plan_id: SchemaPlanId::for_test(8),
+                facts: PreparedRowFacts {
+                    row_content_validated: true,
+                    requires_transaction_validation: false,
+                },
+                tracked_keys_strictly_ordered: true,
+                complete_collection_replacement: true,
+            },
+        )
+        .expect("certified replacement should construct")
+        .into_dense_prepared(
+            None,
+            LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z"),
+        )
+        .expect("certified replacement should prepare");
+
+        assert!(prepared.is_dense_certified_parameter());
+        assert!(prepared.certified_complete_collection_replacement());
+        assert!(prepared.certified_tracked_keys_strictly_ordered());
+        prepared.truncate_rows(2);
+        assert!(prepared.is_dense_certified_parameter());
+        assert!(prepared.certified_complete_collection_replacement());
+
+        prepared.truncate_rows(1);
+        assert!(!prepared.is_dense_certified_parameter());
+        assert!(!prepared.certified_complete_collection_replacement());
+        assert!(!prepared.certified_tracked_keys_strictly_ordered());
+        assert_eq!(prepared.row(0).entity_pk, &EntityPk::single("a"));
     }
 
     #[test]
