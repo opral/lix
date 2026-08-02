@@ -118,10 +118,10 @@ use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
 use crate::transaction::types::{
-    CertifiedParameterReplacementBatch, PreparedRowFacts, PreparedStateBatch,
-    PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef, StagedCommitChangeBatch,
-    StagedCommitChangeBatchBuilder, TransactionFileData, TransactionJson, TransactionWrite,
-    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
+    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
+    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileData, TransactionJson,
+    TransactionWrite, TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteOutcome, TransactionWriteRow, canonicalize_transaction_json_batch,
     stage_json_from_value,
 };
@@ -1848,7 +1848,7 @@ where
     /// preflight. The producer certificate excludes every system column those
     /// generic passes inspect; committed and transaction-local INSERT
     /// collision checks remain in the normal prepared journal.
-    async fn stage_certified_parameter_batch_insert(
+    async fn stage_certified_raw_parameter_batch_insert(
         &mut self,
         rows: RawWriteBatch,
     ) -> Result<TransactionWriteOutcome, LixError> {
@@ -8184,7 +8184,7 @@ where
         rows: RawWriteBatch,
     ) -> Result<TransactionWriteOutcome, LixError> {
         if rows.certified_preparation().is_some() {
-            return Box::pin(self.stage_certified_parameter_batch_insert(rows)).await;
+            return Box::pin(self.stage_certified_raw_parameter_batch_insert(rows)).await;
         }
         let statement_indices = (0..rows.len())
             .map(|index| {
@@ -8205,6 +8205,66 @@ where
             statement_indices,
         )
         .await
+    }
+
+    async fn stage_certified_parameter_batch_insert(
+        &mut self,
+        rows: CertifiedParameterInsertBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        let row_count = rows.len();
+        if row_count == 0 {
+            return Ok(TransactionWriteOutcome { count: 0 });
+        }
+        self.ensure_plugin_generation_read_guard().await;
+
+        let branch_id = rows.schema_scope_branch_id().to_owned();
+        let schema_key = rows.schema_key().to_owned();
+        let staged = self.staged_writes.staging_overlay()?;
+        if StagedLiveStateRows::collection_replaced(&staged, &branch_id, &schema_key, None)? {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!("collection '{schema_key}' was deleted earlier in this transaction"),
+            )
+            .with_hint(
+                "Commit the collection deletion before recreating rows in its next generation.",
+            ));
+        }
+
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_transaction_rows_staged(row_count);
+            crate::storage_bench::record_transaction_untracked_rows(0);
+        }
+        let domain = Domain::schema_catalog(branch_id, false);
+        let prepared = if self
+            .staged_writes
+            .has_staged_schema_catalog_change(&domain)?
+        {
+            self.prepare_transaction_rows(rows.into_raw()?)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.transaction_prepare_rows"
+                ))
+                .await?
+        } else {
+            rows.into_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
+        };
+        if prepared.len() != row_count {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified parameter INSERT preparation changed row cardinality",
+            ));
+        }
+        tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage").in_scope(
+            || {
+                self.staged_writes.stage_certified_parameter_batch_insert(
+                    PreparedTransactionWrite::Rows {
+                        mode: TransactionWriteMode::Insert,
+                        rows: prepared,
+                    },
+                )
+            },
+        )
     }
 
     async fn stage_parameter_batch_replace(

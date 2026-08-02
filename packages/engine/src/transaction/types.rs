@@ -487,14 +487,14 @@ pub(crate) struct CertifiedRawWriteBatchPreparation {
     pub(crate) complete_collection_replacement: bool,
 }
 
-/// Dense, typed replacement columns produced by the certified SQL batch path.
+/// Dense, typed columns produced by certified SQL parameter-batch paths.
 ///
 /// Keeping this transport separate from [`RawWriteBatch`] avoids allocating
 /// raw nullable/system columns only for transaction preparation to dismantle
 /// them immediately. The transaction either lowers these columns directly or
 /// explicitly converts them to raw rows when a transaction-local schema
 /// change invalidates the certificate.
-pub(crate) struct CertifiedParameterReplacementBatch {
+pub(crate) struct CertifiedParameterBatch {
     entity_pks: Vec<EntityPk>,
     snapshots: Vec<TransactionJson>,
     schema_key: SharedStr,
@@ -502,7 +502,7 @@ pub(crate) struct CertifiedParameterReplacementBatch {
     certificate: CertifiedRawWriteBatchPreparation,
 }
 
-impl CertifiedParameterReplacementBatch {
+impl CertifiedParameterBatch {
     pub(crate) fn new(
         entity_pks: Vec<EntityPk>,
         snapshots: Vec<TransactionJson>,
@@ -539,8 +539,12 @@ impl CertifiedParameterReplacementBatch {
         self.branch_id.as_str()
     }
 
+    pub(crate) fn schema_key(&self) -> &str {
+        self.schema_key.as_str()
+    }
+
     pub(crate) fn into_raw(self) -> Result<RawWriteBatch, LixError> {
-        RawWriteBatch::from_certified_parameter_replacement(
+        RawWriteBatch::from_certified_parameter_rows(
             self.entity_pks,
             self.snapshots,
             self.schema_key,
@@ -638,6 +642,9 @@ impl CertifiedParameterReplacementBatch {
     }
 }
 
+pub(crate) type CertifiedParameterInsertBatch = CertifiedParameterBatch;
+pub(crate) type CertifiedParameterReplacementBatch = CertifiedParameterBatch;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RawWriteRowRef<'a> {
     pub(crate) entity_pk: Option<&'a EntityPk>,
@@ -698,25 +705,6 @@ impl RawWriteBatch {
             #[cfg(test)]
             origin_promotions: 0,
         }
-    }
-
-    /// Constructs the fixed-shape public INSERT ingress batch without
-    /// interning the same schema/branch pair and appending seven null system
-    /// columns once per row.
-    pub(crate) fn from_certified_parameter_insert(
-        entity_pks: Vec<EntityPk>,
-        snapshots: Vec<TransactionJson>,
-        schema_key: SharedStr,
-        branch_id: SharedStr,
-        certificate: CertifiedRawWriteBatchPreparation,
-    ) -> Result<Self, LixError> {
-        Self::from_certified_parameter_rows(
-            entity_pks,
-            snapshots,
-            schema_key,
-            branch_id,
-            certificate,
-        )
     }
 
     /// Constructs a fixed-shape, complete tracked replacement batch.

@@ -4916,6 +4916,9 @@ mod tests {
 
     #[tokio::test]
     async fn certified_parameter_batch_revalidates_after_staged_schema_amendment() {
+        // Keep this at the production typed-transport boundary. A separate
+        // route-selection unit test pins the threshold itself.
+        const ROW_COUNT: usize = 32 * 1024;
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4961,22 +4964,15 @@ mod tests {
             .expect("compatible schema amendment should stage");
 
         let sql = "INSERT INTO amended_parameter_insert_probe (id, value) VALUES ($1, $2)";
-        let statements = [
-            ExecuteBatchStatement {
+        let statements = (0..ROW_COUNT)
+            .map(|index| ExecuteBatchStatement {
                 sql: sql.to_string(),
                 params: vec![
-                    Value::Text("a".to_string()),
-                    Value::Text("first".to_string()),
+                    Value::Text(format!("entity-{index:05}")),
+                    Value::Text(format!("value-{index:05}")),
                 ],
-            },
-            ExecuteBatchStatement {
-                sql: sql.to_string(),
-                params: vec![
-                    Value::Text("b".to_string()),
-                    Value::Text("second".to_string()),
-                ],
-            },
-        ];
+            })
+            .collect::<Vec<_>>();
         let parsed = TransactionBatchStatements::Shared {
             statement: sql2::parse_statement(sql).unwrap(),
             len: statements.len(),
@@ -5003,16 +4999,15 @@ mod tests {
 
         let rows = session
             .execute(
-                "SELECT id, source FROM amended_parameter_insert_probe ORDER BY id",
+                "SELECT COUNT(*) AS entries FROM amended_parameter_insert_probe \
+                 WHERE source = 'amended-plan'",
                 &[],
             )
             .await
             .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert!(
-            rows.rows()
-                .iter()
-                .all(|row| row.get::<String>("source").unwrap() == "amended-plan"),
+        assert_eq!(
+            rows.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64,
             "transaction normalization must apply the staged schema's default"
         );
     }

@@ -60,6 +60,8 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 // second tree traversal to sparse non-append writes that already use point
 // reads. Keep those latency-sensitive writes on the unchanged generic path.
 const ORDERED_APPEND_BATCH_MIN_ROWS: usize = 64;
+const STREAMING_DOMINANT_APPEND_MIN_ROWS: usize = 32 * 1024;
+const STREAMING_DOMINANT_APPEND_PARENT_RATIO: u64 = 16;
 // Retain the point cache for latency-sensitive descriptor/registry probes.
 // Above this boundary, per-key cache ownership and duplicate adapters dominate
 // and the arena-backed encoded replay is the intended bulk path.
@@ -68,6 +70,13 @@ const NO_FIRST_PARENT_ORDINAL: u32 = u32::MAX;
 const NO_ROOTLESS_REPLAY_ORDINAL: u32 = u32::MAX;
 const SMALL_FILE_ID_DICTIONARY_CAPACITY: usize = 64;
 const ESTIMATED_FILE_ID_BYTES: usize = 36;
+
+#[cfg(test)]
+thread_local! {
+    static STREAMING_DOMINANT_APPEND_EXECUTIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
 
 #[derive(Clone, Copy)]
 enum FirstParentDiffKeySource {
@@ -3869,8 +3878,27 @@ where
             }
             None => false,
         };
-        let use_borrowed_batch =
-            parent_metadata.is_none() || (append_only && file_delete_cascades.is_empty());
+        // The right-spine patcher is ideal while the durable parent is a
+        // meaningful fraction of the output. For a production-sized append at
+        // least 16x the parent, rebuilding bounds extra parent work to 6.25%
+        // while avoiding mutation arenas and a second owned descriptor vector.
+        let dominant_append = mutation_count >= STREAMING_DOMINANT_APPEND_MIN_ROWS
+            && append_only
+            && file_delete_cascades.is_empty()
+            && parent_metadata.as_ref().is_some_and(|parent_metadata| {
+                mutation_count_u64
+                    >= parent_metadata
+                        .row_count_estimate
+                        .saturating_mul(STREAMING_DOMINANT_APPEND_PARENT_RATIO)
+            });
+        #[cfg(test)]
+        if dominant_append {
+            STREAMING_DOMINANT_APPEND_EXECUTIONS.with(|executions| {
+                executions.set(executions.get().saturating_add(1));
+            });
+        }
+        let use_borrowed_batch = parent_metadata.is_none()
+            || (append_only && file_delete_cascades.is_empty() && !dominant_append);
         // Match the existing full-rebuild threshold for overlapping roots. A
         // parentless batch needs no reads, while an append-only batch is already
         // the patcher's cheapest case and can skip point reads at any batch
@@ -5517,6 +5545,216 @@ mod tests {
                 .await
                 .expect("appended row should load")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn dominant_ordered_append_uses_bounded_parent_merge() {
+        const PARENT_ROWS: usize = 64;
+        const APPENDED_ROWS: usize = STREAMING_DOMINANT_APPEND_MIN_ROWS + 1;
+        STREAMING_DOMINANT_APPEND_EXECUTIONS.with(|executions| executions.set(0));
+
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let parent_commit_id = CommitId::for_test_label("dominant-append-parent").to_string();
+        let child_commit_id = CommitId::for_test_label("dominant-append-child").to_string();
+        let parent_rows = (0..PARENT_ROWS)
+            .map(|index| {
+                row(
+                    &format!("entity-{index:05}"),
+                    &format!("change-parent-{index:05}"),
+                    "dominant-append-parent",
+                )
+            })
+            .collect::<Vec<_>>();
+        let child_rows = (0..APPENDED_ROWS)
+            .map(|index| {
+                row(
+                    &format!("entity-1{index:05}"),
+                    &format!("change-child-{index:05}"),
+                    "dominant-append-child",
+                )
+            })
+            .collect::<Vec<_>>();
+        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let mut writer = tracked_state.writer(&read, &mut writes);
+        writer
+            .stage_commit_root(
+                &parent_commit_id,
+                None,
+                parent_rows.iter().map(delta_from_materialized_row),
+            )
+            .await
+            .expect("parent root should stage");
+        for (claimed_count, actual_count) in [
+            (APPENDED_ROWS, APPENDED_ROWS - 1),
+            (APPENDED_ROWS - 1, APPENDED_ROWS),
+        ] {
+            let error = writer
+                .try_stage_bulk_parent_root_from_ordered_mutations(
+                    &child_commit_id,
+                    Some(&parent_commit_id),
+                    claimed_count,
+                    &first_child_key,
+                    &BTreeMap::new(),
+                    child_rows.iter().take(actual_count).map(|row| {
+                        Ok(TrackedStateRootMutationRef {
+                            delta: delta_from_materialized_row(row),
+                            require_absence: true,
+                        })
+                    }),
+                )
+                .await
+                .expect_err("dominant append must validate its declared mutation count");
+            assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+            assert!(error.message.contains("mutation count mismatch"));
+        }
+        let child_report = writer
+            .try_stage_bulk_parent_root_from_ordered_mutations(
+                &child_commit_id,
+                Some(&parent_commit_id),
+                child_rows.len(),
+                &first_child_key,
+                &BTreeMap::new(),
+                child_rows.iter().map(|row| {
+                    Ok(TrackedStateRootMutationRef {
+                        delta: delta_from_materialized_row(row),
+                        require_absence: true,
+                    })
+                }),
+            )
+            .await
+            .expect("dominant append root should stage")
+            .expect("dominant append should use the ordered bulk path");
+        assert_eq!(child_report.changed_rows, APPENDED_ROWS);
+        STREAMING_DOMINANT_APPEND_EXECUTIONS.with(|executions| {
+            assert_eq!(
+                executions.get(),
+                3,
+                "production-sized dominant appends must use the bounded parent merger"
+            );
+        });
+        drop(writer);
+
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("dominant append root should commit");
+        let committed = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("committed dominant append root should open");
+        for expected in [
+            parent_rows.first().expect("parent fixture has rows"),
+            child_rows.last().expect("append fixture has rows"),
+        ] {
+            assert!(
+                TrackedStateTree::new()
+                    .get(
+                        &committed,
+                        &child_report.root_id,
+                        &TrackedStateKey {
+                            schema_key: expected.schema_key.clone(),
+                            file_id: expected.file_id.clone(),
+                            entity_pk: expected.entity_pk.clone(),
+                        },
+                    )
+                    .await
+                    .expect("merged row should load")
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn substantial_parent_append_preserves_parent_chunks() {
+        const PARENT_ROWS: usize = 4_096;
+        const APPENDED_ROWS: usize = STREAMING_DOMINANT_APPEND_MIN_ROWS;
+        STREAMING_DOMINANT_APPEND_EXECUTIONS.with(|executions| executions.set(0));
+
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let parent_commit_id = CommitId::for_test_label("substantial-append-parent").to_string();
+        let child_commit_id = CommitId::for_test_label("substantial-append-child").to_string();
+        let rebuild_commit_id = CommitId::for_test_label("substantial-append-rebuild").to_string();
+        let parent_rows = (0..PARENT_ROWS)
+            .map(|index| {
+                row(
+                    &format!("entity-{index:05}"),
+                    &format!("change-parent-{index:05}"),
+                    "substantial-append-parent",
+                )
+            })
+            .collect::<Vec<_>>();
+        let child_rows = (0..APPENDED_ROWS)
+            .map(|index| {
+                row(
+                    &format!("entity-1{index:05}"),
+                    &format!("change-child-{index:05}"),
+                    "substantial-append-child",
+                )
+            })
+            .collect::<Vec<_>>();
+        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let mut writer = tracked_state.writer(&read, &mut writes);
+        let _parent_report = writer
+            .stage_commit_root(
+                &parent_commit_id,
+                None,
+                parent_rows.iter().map(delta_from_materialized_row),
+            )
+            .await
+            .expect("parent root should stage");
+        let child_report = writer
+            .try_stage_bulk_parent_root_from_ordered_mutations(
+                &child_commit_id,
+                Some(&parent_commit_id),
+                child_rows.len(),
+                &first_child_key,
+                &BTreeMap::new(),
+                child_rows.iter().map(|row| {
+                    Ok(TrackedStateRootMutationRef {
+                        delta: delta_from_materialized_row(row),
+                        require_absence: true,
+                    })
+                }),
+            )
+            .await
+            .expect("append root should stage")
+            .expect("append should use the ordered bulk path");
+        STREAMING_DOMINANT_APPEND_EXECUTIONS.with(|executions| {
+            assert_eq!(
+                executions.get(),
+                0,
+                "an append below the parent ratio must retain right-spine reuse"
+            );
+        });
+        let rebuild_report = writer
+            .stage_commit_root(
+                &rebuild_commit_id,
+                None,
+                parent_rows
+                    .iter()
+                    .chain(child_rows.iter())
+                    .map(delta_from_materialized_row),
+            )
+            .await
+            .expect("canonical full rebuild should stage");
+        assert!(
+            child_report.primary_chunk_puts < rebuild_report.primary_chunk_puts,
+            "right-spine append should stage fewer chunks than a full output rebuild"
         );
     }
 
