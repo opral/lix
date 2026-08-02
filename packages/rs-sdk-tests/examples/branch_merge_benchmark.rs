@@ -662,6 +662,7 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
     let setup_reopen_ms = elapsed_ms(setup_reopen_started);
     let main_branch_id = lix.active_branch_id().await.expect("main branch id");
 
+    collector.clear();
     let branch_measure = measure_async(|| async {
         let mut per_branch_ms = Vec::with_capacity(cfg.branches);
         for index in 0..cfg.branches.saturating_sub(1) {
@@ -688,6 +689,7 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
         (receipt, per_branch_ms)
     })
     .await;
+    let branch_phases = collector.take_ms();
     let (source_receipt, per_branch_ms) = &branch_measure.value;
     let mut sorted_branch_ms = per_branch_ms.clone();
     sorted_branch_ms.sort_by(f64::total_cmp);
@@ -1012,7 +1014,12 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
             "storage_before": storage_bytes_before, "storage_after": storage_bytes_after,
             "storage_growth": signed_delta(storage_bytes_after, storage_bytes_before),
         },
-        "phase_ms": { "setup": setup_phases, "preview": preview_phases, "merge": merge_phases },
+        "phase_ms": {
+            "setup": setup_phases,
+            "create_branches": branch_phases,
+            "preview": preview_phases,
+            "merge": merge_phases,
+        },
         "correctness": {
             "independent_three_way_model": true,
             "preview_non_mutating": true,

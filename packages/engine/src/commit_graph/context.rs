@@ -72,7 +72,7 @@ where
         self.load_changelog_commit(commit_id).await
     }
 
-    async fn load_commit_records(
+    pub(crate) async fn load_commit_records(
         &mut self,
         commit_ids: &[CommitId],
     ) -> Result<Vec<Option<CommitGraphCommitRecord>>, LixError> {
@@ -392,6 +392,7 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
 fn commit_graph_commit_record_from_commit_record(record: CommitRecord) -> CommitGraphCommitRecord {
     CommitGraphCommitRecord {
         commit_id: record.commit_id,
+        change_id: record.change_id,
         generation: record.generation,
         parent_commit_ids: record.parent_commit_ids,
         created_at: record.created_at,

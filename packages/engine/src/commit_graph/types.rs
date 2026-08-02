@@ -36,6 +36,7 @@ pub(crate) struct CommitGraphCommit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphCommitRecord {
     pub(crate) commit_id: CommitId,
+    pub(crate) change_id: ChangeId,
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
     pub(crate) created_at: LixTimestamp,
@@ -99,6 +100,7 @@ pub(crate) trait CommitGraphReader: Send + Sync {
             .await?
             .map(|commit| CommitGraphCommitRecord {
                 commit_id: commit.commit_id,
+                change_id: commit.canonical_change.id,
                 generation: commit.generation,
                 parent_commit_ids: commit.parent_commit_ids,
                 created_at: commit.canonical_change.created_at,

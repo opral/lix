@@ -82,6 +82,7 @@ where
                 record.commit_id,
                 CommitGraphCommitRecord {
                     commit_id: record.commit_id,
+                    change_id: record.change_id,
                     generation: record.generation,
                     parent_commit_ids: record.parent_commit_ids,
                     created_at: record.created_at,

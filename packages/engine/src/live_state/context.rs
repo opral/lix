@@ -6,7 +6,7 @@ use crate::LixError;
 use crate::NullableKeyFilter;
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::CommitId;
-use crate::commit_graph::CommitGraphContext;
+use crate::commit_graph::{CommitGraphCommitRecord, CommitGraphContext};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
@@ -28,6 +28,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use std::mem::size_of;
 use std::sync::Mutex as StdMutex;
+use tracing::Instrument;
 
 const BRANCH_READ_CONCURRENCY: usize = 8;
 const ENTITY_POINT_SNAPSHOT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -1069,11 +1070,70 @@ async fn scan_commit_derived_rows(
         scope.projection_branch_ids.clone()
     };
     let mut graph = commit_graph.reader(store);
-    let commits = graph.all_commits().await?;
     let include_commit = schema_filter_allows(&request.filter.schema_keys, COMMIT_SCHEMA_KEY);
     let include_commit_edge =
         schema_filter_allows(&request.filter.schema_keys, COMMIT_EDGE_SCHEMA_KEY);
 
+    if include_commit
+        && !request.filter.entity_pks.is_empty()
+        && request.filter.entity_pks.iter().all(|entity_pk| {
+            matches!(
+                entity_pk.components.as_slice(),
+                [crate::entity_pk::EntityPkComponent::Uuid(_)]
+            )
+        })
+    {
+        let commit_ids = request
+            .filter
+            .entity_pks
+            .iter()
+            .filter_map(|entity_pk| match entity_pk.components.as_slice() {
+                [crate::entity_pk::EntityPkComponent::Uuid(bytes)] => {
+                    Some(CommitId::new(uuid::Uuid::from_bytes(*bytes)))
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let records = graph
+            .load_commit_records(&commit_ids)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.commit_derived.point"
+            ))
+            .await?;
+        let mut rows = Vec::with_capacity(records.len() * branch_ids.len());
+        for branch_id in &branch_ids {
+            for (requested_commit_id, record) in commit_ids.iter().zip(&records) {
+                let Some(record) = record else {
+                    continue;
+                };
+                if record.commit_id != *requested_commit_id {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "commit point lookup for {requested_commit_id} decoded record {}",
+                            record.commit_id
+                        ),
+                    ));
+                }
+                rows.push(commit_record_row(record, branch_id)?);
+            }
+        }
+        rows.retain(|row| {
+            request.filter.entity_pks.contains(&row.entity_pk)
+                && (request.filter.branch_ids.is_empty()
+                    || request
+                        .filter
+                        .branch_ids
+                        .iter()
+                        .any(|branch_id| branch_id == row.branch_id.as_ref()))
+        });
+        return Ok(rows);
+    }
+
+    let commits = graph.all_commits().await?;
     let mut rows = Vec::new();
     for branch_id in &branch_ids {
         if include_commit {
@@ -1257,6 +1317,43 @@ fn commit_row(
         updated_at: commit.change.created_at,
         global: true,
         change_id: Some(commit.change.id),
+        commit_id: Some(commit.commit_id),
+        untracked: false,
+        branch_id: branch_id.into(),
+    })
+}
+
+fn commit_record_row(
+    commit: &CommitGraphCommitRecord,
+    branch_id: &str,
+) -> Result<MaterializedLiveStateRow, LixError> {
+    let snapshot_content = serde_json::to_string(&serde_json::json!({
+        "id": commit.commit_id,
+    }))
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to encode derived lix_commit snapshot: {error}"),
+        )
+    })?;
+    Ok(MaterializedLiveStateRow {
+        entity_pk: EntityPk::uuid_from_canonical(&commit.commit_id.to_string()).map_err(
+            |error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("derived commit id is not a canonical UUID: {error}"),
+                )
+            },
+        )?,
+        schema_key: COMMIT_SCHEMA_KEY.to_string(),
+        file_id: None,
+        snapshot_content: Some(snapshot_content.into()),
+        metadata: None,
+        deleted: false,
+        created_at: commit.created_at,
+        updated_at: commit.created_at,
+        global: true,
+        change_id: Some(commit.change_id),
         commit_id: Some(commit.commit_id),
         untracked: false,
         branch_id: branch_id.into(),
@@ -2713,6 +2810,59 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("empty commits should commit");
+    }
+
+    #[tokio::test]
+    async fn commit_point_scan_preserves_typed_identity_and_missing_semantics() {
+        let storage = StorageAdapter::new(Memory::new());
+        let existing = CommitId::for_test_label("commit-point-existing");
+        let missing = CommitId::for_test_label("commit-point-missing");
+        let setup_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("setup read should open");
+        write_empty_commits_to_store(&storage, &setup_read, &[&existing.to_string()]).await;
+        drop(setup_read);
+
+        let scope = LiveStateScanScope {
+            storage_branch_ids: Vec::new(),
+            projection_branch_ids: vec!["test-branch".to_string()],
+            branch_heads: BranchHeads::default(),
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("point scan read should open");
+        let typed_request = finite_pk_scan_request(
+            "test-branch",
+            COMMIT_SCHEMA_KEY,
+            vec![
+                EntityPk::uuid_from_bytes(*existing.as_uuid().as_bytes()),
+                EntityPk::uuid_from_bytes(*existing.as_uuid().as_bytes()),
+                EntityPk::uuid_from_bytes(*missing.as_uuid().as_bytes()),
+            ],
+        );
+        let rows =
+            scan_commit_derived_rows(&read, &CommitGraphContext::new(), &typed_request, &scope)
+                .await
+                .expect("typed point scan should succeed");
+        assert_eq!(rows.len(), 1, "duplicates and missing keys must flatten");
+        assert_eq!(rows[0].entity_pk, typed_request.filter.entity_pks[0]);
+        assert_eq!(rows[0].commit_id, Some(existing));
+
+        let string_request = finite_pk_scan_request(
+            "test-branch",
+            COMMIT_SCHEMA_KEY,
+            vec![EntityPk::single(existing.to_string())],
+        );
+        let rows =
+            scan_commit_derived_rows(&read, &CommitGraphContext::new(), &string_request, &scope)
+                .await
+                .expect("string-typed point scan should succeed");
+        assert!(
+            rows.is_empty(),
+            "a string component must not match the UUID primary key"
+        );
     }
 
     async fn stage_materialized_live_rows(
