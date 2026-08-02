@@ -7254,11 +7254,14 @@ mod tests {
 
         let (first, _) = new_session(&app.router).await;
         let (second, _) = new_session(&app.router).await;
+        let (third, _) = new_session(&app.router).await;
         let first_transaction = begin_remote_transaction(&app.router, &first).await;
         let second_transaction = begin_remote_transaction(&app.router, &second).await;
+        let third_transaction = begin_remote_transaction(&app.router, &third).await;
         for (session_id, transaction_id, base64) in [
             (&first, &first_transaction, "eyJ2YWx1ZSI6ImZpcnN0In0K"),
             (&second, &second_transaction, "eyJ2YWx1ZSI6InNlY29uZCJ9Cg=="),
+            (&third, &third_transaction, "eyJ2YWx1ZSI6InRoaXJkIn0K"),
         ] {
             let staged = remote_transaction_request(
                 &app.router,
@@ -7278,25 +7281,50 @@ mod tests {
             assert_eq!(staged.status(), StatusCode::OK);
         }
 
+        let commits_before = root
+            .execute("SELECT COUNT(*) AS count FROM lix_commit", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap();
         root.reset_plugin_transition_counters();
-        for (session_id, transaction_id) in
-            [(&first, &first_transaction), (&second, &second_transaction)]
-        {
-            let committed = remote_transaction_request(
-                &app.router,
-                "POST",
-                "/lix/v1/transaction/commit",
-                session_id,
-                transaction_id,
-                None,
-            )
-            .await;
-            assert_eq!(committed.status(), StatusCode::NO_CONTENT);
+        let mut commits = tokio::task::JoinSet::new();
+        for (session_id, transaction_id) in [
+            (first.clone(), first_transaction),
+            (second.clone(), second_transaction),
+            (third.clone(), third_transaction),
+        ] {
+            let router = app.router.clone();
+            commits.spawn(async move {
+                remote_transaction_request(
+                    &router,
+                    "POST",
+                    "/lix/v1/transaction/commit",
+                    &session_id,
+                    &transaction_id,
+                    None,
+                )
+                .await
+            });
         }
-        assert!(root.plugin_transition_counters().conflict_resolution_calls > 0);
+        while let Some(committed) = commits.join_next().await {
+            assert_eq!(committed.unwrap().status(), StatusCode::NO_CONTENT);
+        }
+        let commits_after = root
+            .execute("SELECT COUNT(*) AS count FROM lix_commit", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap();
+        assert_eq!(commits_after - commits_before, 1);
+        let counters = root.plugin_transition_counters();
+        assert_eq!(counters.conflict_resolution_calls, 2);
+        assert_eq!(counters.conflict_resolution_records, 2);
 
         let mut converged_rows = Vec::new();
-        for session_id in [&first, &second] {
+        for session_id in [&first, &second, &third] {
             let visible = request(
                 &app.router,
                 "POST",

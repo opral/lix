@@ -32,5 +32,8 @@ pub(crate) use context::TransactionCommitBoundary;
 pub(crate) use context::TransactionCommitOutcome;
 pub(crate) use context::begin_commit_boundary;
 pub(crate) use context::commit_at_boundary;
+pub(crate) use context::commit_transaction_cohort;
 pub(crate) use context::open_transaction;
+pub(crate) use context::transaction_is_file_cohort_eligible;
+pub(crate) use context::transactions_can_share_cohort;
 pub(crate) use staging::duplicate_insert_identity_message;

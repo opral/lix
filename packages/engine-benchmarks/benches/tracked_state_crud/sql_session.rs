@@ -41,7 +41,7 @@ pub(crate) enum SqlFixture {
     SlateDB(GenericSqlFixture<SlateDB>),
 }
 
-pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
+pub(crate) struct GenericSqlFixture<StorageImpl: Storage + 'static> {
     session: SessionContext<StorageImpl>,
     /// Number of tracked fixture rows. In mixed mode the untracked probe
     /// replaces one of the requested rows rather than adding a 10,001st row.
