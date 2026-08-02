@@ -13,6 +13,13 @@ const BOUND_SEED_JSON_SQL: &str =
     "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))";
 const BOUND_UPDATE_ALL_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
 const UNTRACKED_PROBE_PATH: &str = "/__lix_untracked_probe";
+// These deliberately miss the native entity-read recognizer so profile mode
+// can measure the general DataFusion execution path rather than a specialized
+// public CRUD fast path.
+const GENERAL_FILTER_SORT_SQL: &str =
+    "SELECT path, value FROM json_pointer WHERE path IS NOT NULL ORDER BY value, path";
+const GENERAL_AGGREGATE_SQL: &str = "SELECT COUNT(*) AS rows, MIN(path) AS first_path, MAX(path) AS last_path \
+    FROM json_pointer WHERE path IS NOT NULL";
 type SharedParameterBatch = Arc<[Arc<[Value]>]>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,10 +223,14 @@ impl SqlFixture {
     }
 
     pub(crate) async fn read_all(&self) -> usize {
-        if std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE").as_deref()
-            == Ok("aggregate_count")
-        {
-            return self.count_all().await;
+        match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE").as_deref() {
+            Ok("aggregate_count") => return self.count_all().await,
+            Ok("general_filter_sort") => return self.general_filter_sort_all().await,
+            Ok("general_aggregate") => return self.general_aggregate().await,
+            Ok("full_result") | Err(_) => {}
+            Ok(other) => panic!(
+                "unknown LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE '{other}'; expected full_result, aggregate_count, general_filter_sort, or general_aggregate"
+            ),
         }
         match self {
             Self::SQLite(fixture) => fixture.read_all().await,
@@ -238,6 +249,24 @@ impl SqlFixture {
             Self::RocksDB(fixture) => fixture.count_all().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.count_all().await,
+        }
+    }
+
+    async fn general_filter_sort_all(&self) -> usize {
+        match self {
+            Self::SQLite(fixture) => fixture.general_filter_sort_all().await,
+            Self::RocksDB(fixture) => fixture.general_filter_sort_all().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.general_filter_sort_all().await,
+        }
+    }
+
+    async fn general_aggregate(&self) -> usize {
+        match self {
+            Self::SQLite(fixture) => fixture.general_aggregate().await,
+            Self::RocksDB(fixture) => fixture.general_aggregate().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.general_aggregate().await,
         }
     }
 
@@ -440,6 +469,23 @@ where
             execute(&self.session, "SELECT COUNT(*) AS count FROM json_pointer").await,
         );
         assert_eq!(result.columns(), ["count"]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.rows()[0].get_index(0),
+            Some(&Value::Integer(self.visible_row_count as i64))
+        );
+        1
+    }
+
+    async fn general_filter_sort_all(&self) -> usize {
+        let result = std::hint::black_box(execute(&self.session, GENERAL_FILTER_SORT_SQL).await);
+        assert_eq!(result.len(), self.visible_row_count);
+        result.len()
+    }
+
+    async fn general_aggregate(&self) -> usize {
+        let result = std::hint::black_box(execute(&self.session, GENERAL_AGGREGATE_SQL).await);
+        assert_eq!(result.columns(), ["rows", "first_path", "last_path"]);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result.rows()[0].get_index(0),

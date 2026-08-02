@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::LixError;
+use crate::entity_pk::EntityPk;
 use crate::live_state::{LiveStateContext, LiveStateRowFilter, LiveStateScanRequest};
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -41,6 +42,17 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
         &self,
         request: LiveStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError>;
+
+    /// Returns primary keys from the same committed direct-scan proof as raw
+    /// snapshots. Providers use this only when every projected SQL field is
+    /// an exact primary-key component, avoiding a redundant JSON decode while
+    /// leaving all relational operators to DataFusion.
+    async fn scan_entity_primary_keys(
+        &self,
+        _request: LiveStateScanRequest,
+    ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        Ok(None)
+    }
 
     async fn scan_entity_snapshots_by_string_field(
         &self,
@@ -91,6 +103,19 @@ where
         self.live_state
             .reader(self.store.clone())
             .scan_direct_entity_snapshots(&request)
+            .await
+    }
+
+    async fn scan_entity_primary_keys(
+        &self,
+        request: LiveStateScanRequest,
+    ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        if !direct_entity_snapshot_request(&request) {
+            return Ok(None);
+        }
+        self.live_state
+            .reader(self.store.clone())
+            .scan_direct_entity_primary_keys(&request)
             .await
     }
 

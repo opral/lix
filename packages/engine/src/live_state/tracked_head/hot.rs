@@ -4248,6 +4248,43 @@ where
         .await
     }
 
+    pub(crate) async fn scan_entity_primary_keys(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+        entity_pks: &[EntityPk],
+        limit: Option<usize>,
+    ) -> Result<Vec<EntityPk>, LixError> {
+        if matches!(limit, Some(0)) {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .scan_live_batch_for_generation(
+                branch_id,
+                control.generation,
+                control.working_diff_checkpoint_commit_id,
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![schema_key.to_owned()],
+                        entity_pks: entity_pks.to_vec(),
+                        include_tombstones: false,
+                        ..TrackedStateFilter::default()
+                    },
+                    // Retain the packed broad-scan route, which resolves the
+                    // same committed winners as snapshot scans. The provider
+                    // drops these bytes before Arrow conversion because only
+                    // the identity columns were requested.
+                    read_columns: TrackedStateReadColumns {
+                        columns: vec!["snapshot_content".to_owned()],
+                    },
+                    limit,
+                },
+            )
+            .await?;
+        Ok(rows.into_identity_ordered_primary_keys())
+    }
+
     #[cfg(test)]
     pub(crate) async fn scan_live_rows_if_current(
         &self,

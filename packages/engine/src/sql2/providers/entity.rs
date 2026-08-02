@@ -337,6 +337,8 @@ impl TableSpec for EntitySpec {
         let direct_entity_snapshot = direct_entity_batch_eligible(&schema, &request, &row_filters)
             .then(|| self.entity_snapshot_reader.clone())
             .flatten();
+        let direct_primary_key_projection =
+            direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -349,6 +351,7 @@ impl TableSpec for EntitySpec {
                     row_filters,
                     batch_projection,
                     direct_entity_snapshot,
+                    direct_primary_key_projection,
                 ),
                 |(
                     spec,
@@ -358,7 +361,17 @@ impl TableSpec for EntitySpec {
                     row_filters,
                     batch_projection,
                     direct_entity_snapshot,
+                    direct_primary_key_projection,
                 )| async move {
+                    if direct_primary_key_projection
+                        && let Some(direct_entity_snapshot) = direct_entity_snapshot.as_ref()
+                        && let Some(entity_pks) = direct_entity_snapshot
+                            .scan_entity_primary_keys(request.clone())
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
+                    {
+                        return entity_primary_key_record_batch(&spec, schema, entity_pks);
+                    }
                     if let Some(direct_entity_snapshot) = direct_entity_snapshot
                         && let Some(rows) = direct_entity_snapshot
                             .scan_entity_snapshots(request.clone())
@@ -1463,6 +1476,41 @@ fn direct_entity_batch_eligible(
             .all(|field| !field.name().starts_with("lixcol_"))
 }
 
+/// A provider-level physical projection: all requested columns are simple
+/// string primary-key components stored verbatim in the current-state key.
+/// DataFusion still plans and executes every relational operator above this
+/// scan; the provider merely avoids JSON decoding to reproduce identity data.
+fn direct_primary_key_projection_eligible(
+    spec: &EntitySurfaceSpec,
+    schema: &Schema,
+    request: &LiveStateScanRequest,
+    row_filters: &[EntityRowFilter],
+) -> bool {
+    direct_entity_batch_eligible(schema, request, row_filters)
+        // Exact key reads retain the established point-snapshot cache. This
+        // broad-scan projection is an OLAP lane, not a replacement for OLTP
+        // point serving.
+        && request.filter.entity_pks.is_empty()
+        && !schema.fields().is_empty()
+        && schema
+            .fields()
+            .iter()
+            .all(|field| simple_string_primary_key_index(spec, field.name()).is_some())
+}
+
+fn simple_string_primary_key_index(spec: &EntitySurfaceSpec, column_name: &str) -> Option<usize> {
+    spec.primary_key_paths
+        .iter()
+        .position(|path| matches!(path.as_slice(), [name] if name == column_name))
+        .filter(|index| {
+            spec.primary_key_component_types.get(*index)
+                == Some(&crate::entity_pk::EntityPkComponentType::String)
+                && spec
+                    .visible_column(column_name)
+                    .is_some_and(|column| column.column_type == EntityColumnType::String)
+        })
+}
+
 /// Selects the snapshot-to-Arrow implementation once per provider batch.
 ///
 /// Exact primary-key scans retain their established serde-value fallback when
@@ -1527,6 +1575,38 @@ fn entity_record_batch_with_parsed(
             entity_record_batch_from_snapshots(spec, schema, rows)
         }
     }
+}
+
+fn entity_primary_key_record_batch(
+    spec: &EntitySurfaceSpec,
+    schema: SchemaRef,
+    entity_pks: Vec<EntityPk>,
+) -> Result<RecordBatch> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let component_index = simple_string_primary_key_index(spec, field.name()).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "entity primary-key projection cannot serve column '{}' for schema '{}'",
+                    field.name(), spec.schema_key
+                ))
+            })?;
+            let values = entity_pks
+                .iter()
+                .map(|entity_pk| match entity_pk.components.as_slice().get(component_index) {
+                    Some(crate::entity_pk::EntityPkComponent::String(value)) => Ok(Some(value.as_ref())),
+                    _ => Err(DataFusionError::Execution(format!(
+                        "entity primary-key projection found an invalid key component for schema '{}' column '{}'",
+                        spec.schema_key, field.name()
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let array: ArrayRef = Arc::new(StringArray::from(values));
+            Ok(array)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
 }
 
 fn entity_record_batch_from_snapshots(
@@ -1797,7 +1877,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use datafusion::arrow::array::{Float64Array, Int64Array};
+    use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::catalog::TableProvider;
@@ -2082,6 +2162,52 @@ mod tests {
                 column_type: EntityColumnType::String,
                 value: super::EntityFilterValue::String("hello".to_string()),
             }]
+        ));
+    }
+
+    #[test]
+    fn direct_primary_key_projection_uses_identity_columns_without_snapshot_decode() {
+        let spec = entity_insert_spec_with_primary_key();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let request = LiveStateScanRequest::default();
+        assert!(super::direct_primary_key_projection_eligible(
+            &spec,
+            schema.as_ref(),
+            &request,
+            &[]
+        ));
+
+        let batch = super::entity_primary_key_record_batch(
+            &spec,
+            Arc::clone(&schema),
+            vec![crate::entity_pk::EntityPk::single("identity-1")],
+        )
+        .expect("identity projection should build an Arrow batch");
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("identity column should be utf8");
+        assert_eq!(values.value(0), "identity-1");
+
+        let payload_schema = Schema::new(vec![Field::new("body", DataType::Utf8, true)]);
+        assert!(!super::direct_primary_key_projection_eligible(
+            &spec,
+            &payload_schema,
+            &request,
+            &[]
+        ));
+
+        let mut exact_request = request.clone();
+        exact_request
+            .filter
+            .entity_pks
+            .push(crate::entity_pk::EntityPk::single("identity-1"));
+        assert!(!super::direct_primary_key_projection_eligible(
+            &spec,
+            schema.as_ref(),
+            &exact_request,
+            &[]
         ));
     }
 

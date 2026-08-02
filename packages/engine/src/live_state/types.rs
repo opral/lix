@@ -233,6 +233,28 @@ impl MaterializedLiveStateBatch {
             .collect()
     }
 
+    /// Consumes the batch into entity keys ordered by their logical primary
+    /// key.  The direct SQL provider uses this when its entire visible
+    /// projection is primary-key columns, so no snapshot JSON needs decoding.
+    pub(crate) fn into_identity_ordered_primary_keys(mut self) -> Vec<EntityPk> {
+        if let Some(singleton) = self.singleton.take() {
+            return vec![singleton.row.entity_pk];
+        }
+        let mut ordinals = (0..self.len()).collect::<Vec<_>>();
+        if !ordinals.is_sorted_by(|left, right| self.entity_pks[*left] <= self.entity_pks[*right]) {
+            ordinals.sort_unstable_by(|left, right| {
+                self.entity_pks[*left].cmp(&self.entity_pks[*right])
+            });
+        }
+        if ordinals.iter().copied().eq(0..self.len()) {
+            return self.entity_pks;
+        }
+        ordinals
+            .into_iter()
+            .map(|index| self.entity_pks[index].clone())
+            .collect()
+    }
+
     fn terminal_branch_owners(&self) -> Vec<Option<Arc<str>>> {
         if let Some(singleton) = &self.singleton {
             return vec![Some(Arc::clone(&singleton.row.branch_id))];
