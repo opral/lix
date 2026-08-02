@@ -59,6 +59,14 @@ await lix.close();
 
 Reopening the same path resumes existing RocksDB filesystem storage state. Lix stores its private repository data in `<workspace>/.lix/.internal/rocksdb` and syncs workspace files through Lix.
 
+Filesystem sync imports, watches, materializes, and deletes regular files. It
+does not follow or import symbolic links or other special filesystem entries.
+Those entries may coexist at unrelated paths, but if one blocks a path that
+Lix needs to materialize, the write reports
+`LIX_FILESYSTEM_UNSUPPORTED_ENTRY` instead of silently leaving disk and Lix in
+different states. Executable and other permission bits are currently outside
+the sync contract.
+
 Older SQLite filesystem storage metadata is not migrated. If Lix detects the
 old SQLite metadata files in `<workspace>/.lix/.internal` before a RocksDB store
 exists, it clears `.lix/.internal` and initializes a fresh RocksDB storage.

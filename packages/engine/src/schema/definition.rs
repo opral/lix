@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use crate::LixError;
-use crate::common::parse_json_pointer;
+use crate::common::{parse_json_pointer, validate_lix_path_segment};
 
 static LIX_SCHEMA_DEFINITION: OnceLock<JsonValue> = OnceLock::new();
 static LIX_SCHEMA_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceLock::new();
@@ -288,6 +288,7 @@ pub(crate) fn compile_lix_schema(schema: &JsonValue) -> Result<JSONSchema, LixEr
     options.should_validate_formats(true);
     options.with_format("json-pointer", is_json_pointer);
     options.with_format("cel", is_cel_expression);
+    options.with_format("lix-path-segment", is_lix_path_segment);
 
     options.compile(schema).map_err(|err| LixError {
         code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
@@ -310,6 +311,10 @@ fn is_json_pointer(value: &str) -> bool {
 
 fn is_cel_expression(value: &str) -> bool {
     Program::compile(value).is_ok()
+}
+
+fn is_lix_path_segment(value: &str) -> bool {
+    validate_lix_path_segment(value).is_ok()
 }
 
 fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
