@@ -3,7 +3,7 @@ use duckdb::{Connection, params};
 
 use crate::data;
 
-pub(crate) fn seeded(scale_factor: f64) -> Connection {
+pub(crate) fn seeded(scale_factor: f64, overlay_rowkeys: &[String]) -> Connection {
     let mut connection = Connection::open_in_memory().expect("open DuckDB TPC-H control");
     connection
         .execute_batch(
@@ -244,6 +244,21 @@ pub(crate) fn seeded(scale_factor: f64) -> Connection {
         appender.flush().expect("flush DuckDB lineitem appender");
     }
     transaction.commit().expect("commit DuckDB seed");
+    if !overlay_rowkeys.is_empty() {
+        let transaction = connection.transaction().expect("begin DuckDB overlay");
+        let mut affected = 0_usize;
+        for chunk in overlay_rowkeys.chunks(crate::overlay::ROWS_PER_STATEMENT) {
+            affected += transaction
+                .execute(&crate::overlay::lineitem_update_sql(chunk), [])
+                .expect("apply DuckDB TPC-H overlay chunk");
+        }
+        transaction.commit().expect("commit DuckDB overlay");
+        assert_eq!(
+            affected,
+            overlay_rowkeys.len(),
+            "incomplete DuckDB TPC-H overlay"
+        );
+    }
     connection
 }
 

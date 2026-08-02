@@ -4,6 +4,44 @@ use std::time::Duration;
 pub(crate) struct Config {
     pub(crate) scale_factor: f64,
     pub(crate) samples: usize,
+    pub(crate) overlay: Overlay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Overlay {
+    Pristine,
+    Sparse,
+    Moderate,
+}
+
+impl Overlay {
+    pub(crate) fn from_env() -> Self {
+        match std::env::var("LIX_TPCH_OVERLAY").as_deref() {
+            Ok("sparse") => Self::Sparse,
+            Ok("moderate") => Self::Moderate,
+            Ok("pristine") | Err(std::env::VarError::NotPresent) => Self::Pristine,
+            Ok(value) => {
+                panic!("invalid LIX_TPCH_OVERLAY={value:?}: expected pristine, sparse, or moderate")
+            }
+            Err(error) => panic!("invalid LIX_TPCH_OVERLAY: {error}"),
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Pristine => "pristine",
+            Self::Sparse => "sparse",
+            Self::Moderate => "moderate",
+        }
+    }
+
+    pub(crate) fn lineitem_divisor(self) -> Option<usize> {
+        match self {
+            Self::Pristine => None,
+            Self::Sparse => Some(1_000),
+            Self::Moderate => Some(20),
+        }
+    }
 }
 
 impl Config {
@@ -18,6 +56,7 @@ impl Config {
         Self {
             scale_factor,
             samples,
+            overlay: Overlay::from_env(),
         }
     }
 }

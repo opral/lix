@@ -2,6 +2,7 @@ mod config;
 mod data;
 mod duckdb;
 mod lix;
+mod overlay;
 mod queries;
 mod result;
 
@@ -14,14 +15,30 @@ use config::Config;
 async fn main() {
     let config = Config::from_env();
     eprintln!(
-        "seeding deterministic TPC-H-derived data at scale factor {}",
-        config.scale_factor
+        "seeding deterministic TPC-H-derived data at scale factor {} with {} overlay",
+        config.scale_factor,
+        config.overlay.name()
     );
-    let duckdb = duckdb::seeded(config.scale_factor);
+    let overlay = config.overlay.lineitem_divisor().map(|divisor| {
+        overlay::select_every_nth(
+            data::lineitems(config.scale_factor).map(|row| row.rowkey),
+            divisor,
+        )
+    });
+    if let Some(overlay) = &overlay {
+        assert!(
+            !overlay.items.is_empty(),
+            "TPC-H overlay must update at least one row"
+        );
+    }
+    let overlay_rowkeys = overlay
+        .as_ref()
+        .map_or([].as_slice(), |overlay| overlay.items.as_slice());
+    let duckdb = duckdb::seeded(config.scale_factor, overlay_rowkeys);
     #[allow(unused_mut)]
-    let mut lix_fixtures = vec![lix::Fixture::rocksdb(config.scale_factor).await];
+    let mut lix_fixtures = vec![lix::Fixture::rocksdb(config.scale_factor, overlay_rowkeys).await];
     #[cfg(feature = "slatedb")]
-    lix_fixtures.push(lix::Fixture::slatedb(config.scale_factor).await);
+    lix_fixtures.push(lix::Fixture::slatedb(config.scale_factor, overlay_rowkeys).await);
 
     validate_loaded_keys(&duckdb, &lix_fixtures).await;
 
@@ -92,6 +109,11 @@ async fn main() {
                 serde_json::json!({
                     "suite": "tpch-derived-common-types",
                     "scale_factor": config.scale_factor,
+                    "overlay": config.overlay.name(),
+                    "overlay_rows": overlay.as_ref().map_or(0, |overlay| overlay.items.len()),
+                    "overlay_fraction": overlay.as_ref().map_or(0.0, |overlay| {
+                        overlay.items.len() as f64 / overlay.total_rows as f64
+                    }),
                     "query": query.number,
                     "backend": fixture.name(),
                     "threads": 1,
@@ -121,7 +143,10 @@ async fn validate_loaded_keys(duckdb: &::duckdb::Connection, fixtures: &[lix::Fi
         ("partsupp", "SUM(ps_partkey), SUM(ps_suppkey)"),
         ("customer", "SUM(c_custkey), SUM(c_nationkey)"),
         ("orders", "SUM(o_orderkey), SUM(o_custkey)"),
-        ("lineitem", "SUM(l_orderkey), SUM(l_linenumber)"),
+        (
+            "lineitem",
+            "SUM(l_orderkey), SUM(l_linenumber), SUM(l_quantity)",
+        ),
     ];
     for (table, key_sums) in TABLE_KEYS {
         let sql = format!("SELECT COUNT(*), {key_sums} FROM {table}");
