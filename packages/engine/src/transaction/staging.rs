@@ -300,6 +300,7 @@ impl TrackedStateKey {
 }
 
 /// Drained prepared transaction writes ready for commit.
+#[derive(Clone)]
 pub(crate) struct PreparedWriteSet {
     pub(crate) state_rows: PreparedStateBatch,
     pub(crate) insert_selection: PreparedInsertSelection,
@@ -541,6 +542,21 @@ impl PreparedInsertSelection {
         *self = selected;
     }
 
+    pub(crate) fn append(&mut self, other: Self) {
+        let other_rows = other.row_count;
+        self.reserve_rows(other_rows, !other.is_empty());
+        for row_index in 0..other_rows {
+            if other.contains(row_index) {
+                self.push(
+                    other.origins[row_index].as_ref(),
+                    other.statement_index(row_index),
+                );
+            } else {
+                self.push_not_insert();
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn large_buffer_count(&self) -> usize {
         usize::from(!self.bits.is_empty()) + usize::from(!self.origins.is_empty())
@@ -715,6 +731,54 @@ impl<'a> PreparedWriteValidationSet<'a> {
 }
 
 impl PreparedWriteSet {
+    pub(crate) fn append_cohort_member(
+        &mut self,
+        mut other: Self,
+        branch_id: &str,
+        cohort_commit_id: CommitId,
+    ) -> Result<(), LixError> {
+        if !other.first_commit_parent_override_by_branch.is_empty()
+            || !other.checkpoint_publications.is_empty()
+            || !other.extra_commit_parents_by_branch.is_empty()
+            || !other.intermediate_commits.is_empty()
+        {
+            return Err(LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "transaction uses history controls that cannot join a commit cohort",
+            ));
+        }
+        let other_refs = other
+            .commit_change_refs_by_branch
+            .remove(branch_id)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    "transaction is missing its active-branch commit membership",
+                )
+            })?;
+        if !other.commit_change_refs_by_branch.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "transaction writes more than one branch and cannot join a commit cohort",
+            ));
+        }
+        let cohort_refs = self
+            .commit_change_refs_by_branch
+            .get_mut(branch_id)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "commit cohort leader is missing active-branch membership",
+                )
+            })?;
+        cohort_refs.absorb_cohort_membership(other_refs);
+        other.state_rows.set_commit_id_all(cohort_commit_id);
+        self.insert_selection.append(other.insert_selection);
+        self.state_rows.append(other.state_rows);
+        self.file_data_writes.append(&mut other.file_data_writes);
+        Ok(())
+    }
+
     pub(crate) fn replace_reconciled_file_writes(
         &mut self,
         mut replacement: PreparedWriteSet,
@@ -848,6 +912,42 @@ impl TransactionWriteBuffer {
             intermediate_commits: Mutex::new(Vec::new()),
             file_data_writes: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn is_file_cohort_eligible(&self, branch_id: &str) -> bool {
+        let rows = self.rows.lock().unwrap_or_else(|error| error.into_inner());
+        let rows = match &*rows {
+            StagedPreparedRows::AppendOnly { rows, .. }
+            | StagedPreparedRows::Indexed { rows, .. } => rows,
+        };
+        let has_file = rows.iter().any(|row| row.file_id.is_some());
+        let invalid_row = rows
+            .iter()
+            .any(|row| row.untracked || row.global || row.branch_id.as_str() != branch_id);
+        if !has_file || invalid_row {
+            return false;
+        }
+        let eligible = self
+            .first_commit_parent_override_by_branch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
+            && self
+                .checkpoint_publications
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty();
+        eligible
+            && self
+                .extra_commit_parents_by_branch
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+            && self
+                .intermediate_commits
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
     }
 
     /// Captures every mutable staging structure before a statement that may

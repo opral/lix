@@ -29,7 +29,7 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     _deterministic_runtime_guard: Option<DeterministicRuntimeGuard>,
     write_access: Option<SessionWriteAccess>,
-    commit_coordinator: Arc<CommitCoordinator>,
+    commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) has_started_statement: bool,
 }

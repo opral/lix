@@ -183,12 +183,65 @@ use crate::wasm::{
 };
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
+mod cohort;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TransactionCommitOutcome {
     pub(crate) storage_stats: StorageWriteSetStats,
 }
 
-#[derive(Clone)]
+/// Commits one coordinator-owned cohort in queue order.
+///
+/// The coordinator is the sole explicit-transaction persistence authority.
+/// This initial execution seam deliberately lives beside `Transaction` so the
+/// cohort planner can replace per-transaction execution without reintroducing
+/// a type-erased closure queue.
+pub(crate) async fn commit_transaction_cohort<StorageImpl>(
+    cohort: Vec<(Transaction<StorageImpl>, FunctionContext)>,
+) -> Vec<Result<TransactionCommitOutcome, LixError>>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    Box::pin(cohort::commit_transaction_cohort(cohort)).await
+}
+
+pub(crate) fn transactions_can_share_cohort<StorageImpl>(
+    a: &Transaction<StorageImpl>,
+    b: &Transaction<StorageImpl>,
+    eligible_a: bool,
+    eligible_b: bool,
+) -> bool
+where
+    StorageImpl: Storage + 'static,
+{
+    a.active_branch_id == b.active_branch_id
+        && a.opening_active_branch_head == b.opening_active_branch_head
+        && a.opening_global_branch_head == b.opening_global_branch_head
+        && a.opening_tracked_mutation_revision == b.opening_tracked_mutation_revision
+        && a.idempotency_receipt.is_none()
+        && b.idempotency_receipt.is_none()
+        && a.atomic_metadata_writes.is_none()
+        && b.atomic_metadata_writes.is_none()
+        && a.atomic_metadata_preconditions.is_empty()
+        && b.atomic_metadata_preconditions.is_empty()
+        && !a.await_durable_commit
+        && !b.await_durable_commit
+        && eligible_a
+        && eligible_b
+}
+
+pub(crate) fn transaction_is_file_cohort_eligible<StorageImpl>(
+    transaction: &Transaction<StorageImpl>,
+) -> bool
+where
+    StorageImpl: Storage + 'static,
+{
+    transaction
+        .staged_writes
+        .is_file_cohort_eligible(&transaction.active_branch_id)
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct StaleConflictPayload {
     snapshot: SharedStr,
     metadata: Option<SharedStr>,
@@ -229,7 +282,16 @@ fn push_stale_conflict_resolution(
     resolution: WasmConflictResolution<WasmHostBytes>,
     branch_id: &str,
 ) -> Result<(), LixError> {
-    let (snapshot, metadata) = match resolution {
+    let payload = stale_conflict_resolution_payload(conflict, resolution)?;
+    cohort::push_cohort_payload(rows, &conflict.key, payload.as_ref(), branch_id);
+    Ok(())
+}
+
+fn stale_conflict_resolution_payload(
+    conflict: &StaleSemanticConflict,
+    resolution: WasmConflictResolution<WasmHostBytes>,
+) -> Result<Option<StaleConflictPayload>, LixError> {
+    let payload = match resolution {
         WasmConflictResolution::Take(side) => {
             let selected = match side {
                 WasmConflictTake::Base => conflict.base.as_ref(),
@@ -242,17 +304,9 @@ fn push_stale_conflict_resolution(
                     "plugin conflict resolver selected an absent value; use delete for a tombstone",
                 )
             })?;
-            (
-                Some(TransactionJson::from_unvalidated_shared_normalized_content(
-                    selected.snapshot.clone(),
-                )),
-                selected
-                    .metadata
-                    .clone()
-                    .map(TransactionJson::from_unvalidated_shared_normalized_content),
-            )
+            Some(selected.clone())
         }
-        WasmConflictResolution::Delete => (None, None),
+        WasmConflictResolution::Delete => None,
         WasmConflictResolution::Replace {
             snapshot_content,
             effect,
@@ -265,30 +319,17 @@ fn push_stale_conflict_resolution(
             };
             let metadata = match effect {
                 WasmChangeEffect::Content => None,
-                WasmChangeEffect::FormatOnly => Some(v2_format_only_metadata()),
+                WasmChangeEffect::FormatOnly => {
+                    Some(SharedStr::from_static(V2_FORMAT_ONLY_METADATA_JSON))
+                }
             };
-            (
-                Some(TransactionJson::from_canonical_batch(snapshot)),
+            Some(StaleConflictPayload {
+                snapshot: snapshot.normalized_shared(),
                 metadata,
-            )
+            })
         }
     };
-    rows.push_parts(
-        Some(conflict.key.entity_pk.clone()),
-        SharedStr::from(conflict.key.schema_key.as_str()),
-        conflict.key.file_id.as_deref().map(SharedStr::from),
-        snapshot,
-        metadata,
-        None,
-        None,
-        None,
-        false,
-        None,
-        None,
-        false,
-        SharedStr::from(branch_id),
-    );
-    Ok(())
+    Ok(payload)
 }
 
 /// The durable identity and byte proof of one plugin materialization.
@@ -1064,6 +1105,11 @@ where
         discard_plugin_actor_publications(superseded).await;
         self.pending_file_view_mutations
             .retain(|key, _| !file_ids.contains(&key.file_id));
+        self.session_file_views
+            .apply_mutations(file_ids.iter().map(|file_id| {
+                let key = SessionFileViewKey::new(&self.active_branch_id, file_id);
+                SessionFileViewMutation::Remove { key }
+            }));
 
         let mut reconciliation_batches = BTreeMap::<String, RawWriteBatch>::new();
         for (file_id, group) in &groups {
@@ -1347,8 +1393,7 @@ where
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
         let mut transaction = self;
-        let commit_boundary = transaction.commit_boundary.clone();
-        let mut prepared_writes = match transaction.staged_writes.drain() {
+        let prepared_writes = match transaction.staged_writes.drain() {
             Ok(prepared_writes) => prepared_writes,
             Err(error) => {
                 transaction
@@ -1357,6 +1402,18 @@ where
                 return Err(error);
             }
         };
+        transaction
+            .commit_prepared(runtime_functions, prepared_writes)
+            .await
+    }
+
+    async fn commit_prepared(
+        mut self,
+        runtime_functions: &FunctionContext,
+        mut prepared_writes: PreparedWriteSet,
+    ) -> Result<TransactionCommitOutcome, LixError> {
+        let transaction = &mut self;
+        let commit_boundary = transaction.commit_boundary.clone();
         transaction
             .uncache_completed_plugin_actors_for_large_file_writes(&prepared_writes)
             .await;

@@ -56,7 +56,7 @@ impl Display for Operation {
 
 struct Fixture<S>
 where
-    S: Storage,
+    S: Storage + 'static,
 {
     session: SessionContext<S>,
     live_rows: usize,

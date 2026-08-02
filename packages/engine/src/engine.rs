@@ -32,7 +32,7 @@ use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct Engine<StorageImpl: Storage = crate::storage_adapter::Memory> {
+pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memory> {
     storage: StorageAdapter<StorageImpl>,
     tracked_state: Arc<TrackedStateContext>,
     live_state: Arc<LiveStateContext>,
@@ -42,7 +42,7 @@ pub struct Engine<StorageImpl: Storage = crate::storage_adapter::Memory> {
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
-    commit_coordinator: Arc<CommitCoordinator>,
+    commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     observe_coordinator: Arc<ObserveCoordinator>,
     observe_invalidation: Arc<ObserveInvalidation>,
     plugin_host: PluginRuntimeHost,
@@ -173,9 +173,11 @@ where
         // overlay for writes.
 
         let collaboration_write_gate = Arc::new(tokio::sync::Mutex::new(()));
-        let commit_coordinator = Arc::new(CommitCoordinator::new(Arc::clone(
-            &collaboration_write_gate,
-        )));
+        let observe_invalidation = Arc::new(ObserveInvalidation::new());
+        let commit_coordinator = Arc::new(CommitCoordinator::new(
+            Arc::clone(&collaboration_write_gate),
+            Arc::clone(&observe_invalidation),
+        ));
         Ok(Self {
             binary_cas: Arc::new(BinaryCasContext::new()),
             storage,
@@ -188,7 +190,7 @@ where
             collaboration_write_gate,
             commit_coordinator,
             observe_coordinator: Arc::new(ObserveCoordinator::new()),
-            observe_invalidation: Arc::new(ObserveInvalidation::new()),
+            observe_invalidation,
             plugin_host,
             telemetry: options.telemetry,
         })
