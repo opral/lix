@@ -517,6 +517,15 @@ impl TrackedStateTree {
             assembler.push_mutation(mutation, created_at)?;
             next_mutation = mutations.next_pending()?;
         }
+        let actual_mutation_count = mutations.consumed_count();
+        if actual_mutation_count != mutation_count {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked-state ordered bulk mutation count mismatch: expected {mutation_count}, received {actual_mutation_count}"
+                ),
+            ));
+        }
 
         let built = assembler.finish(self)?;
         let result = self
@@ -2361,6 +2370,7 @@ const PENDING_ROOT_MUTATION_WINDOW: usize = 4096;
 struct PendingRootMutationCursor<'a, I> {
     source: Box<I>,
     pending: VecDeque<PendingRootMutation<'a>>,
+    consumed_count: usize,
 }
 
 impl<'a, I> PendingRootMutationCursor<'a, I>
@@ -2371,11 +2381,13 @@ where
         Self {
             source: Box::new(source),
             pending: VecDeque::new(),
+            consumed_count: 0,
         }
     }
 
     fn next_pending(&mut self) -> Result<Option<PendingRootMutation<'a>>, LixError> {
         if let Some(mutation) = self.pending.pop_front() {
+            self.consumed_count = self.consumed_count.saturating_add(1);
             return Ok(Some(mutation));
         }
         let mut key_arena = Vec::with_capacity(PENDING_ROOT_MUTATION_WINDOW * 96);
@@ -2409,7 +2421,15 @@ where
                 },
             ),
         );
-        Ok(self.pending.pop_front())
+        let mutation = self.pending.pop_front();
+        self.consumed_count = self
+            .consumed_count
+            .saturating_add(usize::from(mutation.is_some()));
+        Ok(mutation)
+    }
+
+    fn consumed_count(&self) -> usize {
+        self.consumed_count
     }
 }
 

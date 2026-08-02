@@ -31,8 +31,9 @@ use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::transaction::types::{
-    CertifiedParameterReplacementBatch, CertifiedRawWriteBatchPreparation, PreparedRowFacts,
-    RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
+    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
+    CertifiedRawWriteBatchPreparation, PreparedRowFacts, RawWriteBatch, RawWriteRowRef,
+    TransactionJson, TransactionWrite, TransactionWriteMode,
 };
 use crate::wasm::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
@@ -106,6 +107,26 @@ pub(crate) enum BoundPublicWriteExecution {
 enum EntityInsertParameterBatch<'a> {
     Arrow(&'a RecordBatch),
     Values(&'a [&'a [Value]]),
+}
+
+enum CertifiedEntityInsertParameterBatch {
+    Typed(CertifiedParameterInsertBatch),
+    Raw(RawWriteBatch),
+}
+
+const TYPED_CERTIFIED_INSERT_MIN_ROWS: usize = 32 * 1024;
+
+fn use_typed_certified_insert(row_count: usize) -> bool {
+    row_count >= TYPED_CERTIFIED_INSERT_MIN_ROWS
+}
+
+impl CertifiedEntityInsertParameterBatch {
+    fn into_raw(self) -> Result<RawWriteBatch, LixError> {
+        match self {
+            Self::Typed(rows) => rows.into_raw(),
+            Self::Raw(rows) => Ok(rows),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -267,7 +288,7 @@ async fn try_execute_entity_insert_batch(
         "lix.perf.entity_insert_parameter_batch.certify"
     )
     .entered();
-    let Some(write_rows) = certified_entity_insert_parameter_batch(
+    let Some(mut write_rows) = certified_entity_insert_parameter_batch(
         ctx,
         plan,
         &spec,
@@ -281,24 +302,22 @@ async fn try_execute_entity_insert_batch(
         return Ok(None);
     };
     drop(certification_span);
-    let committed = if collection_is_certifiably_empty(ctx, &spec.schema_key).await? {
-        MaterializedLiveStateBatch::default()
+    let collection_empty = collection_is_certifiably_empty(ctx, &spec.schema_key).await?;
+    let committed_conflict = if collection_empty {
+        None
     } else {
-        scan_entity_conflict_candidates(ctx, &spec, &write_rows)
+        let raw_rows = write_rows.into_raw()?;
+        let committed = scan_entity_conflict_candidates(ctx, &spec, &raw_rows)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.entity_insert_parameter_batch.conflict_scan"
             ))
-            .await?
-    };
-    let conflict_attribution_span = tracing::debug_span!(
-        target: "lix_perf",
-        "lix.perf.entity_insert_parameter_batch.conflict_attribution"
-    )
-    .entered();
-    let committed_conflict = if committed.is_empty() {
-        None
-    } else {
+            .await?;
+        let conflict_attribution_span = tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.entity_insert_parameter_batch.conflict_attribution"
+        )
+        .entered();
         let committed_identities = committed
             .iter()
             .map(|row| {
@@ -314,7 +333,7 @@ async fn try_execute_entity_insert_batch(
             })
             .collect::<std::collections::HashMap<_, _>>();
         let mut conflict = None;
-        for (row_index, row) in write_rows.iter().enumerate() {
+        for (row_index, row) in raw_rows.iter().enumerate() {
             let entity_pk = row
                 .entity_pk
                 .expect("certified parameter INSERT rows have explicit identities");
@@ -359,16 +378,29 @@ async fn try_execute_entity_insert_batch(
             conflict = Some(with_parameter_batch_statement_index(error, row_index));
             break;
         }
+        drop(conflict_attribution_span);
+        drop(committed);
+        write_rows = CertifiedEntityInsertParameterBatch::Raw(raw_rows);
         conflict
     };
-    drop(conflict_attribution_span);
-    drop(committed);
-    ctx.stage_parameter_batch_insert(write_rows)
-        .instrument(tracing::debug_span!(
-            target: "lix_perf",
-            "lix.perf.entity_insert_parameter_batch.stage_rows"
-        ))
-        .await?;
+    match write_rows {
+        CertifiedEntityInsertParameterBatch::Typed(rows) => {
+            ctx.stage_certified_parameter_batch_insert(rows)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.entity_insert_parameter_batch.stage_rows"
+                ))
+                .await?;
+        }
+        CertifiedEntityInsertParameterBatch::Raw(rows) => {
+            ctx.stage_parameter_batch_insert(rows)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.entity_insert_parameter_batch.stage_rows"
+                ))
+                .await?;
+        }
+    }
     if let Some(error) = committed_conflict {
         return Err(error);
     }
@@ -3922,14 +3954,18 @@ fn certified_entity_insert_parameter_batch(
     parameter_batch: EntityInsertParameterBatch<'_>,
     allow_generic_fallback: bool,
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<Option<RawWriteBatch>, LixError> {
+) -> Result<Option<CertifiedEntityInsertParameterBatch>, LixError> {
     let [row] = values.rows.as_slice() else {
         return Ok(None);
     };
     if let Some(rows) =
         certified_direct_parameter_insert_batch(ctx, plan, spec, layout, row, parameter_batch)?
     {
-        return Ok(Some(rows));
+        return Ok(Some(if use_typed_certified_insert(rows.len()) {
+            CertifiedEntityInsertParameterBatch::Typed(rows)
+        } else {
+            CertifiedEntityInsertParameterBatch::Raw(rows.into_raw()?)
+        }));
     }
     if !allow_generic_fallback {
         return Ok(None);
@@ -3954,6 +3990,7 @@ fn certified_entity_insert_parameter_batch(
         }),
         active_branch_commit_id,
     )
+    .map(|rows| rows.map(CertifiedEntityInsertParameterBatch::Raw))
 }
 
 struct DirectParameterInsertColumn {
@@ -3990,7 +4027,7 @@ fn certified_direct_parameter_insert_batch(
     layout: &InsertRowLayout,
     row: &[BoundExpr],
     parameter_batch: EntityInsertParameterBatch<'_>,
-) -> Result<Option<RawWriteBatch>, LixError> {
+) -> Result<Option<CertifiedParameterInsertBatch>, LixError> {
     if plan.bound.conflict.is_some()
         || !spec.defaults.is_empty()
         || row.len() != layout.columns.len()
@@ -4331,7 +4368,7 @@ fn certified_direct_parameter_insert_batch(
         tracked_keys_strictly_ordered,
         complete_collection_replacement: false,
     };
-    let rows = RawWriteBatch::from_certified_parameter_insert(
+    let rows = CertifiedParameterInsertBatch::new(
         entity_pks,
         snapshots,
         schema_key,
@@ -4348,7 +4385,7 @@ fn certified_direct_path_value_insert_batch(
     row: &[BoundExpr],
     parameter_batch: EntityInsertParameterBatch<'_>,
     schema_plan_id: SchemaPlanId,
-) -> Result<Option<RawWriteBatch>, LixError> {
+) -> Result<Option<CertifiedParameterInsertBatch>, LixError> {
     if !spec.certifies_path_value_replacement || row.len() != 2 || layout.columns.len() != 2 {
         return Ok(None);
     }
@@ -4462,7 +4499,7 @@ fn certified_direct_path_value_insert_batch(
         .collect::<Vec<_>>();
     let snapshots =
         TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
-    Ok(Some(RawWriteBatch::from_certified_parameter_insert(
+    Ok(Some(CertifiedParameterInsertBatch::new(
         entity_pks,
         snapshots,
         layout.schema_key.as_str().into(),
@@ -6624,6 +6661,14 @@ fn entity_action(op: &BoundWriteOp) -> &'static str {
 mod primary_key_route_tests {
     use super::*;
     use crate::sql2::bind::expr::{BoundColumnRef, BoundParamRef};
+
+    #[test]
+    fn typed_certified_insert_is_reserved_for_allocation_material_batches() {
+        assert!(!use_typed_certified_insert(
+            TYPED_CERTIFIED_INSERT_MIN_ROWS - 1
+        ));
+        assert!(use_typed_certified_insert(TYPED_CERTIFIED_INSERT_MIN_ROWS));
+    }
 
     #[test]
     fn canonical_string_fast_path_matches_serde_for_safe_and_escaped_utf8() {
