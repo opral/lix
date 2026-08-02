@@ -444,6 +444,32 @@ impl TrackedStateMutationBatchBuilder {
                 .collect(),
         )
     }
+
+    /// Exposes encoded mutations as borrowed views while retaining ownership
+    /// of both backing arenas for the duration of the callback.
+    ///
+    /// Commit-delta encoders consume every mutation synchronously. Borrowing
+    /// here avoids promoting both arenas to shared `Bytes` storage and
+    /// allocating one pair of reference-counted slices per row only to turn
+    /// those slices straight back into `&[u8]` views.
+    pub(crate) fn with_entry_refs<R>(
+        self,
+        use_entries: impl FnOnce(&[EncodedLeafEntryRef<'_>]) -> R,
+    ) -> R {
+        let Self {
+            key_arena,
+            value_arena,
+            spans,
+        } = self;
+        let entries = spans
+            .into_iter()
+            .map(|span| EncodedLeafEntryRef {
+                key: &key_arena[span.key_start..span.key_end],
+                value: &value_arena[span.value_start..span.value_end],
+            })
+            .collect::<Vec<_>>();
+        use_entries(&entries)
+    }
 }
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; TRACKED_STATE_HASH_BYTES] {
