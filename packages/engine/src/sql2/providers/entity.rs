@@ -4762,6 +4762,7 @@ mod tests {
         let layout = crate::sql2::entity_batch::EntityColumnarScanLayout {
             id: crate::live_state::entity_row_group_set_id(base_commit_id, &spec.schema_key),
             manifest: Arc::new(encoded.manifest.clone()),
+            manifest_digest: encoded.manifest.content_digest().expect("manifest digest"),
             overlay: Arc::new(vec![
                 crate::live_state::EntityColumnarOverlayRow {
                     entity_pk: identities[0].clone(),
@@ -4816,6 +4817,7 @@ mod tests {
                 fields: Vec::new(),
                 groups: Vec::new(),
             }),
+            manifest_digest: [24; 32],
             overlay: Arc::new(Vec::new()),
             branch_id: Arc::from(branch_id),
             head_commit_id: CommitId::for_test_label("cached-batch-test-head"),

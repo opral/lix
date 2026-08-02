@@ -89,6 +89,7 @@ struct CachedEntityColumnarLayout {
     key: EntityColumnarLayoutCacheKey,
     id: crate::columnar_row_group::RowGroupSetId,
     manifest: std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
+    manifest_digest: [u8; 32],
     overlay: std::sync::Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
     head_commit_id: CommitId,
     live_count: u64,
@@ -123,6 +124,7 @@ impl EntityColumnarLayoutCache {
         key: EntityColumnarLayoutCacheKey,
         id: crate::columnar_row_group::RowGroupSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
+        manifest_digest: [u8; 32],
         overlay: Vec<crate::live_state::EntityColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
@@ -131,6 +133,7 @@ impl EntityColumnarLayoutCache {
             key,
             id,
             manifest,
+            manifest_digest,
             overlay,
             head_commit_id,
             live_count,
@@ -144,6 +147,7 @@ impl EntityColumnarLayoutCache {
         key: EntityColumnarLayoutCacheKey,
         id: crate::columnar_row_group::RowGroupSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
+        manifest_digest: [u8; 32],
         overlay: Vec<crate::live_state::EntityColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
@@ -161,6 +165,7 @@ impl EntityColumnarLayoutCache {
             key,
             id,
             manifest,
+            manifest_digest,
             overlay,
             head_commit_id,
             live_count,
@@ -302,6 +307,7 @@ pub(crate) struct LiveStateContext {
     entity_columnar_layout_cache: std::sync::Arc<EntityColumnarLayoutCache>,
     entity_columnar_scan_cache:
         std::sync::Arc<std::sync::Mutex<crate::live_state::EntityColumnarShadowMaskCache>>,
+    entity_decoded_column_cache: crate::live_state::EntityDecodedColumnCache,
 }
 
 impl LiveStateContext {
@@ -309,6 +315,8 @@ impl LiveStateContext {
         _tracked_state: TrackedStateContext,
         commit_graph: CommitGraphContext,
     ) -> Self {
+        let entity_columnar_array_budget =
+            std::sync::Arc::new(crate::live_state::EntityColumnarArrayBudget::default());
         Self {
             tracked_head: TrackedHeadContext::new(),
             commit_graph,
@@ -317,8 +325,14 @@ impl LiveStateContext {
             entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
             entity_columnar_layout_cache: std::sync::Arc::new(EntityColumnarLayoutCache::default()),
             entity_columnar_scan_cache: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::live_state::EntityColumnarShadowMaskCache::default(),
+                crate::live_state::EntityColumnarShadowMaskCache::with_array_budget(
+                    std::sync::Arc::clone(&entity_columnar_array_budget),
+                ),
             )),
+            entity_decoded_column_cache:
+                crate::live_state::EntityDecodedColumnCache::with_array_budget(
+                    entity_columnar_array_budget,
+                ),
         }
     }
 
@@ -326,6 +340,12 @@ impl LiveStateContext {
         &self,
     ) -> std::sync::Arc<std::sync::Mutex<crate::live_state::EntityColumnarShadowMaskCache>> {
         std::sync::Arc::clone(&self.entity_columnar_scan_cache)
+    }
+
+    pub(crate) fn entity_decoded_column_cache(
+        &self,
+    ) -> crate::live_state::EntityDecodedColumnCache {
+        self.entity_decoded_column_cache.clone()
     }
 
     /// Creates a visible live-state reader over a caller-provided KV store.
@@ -533,6 +553,7 @@ where
         Option<(
             crate::columnar_row_group::RowGroupSetId,
             std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
+            [u8; 32],
             std::sync::Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
             String,
             CommitId,
@@ -566,6 +587,7 @@ where
             return Ok(Some((
                 layout.id,
                 std::sync::Arc::clone(&layout.manifest),
+                layout.manifest_digest,
                 std::sync::Arc::clone(&layout.overlay),
                 branch_id,
                 layout.head_commit_id,
@@ -578,25 +600,29 @@ where
             .reader(&self.store)
             .entity_columnar_layout(&branch_id, control, &schema_key)
             .await?;
-        Ok(layout.map(|(id, manifest, overlay, live_count)| {
-            let layout = self.entity_columnar_layout_cache.insert(
-                key,
-                id,
-                manifest,
-                overlay,
-                control.head_commit_id,
-                live_count,
-            );
-            (
-                layout.id,
-                std::sync::Arc::clone(&layout.manifest),
-                std::sync::Arc::clone(&layout.overlay),
-                branch_id,
-                layout.head_commit_id,
-                control.current_state_revision,
-                layout.live_count,
-            )
-        }))
+        let Some((id, manifest, overlay, live_count)) = layout else {
+            return Ok(None);
+        };
+        let manifest_digest = manifest.content_digest()?;
+        let layout = self.entity_columnar_layout_cache.insert(
+            key,
+            id,
+            manifest,
+            manifest_digest,
+            overlay,
+            control.head_commit_id,
+            live_count,
+        );
+        Ok(Some((
+            layout.id,
+            std::sync::Arc::clone(&layout.manifest),
+            layout.manifest_digest,
+            std::sync::Arc::clone(&layout.overlay),
+            branch_id,
+            layout.head_commit_id,
+            control.current_state_revision,
+            layout.live_count,
+        )))
     }
 
     #[cfg(test)]
@@ -1673,6 +1699,7 @@ mod tests {
             key,
             crate::columnar_row_group::RowGroupSetId::new([1; 16]),
             empty_columnar_manifest(),
+            [2; 32],
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head"),
             1_000_000,
@@ -1692,6 +1719,7 @@ mod tests {
             first,
             crate::columnar_row_group::RowGroupSetId::new([1; 16]),
             empty_columnar_manifest(),
+            [2; 32],
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head-7"),
             1_000_000,
@@ -1701,6 +1729,7 @@ mod tests {
             columnar_cache_key(8),
             crate::columnar_row_group::RowGroupSetId::new([2; 16]),
             empty_columnar_manifest(),
+            [3; 32],
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head-8"),
             999_999,
@@ -1717,6 +1746,7 @@ mod tests {
             key,
             crate::columnar_row_group::RowGroupSetId::new([1; 16]),
             empty_columnar_manifest(),
+            [2; 32],
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head"),
             1_000_000,

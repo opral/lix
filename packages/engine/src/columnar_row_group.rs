@@ -173,6 +173,13 @@ pub(crate) struct RowGroupManifest {
 }
 
 impl RowGroupManifest {
+    /// Content identity of the complete persisted manifest, including every
+    /// column digest. Decoded-column caches use this in addition to the set
+    /// identifier so corrupted or replaced manifests can never alias.
+    pub(crate) fn content_digest(&self) -> Result<[u8; BLAKE3_DIGEST_LEN], LixError> {
+        Ok(*blake3::hash(&encode_manifest(self)?).as_bytes())
+    }
+
     pub(crate) fn row_count(&self) -> u64 {
         self.groups
             .iter()
@@ -480,6 +487,30 @@ pub(crate) async fn load_row_group_batch(
         .map_err(|error| row_group_error(error.to_string()));
     }
 
+    let arrays = load_row_group_columns(store, id, manifest, group_index, projection).await?;
+    RecordBatch::try_new(projected_schema, arrays)
+        .map_err(|error| row_group_error(error.to_string()))
+}
+
+/// Loads, verifies, decompresses, and decodes exactly the requested columns.
+/// The returned arrays follow `projection` order and retain no storage bytes.
+pub(crate) async fn load_row_group_columns(
+    store: &(impl StorageAdapterRead + ?Sized),
+    id: RowGroupSetId,
+    manifest: &RowGroupManifest,
+    group_index: usize,
+    projection: &[usize],
+) -> Result<Vec<ArrayRef>, LixError> {
+    validate_projection(manifest, projection)?;
+    let group = manifest.groups.get(group_index).ok_or_else(|| {
+        row_group_error(format!(
+            "row-group index {group_index} is outside {} groups",
+            manifest.groups.len()
+        ))
+    })?;
+    if projection.is_empty() {
+        return Ok(Vec::new());
+    }
     let keys = projection
         .iter()
         .map(|&column_index| id.column_key(group_index, column_index))
@@ -513,8 +544,15 @@ pub(crate) async fn load_row_group_batch(
             "row-group read returned excess column values",
         ));
     }
-    RecordBatch::try_new(projected_schema, arrays)
-        .map_err(|error| row_group_error(error.to_string()))
+    Ok(arrays)
+}
+
+pub(crate) fn row_group_projected_schema(
+    manifest: &RowGroupManifest,
+    projection: &[usize],
+) -> Result<SchemaRef, LixError> {
+    validate_projection(manifest, projection)?;
+    Ok(projected_schema(manifest, projection))
 }
 
 fn validate_input_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<(), LixError> {
