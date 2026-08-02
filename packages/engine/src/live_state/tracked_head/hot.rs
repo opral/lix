@@ -2764,6 +2764,22 @@ struct PackedExclusiveSchemaBaseRef {
     index_key: Bytes,
 }
 
+/// One bounded authoritative HOT row layered over an immutable analytical
+/// base. The identity text is encoded exactly as the hidden sidecar column so
+/// execution can suppress stale base rows without parsing entity keys.
+#[derive(Clone, Debug)]
+pub(crate) struct EntityColumnarOverlayRow {
+    pub(crate) entity_pk: EntityPk,
+    pub(crate) snapshot_content: Option<Bytes>,
+    pub(crate) deleted: bool,
+}
+
+// Moderate analytical workloads deliberately keep a few hundred thousand
+// sparse mutations over a million-row immutable base. Bound the merge without
+// forcing that normal shape back through full row materialization.
+const ENTITY_COLUMNAR_MAX_OVERLAY_ROWS: usize = 512 * 1024;
+const ENTITY_COLUMNAR_MAX_OVERLAY_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+
 fn packed_exclusive_schema_base_prefix(
     branch_id: &str,
     generation: CommitId,
@@ -4297,6 +4313,8 @@ where
         Option<(
             crate::columnar_row_group::RowGroupSetId,
             crate::columnar_row_group::RowGroupManifest,
+            Vec<EntityColumnarOverlayRow>,
+            u64,
         )>,
         LixError,
     > {
@@ -4310,7 +4328,7 @@ where
             },
         )
         .await?;
-        if collection.ordered_identity_digest.is_none() {
+        if collection.active_generation != control.generation {
             return Ok(None);
         }
         let base_refs = packed_exclusive_schema_base_refs(
@@ -4329,12 +4347,78 @@ where
         else {
             return Ok(None);
         };
-        if manifest.namespace != schema_key || manifest.row_count() != collection.live_count {
+        if manifest.namespace != schema_key {
             return Err(head_value_error(
                 "entity columnar sidecar disagrees with its collection publication",
             ));
         }
-        Ok(Some((id, manifest)))
+
+        // Read at most one bounded HOT generation. This is deliberately
+        // independent of the SQL predicate: an update or tombstone that no
+        // longer matches the predicate must still suppress its stale base row.
+        let filter = TrackedStateFilter {
+            schema_keys: vec![schema_key.to_owned()],
+            include_tombstones: true,
+            ..TrackedStateFilter::default()
+        };
+        let entries = hot_scan_entries(
+            &self.store,
+            branch_id,
+            control.generation,
+            &filter,
+            Some(ENTITY_COLUMNAR_MAX_OVERLAY_ROWS + 1),
+        )
+        .await?;
+        let entry_count = match &entries {
+            HotScanEntries::Decoded(entries) => entries.len(),
+            HotScanEntries::Finite(entries) => entries
+                .iter()
+                .map(|batch| batch.values.iter().flatten().count())
+                .sum(),
+        };
+        if entry_count > ENTITY_COLUMNAR_MAX_OVERLAY_ROWS {
+            return Ok(None);
+        }
+        let rows = materialize_hot_scan_entries(
+            &self.store,
+            entries,
+            ChangeRecordProjection::from_columns(&["snapshot_content".to_owned()]),
+            branch_id,
+            control.working_diff_checkpoint_commit_id,
+        )
+        .await?;
+        let mut overlay = Vec::with_capacity(rows.len());
+        let mut snapshot_bytes = 0_usize;
+        for row in rows.iter() {
+            // Packed analytical bases contain tracked, unfiled members only.
+            // Retain the established row path for a broader identity domain.
+            if row.file_id().is_some() || row.untracked() || row.global() {
+                return Ok(None);
+            }
+            let Some(commit_id) = row.commit_id() else {
+                return Ok(None);
+            };
+            // A complete packed replacement can be newer than stale HOT
+            // records in the same generation. Mirror the authoritative merge:
+            // equal/newer HOT wins; older HOT is ignored.
+            if commit_id < base_ref.commit_id {
+                continue;
+            }
+            snapshot_bytes = snapshot_bytes
+                .checked_add(row.snapshot_content().map_or(0, |snapshot| snapshot.len()))
+                .ok_or_else(|| head_value_error("entity columnar overlay byte size overflow"))?;
+            if snapshot_bytes > ENTITY_COLUMNAR_MAX_OVERLAY_SNAPSHOT_BYTES {
+                return Ok(None);
+            }
+            overlay.push(EntityColumnarOverlayRow {
+                entity_pk: row.entity_pk().clone(),
+                snapshot_content: row
+                    .snapshot_content()
+                    .map(|snapshot| Bytes::copy_from_slice(snapshot.as_bytes())),
+                deleted: row.deleted(),
+            });
+        }
+        Ok(Some((id, manifest, overlay, collection.live_count)))
     }
 
     #[cfg(test)]

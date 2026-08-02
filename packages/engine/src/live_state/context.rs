@@ -37,6 +37,8 @@ use super::derived::{
 const BRANCH_READ_CONCURRENCY: usize = 8;
 const ENTITY_POINT_SNAPSHOT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const ENTITY_POINT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4_096;
+const ENTITY_COLUMNAR_LAYOUT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const ENTITY_COLUMNAR_LAYOUT_CACHE_MAX_ENTRIES: usize = 16;
 const TRANSACTION_BRANCH_HEAD_CONTROL_CACHE_MAX_ENTRIES: usize = 64;
 type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
 
@@ -72,6 +74,149 @@ struct EntityPointSnapshotCacheEntry {
 #[derive(Debug, Default)]
 struct EntityPointSnapshotCache {
     entries: std::sync::Mutex<Vec<EntityPointSnapshotCacheEntry>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EntityColumnarLayoutCacheKey {
+    branch_id: String,
+    generation: CommitId,
+    current_state_revision: u64,
+    schema_key: String,
+}
+
+#[derive(Debug)]
+struct CachedEntityColumnarLayout {
+    key: EntityColumnarLayoutCacheKey,
+    id: crate::columnar_row_group::RowGroupSetId,
+    manifest: std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
+    overlay: std::sync::Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
+    head_commit_id: CommitId,
+    live_count: u64,
+    bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct EntityColumnarLayoutCache {
+    // Oldest entry first. Analytical planning is infrequent relative to batch
+    // execution, so a tiny vector keeps the synchronization and bookkeeping
+    // cost below that of a second index.
+    entries: StdMutex<Vec<std::sync::Arc<CachedEntityColumnarLayout>>>,
+}
+
+impl EntityColumnarLayoutCache {
+    fn get(
+        &self,
+        key: &EntityColumnarLayoutCacheKey,
+    ) -> Option<std::sync::Arc<CachedEntityColumnarLayout>> {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("entity columnar layout cache lock poisoned");
+        let position = entries.iter().position(|entry| entry.key == *key)?;
+        let entry = entries.remove(position);
+        entries.push(std::sync::Arc::clone(&entry));
+        Some(entry)
+    }
+
+    fn insert(
+        &self,
+        key: EntityColumnarLayoutCacheKey,
+        id: crate::columnar_row_group::RowGroupSetId,
+        manifest: crate::columnar_row_group::RowGroupManifest,
+        overlay: Vec<crate::live_state::EntityColumnarOverlayRow>,
+        head_commit_id: CommitId,
+        live_count: u64,
+    ) -> std::sync::Arc<CachedEntityColumnarLayout> {
+        self.insert_with_max_bytes(
+            key,
+            id,
+            manifest,
+            overlay,
+            head_commit_id,
+            live_count,
+            ENTITY_COLUMNAR_LAYOUT_CACHE_MAX_BYTES,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_with_max_bytes(
+        &self,
+        key: EntityColumnarLayoutCacheKey,
+        id: crate::columnar_row_group::RowGroupSetId,
+        manifest: crate::columnar_row_group::RowGroupManifest,
+        overlay: Vec<crate::live_state::EntityColumnarOverlayRow>,
+        head_commit_id: CommitId,
+        live_count: u64,
+        max_bytes: usize,
+    ) -> std::sync::Arc<CachedEntityColumnarLayout> {
+        let overlay = std::sync::Arc::new(overlay);
+        // Capacity accounting covers every owned buffer. A 2x admission
+        // margin conservatively absorbs allocator and HashMap control-byte
+        // overhead that Rust's collections do not expose.
+        let bytes =
+            estimated_entity_columnar_layout_bytes(&key, &manifest, &overlay, overlay.capacity())
+                .saturating_mul(2);
+        let manifest = std::sync::Arc::new(manifest);
+        let entry = std::sync::Arc::new(CachedEntityColumnarLayout {
+            key,
+            id,
+            manifest,
+            overlay,
+            head_commit_id,
+            live_count,
+            bytes,
+        });
+        if bytes > max_bytes {
+            return entry;
+        }
+
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("entity columnar layout cache lock poisoned");
+        // A newer state revision for one collection makes the older layout
+        // useless to subsequent live readers. The exact revision key already
+        // prevents stale hits; eager removal also bounds revision churn.
+        entries.retain(|resident| {
+            resident.key.branch_id != entry.key.branch_id
+                || resident.key.schema_key != entry.key.schema_key
+        });
+        entries.push(std::sync::Arc::clone(&entry));
+        let mut resident_bytes = entries.iter().map(|entry| entry.bytes).sum::<usize>();
+        while resident_bytes > max_bytes || entries.len() > ENTITY_COLUMNAR_LAYOUT_CACHE_MAX_ENTRIES
+        {
+            resident_bytes = resident_bytes.saturating_sub(entries.remove(0).bytes);
+        }
+        entry
+    }
+}
+
+fn estimated_entity_columnar_layout_bytes(
+    key: &EntityColumnarLayoutCacheKey,
+    manifest: &crate::columnar_row_group::RowGroupManifest,
+    overlay: &[crate::live_state::EntityColumnarOverlayRow],
+    overlay_capacity: usize,
+) -> usize {
+    let manifest_bytes = size_of::<crate::columnar_row_group::RowGroupManifest>()
+        .saturating_add(manifest.estimated_heap_bytes());
+    size_of::<CachedEntityColumnarLayout>()
+        .saturating_add(key.branch_id.capacity())
+        .saturating_add(key.schema_key.capacity())
+        .saturating_add(manifest_bytes)
+        .saturating_add(
+            overlay_capacity
+                .saturating_mul(size_of::<crate::live_state::EntityColumnarOverlayRow>()),
+        )
+        .saturating_add(
+            overlay
+                .iter()
+                .map(|row| {
+                    row.entity_pk
+                        .estimated_heap_bytes()
+                        .saturating_add(row.snapshot_content.as_ref().map_or(0, Bytes::len))
+                })
+                .sum(),
+        )
 }
 
 impl EntityPointSnapshotCache {
@@ -154,6 +299,9 @@ pub(crate) struct LiveStateContext {
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
     entity_field_index_cache: std::sync::Arc<EntitySnapshotFieldIndexCache>,
     entity_point_snapshot_cache: std::sync::Arc<EntityPointSnapshotCache>,
+    entity_columnar_layout_cache: std::sync::Arc<EntityColumnarLayoutCache>,
+    entity_columnar_scan_cache:
+        std::sync::Arc<std::sync::Mutex<crate::live_state::EntityColumnarShadowMaskCache>>,
 }
 
 impl LiveStateContext {
@@ -167,7 +315,17 @@ impl LiveStateContext {
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
             entity_field_index_cache: std::sync::Arc::new(EntitySnapshotFieldIndexCache::default()),
             entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
+            entity_columnar_layout_cache: std::sync::Arc::new(EntityColumnarLayoutCache::default()),
+            entity_columnar_scan_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::live_state::EntityColumnarShadowMaskCache::default(),
+            )),
         }
+    }
+
+    pub(crate) fn entity_columnar_scan_cache(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::live_state::EntityColumnarShadowMaskCache>> {
+        std::sync::Arc::clone(&self.entity_columnar_scan_cache)
     }
 
     /// Creates a visible live-state reader over a caller-provided KV store.
@@ -182,6 +340,7 @@ impl LiveStateContext {
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
             entity_field_index_cache: std::sync::Arc::clone(&self.entity_field_index_cache),
             entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
+            entity_columnar_layout_cache: std::sync::Arc::clone(&self.entity_columnar_layout_cache),
             branch_head_control_cache: None,
         }
     }
@@ -203,6 +362,7 @@ impl LiveStateContext {
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
             entity_field_index_cache: std::sync::Arc::clone(&self.entity_field_index_cache),
             entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
+            entity_columnar_layout_cache: std::sync::Arc::clone(&self.entity_columnar_layout_cache),
             branch_head_control_cache: Some(branch_head_control_cache),
         }
     }
@@ -221,6 +381,7 @@ impl LiveStateContext {
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
             entity_field_index_cache: std::sync::Arc::new(EntitySnapshotFieldIndexCache::default()),
             entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
+            entity_columnar_layout_cache: std::sync::Arc::new(EntityColumnarLayoutCache::default()),
             branch_head_control_cache: None,
         }
     }
@@ -244,6 +405,7 @@ pub(crate) struct LiveStateStoreReader<S> {
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
     entity_field_index_cache: std::sync::Arc<EntitySnapshotFieldIndexCache>,
     entity_point_snapshot_cache: std::sync::Arc<EntityPointSnapshotCache>,
+    entity_columnar_layout_cache: std::sync::Arc<EntityColumnarLayoutCache>,
     branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
 }
 
@@ -370,7 +532,12 @@ where
     ) -> Result<
         Option<(
             crate::columnar_row_group::RowGroupSetId,
-            crate::columnar_row_group::RowGroupManifest,
+            std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
+            std::sync::Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
+            String,
+            CommitId,
+            u64,
+            u64,
         )>,
         LixError,
     > {
@@ -389,10 +556,47 @@ where
         else {
             return Ok(None);
         };
-        self.tracked_head
+        let key = EntityColumnarLayoutCacheKey {
+            branch_id: branch_id.clone(),
+            generation: control.generation,
+            current_state_revision: control.current_state_revision,
+            schema_key: schema_key.clone(),
+        };
+        if let Some(layout) = self.entity_columnar_layout_cache.get(&key) {
+            return Ok(Some((
+                layout.id,
+                std::sync::Arc::clone(&layout.manifest),
+                std::sync::Arc::clone(&layout.overlay),
+                branch_id,
+                layout.head_commit_id,
+                control.current_state_revision,
+                layout.live_count,
+            )));
+        }
+        let layout = self
+            .tracked_head
             .reader(&self.store)
             .entity_columnar_layout(&branch_id, control, &schema_key)
-            .await
+            .await?;
+        Ok(layout.map(|(id, manifest, overlay, live_count)| {
+            let layout = self.entity_columnar_layout_cache.insert(
+                key,
+                id,
+                manifest,
+                overlay,
+                control.head_commit_id,
+                live_count,
+            );
+            (
+                layout.id,
+                std::sync::Arc::clone(&layout.manifest),
+                std::sync::Arc::clone(&layout.overlay),
+                branch_id,
+                layout.head_commit_id,
+                control.current_state_revision,
+                layout.live_count,
+            )
+        }))
     }
 
     pub(crate) async fn scan_direct_entity_snapshots_by_string_field(
@@ -1422,6 +1626,84 @@ mod tests {
     };
     use serde_json::json;
 
+    fn columnar_cache_key(revision: u64) -> EntityColumnarLayoutCacheKey {
+        EntityColumnarLayoutCacheKey {
+            branch_id: "branch".to_owned(),
+            generation: CommitId::for_test_label("columnar-cache-generation"),
+            current_state_revision: revision,
+            schema_key: "cache_schema".to_owned(),
+        }
+    }
+
+    fn empty_columnar_manifest() -> crate::columnar_row_group::RowGroupManifest {
+        crate::columnar_row_group::RowGroupManifest {
+            namespace: "cache_schema".to_owned(),
+            metadata: std::collections::HashMap::new(),
+            fields: Vec::new(),
+            groups: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn entity_columnar_layout_cache_reuses_arc_overlay() {
+        let cache = EntityColumnarLayoutCache::default();
+        let key = columnar_cache_key(7);
+        let inserted = cache.insert(
+            key,
+            crate::columnar_row_group::RowGroupSetId::new([1; 16]),
+            empty_columnar_manifest(),
+            Vec::new(),
+            CommitId::for_test_label("columnar-cache-head"),
+            1_000_000,
+        );
+        let hit = cache
+            .get(&columnar_cache_key(7))
+            .expect("same revision should hit");
+        assert!(std::sync::Arc::ptr_eq(&inserted, &hit));
+        assert!(std::sync::Arc::ptr_eq(&inserted.overlay, &hit.overlay));
+    }
+
+    #[test]
+    fn entity_columnar_layout_cache_revision_change_invalidates_prior_layout() {
+        let cache = EntityColumnarLayoutCache::default();
+        let first = columnar_cache_key(7);
+        cache.insert(
+            first,
+            crate::columnar_row_group::RowGroupSetId::new([1; 16]),
+            empty_columnar_manifest(),
+            Vec::new(),
+            CommitId::for_test_label("columnar-cache-head-7"),
+            1_000_000,
+        );
+        assert!(cache.get(&columnar_cache_key(8)).is_none());
+        cache.insert(
+            columnar_cache_key(8),
+            crate::columnar_row_group::RowGroupSetId::new([2; 16]),
+            empty_columnar_manifest(),
+            Vec::new(),
+            CommitId::for_test_label("columnar-cache-head-8"),
+            999_999,
+        );
+        assert!(cache.get(&columnar_cache_key(7)).is_none());
+        assert!(cache.get(&columnar_cache_key(8)).is_some());
+    }
+
+    #[test]
+    fn entity_columnar_layout_cache_does_not_admit_oversize_layout() {
+        let cache = EntityColumnarLayoutCache::default();
+        let key = columnar_cache_key(7);
+        let returned = cache.insert_with_max_bytes(
+            key,
+            crate::columnar_row_group::RowGroupSetId::new([1; 16]),
+            empty_columnar_manifest(),
+            Vec::new(),
+            CommitId::for_test_label("columnar-cache-head"),
+            1_000_000,
+            0,
+        );
+        assert!(returned.bytes > 0);
+        assert!(cache.get(&columnar_cache_key(7)).is_none());
+    }
     const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 
     #[derive(Clone)]

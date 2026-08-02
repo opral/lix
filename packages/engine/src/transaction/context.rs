@@ -1534,6 +1534,7 @@ where
             match commit::commit_prepared_writes_with_parent_heads(
                 &transaction.binary_cas,
                 &transaction.tracked_state,
+                Some(transaction.sql_schema_snapshot.as_ref()),
                 Some(runtime_functions),
                 &commit_parent_heads,
                 &mut read,

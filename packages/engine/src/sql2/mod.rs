@@ -6,6 +6,7 @@ mod change_materialization;
 mod context;
 mod dml;
 mod entity_batch;
+mod entity_columnar_layout;
 mod entity_projection;
 mod error;
 mod exec;
@@ -35,7 +36,10 @@ pub(crate) use bind::{
     BoundStatementRoute, bind_read_statement, bind_statement_route, bind_statement_with_catalog,
     statement_has_durable_runtime_function,
 };
-pub(crate) use catalog::PublicCatalog;
+pub(crate) use catalog::{
+    EntityColumnType, EntitySurfaceSpec, PublicCatalog, derive_entity_surface_spec_from_schema,
+    entity_visible_fields,
+};
 pub(crate) use change_materialization::MaterializedChange;
 pub(crate) use context::{
     CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
@@ -44,6 +48,11 @@ pub(crate) use context::{
     WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
 pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader};
+pub(crate) use entity_columnar_layout::{
+    ENTITY_COLUMNAR_ENTITY_PK_FIELD, ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY,
+    EntityColumnarRowRef, encode_registered_entity_row_groups,
+};
+pub(crate) use entity_projection::EntityProjectionDecoder;
 pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{

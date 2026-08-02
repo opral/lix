@@ -112,6 +112,7 @@ pub(crate) async fn commit_prepared_writes(
     commit_prepared_writes_with_parent_heads(
         binary_cas,
         &tracked_state,
+        None,
         runtime_functions,
         &commit_parent_heads,
         read,
@@ -125,6 +126,7 @@ pub(crate) async fn commit_prepared_writes(
 pub(crate) async fn commit_prepared_writes_with_parent_heads(
     binary_cas: &BinaryCasContext,
     tracked_state: &TrackedStateContext,
+    entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
     runtime_functions: Option<&FunctionContext>,
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     read: &mut impl StorageAdapterRead,
@@ -242,7 +244,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     }
     let mut insert_selection = prepared_writes.insert_selection;
     let entity_columnar_write_sets =
-        prepare_entity_columnar_write_sets(&state_rows, &insert_selection)?;
+        prepare_entity_columnar_write_sets(&state_rows, &insert_selection, entity_schema_catalog)?;
     release_validated_canonical_value_columns(&mut state_rows);
     if !prepared_writes.file_data_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
@@ -3857,6 +3859,7 @@ fn release_validated_canonical_value_columns(state_rows: &mut PreparedStateBatch
 fn prepare_entity_columnar_write_sets(
     state_rows: &PreparedStateBatch,
     insert_selection: &PreparedInsertSelection,
+    entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
 ) -> Result<crate::live_state::EntityColumnarWriteSets, LixError> {
     if state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS || insert_selection.len() != state_rows.len()
     {
@@ -3883,16 +3886,25 @@ fn prepare_entity_columnar_write_sets(
         if row_indices.len() < PACKED_CURRENT_BASE_MIN_ROWS {
             continue;
         }
-        let snapshots = row_indices.iter().map(|&index| {
-            state_rows
-                .row(index)
+        let Some(schema) = entity_schema_catalog.and_then(|catalog| catalog.schema(&schema_key))
+        else {
+            continue;
+        };
+        let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(schema) else {
+            continue;
+        };
+        let rows = row_indices.iter().map(|&index| {
+            let row = state_rows.row(index);
+            let snapshot = row
                 .snapshot
-                .expect("columnar row index retained a snapshot")
-                .value()
+                .expect("columnar row index retained a snapshot");
+            crate::sql2::EntityColumnarRowRef {
+                entity_pk: row.entity_pk,
+                snapshot_bytes: snapshot.normalized().as_bytes(),
+                snapshot_value: snapshot.value(),
+            }
         });
-        if let Some(row_groups) =
-            crate::live_state::encode_entity_scalar_row_groups(&schema_key, snapshots)?
-        {
+        if let Some(row_groups) = crate::sql2::encode_registered_entity_row_groups(&spec, rows)? {
             encoded.insert((commit_id, schema_key), row_groups);
         }
     }

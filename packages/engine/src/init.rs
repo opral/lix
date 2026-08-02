@@ -39,13 +39,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V44 adds authenticated immutable analytical row groups owned by commit
-/// generations. Older repositories have no lifecycle contract for these
-/// sidecars and must fail closed before any physical representation is decoded.
+/// V45 binds authenticated analytical row groups to registered SQL schemas
+/// and stores canonical entity identities for transactional overlay
+/// reconciliation. Older repositories must fail closed rather than interpret
+/// inferred V44 sidecars as schema-authenticated physical layouts.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"lxcd9-generation-indexed-commits.v44";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"lxcd9-generation-indexed-commits.v45";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
