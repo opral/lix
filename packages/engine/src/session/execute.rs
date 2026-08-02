@@ -4054,6 +4054,41 @@ mod tests {
         assert_eq!(manifest.row_count(), expected_rows);
     }
 
+    async fn assert_current_head_lacks_columnar_manifest(
+        session: &SessionContext<Memory>,
+        schema_key: &str,
+    ) {
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should resolve");
+        let head_read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch-head read should open");
+        let head = session
+            .branch_ctx
+            .ref_reader(head_read)
+            .load_head(&branch_id)
+            .await
+            .expect("branch head should load")
+            .expect("active branch should have a head");
+        let sidecar_read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("sidecar read should open");
+        let id = crate::live_state::entity_row_group_set_id(head.commit_id, schema_key);
+        assert!(
+            crate::columnar_row_group::load_row_group_manifest(&sidecar_read, id)
+                .await
+                .expect("sidecar manifest lookup should succeed")
+                .is_none(),
+            "write-oriented schema must not publish a columnar sidecar"
+        );
+    }
+
     async fn open_session_with_telemetry(
         spans: Arc<std::sync::Mutex<Vec<CompletedTelemetrySpan>>>,
     ) -> SessionContext<Memory> {
@@ -4860,6 +4895,125 @@ mod tests {
             .create_checkpoint()
             .await
             .expect("ordered packed current base should remain checkpointable");
+    }
+
+    #[tokio::test]
+    async fn columnar_opt_out_covers_certified_insert_and_complete_replacement() {
+        const ROW_COUNT: usize = 1_024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "columnar_opt_out_probe",
+            "x-lix-primary-key": ["/path"],
+            "x-lix-columnar": false,
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": [
+                        "object", "array", "string", "number", "integer", "boolean", "null"
+                    ]
+                }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("write-oriented schema should register");
+
+        let sql = "INSERT INTO columnar_opt_out_probe (path, value) VALUES ($1, lix_json($2))";
+        let inserts = (0..ROW_COUNT)
+            .map(|index| ExecuteBatchStatement {
+                sql: sql.to_owned(),
+                params: vec![
+                    Value::Text(format!("/{index:04}")),
+                    Value::Text(format!(r#"{{"before":{index}}}"#)),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let inserted = session
+            .execute_batch(&inserts)
+            .await
+            .expect("certified parameter batch should insert")
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
+        assert_eq!(inserted, ROW_COUNT as u64);
+        assert_current_head_lacks_columnar_manifest(&session, "columnar_opt_out_probe").await;
+
+        crate::transaction::take_complete_replacement_packed_current_base_publications();
+        let update_sql = "UPDATE columnar_opt_out_probe SET value = lix_json($1) WHERE path = $2";
+        let updates = (0..ROW_COUNT)
+            .map(|index| ExecuteBatchStatement {
+                sql: update_sql.to_owned(),
+                params: vec![
+                    Value::Text(format!(r#"{{"after":{index}}}"#)),
+                    Value::Text(format!("/{index:04}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let updated = session
+            .execute_batch(&updates)
+            .await
+            .expect("complete replacement should update")
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
+        assert_eq!(updated, ROW_COUNT as u64);
+        assert_eq!(
+            crate::transaction::take_complete_replacement_packed_current_base_publications(),
+            1,
+            "fixture must publish the certified complete replacement as a packed base"
+        );
+        assert_current_head_lacks_columnar_manifest(&session, "columnar_opt_out_probe").await;
+    }
+
+    #[tokio::test]
+    async fn columnar_opt_out_covers_generic_literal_batch_insert() {
+        const ROW_COUNT: usize = 1_024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "columnar_opt_out_literal_probe",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-columnar": false,
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("write-oriented literal schema should register");
+
+        let inserts = (0..ROW_COUNT)
+            .map(|index| ExecuteBatchStatement {
+                sql: format!(
+                    "INSERT INTO columnar_opt_out_literal_probe (id, value) VALUES ('{index:04}', 'literal-{index:04}')"
+                ),
+                params: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let inserted = session
+            .execute_batch(&inserts)
+            .await
+            .expect("generic literal batch should insert")
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
+        assert_eq!(inserted, ROW_COUNT as u64);
+        assert_current_head_lacks_columnar_manifest(&session, "columnar_opt_out_literal_probe")
+            .await;
     }
 
     #[tokio::test]

@@ -3018,6 +3018,34 @@ mod tests {
     }
 
     #[test]
+    fn entity_columnar_sidecar_policy_defaults_on_and_accepts_explicit_opt_out() {
+        let mut schema = crate::schema::seed_schema_definition("lix_key_value")
+            .expect("key-value schema should exist")
+            .clone();
+        let compile = |schema: JsonValue| {
+            SchemaPlan::compile(
+                SchemaCatalogKey {
+                    schema_key: "lix_key_value".to_string(),
+                },
+                schema,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .expect("key-value schema should compile")
+        };
+
+        assert!(crate::schema::materializes_entity_columnar_sidecar(&schema));
+        let _ = compile(schema.clone());
+        schema["x-lix-columnar"] = json!(false);
+        crate::schema::validate_lix_schema_definition(&schema)
+            .expect("columnar storage policy should be a valid Lix schema extension");
+        assert!(!crate::schema::materializes_entity_columnar_sidecar(
+            &schema
+        ));
+        let _ = compile(schema);
+    }
+
+    #[test]
     fn fast_object_validation_accepts_key_value_rows_and_rejects_invalid_shapes() {
         let schema = crate::schema::seed_schema_definition("lix_key_value")
             .expect("key-value schema should exist");

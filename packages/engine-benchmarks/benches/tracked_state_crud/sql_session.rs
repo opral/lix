@@ -1597,6 +1597,7 @@ where
     let schema = serde_json::json!({
         "x-lix-key": "tracked_crud_insert",
         "x-lix-primary-key": ["/path"],
+        "x-lix-columnar": false,
         "type": "object",
         "required": ["path", "value"],
         "properties": {
