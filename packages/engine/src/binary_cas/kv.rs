@@ -281,6 +281,8 @@ pub(in crate::binary_cas) async fn stage_fixed_part_skipping_existing(
             "resumable CAS parts must contain 1 byte through 16 MiB",
         ));
     }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_media_upload_chunk_payload_hash_bytes(bytes.len());
     let receipts = bytes
         .chunks(crate::binary_cas::chunking::MEDIA_CHUNK_BYTES)
         .map(|chunk| crate::binary_cas::BlobChunkReceipt {

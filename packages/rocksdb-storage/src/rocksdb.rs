@@ -68,6 +68,7 @@ pub struct RocksDBWrite {
     inner: Arc<RocksDBInner>,
     _writer_permit: OwnedMutexGuard<()>,
     batch: WriteBatch,
+    immutable_values: HashMap<Vec<u8>, Bytes>,
     stats: WriteStats,
 }
 
@@ -193,6 +194,7 @@ impl Storage for RocksDB {
                 } else {
                     WriteBatch::with_capacity_bytes(opts.batch_capacity_hint_bytes)
                 },
+                immutable_values: HashMap::new(),
                 stats: WriteStats::default(),
             })
         }
@@ -465,6 +467,31 @@ impl StorageWrite for RocksDBWrite {
                 physical_key.extend_from_slice(&space_prefix);
                 physical_key.extend_from_slice(&entry.key.0);
                 let value = stored_value_bytes(entry.value);
+                if space.value_semantics == ValueSemantics::Immutable {
+                    if let Some(staged) = self.immutable_values.get(physical_key.as_slice()) {
+                        if staged != &value {
+                            return Err(StorageError::Corruption(
+                                "immutable identity was assigned different bytes".to_string(),
+                            ));
+                        }
+                        continue;
+                    }
+                    if let Some(existing) = self
+                        .inner
+                        .db
+                        .get_cf(cf, physical_key.as_slice())
+                        .map_err(rocksdb_error)?
+                    {
+                        if existing.as_slice() != value.as_ref() {
+                            return Err(StorageError::Corruption(
+                                "immutable identity was assigned different bytes".to_string(),
+                            ));
+                        }
+                        continue;
+                    }
+                    self.immutable_values
+                        .insert(physical_key.clone(), value.clone());
+                }
                 self.stats.put_entries += 1;
                 self.stats.written_bytes += value.len() as u64;
                 self.batch

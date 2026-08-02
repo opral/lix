@@ -14,11 +14,11 @@ use lix_engine::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, PutEntry, ReadDurability, ReadEntry,
     ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, WriteOptions, WriteStats,
+    StorageWrite, ValueSemantics, WriteOptions, WriteStats,
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use rusqlite::types::ValueRef as SqlValueRef;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tempfile::TempDir;
 
 /// Format v2: one table per storage space instead of a single interleaved
@@ -463,6 +463,7 @@ impl StorageWrite for SQLiteWrite {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
+            let semantics = space.value_semantics;
             let space = space.id;
             let mut entries = entries.entries;
             entries.sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
@@ -476,6 +477,9 @@ impl StorageWrite for SQLiteWrite {
                 .map(|entry| entry.value.bytes.len() as u64)
                 .sum::<u64>();
             self.ensure_space_table(space)?;
+            if semantics == ValueSemantics::Immutable {
+                self.validate_immutable_rows(space, &entries)?;
+            }
             self.put_rows(space, &entries)?;
             self.stats.put_entries += put_entries;
             self.stats.written_bytes += written_bytes;
@@ -612,6 +616,33 @@ impl SQLiteWrite {
             for entry in remainder {
                 stmt.execute(params![entry.key.0.as_ref(), entry.value.bytes.as_ref()])
                     .map_err(sqlite_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_immutable_rows(
+        &self,
+        space: SpaceId,
+        entries: &[PutEntry],
+    ) -> Result<(), StorageError> {
+        let table = space_table(space);
+        let sql = format!("SELECT value FROM {table} WHERE key = ?1");
+        let mut stmt = self.conn().prepare_cached(&sql).map_err(sqlite_error)?;
+        for entry in entries {
+            let existing = stmt
+                .query_row(params![entry.key.0.as_ref()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .optional()
+                .map_err(sqlite_error)?;
+            if existing
+                .as_deref()
+                .is_some_and(|existing| existing != entry.value.bytes.as_ref())
+            {
+                return Err(StorageError::Corruption(
+                    "immutable identity was assigned different bytes".to_string(),
+                ));
             }
         }
         Ok(())

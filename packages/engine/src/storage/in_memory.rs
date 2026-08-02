@@ -10,7 +10,7 @@ use crate::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
     ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
-    StorageWrite, StoredValue, WriteOptions, WriteStats,
+    StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };
 
 type InMemoryMap = PersistentMap<Key, Bytes>;
@@ -73,6 +73,7 @@ pub struct MemoryWrite {
     base: InMemoryMap,
     preconditions: Vec<Precondition>,
     overlay: EntriesOverlay,
+    immutable_values: BTreeMap<Key, Bytes>,
     stats: WriteStats,
 }
 
@@ -284,6 +285,7 @@ impl Storage for Memory {
             base: self.snapshot()?,
             preconditions: opts.preconditions,
             overlay: EntriesOverlay::default(),
+            immutable_values: BTreeMap::new(),
             stats: WriteStats::default(),
         })
     }
@@ -338,6 +340,25 @@ impl StorageWrite for MemoryWrite {
         for entry in entries.entries {
             let key = physical_key(space.id, &entry.key);
             let value = stored_value_bytes(entry.value);
+            if space.value_semantics == ValueSemantics::Immutable {
+                if let Some(existing) = self.immutable_values.get(&key) {
+                    if existing != &value {
+                        return Err(StorageError::Corruption(
+                            "immutable identity was assigned different bytes".to_string(),
+                        ));
+                    }
+                    continue;
+                }
+                if let Some(existing) = self.base.get(&key) {
+                    if existing != &value {
+                        return Err(StorageError::Corruption(
+                            "immutable identity was assigned different bytes".to_string(),
+                        ));
+                    }
+                    continue;
+                }
+                self.immutable_values.insert(key.clone(), value.clone());
+            }
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
             if !self.overlay.deletes.is_empty() {
@@ -410,6 +431,15 @@ impl StorageWrite for MemoryWrite {
             .lock()
             .map_err(|_| StorageError::Io("in-memory storage lock poisoned".to_string()))?;
         check_preconditions(&parent, &self.preconditions)?;
+        for (key, value) in &self.immutable_values {
+            if let Some(existing) = parent.get(key)
+                && existing != value
+            {
+                return Err(StorageError::Corruption(
+                    "immutable identity was assigned different bytes".to_string(),
+                ));
+            }
+        }
         let mut entries = parent.clone();
         for key in self.overlay.deletes {
             entries = entries.remove(&key);

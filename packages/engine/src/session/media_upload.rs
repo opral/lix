@@ -55,6 +55,7 @@ struct UploadComplete {
     path: String,
     total_size: u64,
     blob_id: [u8; 32],
+    part_identities: Vec<[u8; 32]>,
 }
 
 impl<StorageImpl> SessionContext<StorageImpl>
@@ -95,17 +96,7 @@ where
             let loaded_state = load_upload_state(&read, &state_key).await?;
             match &loaded_state {
                 Some(UploadState::Complete(complete)) => {
-                    validate_upload_binding(
-                        &complete.path,
-                        complete.total_size,
-                        &path,
-                        total_size,
-                    )?;
-                    return Ok(FileUploadProgress {
-                        next_offset: complete.total_size,
-                        total_size: complete.total_size,
-                        finalized: true,
-                    });
+                    validate_upload_binding(&complete.path, complete.total_size, &path, total_size)?
                 }
                 Some(UploadState::Open(existing)) => {
                     validate_upload_binding(
@@ -116,26 +107,6 @@ where
                     )?;
                 }
                 None => {}
-            }
-
-            if upload_manifest_leaf_exists(&read, &leaf_key).await? {
-                let progress = load_upload_progress(&read, &upload_id, total_size).await?;
-                drop(read);
-                drop(operation_guard);
-                return self
-                    .publish_completed_upload(upload_id, state_key, state, progress)
-                    .await;
-            }
-            if part_number >= UPLOAD_PART_WINDOW {
-                let boundary_key = upload_manifest_leaf_key(
-                    &upload_id,
-                    part_number.saturating_sub(UPLOAD_PART_WINDOW),
-                )?;
-                if !upload_manifest_leaf_exists(&read, &boundary_key).await? {
-                    return Err(invalid_upload(
-                        "upload part is outside the four-part completion window",
-                    ));
-                }
             }
 
             let mut writes = self.storage.new_write_set();
@@ -152,6 +123,43 @@ where
                 part_size: data.len() as u64,
                 chunks,
             };
+            if let Some(UploadState::Complete(complete)) = &loaded_state {
+                if complete.part_identities.get(part_number as usize)
+                    != Some(&upload_manifest_leaf_identity(&leaf))
+                {
+                    return Err(invalid_upload(
+                        "completed upload part was replayed with different bytes",
+                    ));
+                }
+                return Ok(FileUploadProgress {
+                    next_offset: complete.total_size,
+                    total_size: complete.total_size,
+                    finalized: true,
+                });
+            }
+
+            if let Some(existing_leaf) = load_upload_manifest_leaf(&read, &leaf_key).await? {
+                if existing_leaf != leaf {
+                    return Err(invalid_upload(
+                        "upload part was replayed with different bytes",
+                    ));
+                }
+                let progress = load_upload_progress(&read, &upload_id, total_size).await?;
+                drop(read);
+                drop(operation_guard);
+                return self
+                    .publish_completed_upload(upload_id, state_key, state, progress)
+                    .await;
+            }
+            let progress = load_upload_progress(&read, &upload_id, total_size).await?;
+            let next_part = u32::try_from(progress.next_offset / FILE_UPLOAD_PART_BYTES as u64)
+                .map_err(|_| invalid_upload("upload progress exceeds u32"))?;
+            if part_number >= next_part.saturating_add(UPLOAD_PART_WINDOW) {
+                return Err(invalid_upload(
+                    "upload part is outside the four-part completion window",
+                ));
+            }
+
             stage_upload_manifest_leaf(&mut writes, leaf_key.clone(), &leaf)?;
             let mut preconditions = vec![StoragePrecondition::KeyAbsent {
                 space: UPLOAD_MANIFEST_LEAF_SPACE,
@@ -178,15 +186,6 @@ where
                 }
                 Some(UploadState::Complete(_)) => unreachable!("complete state returned above"),
             }
-            if part_number >= UPLOAD_PART_WINDOW {
-                preconditions.push(StoragePrecondition::KeyPresent {
-                    space: UPLOAD_MANIFEST_LEAF_SPACE,
-                    key: upload_manifest_leaf_key(
-                        &upload_id,
-                        part_number.saturating_sub(UPLOAD_PART_WINDOW),
-                    )?,
-                });
-            }
             drop(read);
 
             let commit_boundary = self.transaction_commit_boundary();
@@ -212,6 +211,8 @@ where
             .await;
             match result {
                 Ok(stats) => {
+                    #[cfg(feature = "storage-benches")]
+                    crate::storage_bench::record_media_upload_manifest_leaf(leaf.chunks.len());
                     self.observe_invalidation.bump_if_storage_changed(&stats);
                     let read = self
                         .storage
@@ -244,7 +245,8 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let receipts = load_upload_manifest_leaves(&read, &upload_id, state.total_size).await?;
+        let (receipts, part_identities) =
+            load_upload_manifest_leaves(&read, &upload_id, state.total_size).await?;
         let mut finalization_writes = self.storage.new_write_set();
         finalization_writes
             .delete_range_exclusive(
@@ -260,6 +262,7 @@ where
             path: state.path.clone(),
             total_size: state.total_size,
             blob_id: receipt.hash.into_bytes(),
+            part_identities,
         });
         let publication_blob_id = receipt.hash;
         let expected_blob_id = receipt.hash.into_bytes();
@@ -477,6 +480,16 @@ fn encode_upload_manifest_leaf(leaf: &UploadManifestLeaf) -> Result<Vec<u8>, Lix
     Ok(value)
 }
 
+fn upload_manifest_leaf_identity(leaf: &UploadManifestLeaf) -> [u8; 32] {
+    let mut identity = blake3::Hasher::new_derive_key("lix upload manifest leaf identity v1");
+    identity.update(&leaf.part_size.to_le_bytes());
+    for chunk in &leaf.chunks {
+        identity.update(chunk.hash.as_bytes());
+        identity.update(&chunk.size_bytes.to_le_bytes());
+    }
+    *identity.finalize().as_bytes()
+}
+
 fn decode_upload_manifest_leaf(value: &[u8]) -> Result<UploadManifestLeaf, LixError> {
     const HEADER_BYTES: usize = 8 + 8 + 4;
     if value.len() < HEADER_BYTES || !value.starts_with(UPLOAD_MANIFEST_LEAF_MAGIC) {
@@ -530,20 +543,24 @@ fn decode_upload_manifest_leaf(value: &[u8]) -> Result<UploadManifestLeaf, LixEr
     Ok(UploadManifestLeaf { part_size, chunks })
 }
 
-async fn upload_manifest_leaf_exists(
+async fn load_upload_manifest_leaf(
     store: &impl crate::storage_adapter::StorageAdapterRead,
     key: &StorageKey,
-) -> Result<bool, LixError> {
+) -> Result<Option<UploadManifestLeaf>, LixError> {
     let values = store
         .get_many(&[StorageGetManyRequest {
             space: UPLOAD_MANIFEST_LEAF_SPACE,
             keys: std::slice::from_ref(key),
             opts: StorageGetOptions {
-                projection: StorageCoreProjection::KeyOnly,
+                projection: StorageCoreProjection::FullValue,
             },
         }])
         .await?;
-    Ok(values.values.first().is_some_and(Option::is_some))
+    let Some(StorageProjectedValue::FullValue(value)) = values.values.into_iter().next().flatten()
+    else {
+        return Ok(None);
+    };
+    decode_upload_manifest_leaf(&value).map(Some)
 }
 
 async fn load_upload_progress(
@@ -600,10 +617,11 @@ async fn load_upload_manifest_leaves(
     store: &impl crate::storage_adapter::StorageAdapterRead,
     upload_id: &str,
     total_size: u64,
-) -> Result<Vec<BlobChunkReceipt>, LixError> {
+) -> Result<(Vec<BlobChunkReceipt>, Vec<[u8; 32]>), LixError> {
     let range = upload_manifest_leaf_range(upload_id)?;
     let expected_leaf_count = upload_part_count(total_size)?;
     let mut receipts = Vec::new();
+    let mut part_identities = Vec::new();
     let mut next_part = 0_u32;
     let mut resume_after = None;
     loop {
@@ -640,6 +658,7 @@ async fn load_upload_manifest_leaves(
                     "upload manifest leaf has the wrong part size",
                 ));
             }
+            part_identities.push(upload_manifest_leaf_identity(&leaf));
             receipts.extend(leaf.chunks);
             next_part = next_part
                 .checked_add(1)
@@ -667,7 +686,7 @@ async fn load_upload_manifest_leaves(
             "upload manifest leaf sequence is incomplete",
         ));
     }
-    Ok(receipts)
+    Ok((receipts, part_identities))
 }
 
 fn decode_upload_manifest_leaf_part_number(
@@ -852,6 +871,17 @@ mod tests {
             replayed_commit_id, published_commit_id,
             "a completed upload replay must not publish duplicate history",
         );
+        let mismatched_replay = resumed_session
+            .upsert_file_data_part(
+                "movie-proxy-1".into(),
+                "/media/proxy.mov".into(),
+                FILE_UPLOAD_PART_BYTES as u64,
+                total,
+                vec![0x73; 123].into(),
+            )
+            .await
+            .expect_err("completed part replay must preserve content identity");
+        assert_eq!(mismatched_replay.code, LixError::CODE_INVALID_PARAM);
 
         resumed_session
             .upsert_file_data_part(
@@ -978,6 +1008,50 @@ mod tests {
             .await
             .expect_err("fifth part cannot pass a missing first part");
         assert_eq!(outside_window.code, LixError::CODE_INVALID_PARAM);
+
+        session
+            .upsert_file_data_part(
+                "sparse-chain".into(),
+                "/media/sparse-chain.mov".into(),
+                0,
+                9 * FILE_UPLOAD_PART_BYTES as u64,
+                vec![0x10; FILE_UPLOAD_PART_BYTES].into(),
+            )
+            .await
+            .expect("stage sparse-chain first part");
+        session
+            .upsert_file_data_part(
+                "sparse-chain".into(),
+                "/media/sparse-chain.mov".into(),
+                4 * FILE_UPLOAD_PART_BYTES as u64,
+                9 * FILE_UPLOAD_PART_BYTES as u64,
+                vec![0x14; FILE_UPLOAD_PART_BYTES].into(),
+            )
+            .await
+            .expect("stage last part inside the first moving window");
+        let sparse_escape = session
+            .upsert_file_data_part(
+                "sparse-chain".into(),
+                "/media/sparse-chain.mov".into(),
+                8 * FILE_UPLOAD_PART_BYTES as u64,
+                9 * FILE_UPLOAD_PART_BYTES as u64,
+                vec![0x18; FILE_UPLOAD_PART_BYTES].into(),
+            )
+            .await
+            .expect_err("sparse receipts cannot advance the bounded window");
+        assert_eq!(sparse_escape.code, LixError::CODE_INVALID_PARAM);
+
+        let mismatched_active_replay = session
+            .upsert_file_data_part(
+                "windowed-proxy".into(),
+                "/media/windowed.mov".into(),
+                FILE_UPLOAD_PART_BYTES as u64,
+                total_size,
+                vec![0x23; FILE_UPLOAD_PART_BYTES].into(),
+            )
+            .await
+            .expect_err("staged part replay must preserve content identity");
+        assert_eq!(mismatched_active_replay.code, LixError::CODE_INVALID_PARAM);
 
         let completed = session
             .upsert_file_data_part(

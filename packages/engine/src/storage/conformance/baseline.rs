@@ -125,6 +125,53 @@ where
         "baseline::full_value_preserves_opaque_bytes",
         full_value_preserves_opaque_bytes
     );
+    run!(
+        "baseline::immutable_identity_is_idempotent_and_write_once",
+        immutable_identity_is_idempotent_and_write_once
+    );
+}
+
+async fn immutable_identity_is_idempotent_and_write_once<F>(factory: &F) -> ConformanceResult
+where
+    F: StorageFactory,
+{
+    let storage = open_storage(factory).await;
+    let immutable = StorageSpace::immutable(SpaceId(9), "storage.conformance.immutable");
+    let target = key("content-id");
+    for value in [
+        Bytes::from_static(b"payload"),
+        Bytes::from_static(b"payload"),
+    ] {
+        let mut write = storage
+            .begin_write(WriteOptions::default())
+            .await
+            .map_err(|error| error.to_string())?;
+        write
+            .put_many(immutable, put_batch([full_put(target.clone(), value)]))
+            .await
+            .map_err(|error| error.to_string())?;
+        write.commit().await.map_err(|error| error.to_string())?;
+    }
+
+    let mut conflicting = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .map_err(|error| error.to_string())?;
+    let staged = conflicting
+        .put_many(
+            immutable,
+            put_batch([full_put(target.clone(), Bytes::from_static(b"different"))]),
+        )
+        .await;
+    let rejected = match staged {
+        Err(StorageError::Corruption(_)) => true,
+        Err(error) => return Err(error.to_string()),
+        Ok(()) => matches!(conflicting.commit().await, Err(StorageError::Corruption(_))),
+    };
+    if !rejected {
+        return Err("immutable identity accepted different bytes".to_string());
+    }
+    Ok(())
 }
 
 async fn write_precondition_rejects_stale_value<F>(factory: &F) -> ConformanceResult

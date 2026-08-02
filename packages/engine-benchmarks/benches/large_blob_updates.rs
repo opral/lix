@@ -517,6 +517,11 @@ async fn space_accounting<S>(storage: &S, space: SpaceId) -> SpaceAccounting
 where
     S: Storage,
 {
+    let space = if space == PAYLOAD_SPACE {
+        StorageSpace::immutable(space, "benchmark.binary_cas_payload")
+    } else {
+        StorageSpace::mutable(space, "benchmark.binary_cas_metadata")
+    };
     let read = storage
         .begin_read(ReadOptions::default())
         .await

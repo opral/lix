@@ -10,11 +10,12 @@ pub const IMMUTABLE_SEGMENT_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const IMMUTABLE_VALUE_MAX_BYTES: usize = 4 * 1024 * 1024 + 1024;
 
 const IMMUTABLE_VALUE_MAGIC: &[u8; 8] = b"LIXIVS1\0";
-const IMMUTABLE_LOCATOR_MAGIC: &[u8; 8] = b"LIXIVL1\0";
+const IMMUTABLE_LOCATOR_MAGIC: &[u8; 8] = b"LIXIVL2\0";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImmutableValueLocator {
     pub segment_id: Key,
+    pub segment_len: usize,
     pub range: Range<usize>,
 }
 
@@ -111,11 +112,19 @@ pub fn encode_immutable_locator(locator: &ImmutableValueLocator) -> Result<Bytes
         .map_err(|_| StorageError::InvalidKey)?;
     let offset = u64::try_from(locator.range.start)
         .map_err(|_| StorageError::Io("immutable segment offset exceeds u64".to_string()))?;
+    let segment_len = u64::try_from(locator.segment_len)
+        .map_err(|_| StorageError::Io("immutable segment length exceeds u64".to_string()))?;
     let length = u32::try_from(locator.range.len())
         .map_err(|_| StorageError::Io("immutable value exceeds u32".to_string()))?;
-    let mut encoded = Vec::with_capacity(IMMUTABLE_LOCATOR_MAGIC.len() + 32 + 8 + 4);
+    if locator.range.end > locator.segment_len {
+        return Err(StorageError::Io(
+            "immutable value range exceeds its segment".to_string(),
+        ));
+    }
+    let mut encoded = Vec::with_capacity(IMMUTABLE_LOCATOR_MAGIC.len() + 32 + 8 + 8 + 4);
     encoded.extend_from_slice(IMMUTABLE_LOCATOR_MAGIC);
     encoded.extend_from_slice(&segment_id);
+    encoded.extend_from_slice(&segment_len.to_le_bytes());
     encoded.extend_from_slice(&offset.to_le_bytes());
     encoded.extend_from_slice(&length.to_le_bytes());
     Ok(Bytes::from(encoded))
@@ -123,17 +132,29 @@ pub fn encode_immutable_locator(locator: &ImmutableValueLocator) -> Result<Bytes
 
 pub fn decode_immutable_locator(encoded: &[u8]) -> Result<ImmutableValueLocator, StorageError> {
     const HASH_BYTES: usize = 32;
+    const SEGMENT_LENGTH_BYTES: usize = size_of::<u64>();
     const OFFSET_BYTES: usize = size_of::<u64>();
     const LENGTH_BYTES: usize = size_of::<u32>();
-    let expected_len = IMMUTABLE_LOCATOR_MAGIC.len() + HASH_BYTES + OFFSET_BYTES + LENGTH_BYTES;
+    let expected_len = IMMUTABLE_LOCATOR_MAGIC.len()
+        + HASH_BYTES
+        + SEGMENT_LENGTH_BYTES
+        + OFFSET_BYTES
+        + LENGTH_BYTES;
     if encoded.len() != expected_len || !encoded.starts_with(IMMUTABLE_LOCATOR_MAGIC) {
         return Err(StorageError::Corruption(
             "immutable segment locator is invalid".to_string(),
         ));
     }
     let hash_start = IMMUTABLE_LOCATOR_MAGIC.len();
-    let offset_start = hash_start + HASH_BYTES;
+    let segment_length_start = hash_start + HASH_BYTES;
+    let offset_start = segment_length_start + SEGMENT_LENGTH_BYTES;
     let length_start = offset_start + OFFSET_BYTES;
+    let segment_len = usize::try_from(u64::from_le_bytes(
+        encoded[segment_length_start..offset_start]
+            .try_into()
+            .expect("fixed immutable locator segment length"),
+    ))
+    .map_err(|_| StorageError::Corruption("immutable segment length exceeds usize".to_string()))?;
     let offset = usize::try_from(u64::from_le_bytes(
         encoded[offset_start..length_start]
             .try_into()
@@ -148,8 +169,16 @@ pub fn decode_immutable_locator(encoded: &[u8]) -> Result<ImmutableValueLocator,
     let end = offset.checked_add(length).ok_or_else(|| {
         StorageError::Corruption("immutable segment range overflows usize".to_string())
     })?;
+    if end > segment_len {
+        return Err(StorageError::Corruption(
+            "immutable value range exceeds its segment".to_string(),
+        ));
+    }
     Ok(ImmutableValueLocator {
-        segment_id: Key(Bytes::copy_from_slice(&encoded[hash_start..offset_start])),
+        segment_id: Key(Bytes::copy_from_slice(
+            &encoded[hash_start..segment_length_start],
+        )),
+        segment_len,
         range: offset..end,
     })
 }
@@ -220,6 +249,10 @@ impl SegmentBuilder {
         self.identity.update(&key_len.to_le_bytes());
         self.identity.update(&key.0);
         self.identity.update(&value_len.to_le_bytes());
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_immutable_segment_identity_hash_bytes(
+            size_of::<u64>() + key.0.len() + size_of::<u64>(),
+        );
 
         let mut header = BytesMut::with_capacity(IMMUTABLE_VALUE_MAGIC.len() + size_of::<u64>());
         header.extend_from_slice(IMMUTABLE_VALUE_MAGIC);
@@ -303,6 +336,7 @@ mod tests {
         let segment = writer.finish(|_| true).expect("finish").remove(0);
         let locator = ImmutableValueLocator {
             segment_id: segment.id,
+            segment_len: segment.values.last().expect("segment value").1.end,
             range: segment.values[0].1.clone(),
         };
         let encoded = encode_immutable_locator(&locator).expect("encode locator");
