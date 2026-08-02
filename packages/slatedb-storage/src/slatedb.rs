@@ -4739,7 +4739,7 @@ mod tests {
     use slatedb::config::{CheckpointOptions, FlushOptions, FlushType};
     use std::collections::BTreeSet;
     use std::ops::Range;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::{Duration, Instant};
 
     tokio::task_local! {
@@ -7314,6 +7314,22 @@ mod tests {
             .await;
     }
 
+    #[test]
+    fn timed_out_operation_block_releases_without_poisoning_cleanup() {
+        let enabled = Arc::new(AtomicBool::new(false));
+        let block = Arc::new(OperationBlock::default());
+        let blocked = OperationBlockGuard::arm(Arc::clone(&enabled), Arc::clone(&block));
+
+        assert_eq!(
+            block.wait_for_entries_with_timeout(1, Duration::ZERO),
+            Err(0)
+        );
+        drop(blocked);
+
+        assert!(!enabled.load(Ordering::Acquire));
+        assert!(block.released.load(Ordering::Acquire));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
     async fn immutable_uploads_overlap_without_blocking_mutable_publication() {
         let store = BlockingStore::new(Arc::new(InMemory::new()));
@@ -7463,11 +7479,11 @@ mod tests {
             )
         }
 
-        fn maybe_block_write(&self, location: &ObjectPath) {
+        async fn maybe_block_write(&self, location: &ObjectPath) {
             let immutable = self.immutable_writes.load(Ordering::Acquire)
                 && location.as_ref().contains(IMMUTABLE_VALUE_PATH);
             if self.next_write.swap(false, Ordering::AcqRel) || immutable {
-                self.writes.enter();
+                self.writes.enter().await;
             }
         }
 
@@ -7481,7 +7497,7 @@ mod tests {
             }
         }
 
-        fn maybe_block_read(&self, location: &ObjectPath) {
+        async fn maybe_block_read(&self, location: &ObjectPath) {
             let is_sst = location
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("sst"));
@@ -7489,7 +7505,7 @@ mod tests {
             let block_compacted = self.block_compacted_reads.load(Ordering::Acquire)
                 && location.as_ref().contains("/compacted/");
             if is_sst && (block_all_ssts || block_compacted) {
-                self.reads.enter();
+                self.reads.enter().await;
             }
         }
     }
@@ -7502,39 +7518,61 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct OperationBlock {
-        state: Mutex<OperationBlockState>,
-        available: Condvar,
-    }
-
-    #[derive(Debug, Default)]
-    struct OperationBlockState {
-        entries: usize,
-        released: bool,
+        entries: AtomicUsize,
+        released: AtomicBool,
+        entry_state: Mutex<()>,
+        entered: Condvar,
+        release: Notify,
     }
 
     impl OperationBlock {
         fn reset(&self) {
-            let mut state = self.state.lock().expect("lock operation block");
-            state.entries = 0;
-            state.released = false;
+            let _state = self.entry_state.lock().expect("lock operation block");
+            self.entries.store(0, Ordering::Release);
+            self.released.store(false, Ordering::Release);
         }
 
-        fn enter(&self) {
-            let mut state = self.state.lock().expect("lock operation block");
-            state.entries += 1;
-            self.available.notify_all();
-            while !state.released {
-                state = self
-                    .available
-                    .wait(state)
-                    .expect("wait for operation release");
+        async fn enter(&self) {
+            let state = self.entry_state.lock().expect("lock operation block");
+            self.entries.fetch_add(1, Ordering::AcqRel);
+            self.entered.notify_all();
+            drop(state);
+            loop {
+                let released = self.release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                if self.released.load(Ordering::Acquire) {
+                    return;
+                }
+                released.await;
             }
         }
 
         fn release(&self) {
-            let mut state = self.state.lock().expect("lock operation block");
-            state.released = true;
-            self.available.notify_all();
+            self.released.store(true, Ordering::Release);
+            self.release.notify_waiters();
+        }
+
+        fn wait_for_entries_with_timeout(
+            &self,
+            expected: usize,
+            timeout: Duration,
+        ) -> Result<(), usize> {
+            let deadline = Instant::now() + timeout;
+            let mut state = self.entry_state.lock().expect("lock operation block");
+            while self.entries.load(Ordering::Acquire) < expected {
+                let now = Instant::now();
+                if now >= deadline {
+                    let observed = self.entries.load(Ordering::Acquire);
+                    drop(state);
+                    return Err(observed);
+                }
+                (state, _) = self
+                    .entered
+                    .wait_timeout(state, deadline - now)
+                    .expect("wait for blocked operation");
+            }
+            Ok(())
         }
     }
 
@@ -7552,21 +7590,11 @@ mod tests {
         }
 
         fn wait_for_entries(&self, expected: usize, description: &str) {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let mut state = self.block.state.lock().expect("lock operation block");
-            while state.entries < expected {
-                let now = Instant::now();
-                assert!(
-                    now < deadline,
-                    "timed out waiting for {description}; observed {}",
-                    state.entries
-                );
-                let (next_state, _) = self
-                    .block
-                    .available
-                    .wait_timeout(state, deadline - now)
-                    .expect("wait for blocked operation");
-                state = next_state;
+            if let Err(observed) = self
+                .block
+                .wait_for_entries_with_timeout(expected, Duration::from_secs(10))
+            {
+                panic!("timed out waiting for {description}; observed {observed}");
             }
         }
     }
@@ -7586,7 +7614,7 @@ mod tests {
             payload: PutPayload,
             options: PutOptions,
         ) -> ObjectStoreResult<PutResult> {
-            self.maybe_block_write(location);
+            self.maybe_block_write(location).await;
             self.maybe_fail_write()?;
             self.inner.put_opts(location, payload, options).await
         }
@@ -7604,7 +7632,7 @@ mod tests {
             location: &ObjectPath,
             options: ObjectStoreGetOptions,
         ) -> ObjectStoreResult<GetResult> {
-            self.maybe_block_read(location);
+            self.maybe_block_read(location).await;
             self.inner.get_opts(location, options).await
         }
 
@@ -7613,7 +7641,7 @@ mod tests {
             location: &ObjectPath,
             ranges: &[Range<u64>],
         ) -> ObjectStoreResult<Vec<Bytes>> {
-            self.maybe_block_read(location);
+            self.maybe_block_read(location).await;
             self.inner.get_ranges(location, ranges).await
         }
 
