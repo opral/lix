@@ -3970,6 +3970,90 @@ mod tests {
             .expect("workspace session should open")
     }
 
+    async fn assert_columnar_lifecycle_current(
+        session: &SessionContext<Memory>,
+        first: &str,
+        last: &str,
+    ) {
+        const ROW_COUNT: usize = 1_024;
+        let rows = session
+            .execute(
+                "SELECT id, value FROM columnar_lifecycle_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("typed lifecycle scan should succeed");
+        assert_eq!(rows.len(), ROW_COUNT);
+        assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "0000");
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), first);
+        assert_eq!(
+            rows.rows()[ROW_COUNT - 1].get::<String>("id").unwrap(),
+            "1023"
+        );
+        assert_eq!(
+            rows.rows()[ROW_COUNT - 1].get::<String>("value").unwrap(),
+            last
+        );
+    }
+
+    async fn assert_columnar_layout_selected(
+        session: &SessionContext<Memory>,
+        schema_key: &str,
+        expected_overlay_rows: usize,
+    ) {
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should resolve");
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("columnar route read should open");
+        let overlay_rows = session
+            .live_state
+            .reader(&read)
+            .entity_columnar_overlay_len_for_test(&branch_id, schema_key)
+            .await
+            .expect("columnar route should plan")
+            .expect("fixture must retain the authenticated columnar path");
+        assert_eq!(overlay_rows, expected_overlay_rows);
+    }
+
+    async fn assert_current_head_has_columnar_manifest(
+        session: &SessionContext<Memory>,
+        schema_key: &str,
+        expected_rows: u64,
+    ) {
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should resolve");
+        let head_read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch-head read should open");
+        let head = session
+            .branch_ctx
+            .ref_reader(head_read)
+            .load_head(&branch_id)
+            .await
+            .expect("branch head should load")
+            .expect("active branch should have a head");
+        let sidecar_read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("sidecar read should open");
+        let id = crate::live_state::entity_row_group_set_id(head.commit_id, schema_key);
+        let manifest = crate::columnar_row_group::load_row_group_manifest(&sidecar_read, id)
+            .await
+            .expect("sidecar manifest should load")
+            .expect("current packed base must publish its typed sidecar atomically");
+        assert_eq!(manifest.row_count(), expected_rows);
+    }
+
     async fn open_session_with_telemetry(
         spans: Arc<std::sync::Mutex<Vec<CompletedTelemetrySpan>>>,
     ) -> SessionContext<Memory> {
@@ -4779,6 +4863,248 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_columnar_base_preserves_current_diff_and_history_across_lifecycle_changes() {
+        const ROW_COUNT: usize = 1_024;
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized storage should create engine");
+        let main = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        let main_branch_id = main
+            .active_branch_id()
+            .await
+            .expect("workspace branch should resolve");
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "columnar_lifecycle_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        main.execute(
+            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            &[Value::Text(schema.to_string())],
+        )
+        .await
+        .expect("typed lifecycle schema should register");
+        let before_insert = engine
+            .load_branch_head_commit_id(&main_branch_id)
+            .await
+            .expect("pre-insert head should load")
+            .expect("pre-insert head should exist");
+
+        crate::transaction::take_ordered_packed_current_base_publications();
+        let insert_sql = "INSERT INTO columnar_lifecycle_probe (id, value) VALUES ($1, $2)";
+        let inserts = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: insert_sql.to_owned(),
+                params: vec![
+                    Value::Text(format!("{row_index:04}")),
+                    Value::Text(format!("base-{row_index:04}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let inserted = main
+            .execute_batch(&inserts)
+            .await
+            .expect("ordered typed batch should insert")
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
+        assert_eq!(inserted, ROW_COUNT as u64);
+        assert_eq!(
+            crate::transaction::take_ordered_packed_current_base_publications(),
+            1,
+            "fixture must activate packed current-state publication"
+        );
+        let inserted_head = engine
+            .load_branch_head_commit_id(&main_branch_id)
+            .await
+            .expect("insert head should load")
+            .expect("insert head should exist");
+        let storage = engine.storage();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("sidecar read scope should open");
+        let row_group_id = crate::live_state::entity_row_group_set_id(
+            crate::changelog::CommitId::parse_lix(&inserted_head, "typed lifecycle insert head")
+                .expect("insert head should be canonical"),
+            "columnar_lifecycle_probe",
+        );
+        let manifest = crate::columnar_row_group::load_row_group_manifest(&read, row_group_id)
+            .await
+            .expect("typed lifecycle sidecar manifest should load")
+            .expect("fixture must publish a typed analytical sidecar");
+        assert_eq!(manifest.row_count(), ROW_COUNT as u64);
+
+        assert_columnar_lifecycle_current(&main, "base-0000", "base-1023").await;
+
+        let inserted_diff = main
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'columnar_lifecycle_probe' AND diff_type = 'added'",
+                &[
+                    Value::Text(before_insert.to_string()),
+                    Value::Text(inserted_head.to_string()),
+                ],
+            )
+            .await
+            .expect("packed insert diff should remain queryable");
+        assert_eq!(
+            inserted_diff.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64
+        );
+        let inserted_history = main
+            .execute(
+                &format!(
+                    "SELECT COUNT(*) AS entries \
+                     FROM columnar_lifecycle_probe_history('{inserted_head}') \
+                     WHERE lixcol_is_deleted = false"
+                ),
+                &[],
+            )
+            .await
+            .expect("packed insert history should remain queryable");
+        assert_eq!(
+            inserted_history.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64
+        );
+
+        main.execute(
+            "UPDATE columnar_lifecycle_probe SET value = 'sparse-0512' WHERE id = '0512'",
+            &[],
+        )
+        .await
+        .expect("sparse typed update should commit");
+        assert_columnar_layout_selected(&main, "columnar_lifecycle_probe", 1).await;
+        main.execute(
+            "UPDATE columnar_lifecycle_probe SET value = 'base-0512' WHERE id = '0512'",
+            &[],
+        )
+        .await
+        .expect("sparse typed restoration should commit");
+
+        let checkpoint = main
+            .create_checkpoint()
+            .await
+            .expect("packed typed base should checkpoint");
+        let draft = main
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-0000000000c1".to_owned()),
+                name: "columnar-lifecycle-draft".to_owned(),
+                from_commit_id: Some(checkpoint.commit_id.clone()),
+            })
+            .await
+            .expect("checkpoint branch should create");
+        let draft_session = engine
+            .open_session(draft.id.clone())
+            .await
+            .expect("draft session should open");
+        draft_session
+            .execute(
+                "UPDATE columnar_lifecycle_probe SET value = 'draft-0000' WHERE id = '0000'",
+                &[],
+            )
+            .await
+            .expect("draft update should commit");
+        draft_session
+            .undo()
+            .await
+            .expect("draft update should undo");
+        assert_columnar_lifecycle_current(&draft_session, "base-0000", "base-1023").await;
+        draft_session
+            .redo()
+            .await
+            .expect("draft update should redo");
+
+        main.execute(
+            "UPDATE columnar_lifecycle_probe SET value = 'main-1023' WHERE id = '1023'",
+            &[],
+        )
+        .await
+        .expect("main update should commit");
+        let merge = main
+            .merge_branch(crate::MergeBranchOptions {
+                source_branch_id: draft.id,
+            })
+            .await
+            .expect("disjoint typed updates should merge");
+        assert_eq!(merge.outcome, crate::MergeBranchOutcome::MergeCommitted);
+        assert_columnar_lifecycle_current(&main, "draft-0000", "main-1023").await;
+
+        let merged_head = engine
+            .load_branch_head_commit_id(&main_branch_id)
+            .await
+            .expect("merged head should load")
+            .expect("merged head should exist");
+        let merged_diff = main
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'columnar_lifecycle_probe' AND diff_type = 'modified'",
+                &[
+                    Value::Text(checkpoint.commit_id.to_string()),
+                    Value::Text(merged_head.to_string()),
+                ],
+            )
+            .await
+            .expect("merged lifecycle diff should remain queryable");
+        assert_eq!(merged_diff.rows()[0].get::<i64>("entries").unwrap(), 2);
+        let merged_history = main
+            .execute(
+                &format!(
+                    "SELECT value, lixcol_depth \
+                     FROM columnar_lifecycle_probe_history('{merged_head}') \
+                     WHERE id = '0000' ORDER BY lixcol_depth"
+                ),
+                &[],
+            )
+            .await
+            .expect("merged typed history should remain queryable");
+        assert_eq!(
+            merged_history.rows()[0].get::<String>("value").unwrap(),
+            "draft-0000"
+        );
+        assert!(
+            merged_history
+                .rows()
+                .iter()
+                .any(|row| row.get::<String>("value").ok().as_deref() == Some("base-0000"))
+        );
+
+        main.execute(
+            "UPDATE columnar_lifecycle_probe SET value = 'temporary' WHERE id = '0512'",
+            &[],
+        )
+        .await
+        .expect("post-merge update should commit");
+        main.undo().await.expect("post-merge update should undo");
+        let restored = main
+            .execute(
+                "SELECT value FROM columnar_lifecycle_probe WHERE id = '0512'",
+                &[],
+            )
+            .await
+            .expect("undone row should remain queryable");
+        assert_eq!(
+            restored.rows()[0].get::<String>("value").unwrap(),
+            "base-0512"
+        );
+        assert_columnar_lifecycle_current(&main, "draft-0000", "main-1023").await;
+    }
+
+    #[tokio::test]
     async fn large_ordered_parameter_update_replaces_complete_packed_current_base() {
         const ROW_COUNT: usize = 1_024;
         let session = open_session().await;
@@ -4845,6 +5171,12 @@ mod tests {
                 1,
                 "each complete certified replacement should swap one packed base reference"
             );
+            assert_current_head_has_columnar_manifest(
+                &session,
+                "ordered_packed_update_probe",
+                ROW_COUNT as u64,
+            )
+            .await;
         }
 
         let rows = session

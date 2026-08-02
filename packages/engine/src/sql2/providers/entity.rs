@@ -1,8 +1,13 @@
+#[cfg(test)]
+use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(test)]
+use datafusion::arrow::array::Array;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::{ColumnStatistics, Precision};
@@ -52,8 +57,9 @@ use datafusion::physical_plan::{ExecutionPlan, Statistics};
 use futures_util::stream;
 
 use super::spec::{
-    InsertApply, PlannedDml, PlannedScan, TableSpec, batch_stream_source_with_statistics,
-    projected_schema, register_spec_table, row_source, scan_row_source,
+    InsertApply, PlannedDml, PlannedScan, TableSpec,
+    batch_stream_source_with_statistics_and_source, projected_schema, register_spec_table,
+    row_source, scan_row_source,
 };
 use super::values::{
     optional_bool_value, optional_string_value, required_string_value, string_expr_literal,
@@ -317,12 +323,7 @@ impl TableSpec for EntitySpec {
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
         let primary_key_analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
         let row_filter_analyzer = EntityRowFilterAnalyzer::new(&self.spec);
-        if ExactBranchIdFilterAnalyzer.supports(filter)
-            || primary_key_analyzer.supports(filter)
-            || row_filter_analyzer
-                .analyze(filter)
-                .is_some_and(|filter| filter.exact_boolean_equality().is_some())
-        {
+        if ExactBranchIdFilterAnalyzer.supports(filter) || primary_key_analyzer.supports(filter) {
             TableProviderFilterPushDown::Exact
         } else if row_filter_analyzer.supports(filter) {
             // Retain a DataFusion residual even when the row-shaped fallback
@@ -364,13 +365,16 @@ impl TableSpec for EntitySpec {
             return Ok(PlannedScan {
                 schema: Arc::clone(&schema),
                 ordering: None,
-                source: entity_columnar_scan_source(
+                source: Box::pin(entity_columnar_scan_source(
                     Arc::clone(reader),
                     layout,
                     projection,
                     group_indices,
                     schema,
-                ),
+                    Arc::clone(&self.spec),
+                    row_filters,
+                ))
+                .await?,
             });
         }
         Ok(PlannedScan {
@@ -554,17 +558,19 @@ fn entity_columnar_projection(
     schema: &Schema,
     spec: &EntitySurfaceSpec,
 ) -> Option<Vec<usize>> {
+    let expected_fingerprint = spec.columnar_layout_fingerprint();
+    if manifest
+        .metadata
+        .get(crate::sql2::ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+        != Some(&expected_fingerprint)
+    {
+        return None;
+    }
     schema
         .fields()
         .iter()
         .map(|field| {
-            // JSON is exposed as canonical JSON text on the SQL surface, so
-            // its Arrow Utf8 type is not equivalent to a scalar JSON string.
-            // Until sidecars are compiled from the registered schema, retain
-            // the authoritative decoder for every JSON projection.
-            if spec.visible_column(field.name())?.column_type == EntityColumnType::Json {
-                return None;
-            }
+            spec.visible_column(field.name())?;
             manifest.fields.iter().position(|candidate| {
                 candidate.name == *field.name()
                     && candidate.data_type.to_arrow() == *field.data_type()
@@ -573,88 +579,394 @@ fn entity_columnar_projection(
         .collect()
 }
 
-fn entity_columnar_scan_source(
+async fn entity_columnar_scan_source(
     reader: Arc<dyn EntitySnapshotReader>,
-    layout: crate::sql2::entity_batch::EntityColumnarScanLayout,
+    layout: Arc<crate::sql2::entity_batch::EntityColumnarScanLayout>,
     projection: Vec<usize>,
     group_indices: Vec<usize>,
     schema: SchemaRef,
-) -> super::spec::ScanSource {
-    let statistics = group_indices
+    spec: Arc<EntitySurfaceSpec>,
+    row_filters: Vec<EntityRowFilter>,
+) -> Result<super::spec::ScanSource> {
+    let identity_column = layout
+        .manifest
+        .fields
         .iter()
-        .map(|&group_index| {
-            entity_columnar_group_statistics(
-                &layout.manifest.groups[group_index],
-                &projection,
-                schema.as_ref(),
-            )
+        .position(|field| {
+            field.name == crate::sql2::ENTITY_COLUMNAR_ENTITY_PK_FIELD
+                && field.data_type.to_arrow() == datafusion::arrow::datatypes::DataType::Utf8
         })
-        .collect::<Vec<_>>();
+        .ok_or_else(|| {
+            DataFusionError::Execution(
+                "entity columnar sidecar is missing its hidden entity identity".to_owned(),
+            )
+        })?;
+    let mut shadow_identities = layout
+        .overlay
+        .iter()
+        .map(|row| {
+            row.entity_pk
+                .as_json_array_text()
+                .map_err(lix_error_to_datafusion_error)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    shadow_identities.sort_unstable();
+    shadow_identities.dedup();
+    let shadow_identity_digest = {
+        let mut hasher = blake3::Hasher::new();
+        for identity in &shadow_identities {
+            hasher.update(&(identity.len() as u64).to_be_bytes());
+            hasher.update(identity.as_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    };
+    let shadow_identities = Arc::new(shadow_identities);
+    let mut overlay_cache_projection = projection.clone();
+    overlay_cache_projection.push(usize::MAX);
+    let filter_digest = blake3::hash(format!("{row_filters:?}").as_bytes());
+    overlay_cache_projection.extend(
+        filter_digest
+            .as_bytes()
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()) as usize),
+    );
+    let overlay_batches = if layout.overlay.is_empty() {
+        Vec::new()
+    } else if let Some(batch) = reader
+        .cached_entity_columnar_batch(
+            &layout,
+            usize::MAX,
+            shadow_identity_digest,
+            &overlay_cache_projection,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?
+    {
+        vec![batch.as_ref().clone()]
+    } else {
+        let batches = entity_columnar_overlay_batches(
+            spec.as_ref(),
+            Arc::clone(&schema),
+            layout.overlay.as_ref(),
+            &row_filters,
+        )?;
+        if let [batch] = batches.as_slice() {
+            reader
+                .cache_entity_columnar_batch(
+                    &layout,
+                    usize::MAX,
+                    shadow_identity_digest,
+                    overlay_cache_projection.clone(),
+                    Arc::new(batch.clone()),
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+        }
+        batches
+    };
+    let overlay_batches = Arc::new(overlay_batches);
+    if !layout.overlay.is_empty() {
+        let mut snapshot_cache_projection = overlay_cache_projection;
+        snapshot_cache_projection.push(usize::MAX - 1);
+        snapshot_cache_projection.extend(group_indices.iter().copied());
+        let snapshot = if let Some(batch) = reader
+            .cached_entity_columnar_batch(
+                &layout,
+                usize::MAX - 1,
+                shadow_identity_digest,
+                &snapshot_cache_projection,
+            )
+            .await
+            .map_err(lix_error_to_datafusion_error)?
+        {
+            batch
+        } else {
+            let mut batches = Vec::with_capacity(group_indices.len() + overlay_batches.len());
+            for &group_index in &group_indices {
+                let keep = reader
+                    .entity_columnar_shadow_mask(
+                        layout.clone(),
+                        group_index,
+                        identity_column,
+                        Arc::clone(&shadow_identities),
+                        shadow_identity_digest,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                let batch = reader
+                    .load_entity_columnar_group(layout.clone(), group_index, projection.clone())
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                batches.push(filter_record_batch(&batch, keep.as_ref())?);
+            }
+            batches.extend(overlay_batches.iter().cloned());
+            let batch = Arc::new(concat_batches(&schema, &batches)?);
+            reader
+                .cache_entity_columnar_batch(
+                    &layout,
+                    usize::MAX - 1,
+                    shadow_identity_digest,
+                    snapshot_cache_projection,
+                    batch,
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?
+        };
+        let statistics = entity_columnar_record_batch_statistics(snapshot.as_ref())?;
+        let stream_schema = Arc::clone(&schema);
+        return Ok(batch_stream_source_with_statistics_and_source(
+            Arc::clone(&schema),
+            vec![statistics.clone()],
+            Some(statistics),
+            move |partition, _context| {
+                debug_assert_eq!(partition, 0);
+                let batches = stream::iter(vec![Ok(snapshot.as_ref().clone())]);
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&stream_schema),
+                    batches,
+                )))
+            },
+        ));
+    }
+    let mut all_reconciled_statistics_cached = true;
+    let mut base_statistics_cached = Vec::with_capacity(group_indices.len());
+    let mut statistics = if layout.overlay.is_empty() {
+        base_statistics_cached.resize(group_indices.len(), true);
+        group_indices
+            .iter()
+            .map(|&group_index| {
+                entity_columnar_group_statistics(
+                    &layout.manifest.groups[group_index],
+                    &projection,
+                    schema.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let mut cached = Vec::with_capacity(group_indices.len());
+        for &group_index in &group_indices {
+            match reader
+                .cached_entity_columnar_statistics(
+                    &layout,
+                    group_index,
+                    shadow_identity_digest,
+                    &projection,
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?
+            {
+                Some(statistics) => {
+                    base_statistics_cached.push(true);
+                    cached.push(statistics);
+                }
+                None => {
+                    all_reconciled_statistics_cached = false;
+                    base_statistics_cached.push(false);
+                    cached.push(Statistics::new_unknown(schema.as_ref()));
+                }
+            }
+        }
+        cached
+    };
+    for batch in overlay_batches.iter() {
+        statistics.push(entity_columnar_record_batch_statistics(batch)?);
+    }
+    let source_statistics = if all_reconciled_statistics_cached {
+        Some(Statistics::try_merge_iter(
+            statistics.iter(),
+            schema.as_ref(),
+        )?)
+    } else if row_filters.is_empty() {
+        let live_count = usize::try_from(layout.live_count).map_err(|_| {
+            DataFusionError::Execution("entity collection cardinality exceeds usize".to_owned())
+        })?;
+        Some(Statistics::new_unknown(schema.as_ref()).with_num_rows(Precision::Exact(live_count)))
+    } else {
+        None
+    };
+    if statistics.is_empty() {
+        statistics.push(Statistics::new_unknown(schema.as_ref()));
+    }
     let partition_count = statistics.len();
+    let base_partition_count = group_indices.len();
     let stream_schema = Arc::clone(&schema);
-    batch_stream_source_with_statistics(
+    Ok(batch_stream_source_with_statistics_and_source(
         Arc::clone(&schema),
         statistics,
+        source_statistics,
         move |partition, _context| {
             debug_assert!(partition < partition_count);
+            if partition >= base_partition_count {
+                let schema = Arc::clone(&stream_schema);
+                let batches = stream::iter(overlay_batches.as_ref().clone().into_iter().map(Ok));
+                return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)));
+            }
             let reader = Arc::clone(&reader);
             let layout = layout.clone();
-            let projection = projection.clone();
+            let public_projection = projection.clone();
+            let statistics_projection = projection.clone();
+            let statistics_cached = base_statistics_cached[partition];
+            let shadow_identities = Arc::clone(&shadow_identities);
             let group_index = group_indices[partition];
             let schema = Arc::clone(&stream_schema);
             let batch_schema = Arc::clone(&schema);
             let batches = stream::once(async move {
-                let batch = reader
-                    .load_entity_columnar_group(layout, group_index, projection)
+                let batch = if shadow_identities.is_empty() {
+                    Arc::new(
+                        reader
+                            .load_entity_columnar_group(
+                                layout.clone(),
+                                group_index,
+                                public_projection,
+                            )
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?,
+                    )
+                } else if let Some(batch) = reader
+                    .cached_entity_columnar_batch(
+                        &layout,
+                        group_index,
+                        shadow_identity_digest,
+                        &public_projection,
+                    )
                     .await
-                    .map_err(lix_error_to_datafusion_error)?;
+                    .map_err(lix_error_to_datafusion_error)?
+                {
+                    batch
+                } else {
+                    let keep = reader
+                        .entity_columnar_shadow_mask(
+                            layout.clone(),
+                            group_index,
+                            identity_column,
+                            Arc::clone(&shadow_identities),
+                            shadow_identity_digest,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                    let batch = reader
+                        .load_entity_columnar_group(
+                            layout.clone(),
+                            group_index,
+                            public_projection.clone(),
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                    let batch = Arc::new(filter_record_batch(&batch, keep.as_ref())?);
+                    reader
+                        .cache_entity_columnar_batch(
+                            &layout,
+                            group_index,
+                            shadow_identity_digest,
+                            public_projection,
+                            batch,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?
+                };
+                if !shadow_identities.is_empty() && !statistics_cached {
+                    let statistics = entity_columnar_record_batch_statistics(batch.as_ref())?;
+                    reader
+                        .cache_entity_columnar_statistics(
+                            &layout,
+                            group_index,
+                            shadow_identity_digest,
+                            statistics_projection,
+                            statistics,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?;
+                }
                 RecordBatch::try_new(batch_schema, batch.columns().to_vec())
                     .map_err(DataFusionError::from)
             });
             Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
         },
+    ))
+}
+
+#[cfg(test)]
+fn reconcile_entity_columnar_base_batch(
+    batch: RecordBatch,
+    public_schema: SchemaRef,
+    shadow_entity_pks: &HashSet<String, ahash::RandomState>,
+) -> Result<RecordBatch> {
+    let identities = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            DataFusionError::Execution("entity columnar identity column is not Utf8".to_owned())
+        })?;
+    let keep = BooleanArray::from(
+        (0..identities.len())
+            .map(|index| !shadow_entity_pks.contains(identities.value(index)))
+            .collect::<Vec<_>>(),
+    );
+    let batch = filter_record_batch(&batch, &keep)?;
+    RecordBatch::try_new(public_schema, batch.columns()[1..].to_vec())
+        .map_err(DataFusionError::from)
+}
+
+fn entity_columnar_overlay_batches(
+    spec: &EntitySurfaceSpec,
+    schema: SchemaRef,
+    rows: &[crate::live_state::EntityColumnarOverlayRow],
+    row_filters: &[EntityRowFilter],
+) -> Result<Vec<RecordBatch>> {
+    let mut snapshots = Vec::new();
+    for row in rows {
+        if row.deleted {
+            continue;
+        }
+        let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
+            DataFusionError::Execution(
+                "live entity columnar overlay row has no snapshot".to_owned(),
+            )
+        })?;
+        if !row_filters.is_empty() {
+            let parsed = parse_snapshot_value(std::str::from_utf8(snapshot).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "entity columnar overlay snapshot is not UTF-8: {error}"
+                ))
+            })?)
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+            if !row_filters.iter().try_fold(true, |matches, filter| {
+                Ok::<_, DataFusionError>(
+                    matches && filter.matches_snapshot(Some(&parsed), &spec.schema_key)?,
+                )
+            })? {
+                continue;
+            }
+        }
+        snapshots.push(Some(snapshot));
+    }
+    let decoder = EntityProjectionDecoder::new(
+        spec,
+        schema.fields().iter().map(|field| field.name().as_str()),
     )
+    .map_err(entity_projection_error_to_datafusion_error)?;
+    snapshots
+        .chunks(crate::columnar_row_group::ROW_GROUP_MAX_ROWS)
+        .map(|snapshots| {
+            let columns = decoder
+                .decode_arrow_columns(snapshots.iter().copied())
+                .map_err(entity_projection_error_to_datafusion_error)?;
+            RecordBatch::try_new(Arc::clone(&schema), columns).map_err(DataFusionError::from)
+        })
+        .collect()
 }
 
 fn entity_columnar_group_indices(
     manifest: &crate::columnar_row_group::RowGroupManifest,
     row_filters: &[EntityRowFilter],
 ) -> Option<Vec<usize>> {
-    let mut exact_booleans = Vec::new();
-    for filter in row_filters {
-        filter.collect_conjunctive_boolean_equalities(&mut exact_booleans);
-    }
-    if exact_booleans.is_empty() {
-        return Some((0..manifest.groups.len()).collect());
-    }
-    let exact_booleans = exact_booleans
-        .into_iter()
-        .map(|(column, expected)| {
-            manifest
-                .fields
-                .iter()
-                .position(|field| field.name == column)
-                .map(|column_index| (column_index, expected))
-        })
-        .collect::<Option<Vec<_>>>()?;
     let mut selected = Vec::new();
     for (group_index, group) in manifest.groups.iter().enumerate() {
-        let mut matches = true;
-        for &(column_index, expected) in &exact_booleans {
-            let statistics = &group.columns[column_index];
-            let (
-                Some(crate::columnar_row_group::RowGroupScalar::Boolean(min)),
-                Some(crate::columnar_row_group::RowGroupScalar::Boolean(max)),
-            ) = (&statistics.min, &statistics.max)
-            else {
-                return None;
-            };
-            if statistics.null_count != 0 || min != max {
-                return None;
-            }
-            matches &= *min == expected;
-        }
-        if matches {
+        if row_filters
+            .iter()
+            .all(|filter| filter.may_match_group(manifest, group).unwrap_or(true))
+        {
             selected.push(group_index);
         }
     }
@@ -681,6 +993,17 @@ fn entity_columnar_group_statistics(
     statistics.num_rows = Precision::Exact(group.row_count as usize);
     statistics.column_statistics = column_statistics;
     statistics
+}
+
+fn entity_columnar_record_batch_statistics(batch: &RecordBatch) -> Result<Statistics> {
+    let statistics = crate::columnar_row_group::exact_record_batch_statistics(batch)
+        .map_err(lix_error_to_datafusion_error)?;
+    let projection = (0..batch.num_columns()).collect::<Vec<_>>();
+    Ok(entity_columnar_group_statistics(
+        &statistics,
+        &projection,
+        batch.schema().as_ref(),
+    ))
 }
 
 fn entity_columnar_scalar_precision(
@@ -1260,28 +1583,51 @@ enum EntityRowFilter {
 }
 
 impl EntityRowFilter {
-    fn exact_boolean_equality(&self) -> Option<(&str, bool)> {
+    fn may_match_group(
+        &self,
+        manifest: &crate::columnar_row_group::RowGroupManifest,
+        group: &crate::columnar_row_group::RowGroupStatistics,
+    ) -> Option<bool> {
         match self {
-            Self::ColumnEq {
-                column,
-                column_type: EntityColumnType::Boolean,
-                value: EntityFilterValue::Boolean(value),
-            } => Some((column, *value)),
-            _ => None,
-        }
-    }
-
-    fn collect_conjunctive_boolean_equalities<'a>(&'a self, output: &mut Vec<(&'a str, bool)>) {
-        match self {
-            Self::And(left, right) => {
-                left.collect_conjunctive_boolean_equalities(output);
-                right.collect_conjunctive_boolean_equalities(output);
+            Self::ColumnEq { column, value, .. } => {
+                let index = manifest
+                    .fields
+                    .iter()
+                    .position(|field| field.name == *column)?;
+                entity_filter_value_in_statistics(value, &group.columns[index], group.row_count)
             }
-            filter => {
-                if let Some(equality) = filter.exact_boolean_equality() {
-                    output.push(equality);
+            Self::ColumnIn { column, values, .. } => {
+                let index = manifest
+                    .fields
+                    .iter()
+                    .position(|field| field.name == *column)?;
+                let statistics = &group.columns[index];
+                let mut unknown = false;
+                for value in values {
+                    match entity_filter_value_in_statistics(value, statistics, group.row_count) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => unknown = true,
+                    }
                 }
+                (!unknown).then_some(false)
             }
+            Self::And(left, right) => match (
+                left.may_match_group(manifest, group),
+                right.may_match_group(manifest, group),
+            ) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            },
+            Self::Or(left, right) => match (
+                left.may_match_group(manifest, group),
+                right.may_match_group(manifest, group),
+            ) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
         }
     }
 
@@ -1313,6 +1659,41 @@ impl EntityRowFilter {
             Self::Or(left, right) => Ok(left.matches_snapshot(snapshot, schema_key)?
                 || right.matches_snapshot(snapshot, schema_key)?),
         }
+    }
+}
+
+fn entity_filter_value_in_statistics(
+    value: &EntityFilterValue,
+    statistics: &crate::columnar_row_group::RowGroupColumnStatistics,
+    row_count: u32,
+) -> Option<bool> {
+    use crate::columnar_row_group::RowGroupScalar;
+    if statistics.null_count == row_count && statistics.min.is_none() && statistics.max.is_none() {
+        return Some(false);
+    }
+    match (value, statistics.min.as_ref()?, statistics.max.as_ref()?) {
+        (
+            EntityFilterValue::Boolean(value),
+            RowGroupScalar::Boolean(min),
+            RowGroupScalar::Boolean(max),
+        ) => Some(min <= value && value <= max),
+        (
+            EntityFilterValue::Integer(value),
+            RowGroupScalar::Int64(min),
+            RowGroupScalar::Int64(max),
+        ) => Some(min <= value && value <= max),
+        (
+            EntityFilterValue::Number(value),
+            RowGroupScalar::Float64(min),
+            RowGroupScalar::Float64(max),
+        ) => (!value.is_nan() && !min.is_nan() && !max.is_nan())
+            .then_some(min <= value && value <= max),
+        (
+            EntityFilterValue::String(value),
+            RowGroupScalar::String(min),
+            RowGroupScalar::String(max),
+        ) => Some(min <= value && value <= max),
+        _ => None,
     }
 }
 
@@ -2110,10 +2491,12 @@ fn json_to_string(value: &JsonValue) -> Result<String> {
 #[cfg(test)]
 #[expect(trivial_casts)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use datafusion::arrow::array::{Float64Array, Int64Array};
+    use bytes::Bytes;
+    use datafusion::arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::catalog::TableProvider;
@@ -2128,6 +2511,7 @@ mod tests {
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
+    use crate::entity_pk::EntityPk as TestEntityPk;
     use crate::live_state::{
         LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter,
         LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateRow,
@@ -2422,7 +2806,7 @@ mod tests {
         let values = batch
             .column(0)
             .as_any()
-            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .downcast_ref::<StringArray>()
             .expect("identity column should be utf8");
         assert_eq!(values.value(0), "identity-1");
 
@@ -2523,7 +2907,7 @@ mod tests {
                 .column_by_name("body")
                 .expect("body column")
                 .as_any()
-                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .downcast_ref::<StringArray>()
                 .expect("body is utf8")
                 .value(0),
             "hello"
@@ -2760,7 +3144,7 @@ mod tests {
                 .column_by_name("body")
                 .expect("body column")
                 .as_any()
-                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .downcast_ref::<StringArray>()
                 .expect("body is string")
                 .value(0),
             "hello"
@@ -2790,7 +3174,7 @@ mod tests {
                 .column_by_name("lixcol_entity_pk")
                 .expect("entity pk column")
                 .as_any()
-                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .downcast_ref::<StringArray>()
                 .expect("entity pk is string")
                 .value(0),
             "[\"entity-1\"]"
@@ -2800,7 +3184,7 @@ mod tests {
                 .column_by_name("lixcol_branch_id")
                 .expect("branch id column")
                 .as_any()
-                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .downcast_ref::<StringArray>()
                 .expect("branch id is string")
                 .value(0),
             "01920000-0000-7000-8000-0000000000a1"
@@ -2855,7 +3239,7 @@ mod tests {
                 .column_by_name("meta")
                 .expect("meta column")
                 .as_any()
-                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .downcast_ref::<StringArray>()
                 .expect("meta is JSON text")
                 .value(0),
             r#"{"a":1,"z":2}"#,
@@ -3405,17 +3789,41 @@ mod tests {
     }
 
     #[test]
-    fn columnar_pruning_applies_exact_boolean_conjunct_with_residual_filter() {
+    fn columnar_pruning_applies_boolean_conjunct_with_residual_filter() {
+        let spec = derive_entity_surface_spec_from_schema(&serde_json::json!({
+            "x-lix-key": "fixture",
+            "type": "object",
+            "properties": {
+                "active": { "type": "boolean" },
+                "lane": { "type": "string" }
+            }
+        }))
+        .expect("schema");
         let snapshots = [
             serde_json::json!({"active": true, "lane": "a"}),
             serde_json::json!({"active": false, "lane": "a"}),
             serde_json::json!({"active": true, "lane": "b"}),
             serde_json::json!({"active": false, "lane": "b"}),
         ];
-        let encoded =
-            crate::live_state::encode_entity_scalar_row_groups("fixture", snapshots.iter())
-                .expect("encode")
-                .expect("scalar sidecar");
+        let canonical = snapshots
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>();
+        let identities = (0..snapshots.len())
+            .map(|index| TestEntityPk::single(format!("entity-{index}")))
+            .collect::<Vec<_>>();
+        let encoded = crate::sql2::encode_registered_entity_row_groups(
+            &spec,
+            identities.iter().zip(&snapshots).zip(&canonical).map(
+                |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
+                    entity_pk,
+                    snapshot_bytes: canonical.as_bytes(),
+                    snapshot_value: snapshot,
+                },
+            ),
+        )
+        .expect("encode")
+        .expect("registered sidecar");
         let filters = vec![
             super::EntityRowFilter::ColumnEq {
                 column: "active".to_string(),
@@ -3438,29 +3846,208 @@ mod tests {
             .iter()
             .position(|field| field.name == "active")
             .expect("active column");
+        let lane_index = encoded
+            .manifest
+            .fields
+            .iter()
+            .position(|field| field.name == "lane")
+            .expect("lane column");
         assert!(selected.into_iter().all(|group_index| {
+            let group = &encoded.manifest.groups[group_index];
             matches!(
-                encoded.manifest.groups[group_index].columns[active_index].min,
+                group.columns[active_index].min,
                 Some(crate::columnar_row_group::RowGroupScalar::Boolean(true))
+            ) && matches!(
+                (&group.columns[lane_index].min, &group.columns[lane_index].max),
+                (
+                    Some(crate::columnar_row_group::RowGroupScalar::String(min)),
+                    Some(crate::columnar_row_group::RowGroupScalar::String(max))
+                ) if min == "a" && max == "a"
             )
         }));
     }
 
     #[test]
-    fn columnar_projection_rejects_raw_utf8_for_json_surface_column() {
+    fn exact_boolean_pruning_excludes_all_null_groups_above_sidecar_threshold() {
+        let spec = derive_entity_surface_spec_from_schema(&serde_json::json!({
+            "x-lix-key": "nullable_boolean_fixture",
+            "type": "object",
+            "properties": {
+                "active": { "type": ["boolean", "null"] }
+            }
+        }))
+        .expect("schema");
+        let snapshots = (0..1_025)
+            .map(|index| match index % 3 {
+                0 => serde_json::json!({"active": true}),
+                1 => serde_json::json!({"active": false}),
+                _ => serde_json::json!({"active": null}),
+            })
+            .collect::<Vec<_>>();
+        let canonical = snapshots
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>();
+        let identities = (0..snapshots.len())
+            .map(|index| TestEntityPk::single(format!("entity-{index}")))
+            .collect::<Vec<_>>();
+        let encoded = crate::sql2::encode_registered_entity_row_groups(
+            &spec,
+            identities.iter().zip(&snapshots).zip(&canonical).map(
+                |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
+                    entity_pk,
+                    snapshot_bytes: canonical.as_bytes(),
+                    snapshot_value: snapshot,
+                },
+            ),
+        )
+        .expect("encode")
+        .expect("registered sidecar");
+        let filters = vec![super::EntityRowFilter::ColumnEq {
+            column: "active".to_string(),
+            column_type: EntityColumnType::Boolean,
+            value: super::EntityFilterValue::Boolean(true),
+        }];
+
+        let selected = super::entity_columnar_group_indices(&encoded.manifest, &filters)
+            .expect("boolean groups are exact");
+        let active_index = encoded
+            .manifest
+            .fields
+            .iter()
+            .position(|field| field.name == "active")
+            .expect("active column");
+        assert!(!selected.is_empty());
+        assert!(selected.into_iter().all(|group_index| {
+            let group = &encoded.manifest.groups[group_index];
+            group.columns[active_index].null_count < group.row_count
+                && matches!(
+                    (
+                        &group.columns[active_index].min,
+                        &group.columns[active_index].max
+                    ),
+                    (
+                        Some(crate::columnar_row_group::RowGroupScalar::Boolean(true)),
+                        Some(crate::columnar_row_group::RowGroupScalar::Boolean(true))
+                    )
+                )
+        }));
+    }
+
+    #[test]
+    fn boolean_beyond_clustering_budget_retains_datafusion_residual() {
+        let mut properties = serde_json::Map::new();
+        for index in 0..5 {
+            properties.insert(
+                format!("flag_{index}"),
+                serde_json::json!({ "type": "boolean" }),
+            );
+        }
+        let spec = derive_entity_surface_spec_from_schema(&serde_json::json!({
+            "x-lix-key": "wide_boolean_fixture",
+            "type": "object",
+            "properties": properties
+        }))
+        .expect("schema");
+        let snapshots = (0..1_025)
+            .map(|row| {
+                let mut snapshot = serde_json::Map::new();
+                for index in 0..5 {
+                    snapshot.insert(
+                        format!("flag_{index}"),
+                        serde_json::json!(((row >> index) & 1) == 1),
+                    );
+                }
+                serde_json::Value::Object(snapshot)
+            })
+            .collect::<Vec<_>>();
+        let canonical = snapshots
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>();
+        let identities = (0..snapshots.len())
+            .map(|index| TestEntityPk::single(format!("entity-{index}")))
+            .collect::<Vec<_>>();
+        let encoded = crate::sql2::encode_registered_entity_row_groups(
+            &spec,
+            identities.iter().zip(&snapshots).zip(&canonical).map(
+                |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
+                    entity_pk,
+                    snapshot_bytes: canonical.as_bytes(),
+                    snapshot_value: snapshot,
+                },
+            ),
+        )
+        .expect("encode")
+        .expect("registered sidecar");
+        let row_filter = super::EntityRowFilter::ColumnEq {
+            column: "flag_4".to_string(),
+            column_type: EntityColumnType::Boolean,
+            value: super::EntityFilterValue::Boolean(true),
+        };
+        let selected = super::entity_columnar_group_indices(
+            &encoded.manifest,
+            std::slice::from_ref(&row_filter),
+        )
+        .expect("row-group pruning");
+        let flag_index = encoded
+            .manifest
+            .fields
+            .iter()
+            .position(|field| field.name == "flag_4")
+            .expect("flag column");
+        assert!(selected.iter().any(|group_index| {
+            let statistics = &encoded.manifest.groups[*group_index].columns[flag_index];
+            matches!(
+                (&statistics.min, &statistics.max),
+                (
+                    Some(crate::columnar_row_group::RowGroupScalar::Boolean(false)),
+                    Some(crate::columnar_row_group::RowGroupScalar::Boolean(true))
+                )
+            )
+        }));
+
+        let provider = super::EntitySpec::by_branch(
+            Arc::new(spec),
+            Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
+            empty_branch_ref(),
+            None,
+        );
+        let expression = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(column("flag_4")),
+            Operator::Eq,
+            Box::new(Expr::Literal(ScalarValue::Boolean(Some(true)), None)),
+        ));
+        assert_eq!(
+            <super::EntitySpec as super::super::spec::TableSpec>::filter_pushdown(
+                &provider,
+                &expression
+            ),
+            datafusion::logical_expr::TableProviderFilterPushDown::Inexact
+        );
+    }
+
+    #[test]
+    fn columnar_projection_accepts_schema_bound_canonical_json_and_rejects_drift() {
         let spec = derive_entity_surface_spec_from_schema(&serde_json::json!({
             "x-lix-key": "json_payload",
             "type": "object",
             "properties": { "payload": { "type": ["string", "object", "null"] } }
         }))
         .expect("schema");
-        let snapshot = serde_json::json!({"payload": "literal"});
-        let encoded = crate::live_state::encode_entity_scalar_row_groups(
-            "json_payload",
-            std::iter::once(&snapshot),
+        let snapshot = serde_json::json!({"payload": {"z": 2, "a": 1}});
+        let canonical = snapshot.to_string();
+        let identity = TestEntityPk::single("entity-1");
+        let encoded = crate::sql2::encode_registered_entity_row_groups(
+            &spec,
+            std::iter::once(crate::sql2::EntityColumnarRowRef {
+                entity_pk: &identity,
+                snapshot_bytes: canonical.as_bytes(),
+                snapshot_value: &snapshot,
+            }),
         )
         .expect("encode")
-        .expect("observed scalar layout");
+        .expect("registered layout");
         let full_schema = entity_surface_schema(&spec, EntitySurfaceShape::Active);
         let payload_schema = Arc::new(Schema::new(vec![
             full_schema
@@ -3469,9 +4056,110 @@ mod tests {
                 .clone(),
         ]));
 
+        assert_eq!(
+            super::entity_columnar_projection(&encoded.manifest, &payload_schema, &spec),
+            Some(vec![0]),
+            "schema-bound canonical JSON text is safe to scan directly"
+        );
+
+        let mut drifted = encoded.manifest.clone();
+        drifted.metadata.insert(
+            crate::sql2::ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_string(),
+            "different registered schema".to_string(),
+        );
         assert!(
-            super::entity_columnar_projection(&encoded.manifest, &payload_schema, &spec).is_none(),
-            "canonical JSON text must continue through the authoritative decoder"
+            super::entity_columnar_projection(&drifted, &payload_schema, &spec).is_none(),
+            "a String/Json-compatible Arrow type must not bypass schema binding"
+        );
+    }
+
+    #[test]
+    fn columnar_overlay_shadows_before_predicate_and_omits_tombstones() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "overlay_fixture",
+            "type": "object",
+            "properties": {
+                "active": { "type": "boolean" },
+                "lane": { "type": "string" }
+            }
+        }))
+        .expect("schema");
+        let public_schema = Arc::new(Schema::new(vec![
+            Field::new("active", DataType::Boolean, true),
+            Field::new("lane", DataType::Utf8, true),
+        ]));
+        let physical_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                crate::sql2::ENTITY_COLUMNAR_ENTITY_PK_FIELD,
+                DataType::Utf8,
+                false,
+            ),
+            Field::new("active", DataType::Boolean, true),
+            Field::new("lane", DataType::Utf8, true),
+        ]));
+        let base = RecordBatch::try_new(
+            physical_schema,
+            vec![
+                Arc::new(StringArray::from(vec![r#"["a"]"#, r#"["b"]"#, r#"["d"]"#])),
+                Arc::new(BooleanArray::from(vec![true, true, true])),
+                Arc::new(StringArray::from(vec!["old-a", "old-b", "base-d"])),
+            ],
+        )
+        .expect("base batch");
+        let shadows = [r#"["a"]"#.to_owned(), r#"["b"]"#.to_owned()]
+            .into_iter()
+            .collect::<HashSet<_, ahash::RandomState>>();
+        let base =
+            super::reconcile_entity_columnar_base_batch(base, Arc::clone(&public_schema), &shadows)
+                .expect("reconcile base");
+        assert_eq!(base.num_rows(), 1);
+        assert_eq!(
+            base.column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("lane")
+                .value(0),
+            "base-d"
+        );
+
+        let overlays = vec![
+            crate::live_state::EntityColumnarOverlayRow {
+                entity_pk: TestEntityPk::single("a"),
+                snapshot_content: Some(Bytes::from_static(br#"{"active":false,"lane":"new-a"}"#)),
+                deleted: false,
+            },
+            crate::live_state::EntityColumnarOverlayRow {
+                entity_pk: TestEntityPk::single("b"),
+                snapshot_content: None,
+                deleted: true,
+            },
+            crate::live_state::EntityColumnarOverlayRow {
+                entity_pk: TestEntityPk::single("c"),
+                snapshot_content: Some(Bytes::from_static(br#"{"active":true,"lane":"insert-c"}"#)),
+                deleted: false,
+            },
+        ];
+        let filters = [super::EntityRowFilter::ColumnEq {
+            column: "active".to_owned(),
+            column_type: EntityColumnType::Boolean,
+            value: super::EntityFilterValue::Boolean(true),
+        }];
+        let overlay =
+            super::entity_columnar_overlay_batches(&spec, public_schema, &overlays, &filters)
+                .expect("typed overlay");
+        let [overlay] = overlay.as_slice() else {
+            panic!("expected one bounded overlay batch")
+        };
+        assert_eq!(overlay.num_rows(), 1);
+        assert_eq!(
+            overlay
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("lane")
+                .value(0),
+            "insert-c",
+            "the updated row moved out of the predicate and its stale base was already shadowed"
         );
     }
 }

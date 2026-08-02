@@ -68,6 +68,51 @@ impl EntitySurfaceSpec {
             .iter()
             .find(|column| column.name == column_name)
     }
+
+    /// Stable identity of the registered schema properties that determine an
+    /// entity analytical sidecar's physical meaning.
+    ///
+    /// In particular, String and Json both use Arrow Utf8. A name/type-only
+    /// comparison cannot distinguish scalar string bytes from canonical JSON
+    /// text after a registered-schema amendment.
+    pub(crate) fn columnar_layout_fingerprint(&self) -> String {
+        fn update_part(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+            hasher.update(&(bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+
+        let mut hasher = blake3::Hasher::new_derive_key("lix entity columnar layout v1");
+        update_part(&mut hasher, self.schema_key.as_bytes());
+        hasher.update(&(self.columns.len() as u64).to_be_bytes());
+        for column in &self.columns {
+            update_part(&mut hasher, column.name.as_bytes());
+            hasher.update(&[match column.column_type {
+                EntityColumnType::String => 1,
+                EntityColumnType::Json => 2,
+                EntityColumnType::Integer => 3,
+                EntityColumnType::Number => 4,
+                EntityColumnType::Boolean => 5,
+            }]);
+            hasher.update(&[u8::from(column.read_nullable)]);
+        }
+        hasher.update(&(self.primary_key_paths.len() as u64).to_be_bytes());
+        for path in &self.primary_key_paths {
+            hasher.update(&(path.len() as u64).to_be_bytes());
+            for segment in path {
+                update_part(&mut hasher, segment.as_bytes());
+            }
+        }
+        hasher.update(&(self.primary_key_component_types.len() as u64).to_be_bytes());
+        for component_type in &self.primary_key_component_types {
+            hasher.update(&[match component_type {
+                EntityPkComponentType::Uuid => 1,
+                EntityPkComponentType::Integer => 2,
+                EntityPkComponentType::String => 3,
+                EntityPkComponentType::Bytes => 4,
+            }]);
+        }
+        hasher.finalize().to_hex().to_string()
+    }
 }
 
 pub(crate) fn derive_entity_surface_spec_from_schema(
@@ -344,6 +389,13 @@ pub(crate) fn entity_surface_schema(
 
     fields.extend(entity_system_fields(shape));
     Arc::new(Schema::new(fields))
+}
+
+pub(crate) fn entity_visible_fields(spec: &EntitySurfaceSpec) -> Vec<Field> {
+    entity_surface_schema(spec, EntitySurfaceShape::Active).fields()[..spec.columns.len()]
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect()
 }
 
 pub(crate) fn entity_system_fields(shape: EntitySurfaceShape) -> Vec<Field> {
@@ -643,6 +695,31 @@ mod tests {
                 .expect("active identity input")
                 .is_nullable(),
             "read nullability is independent from omission/default input semantics"
+        );
+    }
+
+    #[test]
+    fn columnar_layout_fingerprint_distinguishes_string_from_json_utf8() {
+        let string_spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "payload",
+            "type": "object",
+            "properties": { "value": { "type": "string" } }
+        }))
+        .expect("string spec");
+        let json_spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "payload",
+            "type": "object",
+            "properties": { "value": { "type": ["string", "object"] } }
+        }))
+        .expect("json spec");
+
+        assert_ne!(
+            string_spec.columnar_layout_fingerprint(),
+            json_spec.columnar_layout_fingerprint()
+        );
+        assert_eq!(
+            string_spec.columnar_layout_fingerprint(),
+            string_spec.clone().columnar_layout_fingerprint()
         );
     }
 }

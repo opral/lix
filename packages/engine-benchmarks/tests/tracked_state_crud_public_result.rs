@@ -92,6 +92,43 @@ async fn typed_olap_shapes_validate_above_columnar_publication_threshold() {
 }
 
 #[test]
+fn typed_olap_shapes_validate_exact_results_after_sparse_and_moderate_mutations() {
+    std::thread::Builder::new()
+        .name("post-update-olap-validation".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build post-update OLAP runtime")
+                .block_on(validate_post_update_olap_shapes());
+        })
+        .expect("spawn post-update OLAP validation thread")
+        .join()
+        .expect("join post-update OLAP validation thread");
+}
+
+async fn validate_post_update_olap_shapes() {
+    let rows = workload::fixture_rows(2_048);
+    for &profile in storage::STORAGE_PROFILES
+        .iter()
+        .filter(|profile| profile.name() != "lix_sqlite")
+    {
+        for mutation_profile in [
+            sql_session::OlapMutationProfile::Sparse,
+            sql_session::OlapMutationProfile::Moderate,
+        ] {
+            let fixture =
+                sql_session::seeded_olap_fixture_with_mutations(profile, &rows, mutation_profile)
+                    .await;
+            for shape in sql_session::OlapReadShape::ALL {
+                fixture.read_olap(shape).await;
+            }
+        }
+    }
+}
+
+#[test]
 fn standalone_sqlite_public_results_match_every_lix_adapter() {
     std::thread::Builder::new()
         .name("tracked-state-public-result".to_string())

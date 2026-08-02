@@ -571,8 +571,12 @@ fn profile_hot_sql_session_operations(
     ));
     let _ = lix_engine::storage_bench::take_entity_point_snapshot_cache_accounting();
     if sql_session::selected_olap_read_shape().is_some() {
-        // Match the DuckDB control: one untimed warmup against one seeded
-        // fixture followed by individually timed samples and a median.
+        // Full semantic validation is intentionally outside the samples. This
+        // keeps Rust-vs-JavaScript assertion work out of the engine ratio while
+        // still validating the exact post-mutation public result once.
+        runtime.block_on(fixture.validate_selected_olap());
+        // Match the DuckDB control: one untimed warmup against one seeded and
+        // optionally mutated fixture, followed by timed materializations.
         runtime.block_on(run_sql_session_operation(operation, &fixture));
         let mut samples = Vec::with_capacity(repeats);
         let mut row_count = 0;
@@ -583,9 +587,10 @@ fn profile_hot_sql_session_operations(
         }
         print_profile_samples(
             &format!(
-                "sql_session/{}/{}",
+                "sql_session/{}/{}/{}",
                 profile.name(),
-                sql_session_read_shape()
+                sql_session_read_shape(),
+                sql_session::selected_olap_mutation_profile().label(),
             ),
             operation,
             read_many_pk_count,

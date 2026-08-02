@@ -6,21 +6,32 @@
 //! public-result reads consume those same bytes, keeping visibility proof in
 //! one place and leaving every unsupported shape on the established row path.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use datafusion::arrow::array::{Array, BooleanArray, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::physical_plan::Statistics;
 
 use crate::LixError;
 use crate::entity_pk::EntityPk;
-use crate::live_state::{LiveStateContext, LiveStateRowFilter, LiveStateScanRequest};
+use crate::live_state::{
+    EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey, LiveStateContext,
+    LiveStateRowFilter, LiveStateScanRequest,
+};
 use crate::storage_adapter::StorageAdapterRead;
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Consumed by the source-wide statistics cache in the provider layer.
 pub(crate) struct EntityColumnarScanLayout {
     pub(crate) id: crate::columnar_row_group::RowGroupSetId,
-    pub(crate) manifest: crate::columnar_row_group::RowGroupManifest,
+    pub(crate) manifest: Arc<crate::columnar_row_group::RowGroupManifest>,
+    pub(crate) overlay: Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
+    pub(crate) branch_id: Arc<str>,
+    pub(crate) head_commit_id: crate::changelog::CommitId,
+    pub(crate) current_state_revision: u64,
+    pub(crate) live_count: u64,
 }
 
 /// Optional private capability supplied only by committed read sessions.
@@ -64,13 +75,13 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
     async fn plan_entity_columnar_scan(
         &self,
         _request: LiveStateScanRequest,
-    ) -> Result<Option<EntityColumnarScanLayout>, LixError> {
+    ) -> Result<Option<Arc<EntityColumnarScanLayout>>, LixError> {
         Ok(None)
     }
 
     async fn load_entity_columnar_group(
         &self,
-        _layout: EntityColumnarScanLayout,
+        _layout: Arc<EntityColumnarScanLayout>,
         _group_index: usize,
         _projection: Vec<usize>,
     ) -> Result<RecordBatch, LixError> {
@@ -78,6 +89,73 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
             LixError::CODE_INTERNAL_ERROR,
             "entity snapshot reader does not support columnar groups".to_string(),
         ))
+    }
+
+    /// Returns an exact keep mask for one immutable base group. Implementors
+    /// may cache it because both the row-group set and the sorted shadow
+    /// identity digest are content-addressed inputs.
+    async fn entity_columnar_shadow_mask(
+        &self,
+        layout: Arc<EntityColumnarScanLayout>,
+        group_index: usize,
+        identity_column: usize,
+        shadow_identities: Arc<Vec<String>>,
+        _shadow_identity_digest: [u8; 32],
+    ) -> Result<Arc<BooleanArray>, LixError> {
+        Ok(Arc::new(
+            load_entity_columnar_shadow_mask(
+                self,
+                layout,
+                group_index,
+                identity_column,
+                shadow_identities.as_ref(),
+            )
+            .await?,
+        ))
+    }
+
+    #[allow(dead_code)]
+    async fn cached_entity_columnar_statistics(
+        &self,
+        _layout: &EntityColumnarScanLayout,
+        _group_index: usize,
+        _shadow_identity_digest: [u8; 32],
+        _projection: &[usize],
+    ) -> Result<Option<Statistics>, LixError> {
+        Ok(None)
+    }
+
+    #[allow(dead_code)]
+    async fn cache_entity_columnar_statistics(
+        &self,
+        _layout: &EntityColumnarScanLayout,
+        _group_index: usize,
+        _shadow_identity_digest: [u8; 32],
+        _projection: Vec<usize>,
+        _statistics: Statistics,
+    ) -> Result<(), LixError> {
+        Ok(())
+    }
+
+    async fn cached_entity_columnar_batch(
+        &self,
+        _layout: &EntityColumnarScanLayout,
+        _group_index: usize,
+        _shadow_identity_digest: [u8; 32],
+        _projection: &[usize],
+    ) -> Result<Option<Arc<RecordBatch>>, LixError> {
+        Ok(None)
+    }
+
+    async fn cache_entity_columnar_batch(
+        &self,
+        _layout: &EntityColumnarScanLayout,
+        _group_index: usize,
+        _shadow_identity_digest: [u8; 32],
+        _projection: Vec<usize>,
+        batch: Arc<RecordBatch>,
+    ) -> Result<Arc<RecordBatch>, LixError> {
+        Ok(batch)
     }
 
     async fn scan_entity_snapshots_by_string_field(
@@ -93,11 +171,17 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
 pub(crate) struct CurrentEntitySnapshotReader<S> {
     live_state: Arc<LiveStateContext>,
     store: S,
+    entity_columnar_shadow_masks: Arc<Mutex<EntityColumnarShadowMaskCache>>,
 }
 
 impl<S> CurrentEntitySnapshotReader<S> {
     pub(crate) fn new(live_state: Arc<LiveStateContext>, store: S) -> Self {
-        Self { live_state, store }
+        let entity_columnar_shadow_masks = live_state.entity_columnar_scan_cache();
+        Self {
+            live_state,
+            store,
+            entity_columnar_shadow_masks,
+        }
     }
 }
 
@@ -148,7 +232,7 @@ where
     async fn plan_entity_columnar_scan(
         &self,
         request: LiveStateScanRequest,
-    ) -> Result<Option<EntityColumnarScanLayout>, LixError> {
+    ) -> Result<Option<Arc<EntityColumnarScanLayout>>, LixError> {
         if !direct_entity_snapshot_request(&request)
             || !request.filter.entity_pks.is_empty()
             || request.limit.is_some()
@@ -160,12 +244,32 @@ where
             .reader(self.store.clone())
             .plan_direct_entity_columnar_scan(&request)
             .await?
-            .map(|(id, manifest)| EntityColumnarScanLayout { id, manifest }))
+            .map(
+                |(
+                    id,
+                    manifest,
+                    overlay,
+                    branch_id,
+                    head_commit_id,
+                    current_state_revision,
+                    live_count,
+                )| {
+                    Arc::new(EntityColumnarScanLayout {
+                        id,
+                        manifest,
+                        overlay,
+                        branch_id: Arc::from(branch_id),
+                        head_commit_id,
+                        current_state_revision,
+                        live_count,
+                    })
+                },
+            ))
     }
 
     async fn load_entity_columnar_group(
         &self,
-        layout: EntityColumnarScanLayout,
+        layout: Arc<EntityColumnarScanLayout>,
         group_index: usize,
         projection: Vec<usize>,
     ) -> Result<RecordBatch, LixError> {
@@ -177,6 +281,138 @@ where
             &projection,
         )
         .await
+    }
+
+    async fn entity_columnar_shadow_mask(
+        &self,
+        layout: Arc<EntityColumnarScanLayout>,
+        group_index: usize,
+        identity_column: usize,
+        shadow_identities: Arc<Vec<String>>,
+        shadow_identity_digest: [u8; 32],
+    ) -> Result<Arc<BooleanArray>, LixError> {
+        let key = EntityColumnarShadowMaskKey {
+            row_groups: layout.id,
+            branch_id: Arc::clone(&layout.branch_id),
+            head_commit_id: layout.head_commit_id,
+            current_state_revision: layout.current_state_revision,
+            shadow_identity_digest,
+            group_index,
+        };
+        if let Some(mask) = self
+            .entity_columnar_shadow_masks
+            .lock()
+            .map_err(|_| entity_columnar_mask_error("entity columnar shadow-mask cache poisoned"))?
+            .get(&key)
+        {
+            return Ok(mask);
+        }
+
+        let mask = Arc::new(
+            load_entity_columnar_shadow_mask(
+                self,
+                layout,
+                group_index,
+                identity_column,
+                shadow_identities.as_ref(),
+            )
+            .await?,
+        );
+        Ok(self
+            .entity_columnar_shadow_masks
+            .lock()
+            .map_err(|_| entity_columnar_mask_error("entity columnar shadow-mask cache poisoned"))?
+            .insert(key, mask))
+    }
+
+    async fn cached_entity_columnar_statistics(
+        &self,
+        layout: &EntityColumnarScanLayout,
+        group_index: usize,
+        shadow_identity_digest: [u8; 32],
+        projection: &[usize],
+    ) -> Result<Option<Statistics>, LixError> {
+        let key = EntityColumnarShadowMaskKey {
+            row_groups: layout.id,
+            branch_id: Arc::clone(&layout.branch_id),
+            head_commit_id: layout.head_commit_id,
+            current_state_revision: layout.current_state_revision,
+            shadow_identity_digest,
+            group_index,
+        };
+        Ok(self
+            .entity_columnar_shadow_masks
+            .lock()
+            .map_err(|_| entity_columnar_mask_error("entity columnar shadow-mask cache poisoned"))?
+            .statistics(&key, projection))
+    }
+
+    async fn cache_entity_columnar_statistics(
+        &self,
+        layout: &EntityColumnarScanLayout,
+        group_index: usize,
+        shadow_identity_digest: [u8; 32],
+        projection: Vec<usize>,
+        statistics: Statistics,
+    ) -> Result<(), LixError> {
+        let key = EntityColumnarShadowMaskKey {
+            row_groups: layout.id,
+            branch_id: Arc::clone(&layout.branch_id),
+            head_commit_id: layout.head_commit_id,
+            current_state_revision: layout.current_state_revision,
+            shadow_identity_digest,
+            group_index,
+        };
+        self.entity_columnar_shadow_masks
+            .lock()
+            .map_err(|_| entity_columnar_mask_error("entity columnar shadow-mask cache poisoned"))?
+            .insert_statistics(&key, projection, statistics);
+        Ok(())
+    }
+
+    async fn cached_entity_columnar_batch(
+        &self,
+        layout: &EntityColumnarScanLayout,
+        group_index: usize,
+        shadow_identity_digest: [u8; 32],
+        projection: &[usize],
+    ) -> Result<Option<Arc<RecordBatch>>, LixError> {
+        let key = EntityColumnarShadowMaskKey {
+            row_groups: layout.id,
+            branch_id: Arc::clone(&layout.branch_id),
+            head_commit_id: layout.head_commit_id,
+            current_state_revision: layout.current_state_revision,
+            shadow_identity_digest,
+            group_index,
+        };
+        Ok(self
+            .entity_columnar_shadow_masks
+            .lock()
+            .map_err(|_| entity_columnar_mask_error("entity columnar scan cache poisoned"))?
+            .batch(&key, projection))
+    }
+
+    async fn cache_entity_columnar_batch(
+        &self,
+        layout: &EntityColumnarScanLayout,
+        group_index: usize,
+        shadow_identity_digest: [u8; 32],
+        projection: Vec<usize>,
+        batch: Arc<RecordBatch>,
+    ) -> Result<Arc<RecordBatch>, LixError> {
+        let key = EntityColumnarShadowMaskKey {
+            row_groups: layout.id,
+            branch_id: Arc::clone(&layout.branch_id),
+            head_commit_id: layout.head_commit_id,
+            current_state_revision: layout.current_state_revision,
+            shadow_identity_digest,
+            group_index,
+        };
+        Ok(self
+            .entity_columnar_shadow_masks
+            .lock()
+            .map_err(|_| entity_columnar_mask_error("entity columnar scan cache poisoned"))?
+            .insert_batch(key, projection, batch))
     }
 
     async fn scan_entity_snapshots_by_string_field(
@@ -193,6 +429,41 @@ where
             .scan_direct_entity_snapshots_by_string_field(&request, column, values)
             .await
     }
+}
+
+async fn load_entity_columnar_shadow_mask<R: EntitySnapshotReader + ?Sized>(
+    reader: &R,
+    layout: Arc<EntityColumnarScanLayout>,
+    group_index: usize,
+    identity_column: usize,
+    shadow_identities: &[String],
+) -> Result<BooleanArray, LixError> {
+    let batch = reader
+        .load_entity_columnar_group(layout, group_index, vec![identity_column])
+        .await?;
+    let identities = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| entity_columnar_mask_error("entity columnar identity column is not Utf8"))?;
+    if identities.null_count() != 0 {
+        return Err(entity_columnar_mask_error(
+            "entity columnar identity column contains NULL",
+        ));
+    }
+    Ok(BooleanArray::from(
+        (0..identities.len())
+            .map(|index| {
+                shadow_identities
+                    .binary_search_by(|shadow| shadow.as_str().cmp(identities.value(index)))
+                    .is_err()
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn entity_columnar_mask_error(message: &str) -> LixError {
+    LixError::new(LixError::CODE_INTERNAL_ERROR, message.to_owned())
 }
 
 /// The raw snapshot plane is deliberately narrower than the general

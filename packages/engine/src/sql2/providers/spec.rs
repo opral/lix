@@ -64,6 +64,7 @@ pub(super) type BatchStreamSource =
 pub(super) struct ScanSource {
     partition_count: usize,
     statistics: Arc<Vec<Statistics>>,
+    source_statistics: Option<Statistics>,
     open: BatchStreamSource,
 }
 
@@ -71,6 +72,7 @@ impl ScanSource {
     fn new(
         schema: &SchemaRef,
         statistics: Vec<Statistics>,
+        source_statistics: Option<Statistics>,
         open: impl Fn(usize, Arc<TaskContext>) -> Result<SendableRecordBatchStream>
         + Send
         + Sync
@@ -82,9 +84,14 @@ impl ScanSource {
             statistics.column_statistics.is_empty()
                 || statistics.column_statistics.len() == schema.fields().len()
         }));
+        assert!(source_statistics.as_ref().is_none_or(|statistics| {
+            statistics.column_statistics.is_empty()
+                || statistics.column_statistics.len() == schema.fields().len()
+        }));
         Self {
             partition_count,
             statistics: Arc::new(statistics),
+            source_statistics,
             open: Arc::new(open),
         }
     }
@@ -183,7 +190,26 @@ pub(super) fn batch_stream_source_with_statistics(
     + Sync
     + 'static,
 ) -> ScanSource {
-    ScanSource::new(&schema, statistics, factory)
+    batch_stream_source_with_statistics_and_source(schema, statistics, None, factory)
+}
+
+/// Build a streaming scan with both per-partition statistics and an optional
+/// independently proven whole-source summary.
+///
+/// A source-wide summary is useful when overlays make the exact distribution
+/// across physical partitions unknown even though collection-level metadata
+/// still proves the statistics for their logical union. It never replaces a
+/// request for one specific partition.
+pub(super) fn batch_stream_source_with_statistics_and_source(
+    schema: SchemaRef,
+    statistics: Vec<Statistics>,
+    source_statistics: Option<Statistics>,
+    factory: impl Fn(usize, Arc<TaskContext>) -> Result<SendableRecordBatchStream>
+    + Send
+    + Sync
+    + 'static,
+) -> ScanSource {
+    ScanSource::new(&schema, statistics, source_statistics, factory)
 }
 
 /// Exec-time DML handler: receives the filter-matched batch, stages the
@@ -1039,10 +1065,13 @@ impl ExecutionPlan for SpecScanExec {
                         self.table, self.source.partition_count
                     ))
                 }),
-            None => Statistics::try_merge_iter(
-                self.source.statistics.iter(),
-                self.schema.as_ref(),
-            ),
+            None => match &self.source.source_statistics {
+                Some(statistics) => Ok(statistics.clone()),
+                None => Statistics::try_merge_iter(
+                    self.source.statistics.iter(),
+                    self.schema.as_ref(),
+                ),
+            },
         }
     }
 }
@@ -1416,6 +1445,50 @@ mod scan_source_tests {
                 .expect("merged statistics")
                 .num_rows,
             Precision::Exact(5)
+        );
+    }
+
+    #[test]
+    fn streaming_scan_source_statistics_override_only_the_union() {
+        let schema = int_schema("value");
+        let partition_statistics = [Precision::Absent, Precision::Absent]
+            .into_iter()
+            .map(|rows| Statistics::new_unknown(schema.as_ref()).with_num_rows(rows))
+            .collect();
+        let source_statistics =
+            Statistics::new_unknown(schema.as_ref()).with_num_rows(Precision::Exact(7));
+        let source_schema = Arc::clone(&schema);
+        let source = batch_stream_source_with_statistics_and_source(
+            Arc::clone(&schema),
+            partition_statistics,
+            Some(source_statistics),
+            move |_partition, _context| {
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&source_schema),
+                    stream::empty(),
+                )))
+            },
+        );
+        let exec = SpecScanExec::new(
+            Arc::from("source_statistics_test"),
+            PlannedScan {
+                schema,
+                source,
+                ordering: None,
+            },
+        );
+
+        assert_eq!(
+            exec.partition_statistics(Some(0))
+                .expect("partition statistics")
+                .num_rows,
+            Precision::Absent
+        );
+        assert_eq!(
+            exec.partition_statistics(None)
+                .expect("source statistics")
+                .num_rows,
+            Precision::Exact(7)
         );
     }
 }

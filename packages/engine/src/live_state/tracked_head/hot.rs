@@ -2764,6 +2764,22 @@ struct PackedExclusiveSchemaBaseRef {
     index_key: Bytes,
 }
 
+/// One bounded authoritative HOT row layered over an immutable analytical
+/// base. The identity text is encoded exactly as the hidden sidecar column so
+/// execution can suppress stale base rows without parsing entity keys.
+#[derive(Clone, Debug)]
+pub(crate) struct EntityColumnarOverlayRow {
+    pub(crate) entity_pk: EntityPk,
+    pub(crate) snapshot_content: Option<Bytes>,
+    pub(crate) deleted: bool,
+}
+
+// Moderate analytical workloads deliberately keep a few hundred thousand
+// sparse mutations over a million-row immutable base. Bound the merge without
+// forcing that normal shape back through full row materialization.
+const ENTITY_COLUMNAR_MAX_OVERLAY_ROWS: usize = 512 * 1024;
+const ENTITY_COLUMNAR_MAX_OVERLAY_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+
 fn packed_exclusive_schema_base_prefix(
     branch_id: &str,
     generation: CommitId,
@@ -4373,9 +4389,9 @@ where
         Ok(rows.into_identity_ordered_primary_keys())
     }
 
-    /// Plans a typed analytical scan only when one immutable packed base is
-    /// the complete current collection and its atomically staged row-group
-    /// sidecar agrees with the publication control.
+    /// Plans a typed analytical scan when one immutable packed base plus a
+    /// bounded HOT overlay is the complete current collection and its
+    /// atomically staged row-group sidecar agrees with publication control.
     pub(crate) async fn entity_columnar_layout(
         &self,
         branch_id: &str,
@@ -4385,27 +4401,151 @@ where
         Option<(
             crate::columnar_row_group::RowGroupSetId,
             crate::columnar_row_group::RowGroupManifest,
+            Vec<EntityColumnarOverlayRow>,
+            u64,
         )>,
         LixError,
     > {
-        let Some((commit_id, live_count)) = self
-            .exclusive_entity_base(branch_id, control, schema_key)
+        let Some((base_commit_id, live_count)) = self
+            .analytical_entity_base(branch_id, control, schema_key)
             .await?
         else {
             return Ok(None);
         };
-        let id = crate::live_state::entity_row_group_set_id(commit_id, schema_key);
+        let id = crate::live_state::entity_row_group_set_id(base_commit_id, schema_key);
         let Some(manifest) =
             crate::columnar_row_group::load_row_group_manifest(&self.store, id).await?
         else {
             return Ok(None);
         };
-        if manifest.namespace != schema_key || manifest.row_count() != live_count {
+        if manifest.namespace != schema_key {
             return Err(head_value_error(
                 "entity columnar sidecar disagrees with its collection publication",
             ));
         }
-        Ok(Some((id, manifest)))
+
+        // Read at most one bounded HOT generation. This is deliberately
+        // independent of the SQL predicate: an update or tombstone that no
+        // longer matches the predicate must still suppress its stale base row.
+        let filter = TrackedStateFilter {
+            schema_keys: vec![schema_key.to_owned()],
+            include_tombstones: true,
+            ..TrackedStateFilter::default()
+        };
+        let entries = hot_scan_entries(
+            &self.store,
+            branch_id,
+            control.generation,
+            &filter,
+            Some(ENTITY_COLUMNAR_MAX_OVERLAY_ROWS + 1),
+        )
+        .await?;
+        let entry_count = match &entries {
+            HotScanEntries::Decoded(entries) => entries.len(),
+            HotScanEntries::Finite(entries) => entries
+                .iter()
+                .map(|batch| batch.values.iter().flatten().count())
+                .sum(),
+        };
+        if entry_count > ENTITY_COLUMNAR_MAX_OVERLAY_ROWS {
+            return Ok(None);
+        }
+        let rows = materialize_hot_scan_entries(
+            &self.store,
+            entries,
+            ChangeRecordProjection::from_columns(&["snapshot_content".to_owned()]),
+            branch_id,
+            control.working_diff_checkpoint_commit_id,
+        )
+        .await?;
+        let mut overlay = Vec::with_capacity(rows.len());
+        let mut snapshot_bytes = 0_usize;
+        for row in rows.iter() {
+            // Packed analytical bases contain tracked, unfiled members only.
+            // Retain the established row path for a broader identity domain.
+            if row.file_id().is_some() || row.untracked() || row.global() {
+                return Ok(None);
+            }
+            let Some(row_commit_id) = row.commit_id() else {
+                return Ok(None);
+            };
+            // A complete packed replacement can be newer than stale HOT
+            // records in the same generation. Mirror the authoritative merge:
+            // equal/newer HOT wins; older HOT is ignored.
+            if row_commit_id < base_commit_id {
+                continue;
+            }
+            snapshot_bytes = snapshot_bytes
+                .checked_add(row.snapshot_content().map_or(0, |snapshot| snapshot.len()))
+                .ok_or_else(|| head_value_error("entity columnar overlay byte size overflow"))?;
+            if snapshot_bytes > ENTITY_COLUMNAR_MAX_OVERLAY_SNAPSHOT_BYTES {
+                return Ok(None);
+            }
+            overlay.push(EntityColumnarOverlayRow {
+                entity_pk: row.entity_pk().clone(),
+                snapshot_content: row
+                    .snapshot_content()
+                    .map(|snapshot| Bytes::copy_from_slice(snapshot.as_bytes())),
+                deleted: row.deleted(),
+            });
+        }
+        Ok(Some((id, manifest, overlay, live_count)))
+    }
+
+    async fn analytical_entity_base(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+    ) -> Result<Option<(CommitId, u64)>, LixError> {
+        let collection = load_hot_collection_control(
+            &self.store,
+            branch_id,
+            control.generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: None,
+            },
+        )
+        .await?;
+        if collection.active_generation != control.generation {
+            return Ok(None);
+        }
+        let base_refs = packed_exclusive_schema_base_refs(
+            &self.store,
+            branch_id,
+            control.generation,
+            schema_key,
+        )
+        .await?;
+        let [base_ref] = base_refs.as_slice() else {
+            return Ok(None);
+        };
+        let active_base_refs =
+            packed_current_base_refs(&self.store, branch_id, control.generation).await?;
+        if !active_base_refs
+            .iter()
+            .any(|active| active.commit_id == base_ref.commit_id)
+        {
+            return Err(head_value_error(
+                "exclusive schema index references an inactive packed current base",
+            ));
+        }
+        for active in active_base_refs
+            .iter()
+            .filter(|active| active.commit_id != base_ref.commit_id)
+        {
+            if crate::tracked_state::commit_delta_contains_schema(
+                &self.store,
+                active.commit_id,
+                schema_key,
+            )
+            .await?
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some((base_ref.commit_id, collection.live_count)))
     }
 
     async fn exclusive_entity_base(
@@ -4424,7 +4564,9 @@ where
             },
         )
         .await?;
-        if collection.ordered_identity_digest.is_none() {
+        if collection.active_generation != control.generation
+            || collection.ordered_identity_digest.is_none()
+        {
             return Ok(None);
         }
         let base_refs = packed_exclusive_schema_base_refs(
@@ -5334,6 +5476,7 @@ where
         new_head: CommitId,
         schema_key: &str,
         row_count: usize,
+        entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(CommitId, bool), LixError> {
@@ -5449,6 +5592,13 @@ where
                         head_value_error("packed current-base diff count exceeds u64")
                     })?;
             }
+        }
+        if let Some(encoded) = entity_columnar_write_sets.get(&(new_head, schema_key.to_string())) {
+            crate::columnar_row_group::stage_row_group_set(
+                self.writes,
+                crate::live_state::entity_row_group_set_id(new_head, schema_key),
+                encoded,
+            )?;
         }
         self.writes.put(
             PACKED_CURRENT_BASE_SPACE,
@@ -10747,6 +10897,7 @@ mod tests {
             replacement_head,
             SCHEMA_KEY,
             1_024,
+            &crate::live_state::EntityColumnarWriteSets::new(),
             None,
             &mut coverage,
         )

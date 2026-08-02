@@ -112,6 +112,7 @@ pub(crate) async fn commit_prepared_writes(
     commit_prepared_writes_with_parent_heads(
         binary_cas,
         &tracked_state,
+        None,
         runtime_functions,
         &commit_parent_heads,
         read,
@@ -125,6 +126,7 @@ pub(crate) async fn commit_prepared_writes(
 pub(crate) async fn commit_prepared_writes_with_parent_heads(
     binary_cas: &BinaryCasContext,
     tracked_state: &TrackedStateContext,
+    entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
     runtime_functions: Option<&FunctionContext>,
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     read: &mut impl StorageAdapterRead,
@@ -242,7 +244,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     }
     let mut insert_selection = prepared_writes.insert_selection;
     let entity_columnar_write_sets =
-        prepare_entity_columnar_write_sets(&state_rows, &insert_selection)?;
+        prepare_entity_columnar_write_sets(&state_rows, &insert_selection, entity_schema_catalog)?;
     release_validated_canonical_value_columns(&mut state_rows);
     if !prepared_writes.file_data_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
@@ -2797,6 +2799,7 @@ async fn stage_tracked_head(
                     root.commit_id,
                     schema_key,
                     state_row_indices.len(),
+                    entity_columnar_write_sets,
                     working_diff_capture_checkpoint_commit_id,
                     &mut coverage,
                 )
@@ -3857,26 +3860,44 @@ fn release_validated_canonical_value_columns(state_rows: &mut PreparedStateBatch
 fn prepare_entity_columnar_write_sets(
     state_rows: &PreparedStateBatch,
     insert_selection: &PreparedInsertSelection,
+    entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
 ) -> Result<crate::live_state::EntityColumnarWriteSets, LixError> {
-    if state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS || insert_selection.len() != state_rows.len()
-    {
+    if state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS {
         return Ok(BTreeMap::new());
     }
-    if insert_selection.covers_all(state_rows.len())
+    let publishes_ordered_insert =
+        insert_selection.len() == state_rows.len() && insert_selection.covers_all(state_rows.len());
+    let publishes_complete_replacement =
+        state_rows.certified_complete_collection_replacement() && insert_selection.is_empty();
+    if !publishes_ordered_insert && !publishes_complete_replacement {
+        return Ok(BTreeMap::new());
+    }
+    if (publishes_ordered_insert || publishes_complete_replacement)
         && let Some((commit_id, schema_key, snapshots)) = state_rows.dense_entity_columnar_input()
     {
-        let snapshots = snapshots.iter().map(|snapshot| snapshot.value());
+        let Some(schema) = entity_schema_catalog.and_then(|catalog| catalog.schema(schema_key))
+        else {
+            return Ok(BTreeMap::new());
+        };
+        let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(schema) else {
+            return Ok(BTreeMap::new());
+        };
+        let rows = state_rows.iter().zip(snapshots).map(|(row, snapshot)| {
+            crate::sql2::EntityColumnarRowRef {
+                entity_pk: row.entity_pk,
+                snapshot_bytes: snapshot.normalized().as_bytes(),
+                snapshot_value: snapshot.value(),
+            }
+        });
         let mut encoded = BTreeMap::new();
-        if let Some(row_groups) =
-            crate::live_state::encode_entity_scalar_row_groups(schema_key, snapshots)?
-        {
+        if let Some(row_groups) = crate::sql2::encode_registered_entity_row_groups(&spec, rows)? {
             encoded.insert((commit_id, schema_key.to_string()), row_groups);
         }
         return Ok(encoded);
     }
     let mut indices = BTreeMap::<(CommitId, String), Vec<usize>>::new();
     for (index, row) in state_rows.iter().enumerate() {
-        if !insert_selection.contains(index) {
+        if !publishes_complete_replacement && !insert_selection.contains(index) {
             return Ok(BTreeMap::new());
         }
         let (Some(commit_id), Some(_snapshot)) = (row.commit_id, row.snapshot) else {
@@ -3895,16 +3916,25 @@ fn prepare_entity_columnar_write_sets(
         if row_indices.len() < PACKED_CURRENT_BASE_MIN_ROWS {
             continue;
         }
-        let snapshots = row_indices.iter().map(|&index| {
-            state_rows
-                .row(index)
+        let Some(schema) = entity_schema_catalog.and_then(|catalog| catalog.schema(&schema_key))
+        else {
+            continue;
+        };
+        let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(schema) else {
+            continue;
+        };
+        let rows = row_indices.iter().map(|&index| {
+            let row = state_rows.row(index);
+            let snapshot = row
                 .snapshot
-                .expect("columnar row index retained a snapshot")
-                .value()
+                .expect("columnar row index retained a snapshot");
+            crate::sql2::EntityColumnarRowRef {
+                entity_pk: row.entity_pk,
+                snapshot_bytes: snapshot.normalized().as_bytes(),
+                snapshot_value: snapshot.value(),
+            }
         });
-        if let Some(row_groups) =
-            crate::live_state::encode_entity_scalar_row_groups(&schema_key, snapshots)?
-        {
+        if let Some(row_groups) = crate::sql2::encode_registered_entity_row_groups(&spec, rows)? {
             encoded.insert((commit_id, schema_key), row_groups);
         }
     }

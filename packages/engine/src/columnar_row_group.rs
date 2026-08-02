@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -182,6 +183,85 @@ impl RowGroupManifest {
             fields.collect::<Vec<_>>(),
             self.metadata.clone(),
         ))
+    }
+
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        fn map_bytes(values: &HashMap<String, String>) -> usize {
+            values
+                .capacity()
+                .saturating_mul(size_of::<(String, String)>())
+                .saturating_add(
+                    values
+                        .iter()
+                        .map(|(key, value)| key.capacity().saturating_add(value.capacity()))
+                        .sum(),
+                )
+        }
+
+        fn scalar_bytes(value: &Option<RowGroupScalar>) -> usize {
+            match value {
+                Some(RowGroupScalar::String(value)) => value.capacity(),
+                Some(
+                    RowGroupScalar::Int64(_)
+                    | RowGroupScalar::Float64(_)
+                    | RowGroupScalar::Boolean(_),
+                )
+                | None => 0,
+            }
+        }
+
+        self.namespace
+            .capacity()
+            .saturating_add(map_bytes(&self.metadata))
+            .saturating_add(
+                self.fields
+                    .capacity()
+                    .saturating_mul(size_of::<RowGroupField>()),
+            )
+            .saturating_add(
+                self.fields
+                    .iter()
+                    .map(|field| {
+                        field
+                            .name
+                            .capacity()
+                            .saturating_add(map_bytes(&field.metadata))
+                    })
+                    .sum(),
+            )
+            .saturating_add(
+                self.groups
+                    .capacity()
+                    .saturating_mul(size_of::<RowGroupStatistics>()),
+            )
+            .saturating_add(
+                self.groups
+                    .iter()
+                    .map(|group| {
+                        group
+                            .columns
+                            .capacity()
+                            .saturating_mul(size_of::<RowGroupColumnStatistics>())
+                            .saturating_add(
+                                group
+                                    .column_digests
+                                    .capacity()
+                                    .saturating_mul(size_of::<[u8; BLAKE3_DIGEST_LEN]>()),
+                            )
+                            .saturating_add(
+                                group
+                                    .columns
+                                    .iter()
+                                    .map(|column| {
+                                        scalar_bytes(&column.min)
+                                            .saturating_add(scalar_bytes(&column.max))
+                                            .saturating_add(scalar_bytes(&column.sum))
+                                    })
+                                    .sum(),
+                            )
+                    })
+                    .sum(),
+            )
     }
 }
 
@@ -851,6 +931,33 @@ fn column_statistics(
         min,
         max,
         sum,
+    })
+}
+
+/// Derive exact physical statistics from an already reconciled Arrow batch.
+///
+/// Analytical overlay scans use this after suppressing stale base rows. The
+/// result has the same semantics as persisted row-group statistics but no
+/// column digests because it describes an in-memory derived batch rather than
+/// stored column payloads.
+pub(crate) fn exact_record_batch_statistics(
+    batch: &RecordBatch,
+) -> Result<RowGroupStatistics, LixError> {
+    let row_count = u32::try_from(batch.num_rows())
+        .map_err(|_| row_group_error("record-batch row count exceeds u32"))?;
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(batch.schema().fields())
+        .map(|(array, field)| {
+            let data_type = RowGroupDataType::from_arrow(field.data_type())?;
+            column_statistics(array, data_type)
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    Ok(RowGroupStatistics {
+        row_count,
+        column_digests: vec![[0; BLAKE3_DIGEST_LEN]; columns.len()],
+        columns,
     })
 }
 

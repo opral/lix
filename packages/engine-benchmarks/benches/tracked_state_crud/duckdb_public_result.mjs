@@ -6,6 +6,8 @@
 //
 // The `olap_*` controls create the same typed rows as Lix and materialize
 // owned JavaScript values at the same public-result boundary as ExecuteResult.
+// `LIX_DUCKDB_OLAP_STATE=pristine|sparse|moderate` selects the matched
+// post-publication mutation state before the untimed validation and warmup.
 
 import { createRequire } from "node:module";
 
@@ -19,6 +21,12 @@ const rowCount = Number.parseInt(process.env.LIX_DUCKDB_ROW_COUNT ?? "1000000", 
 const sampleCount = Number.parseInt(process.env.LIX_DUCKDB_SAMPLES ?? "5", 10);
 const shape = process.env.LIX_DUCKDB_SHAPE ?? "full_result";
 const olapShape = shape.startsWith("olap_");
+const mutationState = process.env.LIX_DUCKDB_OLAP_STATE ?? "pristine";
+const mutationStride = {
+  pristine: undefined,
+  sparse: 1000,
+  moderate: 10,
+}[mutationState];
 
 if (!Number.isSafeInteger(rowCount) || rowCount <= 0) {
   throw new Error("LIX_DUCKDB_ROW_COUNT must be a positive safe integer");
@@ -28,6 +36,12 @@ if (!Number.isSafeInteger(sampleCount) || sampleCount <= 0) {
 }
 if (olapShape && rowCount < 20) {
   throw new Error("typed OLAP controls require at least 20 rows");
+}
+if (!(mutationState in { pristine: true, sparse: true, moderate: true })) {
+  throw new Error("LIX_DUCKDB_OLAP_STATE must be pristine, sparse, or moderate");
+}
+if (!olapShape && mutationState !== "pristine") {
+  throw new Error("LIX_DUCKDB_OLAP_STATE is available only for olap_* shapes");
 }
 
 const query = {
@@ -67,6 +81,30 @@ if (olapShape) {
       ordinal % 3 <> 0 AS active
     FROM range(${rowCount}) AS generated(ordinal)
   `);
+  if (mutationStride !== undefined) {
+    const insertedRows = mutationCount(rowCount, 2, mutationStride);
+    await connection.run(`
+      UPDATE olap_row
+      SET lane = printf('lane-%02d', (ordinal + 11) % 32),
+          score = score + 2048.0,
+          active = NOT active
+      WHERE ordinal < ${rowCount} AND ordinal % ${mutationStride} = 1
+    `);
+    await connection.run(`
+      DELETE FROM olap_row
+      WHERE ordinal < ${rowCount} AND ordinal % ${mutationStride} = 2
+    `);
+    await connection.run(`
+      INSERT INTO olap_row
+      SELECT
+        printf('/~lix-olap/%09d', ordinal) AS id,
+        ordinal::BIGINT AS ordinal,
+        printf('lane-%02d', ordinal % 32) AS lane,
+        (ordinal % 10000)::DOUBLE / 8.0 AS score,
+        ordinal % 3 <> 0 AS active
+      FROM range(${rowCount}, ${rowCount + insertedRows}) AS generated(ordinal)
+    `);
+  }
 } else {
   await connection.run(`
     CREATE TABLE json_pointer AS
@@ -77,26 +115,31 @@ if (olapShape) {
   `);
 }
 
-const expected = olapShape ? olapExpected(rowCount) : undefined;
+const expected = olapShape ? olapExpected(rowCount, mutationState) : undefined;
 
-async function materialize() {
+async function materialize(validate) {
   const reader = await connection.runAndReadAll(query);
   const rows = [];
   for (const row of reader.getRows()) {
     rows.push(materializeRow(shape, row));
   }
-  assertRows(shape, rows, rowCount, expected);
+  if (validate) {
+    assertRows(shape, rows, rowCount, expected);
+  } else {
+    assertRowCount(shape, rows, rowCount, expected);
+  }
   return rows;
 }
 
 if (olapShape) {
-  await materialize();
+  await materialize(true);
+  await materialize(false);
 }
 
 const samplesMs = [];
 for (let sample = 0; sample < sampleCount; sample += 1) {
   const started = process.hrtime.bigint();
-  await materialize();
+  await materialize(!olapShape);
   samplesMs.push(Number(process.hrtime.bigint() - started) / 1e6);
 }
 
@@ -106,6 +149,7 @@ console.log(
     duckdb_node_api_version: duckdbNodeApiVersion,
     node_version: process.version,
     shape,
+    olap_state: mutationState,
     row_count: rowCount,
     samples_ms: samplesMs,
     median_ms: samplesMs[Math.floor(samplesMs.length / 2)],
@@ -134,7 +178,49 @@ function materializeRow(selectedShape, row) {
   }
 }
 
-function olapExpected(count) {
+function mutationCount(count, residue, stride) {
+  return count <= residue ? 0 : Math.floor((count - 1 - residue) / stride) + 1;
+}
+
+function olapRow(ordinal, initialCount, state) {
+  const stride = { pristine: undefined, sparse: 1000, moderate: 10 }[state];
+  if (stride !== undefined) {
+    const insertedRows = mutationCount(initialCount, 2, stride);
+    if (ordinal >= initialCount) {
+      if (ordinal >= initialCount + insertedRows) return undefined;
+    } else {
+      if (ordinal % stride === 2) return undefined;
+    }
+  } else if (ordinal >= initialCount) {
+    return undefined;
+  }
+  const row = {
+    id: `/~lix-olap/${String(ordinal).padStart(9, "0")}`,
+    ordinal,
+    lane: ordinal % 32,
+    score: (ordinal % 10000) / 8,
+    active: ordinal % 3 !== 0,
+  };
+  if (stride !== undefined && ordinal < initialCount && ordinal % stride === 1) {
+    row.lane = (row.lane + 11) % 32;
+    row.score += 2048;
+    row.active = !row.active;
+  }
+  return row;
+}
+
+function olapRows(count, state) {
+  const stride = { pristine: undefined, sparse: 1000, moderate: 10 }[state];
+  const insertedRows = stride === undefined ? 0 : mutationCount(count, 2, stride);
+  const rows = [];
+  for (let ordinal = 0; ordinal < count + insertedRows; ordinal += 1) {
+    const row = olapRow(ordinal, count, state);
+    if (row !== undefined) rows.push(row);
+  }
+  return rows;
+}
+
+function olapExpected(count, state) {
   const groups = Array.from({ length: 32 }, () => ({
     rows: 0,
     ordinalSum: 0,
@@ -152,11 +238,12 @@ function olapExpected(count) {
     filteredFirstOrdinal: undefined,
     filteredLastOrdinal: undefined,
     groups,
+    state,
+    visibleRows: count,
   };
-  for (let ordinal = 0; ordinal < count; ordinal += 1) {
-    if (ordinal % 3 === 0) continue;
-    const lane = ordinal % 32;
-    const score = (ordinal % 10000) / 8;
+  for (const row of olapRows(count, state)) {
+    if (!row.active) continue;
+    const { ordinal, lane, score } = row;
     result.activeRows += 1;
     result.activeOrdinalSum += ordinal;
     result.activeScoreSum += score;
@@ -187,25 +274,42 @@ function assertRows(selectedShape, rows, count, olap) {
     return;
   }
   if (selectedShape === "olap_scan") {
-    if (rows.length !== count) throw new Error("unexpected OLAP scan cardinality");
+    const expectedRows = olapRows(count, olap.state);
+    if (rows.length !== expectedRows.length) throw new Error("unexpected OLAP scan cardinality");
+    const expectedByOrdinal = new Map(expectedRows.map((row) => [row.ordinal, row]));
+    const seen = new Set();
+    for (const [id, ordinal, lane, score, active] of rows) {
+      const expectedRow = expectedByOrdinal.get(ordinal);
+      if (expectedRow === undefined || seen.has(ordinal) || id !== expectedRow.id || lane !== `lane-${String(expectedRow.lane).padStart(2, "0")}` || score !== expectedRow.score || active !== expectedRow.active) {
+        throw new Error("unexpected OLAP scan row");
+      }
+      seen.add(ordinal);
+    }
+    if (seen.size !== expectedRows.length) throw new Error("OLAP scan omitted rows");
     return;
   }
   if (selectedShape === "olap_filter") {
-    if (rows.length !== olap.filteredRows || rows[0][0] !== olap.filteredFirstOrdinal || rows.at(-1)[0] !== olap.filteredLastOrdinal) {
-      throw new Error("unexpected OLAP filter result");
+    const expectedRows = olapRows(count, olap.state).filter((row) => row.active && (row.lane === 7 || row.lane === 19));
+    if (rows.length !== expectedRows.length) throw new Error("unexpected OLAP filter cardinality");
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = expectedRows[index];
+      if (rows[index][0] !== row.ordinal || rows[index][1] !== `lane-${String(row.lane).padStart(2, "0")}` || rows[index][2] !== row.score) {
+        throw new Error("unexpected OLAP filter result");
+      }
     }
     return;
   }
   if (selectedShape === "olap_sort") {
-    if (rows.length !== Math.min(10000, olap.activeRows)) throw new Error("unexpected OLAP sort cardinality");
+    const expectedRows = olapRows(count, olap.state)
+      .filter((row) => row.active)
+      .sort((left, right) => right.score - left.score || left.ordinal - right.ordinal)
+      .slice(0, 10000);
+    if (rows.length !== expectedRows.length) throw new Error("unexpected OLAP sort cardinality");
     for (let index = 0; index < rows.length; index += 1) {
       const [id, ordinal, score] = rows[index];
-      if (ordinal % 3 === 0 || id !== `/~lix-olap/${String(ordinal).padStart(9, "0")}` || score !== (ordinal % 10000) / 8) {
+      const expectedRow = expectedRows[index];
+      if (id !== expectedRow.id || ordinal !== expectedRow.ordinal || score !== expectedRow.score) {
         throw new Error("unexpected OLAP sort row");
-      }
-      if (index > 0) {
-        const previous = rows[index - 1];
-        if (!(previous[2] > score || (previous[2] === score && previous[1] < ordinal))) throw new Error("unexpected OLAP sort order");
       }
     }
     return;
@@ -226,6 +330,20 @@ function assertRows(selectedShape, rows, count, olap) {
       throw new Error("unexpected OLAP aggregate");
     }
   }
+}
+
+function assertRowCount(selectedShape, rows, count, olap) {
+  const expected = {
+    full_result: count,
+    general_filter_sort: count,
+    general_aggregate: 1,
+    olap_scan: olap?.visibleRows,
+    olap_filter: olap?.filteredRows,
+    olap_sort: Math.min(10000, olap?.activeRows ?? 0),
+    olap_group: 32,
+    olap_aggregate: 1,
+  }[selectedShape];
+  if (rows.length !== expected) throw new Error(`unexpected ${selectedShape} cardinality`);
 }
 
 function close(actual, expected) {
