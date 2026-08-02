@@ -11,6 +11,20 @@ use std::time::{Duration, Instant};
 
 use config::Config;
 
+#[derive(Clone, Copy)]
+struct DuckDbPhaseSample {
+    prepare: Duration,
+    query_arrow: Duration,
+    arrow_collection: Duration,
+    owned_row_materialization: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct LixPhaseSample {
+    profile: lix_engine::SqlReadProfile,
+    common_owned_row_normalization: Duration,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let config = Config::from_env();
@@ -74,14 +88,27 @@ async fn main() {
         }
 
         let mut duckdb_samples = Vec::with_capacity(config.samples);
+        let mut duckdb_phase_samples = Vec::with_capacity(config.samples);
         let mut lix_samples = (0..lix_fixtures.len())
+            .map(|_| Vec::with_capacity(config.samples))
+            .collect::<Vec<_>>();
+        let mut lix_phase_samples = (0..lix_fixtures.len())
             .map(|_| Vec::with_capacity(config.samples))
             .collect::<Vec<_>>();
         for sample in 0..config.samples {
             if sample % 2 == 0 {
                 let started = Instant::now();
-                black_box(result::from_arrow(&duckdb::query(&duckdb, &query.sql)));
+                let profiled = duckdb::query_profiled(&duckdb, &query.sql);
+                let materialization_started = Instant::now();
+                black_box(result::from_arrow(&profiled.batches));
+                let owned_row_materialization = materialization_started.elapsed();
                 duckdb_samples.push(started.elapsed());
+                duckdb_phase_samples.push(DuckDbPhaseSample {
+                    prepare: profiled.prepare,
+                    query_arrow: profiled.query_arrow,
+                    arrow_collection: profiled.arrow_collection,
+                    owned_row_materialization,
+                });
             }
             for fixture_index in if sample % 2 == 0 {
                 (0..lix_fixtures.len()).collect::<Vec<_>>()
@@ -89,20 +116,37 @@ async fn main() {
                 (0..lix_fixtures.len()).rev().collect::<Vec<_>>()
             } {
                 let started = Instant::now();
-                black_box(result::from_lix(
-                    &lix_fixtures[fixture_index].query(&query.sql).await,
-                ));
+                let (result, profile) =
+                    lix_fixtures[fixture_index].query_profiled(&query.sql).await;
+                let normalization_started = Instant::now();
+                black_box(result::from_lix(&result));
+                let common_owned_row_normalization = normalization_started.elapsed();
                 lix_samples[fixture_index].push(started.elapsed());
+                lix_phase_samples[fixture_index].push(LixPhaseSample {
+                    profile,
+                    common_owned_row_normalization,
+                });
             }
             if sample % 2 != 0 {
                 let started = Instant::now();
-                black_box(result::from_arrow(&duckdb::query(&duckdb, &query.sql)));
+                let profiled = duckdb::query_profiled(&duckdb, &query.sql);
+                let materialization_started = Instant::now();
+                black_box(result::from_arrow(&profiled.batches));
+                let owned_row_materialization = materialization_started.elapsed();
                 duckdb_samples.push(started.elapsed());
+                duckdb_phase_samples.push(DuckDbPhaseSample {
+                    prepare: profiled.prepare,
+                    query_arrow: profiled.query_arrow,
+                    arrow_collection: profiled.arrow_collection,
+                    owned_row_materialization,
+                });
             }
         }
         let duckdb_median = config::median(&duckdb_samples);
 
-        for (fixture, lix_samples) in lix_fixtures.iter().zip(lix_samples) {
+        for ((fixture, lix_samples), lix_phase_samples) in
+            lix_fixtures.iter().zip(lix_samples).zip(lix_phase_samples)
+        {
             let lix_median = config::median(&lix_samples);
             println!(
                 "{}",
@@ -124,9 +168,43 @@ async fn main() {
                     "duckdb_median_ms": millis(duckdb_median),
                     "duckdb_p90_ms": millis(config::p90(&duckdb_samples)),
                     "duckdb_mad_ms": millis(config::median_absolute_deviation(&duckdb_samples)),
+                    "duckdb_phase_contract": "prepare; query_arrow=execution_plus_internal_result; arrow_collection; owned_rows",
+                    "duckdb_phase_samples_ms": duckdb_phase_samples.iter().map(|sample| serde_json::json!({
+                        "prepare": millis(sample.prepare),
+                        "query_arrow_execution_plus_internal_result": millis(sample.query_arrow),
+                        "arrow_collection": millis(sample.arrow_collection),
+                        "owned_row_materialization": millis(sample.owned_row_materialization),
+                    })).collect::<Vec<_>>(),
+                    "duckdb_prepare_median_ms": median_millis(duckdb_phase_samples.iter().map(|sample| sample.prepare)),
+                    "duckdb_query_arrow_median_ms": median_millis(duckdb_phase_samples.iter().map(|sample| sample.query_arrow)),
+                    "duckdb_arrow_collection_median_ms": median_millis(duckdb_phase_samples.iter().map(|sample| sample.arrow_collection)),
+                    "duckdb_owned_row_materialization_median_ms": median_millis(duckdb_phase_samples.iter().map(|sample| sample.owned_row_materialization)),
                     "lix_median_ms": millis(lix_median),
                     "lix_p90_ms": millis(config::p90(&lix_samples)),
                     "lix_mad_ms": millis(config::median_absolute_deviation(&lix_samples)),
+                    "lix_phase_contract": "four disjoint wall phases; scan_elapsed is overlapping summed operator poll time",
+                    "lix_phase_samples": lix_phase_samples.iter().map(|sample| serde_json::json!({
+                        "logical_planning_ms": millis(sample.profile.logical_planning),
+                        "physical_planning_ms": millis(sample.profile.physical_planning),
+                        "arrow_execution_ms": millis(sample.profile.arrow_execution),
+                        "public_result_materialization_ms": millis(sample.profile.public_result_materialization),
+                        "unattributed_overhead_ms": millis(sample.profile.unattributed_overhead()),
+                        "common_owned_row_normalization_ms": millis(sample.common_owned_row_normalization),
+                        "scan_elapsed_operator_sum_ms": millis(sample.profile.scan_elapsed),
+                        "scan_rows": sample.profile.scan_rows,
+                        "scan_batches": sample.profile.scan_batches,
+                        "scan_arrow_bytes": sample.profile.scan_arrow_bytes,
+                    })).collect::<Vec<_>>(),
+                    "lix_logical_planning_median_ms": median_millis(lix_phase_samples.iter().map(|sample| sample.profile.logical_planning)),
+                    "lix_physical_planning_median_ms": median_millis(lix_phase_samples.iter().map(|sample| sample.profile.physical_planning)),
+                    "lix_arrow_execution_median_ms": median_millis(lix_phase_samples.iter().map(|sample| sample.profile.arrow_execution)),
+                    "lix_public_result_materialization_median_ms": median_millis(lix_phase_samples.iter().map(|sample| sample.profile.public_result_materialization)),
+                    "lix_unattributed_overhead_median_ms": median_millis(lix_phase_samples.iter().map(|sample| sample.profile.unattributed_overhead())),
+                    "lix_common_owned_row_normalization_median_ms": median_millis(lix_phase_samples.iter().map(|sample| sample.common_owned_row_normalization)),
+                    "lix_scan_elapsed_operator_sum_median_ms": median_millis(lix_phase_samples.iter().map(|sample| sample.profile.scan_elapsed)),
+                    "lix_scan_rows_median": median_u64(lix_phase_samples.iter().map(|sample| sample.profile.scan_rows)),
+                    "lix_scan_batches_median": median_u64(lix_phase_samples.iter().map(|sample| sample.profile.scan_batches)),
+                    "lix_scan_arrow_bytes_median": median_u64(lix_phase_samples.iter().map(|sample| sample.profile.scan_arrow_bytes)),
                     "lix_over_duckdb": lix_median.as_secs_f64() / duckdb_median.as_secs_f64(),
                 })
             );
@@ -164,4 +242,14 @@ async fn validate_loaded_keys(duckdb: &::duckdb::Connection, fixtures: &[lix::Fi
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn median_millis(samples: impl Iterator<Item = Duration>) -> f64 {
+    millis(config::median(&samples.collect::<Vec<_>>()))
+}
+
+fn median_u64(samples: impl Iterator<Item = u64>) -> u64 {
+    let mut samples = samples.collect::<Vec<_>>();
+    samples.sort_unstable();
+    samples[samples.len() / 2]
 }

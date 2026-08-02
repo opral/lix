@@ -1,5 +1,6 @@
 use datafusion::arrow::record_batch::RecordBatch;
 use duckdb::{Connection, params};
+use std::time::{Duration, Instant};
 
 use crate::data;
 
@@ -263,9 +264,36 @@ pub(crate) fn seeded(scale_factor: f64, overlay_rowkeys: &[String]) -> Connectio
 }
 
 pub(crate) fn query(connection: &Connection, sql: &str) -> Vec<RecordBatch> {
+    query_profiled(connection, sql).batches
+}
+
+pub(crate) struct ProfiledQuery {
+    pub(crate) batches: Vec<RecordBatch>,
+    pub(crate) prepare: Duration,
+    /// DuckDB's `query_arrow` executes the query and constructs its internal
+    /// result. Its public API does not expose a truthful split between those.
+    pub(crate) query_arrow: Duration,
+    pub(crate) arrow_collection: Duration,
+}
+
+pub(crate) fn query_profiled(connection: &Connection, sql: &str) -> ProfiledQuery {
+    let started = Instant::now();
     let mut statement = connection.prepare(sql).expect("prepare DuckDB TPC-H query");
-    statement
+    let prepare = started.elapsed();
+
+    let started = Instant::now();
+    let arrow = statement
         .query_arrow([])
-        .expect("execute DuckDB TPC-H query")
-        .collect()
+        .expect("execute DuckDB TPC-H query");
+    let query_arrow = started.elapsed();
+
+    let started = Instant::now();
+    let batches = arrow.collect();
+    let arrow_collection = started.elapsed();
+    ProfiledQuery {
+        batches,
+        prepare,
+        query_arrow,
+        arrow_collection,
+    }
 }

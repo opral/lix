@@ -27,6 +27,8 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
+#[cfg(feature = "storage-benches")]
+use std::time::Instant;
 
 use crate::branch::BranchHead;
 use crate::functions::FunctionContext;
@@ -141,7 +143,16 @@ pub(crate) async fn execute_read_statement_in_session_from_parsed(
     statement: DataFusionStatement,
     params: &[Value],
 ) -> Result<SqlQueryResult, LixError> {
+    #[cfg(feature = "storage-benches")]
+    let started = crate::sql_profile::is_active().then(Instant::now);
     let plan = create_logical_plan_in_session_from_parsed(session, sql, statement, params).await?;
+    #[cfg(feature = "storage-benches")]
+    if let Some(started) = started {
+        crate::sql_profile::record_phase(
+            crate::sql_profile::Phase::LogicalPlanning,
+            started.elapsed(),
+        );
+    }
     execute_logical_plan(plan, params).await
 }
 
@@ -935,7 +946,16 @@ async fn execute_logical_plan(
     let batches = crate::sql2::runtime::collect_dataframe(dataframe)
         .await
         .map_err(datafusion_error_to_lix_error)?;
+    #[cfg(feature = "storage-benches")]
+    let started = crate::sql_profile::is_active().then(Instant::now);
     let mut result = query_result_from_batches(&result_fields, &batches)?;
+    #[cfg(feature = "storage-benches")]
+    if let Some(started) = started {
+        crate::sql_profile::record_phase(
+            crate::sql_profile::Phase::PublicResultMaterialization,
+            started.elapsed(),
+        );
+    }
     result.notices = notices;
     Ok(result)
 }

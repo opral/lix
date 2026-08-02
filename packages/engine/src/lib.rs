@@ -53,6 +53,8 @@ pub(crate) mod plugin;
 mod schema;
 pub mod session;
 pub(crate) mod sql2;
+#[cfg(feature = "storage-benches")]
+mod sql_profile;
 mod sql_telemetry;
 pub mod storage;
 #[allow(unused_imports)]
@@ -100,6 +102,8 @@ pub use session::{
     RedoReceipt, SessionContext, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
     UndoReceipt,
 };
+#[cfg(feature = "storage-benches")]
+pub use sql_profile::SqlReadProfile;
 pub use sql2::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 pub use storage::conformance::{
     ConformanceReport as StorageConformanceReport, ConformanceResult as StorageConformanceResult,
