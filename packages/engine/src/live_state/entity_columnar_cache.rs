@@ -127,6 +127,23 @@ impl EntityColumnarShadowMaskCache {
         projection: Vec<usize>,
         batch: Arc<RecordBatch>,
     ) -> Arc<RecordBatch> {
+        self.insert_batch_with_limits(
+            key,
+            projection,
+            batch,
+            RECONCILED_BATCH_CACHE_ENTRIES,
+            RECONCILED_BATCH_CACHE_MAX_BYTES,
+        )
+    }
+
+    fn insert_batch_with_limits(
+        &mut self,
+        key: EntityColumnarShadowMaskKey,
+        projection: Vec<usize>,
+        batch: Arc<RecordBatch>,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Arc<RecordBatch> {
         let key = EntityColumnarBatchKey {
             shadow: key,
             projection,
@@ -139,11 +156,11 @@ impl EntityColumnarShadowMaskCache {
             .iter()
             .map(|column| column.get_array_memory_size())
             .sum::<usize>();
-        if bytes > RECONCILED_BATCH_CACHE_MAX_BYTES {
+        if bytes > max_bytes {
             return batch;
         }
-        while self.batches.len() >= RECONCILED_BATCH_CACHE_ENTRIES
-            || self.batch_bytes.saturating_add(bytes) > RECONCILED_BATCH_CACHE_MAX_BYTES
+        while self.batches.len() >= max_entries
+            || self.batch_bytes.saturating_add(bytes) > max_bytes
         {
             let Some(evicted) = self.batch_insertion_order.pop_front() else {
                 break;
@@ -218,5 +235,92 @@ mod tests {
         assert!(cache.batch_bytes <= RECONCILED_BATCH_CACHE_MAX_BYTES);
         assert!(cache.batch(&shadow, &[0]).is_none());
         assert!(cache.batch(&shadow, &[2]).is_some());
+    }
+
+    #[test]
+    fn reconciled_batches_are_byte_bounded() {
+        let shadow = batch_cache_key();
+        let batch = test_batch(&[1, 2, 3, 4]);
+        let bytes = batch
+            .columns()
+            .iter()
+            .map(|column| column.get_array_memory_size())
+            .sum::<usize>();
+        let mut cache = EntityColumnarShadowMaskCache::default();
+
+        cache.insert_batch_with_limits(shadow.clone(), vec![0], Arc::clone(&batch), 8, bytes);
+        cache.insert_batch_with_limits(shadow.clone(), vec![1], Arc::clone(&batch), 8, bytes);
+
+        assert!(cache.batch(&shadow, &[0]).is_none());
+        assert!(cache.batch(&shadow, &[1]).is_some());
+        assert_eq!(cache.batch_bytes, bytes);
+
+        let oversized = test_batch(&[5, 6, 7, 8, 9]);
+        cache.insert_batch_with_limits(shadow.clone(), vec![2], oversized, 8, bytes);
+        assert!(cache.batch(&shadow, &[2]).is_none());
+        assert_eq!(cache.batch_bytes, bytes);
+    }
+
+    #[test]
+    fn batch_cache_key_covers_every_visibility_and_projection_dimension() {
+        let base = batch_cache_key();
+        let batch = test_batch(&[7]);
+        let mut cache = EntityColumnarShadowMaskCache::default();
+        let resident = cache.insert_batch(base.clone(), vec![1, 3], Arc::clone(&batch));
+        assert!(cache.batch(&base, &[1, 3]).is_some());
+        let duplicate = cache.insert_batch(base.clone(), vec![1, 3], test_batch(&[8]));
+        assert!(Arc::ptr_eq(&resident, &duplicate));
+        assert!(Arc::ptr_eq(&batch, &duplicate));
+
+        let variants = [
+            EntityColumnarShadowMaskKey {
+                row_groups: crate::columnar_row_group::RowGroupSetId::new([8; 16]),
+                ..base.clone()
+            },
+            EntityColumnarShadowMaskKey {
+                branch_id: Arc::from("other"),
+                ..base.clone()
+            },
+            EntityColumnarShadowMaskKey {
+                head_commit_id: crate::changelog::CommitId::for_test_label("other-head"),
+                ..base.clone()
+            },
+            EntityColumnarShadowMaskKey {
+                current_state_revision: 2,
+                ..base.clone()
+            },
+            EntityColumnarShadowMaskKey {
+                shadow_identity_digest: [9; 32],
+                ..base.clone()
+            },
+            EntityColumnarShadowMaskKey {
+                group_index: 1,
+                ..base.clone()
+            },
+        ];
+        for variant in variants {
+            assert!(cache.batch(&variant, &[1, 3]).is_none());
+        }
+        assert!(cache.batch(&base, &[3, 1]).is_none());
+        assert!(cache.batch(&base, &[1]).is_none());
+    }
+
+    fn batch_cache_key() -> EntityColumnarShadowMaskKey {
+        EntityColumnarShadowMaskKey {
+            row_groups: crate::columnar_row_group::RowGroupSetId::new([3; 16]),
+            branch_id: Arc::from("branch"),
+            head_commit_id: crate::changelog::CommitId::for_test_label("batch-cache-head"),
+            current_state_revision: 1,
+            shadow_identity_digest: [4; 32],
+            group_index: 0,
+        }
+    }
+
+    fn test_batch(values: &[i64]) -> Arc<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        Arc::new(
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.to_vec()))])
+                .expect("batch"),
+        )
     }
 }

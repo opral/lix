@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -991,65 +992,56 @@ async fn entity_columnar_scan_source(
                     .cloned();
                 let coordinates_prove_unshadowed =
                     coordinate_shadow_masks.is_some() && coordinate_keep.is_none();
-                let batch = if (shadow_identities.is_empty() && coordinate_shadow_masks.is_none())
-                    || coordinates_prove_unshadowed
-                {
-                    Arc::new(
-                        reader
-                            .load_entity_columnar_group(
-                                layout.clone(),
-                                group_index,
-                                public_projection,
+                let batch = cached_or_load_entity_columnar_batch(
+                    &reader,
+                    &layout,
+                    group_index,
+                    shadow_identity_digest,
+                    public_projection.clone(),
+                    async {
+                        let batch = if (shadow_identities.is_empty()
+                            && coordinate_shadow_masks.is_none())
+                            || coordinates_prove_unshadowed
+                        {
+                            Arc::new(
+                                reader
+                                    .load_entity_columnar_group(
+                                        layout.clone(),
+                                        group_index,
+                                        public_projection.clone(),
+                                    )
+                                    .await
+                                    .map_err(lix_error_to_datafusion_error)?,
                             )
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?,
-                    )
-                } else if let Some(batch) = reader
-                    .cached_entity_columnar_batch(
-                        &layout,
-                        group_index,
-                        shadow_identity_digest,
-                        &public_projection,
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?
-                {
-                    batch
-                } else {
-                    let keep = if let Some(keep) = coordinate_keep {
-                        keep
-                    } else {
-                        reader
-                            .entity_columnar_shadow_mask(
-                                layout.clone(),
-                                group_index,
-                                identity_column,
-                                Arc::clone(&shadow_identities),
-                                shadow_identity_digest,
-                            )
-                            .await
-                            .map_err(lix_error_to_datafusion_error)?
-                    };
-                    let batch = reader
-                        .load_entity_columnar_group(
-                            layout.clone(),
-                            group_index,
-                            public_projection.clone(),
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
-                    let batch = Arc::new(filter_record_batch(&batch, keep.as_ref())?);
-                    reader
-                        .cache_entity_columnar_batch(
-                            &layout,
-                            group_index,
-                            shadow_identity_digest,
-                            public_projection,
-                            batch,
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?
-                };
+                        } else {
+                            let keep = if let Some(keep) = coordinate_keep {
+                                keep
+                            } else {
+                                reader
+                                    .entity_columnar_shadow_mask(
+                                        layout.clone(),
+                                        group_index,
+                                        identity_column,
+                                        Arc::clone(&shadow_identities),
+                                        shadow_identity_digest,
+                                    )
+                                    .await
+                                    .map_err(lix_error_to_datafusion_error)?
+                            };
+                            let batch = reader
+                                .load_entity_columnar_group(
+                                    layout.clone(),
+                                    group_index,
+                                    public_projection.clone(),
+                                )
+                                .await
+                                .map_err(lix_error_to_datafusion_error)?;
+                            Arc::new(filter_record_batch(&batch, keep.as_ref())?)
+                        };
+                        Ok(batch)
+                    },
+                )
+                .await?;
                 if !shadow_identities.is_empty() && !statistics_cached {
                     let statistics = entity_columnar_record_batch_statistics(batch.as_ref())?;
                     reader
@@ -1069,6 +1061,34 @@ async fn entity_columnar_scan_source(
             Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
         },
     ))
+}
+
+async fn cached_or_load_entity_columnar_batch(
+    reader: &Arc<dyn EntitySnapshotReader>,
+    layout: &Arc<crate::sql2::entity_batch::EntityColumnarScanLayout>,
+    group_index: usize,
+    shadow_identity_digest: [u8; 32],
+    projection: Vec<usize>,
+    load: impl Future<Output = Result<Arc<RecordBatch>>>,
+) -> Result<Arc<RecordBatch>> {
+    if let Some(batch) = reader
+        .cached_entity_columnar_batch(layout, group_index, shadow_identity_digest, &projection)
+        .await
+        .map_err(lix_error_to_datafusion_error)?
+    {
+        return Ok(batch);
+    }
+    let batch = load.await?;
+    reader
+        .cache_entity_columnar_batch(
+            layout,
+            group_index,
+            shadow_identity_digest,
+            projection,
+            batch,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)
 }
 
 fn entity_columnar_coordinate_shadow_masks(
@@ -2948,8 +2968,9 @@ fn json_to_string(value: &JsonValue) -> Result<String> {
 #[cfg(test)]
 #[expect(trivial_casts)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -2982,6 +3003,43 @@ mod tests {
 
     struct EmptyLiveStateReader;
     struct EmptyBranchRefReader;
+
+    #[derive(Default)]
+    struct TestCachingEntitySnapshotReader {
+        batch: Mutex<Option<Arc<RecordBatch>>>,
+    }
+
+    #[async_trait]
+    impl crate::sql2::EntitySnapshotReader for TestCachingEntitySnapshotReader {
+        async fn scan_entity_snapshots(
+            &self,
+            _request: LiveStateScanRequest,
+        ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+            Ok(None)
+        }
+
+        async fn cached_entity_columnar_batch(
+            &self,
+            _layout: &crate::sql2::entity_batch::EntityColumnarScanLayout,
+            _group_index: usize,
+            _shadow_identity_digest: [u8; 32],
+            _projection: &[usize],
+        ) -> Result<Option<Arc<RecordBatch>>, LixError> {
+            Ok(self.batch.lock().expect("test batch cache lock").clone())
+        }
+
+        async fn cache_entity_columnar_batch(
+            &self,
+            _layout: &crate::sql2::entity_batch::EntityColumnarScanLayout,
+            _group_index: usize,
+            _shadow_identity_digest: [u8; 32],
+            _projection: Vec<usize>,
+            batch: Arc<RecordBatch>,
+        ) -> Result<Arc<RecordBatch>, LixError> {
+            let mut resident = self.batch.lock().expect("test batch cache lock");
+            Ok(Arc::clone(resident.get_or_insert(batch)))
+        }
+    }
 
     #[async_trait]
     impl LiveStateReader for EmptyLiveStateReader {
@@ -4744,5 +4802,108 @@ mod tests {
                 assert!(mask.is_none(), "unaffected group must avoid mask work");
             }
         }
+    }
+
+    fn cached_batch_test_layout(
+        branch_id: &'static str,
+        revision: u64,
+    ) -> Arc<crate::sql2::entity_batch::EntityColumnarScanLayout> {
+        Arc::new(crate::sql2::entity_batch::EntityColumnarScanLayout {
+            id: crate::columnar_row_group::RowGroupSetId::new([23; 16]),
+            manifest: Arc::new(crate::columnar_row_group::RowGroupManifest {
+                namespace: "cached_batch_test".to_owned(),
+                metadata: HashMap::new(),
+                fields: Vec::new(),
+                groups: Vec::new(),
+            }),
+            overlay: Arc::new(Vec::new()),
+            branch_id: Arc::from(branch_id),
+            head_commit_id: CommitId::for_test_label("cached-batch-test-head"),
+            current_state_revision: revision,
+            live_count: 2,
+        })
+    }
+
+    fn cached_batch_test_value(value: i64) -> Arc<RecordBatch> {
+        Arc::new(
+            RecordBatch::try_from_iter([(
+                "value",
+                Arc::new(Int64Array::from(vec![value, value])) as _,
+            )])
+            .expect("test batch"),
+        )
+    }
+
+    #[tokio::test]
+    async fn clean_columnar_batch_is_loaded_once() {
+        let concrete = Arc::new(TestCachingEntitySnapshotReader::default());
+        let reader: Arc<dyn crate::sql2::EntitySnapshotReader> = concrete;
+        let loads = Arc::new(AtomicUsize::new(0));
+        let digest = [31; 32];
+
+        let layout = cached_batch_test_layout("main", 7);
+        for _ in 0..2 {
+            let loads = Arc::clone(&loads);
+            let batch = cached_batch_test_value(7);
+            let result = super::cached_or_load_entity_columnar_batch(
+                &reader,
+                &layout,
+                0,
+                digest,
+                vec![2, 4],
+                async move {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    Ok(batch)
+                },
+            )
+            .await
+            .expect("clean batch should load");
+            assert_eq!(result.num_rows(), 2);
+        }
+
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_clean_columnar_load_is_not_cached() {
+        let concrete = Arc::new(TestCachingEntitySnapshotReader::default());
+        let reader: Arc<dyn crate::sql2::EntitySnapshotReader> = concrete;
+        let layout = cached_batch_test_layout("main", 7);
+        let loads = Arc::new(AtomicUsize::new(0));
+        let first_loads = Arc::clone(&loads);
+        let error = super::cached_or_load_entity_columnar_batch(
+            &reader,
+            &layout,
+            0,
+            [37; 32],
+            vec![2],
+            async move {
+                first_loads.fetch_add(1, Ordering::SeqCst);
+                Err(datafusion::common::DataFusionError::Execution(
+                    "expected test failure".to_owned(),
+                ))
+            },
+        )
+        .await
+        .expect_err("failed load must surface");
+        assert!(error.to_string().contains("expected test failure"));
+
+        let retry_loads = Arc::clone(&loads);
+        let batch = cached_batch_test_value(9);
+        super::cached_or_load_entity_columnar_batch(
+            &reader,
+            &layout,
+            0,
+            [37; 32],
+            vec![2],
+            async move {
+                retry_loads.fetch_add(1, Ordering::SeqCst);
+                Ok(batch)
+            },
+        )
+        .await
+        .expect("retry should populate cache");
+
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
     }
 }

@@ -234,10 +234,7 @@ where
         &self,
         request: LiveStateScanRequest,
     ) -> Result<Option<Arc<EntityColumnarScanLayout>>, LixError> {
-        if !direct_entity_snapshot_request(&request)
-            || !request.filter.entity_pks.is_empty()
-            || request.limit.is_some()
-        {
+        if !direct_entity_columnar_request(&request) {
             return Ok(None);
         }
         Ok(self
@@ -292,14 +289,7 @@ where
         shadow_identities: Arc<HashSet<String, ahash::RandomState>>,
         shadow_identity_digest: [u8; 32],
     ) -> Result<Arc<BooleanArray>, LixError> {
-        let key = EntityColumnarShadowMaskKey {
-            row_groups: layout.id,
-            branch_id: Arc::clone(&layout.branch_id),
-            head_commit_id: layout.head_commit_id,
-            current_state_revision: layout.current_state_revision,
-            shadow_identity_digest,
-            group_index,
-        };
+        let key = entity_columnar_cache_key(&layout, group_index, shadow_identity_digest);
         if let Some(mask) = self
             .entity_columnar_shadow_masks
             .lock()
@@ -333,14 +323,7 @@ where
         shadow_identity_digest: [u8; 32],
         projection: &[usize],
     ) -> Result<Option<Statistics>, LixError> {
-        let key = EntityColumnarShadowMaskKey {
-            row_groups: layout.id,
-            branch_id: Arc::clone(&layout.branch_id),
-            head_commit_id: layout.head_commit_id,
-            current_state_revision: layout.current_state_revision,
-            shadow_identity_digest,
-            group_index,
-        };
+        let key = entity_columnar_cache_key(layout, group_index, shadow_identity_digest);
         Ok(self
             .entity_columnar_shadow_masks
             .lock()
@@ -356,14 +339,7 @@ where
         projection: Vec<usize>,
         statistics: Statistics,
     ) -> Result<(), LixError> {
-        let key = EntityColumnarShadowMaskKey {
-            row_groups: layout.id,
-            branch_id: Arc::clone(&layout.branch_id),
-            head_commit_id: layout.head_commit_id,
-            current_state_revision: layout.current_state_revision,
-            shadow_identity_digest,
-            group_index,
-        };
+        let key = entity_columnar_cache_key(layout, group_index, shadow_identity_digest);
         self.entity_columnar_shadow_masks
             .lock()
             .map_err(|_| entity_columnar_mask_error("entity columnar shadow-mask cache poisoned"))?
@@ -378,14 +354,7 @@ where
         shadow_identity_digest: [u8; 32],
         projection: &[usize],
     ) -> Result<Option<Arc<RecordBatch>>, LixError> {
-        let key = EntityColumnarShadowMaskKey {
-            row_groups: layout.id,
-            branch_id: Arc::clone(&layout.branch_id),
-            head_commit_id: layout.head_commit_id,
-            current_state_revision: layout.current_state_revision,
-            shadow_identity_digest,
-            group_index,
-        };
+        let key = entity_columnar_cache_key(layout, group_index, shadow_identity_digest);
         Ok(self
             .entity_columnar_shadow_masks
             .lock()
@@ -401,14 +370,7 @@ where
         projection: Vec<usize>,
         batch: Arc<RecordBatch>,
     ) -> Result<Arc<RecordBatch>, LixError> {
-        let key = EntityColumnarShadowMaskKey {
-            row_groups: layout.id,
-            branch_id: Arc::clone(&layout.branch_id),
-            head_commit_id: layout.head_commit_id,
-            current_state_revision: layout.current_state_revision,
-            shadow_identity_digest,
-            group_index,
-        };
+        let key = entity_columnar_cache_key(layout, group_index, shadow_identity_digest);
         Ok(self
             .entity_columnar_shadow_masks
             .lock()
@@ -429,6 +391,21 @@ where
             .reader(self.store.clone())
             .scan_direct_entity_snapshots_by_string_field(&request, column, values)
             .await
+    }
+}
+
+fn entity_columnar_cache_key(
+    layout: &EntityColumnarScanLayout,
+    group_index: usize,
+    shadow_identity_digest: [u8; 32],
+) -> EntityColumnarShadowMaskKey {
+    EntityColumnarShadowMaskKey {
+        row_groups: layout.id,
+        branch_id: Arc::clone(&layout.branch_id),
+        head_commit_id: layout.head_commit_id,
+        current_state_revision: layout.current_state_revision,
+        shadow_identity_digest,
+        group_index,
     }
 }
 
@@ -474,4 +451,61 @@ fn direct_entity_snapshot_request(request: &LiveStateScanRequest) -> bool {
         && request.filter.untracked.is_none()
         && request.filter.file_ids.is_empty()
         && request.filter.constraints.is_empty()
+}
+
+fn direct_entity_columnar_request(request: &LiveStateScanRequest) -> bool {
+    direct_entity_snapshot_request(request)
+        && request.filter.entity_pks.is_empty()
+        && request.limit.is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_key_test_layout() -> EntityColumnarScanLayout {
+        EntityColumnarScanLayout {
+            id: crate::columnar_row_group::RowGroupSetId::new([41; 16]),
+            manifest: Arc::new(crate::columnar_row_group::RowGroupManifest {
+                namespace: "cache-key-test".to_owned(),
+                metadata: std::collections::HashMap::new(),
+                fields: Vec::new(),
+                groups: Vec::new(),
+            }),
+            overlay: Arc::new(Vec::new()),
+            branch_id: Arc::from("branch-a"),
+            head_commit_id: crate::changelog::CommitId::for_test_label("cache-key-head"),
+            current_state_revision: 17,
+            live_count: 0,
+        }
+    }
+
+    #[test]
+    fn columnar_cache_key_preserves_every_layout_dimension() {
+        let layout = cache_key_test_layout();
+        let key = entity_columnar_cache_key(&layout, 3, [43; 32]);
+
+        assert_eq!(key.row_groups, layout.id);
+        assert_eq!(key.branch_id, layout.branch_id);
+        assert_eq!(key.head_commit_id, layout.head_commit_id);
+        assert_eq!(key.current_state_revision, layout.current_state_revision);
+        assert_eq!(key.shadow_identity_digest, [43; 32]);
+        assert_eq!(key.group_index, 3);
+    }
+
+    #[test]
+    fn exact_primary_key_and_limit_bypass_columnar_scan() {
+        let mut request = LiveStateScanRequest::default();
+        assert!(direct_entity_columnar_request(&request));
+
+        request
+            .filter
+            .entity_pks
+            .push(EntityPk::single("point-read"));
+        assert!(!direct_entity_columnar_request(&request));
+
+        request.filter.entity_pks.clear();
+        request.limit = Some(1);
+        assert!(!direct_entity_columnar_request(&request));
+    }
 }
