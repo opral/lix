@@ -13,6 +13,7 @@ use std::any::Any;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -379,6 +380,11 @@ pub(super) trait TableSpec: Send + Sync + 'static {
 
     /// `props` are the session's execution properties, for specs that compile
     /// pushed-down filters to physical expressions at plan time.
+    ///
+    /// Within one statement, repeated scans of the same provider instance and
+    /// projection with no pushed filters or limit must expose the same bounded
+    /// source. The runtime may execute that source once and replay its batches.
+    /// Different table-function arguments must use distinct provider instances.
     async fn plan_scan(
         &self,
         projection: Option<&Vec<usize>>,
@@ -518,6 +524,7 @@ pub(super) fn register_spec_table(
 }
 
 pub(super) struct SpecTableProvider {
+    provider_id: u64,
     spec: Arc<dyn TableSpec>,
     schema: SchemaRef,
     write_access: WriteAccess,
@@ -525,7 +532,9 @@ pub(super) struct SpecTableProvider {
 
 impl SpecTableProvider {
     pub(super) fn new(spec: Arc<dyn TableSpec>, write_access: WriteAccess) -> Self {
+        static NEXT_PROVIDER_ID: AtomicU64 = AtomicU64::new(0);
         Self {
+            provider_id: NEXT_PROVIDER_ID.fetch_add(1, AtomicOrdering::Relaxed),
             schema: spec.schema(),
             spec,
             write_access,
@@ -769,10 +778,20 @@ impl TableProvider for SpecTableProvider {
             .spec
             .plan_scan(projection, filters, limit, state.execution_props())
             .await?;
+        // Runtime sharing is deliberately limited to an unmodified source read.
+        // Pushed filters and limits can make two scans with the same projection
+        // observe different source behavior that is not represented in this key.
+        let statement_cache_key =
+            (filters.is_empty() && limit.is_none()).then(|| StatementScanKey {
+                provider_id: self.provider_id,
+                table: self.spec.table_name().into(),
+                projection: projection.cloned(),
+            });
         Ok(Arc::new(SpecScanExec::new(
             self.spec.table_name().into(),
             planned,
             state.config().target_partitions(),
+            statement_cache_key,
         )))
     }
 
@@ -949,16 +968,29 @@ impl InsertSink for PlannedInsertSink {
     }
 }
 
-struct SpecScanExec {
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct StatementScanKey {
+    provider_id: u64,
+    table: Arc<str>,
+    projection: Option<Vec<usize>>,
+}
+
+pub(crate) struct SpecScanExec {
     table: Arc<str>,
     schema: SchemaRef,
     source: ScanSource,
     fragment_ranges: Arc<Vec<Range<usize>>>,
     properties: Arc<PlanProperties>,
+    statement_cache_key: Option<StatementScanKey>,
 }
 
 impl SpecScanExec {
-    fn new(table: Arc<str>, planned: PlannedScan, target_partitions: usize) -> Self {
+    fn new(
+        table: Arc<str>,
+        planned: PlannedScan,
+        target_partitions: usize,
+        statement_cache_key: Option<StatementScanKey>,
+    ) -> Self {
         // A declared ordering only proves that each source fragment is sorted,
         // not that adjacent fragments have non-overlapping value ranges.
         // Keep ordered fragments separate unless the source can eventually
@@ -1005,7 +1037,12 @@ impl SpecScanExec {
             source: planned.source,
             fragment_ranges: Arc::new(fragment_ranges),
             properties: Arc::new(properties),
+            statement_cache_key,
         }
+    }
+
+    pub(crate) fn statement_cache_key(&self) -> Option<&StatementScanKey> {
+        self.statement_cache_key.as_ref()
     }
 }
 
@@ -1369,11 +1406,18 @@ pub(super) fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize
 
 #[cfg(test)]
 mod scan_source_tests {
+    use std::collections::HashMap;
+    use std::future::pending;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use datafusion::arrow::array::Int64Array;
     use datafusion::common::stats::Precision;
-    use futures_util::TryStreamExt;
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::physical_plan::union::UnionExec;
+    use datafusion::prelude::SessionConfig;
+    use futures_util::{StreamExt, TryStreamExt};
 
     use super::*;
 
@@ -1384,6 +1428,333 @@ mod scan_source_tests {
     fn int_batch(schema: SchemaRef, values: &[i64]) -> RecordBatch {
         let values: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
         RecordBatch::try_new(schema, vec![values]).expect("test batch should match schema")
+    }
+
+    struct CountingSpec {
+        schema: SchemaRef,
+        opens: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TableSpec for CountingSpec {
+        fn table_name(&self) -> &str {
+            "counted"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        async fn plan_scan(
+            &self,
+            projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+            _props: &ExecutionProps,
+        ) -> Result<PlannedScan> {
+            let schema = projected_schema(&self.schema, projection);
+            let source_schema = Arc::clone(&schema);
+            let opens = Arc::clone(&self.opens);
+            let source = batch_stream_source(Arc::clone(&schema), 1, move |_, _| {
+                opens.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&source_schema),
+                    stream::iter([Ok(int_batch(Arc::clone(&source_schema), &[1, 2, 3]))]),
+                )))
+            });
+            Ok(PlannedScan {
+                schema,
+                source,
+                ordering: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn referenced_twice_cte_opens_identical_scan_once_per_statement() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let spec = Arc::new(CountingSpec {
+            schema: int_schema("value"),
+            opens: Arc::clone(&opens),
+        });
+        let session = crate::sql2::session::new_sql_session_context();
+        session
+            .register_table(
+                "counted",
+                Arc::new(SpecTableProvider::new(spec, WriteAccess::read_only())),
+            )
+            .expect("counted test table should register");
+        let dataframe = session
+            .sql(
+                "WITH reused AS (SELECT value FROM counted) \
+                 SELECT value FROM reused UNION ALL SELECT value FROM reused",
+            )
+            .await
+            .expect("CTE should plan");
+        let batches = crate::sql2::runtime::collect_dataframe(dataframe)
+            .await
+            .expect("CTE should execute");
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("CTE value should be Int64")
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, [1, 2, 3, 1, 2, 3]);
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+
+    fn cacheable_scan(
+        schema: SchemaRef,
+        source: ScanSource,
+        provider_id: u64,
+    ) -> Arc<dyn ExecutionPlan> {
+        let key = StatementScanKey {
+            provider_id,
+            table: Arc::from("cache_test"),
+            projection: None,
+        };
+        Arc::new(SpecScanExec::new(
+            Arc::from("cache_test"),
+            PlannedScan {
+                schema,
+                source,
+                ordering: None,
+            },
+            1,
+            Some(key),
+        ))
+    }
+
+    fn repeated_cacheable_scan_plan(
+        schema: SchemaRef,
+        source: ScanSource,
+    ) -> Arc<dyn ExecutionPlan> {
+        let scans = (0..2)
+            .map(|_| cacheable_scan(Arc::clone(&schema), source.clone(), 0))
+            .collect();
+        UnionExec::try_new(scans).expect("cache test union schemas should match")
+    }
+
+    #[tokio::test]
+    async fn distinct_provider_instances_with_same_table_name_do_not_share() {
+        let schema = int_schema("value");
+        let first_opens = Arc::new(AtomicUsize::new(0));
+        let second_opens = Arc::new(AtomicUsize::new(0));
+        let source = |value, opens: Arc<AtomicUsize>| {
+            let source_schema = Arc::clone(&schema);
+            batch_stream_source(Arc::clone(&schema), 1, move |_, _| {
+                opens.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&source_schema),
+                    stream::iter([Ok(int_batch(Arc::clone(&source_schema), &[value]))]),
+                )))
+            })
+        };
+        let scans = vec![
+            cacheable_scan(Arc::clone(&schema), source(1, Arc::clone(&first_opens)), 1),
+            cacheable_scan(Arc::clone(&schema), source(2, Arc::clone(&second_opens)), 2),
+        ];
+        let plan = crate::sql2::runtime::adapt_runtime_plan(
+            UnionExec::try_new(scans).expect("provider identity union should plan"),
+        )
+        .expect("provider identity union should adapt");
+        let context = Arc::new(TaskContext::default());
+        let mut values = Vec::new();
+        for partition in 0..2 {
+            let batches = plan
+                .execute(partition, Arc::clone(&context))
+                .expect("provider identity scan should open")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("provider identity scan should complete");
+            values.push(
+                batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("provider identity value should be Int64")
+                    .value(0),
+            );
+        }
+
+        assert_eq!(values, [1, 2]);
+        assert_eq!(first_opens.load(Ordering::SeqCst), 1);
+        assert_eq!(second_opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_scan_cache_consumers_share_one_source_open() {
+        let schema = int_schema("value");
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source_schema = Arc::clone(&schema);
+        let source_opens = Arc::clone(&opens);
+        let source = batch_stream_source(Arc::clone(&schema), 1, move |_, _| {
+            source_opens.fetch_add(1, Ordering::SeqCst);
+            let schema = Arc::clone(&source_schema);
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::once(async move {
+                    tokio::task::yield_now().await;
+                    Ok(int_batch(schema, &[1, 2, 3]))
+                }),
+            )))
+        });
+        let plan = crate::sql2::runtime::adapt_runtime_plan(repeated_cacheable_scan_plan(
+            Arc::clone(&schema),
+            source,
+        ))
+        .expect("cacheable union should adapt");
+        let context = Arc::new(TaskContext::default());
+        let first = plan
+            .execute(0, Arc::clone(&context))
+            .expect("first cache consumer should open")
+            .try_collect::<Vec<_>>();
+        let second = plan
+            .execute(1, context)
+            .expect("second cache consumer should open")
+            .try_collect::<Vec<_>>();
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(
+            first.expect("first consumer should complete")[0].num_rows(),
+            3
+        );
+        assert_eq!(
+            second.expect("second consumer should complete")[0].num_rows(),
+            3
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn scan_cache_shares_source_failure_without_retrying() {
+        const ERROR_CODE: &str = "LIX_ERROR_STATEMENT_SCAN_CACHE_TEST";
+        let schema = int_schema("value");
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source_schema = Arc::clone(&schema);
+        let source_opens = Arc::clone(&opens);
+        let source = batch_stream_source(Arc::clone(&schema), 1, move |_, _| {
+            source_opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&source_schema),
+                stream::iter([Err(DataFusionError::External(Box::new(LixError::new(
+                    ERROR_CODE,
+                    "source failed",
+                ))))]),
+            )))
+        });
+        let plan =
+            crate::sql2::runtime::adapt_runtime_plan(repeated_cacheable_scan_plan(schema, source))
+                .expect("cacheable union should adapt");
+        let context = Arc::new(TaskContext::default());
+        for partition in 0..2 {
+            let error = plan
+                .execute(partition, Arc::clone(&context))
+                .expect("cache consumer should open")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect_err("cached source failure should propagate");
+            let error = crate::sql2::error::datafusion_error_to_lix_error(error);
+            assert_eq!(error.code, ERROR_CODE);
+            assert!(error.message.contains("source failed"));
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn scan_cache_reserves_incrementally_and_releases_on_memory_error() {
+        let schema = int_schema("value");
+        let batch = int_batch(Arc::clone(&schema), &[1, 2, 3]);
+        let one_batch_bytes = batch.get_array_memory_size();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(one_batch_bytes));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("limited runtime should build");
+        let context = Arc::new(TaskContext::new(
+            None,
+            "statement-scan-cache-memory-test".into(),
+            SessionConfig::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            runtime,
+        ));
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source_schema = Arc::clone(&schema);
+        let source_opens = Arc::clone(&opens);
+        let source = batch_stream_source(Arc::clone(&schema), 1, move |_, _| {
+            source_opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&source_schema),
+                stream::iter([Ok(batch.clone()), Ok(batch.clone())]),
+            )))
+        });
+        let plan =
+            crate::sql2::runtime::adapt_runtime_plan(repeated_cacheable_scan_plan(schema, source))
+                .expect("cacheable union should adapt");
+        let error = plan
+            .execute(0, context)
+            .expect("cache consumer should open")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect_err("second retained batch should exceed the memory pool");
+
+        assert!(error.to_string().contains("Resources exhausted"));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_cache_initializer_can_be_retried_by_another_consumer() {
+        let schema = int_schema("value");
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source_schema = Arc::clone(&schema);
+        let source_opens = Arc::clone(&opens);
+        let source = batch_stream_source(Arc::clone(&schema), 1, move |_, _| {
+            let open = source_opens.fetch_add(1, Ordering::SeqCst);
+            let schema = Arc::clone(&source_schema);
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::once(async move {
+                    if open == 0 {
+                        pending::<()>().await;
+                    }
+                    Ok(int_batch(schema, &[1, 2, 3]))
+                }),
+            )))
+        });
+        let plan =
+            crate::sql2::runtime::adapt_runtime_plan(repeated_cacheable_scan_plan(schema, source))
+                .expect("cacheable union should adapt");
+        let context = Arc::new(TaskContext::default());
+        let mut first = plan
+            .execute(0, Arc::clone(&context))
+            .expect("first cache consumer should open");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), first.next())
+                .await
+                .is_err()
+        );
+        drop(first);
+
+        let second = plan
+            .execute(1, context)
+            .expect("second cache consumer should open")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("second consumer should retry cancelled initialization");
+        assert_eq!(second[0].num_rows(), 3);
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1411,6 +1782,7 @@ mod scan_source_tests {
                 ordering: None,
             },
             1,
+            None,
         );
 
         for _ in 0..2 {
@@ -1449,6 +1821,7 @@ mod scan_source_tests {
                 ordering: None,
             },
             1,
+            None,
         );
 
         let error = exec
@@ -1486,6 +1859,7 @@ mod scan_source_tests {
                 ordering: None,
             },
             2,
+            None,
         );
 
         assert_eq!(
@@ -1531,6 +1905,7 @@ mod scan_source_tests {
                 ordering: None,
             },
             2,
+            None,
         );
 
         assert_eq!(
@@ -1582,6 +1957,7 @@ mod scan_source_tests {
                 ordering: None,
             },
             2,
+            None,
         );
 
         assert_eq!(exec.properties().output_partitioning().partition_count(), 2);
@@ -1640,6 +2016,7 @@ mod scan_source_tests {
                 ordering: Some("value".into()),
             },
             1,
+            None,
         );
 
         assert_eq!(exec.properties().output_partitioning().partition_count(), 5);
