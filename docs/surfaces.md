@@ -28,6 +28,13 @@ links, device nodes, sockets, and other non-regular filesystem entries are not
 represented as `lix_file` rows. Executable and other permission bits are not
 part of the current file contract.
 
+The engine defines a Lix logical path as an absolute `/`-separated sequence of
+literal UTF-8 segments. Empty segments, `.`, `..`, `/` within a segment, NUL,
+and a trailing slash are invalid; `/` itself is only the root directory. All
+other segment text is preserved exactly: the engine does not URL-decode,
+case-fold, or Unicode-normalize paths. Filesystem adapters diagnose names that
+the target host cannot represent.
+
 The checkpoint and diff relations are read-only. Their `diff_id` rows can feed
 the `lix_revert`, `lix_apply`, and `lix_create_checkpoint` command sinks. See
 [Checkpoints](./checkpoints.md) and [Diff commands](./diff-commands.md).

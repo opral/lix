@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    CommitResult, Engine, Key, KeyRange, LixError, PutBatch, ReadOptions, SessionContext, SpaceId,
-    Storage, StorageError, StorageWrite, Value, WriteOptions,
+    CommitResult, Engine, Key, KeyRange, LixError, LixPath, PutBatch, ReadOptions, SessionContext,
+    SpaceId, Storage, StorageError, StorageWrite, Value, WriteOptions,
 };
 use notify_debouncer_full::notify::{Config, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
@@ -2023,7 +2023,7 @@ fn normalize_filter_file_path(path: &str) -> Result<String, LixError> {
 }
 
 fn validate_lix_path(path: &str) -> Result<(), LixError> {
-    let _ = lix_path_to_local_path(Path::new("/"), path)?;
+    let _ = LixPath::try_from_file_path(path)?;
     Ok(())
 }
 
@@ -2064,29 +2064,15 @@ fn insert_parent_lix_directories(path: &str, snapshot: &mut Snapshot) {
 }
 
 fn lix_path_to_local_path(root: &Path, path: &str) -> Result<PathBuf, LixError> {
-    if path == "/" {
-        return Ok(root.to_path_buf());
-    }
-    let body = path
-        .strip_prefix('/')
-        .ok_or_else(|| filesystem_error(format!("Lix path {path:?} is not absolute")))?;
-    if body.is_empty() {
-        return Ok(root.to_path_buf());
-    }
+    let parsed = LixPath::try_from_directory_path(path)?;
     let mut local = root.to_path_buf();
-    for segment in body.split('/') {
+    for segment in parsed.segments() {
         push_lix_path_segment(&mut local, segment, path)?;
     }
     Ok(local)
 }
 
 fn push_lix_path_segment(local: &mut PathBuf, segment: &str, path: &str) -> Result<(), LixError> {
-    if segment.is_empty() || segment == "." || segment == ".." {
-        return Err(filesystem_error(format!(
-            "Lix path {path:?} contains unsupported segment {segment:?}"
-        )));
-    }
-
     let mut components = Path::new(segment).components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(component)), None) => {
@@ -2660,9 +2646,15 @@ mod tests {
     fn lix_paths_reject_structurally_unsafe_segments() {
         let root = Path::new("root");
 
-        for path in ["relative", "/a//b", "/./b", "/../b"] {
+        for (path, expected_code) in [
+            ("relative", "LIX_ERROR_PATH_MISSING_LEADING_SLASH"),
+            ("/a//b", "LIX_ERROR_PATH_EMPTY_SEGMENT"),
+            ("/./b", "LIX_ERROR_PATH_DOT_SEGMENT"),
+            ("/../b", "LIX_ERROR_PATH_DOT_SEGMENT"),
+            ("/nul\0name", "LIX_ERROR_PATH_NUL"),
+        ] {
             let error = lix_path_to_local_path(root, path).expect_err("path should fail");
-            assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
+            assert_eq!(error.code, expected_code);
         }
     }
 

@@ -86,6 +86,12 @@ async fn rs_sdk_native_file_upsert_creates_updates_and_keeps_empty_file() {
         .await
         .expect_err("relative native file path should be rejected");
     assert_eq!(error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
+
+    let error = lix
+        .upsert_file_data("/nul\0name.bin", b"invalid".as_slice())
+        .await
+        .expect_err("NUL in a native file path should be rejected by the engine");
+    assert_eq!(error.code, "LIX_ERROR_PATH_NUL");
 }
 
 #[tokio::test]
