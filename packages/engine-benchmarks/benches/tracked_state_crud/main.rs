@@ -532,13 +532,19 @@ fn profile_hot_transaction_operations(
 }
 
 fn sql_session_read_shape() -> &'static str {
-    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE").as_deref() {
+    let shape = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE");
+    if let Ok(label) = shape.as_deref()
+        && let Some(shape) = sql_session::OlapReadShape::from_label(label)
+    {
+        return shape.label();
+    }
+    match shape.as_deref() {
         Ok("aggregate_count") => "aggregate_count",
         Ok("general_filter_sort") => "general_filter_sort",
         Ok("general_aggregate") => "general_aggregate",
         Ok("full_result") | Err(_) => "full_result",
         Ok(other) => panic!(
-            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE '{other}'; expected full_result, aggregate_count, general_filter_sort, or general_aggregate"
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE '{other}'; expected full_result, aggregate_count, general_filter_sort, general_aggregate, olap_scan, olap_filter, olap_sort, olap_group, or olap_aggregate"
         ),
     }
 }
@@ -564,6 +570,30 @@ fn profile_hot_sql_session_operations(
         read_many_pk_count,
     ));
     let _ = lix_engine::storage_bench::take_entity_point_snapshot_cache_accounting();
+    if sql_session::selected_olap_read_shape().is_some() {
+        // Match the DuckDB control: one untimed warmup against one seeded
+        // fixture followed by individually timed samples and a median.
+        runtime.block_on(run_sql_session_operation(operation, &fixture));
+        let mut samples = Vec::with_capacity(repeats);
+        let mut row_count = 0;
+        for _ in 0..repeats {
+            let start = Instant::now();
+            row_count += runtime.block_on(run_sql_session_operation(operation, &fixture));
+            samples.push(start.elapsed());
+        }
+        print_profile_samples(
+            &format!(
+                "sql_session/{}/{}",
+                profile.name(),
+                sql_session_read_shape()
+            ),
+            operation,
+            read_many_pk_count,
+            samples,
+        );
+        black_box(row_count);
+        return;
+    }
     let start = Instant::now();
     let mut row_count = 0;
     for _ in 0..repeats {
