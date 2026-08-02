@@ -5716,7 +5716,8 @@ mod tests {
 
     #[tokio::test]
     async fn large_ordered_parameter_update_replaces_complete_packed_current_base() {
-        const ROW_COUNT: usize = 1_024;
+        const ROW_COUNT: usize = 2_048;
+        const PARTIAL_ROW_COUNT: usize = ROW_COUNT / 2;
         let session = open_session().await;
         let schema = serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5756,6 +5757,7 @@ mod tests {
         session.execute_batch(&insert_statements).await.unwrap();
 
         crate::transaction::take_complete_replacement_packed_current_base_retirements();
+        crate::transaction::take_certified_entity_columnar_reuses();
         let update_sql =
             "UPDATE ordered_packed_update_probe SET value = lix_json($1) WHERE path = $2";
         for version in 1..=2 {
@@ -5777,6 +5779,11 @@ mod tests {
                 .sum::<u64>();
             assert_eq!(affected, ROW_COUNT as u64);
             assert_eq!(
+                crate::transaction::take_certified_entity_columnar_reuses(),
+                1,
+                "complete certified replacements should retain their executor-built columnar vectors"
+            );
+            assert_eq!(
                 crate::transaction::take_complete_replacement_packed_current_base_retirements(),
                 1,
                 "each complete certified replacement should swap one packed base reference"
@@ -5791,7 +5798,7 @@ mod tests {
 
         let rows = session
             .execute(
-                "SELECT path, value FROM ordered_packed_update_probe WHERE path IN ('0000', '1023') ORDER BY path",
+                "SELECT path, value FROM ordered_packed_update_probe WHERE path IN ('0000', '2047') ORDER BY path",
                 &[],
             )
             .await
@@ -5803,7 +5810,7 @@ mod tests {
         );
         assert_eq!(
             rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!("updated-2-1023")
+            serde_json::json!("updated-2-2047")
         );
         let working_diff = session
             .execute(
@@ -5818,13 +5825,29 @@ mod tests {
             "replacing a packed base must preserve its working-diff epoch"
         );
 
-        session
-            .execute(
-                "UPDATE ordered_packed_update_probe SET value = lix_json('\"partial\"') WHERE path = '0000'",
-                &[],
-            )
+        crate::transaction::take_certified_entity_columnar_reuses();
+        let partial_update_statements = (0..PARTIAL_ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: update_sql.to_string(),
+                params: vec![
+                    Value::Text(format!("\"partial-{row_index:04}\"")),
+                    Value::Text(format!("{row_index:04}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let partial_affected = session
+            .execute_batch(&partial_update_statements)
             .await
-            .unwrap();
+            .unwrap()
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
+        assert_eq!(partial_affected, PARTIAL_ROW_COUNT as u64);
+        assert_eq!(
+            crate::transaction::take_certified_entity_columnar_reuses(),
+            0,
+            "a large partial replacement must not build an unpublished columnar base"
+        );
         assert_eq!(
             crate::transaction::take_complete_replacement_packed_current_base_retirements(),
             0,
@@ -5839,7 +5862,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             partial.rows()[0].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!("partial")
+            serde_json::json!("partial-0000")
         );
         session
             .create_checkpoint()

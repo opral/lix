@@ -500,6 +500,44 @@ pub(crate) struct CertifiedParameterBatch {
     schema_key: SharedStr,
     branch_id: SharedStr,
     certificate: CertifiedRawWriteBatchPreparation,
+    entity_columnar: Option<CertifiedEntityColumnarBatch>,
+}
+
+/// Executor-produced analytical projection aligned with one certified dense
+/// entity replacement. JSON snapshots remain the durable history authority;
+/// this certificate only avoids decoding those same snapshots back into
+/// Arrow at the commit boundary.
+#[derive(Debug, Clone)]
+pub(crate) struct CertifiedEntityColumnarBatch {
+    encoded: crate::columnar_row_group::EncodedRowGroupSet,
+    input_locations: Vec<crate::columnar_row_group::RowGroupRowLocation>,
+}
+
+impl CertifiedEntityColumnarBatch {
+    pub(crate) fn new(
+        encoded: crate::columnar_row_group::EncodedRowGroupSet,
+        input_locations: Vec<crate::columnar_row_group::RowGroupRowLocation>,
+        row_count: usize,
+    ) -> Result<Self, LixError> {
+        if input_locations.len() != row_count {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified entity columnar coordinates are not row-aligned",
+            ));
+        }
+        Ok(Self {
+            encoded,
+            input_locations,
+        })
+    }
+
+    pub(crate) fn encoded(&self) -> &crate::columnar_row_group::EncodedRowGroupSet {
+        &self.encoded
+    }
+
+    pub(crate) fn input_locations(&self) -> &[crate::columnar_row_group::RowGroupRowLocation] {
+        &self.input_locations
+    }
 }
 
 impl CertifiedParameterBatch {
@@ -528,7 +566,16 @@ impl CertifiedParameterBatch {
             schema_key,
             branch_id,
             certificate,
+            entity_columnar: None,
         })
+    }
+
+    pub(crate) fn with_entity_columnar(
+        mut self,
+        entity_columnar: CertifiedEntityColumnarBatch,
+    ) -> Self {
+        self.entity_columnar = Some(entity_columnar);
+        self
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -564,6 +611,7 @@ impl CertifiedParameterBatch {
             schema_key,
             branch_id,
             certificate,
+            entity_columnar,
         } = self;
         let row_count = entity_pks.len();
         let (mut strings, schema_key_ordinal, branch_id_ordinal) = if schema_key == branch_id {
@@ -612,6 +660,7 @@ impl CertifiedParameterBatch {
                 commit_id: None,
                 branch_id: branch_id_ordinal,
                 direct_change_ids: None,
+                entity_columnar,
             }),
             entity_pks,
             strings,
@@ -2527,6 +2576,10 @@ struct DenseCertifiedParameterSlots {
     /// Absent until commit-delta publication assigns direct addresses. The
     /// compact segment map derives every UUID without a million-row column.
     direct_change_ids: Option<OrderedAddressableCommitDeltaStage>,
+    /// Present only while row order and contents retain the executor's exact
+    /// complete-replacement certificate. Expanding the dense representation
+    /// drops this derived projection and restores the generic JSON path.
+    entity_columnar: Option<CertifiedEntityColumnarBatch>,
 }
 
 #[derive(Debug, Clone)]
@@ -2953,6 +3006,8 @@ impl PreparedStateBatch {
                     && left.commit_id == right.commit_id
                     && left.direct_change_ids.is_none()
                     && right.direct_change_ids.is_none()
+                    && left.entity_columnar.is_none()
+                    && right.entity_columnar.is_none()
                     && self.durable_predecessors.is_empty()
                     && other.durable_predecessors.is_empty()
                     && self.origins.is_empty()
@@ -3333,6 +3388,17 @@ impl PreparedStateBatch {
             commit_id,
             self.strings[dense.schema_key as usize].as_str(),
             &self.json[..dense.len],
+        ))
+    }
+
+    pub(crate) fn dense_certified_entity_columnar(
+        &self,
+    ) -> Option<(CommitId, &str, &CertifiedEntityColumnarBatch)> {
+        let dense = self.dense_certified_parameter.as_ref()?;
+        Some((
+            dense.commit_id?,
+            self.strings[dense.schema_key as usize].as_str(),
+            dense.entity_columnar.as_ref()?,
         ))
     }
 
