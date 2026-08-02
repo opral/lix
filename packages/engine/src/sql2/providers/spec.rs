@@ -12,6 +12,7 @@
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -759,18 +760,19 @@ impl TableProvider for SpecTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let planned = self
             .spec
-            .plan_scan(projection, filters, limit, _state.execution_props())
+            .plan_scan(projection, filters, limit, state.execution_props())
             .await?;
         Ok(Arc::new(SpecScanExec::new(
             self.spec.table_name().into(),
             planned,
+            state.config().target_partitions(),
         )))
     }
 
@@ -951,11 +953,17 @@ struct SpecScanExec {
     table: Arc<str>,
     schema: SchemaRef,
     source: ScanSource,
+    fragment_ranges: Arc<Vec<Range<usize>>>,
     properties: Arc<PlanProperties>,
 }
 
 impl SpecScanExec {
-    fn new(table: Arc<str>, planned: PlannedScan) -> Self {
+    fn new(table: Arc<str>, planned: PlannedScan, target_partitions: usize) -> Self {
+        // A declared ordering only proves that each source fragment is sorted,
+        // not that adjacent fragments have non-overlapping value ranges.
+        // Keep ordered fragments separate unless the source can eventually
+        // provide that stronger cross-fragment guarantee.
+        let preserve_fragment_boundaries = planned.ordering.is_some();
         let equivalence_properties = planned
             .ordering
             .as_deref()
@@ -978,9 +986,16 @@ impl SpecScanExec {
                     })
             })
             .unwrap_or_else(|| EquivalenceProperties::new(Arc::clone(&planned.schema)));
+        let grouped_target = if preserve_fragment_boundaries {
+            planned.source.partition_count
+        } else {
+            target_partitions.max(1)
+        };
+        let fragment_ranges =
+            grouped_fragment_ranges(planned.source.partition_count, grouped_target);
         let properties = PlanProperties::new(
             equivalence_properties,
-            Partitioning::UnknownPartitioning(planned.source.partition_count),
+            Partitioning::UnknownPartitioning(fragment_ranges.len()),
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
@@ -988,6 +1003,7 @@ impl SpecScanExec {
             table,
             schema: planned.schema,
             source: planned.source,
+            fragment_ranges: Arc::new(fragment_ranges),
             properties: Arc::new(properties),
         }
     }
@@ -1042,38 +1058,73 @@ impl ExecutionPlan for SpecScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let stream = self.source.open(partition, context)?;
-        if stream.schema() != self.schema {
-            return Err(DataFusionError::Execution(format!(
-                "SpecScanExec({}) stream schema does not match its planned schema",
-                self.table
-            )));
-        }
-        Ok(stream)
+        let fragment_range = self
+            .fragment_ranges
+            .get(partition)
+            .cloned()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "SpecScanExec({}) exposes {} partitions, got {partition}",
+                    self.table,
+                    self.fragment_ranges.len()
+                ))
+            })?;
+        let source = self.source.clone();
+        let schema = Arc::clone(&self.schema);
+        let table = Arc::clone(&self.table);
+        let fragments = fragment_range
+            .map(move |fragment| {
+                let fragment_stream = source.open(fragment, Arc::clone(&context))?;
+                if fragment_stream.schema() != schema {
+                    return Err(DataFusionError::Execution(format!(
+                        "SpecScanExec({table}) stream schema does not match its planned schema"
+                    )));
+                }
+                Ok(fragment_stream)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let fragments =
+            stream::iter(fragments.into_iter().map(Ok::<_, DataFusionError>)).try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            fragments,
+        )))
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         match partition {
-            Some(partition) => self
-                .source
-                .statistics
-                .get(partition)
-                .cloned()
-                .ok_or_else(|| {
+            Some(partition) => {
+                let fragment_range = self.fragment_ranges.get(partition).ok_or_else(|| {
                     DataFusionError::Execution(format!(
                         "SpecScanExec({}) exposes {} partitions, got statistics request for {partition}",
-                        self.table, self.source.partition_count
+                        self.table,
+                        self.fragment_ranges.len()
                     ))
-                }),
+                })?;
+                Statistics::try_merge_iter(
+                    self.source.statistics[fragment_range.clone()].iter(),
+                    self.schema.as_ref(),
+                )
+            }
             None => match &self.source.source_statistics {
                 Some(statistics) => Ok(statistics.clone()),
-                None => Statistics::try_merge_iter(
-                    self.source.statistics.iter(),
-                    self.schema.as_ref(),
-                ),
+                None => {
+                    Statistics::try_merge_iter(self.source.statistics.iter(), self.schema.as_ref())
+                }
             },
         }
     }
+}
+
+fn grouped_fragment_ranges(fragment_count: usize, target_partitions: usize) -> Vec<Range<usize>> {
+    debug_assert!(fragment_count > 0);
+    let partition_count = fragment_count.min(target_partitions.max(1));
+    (0..partition_count)
+        .map(|partition| {
+            partition * fragment_count / partition_count
+                ..(partition + 1) * fragment_count / partition_count
+        })
+        .collect()
 }
 
 pub(super) struct SpecDmlExec {
@@ -1359,6 +1410,7 @@ mod scan_source_tests {
                 source,
                 ordering: None,
             },
+            1,
         );
 
         for _ in 0..2 {
@@ -1396,6 +1448,7 @@ mod scan_source_tests {
                 source,
                 ordering: None,
             },
+            1,
         );
 
         let error = exec
@@ -1432,6 +1485,7 @@ mod scan_source_tests {
                 source,
                 ordering: None,
             },
+            2,
         );
 
         assert_eq!(
@@ -1476,6 +1530,7 @@ mod scan_source_tests {
                 source,
                 ordering: None,
             },
+            2,
         );
 
         assert_eq!(
@@ -1490,5 +1545,103 @@ mod scan_source_tests {
                 .num_rows,
             Precision::Exact(7)
         );
+    }
+
+    #[test]
+    fn fragment_ranges_are_contiguous_balanced_and_bounded_by_target() {
+        assert_eq!(grouped_fragment_ranges(5, 2), [0..2, 2..5]);
+        assert_eq!(grouped_fragment_ranges(2, 8), [0..1, 1..2]);
+        let one_partition = grouped_fragment_ranges(3, 0);
+        assert_eq!(one_partition.len(), 1);
+        assert_eq!(one_partition[0], 0..3);
+    }
+
+    #[tokio::test]
+    async fn grouped_scan_preserves_fragment_order_and_merges_partition_statistics() {
+        let schema = int_schema("value");
+        let statistics = (0..5)
+            .map(|_| Statistics::new_unknown(schema.as_ref()).with_num_rows(Precision::Exact(1)))
+            .collect();
+        let source_schema = Arc::clone(&schema);
+        let source = batch_stream_source_with_statistics(
+            Arc::clone(&schema),
+            statistics,
+            move |fragment, _context| {
+                let batch = int_batch(Arc::clone(&source_schema), &[fragment as i64]);
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&source_schema),
+                    stream::iter([Ok(batch)]),
+                )))
+            },
+        );
+        let exec = SpecScanExec::new(
+            Arc::from("grouped_test"),
+            PlannedScan {
+                schema,
+                source,
+                ordering: None,
+            },
+            2,
+        );
+
+        assert_eq!(exec.properties().output_partitioning().partition_count(), 2);
+        for (partition, expected) in [(0, vec![0, 1]), (1, vec![2, 3, 4])] {
+            let batches = exec
+                .execute(partition, Arc::new(TaskContext::default()))
+                .expect("grouped partition should open")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("grouped stream should complete");
+            let actual = batches
+                .iter()
+                .map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("test column should be Int64")
+                        .value(0)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(
+            exec.partition_statistics(Some(0))
+                .expect("first grouped statistics")
+                .num_rows,
+            Precision::Exact(2)
+        );
+        assert_eq!(
+            exec.partition_statistics(Some(1))
+                .expect("second grouped statistics")
+                .num_rows,
+            Precision::Exact(3)
+        );
+        assert!(exec.partition_statistics(Some(2)).is_err());
+    }
+
+    #[test]
+    fn grouped_scan_keeps_ordered_source_fragments_separate() {
+        let schema = int_schema("value");
+        let source = batch_stream_source(Arc::clone(&schema), 5, {
+            let schema = Arc::clone(&schema);
+            move |_fragment, _context| {
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    stream::empty(),
+                )))
+            }
+        });
+        let exec = SpecScanExec::new(
+            Arc::from("ordered_test"),
+            PlannedScan {
+                schema,
+                source,
+                ordering: Some("value".into()),
+            },
+            1,
+        );
+
+        assert_eq!(exec.properties().output_partitioning().partition_count(), 5);
     }
 }
