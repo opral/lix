@@ -265,7 +265,8 @@ where
         else {
             return Ok(None);
         };
-        self.tracked_head
+        let generation = self
+            .tracked_head
             .reader(&self.store)
             .collection_generation(
                 &branch_id,
@@ -275,8 +276,11 @@ where
                     file_id: None,
                 },
             )
-            .await
-            .map(|generation| Some(generation.live_count))
+            .await?;
+        Ok(
+            (generation.live_count != crate::collection_generation::DEFERRED_LIVE_COUNT)
+                .then_some(generation.live_count),
+        )
     }
 
     /// Returns raw current-state snapshot bytes for one current SQL entity scan.

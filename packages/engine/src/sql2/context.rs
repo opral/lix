@@ -199,6 +199,14 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         Ok(None)
     }
 
+    async fn load_exact_collection_live_count(
+        &mut self,
+        _branch_id: &str,
+        _scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<Option<u64>, LixError> {
+        Ok(None)
+    }
+
     fn has_staged_collection_rows(
         &self,
         _branch_id: &str,

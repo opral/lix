@@ -7,6 +7,9 @@ use crate::entity_pk::EntityPk;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 
 pub(crate) const COLLECTION_GENERATION_SCHEMA_KEY: &str = "lix_collection_generation";
+/// Reserved internal count for a root-backed collection whose exact
+/// cardinality has intentionally not been materialized.
+pub(crate) const DEFERRED_LIVE_COUNT: u64 = u64::MAX;
 
 /// One logical collection whose current physical generation can be replaced
 /// without expanding the replacement into one tombstone per member.
