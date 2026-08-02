@@ -1877,7 +1877,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
+    use datafusion::arrow::array::{Float64Array, Int64Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::catalog::TableProvider;
@@ -2186,7 +2186,7 @@ mod tests {
         let values = batch
             .column(0)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
             .expect("identity column should be utf8");
         assert_eq!(values.value(0), "identity-1");
 
