@@ -5018,6 +5018,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn certified_replacement_batch_revalidates_after_staged_schema_amendment() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "amended_parameter_update_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": [
+                        "object", "array", "string", "number", "integer", "boolean", "null"
+                    ]
+                }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO amended_parameter_update_probe (path, value) VALUES ('a', lix_json('\"old-a\"')), ('b', lix_json('\"old-b\"'))",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let amended_schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "amended_parameter_update_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": [
+                        "object", "array", "string", "number", "integer", "boolean", "null"
+                    ]
+                },
+                "source": { "type": "string", "default": "amended-plan" }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        });
+        let mut transaction = session.begin_transaction().await.unwrap();
+        transaction
+            .execute(
+                "UPDATE lix_registered_schema SET value = $1 \
+                 WHERE lixcol_entity_pk = lix_json('[\"amended_parameter_update_probe\"]')",
+                &[Value::Json(amended_schema)],
+            )
+            .await
+            .expect("compatible schema amendment should stage");
+
+        let sql = "UPDATE amended_parameter_update_probe SET value = lix_json($1) WHERE path = $2";
+        let statements = [
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("\"updated-a\"".to_string()),
+                    Value::Text("a".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("\"updated-b\"".to_string()),
+                    Value::Text("b".to_string()),
+                ],
+            },
+        ];
+        let parsed = TransactionBatchStatements::Shared {
+            statement: sql2::parse_statement(sql).unwrap(),
+            len: statements.len(),
+        };
+        sql2::take_certified_replacement_parameter_batch_executions();
+        let staged = try_execute_transaction_parameter_batch(
+            transaction.transaction_mut().unwrap(),
+            &statements,
+            &parsed,
+            &ExecuteOptions::default(),
+            &vec![ExecuteStatementMetadata::default(); statements.len()],
+            &AtomicBool::new(false),
+        )
+        .await
+        .expect("replacement batch should be revalidated");
+        assert!(
+            staged.is_some(),
+            "the UPDATE batch should retain its typed parameter route"
+        );
+        assert_eq!(
+            sql2::take_certified_replacement_parameter_batch_executions(),
+            1,
+            "the UPDATE batch must reach the certified replacement subroute"
+        );
+        transaction.commit().await.unwrap();
+
+        let rows = session
+            .execute(
+                "SELECT path, value, source FROM amended_parameter_update_probe ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("updated-a")
+        );
+        assert_eq!(
+            rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("updated-b")
+        );
+        assert!(
+            rows.rows()
+                .iter()
+                .all(|row| row.get::<String>("source").unwrap() == "amended-plan"),
+            "replacement normalization must apply the staged schema's default"
+        );
+    }
+
+    #[tokio::test]
     async fn certified_empty_batch_rechecks_concurrent_insert_at_commit_snapshot() {
         let storage = Memory::default();
         Engine::initialize(storage.clone())

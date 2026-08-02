@@ -31,8 +31,8 @@ use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::transaction::types::{
-    CertifiedRawWriteBatchPreparation, PreparedRowFacts, RawWriteBatch, RawWriteRowRef,
-    TransactionJson, TransactionWrite, TransactionWriteMode,
+    CertifiedParameterReplacementBatch, CertifiedRawWriteBatchPreparation, PreparedRowFacts,
+    RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
 use crate::wasm::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
@@ -840,7 +840,6 @@ async fn try_execute_direct_path_value_replacement_batch(
         .as_deref()
         .unwrap_or(entity_pks.as_slice());
     let unique_row_count = unique_entity_pks.len();
-
     let active_branch_id = ctx.active_branch_id().to_owned();
     let scope = crate::collection_generation::CollectionScopeRef {
         schema_key: &spec.schema_key,
@@ -1023,11 +1022,10 @@ async fn try_execute_direct_path_value_replacement_batch(
             candidate_index += 1;
         }
     }
-
     if !replacement_entity_pks.is_empty() {
         let snapshots =
             TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
-        let rows = RawWriteBatch::from_certified_parameter_replacement(
+        let rows = CertifiedParameterReplacementBatch::new(
             replacement_entity_pks,
             snapshots,
             spec.schema_key.as_str().into(),
@@ -1042,7 +1040,7 @@ async fn try_execute_direct_path_value_replacement_batch(
                 complete_collection_replacement,
             },
         )?;
-        ctx.stage_parameter_batch_replace(rows)
+        ctx.stage_certified_parameter_batch_replace(rows)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.entity_update_value_batch.stage_rows",

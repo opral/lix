@@ -487,6 +487,157 @@ pub(crate) struct CertifiedRawWriteBatchPreparation {
     pub(crate) complete_collection_replacement: bool,
 }
 
+/// Dense, typed replacement columns produced by the certified SQL batch path.
+///
+/// Keeping this transport separate from [`RawWriteBatch`] avoids allocating
+/// raw nullable/system columns only for transaction preparation to dismantle
+/// them immediately. The transaction either lowers these columns directly or
+/// explicitly converts them to raw rows when a transaction-local schema
+/// change invalidates the certificate.
+pub(crate) struct CertifiedParameterReplacementBatch {
+    entity_pks: Vec<EntityPk>,
+    snapshots: Vec<TransactionJson>,
+    schema_key: SharedStr,
+    branch_id: SharedStr,
+    certificate: CertifiedRawWriteBatchPreparation,
+}
+
+impl CertifiedParameterReplacementBatch {
+    pub(crate) fn new(
+        entity_pks: Vec<EntityPk>,
+        snapshots: Vec<TransactionJson>,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        certificate: CertifiedRawWriteBatchPreparation,
+    ) -> Result<Self, LixError> {
+        if entity_pks.len() != snapshots.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified replacement columns are not aligned",
+            ));
+        }
+        if entity_pks.len() >= RAW_WRITE_NONE as usize {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "certified replacement row count exceeds u32",
+            ));
+        }
+        Ok(Self {
+            entity_pks,
+            snapshots,
+            schema_key,
+            branch_id,
+            certificate,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entity_pks.len()
+    }
+
+    pub(crate) fn schema_scope_branch_id(&self) -> &str {
+        self.branch_id.as_str()
+    }
+
+    pub(crate) fn into_raw(self) -> Result<RawWriteBatch, LixError> {
+        RawWriteBatch::from_certified_parameter_replacement(
+            self.entity_pks,
+            self.snapshots,
+            self.schema_key,
+            self.branch_id,
+            self.certificate,
+        )
+    }
+
+    pub(crate) fn into_prepared(
+        self,
+        origin_key: Option<&SharedStr>,
+        timestamp: LixTimestamp,
+    ) -> Result<PreparedStateBatch, LixError> {
+        let Self {
+            entity_pks,
+            snapshots,
+            schema_key,
+            branch_id,
+            certificate,
+        } = self;
+        let row_count = entity_pks.len();
+        let (mut strings, schema_key_ordinal, branch_id_ordinal) = if schema_key == branch_id {
+            (vec![schema_key], 0_u32, 0_u32)
+        } else {
+            (vec![schema_key, branch_id], 0_u32, 1_u32)
+        };
+        let origin_key = origin_key.map(|value| {
+            if let Some(ordinal) = strings.iter().position(|candidate| candidate == value) {
+                return u32::try_from(ordinal)
+                    .expect("certified replacement string dictionary must fit u32");
+            }
+            let ordinal = u32::try_from(strings.len())
+                .expect("certified replacement string dictionary must fit u32");
+            strings.push(value.clone());
+            ordinal
+        });
+        let mut prepared_slots = Vec::with_capacity(row_count);
+        let mut json = Vec::with_capacity(row_count);
+        for (row_index, snapshot) in snapshots.into_iter().enumerate() {
+            json.push(stage_json_from_value(
+                snapshot,
+                "certified replacement snapshot_content",
+            )?);
+            prepared_slots.push(PreparedStateSlot {
+                schema_plan_id: certificate.schema_plan_id,
+                facts: certificate.facts,
+                entity_pk: u32::try_from(row_index)
+                    .expect("certified replacement row ordinal must fit u32"),
+                schema_key: schema_key_ordinal,
+                file_id: None,
+                snapshot: Some(
+                    u32::try_from(row_index)
+                        .expect("certified replacement JSON ordinal must fit u32"),
+                ),
+                metadata: None,
+                origin: None,
+                origin_key,
+                created_at: timestamp,
+                updated_at: timestamp,
+                global: false,
+                change_id: Some(ChangeId::default()),
+                addressable_change_id: true,
+                commit_id: None,
+                untracked: false,
+                branch_id: branch_id_ordinal,
+                durable_predecessor: None,
+            });
+        }
+        let string_index = strings
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(ordinal, value)| {
+                (
+                    value,
+                    u32::try_from(ordinal)
+                        .expect("certified replacement string dictionary must fit u32"),
+                )
+            })
+            .collect();
+        Ok(PreparedStateBatch {
+            slots: prepared_slots,
+            entity_pks,
+            strings,
+            string_index,
+            json,
+            durable_predecessors: Vec::new(),
+            origins: Vec::new(),
+            origin_index: HashMap::new(),
+            origin_column_sets: Vec::new(),
+            origin_column_index: HashMap::new(),
+            certified_ordered_insert: certificate.tracked_keys_strictly_ordered,
+            certified_complete_collection_replacement: certificate.complete_collection_replacement,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RawWriteRowRef<'a> {
     pub(crate) entity_pk: Option<&'a EntityPk>,

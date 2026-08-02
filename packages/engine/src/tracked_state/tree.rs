@@ -470,8 +470,8 @@ impl TrackedStateTree {
         I: IntoIterator<Item = Result<TrackedStateRootMutationRef<'a>, LixError>>,
     {
         let mut parent_entries = OrderedLeafCursor::new(*root_id.as_bytes());
-        let mut mutations = collect_pending_root_mutations(mutation_count, mutations)?;
-        let mut next_mutation = mutations.pop_front();
+        let mut mutations = PendingRootMutationCursor::new(mutations.into_iter());
+        let mut next_mutation = mutations.next_pending()?;
         let mut assembler = OrderedTreeAssembler::new(&self.options, mutation_count);
         let mut cascaded_rows = 0usize;
 
@@ -489,7 +489,7 @@ impl TrackedStateTree {
                 std::cmp::Ordering::Less => {
                     let created_at = mutation.delta.created_at;
                     assembler.push_mutation(mutation, created_at)?;
-                    next_mutation = mutations.pop_front();
+                    next_mutation = mutations.next_pending()?;
                     next_parent_entry = Some(parent_entry);
                 }
                 std::cmp::Ordering::Equal => {
@@ -498,7 +498,7 @@ impl TrackedStateTree {
                         return Err(duplicate_root_insert_error(&mutation.delta));
                     }
                     assembler.push_mutation(mutation, parent_value.created_at())?;
-                    next_mutation = mutations.pop_front();
+                    next_mutation = mutations.next_pending()?;
                     next_parent_entry = parent_entries.next(self, store, overlay).await?;
                 }
                 std::cmp::Ordering::Greater => {
@@ -515,7 +515,7 @@ impl TrackedStateTree {
         while let Some(mutation) = next_mutation {
             let created_at = mutation.delta.created_at;
             assembler.push_mutation(mutation, created_at)?;
-            next_mutation = mutations.pop_front();
+            next_mutation = mutations.next_pending()?;
         }
 
         let built = assembler.finish(self)?;
@@ -2356,39 +2356,61 @@ fn cascade_parent_entry(
     Ok((entry, true))
 }
 
-fn collect_pending_root_mutations<'a, I>(
-    mutation_count: usize,
-    mutations: I,
-) -> Result<VecDeque<PendingRootMutation<'a>>, LixError>
+const PENDING_ROOT_MUTATION_WINDOW: usize = 4096;
+
+struct PendingRootMutationCursor<'a, I> {
+    source: Box<I>,
+    pending: VecDeque<PendingRootMutation<'a>>,
+}
+
+impl<'a, I> PendingRootMutationCursor<'a, I>
 where
-    I: IntoIterator<Item = Result<TrackedStateRootMutationRef<'a>, LixError>>,
+    I: Iterator<Item = Result<TrackedStateRootMutationRef<'a>, LixError>>,
 {
-    let mut key_arena = Vec::with_capacity(mutation_count.saturating_mul(96));
-    let mut pending = Vec::with_capacity(mutation_count);
-    for mutation in mutations {
-        let mutation = mutation?;
-        let delta = mutation.delta;
-        let encoded_key = encode_key_ref_into(
-            &mut key_arena,
-            TrackedStateKeyRef {
-                schema_key: delta.schema_key,
-                file_id: delta.file_id,
-                entity_pk: delta.entity_pk,
-            },
-        );
-        pending.push((delta, mutation.require_absence, encoded_key));
+    fn new(source: I) -> Self {
+        Self {
+            source: Box::new(source),
+            pending: VecDeque::new(),
+        }
     }
-    let key_arena = Bytes::from(key_arena);
-    Ok(pending
-        .into_iter()
-        .map(
-            |(delta, require_absence, encoded_key)| PendingRootMutation {
-                delta,
-                require_absence,
-                encoded_key: key_arena.slice(encoded_key),
-            },
-        )
-        .collect())
+
+    fn next_pending(&mut self) -> Result<Option<PendingRootMutation<'a>>, LixError> {
+        if let Some(mutation) = self.pending.pop_front() {
+            return Ok(Some(mutation));
+        }
+        let mut key_arena = Vec::with_capacity(PENDING_ROOT_MUTATION_WINDOW * 96);
+        let mut pending = Vec::with_capacity(PENDING_ROOT_MUTATION_WINDOW);
+        for _ in 0..PENDING_ROOT_MUTATION_WINDOW {
+            let Some(mutation) = self.source.next() else {
+                break;
+            };
+            let mutation = mutation?;
+            let delta = mutation.delta;
+            let encoded_key = encode_key_ref_into(
+                &mut key_arena,
+                TrackedStateKeyRef {
+                    schema_key: delta.schema_key,
+                    file_id: delta.file_id,
+                    entity_pk: delta.entity_pk,
+                },
+            );
+            pending.push((delta, mutation.require_absence, encoded_key));
+        }
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let key_arena = Bytes::from(key_arena);
+        self.pending.extend(
+            pending.into_iter().map(
+                |(delta, require_absence, encoded_key)| PendingRootMutation {
+                    delta,
+                    require_absence,
+                    encoded_key: key_arena.slice(encoded_key),
+                },
+            ),
+        );
+        Ok(self.pending.pop_front())
+    }
 }
 
 fn duplicate_root_insert_error(delta: &TrackedStateDeltaRef<'_>) -> LixError {
@@ -2453,9 +2475,7 @@ impl<'a> OrderedTreeAssembler<'a> {
             options,
             current_leaf: OrderedLeafAccumulator::default(),
             leaf_summaries: Vec::new(),
-            chunks: PendingChunkBatchBuilder::with_data_capacity(
-                mutation_count.saturating_mul(128),
-            ),
+            chunks: PendingChunkBatchBuilder::with_data_capacity(mutation_count.saturating_mul(64)),
         }
     }
 

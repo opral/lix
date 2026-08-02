@@ -118,9 +118,10 @@ use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
 use crate::transaction::types::{
-    PreparedRowFacts, PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
-    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileData, TransactionJson,
-    TransactionWrite, TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
+    CertifiedParameterReplacementBatch, PreparedRowFacts, PreparedStateBatch,
+    PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef, StagedCommitChangeBatch,
+    StagedCommitChangeBatchBuilder, TransactionFileData, TransactionJson, TransactionWrite,
+    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteOutcome, TransactionWriteRow, canonicalize_transaction_json_batch,
     stage_json_from_value,
 };
@@ -8197,6 +8198,51 @@ where
             },
         )
         .await
+    }
+
+    async fn stage_certified_parameter_batch_replace(
+        &mut self,
+        rows: CertifiedParameterReplacementBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        let row_count = rows.len();
+        if row_count == 0 {
+            return Ok(TransactionWriteOutcome { count: 0 });
+        }
+        self.ensure_plugin_generation_read_guard().await;
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_transaction_rows_staged(row_count);
+            crate::storage_bench::record_transaction_untracked_rows(0);
+        }
+        let domain = Domain::schema_catalog(rows.schema_scope_branch_id().to_string(), false);
+        let prepared = if self
+            .staged_writes
+            .has_staged_schema_catalog_change(&domain)?
+        {
+            self.prepare_transaction_rows(rows.into_raw()?)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.transaction_prepare_rows"
+                ))
+                .await?
+        } else {
+            rows.into_prepared(self.origin_key.as_ref(), self.functions.call_timestamp())?
+        };
+        if prepared.len() != row_count {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified replacement preparation changed row cardinality",
+            ));
+        }
+        tracing::debug_span!(target: "lix_perf", "lix.perf.transaction_buffer_stage").in_scope(
+            || {
+                self.staged_writes
+                    .stage_write(PreparedTransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
+                        rows: prepared,
+                    })
+            },
+        )
     }
 
     async fn execute_diff_command(

@@ -25,7 +25,8 @@ use crate::plugin::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::TrackedStateScanRequest;
 use crate::transaction::types::{
-    RawWriteBatch, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
+    CertifiedParameterReplacementBatch, RawWriteBatch, TransactionWrite, TransactionWriteMode,
+    TransactionWriteOutcome,
 };
 use crate::wasm::UnsupportedWasmRuntime;
 
@@ -231,6 +232,13 @@ pub(crate) trait SqlWriteExecutionContext: Send {
             rows,
         })
         .await
+    }
+
+    async fn stage_certified_parameter_batch_replace(
+        &mut self,
+        rows: CertifiedParameterReplacementBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_parameter_batch_replace(rows.into_raw()?).await
     }
 
     async fn execute_diff_command(
