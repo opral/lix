@@ -1180,6 +1180,85 @@ pub(crate) async fn scan_certified_history_rows(
     Ok(builder.finish().into_rows())
 }
 
+/// Expands only the identity metadata needed to publish a certified packet in
+/// an immutable tracked-state root. Payload bytes remain owned by the packet
+/// and are not copied into ordinary change records.
+pub(crate) fn materialize_certified_root_rows(
+    branch_id: &str,
+    file_id: &str,
+    commit_id: CommitId,
+    timestamp: LixTimestamp,
+    batch: &WasmCertifiedEntityBatch,
+) -> Result<MaterializedLiveStateBatch, LixError> {
+    let schema_bytes = batch
+        .schema_keys
+        .iter()
+        .try_fold(2usize, |total, schema| total.checked_add(2 + schema.len()))
+        .ok_or_else(|| head_value_error("certified root schema list size overflowed"))?;
+    let mut header = Vec::with_capacity(
+        4 + schema_bytes
+            + 2
+            + file_id.len()
+            + 16
+            + 2
+            + timestamp.to_string().len()
+            + 26
+            + batch.pages.len().saturating_mul(12),
+    );
+    header.extend_from_slice(CERTIFIED_ENTITY_BATCH_MAGIC_V2);
+    header.extend_from_slice(
+        &u16::try_from(batch.schema_keys.len())
+            .map_err(|_| head_value_error("certified root batch has too many schemas"))?
+            .to_le_bytes(),
+    );
+    for schema_key in &batch.schema_keys {
+        append_batch_text(&mut header, schema_key)?;
+    }
+    append_batch_text(&mut header, file_id)?;
+    header.extend_from_slice(commit_id.as_uuid().as_bytes());
+    append_batch_text(&mut header, &timestamp.to_string())?;
+    header.extend_from_slice(&batch.format.to_le_bytes());
+    header.extend_from_slice(&batch.row_count.to_le_bytes());
+    header.extend_from_slice(&batch.creates.high.to_le_bytes());
+    header.extend_from_slice(&batch.creates.low.to_le_bytes());
+    header.extend_from_slice(
+        &u32::try_from(batch.pages.len())
+            .map_err(|_| head_value_error("certified root batch has too many pages"))?
+            .to_le_bytes(),
+    );
+    let mut pages = Vec::with_capacity(batch.pages.len());
+    for (page_index, page) in batch.pages.iter().enumerate() {
+        header.extend_from_slice(&0_u32.to_le_bytes());
+        header.extend_from_slice(&u32::MAX.to_le_bytes());
+        header.extend_from_slice(
+            &u32::try_from(page.len())
+                .map_err(|_| head_value_error("certified root batch page exceeds 4GiB"))?
+                .to_le_bytes(),
+        );
+        pages.push((
+            u32::try_from(page_index)
+                .map_err(|_| head_value_error("certified root batch has too many pages"))?,
+            page.clone(),
+        ));
+    }
+    let request = TrackedStateScanRequest::default();
+    let filter_index = CertifiedScanFilterIndex::new(&request);
+    let row_count = usize::try_from(batch.row_count)
+        .map_err(|_| head_value_error("certified root row count exceeds usize"))?;
+    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(row_count);
+    decode_certified_entity_batch_rows(
+        &header,
+        Some(&pages),
+        branch_id,
+        &request,
+        &filter_index,
+        false,
+        None,
+        &mut builder,
+    )?;
+    Ok(builder.finish())
+}
+
 fn certified_batch_commit_id(bytes: &[u8]) -> Result<CommitId, LixError> {
     let mut input = CertifiedBatchReader::new(bytes)?;
     let schema_count = input.u16()? as usize;

@@ -23,9 +23,10 @@ pub(crate) use tracked_head::{
     HOT_FILE_SPACE, HOT_ROW_SPACE, HotTrackedSnapshot, PACKED_CURRENT_BASE_CONTROL_SPACE,
     PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
     TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
-    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, scan_certified_history_rows,
-    stage_certified_entity_batches, stage_collect_stale_working_diff_indexes,
-    stage_delete_tracked_working_diff_epoch, stage_tracked_working_diff_epoch,
+    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, materialize_certified_root_rows,
+    scan_certified_history_rows, stage_certified_entity_batches,
+    stage_collect_stale_working_diff_indexes, stage_delete_tracked_working_diff_epoch,
+    stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

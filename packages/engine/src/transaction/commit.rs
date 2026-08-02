@@ -321,6 +321,83 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     .await?;
     let commit_rows = finalized.commit_rows;
     let tracked_roots = finalized.tracked_roots;
+    let mut certified_packet_root_rows = BTreeMap::<CommitId, Vec<MaterializedLiveStateRow>>::new();
+    for file in prepared_writes
+        .file_data_writes
+        .iter()
+        .filter(|file| !file.certified_entity_batches().is_empty())
+    {
+        let root = tracked_roots
+            .iter()
+            .find(|root| root.publish_head && root.branch_id == file.branch_id)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified entity batch has no matching published commit",
+                )
+            })?;
+        let timestamp = commit_rows
+            .iter()
+            .find(|commit| commit.commit_id == root.commit_id)
+            .map(|commit| commit.created_at)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified entity batch commit has no timestamp",
+                )
+            })?;
+        let rows = certified_packet_root_rows
+            .entry(root.commit_id)
+            .or_default();
+        for batch in file.certified_entity_batches() {
+            rows.extend(
+                crate::live_state::materialize_certified_root_rows(
+                    &file.branch_id,
+                    &file.file_id,
+                    root.commit_id,
+                    timestamp,
+                    batch,
+                )?
+                .into_rows(),
+            );
+        }
+    }
+    for (commit_id, rows) in &mut certified_packet_root_rows {
+        let ordinary_identities = state_rows
+            .iter()
+            .filter(|row| row.commit_id == Some(*commit_id))
+            .map(|row| {
+                (
+                    row.schema_key.to_string(),
+                    row.file_id.map(ToString::to_string),
+                    row.entity_pk.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        rows.retain(|row| {
+            !ordinary_identities.contains(&(
+                row.schema_key.clone(),
+                row.file_id.clone(),
+                row.entity_pk.clone(),
+            ))
+        });
+        rows.sort_unstable_by(|left, right| {
+            (&left.schema_key, &left.file_id, &left.entity_pk).cmp(&(
+                &right.schema_key,
+                &right.file_id,
+                &right.entity_pk,
+            ))
+        });
+        if rows.windows(2).any(|pair| {
+            (&pair[0].schema_key, &pair[0].file_id, &pair[0].entity_pk)
+                == (&pair[1].schema_key, &pair[1].file_id, &pair[1].entity_pk)
+        }) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified entity batches contain duplicate root identities",
+            ));
+        }
+    }
     let checkpoint_epochs = checkpoint_epoch_bindings(&prepared_writes.checkpoint_publications)?;
     // The current-state protocol removes the automatic mutable branch-ref
     // row for a normal branch-head advance, but `lix_change` remains an
@@ -377,6 +454,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &commit_rows,
         &selected_change_records,
         &host_certified_file_schemas,
+        &certified_packet_root_rows,
     )
     .await?;
 
@@ -389,6 +467,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &[],
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
+        &certified_packet_root_rows,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -425,6 +504,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &tracked_roots,
         &staged_commits,
         &insert_selection,
+        &certified_packet_root_rows,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -715,6 +795,7 @@ async fn stage_changelog_commits(
     compact_change_ids: &[ChangeId],
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     commit_rows: &[FinalizedCommitRow],
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
     let changes = state_rows
@@ -763,8 +844,11 @@ async fn stage_changelog_commits(
             author_account_ids: Vec::new(),
             created_at: commit_row.created_at,
         });
-        let change_count =
-            state_row_indices.len() + selected_change_count(&commit_row.selected_change_batches);
+        let change_count = state_row_indices.len()
+            + certified_packet_root_rows
+                .get(&commit_row.commit_id)
+                .map_or(0, Vec::len)
+            + selected_change_count(&commit_row.selected_change_batches);
         staged.insert(
             commit_row.commit_id,
             StagedChangelogCommit {
@@ -987,6 +1071,44 @@ fn tracked_commit_delta_from_state_row(
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
         authored: true,
         certified: false,
+    })
+}
+
+fn tracked_delta_from_certified_root_row(
+    row: &MaterializedLiveStateRow,
+) -> Result<TrackedStateDeltaRef<'_>, LixError> {
+    Ok(TrackedStateDeltaRef {
+        schema_key: &row.schema_key,
+        file_id: row.file_id.as_deref(),
+        entity_pk: &row.entity_pk,
+        change_id: row.change_id.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified root row is missing change_id",
+            )
+        })?,
+        commit_id: row.commit_id.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified root row is missing commit_id",
+            )
+        })?,
+        deleted: row.deleted,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+fn tracked_commit_delta_from_certified_root_row(
+    row: &MaterializedLiveStateRow,
+) -> Result<TrackedStateCommitDeltaRef<'_>, LixError> {
+    Ok(TrackedStateCommitDeltaRef {
+        delta: tracked_delta_from_certified_root_row(row)?,
+        snapshot: crate::json_store::JsonSlotRef::None,
+        metadata: crate::json_store::JsonSlotRef::None,
+        origin_key: None,
+        authored: true,
+        certified: true,
     })
 }
 
@@ -1272,6 +1394,7 @@ async fn stage_tracked_commit_delta_index(
     commit_rows: &[FinalizedCommitRow],
     selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
     host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
 ) -> Result<BTreeSet<CommitId>, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let commit_rows = commit_rows
@@ -1280,6 +1403,10 @@ async fn stage_tracked_commit_delta_index(
         .collect::<BTreeMap<_, _>>();
     for root in tracked_roots {
         let state_row_indices = tracked_row_indices_by_commit
+            .get(&root.commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let certified_root_rows = certified_packet_root_rows
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
@@ -1344,7 +1471,9 @@ async fn stage_tracked_commit_delta_index(
             }
         }
         let mut deltas = Vec::with_capacity(
-            state_row_indices.len() + selected_change_count(&staged.selected_change_batches),
+            state_row_indices.len()
+                + certified_root_rows.len()
+                + selected_change_count(&staged.selected_change_batches),
         );
         let mut addressable = Vec::with_capacity(deltas.capacity());
         let mut selected_members_by_source = BTreeMap::<CommitId, usize>::new();
@@ -1360,6 +1489,12 @@ async fn stage_tracked_commit_delta_index(
                     host_certified_file_schemas,
                 );
             deltas.push(delta);
+        }
+        for row in certified_root_rows {
+            deltas.push(tracked_commit_delta_from_certified_root_row(row)?);
+            // Certified rows are addressed by commit plus identity. They do
+            // not need standalone change locators in the public ledger.
+            addressable.push(false);
         }
         for change_ref in selected_changes(&staged.selected_change_batches) {
             *selected_members_by_source
@@ -3679,6 +3814,7 @@ async fn stage_tracked_roots(
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     insert_selection: &PreparedInsertSelection,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
 ) -> Result<(), LixError> {
     let root_fence_ids = tracked_root_fence_ids(tracked_roots);
     if root_fence_ids.is_empty() {
@@ -3702,6 +3838,10 @@ async fn stage_tracked_roots(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        let certified_root_rows = certified_packet_root_rows
+            .get(&root.commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if state_row_indices.len() > staged.change_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -3717,7 +3857,8 @@ async fn stage_tracked_roots(
         // When they cover a substantial fraction of a parent root, stream the
         // parent/changes directly into canonical chunks instead of point
         // reading every key and materializing two more full-workload vectors.
-        if !state_row_indices.is_empty()
+        if certified_root_rows.is_empty()
+            && !state_row_indices.is_empty()
             && staged.selected_change_batches.is_empty()
             && tracked_state_rows_are_strictly_sorted(state_rows, state_row_indices)
         {
@@ -3775,6 +3916,11 @@ async fn stage_tracked_roots(
         let deltas = state_row_indices
             .iter()
             .map(|&row_index| tracked_delta_from_state_row(state_rows.row(row_index)))
+            .chain(
+                certified_root_rows
+                    .iter()
+                    .map(tracked_delta_from_certified_root_row),
+            )
             .chain(
                 selected_changes(&staged.selected_change_batches).map(|change_ref| {
                     tracked_delta_from_selected_change_ref(change_ref, root.commit_id)
@@ -6456,6 +6602,7 @@ mod tests {
                 (CommitId::for_test_label("child-commit"), vec![1]),
             ]),
             &commits,
+            &BTreeMap::new(),
         )
         .await
         .expect("child-before-parent input should still stage parent first");
