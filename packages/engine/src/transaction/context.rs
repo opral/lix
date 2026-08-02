@@ -6697,6 +6697,14 @@ where
         self.sql_schema_snapshot.schema_jsons()
     }
 
+    pub(crate) fn visible_schema_keys(&self) -> Result<Vec<String>, LixError> {
+        self.sql_visible_schemas()
+            .iter()
+            .map(crate::schema::schema_key_from_definition)
+            .map(|result| result.map(|key| key.schema_key))
+            .collect()
+    }
+
     /// Advances a branch ref without staging tracked rows.
     ///
     /// Fast-forward merges use this path because the commit graph already

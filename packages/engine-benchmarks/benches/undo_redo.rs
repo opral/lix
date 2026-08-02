@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use lix_engine::{Engine, ExecuteBatchStatement, Memory};
+use lix_engine::{Blob, Engine, ExecuteBatchStatement, Memory};
 
 fn seeded_storage(runtime: &tokio::runtime::Runtime, history_depth: usize) -> Vec<u8> {
     runtime.block_on(async move {
@@ -173,6 +173,53 @@ fn seeded_wide_transition_storage(
     })
 }
 
+fn seeded_descriptor_unrelated_width_storage(
+    runtime: &tokio::runtime::Runtime,
+    unrelated_width: usize,
+) -> Vec<u8> {
+    runtime.block_on(async move {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("benchmark storage initializes");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("benchmark engine opens");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("benchmark session opens");
+        session
+            .upsert_file_data(
+                "/descriptor-target.txt".into(),
+                Blob::from("target".as_bytes()),
+            )
+            .await
+            .expect("target file creates");
+        let values = (0..unrelated_width)
+            .map(|index| format!("('descriptor-noise-{index}', '{index}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
+                &[],
+            )
+            .await
+            .expect("unrelated repository rows write");
+        session
+            .execute(
+                "DELETE FROM lix_file WHERE path = '/descriptor-target.txt'",
+                &[],
+            )
+            .await
+            .expect("target file deletes");
+        storage
+            .export_snapshot()
+            .expect("benchmark storage snapshot exports")
+    })
+}
+
 fn open_session(
     runtime: &tokio::runtime::Runtime,
     storage: Memory,
@@ -270,6 +317,34 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                         runtime
                             .block_on(session.redo())
                             .expect("benchmarked redo succeeds");
+                        elapsed += started.elapsed();
+                    }
+                    elapsed
+                });
+            },
+        );
+    }
+    group.finish();
+
+    let mut group = criterion.benchmark_group("undo_descriptor_unrelated_repository_width");
+    for unrelated_width in [1_usize, 1_000, 10_000] {
+        let snapshot = seeded_descriptor_unrelated_width_storage(&runtime, unrelated_width);
+        group.bench_with_input(
+            BenchmarkId::new("undo_file_delete", unrelated_width),
+            &unrelated_width,
+            |benchmark, _| {
+                benchmark.iter_custom(|iterations| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let session = open_session(
+                            &runtime,
+                            Memory::from_snapshot(&snapshot)
+                                .expect("descriptor benchmark snapshot restores"),
+                        );
+                        let started = Instant::now();
+                        runtime
+                            .block_on(session.undo())
+                            .expect("benchmarked descriptor undo succeeds");
                         elapsed += started.elapsed();
                     }
                     elapsed

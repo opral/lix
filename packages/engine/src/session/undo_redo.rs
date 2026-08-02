@@ -5,7 +5,9 @@ use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage_adapter::Storage;
-use crate::tracked_state::{TrackedStateDiffRequest, TrackedStateIndexValue, TrackedStateKey};
+use crate::tracked_state::{
+    TrackedStateIndexValue, TrackedStateKey, descriptor_dependency_cascade_file_ids,
+};
 use crate::transaction::Transaction;
 use crate::transaction::types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
 use crate::undo_redo::{
@@ -467,21 +469,33 @@ where
 {
     reject_untracked_descriptor_cascade(transaction, target_delta, desired_is_target, target)
         .await?;
-    if target_delta.iter().any(|(key, _)| {
-        matches!(
-            key.schema_key.as_str(),
-            "lix_file_descriptor" | "lix_directory_descriptor"
-        )
-    }) {
-        return apply_generic_state_diff(transaction, current, desired).await;
-    }
-    let keys = target_delta
-        .iter()
-        .filter(|(key, _)| {
+    let cascade_file_ids = descriptor_dependency_cascade_file_ids(target_delta)?;
+    let keys = if cascade_file_ids.is_empty() {
+        target_delta
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>()
+    } else {
+        let visible_schema_keys = transaction.visible_schema_keys()?;
+        let dependency_commit = if desired_is_target { current } else { desired };
+        let mut tracked = transaction.tracked_state_reader().await;
+        tracked
+            .descriptor_dependency_closure(
+                &current.to_string(),
+                &desired.to_string(),
+                &dependency_commit.to_string(),
+                target_delta,
+                &cascade_file_ids,
+                &visible_schema_keys,
+            )
+            .await?
+    };
+    let keys = keys
+        .into_iter()
+        .filter(|key| {
             key.schema_key != CHECKPOINT_MARKER_SCHEMA_KEY
                 && key.schema_key != UNDO_REDO_MARKER_SCHEMA_KEY
         })
-        .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     transaction
         .execute_tracked_state_transition(current, desired, keys)
@@ -536,45 +550,6 @@ where
         ));
     }
     Ok(())
-}
-
-async fn apply_generic_state_diff<S>(
-    transaction: &mut Transaction<S>,
-    current: CommitId,
-    desired: CommitId,
-) -> Result<crate::sql2::DiffCommandOutcome, LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    let diff = {
-        let mut tracked = transaction.tracked_state_reader().await;
-        tracked
-            .diff_commits(
-                &current.to_string(),
-                &desired.to_string(),
-                &TrackedStateDiffRequest {
-                    retain_payloads: false,
-                    ..TrackedStateDiffRequest::default()
-                },
-            )
-            .await?
-    };
-    let keys = diff
-        .entries
-        .into_iter()
-        .filter(|entry| {
-            entry.identity.schema_key() != CHECKPOINT_MARKER_SCHEMA_KEY
-                && entry.identity.schema_key() != UNDO_REDO_MARKER_SCHEMA_KEY
-        })
-        .map(|entry| TrackedStateKey {
-            schema_key: entry.identity.schema_key().to_owned(),
-            file_id: entry.identity.file_id().map(str::to_owned),
-            entity_pk: entry.identity.entity_pk().clone(),
-        })
-        .collect::<Vec<_>>();
-    transaction
-        .execute_tracked_state_transition(current, desired, keys)
-        .await
 }
 
 async fn stage_marker<S>(
@@ -979,12 +954,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_delete_roundtrips_through_the_cascade_fallback() {
+    async fn file_delete_roundtrips_exact_tracked_dependency_closure() {
         let session = setup().await;
         session
             .upsert_file_data("/deleted.txt".into(), Blob::from("restored".as_bytes()))
             .await
             .expect("file creates");
+        session
+            .upsert_file_data("/unrelated.txt".into(), Blob::from("untouched".as_bytes()))
+            .await
+            .expect("unrelated file creates");
+        let files = session
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path IN ('/deleted.txt', '/unrelated.txt')",
+                &[],
+            )
+            .await
+            .expect("file identities read");
+        let file_id = |path: &str| {
+            files
+                .rows()
+                .iter()
+                .find(|row| row.get::<String>("path").ok().as_deref() == Some(path))
+                .and_then(|row| row.get::<String>("id").ok())
+                .expect("file identity exists")
+        };
+        let deleted_file_id = file_id("/deleted.txt");
+        let unrelated_file_id = file_id("/unrelated.txt");
+        session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: "INSERT INTO lix_key_value (key, value, lixcol_file_id) VALUES ('deleted-state', 'restore-me', $1)".to_string(),
+                    params: vec![Value::Text(deleted_file_id)],
+                },
+                ExecuteBatchStatement {
+                    sql: "INSERT INTO lix_key_value (key, value, lixcol_file_id) VALUES ('unrelated-state', 'keep-me', $1)".to_string(),
+                    params: vec![Value::Text(unrelated_file_id)],
+                },
+                ExecuteBatchStatement {
+                    sql: "INSERT INTO lix_key_value (key, value) VALUES ('global-state', 'keep-me')"
+                        .to_string(),
+                    params: vec![],
+                },
+            ])
+            .await
+            .expect("tracked dependency rows write");
         session
             .execute("DELETE FROM lix_file WHERE path = '/deleted.txt'", &[])
             .await
@@ -995,6 +1009,15 @@ mod tests {
                 .await
                 .expect("deleted file reads"),
             None
+        );
+        assert_eq!(value(&session, "deleted-state").await, None);
+        assert_eq!(
+            value(&session, "unrelated-state").await.as_deref(),
+            Some("keep-me")
+        );
+        assert_eq!(
+            value(&session, "global-state").await.as_deref(),
+            Some("keep-me")
         );
 
         session.undo().await.expect("file deletion undoes");
@@ -1008,6 +1031,18 @@ mod tests {
                 .as_ref(),
             b"restored"
         );
+        assert_eq!(
+            value(&session, "deleted-state").await.as_deref(),
+            Some("restore-me")
+        );
+        assert_eq!(
+            value(&session, "unrelated-state").await.as_deref(),
+            Some("keep-me")
+        );
+        assert_eq!(
+            value(&session, "global-state").await.as_deref(),
+            Some("keep-me")
+        );
         session.redo().await.expect("file deletion redoes");
         assert_eq!(
             session
@@ -1015,6 +1050,15 @@ mod tests {
                 .await
                 .expect("redeleted file reads"),
             None
+        );
+        assert_eq!(value(&session, "deleted-state").await, None);
+        assert_eq!(
+            value(&session, "unrelated-state").await.as_deref(),
+            Some("keep-me")
+        );
+        assert_eq!(
+            value(&session, "global-state").await.as_deref(),
+            Some("keep-me")
         );
     }
 

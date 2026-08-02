@@ -12,7 +12,9 @@ mod tree;
 mod types;
 
 pub(crate) use codec::encode_key_ref;
-pub(crate) use context::{TrackedStateContext, TrackedStateStoreReader};
+pub(crate) use context::{
+    TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
+};
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStatePayloadBatch, TrackedStatePayloadRef,
