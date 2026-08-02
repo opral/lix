@@ -384,6 +384,68 @@ impl TrackedStateTree {
         })
     }
 
+    /// Applies a sparse batch as independent path-copy mutations.
+    ///
+    /// Callers use this only after proving every key already exists in the
+    /// parent root. That avoids content-defined batch rechunking from
+    /// amplifying a small merge frontier into a full-tree rewrite.
+    pub(crate) async fn apply_point_mutations_with_overlay(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        writes: &mut StorageWriteSet,
+        overlay: &mut storage::TrackedStateChunkOverlay,
+        base_root: &TrackedStateRootId,
+        mutations: TrackedStateMutationBatch,
+        commit_id: Option<&str>,
+    ) -> Result<TrackedStateApplyResult, LixError> {
+        let mut mutations = mutations.into_mutations().into_iter();
+        let mut current_root = base_root.clone();
+        let mut final_result = None;
+        let mut chunk_count = 0usize;
+        let mut chunk_bytes = 0usize;
+        while let Some(mutation) = mutations.next() {
+            match self
+                .apply_single_mutation(store, writes, overlay, &current_root, mutation, commit_id)
+                .await?
+            {
+                MutationApply::Applied(result) => {
+                    chunk_count = chunk_count.saturating_add(result.chunk_count);
+                    chunk_bytes = chunk_bytes.saturating_add(result.chunk_bytes);
+                    current_root = result.root_id.clone();
+                    final_result = Some(result);
+                }
+                MutationApply::Fallback(mutation) => {
+                    let remaining = std::iter::once(mutation).chain(mutations).collect();
+                    let mut result = self
+                        .apply_mutations_with_overlay(
+                            store,
+                            writes,
+                            overlay,
+                            Some(&current_root),
+                            TrackedStateMutationBatch::from_shared(remaining),
+                            commit_id,
+                        )
+                        .await?;
+                    result.chunk_count = result.chunk_count.saturating_add(chunk_count);
+                    result.chunk_bytes = result.chunk_bytes.saturating_add(chunk_bytes);
+                    return Ok(result);
+                }
+            }
+        }
+        final_result
+            .map(|mut result| {
+                result.chunk_count = chunk_count;
+                result.chunk_bytes = chunk_bytes;
+                result
+            })
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "point mutation batch must not be empty",
+                )
+            })
+    }
+
     /// Merges a full, primary-key-sorted mutation batch with a parent root in
     /// one pass and rebuilds canonical chunks directly from that merge.
     ///
@@ -1201,7 +1263,7 @@ impl TrackedStateTree {
             }
         };
 
-        let mutation_entry_index =
+        let (mutation_entry_index, replaced_existing) =
             match entries.binary_search_by(|entry| entry.key.as_ref().cmp(encoded_key.as_ref())) {
                 Ok(index) => {
                     if entries[index].value.as_ref() == encoded_value.as_ref() {
@@ -1211,7 +1273,7 @@ impl TrackedStateTree {
                         }));
                     }
                     entries[index].value = encoded_value;
-                    index
+                    (index, true)
                 }
                 Err(index) => {
                     entries.insert(
@@ -1221,7 +1283,7 @@ impl TrackedStateTree {
                             value: encoded_value,
                         },
                     );
-                    index
+                    (index, false)
                 }
             };
 
@@ -1249,6 +1311,12 @@ impl TrackedStateTree {
                 leaf_entries.iter().map(EncodedLeafEntry::as_ref),
                 &mut candidate_chunks,
             );
+            if replaced_existing && candidate_leaves.len() == 1 {
+                chunks.extend(candidate_chunks);
+                replacement_children = candidate_leaves;
+                old_child_count = 1;
+                break;
+            }
             if let Some((generated_resync_index, existing_resync_index)) = first_resync_index(
                 &candidate_leaves,
                 &leaf_parent.children[leaf_parent.child_index..],
@@ -3425,6 +3493,47 @@ mod tests {
             insert_reads <= max_height * 2 + 4,
             "one appended key read {insert_reads} chunks across height {max_height}"
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_existing_updates_keep_tree_shape_and_bounded_chunks() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::new();
+        let rows = (0..10_000)
+            .map(|index| {
+                mutation_owned(
+                    key("schema", None, &format!("entity-{index:05}")),
+                    value(&format!("change-{index}"), Some("{}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let base = apply_mutations_for_test(&tree, &storage, None, rows, None)
+            .await
+            .expect("base should build");
+        let mut current = base.root_id.clone();
+        for index in 0..100 {
+            let updated = apply_mutations_for_test(
+                &tree,
+                &storage,
+                Some(&current),
+                vec![mutation_owned(
+                    key("schema", None, &format!("entity-{:05}", 5_000 + index)),
+                    value(&format!("updated-{index}"), Some("{}")),
+                )],
+                None,
+            )
+            .await
+            .expect("existing update should path-copy");
+            assert_eq!(updated.row_count, 10_000);
+            assert_eq!(updated.tree_height, base.tree_height);
+            assert!(
+                updated.chunk_count <= base.tree_height,
+                "one existing update wrote {} chunks for height {}",
+                updated.chunk_count,
+                base.tree_height
+            );
+            current = updated.root_id;
+        }
     }
 
     #[tokio::test]

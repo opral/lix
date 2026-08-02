@@ -1205,46 +1205,7 @@ where
             .collect();
         let batch =
             materialize_batch_from_index_entry_refs(&self.store, entries, projection).await?;
-        let batch = MaterializedTrackedStateExactBatch::new(batch, slots)?;
-        if !batch.has_missing() || keys.iter().all(|key| key.schema_key.starts_with("lix_")) {
-            return Ok(batch);
-        }
-        let commit_id = CommitId::parse_lix(commit_id, "certified historical exact read")?;
-        let certified = crate::live_state::scan_certified_history_rows(
-            &self.store,
-            &BTreeSet::from([commit_id]),
-            &TrackedStateScanRequest {
-                filter: crate::tracked_state::TrackedStateFilter {
-                    schema_keys: keys.iter().map(|key| key.schema_key.to_owned()).collect(),
-                    entity_pks: keys.iter().map(|key| key.entity_pk.clone()).collect(),
-                    file_ids: keys
-                        .iter()
-                        .map(|key| {
-                            key.file_id.map_or(NullableKeyFilter::Null, |file_id| {
-                                NullableKeyFilter::Value(file_id.to_owned())
-                            })
-                        })
-                        .collect(),
-                    include_tombstones: true,
-                },
-                read_columns: crate::tracked_state::TrackedStateReadColumns {
-                    columns: [
-                        projection.snapshot_content.then_some("snapshot_content"),
-                        projection.metadata.then_some("metadata"),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .map(str::to_owned)
-                    .collect(),
-                },
-                limit: None,
-            },
-        )
-        .await?;
-        if certified.is_empty() {
-            return Ok(batch);
-        }
-        batch.fill_missing_from_certified(keys, certified)
+        MaterializedTrackedStateExactBatch::new(batch, slots)
     }
 
     #[cfg(any(test, feature = "storage-benches"))]
@@ -1286,9 +1247,9 @@ where
             .await
     }
 
-    /// True only for the sparse immutable checkpoints. A false result does
-    /// not mean the commit is unreadable: ordinary v4 commits replay their
-    /// first-parent changelog interval on the cold historical path.
+    /// Probes root publication in tests and storage benchmarks. Every current
+    /// protocol commit must return true; false is valid only for explicit
+    /// legacy-rootless fixtures or damaged storage awaiting repair.
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn has_durable_commit_root(&self, commit_id: &str) -> Result<bool, LixError> {
         Ok(self.tree.load_root(&self.store, commit_id).await?.is_some())
@@ -2238,6 +2199,20 @@ where
         } else {
             self.tree.load_root(&self.store, right_commit_id).await?
         };
+        if left_root.is_none() {
+            self.load_point_replay_commit(CommitId::parse_lix(
+                left_commit_id,
+                "tracked-state diff left commit_id",
+            )?)
+            .await?;
+        }
+        if right_root.is_none() && right_commit_id != left_commit_id {
+            self.load_point_replay_commit(CommitId::parse_lix(
+                right_commit_id,
+                "tracked-state diff right commit_id",
+            )?)
+            .await?;
+        }
         if let (Some(_), Some(_)) = (&left_root, &right_root) {
             return self
                 .diff_tree_entries_from_roots(left_commit_id, right_commit_id, request)
@@ -3081,9 +3056,12 @@ where
         let root_id = if record.tracked_state_rootless {
             None
         } else {
-            self.tree
-                .load_root(&self.store, &commit_id.to_string())
-                .await?
+            Some(
+                self.tree
+                    .load_root(&self.store, &commit_id.to_string())
+                    .await?
+                    .ok_or_else(|| missing_commit_root_error(&commit_id.to_string()))?,
+            )
         };
         let replay_commit = PointReplayCommit {
             parent_commit_id: record.parent_commit_ids.first().copied(),
@@ -3290,18 +3268,6 @@ impl<S> TrackedStateWriter<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    pub(crate) async fn stage_missing_commit_root_chain(
-        &mut self,
-        commit_id: &str,
-    ) -> Result<(), LixError> {
-        crate::tracked_state::commit_root_rebuild::stage_missing_commit_root_chain(self, commit_id)
-            .await
-    }
-
-    pub(super) fn store(&self) -> &S {
-        self.store
-    }
-
     pub(crate) async fn validate_staged_commit_root_against_changelog(
         &self,
         commit_id: &str,
@@ -3467,7 +3433,7 @@ where
                 }
             }
         }
-        let parent_values = if let Some(base_root) = base_root.as_ref() {
+        let mut parent_values = if let Some(base_root) = base_root.as_ref() {
             let keys = deltas
                 .iter()
                 .map(|delta| TrackedStateKey {
@@ -3489,9 +3455,79 @@ where
         } else {
             vec![None; deltas.len()]
         };
+        if let Some(base_root) = base_root.as_ref() {
+            use crate::collection_generation::{
+                COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_key,
+            };
+
+            let mut marker_keys = Vec::new();
+            let mut marker_ordinals = BTreeMap::<(String, Option<String>), usize>::new();
+            for delta in &deltas {
+                if delta.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
+                    continue;
+                }
+                for scope in [
+                    Some((delta.schema_key.to_string(), None)),
+                    delta
+                        .file_id
+                        .map(|file_id| (delta.schema_key.to_string(), Some(file_id.to_string()))),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if marker_ordinals.contains_key(&scope) {
+                        continue;
+                    }
+                    let ordinal = marker_keys.len();
+                    marker_keys.push(TrackedStateKey {
+                        schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_string(),
+                        file_id: None,
+                        entity_pk: EntityPk::single(collection_scope_key(CollectionScopeRef {
+                            schema_key: &scope.0,
+                            file_id: scope.1.as_deref(),
+                        })),
+                    });
+                    marker_ordinals.insert(scope, ordinal);
+                }
+            }
+            if !marker_keys.is_empty() {
+                let staged_read = storage::TrackedStateStagedRead::new(
+                    self.store,
+                    self.staged_roots.values(),
+                    &self.chunk_overlay,
+                )?;
+                let marker_values = self
+                    .tree
+                    .get_many(&staged_read, base_root, &marker_keys)
+                    .await?;
+                for (delta, parent_value) in deltas.iter().zip(parent_values.iter_mut()) {
+                    let Some(value) = parent_value.as_ref() else {
+                        continue;
+                    };
+                    if delta.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
+                        continue;
+                    }
+                    let retired = [
+                        Some((delta.schema_key.to_string(), None)),
+                        delta.file_id.map(|file_id| {
+                            (delta.schema_key.to_string(), Some(file_id.to_string()))
+                        }),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|scope| marker_ordinals.get(&scope).copied())
+                    .filter_map(|ordinal| marker_values[ordinal].as_ref())
+                    .any(|marker| value.commit_id <= marker.commit_id);
+                    if retired {
+                        *parent_value = None;
+                    }
+                }
+            }
+        }
         let mut mutation_batch = TrackedStateMutationBatchBuilder::with_row_capacity(
             cascade_mutations.len().saturating_add(deltas.len()),
         );
+        let has_cascade_mutations = !cascade_mutations.is_empty();
         for (key, value) in cascade_mutations {
             mutation_batch.push_encoded(&key, &value);
         }
@@ -3535,17 +3571,35 @@ where
         }
         let mutations = mutation_batch.finish();
         let changed_rows = mutations.len();
-        let result = self
-            .tree
-            .apply_mutations_with_overlay(
-                self.store,
-                self.writes,
-                &mut self.chunk_overlay,
-                base_root.as_ref(),
-                mutations,
-                Some(commit_id),
-            )
-            .await?;
+        let sparse_existing_batch = base_root.is_some()
+            && !has_cascade_mutations
+            && parent_values.iter().all(Option::is_some)
+            && mutations.len() > 1;
+        let result = if sparse_existing_batch {
+            self.tree
+                .apply_point_mutations_with_overlay(
+                    self.store,
+                    self.writes,
+                    &mut self.chunk_overlay,
+                    base_root
+                        .as_ref()
+                        .expect("sparse batch requires parent root"),
+                    mutations,
+                    Some(commit_id),
+                )
+                .await?
+        } else {
+            self.tree
+                .apply_mutations_with_overlay(
+                    self.store,
+                    self.writes,
+                    &mut self.chunk_overlay,
+                    base_root.as_ref(),
+                    mutations,
+                    Some(commit_id),
+                )
+                .await?
+        };
         let metadata = TrackedStateCommitRoot {
             commit_id: typed_commit_id,
             root_id: result.root_id.clone(),
@@ -3854,7 +3908,7 @@ fn missing_commit_root_error(commit_id: &str) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
         format!(
-            "tracked_state commit_root is missing for commit '{commit_id}'; run explicit commit_root rebuild before structural diff"
+            "tracked_state commit_root is missing for commit '{commit_id}'; run explicit commit_root rebuild before historical reads"
         ),
     )
 }
@@ -5541,7 +5595,18 @@ mod tests {
                 .expect("child commit_root delete should commit");
         }
 
-        let rootless_diff = tracked_state
+        let error = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("self-diff read should open"),
+            )
+            .diff_commits("child", "child", &test_schema_diff_request())
+            .await
+            .expect_err("current-protocol self-diff must validate its root");
+        assert!(error.message.contains("commit_root is missing"));
+        let error = tracked_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
@@ -5550,12 +5615,41 @@ mod tests {
             )
             .diff_commits("base", "child", &test_schema_diff_request())
             .await
-            .expect("rootless history should remain diffable before repair");
-        assert_eq!(rootless_diff.entries.len(), 1);
-        assert_eq!(
-            rootless_diff.entries[0].kind,
-            crate::tracked_state::TrackedStateDiffKind::Modified
+            .expect_err("current-protocol history must fail closed before repair");
+        assert!(
+            error.message.contains("commit_root is missing"),
+            "unexpected error: {}",
+            error.message
         );
+        let error = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("scan read should open"),
+            )
+            .scan_batch_at_commit("child", &TrackedStateScanRequest::default())
+            .await
+            .expect_err("current-protocol scan must fail closed before repair");
+        assert!(error.message.contains("commit_root is missing"));
+        let error = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("exact read should open"),
+            )
+            .load_batch_at_commit(
+                "child",
+                &[TrackedStateKey {
+                    schema_key: "test_schema".to_owned(),
+                    file_id: None,
+                    entity_pk: EntityPk::single("entity-a"),
+                }],
+            )
+            .await
+            .expect_err("current-protocol exact read must fail closed before repair");
+        assert!(error.message.contains("commit_root is missing"));
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -7240,7 +7334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_exact_read_fills_missing_root_row_from_certified_batch() {
+    async fn historical_exact_read_requires_certified_rows_to_exist_in_root() {
         const COMMIT_LABEL: &str = "certified-historical-exact";
         const BRANCH_ID: &str = "certified-branch";
         const FILE_ID: &str = "certified.csv";
@@ -7420,19 +7514,9 @@ mod tests {
             )
             .await
             .expect("certified historical exact row should load");
-        let row = exact
-            .row(0)
-            .expect("certified row must fill the missing slot");
-        assert_eq!(row.schema_key(), SCHEMA_KEY);
-        assert_eq!(row.file_id(), Some(FILE_ID));
-        assert_eq!(row.commit_id(), commit_id);
-        let expected_snapshot = format!(
-            r#"{{"cells":["value"],"id":"{}","order_key":"0000000000000001"}}"#,
-            uuid::Uuid::from_bytes(id)
-        );
-        assert_eq!(
-            row.snapshot_content().map(SharedStr::as_str),
-            Some(expected_snapshot.as_str())
+        assert!(
+            exact.row(0).is_none(),
+            "certified packet authority must not fabricate an identity omitted from the commit root"
         );
     }
 

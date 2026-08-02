@@ -62,25 +62,6 @@ where
     Ok(report)
 }
 
-/// Stages every missing first-parent root from the nearest durable checkpoint
-/// through `commit_id` into one caller-owned root writer. Normal commits no
-/// longer materialize roots, so merge/checkpoint fences use this cold helper
-/// to recover their first-parent base without exposing an intermediate write.
-pub(crate) async fn stage_missing_commit_root_chain<S>(
-    writer: &mut TrackedStateWriter<'_, S>,
-    commit_id: &str,
-) -> Result<(), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let plans =
-        load_rebuild_plans_to_nearest_available_root(writer.store(), commit_id, false).await?;
-    for plan in plans.iter().rev() {
-        stage_rebuild_plan_with_writer(writer, plan).await?;
-    }
-    Ok(())
-}
-
 pub(crate) async fn load_rebuild_plans_to_nearest_available_root<S>(
     store: &S,
     commit_id: &str,

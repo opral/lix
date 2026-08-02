@@ -106,10 +106,12 @@ pub(crate) async fn commit_prepared_writes(
     read: &mut impl StorageAdapterRead,
     prepared_writes: PreparedWriteSet,
 ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
+    let tracked_state = TrackedStateContext::new();
     let commit_parent_heads =
         resolve_prepared_commit_parent_heads(branch_ctx, &*read, &prepared_writes, false).await?;
     commit_prepared_writes_with_parent_heads(
         binary_cas,
+        &tracked_state,
         runtime_functions,
         &commit_parent_heads,
         read,
@@ -122,6 +124,7 @@ pub(crate) async fn commit_prepared_writes(
 /// caller's coherent commit snapshot.
 pub(crate) async fn commit_prepared_writes_with_parent_heads(
     binary_cas: &BinaryCasContext,
+    tracked_state: &TrackedStateContext,
     runtime_functions: Option<&FunctionContext>,
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     read: &mut impl StorageAdapterRead,
@@ -328,14 +331,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .filter(|root| root.publish_head)
         .map(branch_ref_change_record)
         .collect::<Result<Vec<_>, _>>()?;
-    // Checkpoints are logical compaction boundaries, not full immutable-tree
-    // snapshots. Their absolute commit-delta segments plus the previous
-    // checkpoint parent already form the persistent history representation;
-    // forcing a second full-state root made N checkpoints rewrite
-    // 1 + 2 + ... + N rows. Rootless history readers reconstruct from the
-    // nearest available ancestor root when a historical scan actually needs
-    // one, while eager HOT state remains complete at publication time.
-    let force_root_fence = false;
+    // Every commit publishes an immutable, structurally shared tracked-state
+    // root. Historical diff, merge, and point reads can therefore traverse
+    // endpoint trees instead of replaying the first-parent changelog.
     // The current-state protocol publishes automatic tracked heads through
     // one direct control record.
     // Do not also synthesize a mutable `lix_branch_ref` current row for every
@@ -391,7 +389,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &[],
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
-        force_root_fence,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -420,6 +417,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     .await?;
 
     stage_tracked_roots(
+        tracked_state,
         read,
         &mut writes,
         &state_rows,
@@ -427,7 +425,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &tracked_roots,
         &staged_commits,
         &insert_selection,
-        force_root_fence,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -718,7 +715,6 @@ async fn stage_changelog_commits(
     compact_change_ids: &[ChangeId],
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     commit_rows: &[FinalizedCommitRow],
-    force_root_fence: bool,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
     let changes = state_rows
@@ -762,10 +758,7 @@ async fn stage_changelog_commits(
             format_version: 1,
             commit_id: commit_row.commit_id,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
-            // Every commit carries absolute per-identity deltas against its
-            // first parent. Additional ancestry and selected historical refs
-            // therefore do not require eagerly materializing the full root.
-            tracked_state_rootless: !force_root_fence,
+            tracked_state_rootless: false,
             change_id: commit_row.change_id,
             author_account_ids: Vec::new(),
             created_at: commit_row.created_at,
@@ -3678,6 +3671,7 @@ async fn observe_branch_head_controls(
 }
 
 async fn stage_tracked_roots(
+    tracked_state: &TrackedStateContext,
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &PreparedStateBatch,
@@ -3685,30 +3679,15 @@ async fn stage_tracked_roots(
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     insert_selection: &PreparedInsertSelection,
-    force_root_fence: bool,
 ) -> Result<(), LixError> {
-    let root_fence_ids = tracked_root_fence_ids(tracked_roots, force_root_fence);
+    let root_fence_ids = tracked_root_fence_ids(tracked_roots);
     if root_fence_ids.is_empty() {
         return Ok(());
     }
-    let tracked_state = TrackedStateContext::new();
     let mut tracked_writer = tracked_state.writer(read, writes);
     for root in tracked_roots_parent_first(tracked_roots)? {
         if !root_fence_ids.contains(&root.commit_id) {
             continue;
-        }
-        if let Some(parent_commit_id) = root.parent_commit_id
-            && !root_fence_ids.contains(&parent_commit_id)
-        {
-            // Ordinary commits deliberately omit immutable roots. A
-            // merge/checkpoint fence still needs a canonical first-parent
-            // root, so reconstruct the cold chain in this same root writer
-            // before staging the fence. Keeping one overlay makes the newly
-            // staged ancestors visible to the fence without a second storage
-            // transaction.
-            tracked_writer
-                .stage_missing_commit_root_chain(&parent_commit_id.to_string())
-                .await?;
         }
         let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
             LixError::new(
@@ -3840,19 +3819,9 @@ async fn stage_tracked_roots(
     Ok(())
 }
 
-/// Immutable roots are an optional cold-path history accelerator. A caller
-/// that explicitly requests a fence also stages any missing first-parent
-/// ancestors in the same atomic write set. Normal serial and checkpoint
-/// commits use compact absolute deltas plus the durable current-state
-/// projection.
-fn tracked_root_fence_ids(
-    tracked_roots: &[PendingTrackedRoot],
-    force_all: bool,
-) -> BTreeSet<CommitId> {
-    if force_all {
-        return tracked_roots.iter().map(|root| root.commit_id).collect();
-    }
-    BTreeSet::new()
+/// Every current-protocol commit is a root fence.
+fn tracked_root_fence_ids(tracked_roots: &[PendingTrackedRoot]) -> BTreeSet<CommitId> {
+    tracked_roots.iter().map(|root| root.commit_id).collect()
 }
 
 fn tracked_state_rows_are_strictly_sorted(
@@ -4657,7 +4626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_tracked_commit_appends_changelog_without_materializing_root() {
+    async fn ordinary_tracked_commit_appends_changelog_and_root() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -4689,12 +4658,12 @@ mod tests {
         .await
         .expect("commit should flush staged rows");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE),
-            "an ordinary tracked commit must not write immutable tree chunks"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE),
+            "an ordinary tracked commit must write immutable tree chunks"
         );
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "an ordinary tracked commit must not write commit-root metadata"
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "an ordinary tracked commit must write commit-root metadata"
         );
         assert!(
             writes.has_mutations_in_space(HOT_ROW_SPACE),
@@ -4725,6 +4694,7 @@ mod tests {
             panic!("changelog commit should exist");
         };
         assert_eq!(record.change_id, change_id("test-uuid-2"));
+        assert!(!record.tracked_state_rootless);
         let membership_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -4779,7 +4749,7 @@ mod tests {
                 },
             )
             .await
-            .expect("rootless commit history should replay")
+            .expect("rooted commit history should scan")
             .into_rows();
         assert!(
             commit_rows.is_empty(),
@@ -5357,7 +5327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rootless_serial_history_replays_scan_and_diff() {
+    async fn serial_history_publishes_roots_and_diffs() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -5395,11 +5365,11 @@ mod tests {
             },
         )
         .await
-        .expect("first rootless commit should stage");
+        .expect("first rooted commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "first ordinary commit must remain rootless"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "first ordinary commit must publish its immutable root"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5448,11 +5418,11 @@ mod tests {
             },
         )
         .await
-        .expect("second rootless commit should stage");
+        .expect("second rooted commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "serial ordinary commit must remain rootless"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "serial ordinary commit must publish its immutable root"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5501,11 +5471,11 @@ mod tests {
             },
         )
         .await
-        .expect("third rootless commit should stage");
+        .expect("third rooted commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "serial ordinary commit must remain rootless"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "serial ordinary commit must publish its immutable root"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5546,11 +5516,11 @@ mod tests {
             },
         )
         .await
-        .expect("rootless delete commit should stage");
+        .expect("rooted delete commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "serial delete commit must remain rootless"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "serial delete commit must publish its immutable root"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5672,7 +5642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_reference_commit_stays_rootless_and_replays_first_parent() {
+    async fn selected_reference_commit_publishes_root() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -5708,10 +5678,10 @@ mod tests {
             },
         )
         .await
-        .expect("normal rootless commit should stage");
+        .expect("normal rooted commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "ordinary parent must not materialize a root"
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "ordinary parent must publish a root"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5755,9 +5725,8 @@ mod tests {
         .await
         .expect("selected-reference commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "absolute selected-reference deltas must keep the commit rootless"
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "selected-reference commits must publish root metadata"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5776,7 +5745,7 @@ mod tests {
                 &TrackedStateScanRequest::default(),
             )
             .await
-            .expect("rootless selected-reference commit should replay history")
+            .expect("rooted selected-reference commit should scan")
             .into_rows();
         assert!(matches!(
             rows.as_slice(),
@@ -5816,12 +5785,12 @@ mod tests {
         .await
         .expect("normal tracked commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE),
-            "an ordinary tracked commit must not write immutable tree chunks"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE),
+            "an ordinary tracked commit must write immutable tree chunks"
         );
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "an ordinary tracked commit must not write commit-root metadata"
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "an ordinary tracked commit must write commit-root metadata"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -6487,7 +6456,6 @@ mod tests {
                 (CommitId::for_test_label("child-commit"), vec![1]),
             ]),
             &commits,
-            false,
         )
         .await
         .expect("child-before-parent input should still stage parent first");
@@ -7175,6 +7143,11 @@ mod tests {
         crate::test_support::stage_empty_changelog_commit(&mut read, &mut writes, label, None)
             .await
             .expect("empty commit target should stage");
+        TrackedStateContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit_root(label, None, std::iter::empty())
+            .await
+            .expect("empty commit target root should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await

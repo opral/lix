@@ -149,7 +149,7 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
     fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
-        if metadata.target() == "lix_perf" && metadata.name().starts_with("lix.perf.merge") {
+        if metadata.target() == "lix_perf" {
             Interest::always()
         } else {
             Interest::never()
@@ -157,9 +157,7 @@ where
     }
 
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: TracingContext<'_, S>) {
-        if attrs.metadata().target() != "lix_perf"
-            || !attrs.metadata().name().starts_with("lix.perf.merge")
-        {
+        if attrs.metadata().target() != "lix_perf" {
             return;
         }
         if let Some(span) = ctx.span(id) {
@@ -656,6 +654,7 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
     register_row_schema(&lix).await;
     seed_rows(&lix, &cfg).await;
     seed_history(&lix, &cfg).await;
+    let setup_phases = collector.take_ms();
     lix.close().await.expect("close row setup fixture");
     drop(lix);
     let setup_reopen_started = Instant::now();
@@ -1013,7 +1012,7 @@ async fn run_row_case(cfg: Config, collector: PerfSpanCollector) {
             "storage_before": storage_bytes_before, "storage_after": storage_bytes_after,
             "storage_growth": signed_delta(storage_bytes_after, storage_bytes_before),
         },
-        "phase_ms": { "preview": preview_phases, "merge": merge_phases },
+        "phase_ms": { "setup": setup_phases, "preview": preview_phases, "merge": merge_phases },
         "correctness": {
             "independent_three_way_model": true,
             "preview_non_mutating": true,
