@@ -1062,6 +1062,7 @@ mod tests {
                     canonical_change: change.clone(),
                     change,
                     commit_id: self.start_commit_id,
+                    generation: 0,
                     change_ids: vec![ChangeId::for_test_label("entity-change")],
                     author_account_ids: Vec::new(),
                     parent_commit_ids: Vec::new(),

@@ -1360,6 +1360,7 @@ mod tests {
             CommitRecord {
                 format_version: 1,
                 commit_id: source_commit,
+                generation: 0,
                 parent_commit_ids: Vec::new(),
                 tracked_state_rootless: true,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-source-header"),
@@ -1369,6 +1370,7 @@ mod tests {
             CommitRecord {
                 format_version: 1,
                 commit_id: alias_commit,
+                generation: 0,
                 parent_commit_ids: Vec::new(),
                 tracked_state_rootless: true,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-live-header"),
@@ -1378,6 +1380,7 @@ mod tests {
             CommitRecord {
                 format_version: 1,
                 commit_id: authority_commit,
+                generation: 0,
                 parent_commit_ids: Vec::new(),
                 tracked_state_rootless: true,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-authority-header"),
@@ -1387,6 +1390,7 @@ mod tests {
             CommitRecord {
                 format_version: 1,
                 commit_id: live_head,
+                generation: 1,
                 parent_commit_ids: vec![alias_commit, authority_commit],
                 tracked_state_rootless: true,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-head-header"),
@@ -1517,6 +1521,7 @@ mod tests {
             CommitRecord {
                 format_version: 1,
                 commit_id: live_parent,
+                generation: 0,
                 parent_commit_ids: Vec::new(),
                 tracked_state_rootless: true,
                 change_id: ChangeId::for_test_label("authority-gc-live-parent-header"),
@@ -1526,6 +1531,7 @@ mod tests {
             CommitRecord {
                 format_version: 1,
                 commit_id: live_head,
+                generation: 1,
                 parent_commit_ids: vec![live_parent],
                 tracked_state_rootless: true,
                 change_id: ChangeId::for_test_label("authority-gc-live-head-header"),
@@ -1535,6 +1541,7 @@ mod tests {
             CommitRecord {
                 format_version: 1,
                 commit_id: dead_commit,
+                generation: 0,
                 parent_commit_ids: Vec::new(),
                 tracked_state_rootless: true,
                 change_id: ChangeId::for_test_label("authority-gc-dead-header"),

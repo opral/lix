@@ -743,23 +743,67 @@ where
         append: &ChangelogAppend,
         append_commit_ids: &HashSet<CommitId>,
     ) -> Result<(), LixError> {
-        let parent_ids = append
+        let mut parent_ids = append
             .commits
             .iter()
             .flat_map(|commit| commit.parent_commit_ids.iter().copied())
             .filter(|parent_id| !append_commit_ids.contains(parent_id))
-            .collect::<HashSet<_>>();
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        parent_ids.sort_unstable();
         let keys = parent_ids
             .iter()
             .map(|id| commit_key(*id))
             .collect::<Vec<_>>();
+        let mut parent_generations = HashMap::<CommitId, u64>::new();
         for (parent_id, found) in parent_ids
             .iter()
             .zip(get_many(self.store, COMMIT_SPACE, keys).await?)
         {
-            if found.is_none() && !self.staged_commits.contains_key(parent_id) {
+            let generation = match found {
+                Some(bytes) => {
+                    let record: CommitRecord = storage_codec::decode("commit record", &bytes)?;
+                    record.generation
+                }
+                None => self
+                    .staged_commits
+                    .get(parent_id)
+                    .map(|commit| commit.generation)
+                    .ok_or_else(|| {
+                        LixError::unknown(format!(
+                            "changelog parent commit '{parent_id}' does not exist"
+                        ))
+                    })?,
+            };
+            parent_generations.insert(*parent_id, generation);
+        }
+        let append_generations = append
+            .commits
+            .iter()
+            .map(|commit| (commit.commit_id, commit.generation))
+            .collect::<HashMap<_, _>>();
+        for commit in &append.commits {
+            let expected_generation = commit
+                .parent_commit_ids
+                .iter()
+                .map(|parent_id| {
+                    append_generations
+                        .get(parent_id)
+                        .or_else(|| parent_generations.get(parent_id))
+                        .copied()
+                        .expect("every parent generation was resolved")
+                })
+                .max()
+                .map_or(Ok(0), |generation| {
+                    generation
+                        .checked_add(1)
+                        .ok_or_else(|| LixError::unknown("commit generation exceeds u64"))
+                })?;
+            if commit.generation != expected_generation {
                 return Err(LixError::unknown(format!(
-                    "changelog parent commit '{parent_id}' does not exist"
+                    "changelog commit '{}' has generation {}, expected {expected_generation}",
+                    commit.commit_id, commit.generation
                 )));
             }
         }

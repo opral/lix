@@ -231,6 +231,7 @@ pub fn append_ordered_commits(
         append.commits.push(CommitRecord {
             format_version: 1,
             commit_id: CommitId::new(ordered_bench_uuid(commit_index, 0)),
+            generation: 0,
             parent_commit_ids: Vec::new(),
             tracked_state_rootless: false,
             change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
@@ -591,6 +592,7 @@ fn direct_append_with_shape(
         append.commits.push(CommitRecord {
             format_version: 1,
             commit_id: typed_commit_id,
+            generation: 0,
             parent_commit_ids: Vec::new(),
             tracked_state_rootless: false,
             change_id: ChangeId::for_test_label(&commit_change_id),

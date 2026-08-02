@@ -890,6 +890,95 @@ async fn stage_changelog_commits(
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
+    let staged_commit_ids = commit_rows
+        .iter()
+        .map(|commit| commit.commit_id)
+        .collect::<BTreeSet<_>>();
+    if staged_commit_ids.len() != commit_rows.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "transaction contains duplicate staged commit ids",
+        ));
+    }
+    let external_parent_ids = commit_rows
+        .iter()
+        .flat_map(|commit| commit.parent_commit_ids.iter().copied())
+        .filter(|parent| !staged_commit_ids.contains(parent))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let external_parent_records = ChangelogContext::new()
+        .reader(&mut *read)
+        .load_commits(ChangelogCommitLoadRequest {
+            commit_ids: &external_parent_ids,
+        })
+        .await?;
+    let mut generations = external_parent_ids
+        .into_iter()
+        .zip(external_parent_records.entries)
+        .map(|(commit_id, record)| {
+            record
+                .map(|record| (commit_id, record.generation))
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("commit '{commit_id}' has a missing parent"),
+                    )
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let mut staged_parent_count = BTreeMap::<CommitId, usize>::new();
+    let mut children = BTreeMap::<CommitId, Vec<CommitId>>::new();
+    for commit in commit_rows {
+        let mut count = 0;
+        for parent in &commit.parent_commit_ids {
+            if staged_commit_ids.contains(parent) {
+                count += 1;
+                children.entry(*parent).or_default().push(commit.commit_id);
+            }
+        }
+        staged_parent_count.insert(commit.commit_id, count);
+    }
+    let mut ready = staged_parent_count
+        .iter()
+        .filter_map(|(commit_id, count)| (*count == 0).then_some(*commit_id))
+        .collect::<BTreeSet<_>>();
+    let commit_rows_by_id = commit_rows
+        .iter()
+        .map(|commit| (commit.commit_id, commit))
+        .collect::<BTreeMap<_, _>>();
+    while let Some(commit_id) = ready.pop_first() {
+        let commit = commit_rows_by_id[&commit_id];
+        let generation = commit
+            .parent_commit_ids
+            .iter()
+            .filter_map(|parent| generations.get(parent).copied())
+            .max()
+            .map_or(Ok(0), |generation| {
+                generation
+                    .checked_add(1)
+                    .ok_or_else(|| LixError::unknown("commit generation exceeds u64"))
+            })?;
+        generations.insert(commit_id, generation);
+        for child in children.get(&commit_id).into_iter().flatten() {
+            let remaining = staged_parent_count
+                .get_mut(child)
+                .expect("staged child has a parent count");
+            *remaining -= 1;
+            if *remaining == 0 {
+                ready.insert(*child);
+            }
+        }
+    }
+    if staged_commit_ids
+        .iter()
+        .any(|commit_id| !generations.contains_key(commit_id))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "staged commit graph contains a parent cycle",
+        ));
+    }
     let changes = state_rows
         .iter()
         // Ordinary untracked members are intentionally current-state only in
@@ -908,6 +997,7 @@ async fn stage_changelog_commits(
         .collect::<Result<Vec<_>, _>>()?;
     let mut staged = BTreeMap::<CommitId, StagedChangelogCommit>::new();
     for commit_row in commit_rows {
+        let generation = generations[&commit_row.commit_id];
         let state_row_indices = tracked_row_indices_by_commit
             .get(&commit_row.commit_id)
             .map(Vec::as_slice)
@@ -930,6 +1020,7 @@ async fn stage_changelog_commits(
         commits.push(CommitRecord {
             format_version: 1,
             commit_id: commit_row.commit_id,
+            generation,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
             tracked_state_rootless: false,
             change_id: commit_row.change_id,
@@ -6925,6 +7016,8 @@ mod tests {
             .await
             .expect("commits should load");
         assert!(commits.entries.iter().all(Option::is_some));
+        assert_eq!(commits.entries[0].as_ref().unwrap().generation, 0);
+        assert_eq!(commits.entries[1].as_ref().unwrap().generation, 1);
     }
 
     #[tokio::test]
