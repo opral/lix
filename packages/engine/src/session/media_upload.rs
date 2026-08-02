@@ -7,6 +7,7 @@ use crate::storage_adapter::{
     MAX_SCAN_PAGE_ROWS, Storage, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
     StorageKey, StorageKeyRange, StoragePrecondition, StorageProjectedValue, StorageReadOptions,
     StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteOptions,
+    exact_get_many,
 };
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{Blob, LixError};
@@ -369,15 +370,17 @@ async fn load_upload_state(
     store: &impl crate::storage_adapter::StorageAdapterRead,
     key: &StorageKey,
 ) -> Result<Option<UploadState>, LixError> {
-    let values = store
-        .get_many(&[StorageGetManyRequest {
+    let values = exact_get_many(
+        store,
+        &[StorageGetManyRequest {
             space: UPLOAD_STATE_SPACE,
             keys: std::slice::from_ref(key),
             opts: StorageGetOptions {
                 projection: StorageCoreProjection::FullValue,
             },
-        }])
-        .await?;
+        }],
+    )
+    .await?;
     let Some(value) = values.values.into_iter().next().flatten() else {
         return Ok(None);
     };
@@ -547,15 +550,17 @@ async fn load_upload_manifest_leaf(
     store: &impl crate::storage_adapter::StorageAdapterRead,
     key: &StorageKey,
 ) -> Result<Option<UploadManifestLeaf>, LixError> {
-    let values = store
-        .get_many(&[StorageGetManyRequest {
+    let values = exact_get_many(
+        store,
+        &[StorageGetManyRequest {
             space: UPLOAD_MANIFEST_LEAF_SPACE,
             keys: std::slice::from_ref(key),
             opts: StorageGetOptions {
                 projection: StorageCoreProjection::FullValue,
             },
-        }])
-        .await?;
+        }],
+    )
+    .await?;
     let Some(StorageProjectedValue::FullValue(value)) = values.values.into_iter().next().flatten()
     else {
         return Ok(None);

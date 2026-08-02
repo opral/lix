@@ -193,7 +193,7 @@ where
             .await?;
         let mut rows = Vec::with_capacity(records.len() * scope.branch_ids.len());
         for branch_id in scope.branch_ids {
-            for (requested_commit_id, record) in commit_ids.iter().zip(&records) {
+            for (requested_commit_id, record) in records.iter() {
                 let Some(record) = record else {
                     continue;
                 };
@@ -261,15 +261,11 @@ where
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let nodes = reads
-            .commit_graph
-            .reader(reads.store)
-            .load_nodes(&child_ids)
-            .await?;
-        let nodes_by_id = child_ids
+        let mut graph_reader = reads.commit_graph.reader(reads.store);
+        let nodes = graph_reader.load_nodes(&child_ids).await?;
+        let nodes_by_id = nodes
             .into_iter()
-            .zip(nodes)
-            .filter_map(|(commit_id, node)| node.map(|node| (commit_id, node)))
+            .filter_map(|(commit_id, node)| node.map(|node| (*commit_id, node)))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut edges = Vec::with_capacity(edge_ids.len());
         for (child_commit_id, parent_order) in edge_ids {

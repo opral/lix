@@ -40,7 +40,7 @@ use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, ScanPlan, StorageAdapter,
     StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
     StorageKey, StoragePrefix, StorageProjectedValue, StorageReadOptions, StorageScanOptions,
-    StorageSpace, StorageWriteSet,
+    StorageSpace, StorageWriteSet, exact_get_many,
 };
 use crate::{LixError, storage_codec};
 
@@ -285,10 +285,10 @@ impl<S> ChangelogReader for ChangelogStoreReader<S>
 where
     S: ChangelogStorageRead + Send,
 {
-    async fn load_commits(
+    async fn load_commits<'a>(
         &mut self,
-        request: CommitLoadRequest<'_>,
-    ) -> Result<CommitLoadBatch, LixError> {
+        request: CommitLoadRequest<'a>,
+    ) -> Result<CommitLoadBatch<'a>, LixError> {
         load_commits_from_store(&mut self.store, request).await
     }
 
@@ -299,10 +299,10 @@ where
         scan_commits_from_store(&mut self.store, request).await
     }
 
-    async fn load_changes(
+    async fn load_changes<'a>(
         &mut self,
-        request: ChangeLoadRequest<'_>,
-    ) -> Result<ChangeLoadBatch, LixError> {
+        request: ChangeLoadRequest<'a>,
+    ) -> Result<ChangeLoadBatch<'a>, LixError> {
         load_changes_from_store(&mut self.store, request).await
     }
 
@@ -319,15 +319,13 @@ impl<S> ChangelogReader for ChangelogStoreWriter<'_, S>
 where
     S: ChangelogStorageRead + Send + ?Sized,
 {
-    async fn load_commits(
+    async fn load_commits<'a>(
         &mut self,
-        request: CommitLoadRequest<'_>,
-    ) -> Result<CommitLoadBatch, LixError> {
+        request: CommitLoadRequest<'a>,
+    ) -> Result<CommitLoadBatch<'a>, LixError> {
         let stored = load_commits_from_store(self.store, request).await?;
-        let entries = request
-            .commit_ids
-            .iter()
-            .zip(stored.entries)
+        let entries = stored
+            .into_iter()
             .map(|(commit_id, stored)| {
                 if let Some(record) = self.staged_commits.get(commit_id) {
                     return Some(record.clone());
@@ -335,7 +333,7 @@ where
                 stored
             })
             .collect();
-        Ok(CommitLoadBatch { entries })
+        CommitLoadBatch::try_new("changelog commit overlay", request.commit_ids, entries)
     }
 
     async fn scan_commits(
@@ -365,18 +363,16 @@ where
         Ok(batch)
     }
 
-    async fn load_changes(
+    async fn load_changes<'a>(
         &mut self,
-        request: ChangeLoadRequest<'_>,
-    ) -> Result<ChangeLoadBatch, LixError> {
+        request: ChangeLoadRequest<'a>,
+    ) -> Result<ChangeLoadBatch<'a>, LixError> {
         let stored = load_changes_from_store(self.store, request).await?;
-        let entries = request
-            .change_ids
-            .iter()
-            .zip(stored.entries)
+        let entries = stored
+            .into_iter()
             .map(|(change_id, stored)| self.staged_changes.get(change_id).cloned().or(stored))
             .collect();
-        Ok(ChangeLoadBatch { entries })
+        ChangeLoadBatch::try_new("changelog change overlay", request.change_ids, entries)
     }
 
     async fn scan_changes(
@@ -811,10 +807,10 @@ where
     }
 }
 
-async fn load_commits_from_store(
+async fn load_commits_from_store<'a>(
     store: &mut (impl ChangelogStorageRead + ?Sized),
-    request: CommitLoadRequest<'_>,
-) -> Result<CommitLoadBatch, LixError> {
+    request: CommitLoadRequest<'a>,
+) -> Result<CommitLoadBatch<'a>, LixError> {
     let keys = request
         .commit_ids
         .iter()
@@ -822,7 +818,7 @@ async fn load_commits_from_store(
         .collect::<Vec<_>>();
     let commit_values = get_many(store, COMMIT_SPACE, keys).await?;
     let mut entries = Vec::with_capacity(request.commit_ids.len());
-    for (_commit_id, value) in request.commit_ids.iter().zip(commit_values) {
+    for value in commit_values {
         let Some(value) = value else {
             entries.push(None);
             continue;
@@ -830,7 +826,7 @@ async fn load_commits_from_store(
         let record = storage_codec::decode("commit record", &value)?;
         entries.push(Some(record));
     }
-    Ok(CommitLoadBatch { entries })
+    CommitLoadBatch::try_new("changelog commit", request.commit_ids, entries)
 }
 
 async fn scan_commits_from_store(
@@ -883,10 +879,10 @@ async fn scan_commits_from_store(
     })
 }
 
-async fn load_changes_from_store(
+async fn load_changes_from_store<'a>(
     store: &mut (impl ChangelogStorageRead + ?Sized),
-    request: ChangeLoadRequest<'_>,
-) -> Result<ChangeLoadBatch, LixError> {
+    request: ChangeLoadRequest<'a>,
+) -> Result<ChangeLoadBatch<'a>, LixError> {
     let keys = request
         .change_ids
         .iter()
@@ -903,7 +899,7 @@ async fn load_changes_from_store(
                 .transpose()
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    Ok(ChangeLoadBatch { entries })
+    ChangeLoadBatch::try_new("changelog change", request.change_ids, entries)
 }
 
 async fn scan_changes_from_store(
@@ -1026,7 +1022,7 @@ where
             opts: StorageGetOptions::default(),
         })
         .collect::<Vec<_>>();
-    let mut values = read.get_many(&requests).await?.values.into_iter();
+    let mut values = exact_get_many(read, &requests).await?.values.into_iter();
     Ok(requests
         .iter()
         .map(|request| {

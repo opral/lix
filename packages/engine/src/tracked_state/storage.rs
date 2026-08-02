@@ -16,6 +16,7 @@ use crate::storage_adapter::{
     StorageCoreProjection, StorageError, StorageGetManyRequest, StorageGetManyResult,
     StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageScanChunk,
     StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    exact_get_many,
 };
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
@@ -5671,18 +5672,7 @@ where
         &self,
         requests: &[StorageGetManyRequest<'_>],
     ) -> Result<StorageGetManyResult, StorageError> {
-        let mut result = self.store.get_many(requests).await?;
-        let requested = requests
-            .iter()
-            .map(|request| request.keys.len())
-            .sum::<usize>();
-        if result.values.len() != requested {
-            return Err(StorageError::Corruption(format!(
-                "tracked-state staged audit requested {} point reads but storage returned {} slots",
-                requested,
-                result.values.len()
-            )));
-        }
+        let mut result = exact_get_many(self.store, requests).await?;
         let mut slots = result.values.iter_mut();
         for request in requests {
             for (key, slot) in request.keys.iter().zip(slots.by_ref()) {

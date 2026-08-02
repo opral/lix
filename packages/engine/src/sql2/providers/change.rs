@@ -279,10 +279,9 @@ where
             change_ids: std::slice::from_ref(&change_id),
         })
         .await?
-        .entries
         .into_iter()
         .next()
-        .flatten()
+        .and_then(|(_, value)| value)
     {
         return Ok(Some(LixChangeRow::Direct(change)));
     }
@@ -310,10 +309,9 @@ where
             commit_ids: std::slice::from_ref(&commit_id),
         })
         .await?
-        .entries
         .into_iter()
         .next()
-        .flatten()
+        .and_then(|(_, value)| value)
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,

@@ -1703,13 +1703,14 @@ where
             return Ok(());
         }
         let commit_id_typed = CommitId::parse_lix(commit_id, "commit-delta winner commit_id")?;
+        let commit_ids = [commit_id_typed];
         let mut changelog_reader = ChangelogContext::new().reader(&mut self.store);
         let batch = changelog_reader
             .load_commits(CommitLoadRequest {
-                commit_ids: &[commit_id_typed],
+                commit_ids: &commit_ids,
             })
             .await?;
-        let Some(_) = batch.entries.into_iter().next().flatten() else {
+        let Some(_) = batch.into_iter().next().and_then(|(_, value)| value) else {
             return Err(LixError::unknown(format!(
                 "changelog commit '{commit_id}' is missing while validating tracked-state commit-root rows"
             )));
@@ -1813,7 +1814,7 @@ where
                 commit_ids: &commit_ids,
             })
             .await?;
-        let Some(entry) = batch.entries.into_iter().next().flatten() else {
+        let Some(entry) = batch.into_iter().next().and_then(|(_, value)| value) else {
             return Err(LixError::unknown(format!(
                 "changelog commit '{commit_id}' is missing while validating tracked-state commit-root metadata"
             )));
@@ -1886,7 +1887,7 @@ where
                 commit_ids: &commit_ids,
             })
             .await?;
-        let Some(commit) = batch.entries.into_iter().next().flatten() else {
+        let Some(commit) = batch.into_iter().next().and_then(|(_, value)| value) else {
             return Ok(None);
         };
         for parent_id in commit.parent_commit_ids.iter().skip(1) {
@@ -3141,13 +3142,14 @@ where
             return Ok(cached.clone());
         }
         let record = {
+            let commit_ids = [commit_id];
             let mut reader = ChangelogContext::new().reader(&self.store);
             let batch = reader
                 .load_commits(CommitLoadRequest {
-                    commit_ids: &[commit_id],
+                    commit_ids: &commit_ids,
                 })
                 .await?;
-            match batch.entries.into_iter().next().flatten() {
+            match batch.into_iter().next().and_then(|(_, value)| value) {
                 Some(record) => record,
                 None => {
                     return Err(LixError::new(

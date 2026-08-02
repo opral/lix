@@ -556,9 +556,8 @@ async fn stage_test_changelog_commit(
         })
         .await?;
     let generation = parent_records
-        .entries
         .into_iter()
-        .map(|record| {
+        .map(|(_, record)| {
             record
                 .map(|record| record.generation)
                 .ok_or_else(|| crate::LixError::unknown("test changelog parent commit is missing"))

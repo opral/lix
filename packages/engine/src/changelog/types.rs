@@ -1,5 +1,6 @@
 use crate::LixError;
 use crate::common::LixTimestamp;
+use crate::common::{ExactBatch, ExactValue};
 use crate::entity_pk::EntityPk;
 use crate::json_store::{JsonRef, JsonSlot};
 use std::fmt;
@@ -333,9 +334,12 @@ pub(crate) struct CommitLoadRequest<'a> {
     pub(crate) commit_ids: &'a [CommitId],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommitLoadBatch {
-    pub(crate) entries: Vec<Option<CommitRecord>>,
+pub(crate) type CommitLoadBatch<'a> = ExactBatch<'a, CommitId, CommitRecord>;
+
+impl ExactValue<CommitId> for CommitRecord {
+    fn matches_exact_key(&self, key: &CommitId) -> bool {
+        self.commit_id == *key
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -452,9 +456,12 @@ pub(crate) struct ChangeLoadRequest<'a> {
     pub(crate) change_ids: &'a [ChangeId],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ChangeLoadBatch {
-    pub(crate) entries: Vec<Option<ChangeRecord>>,
+pub(crate) type ChangeLoadBatch<'a> = ExactBatch<'a, ChangeId, ChangeRecord>;
+
+impl ExactValue<ChangeId> for ChangeRecord {
+    fn matches_exact_key(&self, key: &ChangeId) -> bool {
+        self.change_id == *key
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

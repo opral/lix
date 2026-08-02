@@ -19,6 +19,7 @@ use crate::commit_graph::{
     CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
     CommitGraphHistory, CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
 };
+use crate::common::ExactBatch;
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -83,13 +84,13 @@ where
             .await?
             .into_iter()
             .next()
-            .flatten())
+            .and_then(|(_, value)| value))
     }
 
-    pub(crate) async fn load_nodes(
+    pub(crate) async fn load_nodes<'a>(
         &mut self,
-        commit_ids: &[CommitId],
-    ) -> Result<Vec<Option<CommitGraphNode>>, LixError> {
+        commit_ids: &'a [CommitId],
+    ) -> Result<ExactBatch<'a, CommitId, CommitGraphNode>, LixError> {
         let uncached_ids = commit_ids
             .iter()
             .filter(|commit_id| !self.node_cache.contains_key(commit_id))
@@ -99,21 +100,21 @@ where
             .collect::<Vec<_>>();
         if !uncached_ids.is_empty() {
             let mut reader = ChangelogContext::new().reader(&self.store);
-            let entries = reader
+            let batch = reader
                 .load_commits(CommitLoadRequest {
                     commit_ids: &uncached_ids,
                 })
-                .await?
-                .entries;
-            for (commit_id, entry) in uncached_ids.into_iter().zip(entries) {
+                .await?;
+            for (commit_id, entry) in batch {
                 self.node_cache
-                    .insert(commit_id, entry.map(commit_graph_node_from_commit_record));
+                    .insert(*commit_id, entry.map(commit_graph_node_from_commit_record));
             }
         }
-        Ok(commit_ids
+        let nodes = commit_ids
             .iter()
             .map(|commit_id| self.node_cache.get(commit_id).cloned().unwrap_or(None))
-            .collect())
+            .collect();
+        ExactBatch::try_new("commit graph", commit_ids, nodes)
     }
 
     /// Loads every direct commit fact from the changelog.
@@ -182,14 +183,16 @@ where
         left_commit_id: &CommitId,
         right_commit_id: &CommitId,
     ) -> Result<CommitId, LixError> {
-        let heads = self
-            .load_nodes(&[*left_commit_id, *right_commit_id])
-            .await?;
-        let left = heads[0]
-            .as_ref()
+        let head_ids = [*left_commit_id, *right_commit_id];
+        let heads = self.load_nodes(&head_ids).await?;
+        let mut heads = heads.into_iter().map(|(_, node)| node);
+        let left = heads
+            .next()
+            .flatten()
             .ok_or_else(|| missing_commit_graph_error(left_commit_id))?;
-        let right = heads[1]
-            .as_ref()
+        let right = heads
+            .next()
+            .flatten()
             .ok_or_else(|| missing_commit_graph_error(right_commit_id))?;
 
         if left_commit_id == right_commit_id {
@@ -206,12 +209,13 @@ where
             right.parent_commit_ids.as_slice(),
         ) && left_parent == right_parent
         {
+            let parent_ids = [*left_parent];
             if self
-                .load_nodes(&[*left_parent])
+                .load_nodes(&parent_ids)
                 .await?
                 .into_iter()
                 .next()
-                .flatten()
+                .and_then(|(_, value)| value)
                 .is_none()
             {
                 return Err(missing_commit_graph_error(left_parent));

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use bytes::Bytes;
 
 use crate::LixError;
-use crate::common::SharedStr;
+use crate::common::{ExactBatch, SharedStr};
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonStoreContext,
 };
@@ -86,9 +86,9 @@ where
     }
     let records = load_unique_change_records_in_order(store, &unique).await?;
     let mut by_id = HashMap::with_capacity(unique.len());
-    for (change_id, record) in unique.into_iter().zip(records) {
+    for (change_id, record) in records {
         if let Some(record) = record {
-            by_id.insert(change_id, record);
+            by_id.insert(*change_id, record);
         }
     }
     Ok(by_id)
@@ -102,15 +102,15 @@ where
 /// materialized value vector for the common identity mapping. Decoded records
 /// retain that same order so batch materialization does not need an
 /// intermediate `HashMap`.
-async fn load_unique_change_records_in_order<S>(
+async fn load_unique_change_records_in_order<'a, S>(
     store: &S,
-    unique: &[ChangeId],
-) -> Result<Vec<Option<ChangeRecord>>, LixError>
+    unique: &'a [ChangeId],
+) -> Result<ExactBatch<'a, ChangeId, ChangeRecord>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
     if unique.is_empty() {
-        return Ok(Vec::new());
+        return ExactBatch::try_new("change materialization", unique, Vec::new());
     }
     let keys = change_storage_keys(unique)?;
     let plan = PointReadPlan::from_unique_keys(CHANGE_SPACE, keys);
@@ -121,18 +121,8 @@ where
 fn decode_change_records_in_order(
     unique: &[ChangeId],
     values: Vec<Option<StorageProjectedValue>>,
-) -> Result<Vec<Option<ChangeRecord>>, LixError> {
-    if values.len() != unique.len() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "change point read returned {} values for {} unique ids",
-                values.len(),
-                unique.len()
-            ),
-        ));
-    }
-    unique
+) -> Result<ExactBatch<'_, ChangeId, ChangeRecord>, LixError> {
+    let records = unique
         .iter()
         .copied()
         .zip(values)
@@ -148,7 +138,8 @@ fn decode_change_records_in_order(
                 ),
             )),
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    ExactBatch::try_new("change materialization", unique, records)
 }
 
 fn change_storage_keys(
@@ -415,6 +406,10 @@ mod tests {
             ],
         )
         .expect("ordered change records should decode");
+        let records = records
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect::<Vec<_>>();
 
         assert_eq!(records.len(), change_ids.len());
         let first = records[0].as_ref().expect("first record");
@@ -438,7 +433,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("returned 1 values for 2 unique ids")
+                .contains("returned 1 values for 2 requested keys")
         );
     }
 

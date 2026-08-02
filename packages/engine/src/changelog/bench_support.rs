@@ -733,7 +733,10 @@ where
             commit_ids: &commit_ids,
         })
         .await?;
-    Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
+    Ok(batch
+        .into_iter()
+        .filter(|(_, entry)| entry.is_some())
+        .count())
 }
 
 async fn load_changes_with_lookup<StorageImpl, S: AsRef<str> + Sync>(
@@ -758,7 +761,10 @@ where
             change_ids: &change_ids,
         })
         .await?;
-    Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
+    Ok(batch
+        .into_iter()
+        .filter(|(_, entry)| entry.is_some())
+        .count())
 }
 
 #[expect(clippy::cast_possible_truncation)]
