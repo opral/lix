@@ -1648,18 +1648,7 @@ async fn stage_tracked_commit_delta_index(
                 stage_ordered_addressable_commit_deltas(writes, deltas, order_certified)?
             };
             if let Some(ordered_stage) = ordered_stage {
-                if ordered_stage.row_count() != state_row_indices.len() {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "ordered commit-delta assignment count changed during staging",
-                    ));
-                }
-                for (&row_index, change_id) in state_row_indices
-                    .iter()
-                    .zip(ordered_stage.assigned_change_ids())
-                {
-                    state_rows.set_change_id(row_index, Some(change_id));
-                }
+                state_rows.set_ordered_addressable_change_ids(state_row_indices, ordered_stage)?;
                 ordered_addressable_commits.insert(root.commit_id);
                 continue;
             }

@@ -405,33 +405,58 @@ pub(crate) struct AddressableCommitDeltaStage {
 
 /// Compact assignment map for an already ordered, fully addressable commit.
 ///
-/// Segment lengths reconstruct every direct change id in source order. This
-/// avoids retaining one UUID per row while the prepared batch and backend
+/// Full 512-row segments derive their direct addresses from the row ordinal.
+/// Byte-limited irregular segments retain one packed u32 address per row. Both
+/// shapes avoid retaining one UUID per row while the prepared batch and backend
 /// write batch are simultaneously live.
+#[derive(Debug, Clone)]
 pub(crate) struct OrderedAddressableCommitDeltaStage {
     commit_id: CommitId,
-    segment_row_counts: Vec<u16>,
+    change_addresses: OrderedChangeAddresses,
     row_count: usize,
+}
+
+#[derive(Debug, Clone)]
+enum OrderedChangeAddresses {
+    Dense,
+    Packed(Vec<u32>),
 }
 
 impl OrderedAddressableCommitDeltaStage {
     pub(crate) fn assigned_change_ids(
         &self,
     ) -> impl Iterator<Item = crate::changelog::ChangeId> + '_ {
-        let commit_id = self.commit_id;
-        self.segment_row_counts
-            .iter()
-            .enumerate()
-            .flat_map(move |(segment_index, &row_count)| {
-                (0..row_count).map(move |ordinal| {
-                    addressable_change_id(commit_id, segment_index, usize::from(ordinal))
-                        .expect("staged ordered address is inside the direct change-id space")
-                })
-            })
+        (0..self.row_count).map(|row_index| {
+            self.change_id_at(row_index)
+                .expect("ordered change assignment covers every row")
+        })
     }
 
     pub(crate) fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    pub(crate) fn change_id_at(&self, row_index: usize) -> Option<crate::changelog::ChangeId> {
+        if row_index >= self.row_count {
+            return None;
+        }
+        let packed = match &self.change_addresses {
+            OrderedChangeAddresses::Dense => u32::try_from(row_index)
+                .expect("ordered commit-delta row index fits direct address space")
+                .checked_add(1)
+                .expect("ordered commit-delta address fits direct address space"),
+            OrderedChangeAddresses::Packed(addresses) => addresses[row_index],
+        };
+        Some(change_id_from_packed_address(self.commit_id, packed))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_dense(commit_id: CommitId, row_count: usize) -> Self {
+        Self {
+            commit_id,
+            change_addresses: OrderedChangeAddresses::Dense,
+            row_count,
+        }
     }
 }
 
@@ -1222,7 +1247,7 @@ where
     let Some(first) = probe.next().transpose()? else {
         return Ok(Some(OrderedAddressableCommitDeltaStage {
             commit_id: CommitId::default(),
-            segment_row_counts: Vec::new(),
+            change_addresses: OrderedChangeAddresses::Dense,
             row_count: 0,
         }));
     };
@@ -1354,9 +1379,35 @@ where
         key(commit_delta_manifest_key(commit_id)),
         value(encode_commit_delta_manifest(&manifest)?),
     );
+    let dense_addresses = segment_row_counts
+        .iter()
+        .take(segment_row_counts.len().saturating_sub(1))
+        .all(|&count| usize::from(count) == COMMIT_DELTA_SEGMENT_MAX_ROWS);
+    let change_addresses = if dense_addresses {
+        OrderedChangeAddresses::Dense
+    } else {
+        let mut packed = Vec::with_capacity(row_count);
+        for (segment_index, &segment_rows) in segment_row_counts.iter().enumerate() {
+            let segment_base = u32::try_from(segment_index)
+                .expect("ordered commit-delta segment index fits u32")
+                .checked_mul(
+                    u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                        .expect("segment row limit fits u32"),
+                )
+                .expect("ordered commit-delta segment base fits direct address space");
+            packed.extend((0..segment_rows).map(|ordinal| {
+                segment_base
+                    .checked_add(u32::from(ordinal))
+                    .and_then(|address| address.checked_add(1))
+                    .expect("ordered commit-delta address fits u32")
+            }));
+        }
+        debug_assert_eq!(packed.len(), row_count);
+        OrderedChangeAddresses::Packed(packed)
+    };
     Ok(Some(OrderedAddressableCommitDeltaStage {
         commit_id,
-        segment_row_counts,
+        change_addresses,
         row_count,
     }))
 }
@@ -1696,11 +1747,13 @@ fn addressable_change_id(
                 "tracked_state commit_delta address exceeds u32",
             )
         })?;
+    Ok(change_id_from_packed_address(commit_id, packed))
+}
+
+fn change_id_from_packed_address(commit_id: CommitId, packed: u32) -> crate::changelog::ChangeId {
     let mut bytes = *commit_id.as_uuid().as_bytes();
     bytes[12..].copy_from_slice(&packed.to_be_bytes());
-    Ok(crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
-        bytes,
-    )))
+    crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(bytes))
 }
 
 fn commit_delta_change_locators(
@@ -6068,6 +6121,106 @@ mod tests {
             assert_eq!(generic_loaded.created_at, loaded.created_at);
             assert_eq!(generic_loaded.origin_key, loaded.origin_key);
         }
+    }
+
+    #[tokio::test]
+    async fn irregular_ordered_segment_addresses_match_the_manifest() {
+        use std::fmt::Write as _;
+
+        const ROW_COUNT: usize = 700;
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_9876_0000_0000,
+        ));
+        let fixtures = (0..ROW_COUNT)
+            .map(|index| CommitDeltaFixture {
+                schema_key: "irregular".to_string(),
+                file_id: None,
+                entity_pk: EntityPk::single(format!("entity-{index:04}")),
+                change_id: ChangeId::for_test_label(&format!("irregular-change-{index}")),
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(index as i64 + 1),
+            })
+            .collect::<Vec<_>>();
+        let snapshots = (0..ROW_COUNT)
+            .map(|index| {
+                let mut state = (index as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                let mut payload = String::with_capacity(1_024);
+                for _ in 0..64 {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    write!(&mut payload, "{state:016x}").expect("write deterministic payload");
+                }
+                format!(r#"{{"payload":"{payload}"}}"#)
+            })
+            .collect::<Vec<_>>();
+        let deltas = fixtures
+            .iter()
+            .zip(&snapshots)
+            .map(|(fixture, snapshot)| {
+                commit_delta_ref(
+                    commit_id,
+                    fixture,
+                    crate::json_store::JsonSlotRef::Inline(snapshot),
+                    crate::json_store::JsonSlotRef::None,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_ordered_addressable_commit_deltas(
+            &mut writes,
+            deltas.iter().copied().map(Ok::<_, LixError>),
+            true,
+        )
+        .expect("irregular ordered deltas should stage")
+        .expect("certified ordered deltas should use the streaming route");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("irregular ordered deltas should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("irregular ordered read should open");
+        let certificate = super::load_commit_delta_selection_certificate(&read, commit_id)
+            .await
+            .expect("irregular selection certificate should load")
+            .expect("irregular ordered commit should have a certificate");
+        assert!(
+            certificate
+                .direct_segment_row_counts
+                .iter()
+                .take(certificate.direct_segment_row_counts.len() - 1)
+                .any(|&count| usize::from(count) < super::COMMIT_DELTA_SEGMENT_MAX_ROWS),
+            "payload bytes should force a non-final segment below the row limit"
+        );
+        let assigned = staged.assigned_change_ids().collect::<Vec<_>>();
+        assert_eq!(assigned.len(), ROW_COUNT);
+        assert_eq!(staged.change_id_at(ROW_COUNT), None);
+
+        let mut row_start = 0usize;
+        for (segment_index, &segment_rows) in
+            certificate.direct_segment_row_counts.iter().enumerate()
+        {
+            for row_index in [row_start, row_start + usize::from(segment_rows) - 1] {
+                assert_eq!(staged.change_id_at(row_index), Some(assigned[row_index]));
+                let locator = super::direct_change_locator(assigned[row_index])
+                    .expect("assigned id should carry a direct locator");
+                assert_eq!(locator.segment_index, segment_index as u32);
+                assert_eq!(locator.ordinal as usize, row_index - row_start);
+                let loaded = load_change_record_by_id(&read, assigned[row_index])
+                    .await
+                    .expect("irregular direct address should read")
+                    .expect("irregular direct address should resolve");
+                assert_eq!(loaded.entity_pk, fixtures[row_index].entity_pk);
+            }
+            row_start += usize::from(segment_rows);
+        }
+        assert_eq!(row_start, ROW_COUNT);
     }
 
     #[tokio::test]

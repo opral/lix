@@ -365,7 +365,7 @@ impl PreparedInsertSelection {
             row_count: 0,
             count: 0,
             bits: Vec::with_capacity(row_capacity.div_ceil(Self::WORD_BITS)),
-            origins: Vec::with_capacity(row_capacity),
+            origins: Vec::new(),
             statement_indices: Vec::new(),
             statement_indices_are_row_ordinals: false,
         }
@@ -392,7 +392,7 @@ impl PreparedInsertSelection {
 
     pub(crate) fn origin(&self, row_index: usize) -> Option<&TransactionWriteOrigin> {
         self.contains(row_index)
-            .then(|| self.origins[row_index].as_ref())
+            .then(|| self.origins.get(row_index).and_then(Option::as_ref))
             .flatten()
     }
 
@@ -405,7 +405,7 @@ impl PreparedInsertSelection {
             .map(|row_index| PreparedInsertRef {
                 row_index,
                 row: rows.row(row_index),
-                origin: self.origins[row_index].as_ref(),
+                origin: self.origins.get(row_index).and_then(Option::as_ref),
                 statement_index: self.statement_index(row_index),
             })
     }
@@ -433,8 +433,14 @@ impl PreparedInsertSelection {
         {
             *last = (1_u64 << (row_count % Self::WORD_BITS)) - 1;
         }
-        self.origins.resize(row_count, None);
         self.statement_indices_are_row_ordinals = true;
+    }
+
+    pub(crate) fn is_complete_ordinal_selection(&self, row_count: usize) -> bool {
+        self.row_count == row_count
+            && self.count == row_count
+            && self.statement_indices_are_row_ordinals
+            && self.origins.is_empty()
     }
 
     fn push_not_insert(&mut self) {
@@ -445,10 +451,7 @@ impl PreparedInsertSelection {
         if !may_insert && self.is_empty() {
             return;
         }
-        if self.origins.is_empty() {
-            self.origins
-                .reserve(self.row_count.saturating_add(additional));
-        } else {
+        if !self.origins.is_empty() {
             self.origins.reserve(additional);
         }
         let final_words = self
@@ -488,12 +491,18 @@ impl PreparedInsertSelection {
         if self.bits.is_empty() {
             self.bits
                 .resize(self.row_count.div_ceil(Self::WORD_BITS), 0);
-            self.origins.resize(self.row_count, None);
         }
         if self.bits[word] & mask == 0 {
             self.bits[word] |= mask;
             self.count += 1;
-            self.origins[row_index] = origin.cloned();
+            if let Some(origin) = origin {
+                if self.origins.is_empty() {
+                    self.origins.resize(self.row_count, None);
+                }
+                self.origins[row_index] = Some(origin.clone());
+            } else if !self.origins.is_empty() {
+                self.origins[row_index] = None;
+            }
         }
         if let Some(statement_index) = statement_index {
             let statement_index =
@@ -534,7 +543,10 @@ impl PreparedInsertSelection {
         let mut selected = Self::with_row_capacity(source_by_destination.len());
         for &source in source_by_destination {
             if self.contains(source) {
-                selected.push(self.origins[source].as_ref(), self.statement_index(source));
+                selected.push(
+                    self.origins.get(source).and_then(Option::as_ref),
+                    self.statement_index(source),
+                );
             } else {
                 selected.push_not_insert();
             }
@@ -548,7 +560,7 @@ impl PreparedInsertSelection {
         for row_index in 0..other_rows {
             if other.contains(row_index) {
                 self.push(
-                    other.origins[row_index].as_ref(),
+                    other.origins.get(row_index).and_then(Option::as_ref),
                     other.statement_index(row_index),
                 );
             } else {
@@ -3092,8 +3104,12 @@ mod tests {
     fn generic_insert_after_certified_batch_does_not_inherit_statement_index() {
         let mut selection = PreparedInsertSelection::new();
         selection.push_certified_ordinal_inserts(2);
+        assert!(selection.is_complete_ordinal_selection(2));
+        assert!(selection.origins.is_empty());
         selection.push(None, None);
 
+        assert!(!selection.is_complete_ordinal_selection(3));
+        assert!(selection.origins.is_empty());
         assert_eq!(selection.statement_index(0), Some(0));
         assert_eq!(selection.statement_index(1), Some(1));
         assert_eq!(selection.statement_index(2), None);
@@ -5005,7 +5021,7 @@ mod tests {
     }
 
     #[test]
-    fn ten_thousand_inserts_use_two_dense_buffers_and_no_identity_copies() {
+    fn ten_thousand_inserts_use_one_dense_buffer_and_no_identity_copies() {
         const ROW_COUNT: usize = 10_000;
         let staged_writes = test_staged_writes();
         let mut rows = PreparedStateBatch::with_capacity(ROW_COUNT);
@@ -5028,7 +5044,7 @@ mod tests {
             .drain()
             .expect("10k INSERT batch should drain");
         assert_eq!(drained.insert_selection.len(), ROW_COUNT);
-        assert_eq!(drained.insert_selection.large_buffer_count(), 2);
+        assert_eq!(drained.insert_selection.large_buffer_count(), 1);
         assert_eq!(drained.insert_selection.identity_copy_count(), 0);
         assert!(
             (0..ROW_COUNT).all(|row_index| drained.insert_selection.contains(row_index)),
