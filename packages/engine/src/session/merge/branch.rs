@@ -146,7 +146,7 @@ where
                     return Err(LixError::invalid_self_merge(active_branch_id));
                 }
 
-                let (target_head, source_head) = {
+                let (target_head, source_head) = async {
                     let reader = transaction.branch_ref_reader().await;
                     let lifecycle = BranchLifecycle::new(&reader);
                     let target_head = lifecycle
@@ -163,15 +163,19 @@ where
                             BranchReferenceRole::Source,
                         )
                         .await?;
-                    (target_head, source_head)
-                };
+                    Ok::<_, LixError>((target_head, source_head))
+                }
+                .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_branch_refs"))
+                .await?;
 
-                let merge_base = {
+                let merge_base = async {
                     let mut reader = transaction.commit_graph_reader().await;
-                    reader.merge_base(&target_head, &source_head).await?
-                };
+                    reader.merge_base(&target_head, &source_head).await
+                }
+                .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_base"))
+                .await?;
 
-                let analysis = {
+                let analysis = async {
                     let mut reader = transaction.tracked_state_reader().await;
                     analyze(
                         &mut reader,
@@ -181,18 +185,22 @@ where
                             source_commit_id: source_head,
                         },
                     )
-                    .await?
-                };
-                let derived_blob_files = {
+                    .await
+                }
+                .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_analysis"))
+                .await?;
+                let derived_blob_files = async {
                     let mut reader = transaction.tracked_state_reader().await;
-                    derived_plugin_blob_conflicts(&mut reader, &analysis).await?
-                };
+                    derived_plugin_blob_conflicts(&mut reader, &analysis).await
+                }
+                .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_derived_blob_detection"))
+                .await?;
 
                 let resolvable_plugin_conflicts =
                     resolvable_plugin_conflict_keys(&analysis, &derived_blob_files);
 
                 let plugin_resolution_stats = if analysis.outcome == MergeOutcome::MergeCommitted {
-                    let plugin_conflict_groups = {
+                    let plugin_conflict_groups = async {
                         let mut reader = transaction.tracked_state_reader().await;
                         plugin_merge_conflict_groups(
                             &mut reader,
@@ -200,18 +208,24 @@ where
                             &derived_blob_files,
                             &resolvable_plugin_conflicts,
                         )
-                        .await?
-                    };
+                        .await
+                    }
+                    .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_plugin_conflict_inputs"))
+                    .await?;
                     let semantic_branch_id = SharedStr::from(active_branch_id.as_str());
                     let resolved_plugin_rows = resolve_plugin_merge_conflict_groups(
                         transaction,
                         plugin_conflict_groups,
                         &semantic_branch_id,
                     )
+                    .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_plugin_conflict_resolve"))
                     .await?;
-                    let mut reader = transaction.tracked_state_reader().await;
-                    plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows)
-                        .await?
+                    async {
+                        let mut reader = transaction.tracked_state_reader().await;
+                        plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows).await
+                    }
+                    .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_plugin_resolution_stats"))
+                    .await?
                 } else {
                     MergeChangeStats::default()
                 };
@@ -226,6 +240,7 @@ where
                 )
             })
         })
+        .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_preview_total"))
         .await
     }
 
