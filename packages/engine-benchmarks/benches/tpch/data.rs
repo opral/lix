@@ -213,7 +213,7 @@ pub(crate) fn lineitems(scale_factor: f64) -> impl Iterator<Item = LineItem> {
     LineItemGenerator::new(scale_factor, 1, 1)
         .iter()
         .map(|row| LineItem {
-            // Lix's initial analytical base is published only when fresh rows
+            // Lix's initial columnar base is published only when fresh rows
             // arrive in physical identity order. Fixed-width components make
             // lexicographic identity order equal TPC-H order/line order.
             rowkey: format!("{:012}:{:02}", row.l_orderkey, row.l_linenumber),

@@ -10,7 +10,7 @@ tokio::task_local! {
     static ACTIVE_PROFILE: RefCell<SqlReadProfile>;
 }
 
-/// Disjoint wall-clock phases for one public analytical SQL read.
+/// Disjoint wall-clock phases for one public columnar SQL read.
 ///
 /// Scan elapsed time is operator poll time summed across scan partitions. It
 /// can overlap physical execution and therefore is diagnostic rather than a

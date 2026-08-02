@@ -39,14 +39,16 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V45 binds authenticated analytical row groups to registered SQL schemas
-/// and stores canonical entity identities for transactional overlay
-/// reconciliation. Older repositories must fail closed rather than interpret
-/// inferred V44 sidecars as schema-authenticated physical layouts.
+/// V46 makes immutable columnar bases a schema-independent physical detail,
+/// routes broad scans and collection aggregates through DataFusion, binds
+/// authenticated row groups to registered SQL schemas, and stores canonical
+/// entity identities for transactional overlay reconciliation. Older
+/// repositories must fail closed rather than interpret earlier workload-policy
+/// sidecars as schema-authenticated physical layouts.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"lxcd9-generation-indexed-commits.v45";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"lxcd9-generation-indexed-commits.v46";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -389,7 +391,7 @@ where
                 updated_at: change.created_at,
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
-                analytical_base_coordinate: None,
+                columnar_base_coordinate: None,
             })
             .collect::<Vec<_>>();
         let tracked_head = TrackedHeadContext::new();
@@ -409,7 +411,7 @@ where
                     updated_at: row.updated_at,
                     snapshot: crate::json_store::JsonSlotRef::Inline(&row.snapshot_content),
                     metadata: crate::json_store::JsonSlotRef::None,
-                    analytical_base_coordinate: None,
+                    columnar_base_coordinate: None,
                 }));
             }
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
@@ -928,6 +930,35 @@ mod tests {
         assert!(
             rows.is_empty(),
             "initial commit rows are derived from changelog.commit, not stored in tracked roots"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_protocol_rejects_pre_columnar_policy_cut_marker() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            REPOSITORY_PROTOCOL_SPACE,
+            REPOSITORY_PROTOCOL_KEY,
+            &b"lxcd9-generation-indexed-commits.v45"[..],
+        );
+        storage
+            .commit_write_set(
+                writes,
+                crate::storage_adapter::StorageWriteOptions::default(),
+            )
+            .await
+            .expect("old protocol marker should stage");
+        let read = storage
+            .begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .await
+            .expect("protocol read should open");
+
+        assert_eq!(
+            repository_protocol_status(&read)
+                .await
+                .expect("protocol status should load"),
+            RepositoryProtocolStatus::Unsupported
         );
     }
 

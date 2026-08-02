@@ -37,11 +37,11 @@ pub(crate) struct RowGroupRowLocation {
 }
 pub(crate) const ROW_GROUP_MANIFEST_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_0029),
-    "analytical.row_group_manifest.v1",
+    "entity.columnar_row_group_manifest.v1",
 );
 pub(crate) const ROW_GROUP_COLUMN_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_002a),
-    "analytical.row_group_column.v1",
+    "entity.columnar_row_group_column.v1",
 );
 
 const MANIFEST_MAGIC: &[u8; 8] = b"LXRGM003";
@@ -980,7 +980,7 @@ fn column_statistics(
 
 /// Derive exact physical statistics from an already reconciled Arrow batch.
 ///
-/// Analytical overlay scans use this after suppressing stale base rows. The
+/// Columnar overlay scans use this after suppressing stale base rows. The
 /// result has the same semantics as persisted row-group statistics but no
 /// column digests because it describes an in-memory derived batch rather than
 /// stored column payloads.

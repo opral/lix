@@ -20,7 +20,7 @@ static CERTIFIED_INSERT_COUNTER_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
 #[test]
-fn typed_olap_queries_are_structurally_ineligible_for_strict_native_reads() {
+fn typed_olap_queries_are_plain_datafusion_selects() {
     use datafusion::sql::parser::DFParser;
     use datafusion::sql::sqlparser::ast::{SetExpr, Statement as SqlStatement};
     use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -36,8 +36,8 @@ fn typed_olap_queries_are_structurally_ineligible_for_strict_native_reads() {
             panic!("{} must remain a SELECT query", shape.label());
         };
         assert!(
-            query.with.is_some(),
-            "{} must retain a top-level CTE: strict_single_table_select rejects query.with before any native entity recognizer can match",
+            query.with.is_none(),
+            "{} must not need a CTE to evade a native query recognizer",
             shape.label()
         );
         assert!(

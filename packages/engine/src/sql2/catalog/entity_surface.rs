@@ -70,7 +70,7 @@ impl EntitySurfaceSpec {
     }
 
     /// Stable identity of the registered schema properties that determine an
-    /// entity analytical sidecar's physical meaning.
+    /// entity columnar sidecar's physical meaning.
     ///
     /// In particular, String and Json both use Arrow Utf8. A name/type-only
     /// comparison cannot distinguish scalar string bytes from canonical JSON
@@ -239,7 +239,6 @@ fn certifies_path_value_replacement(schema: &JsonValue) -> bool {
         "additionalProperties",
         "x-lix-key",
         "x-lix-primary-key",
-        "x-lix-columnar",
     ];
     if object
         .keys()

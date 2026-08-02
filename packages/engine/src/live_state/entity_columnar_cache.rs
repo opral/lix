@@ -1,4 +1,4 @@
-//! Repository-scoped reconciliation artifacts for analytical entity scans.
+//! Repository-scoped reconciliation artifacts for columnar entity scans.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};

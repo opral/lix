@@ -1,4 +1,4 @@
-//! V21 row-addressable current state with analytical-base coordinates.
+//! V21 row-addressable current state with columnar-base coordinates.
 //!
 //! V12 packed every file member of one logical entity into a group. That made
 //! a logical-PK lookup cheap, but it also made every normal commit read,
@@ -9,6 +9,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -86,11 +87,6 @@ const HOT_DIFF_SEGMENT_MAX_IDENTITIES: u32 = 4_096;
 // Real-repository profiling showed that smaller batches contribute negligible
 // storage amplification, so retain their allocation-free direct-key path.
 const HOT_DIFF_PACK_MIN_IDENTITIES: usize = 64;
-// Native analytical reads materialize their complete public result, so a
-// one-base payload pass may scale with that requested result. Keep the eager
-// compatibility path bounded while covering the 1M-row (about 2k-segment)
-// analytical scan target; multi-base scans retain their smaller merge bound.
-const PACKED_BROAD_SNAPSHOT_MAX_SEGMENTS: usize = 4_096;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V1: &[u8; 4] = b"CEB1";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V2: &[u8; 4] = b"CEB2";
@@ -2767,7 +2763,7 @@ struct PackedExclusiveSchemaBaseRef {
     index_key: Bytes,
 }
 
-/// One bounded authoritative HOT row layered over an immutable analytical
+/// One bounded authoritative HOT row layered over an immutable columnar
 /// base. The identity text is encoded exactly as the hidden sidecar column so
 /// execution can suppress stale base rows without parsing entity keys.
 #[derive(Clone, Debug)]
@@ -2775,14 +2771,34 @@ pub(crate) struct EntityColumnarOverlayRow {
     pub(crate) entity_pk: EntityPk,
     pub(crate) snapshot_content: Option<Bytes>,
     pub(crate) deleted: bool,
-    pub(crate) analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
+    pub(crate) columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
 }
 
-// Moderate analytical workloads deliberately keep a few hundred thousand
-// sparse mutations over a million-row immutable base. Bound the merge without
-// forcing that normal shape back through full row materialization.
-const ENTITY_COLUMNAR_MAX_OVERLAY_ROWS: usize = 512 * 1024;
-const ENTITY_COLUMNAR_MAX_OVERLAY_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+// Columnar planning temporarily overlaps encoded HOT input, its materialized
+// batch, and the final typed overlay. Reserve half of one 256 MiB admission
+// envelope for each adjacent representation instead of using a row-count
+// policy. These are conservative admission estimates, not allocator metering;
+// exceeding either half falls back to the authoritative generic row path.
+const ENTITY_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES: usize = 128 * 1024 * 1024;
+const ENTITY_COLUMNAR_OVERLAY_OUTPUT_ADMISSION_BYTES: usize = 128 * 1024 * 1024;
+
+fn materialized_columnar_overlay_admission_bytes(
+    rows: &MaterializedLiveStateBatch,
+) -> Result<usize, LixError> {
+    rows.iter().try_fold(0_usize, |bytes, row| {
+        bytes
+            .checked_add(size_of::<MaterializedLiveStateRow>())
+            .and_then(|bytes| bytes.checked_add(row.schema_key().len()))
+            .and_then(|bytes| bytes.checked_add(row.file_id().map_or(0, str::len)))
+            .and_then(|bytes| bytes.checked_add(row.branch_id().len()))
+            .and_then(|bytes| bytes.checked_add(row.entity_pk().estimated_heap_bytes()))
+            .and_then(|bytes| {
+                bytes.checked_add(row.snapshot_content().map_or(0, |value| value.len()))
+            })
+            .and_then(|bytes| bytes.checked_add(row.metadata().map_or(0, |value| value.len())))
+            .ok_or_else(|| head_value_error("entity columnar overlay byte size overflow"))
+    })
+}
 
 fn packed_exclusive_schema_base_prefix(
     branch_id: &str,
@@ -3104,7 +3120,7 @@ fn push_root_current_base_row(
             created_at: row.created_at(),
             updated_at: row.updated_at(),
             checkpoint_commit_id: active_checkpoint_commit_id,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         }),
     );
 }
@@ -3536,8 +3552,8 @@ async fn scan_packed_current_base_rows(
             && request.limit.is_none()
             && request.read_columns.columns.as_slice() == ["snapshot_content"];
         if scan_members_with_payloads {
-            // Native broad entity reads need every payload in the selected
-            // schema. Decode each packed segment once with its payload sidecar
+            // Complete entity snapshot scans need every payload in the
+            // selected schema. Decode each packed segment once with its payload sidecar
             // instead of first scanning the identity/value plane and then
             // issuing a second manifest + segment pass for the same rows.
             let members =
@@ -3545,18 +3561,11 @@ async fn scan_packed_current_base_rows(
                     store,
                     base_ref.commit_id,
                     &request.filter.schema_keys,
-                    // A direct public scan over one base must return every
-                    // visible row anyway. Limiting that one-pass route by
-                    // *segment* count turned large collections into a
-                    // two-pass scan: first the identity/value plane, then a
-                    // million owned key lookups for the payloads. Keep the
-                    // resource bound for multi-base winner merges, but let
-                    // the one-base route decode every selected segment once.
-                    if single_base {
-                        PACKED_BROAD_SNAPSHOT_MAX_SEGMENTS
-                    } else {
-                        512
-                    },
+                    // This API materializes the complete requested public
+                    // result. Segment count is a physical-layout detail, not
+                    // a memory budget, so it must not select a different read
+                    // algorithm as collections are repartitioned.
+                    usize::MAX,
                 )
                 .await?;
             if single_base {
@@ -3777,12 +3786,11 @@ async fn load_packed_current_base_exact(
             continue;
         }
         let row_index = rows.len();
-        let analytical_base_coordinate =
-            base_coordinate.map(|coordinate| AnalyticalBaseCoordinate {
-                base_commit_id: coordinate.base_commit_id,
-                group_index: coordinate.group_index,
-                row_index: coordinate.row_index,
-            });
+        let columnar_base_coordinate = base_coordinate.map(|coordinate| ColumnarBaseCoordinate {
+            base_commit_id: coordinate.base_commit_id,
+            group_index: coordinate.group_index,
+            row_index: coordinate.row_index,
+        });
         let durable_predecessor = CertifiedCurrentStatePredecessor::Packed(PackedHeadValue {
             change_id: value.change_id,
             commit_id: value.commit_id,
@@ -3790,7 +3798,7 @@ async fn load_packed_current_base_exact(
             created_at: value.created_at,
             updated_at: value.updated_at,
             checkpoint_commit_id: active_checkpoint_commit_id,
-            analytical_base_coordinate,
+            columnar_base_coordinate,
         });
         let snapshot = materialize_packed_slot(
             projection.snapshot_content,
@@ -3827,8 +3835,8 @@ async fn load_packed_current_base_exact(
             branch_id,
         );
         rows.set_durable_predecessor(row_index, durable_predecessor);
-        if let Some(coordinate) = analytical_base_coordinate {
-            rows.set_analytical_base_coordinate(row_index, coordinate);
+        if let Some(coordinate) = columnar_base_coordinate {
+            rows.set_columnar_base_coordinate(row_index, coordinate);
         }
     }
     if !json_refs.is_empty() {
@@ -4317,7 +4325,10 @@ where
                 &self.store,
                 commit_id,
                 &[schema_key.to_owned()],
-                PACKED_BROAD_SNAPSHOT_MAX_SEGMENTS,
+                // The exclusive publication's live count already defines the
+                // exact materialized result below. Do not impose a second
+                // physical-segment cardinality policy on the same result.
+                usize::MAX,
             )
             .await?
         else {
@@ -4412,7 +4423,7 @@ where
         Ok(rows.into_identity_ordered_primary_keys())
     }
 
-    /// Plans a typed analytical scan when one immutable packed base plus a
+    /// Plans a typed columnar scan when one immutable packed base plus a
     /// bounded HOT overlay is the complete current collection and its
     /// atomically staged row-group sidecar agrees with publication control.
     pub(crate) async fn entity_columnar_layout(
@@ -4430,7 +4441,7 @@ where
         LixError,
     > {
         let Some((base_commit_id, live_count)) = self
-            .analytical_entity_base(branch_id, control, schema_key)
+            .entity_columnar_base(branch_id, control, schema_key)
             .await?
         else {
             return Ok(None);
@@ -4455,24 +4466,18 @@ where
             include_tombstones: true,
             ..TrackedStateFilter::default()
         };
-        let entries = hot_scan_entries(
+        let Some(entries) = hot_scan_entries(
             &self.store,
             branch_id,
             control.generation,
             &filter,
-            Some(ENTITY_COLUMNAR_MAX_OVERLAY_ROWS + 1),
+            None,
+            Some(ENTITY_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES),
         )
-        .await?;
-        let entry_count = match &entries {
-            HotScanEntries::Decoded(entries) => entries.len(),
-            HotScanEntries::Finite(entries) => entries
-                .iter()
-                .map(|batch| batch.values.iter().flatten().count())
-                .sum(),
-        };
-        if entry_count > ENTITY_COLUMNAR_MAX_OVERLAY_ROWS {
+        .await?
+        else {
             return Ok(None);
-        }
+        };
         let rows = materialize_hot_scan_entries(
             &self.store,
             entries,
@@ -4481,10 +4486,15 @@ where
             control.working_diff_checkpoint_commit_id,
         )
         .await?;
+        if materialized_columnar_overlay_admission_bytes(&rows)?
+            > ENTITY_COLUMNAR_OVERLAY_OUTPUT_ADMISSION_BYTES
+        {
+            return Ok(None);
+        }
         let mut overlay = Vec::with_capacity(rows.len());
-        let mut snapshot_bytes = 0_usize;
+        let mut overlay_bytes = 0_usize;
         for row in rows.iter() {
-            // Packed analytical bases contain tracked, unfiled members only.
+            // Packed columnar bases contain tracked, unfiled members only.
             // Retain the established row path for a broader identity domain.
             if row.file_id().is_some() || row.untracked() || row.global() {
                 return Ok(None);
@@ -4498,10 +4508,14 @@ where
             if row_commit_id < base_commit_id {
                 continue;
             }
-            snapshot_bytes = snapshot_bytes
-                .checked_add(row.snapshot_content().map_or(0, |snapshot| snapshot.len()))
+            overlay_bytes = overlay_bytes
+                .checked_add(size_of::<EntityColumnarOverlayRow>())
+                .and_then(|bytes| bytes.checked_add(row.entity_pk().estimated_heap_bytes()))
+                .and_then(|bytes| {
+                    bytes.checked_add(row.snapshot_content().map_or(0, |snapshot| snapshot.len()))
+                })
                 .ok_or_else(|| head_value_error("entity columnar overlay byte size overflow"))?;
-            if snapshot_bytes > ENTITY_COLUMNAR_MAX_OVERLAY_SNAPSHOT_BYTES {
+            if overlay_bytes > ENTITY_COLUMNAR_OVERLAY_OUTPUT_ADMISSION_BYTES {
                 return Ok(None);
             }
             overlay.push(EntityColumnarOverlayRow {
@@ -4510,13 +4524,13 @@ where
                     .snapshot_content()
                     .map(|snapshot| Bytes::copy_from_slice(snapshot.as_bytes())),
                 deleted: row.deleted(),
-                analytical_base_coordinate: row.analytical_base_coordinate(),
+                columnar_base_coordinate: row.columnar_base_coordinate(),
             });
         }
         Ok(Some((id, manifest, overlay, live_count)))
     }
 
-    async fn analytical_entity_base(
+    async fn entity_columnar_base(
         &self,
         branch_id: &str,
         control: BranchHeadControl,
@@ -4678,8 +4692,16 @@ where
         // A storage prefix is ordered by identity, but tombstones are filtered
         // only after decoding the value. Applying SQL LIMIT to the raw scan
         // would therefore let one tombstone hide a later live row.
-        let mut entries =
-            hot_scan_entries(&self.store, branch_id, generation, &request.filter, None).await?;
+        let mut entries = hot_scan_entries(
+            &self.store,
+            branch_id,
+            generation,
+            &request.filter,
+            None,
+            None,
+        )
+        .await?
+        .expect("unbounded HOT scan cannot exhaust a byte budget");
         if let Some(control) = replaced_generation {
             filter_hot_scan_entries_by_collection_generation(&mut entries, control)?;
         }
@@ -5360,7 +5382,7 @@ impl HotTrackedSnapshot {
                     .metadata
                     .as_deref()
                     .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
-                analytical_base_coordinate: None,
+                columnar_base_coordinate: None,
                 working_diff_baseline: WorkingDiffBaseline::Disabled,
             };
             if rows
@@ -6311,8 +6333,8 @@ where
                 created_at: packed_value.created_at,
                 updated_at: packed_value.updated_at,
                 checkpoint_commit_id: working_diff_capture_checkpoint_commit_id,
-                analytical_base_coordinate: base_coordinate.map(|coordinate| {
-                    AnalyticalBaseCoordinate {
+                columnar_base_coordinate: base_coordinate.map(|coordinate| {
+                    ColumnarBaseCoordinate {
                         base_commit_id: coordinate.base_commit_id,
                         group_index: coordinate.group_index,
                         row_index: coordinate.row_index,
@@ -6551,7 +6573,7 @@ where
                     previous
                         .view()
                         .expect("HOT predecessor was validated before capacity planning")
-                        .analytical_base_coordinate
+                        .columnar_base_coordinate
                         .is_some()
                 });
                 checked_add_hot_next_value_capacity(
@@ -6622,7 +6644,7 @@ where
                     None
                 } else {
                     let mut value = delta.value_ref(*created_at, working_diff_baseline);
-                    value.analytical_base_coordinate = next_analytical_base_coordinate(
+                    value.columnar_base_coordinate = next_columnar_base_coordinate(
                         reset_working_diff_baselines,
                         delta,
                         previous.as_ref(),
@@ -6911,7 +6933,7 @@ async fn stage_incremental_file_delete_cascades(
                 updated_at: cascade.updated_at,
                 snapshot: JsonSlotRef::None,
                 metadata: JsonSlotRef::None,
-                analytical_base_coordinate: existing.analytical_base_coordinate,
+                columnar_base_coordinate: existing.columnar_base_coordinate,
                 working_diff_baseline: baseline,
             },
         )?;
@@ -6956,7 +6978,7 @@ impl HotCascadeMutationBuffers {
         };
         let value_bytes_per_row = HEAD_VALUE_HEADER_BYTES
             .checked_add(checkpoint_bytes)
-            .and_then(|bytes| bytes.checked_add(ANALYTICAL_BASE_COORDINATE_BYTES));
+            .and_then(|bytes| bytes.checked_add(COLUMNAR_BASE_COORDINATE_BYTES));
         let value_capacity = value_bytes_per_row
             .and_then(|value_bytes| row_capacity.checked_mul(value_bytes))
             .unwrap_or(0);
@@ -7116,18 +7138,18 @@ fn next_hot_working_diff_baseline(
     }
 }
 
-fn next_analytical_base_coordinate(
+fn next_columnar_base_coordinate(
     reset_working_diff_baselines: bool,
     delta: &CurrentStateDeltaRef<'_>,
     previous: Option<&CertifiedCurrentStatePredecessor>,
-) -> Result<Option<AnalyticalBaseCoordinate>, LixError> {
+) -> Result<Option<ColumnarBaseCoordinate>, LixError> {
     if reset_working_diff_baselines {
         return Ok(None);
     }
-    Ok(delta.analytical_base_coordinate.or(previous
+    Ok(delta.columnar_base_coordinate.or(previous
         .map(CertifiedCurrentStatePredecessor::view)
         .transpose()?
-        .and_then(|value| value.analytical_base_coordinate)))
+        .and_then(|value| value.columnar_base_coordinate)))
 }
 
 async fn load_hot_untracked_generation(
@@ -7140,7 +7162,9 @@ async fn load_hot_untracked_generation(
         ..TrackedStateFilter::default()
     };
     let HotScanEntries::Decoded(entries) =
-        hot_scan_entries(store, branch_id, generation, &filter, None).await?
+        hot_scan_entries(store, branch_id, generation, &filter, None, None)
+            .await?
+            .expect("unbounded HOT scan cannot exhaust a byte budget")
     else {
         unreachable!("an unconstrained HOT scan cannot select the finite point-read route");
     };
@@ -7278,7 +7302,7 @@ fn apply_complete_hot_snapshot_delta(
             identity,
             Bytes::from(encode_head_value(&{
                 let mut value = delta.value_ref(created_at, WorkingDiffBaseline::Disabled);
-                value.analytical_base_coordinate = None;
+                value.columnar_base_coordinate = None;
                 value
             })?),
         );
@@ -7323,7 +7347,7 @@ fn apply_complete_file_delete_cascade(
                 updated_at: delta.updated_at,
                 snapshot: JsonSlotRef::None,
                 metadata: JsonSlotRef::None,
-                analytical_base_coordinate: existing.analytical_base_coordinate,
+                columnar_base_coordinate: existing.columnar_base_coordinate,
                 working_diff_baseline: WorkingDiffBaseline::Disabled,
             })?),
         );
@@ -7607,8 +7631,8 @@ fn checked_add_hot_next_value_capacity(
         .checked_add(metadata_len)?
         .checked_add(baseline_len)?
         .checked_add(
-            (delta.analytical_base_coordinate.is_some() || inherited_coordinate)
-                .then_some(ANALYTICAL_BASE_COORDINATE_BYTES)
+            (delta.columnar_base_coordinate.is_some() || inherited_coordinate)
+                .then_some(COLUMNAR_BASE_COORDINATE_BYTES)
                 .unwrap_or(0),
         )?;
     total.checked_add(encoded_len)
@@ -7987,7 +8011,7 @@ fn stage_hot_bootstrap(
                 .metadata
                 .as_deref()
                 .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
             working_diff_baseline: tracked_baseline,
         };
         if rows
@@ -8034,7 +8058,7 @@ fn stage_hot_bootstrap(
                 .metadata
                 .as_deref()
                 .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
         if rows
@@ -8086,7 +8110,7 @@ fn stage_hot_bootstrap(
                             tracked_baseline
                         },
                     );
-                    value.analytical_base_coordinate = None;
+                    value.columnar_base_coordinate = None;
                     value
                 })?),
             );
@@ -9015,7 +9039,9 @@ async fn hot_working_diff_entries_for_finite_filter(
     generation: CommitId,
     filter: &TrackedStateFilter,
 ) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
-    let rows = hot_scan_entries(store, branch_id, generation, filter, None).await?;
+    let rows = hot_scan_entries(store, branch_id, generation, filter, None, None)
+        .await?
+        .expect("unbounded HOT scan cannot exhaust a byte budget");
     match rows {
         HotScanEntries::Decoded(rows) => {
             let mut candidates = Vec::with_capacity(rows.len());
@@ -9183,7 +9209,8 @@ async fn hot_scan_entries<'a>(
     generation: CommitId,
     filter: &'a TrackedStateFilter,
     limit: Option<usize>,
-) -> Result<HotScanEntries<'a>, LixError> {
+    retained_byte_budget: Option<usize>,
+) -> Result<Option<HotScanEntries<'a>>, LixError> {
     // The null-file member is a true point key. A logical-PK scan can use a
     // single MultiGet only when this schema has no file-backed members; if it
     // does, fall through to the complete primary-prefix route so UPDATE and
@@ -9193,9 +9220,10 @@ async fn hot_scan_entries<'a>(
             || !hot_schema_has_file_members(store, branch_id, generation, &filter.schema_keys)
                 .await?;
         if may_use_null_point_batch {
-            return hot_scan_finite_identity_batches(store, identities, limit)
-                .await
-                .map(HotScanEntries::Finite);
+            let entries = HotScanEntries::Finite(
+                hot_scan_finite_identity_batches(store, identities, limit).await?,
+            );
+            return Ok(hot_scan_entries_fit_budget(entries, retained_byte_budget));
         }
     }
 
@@ -9203,9 +9231,10 @@ async fn hot_scan_entries<'a>(
     // `WHERE file_id = ?` read one contiguous hydrated range without a second
     // value projection or random point-read hydration.
     if let Some(prefixes) = hot_file_scan_prefixes(branch_id, generation, filter) {
-        return scan_hot_file_entries(store, branch_id, generation, prefixes, filter, limit)
-            .await
-            .map(HotScanEntries::Decoded);
+        let entries = HotScanEntries::Decoded(
+            scan_hot_file_entries(store, branch_id, generation, prefixes, filter, limit).await?,
+        );
+        return Ok(hot_scan_entries_fit_budget(entries, retained_byte_budget));
     }
 
     let scope = hot_scope_prefix(branch_id, generation);
@@ -9213,6 +9242,7 @@ async fn hot_scan_entries<'a>(
     prefixes.sort();
     prefixes.dedup();
     let mut rows = Vec::new();
+    let mut retained_bytes = 0_usize;
     for prefix in prefixes {
         let plan = ScanPlan::prefix(
             HOT_ROW_SPACE,
@@ -9224,7 +9254,7 @@ async fn hot_scan_entries<'a>(
         loop {
             let remaining = limit.map(|limit| limit.saturating_sub(rows.len()));
             if matches!(remaining, Some(0)) {
-                return Ok(HotScanEntries::Decoded(rows));
+                return Ok(Some(HotScanEntries::Decoded(rows)));
             }
             let page = plan
                 .collect(
@@ -9239,11 +9269,21 @@ async fn hot_scan_entries<'a>(
                 .await?;
             resume_after = page.value.entries.last().map(|entry| entry.key.clone());
             for entry in page.value.entries {
+                let encoded_key_bytes = entry.key.0.len();
                 let identity = decode_hot_scan_row_key_in_scope(entry.key.0, &scope)?;
                 if identity.matches_filter(filter) {
-                    rows.push((identity, full_value_bytes(entry.value)?));
+                    let value = full_value_bytes(entry.value)?;
+                    retained_bytes = retained_bytes
+                        .checked_add(encoded_key_bytes)
+                        .and_then(|bytes| bytes.checked_add(value.len()))
+                        .and_then(|bytes| bytes.checked_add(size_of::<(HotScanIdentity, Bytes)>()))
+                        .ok_or_else(|| head_value_error("HOT scan resident byte size overflow"))?;
+                    if retained_byte_budget.is_some_and(|budget| retained_bytes > budget) {
+                        return Ok(None);
+                    }
+                    rows.push((identity, value));
                     if limit.is_some_and(|limit| rows.len() >= limit) {
-                        return Ok(HotScanEntries::Decoded(rows));
+                        return Ok(Some(HotScanEntries::Decoded(rows)));
                     }
                 }
             }
@@ -9252,7 +9292,70 @@ async fn hot_scan_entries<'a>(
             }
         }
     }
-    Ok(HotScanEntries::Decoded(rows))
+    Ok(Some(HotScanEntries::Decoded(rows)))
+}
+
+fn hot_scan_entries_fit_budget<'a>(
+    entries: HotScanEntries<'a>,
+    retained_byte_budget: Option<usize>,
+) -> Option<HotScanEntries<'a>> {
+    let Some(budget) = retained_byte_budget else {
+        return Some(entries);
+    };
+    let retained_bytes = match &entries {
+        HotScanEntries::Decoded(rows) => rows
+            .capacity()
+            .saturating_mul(size_of::<(HotScanIdentity, Bytes)>())
+            .saturating_add(rows.iter().fold(0_usize, |bytes, (identity, value)| {
+                bytes
+                    .saturating_add(identity.key.len())
+                    .saturating_add(value.len())
+                    .saturating_add(match &identity.schema_key {
+                        HotScanString::Borrowed(_) => 0,
+                        HotScanString::Owned(value) => value.capacity(),
+                    })
+                    .saturating_add(match &identity.file_id {
+                        None | Some(HotScanString::Borrowed(_)) => 0,
+                        Some(HotScanString::Owned(value)) => value.capacity(),
+                    })
+            })),
+        HotScanEntries::Finite(batches) => batches
+            .capacity()
+            .saturating_mul(size_of::<FiniteHotEntryBatchRef<'_>>())
+            .saturating_add(batches.iter().fold(0_usize, |bytes, batch| {
+                bytes
+                    .saturating_add(
+                        batch
+                            .identities
+                            .identities
+                            .capacity()
+                            .saturating_mul(size_of::<FiniteHotIdentityRef<'_>>()),
+                    )
+                    .saturating_add(batch.identities.encoded.bytes.len())
+                    .saturating_add(
+                        batch
+                            .identities
+                            .encoded
+                            .ranges
+                            .capacity()
+                            .saturating_mul(size_of::<EncodedHotPointKeyRanges>()),
+                    )
+                    .saturating_add(
+                        batch
+                            .values
+                            .capacity()
+                            .saturating_mul(size_of::<Option<Bytes>>()),
+                    )
+                    .saturating_add(
+                        batch
+                            .values
+                            .iter()
+                            .flatten()
+                            .fold(0_usize, |bytes, value| bytes.saturating_add(value.len())),
+                    )
+            })),
+    };
+    (retained_bytes <= budget).then_some(entries)
 }
 
 async fn hot_scan_dense_identity_range(
@@ -11265,7 +11368,7 @@ mod tests {
             updated_at: created_at,
             snapshot: JsonSlotRef::Inline(snapshot),
             metadata: JsonSlotRef::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         };
         let mut checkpoint_writes = StorageWriteSet::new();
         let mut coverage = WorkingDiffIndexCoverage::default();
@@ -12185,6 +12288,43 @@ mod tests {
     }
 
     #[test]
+    fn hot_scan_admission_is_bounded_by_retained_bytes_not_row_count() {
+        const TINY_ROW_COUNT: usize = 5_000;
+        const BUDGET: usize = 4 * 1024 * 1024;
+        let generation = CommitId::for_test_label("hot-scan-byte-budget");
+        let scope = hot_scope_prefix("branch", generation);
+        let tiny_rows = (0..TINY_ROW_COUNT)
+            .map(|index| {
+                let entity_pk = EntityPk::single(format!("entity-{index:05}"));
+                let key = Bytes::from(encode_hot_row_key_parts(
+                    "branch", generation, "schema", &entity_pk, None,
+                ));
+                let identity = decode_hot_scan_row_key_in_scope(key, &scope)
+                    .expect("decode tiny HOT scan identity");
+                (identity, Bytes::from_static(b"{}"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            hot_scan_entries_fit_budget(HotScanEntries::Decoded(tiny_rows), Some(BUDGET),)
+                .is_some(),
+            "thousands of narrow rows must not trip a cardinality policy"
+        );
+
+        let entity_pk = EntityPk::single("large");
+        let key = Bytes::from(encode_hot_row_key_parts(
+            "branch", generation, "schema", &entity_pk, None,
+        ));
+        let identity =
+            decode_hot_scan_row_key_in_scope(key, &scope).expect("decode large HOT scan identity");
+        let wide_rows = vec![(identity, Bytes::from(vec![0_u8; BUDGET]))];
+        assert!(
+            hot_scan_entries_fit_budget(HotScanEntries::Decoded(wide_rows), Some(BUDGET),)
+                .is_none(),
+            "retained payload bytes must govern fallback even for one row"
+        );
+    }
+
+    #[test]
     fn hot_diff_keys_append_into_one_exact_arena() {
         let checkpoint = CommitId::for_test_label("shared-hot-diff-checkpoint");
         let generation = CommitId::for_test_label("shared-hot-diff-generation");
@@ -12244,9 +12384,9 @@ mod tests {
     }
 
     #[test]
-    fn analytical_base_coordinate_survives_repeated_hot_updates_and_tombstones() {
+    fn columnar_base_coordinate_survives_repeated_hot_updates_and_tombstones() {
         let entity_pk = EntityPk::single("coordinated-row");
-        let coordinate = AnalyticalBaseCoordinate {
+        let coordinate = ColumnarBaseCoordinate {
             base_commit_id: CommitId::for_test_label("coordinate-base"),
             group_index: 7,
             row_index: 31,
@@ -12260,7 +12400,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
-            analytical_base_coordinate: Some(coordinate),
+            columnar_base_coordinate: Some(coordinate),
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
         let mut predecessor = CertifiedCurrentStatePredecessor::Encoded(Bytes::from(
@@ -12287,18 +12427,18 @@ mod tests {
                 updated_at: timestamp(),
                 snapshot: JsonSlotRef::Inline("{\"updated\":true}"),
                 metadata: JsonSlotRef::None,
-                analytical_base_coordinate: None,
+                columnar_base_coordinate: None,
             };
-            let inherited = next_analytical_base_coordinate(false, &delta, Some(&predecessor))
+            let inherited = next_columnar_base_coordinate(false, &delta, Some(&predecessor))
                 .expect("inherit coordinate");
             assert_eq!(inherited, Some(coordinate));
             assert_eq!(
-                next_analytical_base_coordinate(true, &delta, Some(&predecessor))
+                next_columnar_base_coordinate(true, &delta, Some(&predecessor))
                     .expect("clear coordinate for new base"),
                 None
             );
             let mut next = delta.value_ref(timestamp(), WorkingDiffBaseline::Disabled);
-            next.analytical_base_coordinate = inherited;
+            next.columnar_base_coordinate = inherited;
             predecessor = CertifiedCurrentStatePredecessor::Encoded(Bytes::from(
                 encode_head_value(&next).expect("encode repeated coordinated mutation"),
             ));
@@ -12308,7 +12448,7 @@ mod tests {
             predecessor
                 .view()
                 .expect("decode tombstone coordinate")
-                .analytical_base_coordinate,
+                .columnar_base_coordinate,
             Some(coordinate)
         );
     }
@@ -12401,7 +12541,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         };
         let second = CurrentStateDeltaRef {
             schema_key: "schema_without_file",
@@ -12415,7 +12555,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         };
         let deltas = [&first, &second];
         let capacity = encoded_hot_mutation_identity_capacity(scope.len(), &deltas)
@@ -12505,7 +12645,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Inline("{\"tracked\":true}"),
             metadata: JsonSlotRef::Inline("{\"source\":\"test\"}"),
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         };
         let tombstone = CurrentStateDeltaRef {
             schema_key: "tracked_schema",
@@ -12520,7 +12660,7 @@ mod tests {
             // Deleted values deliberately ignore both supplied slots.
             snapshot: JsonSlotRef::Inline("{\"ignored\":true}"),
             metadata: JsonSlotRef::Ref(&snapshot_ref),
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         };
         let untracked = CurrentStateDeltaRef {
             schema_key: "untracked_schema",
@@ -12534,7 +12674,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Ref(&snapshot_ref),
             metadata: JsonSlotRef::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         };
         let removed = CurrentStateDeltaRef {
             schema_key: "untracked_schema",
@@ -12548,7 +12688,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::None,
             metadata: JsonSlotRef::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         };
         let deltas = [&tracked, &tombstone, &untracked, &removed];
 
@@ -12729,7 +12869,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::None,
             metadata: JsonSlotRef::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::BeforePresent {
                 checkpoint_commit_id: CommitId::for_test_label("cascade-reserve-checkpoint"),
                 version: working_diff_version("cascade-reserve-before"),
@@ -12797,7 +12937,7 @@ mod tests {
             updated_at: timestamp,
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         };
         let deltas = vec![&delta; DELTAS];
         let generation = CommitId::for_test_label("ordinary-import-generation");
@@ -12850,7 +12990,7 @@ mod tests {
                 updated_at: timestamp,
                 snapshot: JsonSlotRef::Inline("{}"),
                 metadata: JsonSlotRef::None,
-                analytical_base_coordinate: None,
+                columnar_base_coordinate: None,
             })
             .collect::<Vec<_>>();
         let delta_refs = deltas.iter().collect::<Vec<_>>();

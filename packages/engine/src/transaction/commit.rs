@@ -86,8 +86,6 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_RETIREMENTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    static CERTIFIED_ENTITY_COLUMNAR_REUSES: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -104,11 +102,6 @@ pub(crate) fn take_complete_replacement_packed_current_base_publications() -> us
 #[cfg(test)]
 pub(crate) fn take_complete_replacement_packed_current_base_retirements() -> usize {
     COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_RETIREMENTS.with(|retirements| retirements.replace(0))
-}
-
-#[cfg(test)]
-pub(crate) fn take_certified_entity_columnar_reuses() -> usize {
-    CERTIFIED_ENTITY_COLUMNAR_REUSES.with(|reuses| reuses.replace(0))
 }
 
 /// Commits prepared transaction rows into tracked history and unified current
@@ -1544,7 +1537,7 @@ fn current_state_delta_from_state_row(
             crate::json_store::JsonSlotRef::None,
             crate::transaction::types::StageJson::slot_ref,
         ),
-        analytical_base_coordinate: None,
+        columnar_base_coordinate: None,
     })
 }
 
@@ -1591,7 +1584,7 @@ impl crate::live_state::DeferredFreshHotRows for PreparedStateBatch {
                     crate::json_store::JsonSlotRef::None,
                     crate::transaction::types::StageJson::slot_ref,
                 ),
-                analytical_base_coordinate: None,
+                columnar_base_coordinate: None,
             },
         }
     }
@@ -1612,7 +1605,7 @@ fn current_state_delta_from_engine_row(
         updated_at: row.updated_at,
         snapshot: row.change.snapshot.as_ref_slot(),
         metadata: row.change.metadata.as_ref_slot(),
-        analytical_base_coordinate: None,
+        columnar_base_coordinate: None,
     }
 }
 
@@ -3132,7 +3125,7 @@ async fn stage_tracked_head(
                             updated_at: change_ref.updated_at,
                             snapshot: snapshot.as_ref_slot(),
                             metadata: metadata.as_ref_slot(),
-                            analytical_base_coordinate: None,
+                            columnar_base_coordinate: None,
                         }
                     }),
             );
@@ -4084,31 +4077,6 @@ fn prepare_entity_columnar_write_sets(
     if !publishes_ordered_insert && !publishes_complete_replacement {
         return Ok(crate::live_state::EntityColumnarWriteSets::new());
     }
-    if publishes_complete_replacement
-        && let Some((commit_id, schema_key, certified)) =
-            state_rows.dense_certified_entity_columnar()
-    {
-        if certified.input_locations().len() != state_rows.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "certified entity columnar coordinates lost row alignment before commit",
-            ));
-        }
-        let mut encoded =
-            crate::live_state::EntityColumnarWriteSets::with_state_row_count(state_rows.len());
-        for (state_row_index, &location) in certified.input_locations().iter().enumerate() {
-            encoded.set_state_row_location(state_row_index, location);
-        }
-        encoded.insert(
-            (commit_id, schema_key.to_string()),
-            certified.encoded().clone(),
-        );
-        #[cfg(test)]
-        CERTIFIED_ENTITY_COLUMNAR_REUSES.with(|reuses| {
-            reuses.set(reuses.get().saturating_add(1));
-        });
-        return Ok(encoded);
-    }
     if (publishes_ordered_insert || publishes_complete_replacement)
         && let Some((commit_id, schema_key, snapshots)) = state_rows.dense_entity_columnar_input()
     {
@@ -4116,9 +4084,6 @@ fn prepare_entity_columnar_write_sets(
         else {
             return Ok(crate::live_state::EntityColumnarWriteSets::new());
         };
-        if !crate::schema::materializes_entity_columnar_sidecar(schema) {
-            return Ok(crate::live_state::EntityColumnarWriteSets::new());
-        }
         let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(schema) else {
             return Ok(crate::live_state::EntityColumnarWriteSets::new());
         };
@@ -4166,9 +4131,6 @@ fn prepare_entity_columnar_write_sets(
         else {
             continue;
         };
-        if !crate::schema::materializes_entity_columnar_sidecar(schema) {
-            continue;
-        }
         let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(schema) else {
             continue;
         };
@@ -5292,7 +5254,7 @@ mod tests {
             updated_at: timestamp,
             snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"value":1}"#),
             metadata: crate::json_store::JsonSlotRef::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         };
         let guard = TrackedStateKeyRef {
             schema_key: "untracked_schema",

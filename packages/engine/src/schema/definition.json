@@ -65,10 +65,6 @@
             "description": "JSON Pointer (RFC 6901) to a property that participates in the primary key, e.g. `/id` or `/nested/field`."
           }
         },
-        "x-lix-columnar": {
-          "type": "boolean",
-          "description": "Whether commits synchronously materialize a typed analytical sidecar for this schema. Defaults to true; set false for write-oriented schemas that use the authoritative packed row layout."
-        },
         "x-lix-foreign-keys": {
           "type": "array",
           "items": {

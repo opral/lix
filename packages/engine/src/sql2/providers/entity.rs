@@ -547,17 +547,21 @@ impl TableSpec for EntitySpec {
             .flatten();
         let direct_primary_key_projection =
             direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
+        let mut columnar_request = request.clone();
+        // LIMIT is a relational operator, not a storage-layout capability.
+        // Ask the reader whether the same filtered/projection scan has a
+        // columnar layout; DataFusion retains the semantic LimitExec above it.
+        columnar_request.limit = None;
         if let Some(reader) = self.entity_snapshot_reader.as_ref()
-            && entity_columnar_projection_eligible(&schema, &request)
+            && entity_columnar_projection_eligible(&schema)
             && let Some(layout) = reader
-                .plan_entity_columnar_scan(request.clone())
+                .plan_entity_columnar_scan(columnar_request)
                 .await
                 .map_err(lix_error_to_datafusion_error)?
             && let Some(projection) =
                 entity_columnar_projection(&layout.manifest, &schema, &self.spec)
-            && let Some(group_indices) =
-                entity_columnar_group_indices(&layout.manifest, &row_filters)
         {
+            let group_indices = entity_columnar_group_indices(&layout.manifest, &row_filters);
             return Ok(PlannedScan {
                 schema: Arc::clone(&schema),
                 ordering: None,
@@ -751,10 +755,8 @@ impl TableSpec for EntitySpec {
     }
 }
 
-fn entity_columnar_projection_eligible(schema: &Schema, request: &LiveStateScanRequest) -> bool {
+fn entity_columnar_projection_eligible(schema: &Schema) -> bool {
     !schema.fields().is_empty()
-        && request.filter.entity_pks.is_empty()
-        && request.limit.is_none()
         && schema
             .fields()
             .iter()
@@ -884,6 +886,22 @@ async fn entity_columnar_scan_source(
         batches
     };
     let overlay_batches = Arc::new(overlay_batches);
+    if group_indices.is_empty() && overlay_batches.is_empty() {
+        let empty_schema = Arc::clone(&schema);
+        let statistics =
+            Statistics::new_unknown(schema.as_ref()).with_num_rows(Precision::Exact(0));
+        return Ok(batch_stream_source_with_statistics_and_source(
+            Arc::clone(&schema),
+            vec![statistics.clone()],
+            Some(statistics),
+            move |_partition, _context| {
+                let schema = Arc::clone(&empty_schema);
+                let batch = RecordBatch::new_empty(Arc::clone(&schema));
+                let batches = stream::once(async move { Ok(batch) });
+                Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
+            },
+        ));
+    }
     let mut all_reconciled_statistics_cached = true;
     let mut base_statistics_cached = Vec::with_capacity(group_indices.len());
     let mut statistics = if layout.overlay.is_empty() {
@@ -1111,7 +1129,7 @@ fn entity_columnar_coordinate_shadow_masks(
         .map(|_| None)
         .collect::<Vec<Option<Vec<bool>>>>();
     for row in layout.overlay.iter() {
-        let Some(coordinate) = row.analytical_base_coordinate else {
+        let Some(coordinate) = row.columnar_base_coordinate else {
             // This row was inserted after the immutable base and therefore
             // has no stale base member to suppress.
             continue;
@@ -1120,17 +1138,17 @@ fn entity_columnar_coordinate_shadow_masks(
             crate::live_state::entity_row_group_set_id(coordinate.base_commit_id, &spec.schema_key);
         if owner != layout.id {
             return exec_err!(
-                "entity overlay analytical coordinate belongs to a different immutable base"
+                "entity overlay columnar coordinate belongs to a different immutable base"
             );
         }
         let group_index = coordinate.group_index as usize;
         let group = layout.manifest.groups.get(group_index).ok_or_else(|| {
             DataFusionError::Execution(
-                "entity overlay analytical coordinate has an invalid group index".to_owned(),
+                "entity overlay columnar coordinate has an invalid group index".to_owned(),
             )
         })?;
         if coordinate.row_index >= group.row_count {
-            return exec_err!("entity overlay analytical coordinate has an invalid row index");
+            return exec_err!("entity overlay columnar coordinate has an invalid row index");
         }
         let keep =
             keep_rows[group_index].get_or_insert_with(|| vec![true; group.row_count as usize]);
@@ -1229,7 +1247,7 @@ fn entity_columnar_overlay_batches(
 fn entity_columnar_group_indices(
     manifest: &crate::columnar_row_group::RowGroupManifest,
     row_filters: &[EntityRowFilter],
-) -> Option<Vec<usize>> {
+) -> Vec<usize> {
     let mut selected = Vec::new();
     for (group_index, group) in manifest.groups.iter().enumerate() {
         if row_filters
@@ -1239,7 +1257,7 @@ fn entity_columnar_group_indices(
             selected.push(group_index);
         }
     }
-    (!selected.is_empty()).then_some(selected)
+    selected
 }
 
 fn entity_columnar_group_statistics(
@@ -2581,9 +2599,9 @@ fn direct_primary_key_projection_eligible(
     row_filters: &[EntityRowFilter],
 ) -> bool {
     direct_entity_batch_eligible(schema, request, row_filters)
-        // Exact key reads retain the established point-snapshot cache. This
-        // broad-scan projection is an OLAP lane, not a replacement for OLTP
-        // point serving.
+        // Exact identities retain the point-snapshot cache. This projection
+        // capability is for ordered collection scans, not a replacement for
+        // the row-addressable OLTP path.
         && request.filter.entity_pks.is_empty()
         && !schema.fields().is_empty()
         && schema
@@ -4352,8 +4370,7 @@ mod tests {
             },
         ];
 
-        let selected = super::entity_columnar_group_indices(&encoded.manifest, &filters)
-            .expect("boolean groups are exact");
+        let selected = super::entity_columnar_group_indices(&encoded.manifest, &filters);
         assert!(!selected.is_empty());
         let active_index = encoded
             .manifest
@@ -4424,8 +4441,7 @@ mod tests {
             value: super::EntityFilterValue::Boolean(true),
         }];
 
-        let selected = super::entity_columnar_group_indices(&encoded.manifest, &filters)
-            .expect("boolean groups are exact");
+        let selected = super::entity_columnar_group_indices(&encoded.manifest, &filters);
         let active_index = encoded
             .manifest
             .fields
@@ -4503,8 +4519,7 @@ mod tests {
         let selected = super::entity_columnar_group_indices(
             &encoded.manifest,
             std::slice::from_ref(&row_filter),
-        )
-        .expect("row-group pruning");
+        );
         let flag_index = encoded
             .manifest
             .fields
@@ -4642,19 +4657,19 @@ mod tests {
                 entity_pk: TestEntityPk::single("a"),
                 snapshot_content: Some(Bytes::from_static(br#"{"active":false,"lane":"new-a"}"#)),
                 deleted: false,
-                analytical_base_coordinate: None,
+                columnar_base_coordinate: None,
             },
             crate::live_state::EntityColumnarOverlayRow {
                 entity_pk: TestEntityPk::single("b"),
                 snapshot_content: None,
                 deleted: true,
-                analytical_base_coordinate: None,
+                columnar_base_coordinate: None,
             },
             crate::live_state::EntityColumnarOverlayRow {
                 entity_pk: TestEntityPk::single("c"),
                 snapshot_content: Some(Bytes::from_static(br#"{"active":true,"lane":"insert-c"}"#)),
                 deleted: false,
-                analytical_base_coordinate: None,
+                columnar_base_coordinate: None,
             },
         ];
         let filters = [super::EntityRowFilter::ColumnEq {
@@ -4768,7 +4783,7 @@ mod tests {
                     entity_pk: identities[0].clone(),
                     snapshot_content: Some(Bytes::from_static(br#"{"id":"a","active":false}"#)),
                     deleted: false,
-                    analytical_base_coordinate: Some(crate::live_state::AnalyticalBaseCoordinate {
+                    columnar_base_coordinate: Some(crate::live_state::ColumnarBaseCoordinate {
                         base_commit_id,
                         group_index: location.group_index,
                         row_index: location.row_index,
@@ -4781,7 +4796,7 @@ mod tests {
                         br#"{"id":"inserted","active":true}"#,
                     )),
                     deleted: false,
-                    analytical_base_coordinate: None,
+                    columnar_base_coordinate: None,
                 },
             ]),
             branch_id: Arc::from("main"),

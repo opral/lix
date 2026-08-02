@@ -49,7 +49,7 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
 }
 
-/// Physical location of an entity snapshot in an immutable analytical base.
+/// Physical location of an entity snapshot in an immutable columnar base.
 ///
 /// Commit deltas carry this coordinate alongside their authoritative payload,
 /// allowing exact identity lookups to reconcile an overlay row with its base

@@ -38,45 +38,6 @@ pub(crate) async fn try_execute_bound_public_read<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    if let Some(shape) = strict_entity_count_read(statement, params) {
-        // Validate before using publication metadata so a fast path never
-        // widens the accepted public SQL surface.
-        crate::sql2::bind_read_statement(sql, statement)?;
-        let catalog = ctx.public_catalog().await?;
-        let Some(surface) = catalog.surface(&shape.table_name) else {
-            return Ok(None);
-        };
-        let PublicSurfaceKind::EntityBase { schema_key } = &surface.kind else {
-            return Ok(None);
-        };
-        let Some(reader) = ctx.entity_snapshot_reader() else {
-            return Ok(None);
-        };
-        let request = LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: vec![schema_key.clone()],
-                branch_ids: vec![ctx.active_branch_id().to_owned()],
-                include_tombstones: false,
-                ..LiveStateFilter::default()
-            },
-            projection: LiveStateProjection::default(),
-            limit: None,
-        };
-        if let Some(count) = reader.count_entity_snapshots(request).await? {
-            let count = i64::try_from(count).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "entity collection count exceeds the SQL INTEGER range",
-                )
-            })?;
-            return Ok(Some(SqlQueryResult {
-                columns: vec![shape.alias],
-                rows: vec![vec![Value::Integer(count)]],
-                notices: Vec::new(),
-            }));
-        }
-        return Ok(None);
-    }
     if let Some(shape) = strict_entity_left_join_read(statement, params) {
         crate::sql2::bind_read_statement(sql, statement)?;
         let catalog = ctx.public_catalog().await?;
@@ -85,10 +46,7 @@ where
         }
         return Ok(None);
     }
-    let Some(shape) = strict_entity_primary_key_read(statement, params)
-        .map(StrictEntityRead::PrimaryKey)
-        .or_else(|| strict_entity_broad_read(statement, params).map(StrictEntityRead::Broad))
-    else {
+    let Some(shape) = strict_entity_primary_key_read(statement, params) else {
         return Ok(None);
     };
 
@@ -99,7 +57,7 @@ where
         .in_scope(|| crate::sql2::bind_read_statement(sql, statement))?;
 
     let catalog = ctx.public_catalog().await?;
-    let Some(surface) = catalog.surface(shape.table_name()) else {
+    let Some(surface) = catalog.surface(&shape.table_name) else {
         return Ok(None);
     };
     let PublicSurfaceKind::EntityBase { schema_key } = &surface.kind else {
@@ -111,119 +69,79 @@ where
     let Some(primary_key_column) = single_top_level_string_primary_key(spec) else {
         return Ok(None);
     };
-    match shape {
-        StrictEntityRead::PrimaryKey(shape) => {
-            if primary_key_column != shape.primary_key_column
-                || shape.projection.iter().any(|column| {
-                    !matches!(
-                        spec.visible_column(column).map(|column| column.column_type),
-                        Some(EntityColumnType::String | EntityColumnType::Json)
-                    )
-                })
-            {
-                return Ok(None);
-            }
-
-            let entity_pks = shape
-                .primary_key_values
-                .into_iter()
-                .map(EntityPk::single)
-                .collect::<Vec<_>>();
-            let request = LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: vec![schema_key.clone()],
-                    entity_pks,
-                    branch_ids: vec![ctx.active_branch_id().to_string()],
-                    include_tombstones: false,
-                    ..LiveStateFilter::default()
-                },
-                projection: LiveStateProjection {
-                    columns: vec!["snapshot_content".to_string()],
-                },
-                limit: None,
-            };
-            if let Some(reader) = ctx.entity_snapshot_reader()
-                && let Some(snapshots) = reader
-                    .scan_entity_snapshots(request.clone())
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.public_read.snapshot_scan",
-                        row_count = request.filter.entity_pks.len()
-                    ))
-                    .await?
-            {
-                return Ok(Some(SqlQueryResult {
-                    columns: shape.projection.clone(),
-                    rows: materialize_snapshot_rows(spec, &shape.projection, snapshots)?,
-                    notices: Vec::new(),
-                }));
-            }
-            let rows = ctx.live_state().scan_batch(&request).await?;
-
-            // The accepted ORDER BY is the complete one-column primary key.
-            // Retain multiple file-backed identities for one logical primary
-            // key; `file_id` is a first-class row identity and must not be
-            // collapsed by this route.
-            let mut ordinals = (0..rows.len()).collect::<Vec<_>>();
-            ordinals.sort_unstable_by(|left, right| {
-                rows.row(*left)
-                    .entity_pk()
-                    .cmp(rows.row(*right).entity_pk())
-            });
-            let result_rows = ordinals
-                .into_iter()
-                .map(|row| {
-                    materialize_row(
-                        spec,
-                        &shape.projection,
-                        rows.row(row).snapshot_content().map(|value| value.as_str()),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            Ok(Some(SqlQueryResult {
-                columns: shape.projection,
-                rows: result_rows,
-                notices: Vec::new(),
-            }))
-        }
-        StrictEntityRead::Broad(shape) => {
-            if primary_key_column != shape.primary_key_column
-                || shape
-                    .projection
-                    .iter()
-                    .any(|column| spec.visible_column(column).is_none())
-            {
-                return Ok(None);
-            }
-            let Some(reader) = ctx.entity_snapshot_reader() else {
-                return Ok(None);
-            };
-            let Some(snapshots) = reader
-                .scan_entity_snapshots(LiveStateScanRequest {
-                    filter: LiveStateFilter {
-                        schema_keys: vec![schema_key.clone()],
-                        branch_ids: vec![ctx.active_branch_id().to_string()],
-                        include_tombstones: false,
-                        ..LiveStateFilter::default()
-                    },
-                    projection: LiveStateProjection {
-                        columns: vec!["snapshot_content".to_string()],
-                    },
-                    limit: None,
-                })
-                .await?
-            else {
-                return Ok(None);
-            };
-            let rows = materialize_snapshot_rows(spec, &shape.projection, snapshots)?;
-            Ok(Some(SqlQueryResult {
-                columns: shape.projection,
-                rows,
-                notices: Vec::new(),
-            }))
-        }
+    if primary_key_column != shape.primary_key_column
+        || shape.projection.iter().any(|column| {
+            !matches!(
+                spec.visible_column(column).map(|column| column.column_type),
+                Some(EntityColumnType::String | EntityColumnType::Json)
+            )
+        })
+    {
+        return Ok(None);
     }
+
+    let entity_pks = shape
+        .primary_key_values
+        .into_iter()
+        .map(EntityPk::single)
+        .collect::<Vec<_>>();
+    let request = LiveStateScanRequest {
+        filter: LiveStateFilter {
+            schema_keys: vec![schema_key.clone()],
+            entity_pks,
+            branch_ids: vec![ctx.active_branch_id().to_string()],
+            include_tombstones: false,
+            ..LiveStateFilter::default()
+        },
+        projection: LiveStateProjection {
+            columns: vec!["snapshot_content".to_string()],
+        },
+        limit: None,
+    };
+    if let Some(reader) = ctx.entity_snapshot_reader()
+        && let Some(snapshots) = reader
+            .scan_entity_snapshots(request.clone())
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.public_read.snapshot_scan",
+                row_count = request.filter.entity_pks.len()
+            ))
+            .await?
+    {
+        return Ok(Some(SqlQueryResult {
+            columns: shape.projection.clone(),
+            rows: materialize_snapshot_rows(spec, &shape.projection, snapshots)?,
+            notices: Vec::new(),
+        }));
+    }
+    let rows = ctx.live_state().scan_batch(&request).await?;
+
+    // The accepted ORDER BY is the complete one-column primary key.
+    // Retain multiple file-backed identities for one logical primary
+    // key; `file_id` is a first-class row identity and must not be
+    // collapsed by this route.
+    let mut ordinals = (0..rows.len()).collect::<Vec<_>>();
+    ordinals.sort_unstable_by(|left, right| {
+        rows.row(*left)
+            .entity_pk()
+            .cmp(rows.row(*right).entity_pk())
+    });
+    let result_rows = ordinals
+        .into_iter()
+        .map(|row| {
+            materialize_row(
+                spec,
+                &shape.projection,
+                rows.row(row).snapshot_content().map(|value| value.as_str()),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Some(SqlQueryResult {
+        columns: shape.projection,
+        rows: result_rows,
+        notices: Vec::new(),
+    }))
 }
 
 async fn execute_entity_left_join_read<C>(
@@ -547,33 +465,6 @@ struct StrictEntityPrimaryKeyRead {
     primary_key_values: Vec<String>,
 }
 
-enum StrictEntityRead {
-    PrimaryKey(StrictEntityPrimaryKeyRead),
-    Broad(StrictEntityBroadRead),
-}
-
-impl StrictEntityRead {
-    fn table_name(&self) -> &str {
-        match self {
-            Self::PrimaryKey(shape) => &shape.table_name,
-            Self::Broad(shape) => &shape.table_name,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct StrictEntityBroadRead {
-    table_name: String,
-    projection: Vec<String>,
-    primary_key_column: String,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct StrictEntityCountRead {
-    table_name: String,
-    alias: String,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct StrictEntityJoinProjection {
     table: String,
@@ -760,91 +651,6 @@ fn strict_entity_primary_key_read(
         primary_key_column,
         primary_key_values,
     })
-}
-
-/// Recognizes the canonical broad tracked entity read. The packed head index
-/// already stores one schema in primary-key order, so this shape can return
-/// final public rows without routing an otherwise no-op sort through
-/// DataFusion. Any clause that needs general SQL semantics remains a normal
-/// DataFusion query.
-fn strict_entity_broad_read(
-    statement: &DataFusionStatement,
-    params: &[Value],
-) -> Option<StrictEntityBroadRead> {
-    if !params.is_empty() {
-        return None;
-    }
-    let (query, select, table_name) = strict_single_table_select(statement)?;
-    if query.limit_clause.is_some() || query.fetch.is_some() || select.selection.is_some() {
-        return None;
-    }
-    Some(StrictEntityBroadRead {
-        table_name,
-        projection: strict_projection(&select.projection)?,
-        primary_key_column: canonical_ascending_order_column(query)?,
-    })
-}
-
-/// Recognizes only `COUNT(*)` over one active entity table. Any predicate,
-/// grouping, distinct modifier, or expression remains with DataFusion because
-/// the collection-control cardinality is not a substitute for those SQL
-/// semantics.
-fn strict_entity_count_read(
-    statement: &DataFusionStatement,
-    params: &[Value],
-) -> Option<StrictEntityCountRead> {
-    if !params.is_empty() {
-        return None;
-    }
-    let (query, select, table_name) = strict_single_table_select(statement)?;
-    if query.order_by.is_some()
-        || query.limit_clause.is_some()
-        || query.fetch.is_some()
-        || select.selection.is_some()
-    {
-        return None;
-    }
-    let [projection] = select.projection.as_slice() else {
-        return None;
-    };
-    let (expression, alias) = match projection {
-        // Match DataFusion's public column name for an unaliased aggregate.
-        // The metadata route must not expose a different result schema.
-        SelectItem::UnnamedExpr(expression) => (expression, "count(*)".to_owned()),
-        SelectItem::ExprWithAlias { expr, alias } => (expr, strict_identifier_name(alias)),
-        _ => return None,
-    };
-    let Expr::Function(function) = expression else {
-        return None;
-    };
-    if function.name.0.len() != 1
-        || function
-            .name
-            .0
-            .first()
-            .and_then(|part| part.as_ident())
-            .is_none_or(|ident| !ident.value.eq_ignore_ascii_case("count"))
-        || function.filter.is_some()
-        || function.null_treatment.is_some()
-        || function.over.is_some()
-        || !function.within_group.is_empty()
-        || function.uses_odbc_syntax
-    {
-        return None;
-    }
-    let datafusion::sql::sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
-        return None;
-    };
-    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
-        return None;
-    }
-    matches!(
-        arguments.args.as_slice(),
-        [datafusion::sql::sqlparser::ast::FunctionArg::Unnamed(
-            datafusion::sql::sqlparser::ast::FunctionArgExpr::Wildcard
-        )]
-    )
-    .then_some(StrictEntityCountRead { table_name, alias })
 }
 
 fn strict_single_table_select(
@@ -1068,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_benchmark_primary_key_read() {
+    fn recognizes_canonical_primary_key_read() {
         let shape = strict_entity_primary_key_read(
             &parse(
                 "SELECT path, value FROM json_pointer WHERE path IN ('/a', '/b', '/a') ORDER BY path",
@@ -1092,49 +898,6 @@ mod tests {
         .expect("numbered text params should use direct route");
 
         assert_eq!(shape.primary_key_values, ["/a", "/b"]);
-    }
-
-    #[test]
-    fn recognizes_benchmark_broad_read() {
-        let shape = strict_entity_broad_read(
-            &parse("SELECT path, value FROM json_pointer ORDER BY path"),
-            &[],
-        )
-        .expect("benchmark query should use the broad direct route");
-
-        assert_eq!(shape.table_name, "json_pointer");
-        assert_eq!(shape.projection, ["path", "value"]);
-        assert_eq!(shape.primary_key_column, "path");
-    }
-
-    #[test]
-    fn recognizes_unfiltered_entity_count() {
-        let shape =
-            strict_entity_count_read(&parse("SELECT COUNT(*) AS total FROM json_pointer"), &[])
-                .expect("unfiltered entity count should use collection metadata");
-
-        assert_eq!(shape.table_name, "json_pointer");
-        assert_eq!(shape.alias, "total");
-
-        let unaliased = strict_entity_count_read(&parse("SELECT COUNT(*) FROM json_pointer"), &[])
-            .expect("unaliased entity count should use collection metadata");
-        assert_eq!(unaliased.alias, "count(*)");
-    }
-
-    #[test]
-    fn count_read_rejects_semantics_not_covered_by_collection_metadata() {
-        for sql in [
-            "SELECT COUNT(value) FROM json_pointer",
-            "SELECT COUNT(*) FROM json_pointer WHERE path = '/a'",
-            "SELECT COUNT(DISTINCT path) FROM json_pointer",
-            "SELECT COUNT(*) FROM json_pointer GROUP BY path",
-            "SELECT COUNT(*) FROM json_pointer LIMIT 1",
-        ] {
-            assert!(
-                strict_entity_count_read(&parse(sql), &[]).is_none(),
-                "query must retain DataFusion semantics: {sql}"
-            );
-        }
     }
 
     #[test]
@@ -1197,31 +960,5 @@ mod tests {
                 "{sql} must fall back"
             );
         }
-    }
-
-    #[test]
-    fn broad_read_rejects_any_clause_that_needs_general_sql() {
-        for sql in [
-            "SELECT path, value FROM json_pointer",
-            "SELECT path, value FROM json_pointer ORDER BY path DESC",
-            "SELECT path, value FROM json_pointer WHERE true ORDER BY path",
-            "SELECT path, value FROM json_pointer ORDER BY path LIMIT 1",
-            "SELECT path, value FROM json_pointer AS p ORDER BY path",
-            "SELECT * FROM json_pointer ORDER BY path",
-            "SELECT path, path FROM json_pointer ORDER BY path",
-        ] {
-            assert!(
-                strict_entity_broad_read(&parse(sql), &[]).is_none(),
-                "{sql} must fall back"
-            );
-        }
-        assert!(
-            strict_entity_broad_read(
-                &parse("SELECT path, value FROM json_pointer ORDER BY path"),
-                &[Value::Text("unused".to_string())],
-            )
-            .is_none(),
-            "an unused parameter must retain normal SQL validation"
-        );
     }
 }

@@ -55,4 +55,4 @@ defect fixed by <https://github.com/opral/lix/pull/1137>.
 
 The padded storage identity columns are present in both engines and absent
 from benchmark SQL. They make the initial load deterministically ordered and
-allow Lix to publish its normal packed analytical base.
+allow Lix to publish its normal packed columnar base.

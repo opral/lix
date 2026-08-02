@@ -3018,31 +3018,18 @@ mod tests {
     }
 
     #[test]
-    fn entity_columnar_sidecar_policy_defaults_on_and_accepts_explicit_opt_out() {
+    fn schema_rejects_removed_columnar_storage_policy() {
         let mut schema = crate::schema::seed_schema_definition("lix_key_value")
             .expect("key-value schema should exist")
             .clone();
-        let compile = |schema: JsonValue| {
-            SchemaPlan::compile(
-                SchemaCatalogKey {
-                    schema_key: "lix_key_value".to_string(),
-                },
-                schema,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-            )
-            .expect("key-value schema should compile")
-        };
-
-        assert!(crate::schema::materializes_entity_columnar_sidecar(&schema));
-        let _ = compile(schema.clone());
         schema["x-lix-columnar"] = json!(false);
-        crate::schema::validate_lix_schema_definition(&schema)
-            .expect("columnar storage policy should be a valid Lix schema extension");
-        assert!(!crate::schema::materializes_entity_columnar_sidecar(
-            &schema
-        ));
-        let _ = compile(schema);
+        let error = crate::schema::validate_lix_schema_definition(&schema)
+            .expect_err("physical storage policy must not be part of a public schema");
+        assert!(
+            error
+                .message
+                .contains("unknown x-lix field 'x-lix-columnar'")
+        );
     }
 
     #[test]
