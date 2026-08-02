@@ -107,22 +107,6 @@ where
         })
     }
 
-    /// Extracts literal parameters when `sql` has an already validated UPDATE
-    /// shape.
-    ///
-    /// Batch classification validates and parses the first statement once.
-    /// The remaining statements only need to prove that normalization yields
-    /// the same shape; reparsing and cloning the same AST for every row would
-    /// make classification itself linear in the planner representation.
-    pub(crate) fn update_literal_params_for_shape(
-        &self,
-        sql: &str,
-        normalized_shape: &str,
-    ) -> Option<Vec<Value>> {
-        let (normalized_sql, params) = normalize_update_string_literals(sql)?;
-        (normalized_sql == normalized_shape).then_some(params)
-    }
-
     /// Checks an UPDATE template without retaining decoded literal values.
     ///
     /// Large heterogeneous batches use this as a cheap certification pass so
@@ -130,6 +114,20 @@ where
     /// memory before ordinary sequential classification resumes.
     pub(crate) fn update_literal_shape_matches(&self, sql: &str, normalized_shape: &str) -> bool {
         update_string_literals_match_shape(sql, normalized_shape)
+    }
+
+    /// Decodes a previously shape-certified UPDATE into reusable string slots.
+    ///
+    /// The batch classifier calls [`Self::update_literal_shape_matches`] for
+    /// every row before entering this path. Reusing one string per parameter
+    /// avoids allocating a transient `Vec<Value>` and owned string set for
+    /// every statement while the Arrow columns are being assembled.
+    pub(crate) fn decode_certified_update_literals_into(
+        &self,
+        sql: &str,
+        params: &mut [String],
+    ) -> bool {
+        decode_update_string_literals_into(sql, params)
     }
 
     /// Returns stable public-surface metadata for one catalog generation.
@@ -390,6 +388,54 @@ fn update_string_literals_match_shape(sql: &str, normalized_shape: &str) -> bool
     !quoted_identifier && param_count > 0 && shape.get(shape_cursor..) == Some(&bytes[copied..])
 }
 
+fn decode_update_string_literals_into(sql: &str, params: &mut [String]) -> bool {
+    params.iter_mut().for_each(String::clear);
+    let bytes = sql.as_bytes();
+    let mut cursor = 0_usize;
+    let mut param_index = 0_usize;
+    let mut quoted_identifier = false;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'"' => {
+                if quoted_identifier && bytes.get(cursor + 1) == Some(&b'"') {
+                    cursor += 2;
+                    continue;
+                }
+                quoted_identifier = !quoted_identifier;
+                cursor += 1;
+            }
+            b'\'' if !quoted_identifier => {
+                let Some(value) = params.get_mut(param_index) else {
+                    return false;
+                };
+                param_index += 1;
+                cursor += 1;
+                let mut segment_start = cursor;
+                loop {
+                    let Some(quote) = bytes[cursor..]
+                        .iter()
+                        .position(|byte| *byte == b'\'')
+                        .map(|offset| cursor + offset)
+                    else {
+                        return false;
+                    };
+                    value.push_str(&sql[segment_start..quote]);
+                    if bytes.get(quote + 1) == Some(&b'\'') {
+                        value.push('\'');
+                        cursor = quote + 2;
+                        segment_start = cursor;
+                        continue;
+                    }
+                    cursor = quote + 1;
+                    break;
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+    !quoted_identifier && param_index == params.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +541,24 @@ mod tests {
                 "{different_shape}"
             );
         }
+    }
+
+    #[test]
+    fn certified_literal_decoder_reuses_slots_and_unescapes_quotes() {
+        let cache = test_cache(8);
+        let mut params = vec![String::with_capacity(32), String::with_capacity(8)];
+        params[0].push_str("stale-value");
+        params[1].push_str("stale-id");
+
+        assert!(cache.decode_certified_update_literals_into(
+            "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'b'",
+            &mut params,
+        ));
+        assert_eq!(params, ["{\"text\":\"it's fine\"}", "b"]);
+        assert!(!cache.decode_certified_update_literals_into(
+            "UPDATE notes SET value = 'only-one'",
+            &mut params,
+        ));
     }
 
     #[test]
