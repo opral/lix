@@ -4237,6 +4237,14 @@ where
         entity_pks: &[EntityPk],
         limit: Option<usize>,
     ) -> Result<Vec<Option<Bytes>>, LixError> {
+        if entity_pks.is_empty()
+            && limit.is_none()
+            && let Some(snapshots) = self
+                .scan_exclusive_entity_snapshots(branch_id, control, schema_key)
+                .await?
+        {
+            return Ok(snapshots);
+        }
         self.scan_entity_snapshots_for_generation(
             branch_id,
             control.generation,
@@ -4246,6 +4254,86 @@ where
             limit,
         )
         .await
+    }
+
+    /// Reads one atomically published exclusive collection straight from its
+    /// packed commit payload column. The publication proof excludes HOT,
+    /// root, certified, and multi-base winners, so manufacturing a generic
+    /// live-state batch only to discard every column except the snapshot is
+    /// unnecessary read and allocation amplification.
+    async fn scan_exclusive_entity_snapshots(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        let Some((commit_id, live_count)) = self
+            .exclusive_entity_base(branch_id, control, schema_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(members) =
+            crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
+                &self.store,
+                commit_id,
+                &[schema_key.to_owned()],
+                PACKED_BROAD_SNAPSHOT_MAX_SEGMENTS,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let capacity = usize::try_from(live_count)
+            .map_err(|_| head_value_error("exclusive entity live count exceeds usize"))?;
+        let mut snapshots = Vec::with_capacity(capacity);
+        let mut deferred_refs = Vec::new();
+        let mut deferred_rows = Vec::new();
+        for member in members {
+            if member.value.deleted
+                || member.key.schema_key != schema_key
+                || member.key.file_id.is_some()
+            {
+                return Err(head_value_error(
+                    "exclusive entity base contains a non-live or file-scoped member",
+                ));
+            }
+            match member.change.snapshot {
+                JsonSlot::None => snapshots.push(None),
+                JsonSlot::Inline(json) => {
+                    snapshots.push(Some(Bytes::from(json.into_string())));
+                }
+                JsonSlot::Ref(json_ref) => {
+                    deferred_rows.push(snapshots.len());
+                    deferred_refs.push(json_ref);
+                    snapshots.push(None);
+                }
+            }
+        }
+        if snapshots.len() != capacity {
+            return Err(head_value_error(format!(
+                "exclusive entity base expected {live_count} live rows, decoded {}",
+                snapshots.len()
+            )));
+        }
+        if !deferred_refs.is_empty() {
+            let loaded = JsonStoreContext::new()
+                .load_bytes_many(
+                    &self.store,
+                    JsonLoadRequestRef {
+                        refs: &deferred_refs,
+                        scope: JsonReadScopeRef::OutOfBand,
+                    },
+                )
+                .await?
+                .into_values();
+            for (row_index, value) in deferred_rows.into_iter().zip(loaded) {
+                snapshots[row_index] = Some(value.ok_or_else(|| {
+                    head_value_error("exclusive entity snapshot payload is missing")
+                })?);
+            }
+        }
+        Ok(Some(snapshots))
     }
 
     pub(crate) async fn scan_entity_primary_keys(
@@ -4300,6 +4388,32 @@ where
         )>,
         LixError,
     > {
+        let Some((commit_id, live_count)) = self
+            .exclusive_entity_base(branch_id, control, schema_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let id = crate::live_state::entity_row_group_set_id(commit_id, schema_key);
+        let Some(manifest) =
+            crate::columnar_row_group::load_row_group_manifest(&self.store, id).await?
+        else {
+            return Ok(None);
+        };
+        if manifest.namespace != schema_key || manifest.row_count() != live_count {
+            return Err(head_value_error(
+                "entity columnar sidecar disagrees with its collection publication",
+            ));
+        }
+        Ok(Some((id, manifest)))
+    }
+
+    async fn exclusive_entity_base(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+    ) -> Result<Option<(CommitId, u64)>, LixError> {
         let collection = load_hot_collection_control(
             &self.store,
             branch_id,
@@ -4323,18 +4437,17 @@ where
         let [base_ref] = base_refs.as_slice() else {
             return Ok(None);
         };
-        let id = crate::live_state::entity_row_group_set_id(base_ref.commit_id, schema_key);
-        let Some(manifest) =
-            crate::columnar_row_group::load_row_group_manifest(&self.store, id).await?
-        else {
-            return Ok(None);
-        };
-        if manifest.namespace != schema_key || manifest.row_count() != collection.live_count {
+        let active_base_refs =
+            packed_current_base_refs(&self.store, branch_id, control.generation).await?;
+        if !active_base_refs
+            .iter()
+            .any(|active| active.commit_id == base_ref.commit_id)
+        {
             return Err(head_value_error(
-                "entity columnar sidecar disagrees with its collection publication",
+                "exclusive schema index references an inactive packed current base",
             ));
         }
-        Ok(Some((id, manifest)))
+        Ok(Some((base_ref.commit_id, collection.live_count)))
     }
 
     #[cfg(test)]

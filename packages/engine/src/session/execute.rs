@@ -6183,6 +6183,27 @@ mod tests {
             "the certified full replacement must publish one packed current base"
         );
 
+        let broad_rows = session
+            .execute(
+                "SELECT path, value FROM packed_replacement_probe ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(broad_rows.len(), ROW_COUNT);
+        assert_eq!(
+            broad_rows.rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"updated": 0})
+        );
+        assert_eq!(
+            broad_rows.rows()[ROW_COUNT - 1]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"updated": ROW_COUNT - 1})
+        );
+
         let rows = session
             .execute(
                 "SELECT path, value FROM packed_replacement_probe WHERE path IN ('/0000', '/1023') ORDER BY path",
@@ -6216,12 +6237,12 @@ mod tests {
             .unwrap();
         let rows = session
             .execute(
-                "SELECT path, value FROM packed_replacement_probe WHERE path IN ('/0000', '/1023') ORDER BY path",
+                "SELECT path, value FROM packed_replacement_probe ORDER BY path",
                 &[],
             )
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), ROW_COUNT - 1);
         assert_eq!(rows.rows()[0].get::<String>("path").unwrap(), "/0000");
         assert_eq!(
             rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
