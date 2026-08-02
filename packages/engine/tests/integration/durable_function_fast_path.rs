@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use lix_engine::{
     Engine, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, Value, WriteOptions,
+    ScanChunk, ScanOptions, Storage, StorageError, StorageRead, Value, WriteOptions,
 };
 
 #[derive(Clone, Default)]
@@ -75,7 +75,7 @@ impl StorageRead for CountingRead {
 
     async fn scan(
         &self,
-        space: SpaceId,
+        space: lix_engine::storage::StorageSpace,
         range: KeyRange,
         options: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {

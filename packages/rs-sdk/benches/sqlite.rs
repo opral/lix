@@ -9,13 +9,13 @@ use lix_engine::storage::PutEntry;
 use lix_sdk::{
     CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue,
     PutBatch, ReadOptions, SQLite, ScanChunk, ScanOptions, SpaceId, Storage, StorageError,
-    StorageRead, StorageWrite, StoredValue, WriteOptions,
+    StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
 };
 use tempfile::TempDir;
 
 const ROWS: usize = 50_000;
 /// Space used by the single-space cells.
-const BENCH_SPACE: SpaceId = SpaceId(0x0001_0001);
+const BENCH_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(0x0001_0001), "benchmark.mutable");
 const POINT_KEYS: usize = 1_000;
 const VALUE_SIZE: usize = 256;
 const SCAN_CHUNK_ROWS: usize = 1_024;
@@ -128,10 +128,14 @@ fn full_range() -> KeyRange {
     }
 }
 
+const fn mutable_space(id: u32) -> StorageSpace {
+    StorageSpace::mutable(SpaceId(id), "benchmark.mutable")
+}
+
 fn seed_spaces(storage: &SQLite) {
     let mut write = block_on(storage.begin_write(WriteOptions::default())).expect("begin write");
     for &(space_id, rows, value_size) in SPACE_MIX {
-        let space = SpaceId(space_id);
+        let space = mutable_space(space_id);
         let mut entries = (0..rows)
             .map(|index| PutEntry {
                 key: space_key_for(index),
@@ -168,7 +172,7 @@ fn bench_space_prefix_scan(c: &mut Criterion, fixture: &SQLiteFixture) {
             let mut count = CountingScanRead::default();
             let result = block_on(paged_scan(
                 &read,
-                SpaceId(0x0001_0001),
+                mutable_space(0x0001_0001),
                 CoreProjection::FullValue,
                 &mut count,
             ))
@@ -190,7 +194,7 @@ fn bench_space_prefix_scan(c: &mut Criterion, fixture: &SQLiteFixture) {
                 let mut count = CountingScanRead::default();
                 let result = block_on(paged_scan(
                     &read,
-                    SpaceId(space_id),
+                    mutable_space(space_id),
                     CoreProjection::FullValue,
                     &mut count,
                 ))
@@ -216,7 +220,7 @@ fn bench_space_truncate(c: &mut Criterion) {
             |fixture| {
                 let mut write = block_on(fixture.storage.begin_write(WriteOptions::default()))
                     .expect("begin write");
-                block_on(write.delete_range(SpaceId(0x0001_0001), full_range()))
+                block_on(write.delete_range(mutable_space(0x0001_0001), full_range()))
                     .expect("truncate space");
                 block_on(write.commit()).expect("commit");
                 fixture
@@ -466,7 +470,7 @@ fn bench_write_batches(c: &mut Criterion) {
 /// limited scans, one query per page.
 async fn paged_scan<R: StorageRead>(
     read: &R,
-    space: SpaceId,
+    space: StorageSpace,
     projection: CoreProjection,
     count: &mut CountingScanRead,
 ) -> Result<PagedScanResult, StorageError> {

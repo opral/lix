@@ -13,12 +13,12 @@ use bytes::Bytes;
 use lix_engine::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, PutEntry, ReadDurability, ReadEntry,
-    ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
-    WriteOptions, WriteStats,
+    ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
+    StorageWrite, ValueSemantics, WriteOptions, WriteStats,
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use rusqlite::types::ValueRef as SqlValueRef;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tempfile::TempDir;
 
 /// Format v2: one table per storage space instead of a single interleaved
@@ -235,23 +235,23 @@ fn check_preconditions(
     for (index, precondition) in preconditions.iter().enumerate() {
         let matches = match precondition {
             Precondition::KeyAbsent { space, key } => {
-                precondition_value(conn, *space, key)?.is_none()
+                precondition_value(conn, space.id, key)?.is_none()
             }
             Precondition::KeyPresent { space, key } => {
-                precondition_value(conn, *space, key)?.is_some()
+                precondition_value(conn, space.id, key)?.is_some()
             }
             Precondition::KeyValueHashEquals { space, key, hash } => {
-                precondition_value(conn, *space, key)?
+                precondition_value(conn, space.id, key)?
                     .is_some_and(|value| blake3::hash(&value).as_bytes() == hash)
             }
             Precondition::KeyValueEquals {
                 space,
                 key,
                 expected,
-            } => precondition_value(conn, *space, key)?
+            } => precondition_value(conn, space.id, key)?
                 .is_some_and(|value| value.as_slice() == expected.as_ref()),
             Precondition::RangeEmpty { space, range } => {
-                precondition_range_is_empty(conn, *space, range)?
+                precondition_range_is_empty(conn, space.id, range)?
             }
             Precondition::BranchEquals { .. } => false,
         };
@@ -332,13 +332,13 @@ impl StorageRead for SQLiteRead {
             for request in requests {
                 let offset = values.len();
                 values.resize(offset + request.keys.len(), None);
-                if !space_table_exists(conn, request.space)? {
+                if !space_table_exists(conn, request.space.id)? {
                     continue;
                 }
                 for (chunk_index, chunk) in request.keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
                     read_points_chunk(
                         conn,
-                        request.space,
+                        request.space.id,
                         offset + chunk_index * POINT_READ_CHUNK_KEYS,
                         chunk,
                         request.opts.projection,
@@ -352,7 +352,7 @@ impl StorageRead for SQLiteRead {
 
     fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
@@ -369,6 +369,7 @@ impl StorageRead for SQLiteRead {
             let conn = conn
                 .as_ref()
                 .ok_or_else(|| StorageError::Io("sqlite read is closed".to_string()))?;
+            let space = space.id;
             if !space_table_exists(conn, space)? {
                 return Ok(ScanChunk {
                     entries: Vec::new(),
@@ -458,10 +459,12 @@ impl Drop for SQLiteRead {
 impl StorageWrite for SQLiteWrite {
     fn put_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
+            let semantics = space.value_semantics;
+            let space = space.id;
             let mut entries = entries.entries;
             entries.sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
             debug_assert!(
@@ -474,6 +477,9 @@ impl StorageWrite for SQLiteWrite {
                 .map(|entry| entry.value.bytes.len() as u64)
                 .sum::<u64>();
             self.ensure_space_table(space)?;
+            if semantics == ValueSemantics::Immutable {
+                self.validate_immutable_rows(space, &entries)?;
+            }
             self.put_rows(space, &entries)?;
             self.stats.put_entries += put_entries;
             self.stats.written_bytes += written_bytes;
@@ -484,10 +490,11 @@ impl StorageWrite for SQLiteWrite {
 
     fn delete_many(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         keys: &[Key],
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
+            let space = space.id;
             if space_table_exists(self.conn(), space)? {
                 let table = space_table(space);
                 let sql = format!("DELETE FROM {table} WHERE key = ?1");
@@ -506,10 +513,11 @@ impl StorageWrite for SQLiteWrite {
 
     fn delete_range(
         &mut self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
+            let space = space.id;
             let deleted = if !space_table_exists(self.conn(), space)? {
                 0
             } else {
@@ -608,6 +616,33 @@ impl SQLiteWrite {
             for entry in remainder {
                 stmt.execute(params![entry.key.0.as_ref(), entry.value.bytes.as_ref()])
                     .map_err(sqlite_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_immutable_rows(
+        &self,
+        space: SpaceId,
+        entries: &[PutEntry],
+    ) -> Result<(), StorageError> {
+        let table = space_table(space);
+        let sql = format!("SELECT value FROM {table} WHERE key = ?1");
+        let mut stmt = self.conn().prepare_cached(&sql).map_err(sqlite_error)?;
+        for entry in entries {
+            let existing = stmt
+                .query_row(params![entry.key.0.as_ref()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .optional()
+                .map_err(sqlite_error)?;
+            if existing
+                .as_deref()
+                .is_some_and(|existing| existing != entry.value.bytes.as_ref())
+            {
+                return Err(StorageError::Corruption(
+                    "immutable identity was assigned different bytes".to_string(),
+                ));
             }
         }
         Ok(())

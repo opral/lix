@@ -42,14 +42,14 @@ pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifes
 pub(crate) const BINARY_CAS_CHUNK_NAMESPACE: &str = "binary_cas.chunk";
 pub(crate) const BINARY_CAS_CHUNK_PRESENCE_NAMESPACE: &str = "binary_cas.chunk_presence";
 pub(crate) const BINARY_CAS_MANIFEST_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0005_0001), BINARY_CAS_MANIFEST_NAMESPACE);
-pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpace::mutable(StorageSpaceId(0x0005_0001), BINARY_CAS_MANIFEST_NAMESPACE);
+pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0005_0002),
     BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
 );
 pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0005_0003), BINARY_CAS_CHUNK_NAMESPACE);
-pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpace::immutable(StorageSpaceId(0x0005_0003), BINARY_CAS_CHUNK_NAMESPACE);
+pub(crate) const BINARY_CAS_CHUNK_PRESENCE_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0005_0004),
     BINARY_CAS_CHUNK_PRESENCE_NAMESPACE,
 );
@@ -281,6 +281,8 @@ pub(in crate::binary_cas) async fn stage_fixed_part_skipping_existing(
             "resumable CAS parts must contain 1 byte through 16 MiB",
         ));
     }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_media_upload_chunk_payload_hash_bytes(bytes.len());
     let receipts = bytes
         .chunks(crate::binary_cas::chunking::MEDIA_CHUNK_BYTES)
         .map(|chunk| crate::binary_cas::BlobChunkReceipt {
@@ -2105,15 +2107,15 @@ mod tests {
             requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
         ) -> Result<StorageGetManyResult, StorageError> {
             for request in requests {
-                if request.space == BINARY_CAS_MANIFEST_SPACE.id {
+                if request.space == BINARY_CAS_MANIFEST_SPACE {
                     self.manifest_get_many_calls.fetch_add(1, Ordering::Relaxed);
                 }
-                if request.space == BINARY_CAS_CHUNK_SPACE.id {
+                if request.space == BINARY_CAS_CHUNK_SPACE {
                     self.chunk_get_many_calls.fetch_add(1, Ordering::Relaxed);
                     self.chunk_keys_requested
                         .fetch_add(request.keys.len(), Ordering::Relaxed);
                 }
-                if request.space == BINARY_CAS_CHUNK_PRESENCE_SPACE.id {
+                if request.space == BINARY_CAS_CHUNK_PRESENCE_SPACE {
                     self.presence_get_many_calls.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -2122,11 +2124,11 @@ mod tests {
 
         async fn scan(
             &self,
-            space: StorageSpaceId,
+            space: StorageSpace,
             range: StorageKeyRange,
             opts: StorageScanOptions,
         ) -> Result<StorageScanChunk, StorageError> {
-            let is_manifest_scan = space == BINARY_CAS_MANIFEST_CHUNK_SPACE.id;
+            let is_manifest_scan = space == BINARY_CAS_MANIFEST_CHUNK_SPACE;
             let manifest_hash = if is_manifest_scan {
                 manifest_hash_from_range(&range)
             } else {
@@ -3267,7 +3269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_rejects_chunk_bytes_that_do_not_match_manifest_hash() {
+    async fn immutable_storage_rejects_chunk_bytes_that_do_not_match_identity() {
         let storage = StorageAdapter::new(Memory::new());
         let data = b"same length";
         let corrupted = b"SAME length";
@@ -3291,24 +3293,21 @@ mod tests {
                 corrupted.len() as u64,
                 corrupted,
             );
-            storage
+            let error = storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .await
-                .expect("corrupt manifest should overwrite");
+                .expect_err("corrupt immutable chunk must not overwrite");
+            assert!(error.to_string().contains("immutable identity"));
         }
 
         let store = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let error = load_bytes_many(&store, &[blob_hash])
+        let loaded = load_bytes_many(&store, &[blob_hash])
             .await
-            .expect_err("corrupt chunk should be rejected");
-        assert!(
-            error
-                .message
-                .contains("failed content-address verification")
-        );
+            .expect("original chunk remains readable");
+        assert_eq!(loaded.into_vec(), vec![Some(data.to_vec())]);
     }
     #[test]
     fn decode_rejects_same_length_raw_bytes_for_wrong_hash() {

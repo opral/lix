@@ -49,10 +49,11 @@ pub use lix_engine::{
     ReadEntry, ReadOptions, RedoReceipt, RequestBlobSpliceProvenance, Row, ScanChunk, ScanOptions,
     SpaceId, SqlQueryResult, SqlScriptPlan, SqlScriptStatement, Storage, StorageConformanceReport,
     StorageConformanceResult, StorageConformanceStatus, StorageConformanceTest, StorageError,
-    StorageFactory, StorageFixture, StorageRead, StorageTestConfig, StorageWrite, StoredValue,
-    SwitchBranchOptions, SwitchBranchReceipt, SwitchBranchReceipt as SwitchBranchResult,
-    TryFromValue, UndoReceipt, Value, VerifiedRequestBlob, WireValue, WriteOptions, WriteStats,
-    parse_sql_script, run_storage_conformance, validate_lix_path_segment,
+    StorageFactory, StorageFixture, StorageRead, StorageSpace, StorageTestConfig, StorageWrite,
+    StoredValue, SwitchBranchOptions, SwitchBranchReceipt,
+    SwitchBranchReceipt as SwitchBranchResult, TryFromValue, UndoReceipt, Value, ValueSemantics,
+    VerifiedRequestBlob, WireValue, WriteOptions, WriteStats, parse_sql_script,
+    run_storage_conformance, validate_lix_path_segment,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, SQLiteFixture, SQLiteOptions};

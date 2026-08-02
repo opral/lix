@@ -31,7 +31,7 @@ use super::keys::{
 use super::persistent_map::PersistentMap;
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey};
 
-const FILESYSTEM_PATH_REVISION_SPACE: StorageSpace = StorageSpace::new(
+const FILESYSTEM_PATH_REVISION_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0007_0002),
     "filesystem.path_index_revision",
 );

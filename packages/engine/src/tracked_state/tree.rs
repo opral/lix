@@ -3151,8 +3151,8 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
     use crate::storage::{
-        GetManyResult, KeyRange, ProjectedValue, ScanChunk, ScanOptions, SpaceId, Storage,
-        StorageError, StorageRead,
+        GetManyResult, KeyRange, ProjectedValue, ScanChunk, ScanOptions, Storage, StorageError,
+        StorageRead,
     };
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageAdapterReadScope};
@@ -3179,7 +3179,7 @@ mod tests {
             requests: &[crate::storage::GetManyRequest<'_>],
         ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
             for request in requests {
-                if request.space == storage::TRACKED_STATE_TREE_CHUNK_SPACE.id {
+                if request.space == storage::TRACKED_STATE_TREE_CHUNK_SPACE {
                     self.tree_chunk_reads
                         .fetch_add(request.keys.len(), Ordering::Relaxed);
                 }
@@ -3189,7 +3189,7 @@ mod tests {
 
         fn scan(
             &self,
-            space: SpaceId,
+            space: crate::storage::StorageSpace,
             range: KeyRange,
             opts: ScanOptions,
         ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
@@ -3206,7 +3206,7 @@ mod tests {
                 assert!(
                     requests
                         .iter()
-                        .all(|request| request.space == storage::TRACKED_STATE_TREE_CHUNK_SPACE.id)
+                        .all(|request| request.space == storage::TRACKED_STATE_TREE_CHUNK_SPACE)
                 );
                 let read_index = self.storage_reads.fetch_add(1, Ordering::Relaxed);
                 let bytes = if self.corrupt_first_read && read_index == 0 {
@@ -3229,7 +3229,7 @@ mod tests {
 
         fn scan(
             &self,
-            _space: SpaceId,
+            _space: crate::storage::StorageSpace,
             _range: KeyRange,
             _opts: ScanOptions,
         ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {

@@ -10,7 +10,7 @@ use crate::storage::{ProfileStorage as RawProfileStorage, RocksDB, SQLite, Stora
 use crate::workload::{WorkloadRow, snapshot_value};
 
 const ROW_SPACE: StorageSpace =
-    StorageSpace::new(SpaceId(0x0002_0001), "tracked_state.crud.row.v1");
+    StorageSpace::mutable(SpaceId(0x0002_0001), "tracked_state.crud.row.v1");
 
 #[derive(Clone)]
 struct BenchRow {

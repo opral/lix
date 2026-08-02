@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::storage::{
-    GetManyRequest, GetManyResult, KeyRange, ScanChunk, ScanOptions, SpaceId, StorageError,
-    StorageRead,
+    GetManyRequest, GetManyResult, KeyRange, ScanChunk, ScanOptions, StorageError, StorageRead,
+    StorageSpace,
 };
 
 /// The async read capability consumed by engine stores.
@@ -21,7 +21,7 @@ pub trait StorageAdapterRead: Send + Sync {
 
     fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send;
@@ -103,7 +103,7 @@ where
 
     fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
@@ -128,7 +128,7 @@ where
 
     fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
@@ -153,7 +153,7 @@ where
 
     fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
@@ -178,7 +178,7 @@ where
 
     fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {

@@ -30,7 +30,8 @@ pub use crate::storage::{
     ReadDurability as StorageReadDurability, ReadEntry as StorageReadEntry,
     ReadOptions as StorageReadOptions, ScanChunk as StorageScanChunk,
     ScanOptions as StorageScanOptions, SpaceId as StorageSpaceId, Storage, StorageError,
-    StorageRead, StoredValue as StorageValue, WriteOptions as StorageWriteOptions,
+    StorageRead, StorageSpace, StoredValue as StorageValue, ValueSemantics,
+    WriteOptions as StorageWriteOptions,
 };
 pub(crate) use crate::storage::{PutBatch, PutEntry};
 
@@ -39,7 +40,6 @@ pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUnique
 pub(crate) use read_scope::SharedStorageAdapterRead;
 pub use read_scope::{StorageAdapterRead, StorageAdapterReadScope};
 pub use scan::ScanPlan;
-pub use spaces::StorageSpace;
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,
 };

@@ -106,9 +106,9 @@ async fn sqlite_scans_with_usize_max_limit() {
     // a wrapping lookahead limit returned zero rows in release builds.
     use lix_sdk::{
         CoreProjection, KeyRange, PutBatch, ReadOptions, ScanOptions, SpaceId, Storage,
-        StorageRead, StorageWrite, WriteOptions,
+        StorageRead, StorageSpace, StorageWrite, WriteOptions,
     };
-    const TEST_SPACE: SpaceId = SpaceId(0x0001_0001);
+    const TEST_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(0x0001_0001), "test.mutable");
     let dir = tempfile::tempdir().expect("tempdir");
     let storage = SQLite::open(dir.path().join("max.lix")).expect("open");
     let mut write = storage
@@ -162,9 +162,9 @@ async fn sqlite_put_many_handles_multi_chunk_batches() {
     use lix_engine::storage::PutEntry;
     use lix_sdk::{
         CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, PutBatch, ReadOptions,
-        SpaceId, Storage, StorageRead, StorageWrite, StoredValue, WriteOptions,
+        SpaceId, Storage, StorageRead, StorageSpace, StorageWrite, StoredValue, WriteOptions,
     };
-    const TEST_SPACE: SpaceId = SpaceId(0x0001_0001);
+    const TEST_SPACE: StorageSpace = StorageSpace::mutable(SpaceId(0x0001_0001), "test.mutable");
 
     // 300 entries: two full 128-row upsert chunks plus a 44-row remainder.
     const ROWS: usize = 300;

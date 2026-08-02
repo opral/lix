@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use lix_engine::Value;
 use lix_engine::{
     CreateBranchOptions, Engine, GetManyRequest, GetManyResult, KeyRange, LixError, Memory,
-    MemoryRead, MemoryWrite, MergeBranchOptions, ReadOptions, ScanChunk, ScanOptions, SpaceId,
-    Storage, StorageError, StorageRead, WriteOptions,
+    MemoryRead, MemoryWrite, MergeBranchOptions, ReadOptions, ScanChunk, ScanOptions, Storage,
+    StorageError, StorageRead, WriteOptions,
 };
 use serde_json::json;
 
@@ -84,7 +84,7 @@ impl StorageRead for CountingRead {
 
     async fn scan(
         &self,
-        space: SpaceId,
+        space: lix_engine::storage::StorageSpace,
         range: KeyRange,
         options: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {

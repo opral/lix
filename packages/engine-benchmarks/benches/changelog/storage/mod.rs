@@ -3,7 +3,7 @@ use std::sync::Arc;
 use lix_engine::Storage;
 use lix_engine::storage::{
     CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
-    PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead,
+    PutBatch, ReadOptions, ScanChunk, ScanOptions, StorageError, StorageRead, StorageSpace,
     StorageWrite, WriteOptions,
 };
 use lix_rocksdb_storage::{RocksDB, RocksDBRead, RocksDBWrite};
@@ -122,7 +122,7 @@ impl StorageRead for ChangelogScoreRead<'_> {
 
     async fn scan(
         &self,
-        space: SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {
@@ -135,7 +135,11 @@ impl StorageRead for ChangelogScoreRead<'_> {
 }
 
 impl StorageWrite for ChangelogScoreWrite {
-    async fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), StorageError> {
+    async fn put_many(
+        &mut self,
+        space: StorageSpace,
+        entries: PutBatch,
+    ) -> Result<(), StorageError> {
         match self {
             Self::Unit(write) => write.put_many(space, entries).await,
             Self::SQLite(write) => write.put_many(space, entries).await,
@@ -143,7 +147,7 @@ impl StorageWrite for ChangelogScoreWrite {
         }
     }
 
-    async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), StorageError> {
+    async fn delete_many(&mut self, space: StorageSpace, keys: &[Key]) -> Result<(), StorageError> {
         match self {
             Self::Unit(write) => write.delete_many(space, keys).await,
             Self::SQLite(write) => write.delete_many(space, keys).await,
@@ -151,7 +155,11 @@ impl StorageWrite for ChangelogScoreWrite {
         }
     }
 
-    async fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), StorageError> {
+    async fn delete_range(
+        &mut self,
+        space: StorageSpace,
+        range: KeyRange,
+    ) -> Result<(), StorageError> {
         match self {
             Self::Unit(write) => write.delete_range(space, range).await,
             Self::SQLite(write) => write.delete_range(space, range).await,

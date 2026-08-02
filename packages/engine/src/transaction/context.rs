@@ -1585,7 +1585,7 @@ where
             write_options
                 .preconditions
                 .push(StoragePrecondition::KeyAbsent {
-                    space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE.id,
+                    space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
                     key,
                 });
         }

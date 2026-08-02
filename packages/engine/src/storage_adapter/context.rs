@@ -131,11 +131,11 @@ where
     pub(crate) fn tracked_mutation_revision_precondition(expected: Option<Bytes>) -> Precondition {
         expected.map_or_else(
             || Precondition::KeyAbsent {
-                space: TRACKED_MUTATION_REVISION_SPACE.id,
+                space: TRACKED_MUTATION_REVISION_SPACE,
                 key: mutation_revision_key(),
             },
             |expected| Precondition::KeyValueEquals {
-                space: TRACKED_MUTATION_REVISION_SPACE.id,
+                space: TRACKED_MUTATION_REVISION_SPACE,
                 key: mutation_revision_key(),
                 expected,
             },
@@ -158,7 +158,7 @@ where
     {
         let values = read
             .get_many(&[crate::storage::GetManyRequest {
-                space: MUTATION_REVISION_SPACE.id,
+                space: MUTATION_REVISION_SPACE,
                 keys: &[mutation_revision_key()],
                 opts: GetOptions {
                     projection: CoreProjection::FullValue,
@@ -184,7 +184,7 @@ where
     {
         let values = read
             .get_many(&[crate::storage::GetManyRequest {
-                space: TRACKED_MUTATION_REVISION_SPACE.id,
+                space: TRACKED_MUTATION_REVISION_SPACE,
                 keys: &[mutation_revision_key()],
                 opts: GetOptions {
                     projection: CoreProjection::FullValue,
@@ -209,7 +209,7 @@ where
         opts: WriteOptions,
     ) -> Result<CommitResult, StorageError> {
         let mut write = self.storage.begin_write(opts).await?;
-        if let Err(error) = write.delete_range(space.id, range).await {
+        if let Err(error) = write.delete_range(space, range).await {
             let _ = write.rollback().await;
             return Err(error);
         }
@@ -252,7 +252,7 @@ where
 {
     write
         .put_many(
-            MUTATION_REVISION_SPACE.id,
+            MUTATION_REVISION_SPACE,
             PutBatch {
                 entries: vec![PutEntry {
                     key: mutation_revision_key(),
@@ -317,7 +317,7 @@ where
 
     fn scan(
         &self,
-        space: crate::storage::SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: crate::storage::ScanOptions,
     ) -> impl Future<Output = Result<crate::storage::ScanChunk, StorageError>> + Send {
@@ -374,7 +374,7 @@ where
 
     fn scan(
         &self,
-        space: crate::storage::SpaceId,
+        space: StorageSpace,
         range: KeyRange,
         opts: crate::storage::ScanOptions,
     ) -> impl Future<Output = Result<crate::storage::ScanChunk, StorageError>> + Send {
@@ -402,7 +402,7 @@ mod tests {
     }
 
     fn space() -> StorageSpace {
-        StorageSpace::new(SpaceId(1), "test.space")
+        StorageSpace::mutable(SpaceId(1), "test.space")
     }
 
     #[tokio::test]
