@@ -1639,7 +1639,7 @@ async fn stage_tracked_commit_delta_index(
                         );
                     Ok(delta)
                 });
-                let order_certified = state_rows.certified_ordered_insert()
+                let order_certified = state_rows.certified_tracked_keys_strictly_ordered()
                     && state_row_indices.len() == state_rows.len()
                     && state_row_indices
                         .iter()
