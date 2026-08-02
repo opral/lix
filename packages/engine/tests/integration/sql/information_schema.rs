@@ -1697,6 +1697,17 @@ simulation_test!(
             overlay_updated,
             vec![vec![Value::Integer(12), Value::Integer(10)]],
         );
+        let returning_expression = transaction
+            .execute(
+                "UPDATE engine_arithmetic_update \
+                 SET line_number = line_number WHERE id = 'c' \
+                 RETURNING quantity + 1",
+                &[],
+            )
+            .await
+            .expect("binary RETURNING alone should select the generic UPDATE executor");
+        assert_eq!(returning_expression.rows_affected(), 1);
+        assert_rows_eq(returning_expression, vec![vec![Value::Integer(31)]]);
         assert_rows_eq(
             transaction
                 .execute(

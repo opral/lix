@@ -2017,7 +2017,13 @@ fn bound_update_contains_binary(plan: &LogicalWritePlan) -> bool {
             .assignments
             .iter()
             .any(|assignment| bound_expr_contains_binary(&assignment.value))
-            || bound_predicate_contains_binary(&plan.bound.predicate))
+            || bound_predicate_contains_binary(&plan.bound.predicate)
+            || plan.bound.returning.as_ref().is_some_and(|returning| {
+                returning
+                    .items
+                    .iter()
+                    .any(|item| bound_expr_contains_binary(&item.expr))
+            }))
 }
 
 fn bound_expr_contains_binary(expr: &BoundExpr) -> bool {
