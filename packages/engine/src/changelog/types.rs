@@ -323,6 +323,15 @@ pub(crate) struct CommitRecord {
     /// changelog/delta index and intentionally omit an immutable root. Root
     /// fences remain the topology and checkpoint fallback.
     pub(crate) tracked_state_rootless: bool,
+    /// First-parent distance from the nearest rooted commit. Zero means this
+    /// commit is rooted; rootless intervals use this to schedule bounded
+    /// automatic root fences without graph walks on the write path.
+    pub(crate) tracked_state_rootless_depth: u16,
+    /// Cumulative delta rows since the nearest rooted first-parent ancestor.
+    /// This bounds foreground replay work independently of commit depth.
+    pub(crate) tracked_state_rootless_rows: u64,
+    /// Conservative encoded/payload work estimate for the same interval.
+    pub(crate) tracked_state_rootless_bytes: u64,
     pub(crate) change_id: ChangeId,
     #[musli(with = crate::storage_codec::id_string_seq)]
     pub(crate) author_account_ids: Vec<String>,

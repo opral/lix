@@ -12,6 +12,9 @@ mod tree;
 mod types;
 
 pub(crate) use codec::encode_key_ref;
+pub(crate) use commit_root_rebuild::{
+    load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
+};
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
 };
@@ -53,7 +56,9 @@ pub(crate) use storage::{
     TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
 };
 #[cfg(test)]
-pub(crate) use storage::{load_commit_delta_change_ids, scan_commit_delta_members};
+pub(crate) use storage::{
+    load_commit_delta_change_ids, load_commit_root, scan_commit_delta_members,
+};
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
     TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,

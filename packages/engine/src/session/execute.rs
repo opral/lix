@@ -5017,6 +5017,456 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_certified_insert_publishes_rootless_history_and_reads_packed_head() {
+        use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
+
+        const ROW_COUNT: usize = 32 * 1_024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "rootless_ordered_insert_probe",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-columnar": false,
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("rootless ordered schema should register");
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should resolve");
+        let baseline_read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("baseline read should open");
+        let baseline = session
+            .branch_ctx
+            .ref_reader(baseline_read)
+            .load_head(&branch_id)
+            .await
+            .expect("baseline head should load")
+            .expect("schema registration should publish a head");
+
+        let sql = "INSERT INTO rootless_ordered_insert_probe (id, value) VALUES ($1, $2)";
+        let inserts = (0..ROW_COUNT)
+            .map(|index| ExecuteBatchStatement {
+                sql: sql.to_owned(),
+                params: vec![
+                    Value::Text(format!("{index:05}")),
+                    Value::Text(format!("value-{index:05}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let inserted = session
+            .execute_batch(&inserts)
+            .await
+            .expect("large certified parameter batch should insert")
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
+        assert_eq!(inserted, ROW_COUNT as u64);
+
+        let rows = session
+            .execute(
+                "SELECT id, value FROM rootless_ordered_insert_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("packed current head should serve the rootless commit");
+        assert_eq!(rows.len(), ROW_COUNT);
+        assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "00000");
+        assert_eq!(
+            rows.rows()[ROW_COUNT - 1].get::<String>("id").unwrap(),
+            "32767"
+        );
+
+        let head_read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("head read should open");
+        let head = session
+            .branch_ctx
+            .ref_reader(head_read)
+            .load_head(&branch_id)
+            .await
+            .expect("branch head should load")
+            .expect("large insert should publish a head");
+        let history_read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("history read should open");
+        let head_commit_ids = [head.commit_id];
+        let commits = ChangelogContext::new()
+            .reader(&history_read)
+            .load_commits(CommitLoadRequest {
+                commit_ids: &head_commit_ids,
+            })
+            .await
+            .expect("head commit should load");
+        let record = commits
+            .into_iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .expect("head commit should exist");
+        assert!(record.tracked_state_rootless);
+        assert_eq!(record.tracked_state_rootless_depth, 1);
+        assert_eq!(record.tracked_state_rootless_rows, ROW_COUNT as u64);
+        assert!(record.tracked_state_rootless_bytes > record.tracked_state_rootless_rows);
+        assert!(
+            crate::tracked_state::load_commit_root(&history_read, &head.commit_id.to_string(),)
+                .await
+                .expect("root lookup should succeed")
+                .is_none(),
+            "rootless production commit must skip the duplicate immutable tree"
+        );
+
+        let diff = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'rootless_ordered_insert_probe' AND diff_type = 'added'",
+                &[
+                    Value::Text(baseline.commit_id.to_string()),
+                    Value::Text(head.commit_id.to_string()),
+                ],
+            )
+            .await
+            .expect("rootless insert diff should replay from the ordered delta");
+        assert_eq!(
+            diff.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64
+        );
+        let history = session
+            .execute(
+                &format!(
+                    "SELECT COUNT(*) AS entries \
+                     FROM rootless_ordered_insert_probe_history('{}') \
+                     WHERE lixcol_is_deleted = false",
+                    head.commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("rootless insert history should replay from the ordered delta");
+        assert_eq!(
+            history.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64
+        );
+
+        session
+            .execute(
+                "UPDATE rootless_ordered_insert_probe SET value = 'updated' WHERE id = '00000'",
+                &[],
+            )
+            .await
+            .expect("a sparse descendant of a rootless commit should remain writable");
+        let descendant_read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("descendant read should open");
+        let descendant = session
+            .branch_ctx
+            .ref_reader(descendant_read)
+            .load_head(&branch_id)
+            .await
+            .expect("descendant head should load")
+            .expect("sparse update should publish a head");
+        let descendant_history_read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("descendant history read should open");
+        let descendant_commit_ids = [descendant.commit_id];
+        let descendant_commits = ChangelogContext::new()
+            .reader(&descendant_history_read)
+            .load_commits(CommitLoadRequest {
+                commit_ids: &descendant_commit_ids,
+            })
+            .await
+            .expect("descendant commit should load");
+        let descendant_record = descendant_commits
+            .into_iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .expect("descendant commit should exist");
+        assert!(
+            descendant_record.tracked_state_rootless,
+            "a sparse descendant must extend the rootless first-parent interval"
+        );
+        assert_eq!(descendant_record.tracked_state_rootless_depth, 2);
+        assert_eq!(
+            descendant_record.tracked_state_rootless_rows,
+            ROW_COUNT as u64 + 1
+        );
+        assert!(
+            descendant_record.tracked_state_rootless_bytes > record.tracked_state_rootless_bytes
+        );
+        assert!(
+            crate::tracked_state::load_commit_root(
+                &descendant_history_read,
+                &descendant.commit_id.to_string(),
+            )
+            .await
+            .expect("descendant root lookup should succeed")
+            .is_none()
+        );
+        let updated = session
+            .execute(
+                "SELECT value FROM rootless_ordered_insert_probe WHERE id = '00000'",
+                &[],
+            )
+            .await
+            .expect("rootless descendant should remain readable");
+        assert_eq!(updated.rows()[0].get::<String>("value").unwrap(), "updated");
+        let update_diff = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'rootless_ordered_insert_probe' AND diff_type = 'modified'",
+                &[
+                    Value::Text(head.commit_id.to_string()),
+                    Value::Text(descendant.commit_id.to_string()),
+                ],
+            )
+            .await
+            .expect("rootless descendant diff should remain queryable");
+        assert_eq!(update_diff.rows()[0].get::<i64>("entries").unwrap(), 1);
+
+        let draft = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-00000000b001".to_owned()),
+                name: "rootless-ordered-draft".to_owned(),
+                from_commit_id: Some(descendant.commit_id.to_string()),
+            })
+            .await
+            .expect("a branch should start from a rootless history commit");
+        let (draft_session, _) = session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: draft.id.clone(),
+            })
+            .await
+            .expect("rootless draft should open");
+        draft_session
+            .execute(
+                "UPDATE rootless_ordered_insert_probe SET value = 'draft' WHERE id = '00001'",
+                &[],
+            )
+            .await
+            .expect("rootless draft should remain writable");
+        let (main_session, _) = draft_session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: branch_id.clone(),
+            })
+            .await
+            .expect("workspace should switch back to the rootless main branch");
+        main_session
+            .execute(
+                "UPDATE rootless_ordered_insert_probe SET value = 'main' WHERE id = '32767'",
+                &[],
+            )
+            .await
+            .expect("rootless main branch should remain writable");
+        let merge = main_session
+            .merge_branch(crate::MergeBranchOptions {
+                source_branch_id: draft.id,
+            })
+            .await
+            .expect("disjoint changes descending from a rootless base should merge");
+        assert_eq!(merge.outcome, crate::MergeBranchOutcome::MergeCommitted);
+        let merged = main_session
+            .execute(
+                "SELECT id, value FROM rootless_ordered_insert_probe \
+                 WHERE id IN ('00001', '32767') ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("merged rootless head should remain readable");
+        assert_eq!(merged.rows()[0].get::<String>("value").unwrap(), "draft");
+        assert_eq!(merged.rows()[1].get::<String>("value").unwrap(), "main");
+
+        let deleted = main_session
+            .execute("DELETE FROM rootless_ordered_insert_probe", &[])
+            .await
+            .expect("the merged fixture should delete through the file cascade");
+        assert_eq!(deleted.rows_affected(), ROW_COUNT as u64);
+        let reinserts = (0..ROW_COUNT)
+            .map(|index| ExecuteBatchStatement {
+                sql: sql.to_owned(),
+                params: vec![
+                    Value::Text(format!("{index:05}")),
+                    Value::Text("second-seed".to_owned()),
+                ],
+            })
+            .collect::<Vec<_>>();
+        let reseeded = main_session
+            .execute_batch(&reinserts)
+            .await
+            .expect("a second large ordered insert should start a bounded interval")
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
+        assert_eq!(reseeded, ROW_COUNT as u64);
+        let reseed_read = main_session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("reseed read should open");
+        let reseed_head = main_session
+            .branch_ctx
+            .ref_reader(&reseed_read)
+            .load_head(&branch_id)
+            .await
+            .expect("reseed head should load")
+            .expect("reseed head should exist");
+        let reseed_commit_ids = [reseed_head.commit_id];
+        let reseed_commits = ChangelogContext::new()
+            .reader(&reseed_read)
+            .load_commits(CommitLoadRequest {
+                commit_ids: &reseed_commit_ids,
+            })
+            .await
+            .expect("reseed commit should load");
+        let reseed_record = reseed_commits
+            .into_iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .expect("reseed commit should exist");
+        assert!(reseed_record.tracked_state_rootless);
+        assert_eq!(reseed_record.tracked_state_rootless_depth, 1);
+
+        let mut rooted_fence = None;
+        for generation_offset in 1..=32 {
+            main_session
+                .execute(
+                    "UPDATE rootless_ordered_insert_probe SET value = $1 WHERE id = '00002'",
+                    &[Value::Text(format!("fence-{generation_offset}"))],
+                )
+                .await
+                .expect("a bounded rootless descendant should commit");
+            let read = main_session
+                .storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("root-fence read should open");
+            let head = main_session
+                .branch_ctx
+                .ref_reader(&read)
+                .load_head(&branch_id)
+                .await
+                .expect("root-fence head should load")
+                .expect("root-fence head should exist");
+            let fence_commit_ids = [head.commit_id];
+            let commits = ChangelogContext::new()
+                .reader(&read)
+                .load_commits(CommitLoadRequest {
+                    commit_ids: &fence_commit_ids,
+                })
+                .await
+                .expect("root-fence commit should load");
+            let record = commits
+                .into_iter()
+                .next()
+                .and_then(|(_, record)| record)
+                .expect("root-fence commit should exist");
+            if !record.tracked_state_rootless {
+                assert_eq!(record.tracked_state_rootless_depth, 0);
+                assert_eq!(record.tracked_state_rootless_rows, 0);
+                assert_eq!(record.tracked_state_rootless_bytes, 0);
+                assert!(
+                    crate::tracked_state::load_commit_root(&read, &head.commit_id.to_string())
+                        .await
+                        .expect("root-fence lookup should succeed")
+                        .is_some(),
+                    "a rooted fence must publish its immutable accelerator"
+                );
+                rooted_fence = Some(head.commit_id);
+                break;
+            }
+        }
+        assert!(
+            rooted_fence.is_some(),
+            "rootless replay intervals must close within one generation fence"
+        );
+        let rooted_fence = rooted_fence.unwrap();
+        let rebuilt_rows = main_session
+            .execute(
+                "SELECT id, value FROM rootless_ordered_insert_probe \
+                 WHERE id IN ('00000', '00001', '00002', '32767') ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("rebuilt root fence should serve representative rows");
+        assert_eq!(
+            rebuilt_rows.rows()[0].get::<String>("value").unwrap(),
+            "second-seed"
+        );
+        assert_eq!(
+            rebuilt_rows.rows()[1].get::<String>("value").unwrap(),
+            "second-seed"
+        );
+        assert!(
+            rebuilt_rows.rows()[2]
+                .get::<String>("value")
+                .unwrap()
+                .starts_with("fence-")
+        );
+        assert_eq!(
+            rebuilt_rows.rows()[3].get::<String>("value").unwrap(),
+            "second-seed"
+        );
+        let fence_diff = main_session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'rootless_ordered_insert_probe' AND diff_type = 'modified'",
+                &[
+                    Value::Text(reseed_head.commit_id.to_string()),
+                    Value::Text(rooted_fence.to_string()),
+                ],
+            )
+            .await
+            .expect("diff should cross the rebuilt root fence");
+        assert_eq!(fence_diff.rows()[0].get::<i64>("entries").unwrap(), 1);
+        let fence_history = main_session
+            .execute(
+                &format!(
+                    "SELECT COUNT(DISTINCT id) AS entries \
+                     FROM rootless_ordered_insert_probe_history('{rooted_fence}') \
+                     WHERE id IN ('00000', '00001', '00002', '32767') \
+                       AND lixcol_is_deleted = false"
+                ),
+                &[],
+            )
+            .await
+            .expect("history should cross the rebuilt root fence");
+        assert_eq!(fence_history.rows()[0].get::<i64>("entries").unwrap(), 4);
+        let merge_history = main_session
+            .execute(
+                &format!(
+                    "SELECT COUNT(*) AS entries \
+                     FROM rootless_ordered_insert_probe_history('{rooted_fence}') \
+                     WHERE (id = '00001' AND value = 'draft') \
+                        OR (id = '32767' AND value = 'main')"
+                ),
+                &[],
+            )
+            .await
+            .expect("merge-selected revisions should survive both root fences");
+        assert_eq!(merge_history.rows()[0].get::<i64>("entries").unwrap(), 2);
+    }
+
+    #[tokio::test]
     async fn typed_columnar_base_preserves_current_diff_and_history_across_lifecycle_changes() {
         const ROW_COUNT: usize = 1_024;
         let storage = Memory::default();

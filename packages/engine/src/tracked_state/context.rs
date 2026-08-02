@@ -6482,6 +6482,9 @@ mod tests {
                     generation: 1,
                     parent_commit_ids: vec![commit_b],
                     tracked_state_rootless: false,
+                    tracked_state_rootless_depth: 0,
+                    tracked_state_rootless_rows: 0,
+                    tracked_state_rootless_bytes: 0,
                     change_id: ChangeId::for_test_label("commit-a:commit"),
                     author_account_ids: Vec::new(),
                     created_at: crate::common::LixTimestamp::expect_parse(
