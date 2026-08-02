@@ -43,16 +43,16 @@ where
 {
     /// Reverses the latest undoable tracked commit on the active branch.
     pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
-        self.with_write_transaction(|transaction| {
-            Box::pin(async move { undo_in_transaction(transaction).await })
+        self.with_write_transaction_lending(async move |transaction| {
+            undo_in_transaction(transaction).await
         })
         .await
     }
 
     /// Replays the latest tracked commit abandoned by undo on the active branch.
     pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
-        self.with_write_transaction(|transaction| {
-            Box::pin(async move { redo_in_transaction(transaction).await })
+        self.with_write_transaction_lending(async move |transaction| {
+            redo_in_transaction(transaction).await
         })
         .await
     }
@@ -665,25 +665,23 @@ mod tests {
             .expect("update commits");
 
         let duplicate = session
-            .with_write_transaction(|transaction| {
-                Box::pin(async move {
-                    let branch_id = transaction.active_branch_id().to_string();
-                    let head = transaction
-                        .load_branch_head(&branch_id)
-                        .await?
-                        .expect("branch has a head");
-                    let record = load_node(transaction, head).await?;
-                    let parent = only_parent(&record.parent_commit_ids, head, "test")?;
-                    let key = load_commit_delta(transaction, head)
-                        .await?
-                        .into_iter()
-                        .find(|(key, _)| key.schema_key == "lix_key_value")
-                        .expect("update delta contains the key-value row")
-                        .0;
-                    transaction
-                        .execute_tracked_state_transition(head, parent, vec![key.clone(), key])
-                        .await
-                })
+            .with_write_transaction_lending(async move |transaction| {
+                let branch_id = transaction.active_branch_id().to_string();
+                let head = transaction
+                    .load_branch_head(&branch_id)
+                    .await?
+                    .expect("branch has a head");
+                let record = load_node(transaction, head).await?;
+                let parent = only_parent(&record.parent_commit_ids, head, "test")?;
+                let key = load_commit_delta(transaction, head)
+                    .await?
+                    .into_iter()
+                    .find(|(key, _)| key.schema_key == "lix_key_value")
+                    .expect("update delta contains the key-value row")
+                    .0;
+                transaction
+                    .execute_tracked_state_transition(head, parent, vec![key.clone(), key])
+                    .await
             })
             .await
             .expect_err("duplicate transition identities are rejected");
@@ -691,25 +689,23 @@ mod tests {
         assert_eq!(value(&session, "typed").await.as_deref(), Some("after"));
 
         let stale = session
-            .with_write_transaction(|transaction| {
-                Box::pin(async move {
-                    let branch_id = transaction.active_branch_id().to_string();
-                    let head = transaction
-                        .load_branch_head(&branch_id)
-                        .await?
-                        .expect("branch has a head");
-                    let record = load_node(transaction, head).await?;
-                    let parent = only_parent(&record.parent_commit_ids, head, "test")?;
-                    let key = load_commit_delta(transaction, head)
-                        .await?
-                        .into_iter()
-                        .find(|(key, _)| key.schema_key == "lix_key_value")
-                        .expect("update delta contains the key-value row")
-                        .0;
-                    transaction
-                        .execute_tracked_state_transition(parent, head, vec![key])
-                        .await
-                })
+            .with_write_transaction_lending(async move |transaction| {
+                let branch_id = transaction.active_branch_id().to_string();
+                let head = transaction
+                    .load_branch_head(&branch_id)
+                    .await?
+                    .expect("branch has a head");
+                let record = load_node(transaction, head).await?;
+                let parent = only_parent(&record.parent_commit_ids, head, "test")?;
+                let key = load_commit_delta(transaction, head)
+                    .await?
+                    .into_iter()
+                    .find(|(key, _)| key.schema_key == "lix_key_value")
+                    .expect("update delta contains the key-value row")
+                    .0;
+                transaction
+                    .execute_tracked_state_transition(parent, head, vec![key])
+                    .await
             })
             .await
             .expect_err("non-head transition sources are rejected");

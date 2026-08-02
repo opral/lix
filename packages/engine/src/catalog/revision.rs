@@ -467,8 +467,8 @@ mod tests {
         let commit_id = CommitId::parse_lix(commit_id, "catalog revision test branch head")
             .expect("test commit id should parse");
         session
-            .with_write_transaction(move |transaction| {
-                Box::pin(async move { transaction.advance_branch_ref(&branch_id, commit_id).await })
+            .with_write_transaction_lending(async move |transaction| {
+                transaction.advance_branch_ref(&branch_id, commit_id).await
             })
             .await
             .expect("branch ref should move");

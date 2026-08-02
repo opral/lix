@@ -111,6 +111,17 @@ impl ObserveInvalidation {
                 let Some(invalidation) = invalidation.upgrade() else {
                     break;
                 };
+                if invalidation.sender.receiver_count() == 0 {
+                    // Synchronize shutdown with startup. A new subscriber can race this
+                    // check; rechecking under the startup gate either keeps this watcher
+                    // alive or lets the contender start its replacement.
+                    let mut watcher_started = invalidation.external_watcher_started.lock().await;
+                    if invalidation.sender.receiver_count() == 0 {
+                        *watcher_started = false;
+                        break;
+                    }
+                    drop(watcher_started);
+                }
                 let current_revision = match storage.load_mutation_revision().await {
                     Ok(revision) => revision,
                     Err(error) => {
@@ -304,5 +315,35 @@ mod tests {
             *invalidation.external_watcher_started.lock().await,
             "contending retry should mark the watcher as started"
         );
+    }
+
+    #[tokio::test]
+    async fn external_watcher_stops_without_subscribers_and_restarts_on_demand() {
+        let invalidation = Arc::new(ObserveInvalidation::new());
+        let storage = StorageAdapter::new(Memory::new());
+        let observer = invalidation.subscribe();
+        invalidation
+            .ensure_external_watcher(storage.clone())
+            .await
+            .expect("watcher should start");
+        drop(observer);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !*invalidation.external_watcher_started.lock().await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watcher should stop after its last subscriber is dropped");
+
+        let _replacement = invalidation.subscribe();
+        invalidation
+            .ensure_external_watcher(storage)
+            .await
+            .expect("watcher should restart");
+        assert!(*invalidation.external_watcher_started.lock().await);
     }
 }

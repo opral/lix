@@ -139,8 +139,7 @@ where
     ) -> Result<MergeBranchPreview, LixError> {
         let source_branch_id = options.source_branch_id;
 
-        self.with_write_transaction(|transaction| {
-            Box::pin(async move {
+        self.with_write_transaction_lending(async move |transaction| {
                 let active_branch_id = transaction.active_branch_id().to_string();
                 if source_branch_id == active_branch_id {
                     return Err(LixError::invalid_self_merge(active_branch_id));
@@ -238,7 +237,6 @@ where
                     &resolvable_plugin_conflicts,
                     &plugin_resolution_stats,
                 )
-            })
         })
         .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_preview_total"))
         .await
@@ -256,250 +254,247 @@ where
     ) -> Result<MergeBranchReceipt, LixError> {
         let source_branch_id = options.source_branch_id;
 
-        self.with_write_transaction(|transaction| {
-            Box::pin(async move {
-                let active_branch_id = transaction.active_branch_id().to_string();
-                if source_branch_id == active_branch_id {
-                    return Err(LixError::invalid_self_merge(active_branch_id));
-                }
+        self.with_write_transaction_lending(async move |transaction| {
+            let active_branch_id = transaction.active_branch_id().to_string();
+            if source_branch_id == active_branch_id {
+                return Err(LixError::invalid_self_merge(active_branch_id));
+            }
 
-                let (target_head, source_head) = async {
-                    let reader = transaction.branch_ref_reader().await;
-                    let lifecycle = BranchLifecycle::new(&reader);
-                    let target_head = lifecycle
-                        .require_existing_commit_id(
-                            &active_branch_id,
-                            BranchOperation::MergeBranch,
-                            BranchReferenceRole::Target,
-                        )
-                        .await?;
-                    let source_head = lifecycle
-                        .require_existing_commit_id(
-                            &source_branch_id,
-                            BranchOperation::MergeBranch,
-                            BranchReferenceRole::Source,
-                        )
-                        .await?;
-                    Ok::<_, LixError>((target_head, source_head))
-                }
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.merge_branch_refs"
-                ))
-                .await?;
-
-                let merge_base = async {
-                    let mut reader = transaction.commit_graph_reader().await;
-                    reader.merge_base(&target_head, &source_head).await
-                }
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.merge_base"
-                ))
-                .await?;
-                let base_commit_id = merge_base;
-                let analysis = async {
-                    let mut reader = transaction.tracked_state_reader().await;
-                    analyze(
-                        &mut reader,
-                        MergeCommits {
-                            base_commit_id,
-                            target_commit_id: target_head,
-                            source_commit_id: source_head,
-                        },
+            let (target_head, source_head) = async {
+                let reader = transaction.branch_ref_reader().await;
+                let lifecycle = BranchLifecycle::new(&reader);
+                let target_head = lifecycle
+                    .require_existing_commit_id(
+                        &active_branch_id,
+                        BranchOperation::MergeBranch,
+                        BranchReferenceRole::Target,
                     )
-                    .await
-                }
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.merge_analysis"
-                ))
-                .await?;
-                let derived_blob_files = async {
-                    let mut reader = transaction.tracked_state_reader().await;
-                    derived_plugin_blob_conflicts(&mut reader, &analysis).await
-                }
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.merge_derived_blob_detection"
-                ))
-                .await?;
-
-                if analysis.outcome == MergeOutcome::AlreadyUpToDate {
-                    return Ok(MergeBranchReceipt {
-                        outcome: MergeBranchOutcome::AlreadyUpToDate,
-                        target_branch_id: active_branch_id,
-                        source_branch_id,
-                        base_commit_id: analysis.commits.base_commit_id.to_string(),
-                        target_head_after_commit_id: analysis.commits.target_commit_id.to_string(),
-                        target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
-                        source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
-                        created_merge_commit_id: None,
-                        change_stats: merge_change_stats_from_analysis(&analysis.stats),
-                    });
-                }
-
-                if analysis.outcome == MergeOutcome::FastForward {
-                    transaction
-                        .advance_branch_ref(&active_branch_id, analysis.commits.source_commit_id)
-                        .await?;
-
-                    return Ok(MergeBranchReceipt {
-                        outcome: MergeBranchOutcome::FastForward,
-                        target_branch_id: active_branch_id,
-                        source_branch_id,
-                        base_commit_id: analysis.commits.base_commit_id.to_string(),
-                        target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
-                        source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
-                        target_head_after_commit_id: analysis.commits.source_commit_id.to_string(),
-                        created_merge_commit_id: None,
-                        change_stats: merge_change_stats_from_analysis(&analysis.stats),
-                    });
-                }
-
-                let merge_plan = analysis
-                    .merge_plan()
-                    .expect("merge analysis should include a plan for mergeCommitted");
-
-                // Do the no-Wasm compatibility preflight and reject ordinary
-                // conflicts before constructing a Component Store. A merge
-                // with an unrelated unresolved row must not pay for (or be
-                // masked by) a plugin resolver invocation.
-                let resolvable_plugin_conflicts =
-                    resolvable_plugin_conflict_keys(&analysis, &derived_blob_files);
-                let effective_conflicts = if resolvable_plugin_conflicts
-                    .covers_all_with_derived_blobs(merge_plan.conflicts.len(), &derived_blob_files)
-                {
-                    Vec::new()
-                } else {
-                    analysis
-                        .conflict_batch()
-                        .expect("mergeCommitted analysis should include a conflict batch")
-                        .iter()
-                        .enumerate()
-                        .filter(|(index, conflict)| {
-                            !is_derived_blob_conflict(conflict.tracked(), &derived_blob_files)
-                                && !resolvable_plugin_conflicts.contains_index(*index)
-                        })
-                        .map(|(_, conflict)| conflict)
-                        .collect::<Vec<_>>()
-                };
-                if !effective_conflicts.is_empty() {
-                    return Err(merge_conflict_error(
-                        &effective_conflicts
-                            .into_iter()
-                            .map(merge_conflict_from_analysis)
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )?);
-                }
-
-                let plugin_conflict_groups = async {
-                    let mut reader = transaction.tracked_state_reader().await;
-                    plugin_merge_conflict_groups(
-                        &mut reader,
-                        &analysis,
-                        &derived_blob_files,
-                        &resolvable_plugin_conflicts,
+                    .await?;
+                let source_head = lifecycle
+                    .require_existing_commit_id(
+                        &source_branch_id,
+                        BranchOperation::MergeBranch,
+                        BranchReferenceRole::Source,
                     )
-                    .await
-                }
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.merge_plugin_conflict_inputs"
-                ))
-                .await?;
-                let semantic_branch_id = SharedStr::from(active_branch_id.as_str());
-                let resolved_plugin_rows = resolve_plugin_merge_conflict_groups(
-                    transaction,
-                    plugin_conflict_groups,
-                    &semantic_branch_id,
+                    .await?;
+                Ok::<_, LixError>((target_head, source_head))
+            }
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.merge_branch_refs"
+            ))
+            .await?;
+
+            let merge_base = async {
+                let mut reader = transaction.commit_graph_reader().await;
+                reader.merge_base(&target_head, &source_head).await
+            }
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.merge_base"
+            ))
+            .await?;
+            let base_commit_id = merge_base;
+            let analysis = async {
+                let mut reader = transaction.tracked_state_reader().await;
+                analyze(
+                    &mut reader,
+                    MergeCommits {
+                        base_commit_id,
+                        target_commit_id: target_head,
+                        source_commit_id: source_head,
+                    },
                 )
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.merge_plugin_conflict_resolve"
-                ))
-                .await?;
+                .await
+            }
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.merge_analysis"
+            ))
+            .await?;
+            let derived_blob_files = async {
+                let mut reader = transaction.tracked_state_reader().await;
+                derived_plugin_blob_conflicts(&mut reader, &analysis).await
+            }
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.merge_derived_blob_detection"
+            ))
+            .await?;
 
-                let plugin_resolution_stats = async {
-                    let mut reader = transaction.tracked_state_reader().await;
-                    plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows)
-                        .await
-                }
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.merge_plugin_resolution_stats"
-                ))
-                .await?;
-
-                let semantic_rows = async {
-                    let mut reader = transaction.tracked_state_reader().await;
-                    materialized_plugin_merge_rows(
-                        &mut reader,
-                        &analysis,
-                        &derived_blob_files,
-                        &semantic_branch_id,
-                        resolved_plugin_rows,
-                    )
-                    .await
-                }
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.merge_materialized_rows"
-                ))
-                .await?;
-                if !semantic_rows.is_empty() {
-                    transaction
-                        .stage_write(TransactionWrite::Rows {
-                            mode: TransactionWriteMode::Replace,
-                            rows: semantic_rows,
-                        })
-                        .instrument(tracing::debug_span!(
-                            target: "lix_perf",
-                            "lix.perf.merge_stage_semantic_rows"
-                        ))
-                        .await?;
-                }
-                let created_merge_commit_id = tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.merge_stage_commit"
-                )
-                .in_scope(|| {
-                    let mut selected_changes =
-                        StagedCommitChangeBatchBuilder::with_capacity(merge_plan.picks.len());
-                    for pick in merge_plan
-                        .picks
-                        .iter()
-                        .filter(|pick| !pick_is_derived_plugin_state(pick, &derived_blob_files))
-                    {
-                        selected_changes.push(
-                            pick.identity.clone(),
-                            pick.selected_row.commit_id,
-                            pick.change_id,
-                            pick.selected_row.deleted,
-                            pick.selected_row.created_at,
-                            pick.selected_row.updated_at,
-                        );
-                    }
-                    transaction.stage_merge_commit(
-                        active_branch_id.clone(),
-                        analysis.commits.source_commit_id,
-                        selected_changes.finish(),
-                    )
-                })?;
-                Ok(MergeBranchReceipt {
-                    outcome: MergeBranchOutcome::MergeCommitted,
+            if analysis.outcome == MergeOutcome::AlreadyUpToDate {
+                return Ok(MergeBranchReceipt {
+                    outcome: MergeBranchOutcome::AlreadyUpToDate,
                     target_branch_id: active_branch_id,
                     source_branch_id,
                     base_commit_id: analysis.commits.base_commit_id.to_string(),
-                    target_head_after_commit_id: created_merge_commit_id.clone(),
+                    target_head_after_commit_id: analysis.commits.target_commit_id.to_string(),
                     target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
                     source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
-                    created_merge_commit_id: Some(created_merge_commit_id),
-                    change_stats: merge_change_stats_with_plugin_resolutions(
-                        &analysis.stats,
-                        &plugin_resolution_stats,
-                    ),
-                })
+                    created_merge_commit_id: None,
+                    change_stats: merge_change_stats_from_analysis(&analysis.stats),
+                });
+            }
+
+            if analysis.outcome == MergeOutcome::FastForward {
+                transaction
+                    .advance_branch_ref(&active_branch_id, analysis.commits.source_commit_id)
+                    .await?;
+
+                return Ok(MergeBranchReceipt {
+                    outcome: MergeBranchOutcome::FastForward,
+                    target_branch_id: active_branch_id,
+                    source_branch_id,
+                    base_commit_id: analysis.commits.base_commit_id.to_string(),
+                    target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
+                    source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
+                    target_head_after_commit_id: analysis.commits.source_commit_id.to_string(),
+                    created_merge_commit_id: None,
+                    change_stats: merge_change_stats_from_analysis(&analysis.stats),
+                });
+            }
+
+            let merge_plan = analysis
+                .merge_plan()
+                .expect("merge analysis should include a plan for mergeCommitted");
+
+            // Do the no-Wasm compatibility preflight and reject ordinary
+            // conflicts before constructing a Component Store. A merge
+            // with an unrelated unresolved row must not pay for (or be
+            // masked by) a plugin resolver invocation.
+            let resolvable_plugin_conflicts =
+                resolvable_plugin_conflict_keys(&analysis, &derived_blob_files);
+            let effective_conflicts = if resolvable_plugin_conflicts
+                .covers_all_with_derived_blobs(merge_plan.conflicts.len(), &derived_blob_files)
+            {
+                Vec::new()
+            } else {
+                analysis
+                    .conflict_batch()
+                    .expect("mergeCommitted analysis should include a conflict batch")
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, conflict)| {
+                        !is_derived_blob_conflict(conflict.tracked(), &derived_blob_files)
+                            && !resolvable_plugin_conflicts.contains_index(*index)
+                    })
+                    .map(|(_, conflict)| conflict)
+                    .collect::<Vec<_>>()
+            };
+            if !effective_conflicts.is_empty() {
+                return Err(merge_conflict_error(
+                    &effective_conflicts
+                        .into_iter()
+                        .map(merge_conflict_from_analysis)
+                        .collect::<Result<Vec<_>, _>>()?,
+                )?);
+            }
+
+            let plugin_conflict_groups = async {
+                let mut reader = transaction.tracked_state_reader().await;
+                plugin_merge_conflict_groups(
+                    &mut reader,
+                    &analysis,
+                    &derived_blob_files,
+                    &resolvable_plugin_conflicts,
+                )
+                .await
+            }
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.merge_plugin_conflict_inputs"
+            ))
+            .await?;
+            let semantic_branch_id = SharedStr::from(active_branch_id.as_str());
+            let resolved_plugin_rows = resolve_plugin_merge_conflict_groups(
+                transaction,
+                plugin_conflict_groups,
+                &semantic_branch_id,
+            )
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.merge_plugin_conflict_resolve"
+            ))
+            .await?;
+
+            let plugin_resolution_stats = async {
+                let mut reader = transaction.tracked_state_reader().await;
+                plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows).await
+            }
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.merge_plugin_resolution_stats"
+            ))
+            .await?;
+
+            let semantic_rows = async {
+                let mut reader = transaction.tracked_state_reader().await;
+                materialized_plugin_merge_rows(
+                    &mut reader,
+                    &analysis,
+                    &derived_blob_files,
+                    &semantic_branch_id,
+                    resolved_plugin_rows,
+                )
+                .await
+            }
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.merge_materialized_rows"
+            ))
+            .await?;
+            if !semantic_rows.is_empty() {
+                transaction
+                    .stage_write(TransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
+                        rows: semantic_rows,
+                    })
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.merge_stage_semantic_rows"
+                    ))
+                    .await?;
+            }
+            let created_merge_commit_id = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.merge_stage_commit"
+            )
+            .in_scope(|| {
+                let mut selected_changes =
+                    StagedCommitChangeBatchBuilder::with_capacity(merge_plan.picks.len());
+                for pick in merge_plan
+                    .picks
+                    .iter()
+                    .filter(|pick| !pick_is_derived_plugin_state(pick, &derived_blob_files))
+                {
+                    selected_changes.push(
+                        pick.identity.clone(),
+                        pick.selected_row.commit_id,
+                        pick.change_id,
+                        pick.selected_row.deleted,
+                        pick.selected_row.created_at,
+                        pick.selected_row.updated_at,
+                    );
+                }
+                transaction.stage_merge_commit(
+                    active_branch_id.clone(),
+                    analysis.commits.source_commit_id,
+                    selected_changes.finish(),
+                )
+            })?;
+            Ok(MergeBranchReceipt {
+                outcome: MergeBranchOutcome::MergeCommitted,
+                target_branch_id: active_branch_id,
+                source_branch_id,
+                base_commit_id: analysis.commits.base_commit_id.to_string(),
+                target_head_after_commit_id: created_merge_commit_id.clone(),
+                target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
+                source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
+                created_merge_commit_id: Some(created_merge_commit_id),
+                change_stats: merge_change_stats_with_plugin_resolutions(
+                    &analysis.stats,
+                    &plugin_resolution_stats,
+                ),
             })
         })
         .instrument(tracing::debug_span!(

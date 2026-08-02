@@ -42,35 +42,33 @@ where
         let receipt_branch_id = branch_id.clone();
         let current_mode = self.mode.clone();
         let next_mode = self
-            .with_write_transaction(|transaction| {
-                Box::pin(async move {
-                    {
-                        let reader = transaction.branch_ref_reader().await;
-                        BranchLifecycle::new(&reader)
-                            .require_existing_commit_id(
-                                &branch_id,
-                                BranchOperation::SwitchBranch,
-                                BranchReferenceRole::Target,
-                            )
-                            .await?
-                    };
+            .with_write_transaction_lending(async move |transaction| {
+                {
+                    let reader = transaction.branch_ref_reader().await;
+                    BranchLifecycle::new(&reader)
+                        .require_existing_commit_id(
+                            &branch_id,
+                            BranchOperation::SwitchBranch,
+                            BranchReferenceRole::Target,
+                        )
+                        .await?
+                };
 
-                    match current_mode {
-                        SessionMode::Pinned { .. } => Ok(SessionMode::Pinned {
-                            branch_id: branch_id.clone(),
-                        }),
-                        SessionMode::Workspace {
+                match current_mode {
+                    SessionMode::Pinned { .. } => Ok(SessionMode::Pinned {
+                        branch_id: branch_id.clone(),
+                    }),
+                    SessionMode::Workspace {
+                        branch_id: selector,
+                    } => {
+                        let mut rows = RawWriteBatch::with_capacity(1);
+                        rows.push(workspace_branch_stage_row(&branch_id)?);
+                        transaction.stage_rows(rows).await?;
+                        Ok(SessionMode::Workspace {
                             branch_id: selector,
-                        } => {
-                            let mut rows = RawWriteBatch::with_capacity(1);
-                            rows.push(workspace_branch_stage_row(&branch_id)?);
-                            transaction.stage_rows(rows).await?;
-                            Ok(SessionMode::Workspace {
-                                branch_id: selector,
-                            })
-                        }
+                        })
                     }
-                })
+                }
             })
             .await?;
 

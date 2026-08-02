@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::ops::ControlFlow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +31,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::Instrument as _;
 
 use super::ExecuteIdempotency;
-use super::context::{SessionContext, SessionSqlExecutionContext, SessionWriteAccess};
+use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::SessionTransaction;
 
@@ -755,38 +754,36 @@ where
         crate::common::LixPath::try_from_file_path(&path)?;
         let write_access = self.begin_session_write_access().await?;
         let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
-        self.with_write_transaction_reserved(write_access, |transaction| {
-            Box::pin(async move {
-                // `Blob` is reference-counted. Retaining a copy lets the rare
-                // general-write fallback reuse the same payload without a
-                // second allocation or a second transaction.
-                let fast_path = sql2::execute_fast_lix_file_path_writes(
-                    transaction,
-                    vec![(path.clone(), data.clone(), None, None)],
-                    sql2::FastLixFilePathWriteConflict::UpdateData,
-                    None,
-                )
-                .await?;
-                if let Some(count) = fast_path {
-                    return Ok(count);
-                }
+        self.with_write_transaction_reserved_lending(write_access, async move |transaction| {
+            // `Blob` is reference-counted. Retaining a copy lets the rare
+            // general-write fallback reuse the same payload without a
+            // second allocation or a second transaction.
+            let fast_path = sql2::execute_fast_lix_file_path_writes(
+                transaction,
+                vec![(path.clone(), data.clone(), None, None)],
+                sql2::FastLixFilePathWriteConflict::UpdateData,
+                None,
+            )
+            .await?;
+            if let Some(count) = fast_path {
+                return Ok(count);
+            }
 
-                // The fast helper declines pre-existing cross-scope path
-                // collisions before staging anything. The general provider
-                // handles those valid legacy layouts, so keep this request in
-                // the same transaction and use its public upsert semantics.
-                let statement = sql_planning_cache.parse_statement(NATIVE_FILE_UPSERT_SQL)?;
-                let plan = transaction
-                    .prepare_sql_write_logical_plan(NATIVE_FILE_UPSERT_SQL, &statement)?;
-                sql2::execute_write_logical_plan_result_with_metadata(
-                    transaction,
-                    plan,
-                    &[Value::Text(path), Value::Blob(data)],
-                    &ExecuteStatementMetadata::default(),
-                )
-                .await
-                .map(|result| result.rows_affected)
-            })
+            // The fast helper declines pre-existing cross-scope path
+            // collisions before staging anything. The general provider
+            // handles those valid legacy layouts, so keep this request in
+            // the same transaction and use its public upsert semantics.
+            let statement = sql_planning_cache.parse_statement(NATIVE_FILE_UPSERT_SQL)?;
+            let plan =
+                transaction.prepare_sql_write_logical_plan(NATIVE_FILE_UPSERT_SQL, &statement)?;
+            sql2::execute_write_logical_plan_result_with_metadata(
+                transaction,
+                plan,
+                &[Value::Text(path), Value::Blob(data)],
+                &ExecuteStatementMetadata::default(),
+            )
+            .await
+            .map(|result| result.rows_affected)
         })
         .await
     }
@@ -804,8 +801,7 @@ where
         self.ensure_open()?;
         validate_native_file_upsert_batch(&writes)?;
         let write_access = self.begin_session_write_access().await?;
-        self.with_write_transaction_reserved(write_access, |transaction| {
-            Box::pin(async move {
+        self.with_write_transaction_reserved_lending(write_access, async move |transaction| {
                 sql2::execute_fast_lix_file_path_writes(
                     transaction,
                     writes
@@ -826,7 +822,6 @@ where
                         "expected": "a filesystem layout that the direct path index can route unambiguously",
                     }))
                 })
-            })
         })
         .await
     }
@@ -854,9 +849,9 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let (data, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
+        let (data, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _>(
             read_scope,
-            |read_store| async move {
+            |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
                 let plugin_cache_snapshot = read_store.snapshot_cache_key();
                 let live_state: Arc<dyn crate::live_state::LiveStateReader> =
@@ -977,26 +972,23 @@ where
             let sql_for_planning = sql_for_error.clone();
             let params = params.to_vec();
             return self
-                .with_write_transaction_reserved(write_access, |transaction| {
-                    Box::pin(async move {
-                        let previous_origin_key =
-                            transaction.replace_origin_key(options.origin_key);
-                        let result = async {
-                            let tx_plan = transaction
-                                .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
-                            let result = execute_prepared_transaction_write(
-                                transaction,
-                                tx_plan,
-                                &params,
-                                &metadata,
-                            )
-                            .await?;
-                            Ok(ExecuteResult::from_sql_write_result(result))
-                        }
-                        .await;
-                        transaction.replace_origin_key(previous_origin_key);
-                        result
-                    })
+                .with_write_transaction_reserved_lending(write_access, async move |transaction| {
+                    let previous_origin_key = transaction.replace_origin_key(options.origin_key);
+                    let result = async {
+                        let tx_plan = transaction
+                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
+                        let result = execute_prepared_transaction_write(
+                            transaction,
+                            tx_plan,
+                            &params,
+                            &metadata,
+                        )
+                        .await?;
+                        Ok(ExecuteResult::from_sql_write_result(result))
+                    }
+                    .await;
+                    transaction.replace_origin_key(previous_origin_key);
+                    result
                 })
                 .await
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
@@ -1038,9 +1030,9 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let read_result = with_static_session_sql_read::<StorageImpl, _, _, _>(
+        let read_result = with_static_session_sql_read::<StorageImpl, _, _>(
             read_scope,
-            |read_store| async move {
+            |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 self.execute_read_statement_with_store(
                     read_store,
                     sql,
@@ -1054,17 +1046,17 @@ where
                 .await
             },
         );
-        let (read_result, file_view_mutations) = match read_result.await {
+        let (mut read_result, file_view_mutations) = match read_result.await {
             Ok(result) => result,
             Err(error) => {
                 return Err(normalize_sql_surface_error(error, sql));
             }
         };
-        let runtime_storage_stats = match read_result.runtime_functions.as_ref() {
+        let runtime_storage_stats = match read_result.runtime_functions.take() {
             Some(runtime_functions) => {
                 self.persist_runtime_functions_if_needed(
                     runtime_functions,
-                    runtime_write_access.as_ref(),
+                    runtime_write_access.is_some(),
                 )
                 .await?
             }
@@ -1107,30 +1099,28 @@ where
         // this call's immediate stack frame while the write lease is held.
         let idempotency_for_commit = idempotency.clone();
         let result = self
-            .with_write_transaction_reserved(write_access, |transaction| {
-                Box::pin(async move {
-                    let previous_origin_key = transaction.replace_origin_key(options.origin_key);
-                    let result = async {
-                        let tx_plan = transaction
-                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
-                        let result = execute_prepared_transaction_write(
-                            transaction,
-                            tx_plan,
-                            &params,
-                            &metadata,
-                        )
-                        .await?;
-                        let result = ExecuteResult::from_sql_write_result(result);
-                        let receipt =
-                            ExecuteIdempotencyReceipt::single(&idempotency_for_commit, &result)?;
-                        transaction
-                            .stage_execute_idempotency_receipt(&idempotency_for_commit, &receipt)?;
-                        Ok(result)
-                    }
-                    .await;
-                    transaction.replace_origin_key(previous_origin_key);
-                    result
-                })
+            .with_write_transaction_reserved_lending(write_access, async move |transaction| {
+                let previous_origin_key = transaction.replace_origin_key(options.origin_key);
+                let result = async {
+                    let tx_plan = transaction
+                        .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
+                    let result = execute_prepared_transaction_write(
+                        transaction,
+                        tx_plan,
+                        &params,
+                        &metadata,
+                    )
+                    .await?;
+                    let result = ExecuteResult::from_sql_write_result(result);
+                    let receipt =
+                        ExecuteIdempotencyReceipt::single(&idempotency_for_commit, &result)?;
+                    transaction
+                        .stage_execute_idempotency_receipt(&idempotency_for_commit, &receipt)?;
+                    Ok(result)
+                }
+                .await;
+                transaction.replace_origin_key(previous_origin_key);
+                result
             })
             .await
             .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
@@ -1292,51 +1282,48 @@ where
 
         let sql_for_error = Arc::clone(&sql);
         let result = self
-            .with_write_transaction(move |transaction| {
-                Box::pin(async move {
-                    let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
-                    let parameter_refs = parameter_rows
-                        .iter()
-                        .map(|parameters| parameters.as_ref())
-                        .collect::<Vec<_>>();
-                    let results = if let Some(results) =
-                        sql2::execute_write_logical_plan_value_batch(
-                            transaction,
-                            &plan,
-                            &parameter_refs,
-                        )
-                        .await?
-                    {
-                        Some(results)
-                    } else {
-                        let Some(parameter_batch) = sql2::parameter_record_batch(&parameter_refs)?
-                        else {
-                            return Err(LixError::new(
-                                LixError::CODE_INVALID_PARAM,
-                                "homogeneous write parameters cannot be lowered as one batch",
-                            ));
-                        };
-                        sql2::execute_write_logical_plan_parameter_batch(
-                            transaction,
-                            plan,
-                            &parameter_batch,
-                        )
-                        .await?
+            .with_write_transaction_lending(async move |transaction| {
+                let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
+                let parameter_refs = parameter_rows
+                    .iter()
+                    .map(|parameters| parameters.as_ref())
+                    .collect::<Vec<_>>();
+                let results = if let Some(results) = sql2::execute_write_logical_plan_value_batch(
+                    transaction,
+                    &plan,
+                    &parameter_refs,
+                )
+                .await?
+                {
+                    Some(results)
+                } else {
+                    let Some(parameter_batch) = sql2::parameter_record_batch(&parameter_refs)?
+                    else {
+                        return Err(LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "homogeneous write parameters cannot be lowered as one batch",
+                        ));
                     };
-                    results
-                        .ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_INVALID_PARAM,
-                                "write shape requires sequential execute_batch semantics",
-                            )
-                        })
-                        .map(|results| {
-                            results
-                                .into_iter()
-                                .map(ExecuteResult::from_sql_write_result)
-                                .collect()
-                        })
-                })
+                    sql2::execute_write_logical_plan_parameter_batch(
+                        transaction,
+                        plan,
+                        &parameter_batch,
+                    )
+                    .await?
+                };
+                results
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "write shape requires sequential execute_batch semantics",
+                        )
+                    })
+                    .map(|results| {
+                        results
+                            .into_iter()
+                            .map(ExecuteResult::from_sql_write_result)
+                            .collect()
+                    })
             })
             .await;
         result.map_err(|error| normalize_sql_surface_error(error, &sql_for_error))
@@ -1591,31 +1578,28 @@ where
                                 "batch",
                                 Some(statement_index),
                             );
-                            let operation = async {
-                                // Keep the large statement executor behind a heap boundary. The
-                                // lending transaction closure already carries the whole parsed
-                                // batch; embedding this future in it makes debug poll stacks exceed
-                                // the standard 2 MiB worker stack for ordinary entity writes.
-                                Box::pin(execute_transaction_statement(
-                                    transaction,
-                                    &sql,
-                                    parsed.clone(),
-                                    &params,
-                                    options.clone(),
-                                    metadata,
-                                ))
-                                .await
-                                .map_err(|error| {
-                                    with_batch_statement_index(
-                                        normalize_sql_surface_error(error, &statement.sql),
-                                        statement_index,
-                                    )
-                                })
-                            };
+                            // Keep the large statement executor behind a heap boundary. The
+                            // lending transaction closure already carries the whole parsed batch;
+                            // embedding this future in it makes debug poll stacks exceed the
+                            // standard 2 MiB worker stack for ordinary entity writes.
+                            let operation = Box::pin(execute_transaction_statement(
+                                transaction,
+                                &sql,
+                                parsed.clone(),
+                                &params,
+                                options.clone(),
+                                metadata,
+                            ));
                             let result = match telemetry.as_ref() {
                                 Some(telemetry) => telemetry.instrument(operation).await,
                                 None => operation.await,
-                            };
+                            }
+                            .map_err(|error| {
+                                with_batch_statement_index(
+                                    normalize_sql_surface_error(error, &statement.sql),
+                                    statement_index,
+                                )
+                            });
                             if let Some(telemetry) = telemetry {
                                 telemetry.finish(&result);
                             }
@@ -1635,29 +1619,26 @@ where
                                 "batch",
                                 Some(statement_index),
                             );
-                            let operation = async {
-                                // See the auto-parameterized branch above. Both batch routes need
-                                // the same bounded poll-stack boundary.
-                                Box::pin(execute_transaction_statement(
-                                    transaction,
-                                    &statement.sql,
-                                    parsed,
-                                    &statement.params,
-                                    options.clone(),
-                                    metadata,
-                                ))
-                                .await
-                                .map_err(|error| {
-                                    with_batch_statement_index(
-                                        normalize_sql_surface_error(error, &statement.sql),
-                                        statement_index,
-                                    )
-                                })
-                            };
+                            // See the auto-parameterized branch above. Both batch routes need the
+                            // same bounded poll-stack boundary.
+                            let operation = Box::pin(execute_transaction_statement(
+                                transaction,
+                                &statement.sql,
+                                parsed,
+                                &statement.params,
+                                options.clone(),
+                                metadata,
+                            ));
                             let result = match telemetry.as_ref() {
                                 Some(telemetry) => telemetry.instrument(operation).await,
                                 None => operation.await,
-                            };
+                            }
+                            .map_err(|error| {
+                                with_batch_statement_index(
+                                    normalize_sql_surface_error(error, &statement.sql),
+                                    statement_index,
+                                )
+                            });
                             if let Some(telemetry) = telemetry {
                                 telemetry.finish(&result);
                             }
@@ -1695,9 +1676,9 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let (results, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
+        let (results, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _>(
             read_scope,
-            |read_store| async move {
+            |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let file_view_collector =
                     acknowledge_file_views.then(sql2::SessionFileViews::default);
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
@@ -1817,9 +1798,9 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let (batch, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _, _>(
+        let (batch, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _>(
             read_scope,
-            |read_store| async move {
+            |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let file_view_collector =
                     acknowledge_file_views.then(sql2::SessionFileViews::default);
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
@@ -1931,19 +1912,17 @@ where
             let sql_for_planning = sql_for_error.clone();
             let params = params.to_vec();
             return self
-                .with_write_transaction_reserved(write_access, |transaction| {
-                    Box::pin(async move {
-                        let tx_plan = transaction
-                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
-                        let result = sql2::execute_write_logical_plan_with_mode_result(
-                            transaction,
-                            tx_plan,
-                            &params,
-                            mode,
-                        )
-                        .await?;
-                        Ok(ExecuteResult::from_sql_write_result(result))
-                    })
+                .with_write_transaction_reserved_lending(write_access, async move |transaction| {
+                    let tx_plan = transaction
+                        .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
+                    let result = sql2::execute_write_logical_plan_with_mode_result(
+                        transaction,
+                        tx_plan,
+                        &params,
+                        mode,
+                    )
+                    .await?;
+                    Ok(ExecuteResult::from_sql_write_result(result))
                 })
                 .await
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
@@ -1959,8 +1938,8 @@ where
     /// sequence state.
     async fn persist_runtime_functions_if_needed(
         &self,
-        runtime_functions: &FunctionContext,
-        runtime_write_access: Option<&SessionWriteAccess>,
+        runtime_functions: FunctionContext,
+        has_runtime_write_access: bool,
     ) -> Result<Option<crate::storage_adapter::StorageWriteSetStats>, LixError> {
         let mut writes = StorageWriteSet::new();
         let read = SharedStorageAdapterRead::new(
@@ -1974,7 +1953,7 @@ where
         if writes.is_empty() {
             return Ok(None);
         }
-        if runtime_write_access.is_none() {
+        if !has_runtime_write_access {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "runtime function state changed without reserved write access",
@@ -2470,14 +2449,13 @@ async fn hydrate_lix_file_data_result(
 /// storage implementations such as RocksDB naturally expose borrowed read snapshots. Keep
 /// the lifetime erasure private to session SQL execution so callers cannot
 /// receive the widened read as a general crate capability.
-async fn with_static_session_sql_read<StorageImpl, F, Fut, T>(
+async fn with_static_session_sql_read<StorageImpl, F, T>(
     read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
     f: F,
 ) -> Result<T, LixError>
 where
     StorageImpl: Storage + 'static,
-    F: FnOnce(SharedStorageAdapterRead<StorageImpl::Read<'static>>) -> Fut,
-    Fut: Future<Output = Result<T, LixError>>,
+    F: AsyncFnOnce(SharedStorageAdapterRead<StorageImpl::Read<'static>>) -> Result<T, LixError>,
 {
     // SAFETY: the widened read is wrapped immediately in `SharedStorageAdapterRead`,
     // only passed into this private SQL execution closure, and explicitly

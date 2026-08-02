@@ -2043,7 +2043,7 @@ impl TrackedStateTree {
         overlay: &'a storage::TrackedStateChunkOverlay,
         hash: [u8; TRACKED_STATE_HASH_BYTES],
         levels: &'a mut Vec<Vec<ChildSummary>>,
-    ) -> Pin<Box<dyn Future<Output = Result<(ChildSummary, usize), LixError>> + 'a>>
+    ) -> Pin<Box<dyn Future<Output = Result<(ChildSummary, usize), LixError>> + Send + 'a>>
     where
         S: StorageAdapterRead + ?Sized + 'a,
     {

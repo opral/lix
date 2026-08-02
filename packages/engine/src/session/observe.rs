@@ -48,7 +48,7 @@ where
 {
     session: SessionContext<StorageImpl>,
     query: ObserveQuery,
-    receiver: watch::Receiver<ObserveInvalidationEvent>,
+    receiver: Option<watch::Receiver<ObserveInvalidationEvent>>,
     sequence: u64,
     last_rows: Option<ExecuteResult>,
     last_shared_content: Option<ObserveSharedContent>,
@@ -61,7 +61,7 @@ where
 {
     pub async fn next(&mut self) -> Result<Option<ObserveEvent>, LixError> {
         if self.closed || self.session.is_closed() {
-            self.closed = true;
+            self.close();
             return Ok(None);
         }
         if self.last_rows.is_none() {
@@ -83,17 +83,17 @@ where
 
         loop {
             if self.closed || self.session.is_closed() {
-                self.closed = true;
+                self.close();
                 return Ok(None);
             }
 
             if !Box::pin(self.wait_for_invalidation()).await? {
-                self.closed = true;
+                self.close();
                 return Ok(None);
             }
 
             if self.session.is_closed() {
-                self.closed = true;
+                self.close();
                 return Ok(None);
             }
 
@@ -121,6 +121,7 @@ where
 
     pub fn close(&mut self) {
         self.closed = true;
+        self.receiver.take();
     }
 
     fn acknowledge_delivered_file_views(&self, rows: &ExecuteResult) {
@@ -130,14 +131,22 @@ where
     }
 
     async fn wait_for_invalidation(&mut self) -> Result<bool, LixError> {
-        if self.receiver.changed().await.is_err() {
+        let Some(receiver) = self.receiver.as_mut() else {
+            return Ok(false);
+        };
+        if receiver.changed().await.is_err() {
             return Ok(false);
         }
         self.invalidation_generation().map(|_| true)
     }
 
     fn invalidation_generation(&mut self) -> Result<u64, LixError> {
-        let event = self.receiver.borrow_and_update().clone();
+        let event = self
+            .receiver
+            .as_mut()
+            .expect("open observer retains its invalidation receiver")
+            .borrow_and_update()
+            .clone();
         match event {
             ObserveInvalidationEvent::Generation(generation) => Ok(generation),
             ObserveInvalidationEvent::TerminalStorageError(error) => Err(error),
@@ -157,10 +166,17 @@ where
             let before = self.invalidation_generation()?;
             let rows = Box::pin(self.execute_or_share(before)).await;
             drop(operation_guard);
+            // Closing transitions the shared session to `Closing` before it
+            // waits for active operations. Do not publish a snapshot that
+            // completed concurrently with that lifecycle boundary.
+            if self.session.is_closed() {
+                self.close();
+                return Ok(None);
+            }
             let rows = match rows {
                 Ok(rows) => rows,
                 Err(error) if error.code == LixError::CODE_CLOSED => {
-                    self.closed = true;
+                    self.close();
                     return Ok(None);
                 }
                 Err(error) => return Err(error),
@@ -240,7 +256,7 @@ where
         Ok(ObserveEvents {
             session: self.clone(),
             query: ObserveQuery::new(sql, params.to_vec(), shared_state),
-            receiver: self.observe_invalidation.subscribe(),
+            receiver: Some(self.observe_invalidation.subscribe()),
             sequence: 0,
             last_rows: None,
             last_shared_content: None,

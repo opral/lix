@@ -6664,29 +6664,31 @@ where
             certified_live_increments,
         )?;
 
-        let _stage_span = tracing::debug_span!(
+        async {
+            stage_hot_diff_batch(
+                self.writes,
+                diff_scope.as_deref().unwrap_or_default(),
+                diff_key_bytes,
+                diff_puts,
+            )?;
+            stage_hot_mutation_batch(self.writes, identities, next_value_bytes, next_value_ranges);
+            stage_incremental_file_delete_cascades(
+                self.store,
+                self.writes,
+                branch_id,
+                generation,
+                &sorted,
+                working_diff_capture_checkpoint_commit_id,
+                reset_working_diff_baselines,
+                &mut next_coverage,
+                &mut retired_untracked_json_refs,
+            )
+            .await
+        }
+        .instrument(tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.materialization.hot.stage"
-        )
-        .entered();
-        stage_hot_diff_batch(
-            self.writes,
-            diff_scope.as_deref().unwrap_or_default(),
-            diff_key_bytes,
-            diff_puts,
-        )?;
-        stage_hot_mutation_batch(self.writes, identities, next_value_bytes, next_value_ranges);
-        stage_incremental_file_delete_cascades(
-            self.store,
-            self.writes,
-            branch_id,
-            generation,
-            &sorted,
-            working_diff_capture_checkpoint_commit_id,
-            reset_working_diff_baselines,
-            &mut next_coverage,
-            &mut retired_untracked_json_refs,
-        )
+        ))
         .await?;
         JsonStoreWriter::stage_untracked_reclaim_candidates(
             self.writes,

@@ -42,14 +42,20 @@ impl<StorageImpl> OpenLixOptions<StorageImpl> {
     }
 }
 
-/// Workspace-session handle for a Lix repository.
+/// Clonable workspace-session handle for a Lix repository.
+///
+/// Clones are concurrent handles to the same logical session: they share the
+/// active workspace branch, transaction exclusion, file-view state, and close
+/// lifecycle. Use [`Lix::open_session`] when an operation needs an independent
+/// pinned session and lifecycle.
+#[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct Lix<StorageImpl = Memory>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    engine: Engine<StorageImpl>,
-    session: SessionContext<StorageImpl>,
+    engine: Arc<Engine<StorageImpl>>,
+    session: Arc<SessionContext<StorageImpl>>,
 }
 
 /// Opens a Lix workspace session.
@@ -90,7 +96,10 @@ where
     let engine =
         open_or_initialize_engine(options.storage, options.wasm_runtime, telemetry, None).await?;
     let session = engine.open_workspace_session().await?;
-    Ok(Lix { engine, session })
+    Ok(Lix {
+        engine: Arc::new(engine),
+        session: Arc::new(session),
+    })
 }
 
 pub async fn open_lix_with_storage<StorageImpl>(
@@ -120,7 +129,10 @@ where
     )
     .await?;
     let session = engine.open_workspace_session().await?;
-    Ok(Lix { engine, session })
+    Ok(Lix {
+        engine: Arc::new(engine),
+        session: Arc::new(session),
+    })
 }
 
 impl<StorageImpl> Lix<StorageImpl>
@@ -153,7 +165,7 @@ where
         let session = self.engine.open_workspace_session().await?;
         Ok(Self {
             engine: self.engine.clone(),
-            session,
+            session: Arc::new(session),
         })
     }
 
@@ -190,7 +202,7 @@ where
         let session = self.engine.open_session(active_branch_id).await?;
         Ok(Self {
             engine: self.engine.clone(),
-            session,
+            session: Arc::new(session),
         })
     }
 
@@ -449,7 +461,7 @@ where
         Ok((
             Self {
                 engine: self.engine.clone(),
-                session,
+                session: Arc::new(session),
             },
             receipt,
         ))
