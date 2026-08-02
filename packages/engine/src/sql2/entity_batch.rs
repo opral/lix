@@ -6,6 +6,7 @@
 //! public-result reads consume those same bytes, keeping visibility proof in
 //! one place and leaving every unsupported shape on the established row path.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -99,7 +100,7 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
         layout: Arc<EntityColumnarScanLayout>,
         group_index: usize,
         identity_column: usize,
-        shadow_identities: Arc<Vec<String>>,
+        shadow_identities: Arc<HashSet<String, ahash::RandomState>>,
         _shadow_identity_digest: [u8; 32],
     ) -> Result<Arc<BooleanArray>, LixError> {
         Ok(Arc::new(
@@ -288,7 +289,7 @@ where
         layout: Arc<EntityColumnarScanLayout>,
         group_index: usize,
         identity_column: usize,
-        shadow_identities: Arc<Vec<String>>,
+        shadow_identities: Arc<HashSet<String, ahash::RandomState>>,
         shadow_identity_digest: [u8; 32],
     ) -> Result<Arc<BooleanArray>, LixError> {
         let key = EntityColumnarShadowMaskKey {
@@ -436,7 +437,7 @@ async fn load_entity_columnar_shadow_mask<R: EntitySnapshotReader + ?Sized>(
     layout: Arc<EntityColumnarScanLayout>,
     group_index: usize,
     identity_column: usize,
-    shadow_identities: &[String],
+    shadow_identities: &HashSet<String, ahash::RandomState>,
 ) -> Result<BooleanArray, LixError> {
     let batch = reader
         .load_entity_columnar_group(layout, group_index, vec![identity_column])
@@ -453,11 +454,7 @@ async fn load_entity_columnar_shadow_mask<R: EntitySnapshotReader + ?Sized>(
     }
     Ok(BooleanArray::from(
         (0..identities.len())
-            .map(|index| {
-                shadow_identities
-                    .binary_search_by(|shadow| shadow.as_str().cmp(identities.value(index)))
-                    .is_err()
-            })
+            .map(|index| !shadow_identities.contains(identities.value(index)))
             .collect::<Vec<_>>(),
     ))
 }
