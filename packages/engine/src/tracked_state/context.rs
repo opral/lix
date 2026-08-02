@@ -55,6 +55,7 @@ use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_64;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 // A right-edge probe is worthwhile for a real append batch, but would add a
 // second tree traversal to sparse non-append writes that already use point
 // reads. Keep those latency-sensitive writes on the unchanged generic path.
@@ -1264,6 +1265,102 @@ where
         request: &TrackedStateDiffRequest,
     ) -> Result<TrackedStateDiff, LixError> {
         diff_commits(self, left_commit_id, right_commit_id, request).await
+    }
+
+    /// Resolves the exact tracked identities affected by descriptor cascades.
+    ///
+    /// File-descriptor tombstones implicitly delete every tracked row owned by
+    /// that file, but those cascade members are not authored commit-delta
+    /// rows. Historical keys are ordered by schema before file ID, so a
+    /// file-only scan would still walk the whole root. Build the schema
+    /// inventory from the visible schema catalog and scan only the resulting
+    /// `(schema_key, file_id)` prefixes at the endpoint where the file is
+    /// live. If the target changes the catalog, also include both historical
+    /// endpoint inventories.
+    pub(crate) async fn descriptor_dependency_closure(
+        &mut self,
+        current_commit_id: &str,
+        desired_commit_id: &str,
+        dependency_commit_id: &str,
+        target_delta: &[(TrackedStateKey, TrackedStateIndexValue)],
+        file_ids: &[String],
+        visible_schema_keys: &[String],
+    ) -> Result<Vec<TrackedStateKey>, LixError> {
+        let mut keys = target_delta
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<BTreeSet<_>>();
+
+        let mut schema_keys = visible_schema_keys.iter().cloned().collect::<BTreeSet<_>>();
+        if target_delta
+            .iter()
+            .any(|(key, _)| key.schema_key == REGISTERED_SCHEMA_KEY)
+        {
+            schema_keys.extend(
+                self.registered_schema_keys_at_commit(desired_commit_id)
+                    .await?,
+            );
+            schema_keys.extend(
+                self.registered_schema_keys_at_commit(current_commit_id)
+                    .await?,
+            );
+        }
+        let request = TrackedStateScanRequest {
+            filter: crate::tracked_state::TrackedStateFilter {
+                schema_keys: schema_keys.into_iter().collect(),
+                file_ids: file_ids
+                    .iter()
+                    .cloned()
+                    .map(NullableKeyFilter::Value)
+                    .collect(),
+                ..crate::tracked_state::TrackedStateFilter::default()
+            },
+            read_columns: crate::tracked_state::TrackedStateReadColumns {
+                columns: vec!["change_id".to_string()],
+            },
+            limit: None,
+        };
+        let rows = self
+            .scan_batch_at_commit(dependency_commit_id, &request)
+            .await?;
+        keys.extend(rows.iter().map(|row| TrackedStateKey {
+            schema_key: row.schema_key().to_owned(),
+            file_id: row.file_id().map(str::to_owned),
+            entity_pk: row.entity_pk().clone(),
+        }));
+        Ok(keys.into_iter().collect())
+    }
+
+    async fn registered_schema_keys_at_commit(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<BTreeSet<String>, LixError> {
+        let rows = self
+            .scan_batch_at_commit(
+                commit_id,
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
+                        file_ids: vec![NullableKeyFilter::Null],
+                        ..crate::tracked_state::TrackedStateFilter::default()
+                    },
+                    read_columns: crate::tracked_state::TrackedStateReadColumns {
+                        columns: vec!["change_id".to_string()],
+                    },
+                    limit: None,
+                },
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                row.entity_pk().as_single_string_owned().map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("registered schema dependency identity is invalid: {error}"),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Loads the identities and index values authored or selected by exactly
@@ -3929,6 +4026,18 @@ fn file_delete_cascade(
         },
         value,
     )
+}
+
+pub(crate) fn descriptor_dependency_cascade_file_ids(
+    target_delta: &[(TrackedStateKey, TrackedStateIndexValue)],
+) -> Result<Vec<String>, LixError> {
+    let mut file_ids = BTreeSet::new();
+    for (key, value) in target_delta {
+        if let Some(file_id) = file_delete_cascade(key, value)? {
+            file_ids.insert(file_id);
+        }
+    }
+    Ok(file_ids.into_iter().collect())
 }
 
 fn file_delete_cascade_ref(
