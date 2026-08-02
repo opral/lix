@@ -521,6 +521,21 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     plugin_generation_upgrade_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
 }
 
+/// One already-resolved tracked-state transition. The expected side is
+/// certified by the active branch head and its immutable historical root;
+/// target payloads come from an exact read of the desired root.
+struct TypedStateTransition {
+    identity: TrackedStateKey,
+    expected_change_id: Option<ChangeId>,
+    target: Option<TypedStateTransitionTarget>,
+}
+
+struct TypedStateTransitionTarget {
+    change_id: ChangeId,
+    snapshot_content: Option<SharedStr>,
+    metadata: Option<SharedStr>,
+}
+
 /// State which must be restored when `RETURNING` evaluation fails after a
 /// write has been staged in an explicit SQL transaction.
 pub(crate) struct SqlStatementCheckpoint {
@@ -6763,6 +6778,162 @@ where
         CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read))
     }
 
+    /// Applies a tracked-state transition resolved from two immutable commits.
+    ///
+    /// This is the internal counterpart to the public diff command. The
+    /// caller supplies typed identities instead of user-facing `diff_id`
+    /// strings. The transaction's coherent opening head certifies the current
+    /// side, so undo/redo does not need to reload visible live state after it
+    /// has already read that exact historical root.
+    pub(crate) async fn execute_tracked_state_transition(
+        &mut self,
+        current_commit_id: CommitId,
+        desired_commit_id: CommitId,
+        keys: Vec<TrackedStateKey>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        let branch_id = self.active_branch_id.clone();
+        if self.opening_active_branch_head != Some(current_commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "tracked-state transition source is no longer the active branch head",
+            ));
+        }
+        if self
+            .staged_writes
+            .commit_id_for_branch(&branch_id)?
+            .is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "typed tracked-state transitions require a clean branch transaction",
+            ));
+        }
+        if keys.is_empty() {
+            return Err(empty_state_transition(current_commit_id, desired_commit_id));
+        }
+        let unique = keys.iter().collect::<BTreeSet<_>>();
+        if unique.len() != keys.len() {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "typed tracked-state transition contains more than one row for the same entity",
+            ));
+        }
+
+        let (current_rows, desired_rows) = {
+            let mut tracked = self.tracked_state_reader().await;
+            let current_rows = tracked
+                .load_projected_batch_at_commit(
+                    &current_commit_id.to_string(),
+                    &keys,
+                    &ChangeRecordProjection::identity_only(),
+                )
+                .await?;
+            let desired_rows = tracked
+                .load_projected_batch_at_commit(
+                    &desired_commit_id.to_string(),
+                    &keys,
+                    &ChangeRecordProjection::full(),
+                )
+                .await?;
+            (current_rows, desired_rows)
+        };
+        let mut transitions = Vec::with_capacity(keys.len());
+        for (index, identity) in keys.into_iter().enumerate() {
+            let current = current_rows.row(index).filter(|row| !row.deleted());
+            let desired = desired_rows.row(index).filter(|row| !row.deleted());
+            for row in [current, desired].into_iter().flatten() {
+                if row.schema_key() != identity.schema_key
+                    || row.file_id() != identity.file_id.as_deref()
+                    || row.entity_pk() != &identity.entity_pk
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "historical exact read returned a mismatched transition identity",
+                    ));
+                }
+            }
+            let expected_change_id = current.map(|row| row.change_id());
+            let target = desired.map(|row| TypedStateTransitionTarget {
+                change_id: row.change_id(),
+                snapshot_content: row.snapshot_content().cloned(),
+                metadata: row.metadata().cloned(),
+            });
+            if expected_change_id != target.as_ref().map(|target| target.change_id) {
+                transitions.push(TypedStateTransition {
+                    identity,
+                    expected_change_id,
+                    target,
+                });
+            }
+        }
+        self.execute_typed_state_transitions(current_commit_id, desired_commit_id, transitions)
+            .await
+    }
+
+    async fn execute_typed_state_transitions(
+        &mut self,
+        current_commit_id: CommitId,
+        desired_commit_id: CommitId,
+        transitions: Vec<TypedStateTransition>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        if transitions.is_empty() {
+            return Err(empty_state_transition(current_commit_id, desired_commit_id));
+        }
+        let branch_id = self.active_branch_id.clone();
+        let rows_affected = transitions.len() as u64;
+        let mut rows = RawWriteBatch::with_capacity(transitions.len());
+        for transition in transitions {
+            if transition.expected_change_id
+                == transition.target.as_ref().map(|target| target.change_id)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "typed tracked-state transition contains an unchanged row",
+                ));
+            }
+            let (snapshot, metadata) = match transition.target {
+                Some(target) => (
+                    parse_materialized_diff_json(
+                        target.snapshot_content,
+                        "typed state transition target",
+                    )?,
+                    parse_materialized_diff_json(
+                        target.metadata,
+                        "typed state transition target metadata",
+                    )?,
+                ),
+                None => (None, None),
+            };
+            rows.push(TransactionWriteRow {
+                entity_pk: Some(transition.identity.entity_pk),
+                schema_key: transition.identity.schema_key.into(),
+                file_id: transition.identity.file_id.map(Into::into),
+                snapshot,
+                metadata,
+                origin: None,
+                created_at: None,
+                updated_at: None,
+                global: false,
+                change_id: None,
+                commit_id: None,
+                untracked: false,
+                branch_id: branch_id.clone().into(),
+            });
+        }
+        self.stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Replace,
+            rows,
+        })
+        .await?;
+        Ok(crate::sql2::DiffCommandOutcome {
+            rows_affected,
+            commit_id: self
+                .staged_writes
+                .commit_id_for_branch(&branch_id)?
+                .map(|commit_id| commit_id.to_string()),
+        })
+    }
+
     async fn execute_apply_or_revert(
         &mut self,
         command: DiffCommand,
@@ -7183,6 +7354,13 @@ fn stale_or_unknown_diff_id() -> LixError {
     LixError::new(
         LixError::CODE_CONSTRAINT_VIOLATION,
         "stale or unknown diff_id; re-evaluate the source diff and retry",
+    )
+}
+
+fn empty_state_transition(current: CommitId, desired: CommitId) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("tracked-state transition from '{current}' to '{desired}' is empty"),
     )
 }
 
