@@ -29,6 +29,12 @@ use crate::storage_adapter::{
 };
 
 pub(crate) const ROW_GROUP_MAX_ROWS: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RowGroupRowLocation {
+    pub(crate) group_index: u32,
+    pub(crate) row_index: u32,
+}
 pub(crate) const ROW_GROUP_MANIFEST_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_0029),
     "analytical.row_group_manifest.v1",

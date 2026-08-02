@@ -51,8 +51,8 @@ pub(crate) use storage::{
 #[cfg(test)]
 pub(crate) use storage::{load_commit_delta_change_ids, scan_commit_delta_members};
 pub(crate) use types::{
-    MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateDeltaRef,
-    TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
+    MaterializedTrackedStateRow, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
+    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest,
 };
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};

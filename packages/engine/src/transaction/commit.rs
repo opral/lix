@@ -484,6 +484,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         read,
         &mut writes,
         &mut state_rows,
+        &entity_columnar_write_sets,
         &row_index.tracked_row_indices_by_commit,
         &tracked_roots,
         &commit_rows,
@@ -1257,6 +1258,7 @@ fn tracked_commit_delta_from_state_row(
             crate::transaction::types::StageJson::slot_ref,
         ),
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
+        base_coordinate: None,
         authored: true,
         certified: false,
     })
@@ -1305,6 +1307,7 @@ fn tracked_commit_delta_from_certified_root_row(
                 crate::json_store::JsonSlotRef::Inline(metadata.as_str())
             }),
         origin_key: None,
+        base_coordinate: None,
         authored: true,
         certified: row.snapshot_content.is_none() && row.metadata.is_none(),
     })
@@ -1361,6 +1364,7 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
             record.metadata.as_ref_slot()
         }),
         origin_key: record.and_then(|record| record.origin_key.as_deref()),
+        base_coordinate: None,
         authored: false,
         certified: false,
     })
@@ -1403,6 +1407,7 @@ fn current_state_delta_from_state_row(
             crate::json_store::JsonSlotRef::None,
             crate::transaction::types::StageJson::slot_ref,
         ),
+        analytical_base_coordinate: None,
     })
 }
 
@@ -1449,6 +1454,7 @@ impl crate::live_state::DeferredFreshHotRows for PreparedStateBatch {
                     crate::json_store::JsonSlotRef::None,
                     crate::transaction::types::StageJson::slot_ref,
                 ),
+                analytical_base_coordinate: None,
             },
         }
     }
@@ -1469,6 +1475,7 @@ fn current_state_delta_from_engine_row(
         updated_at: row.updated_at,
         snapshot: row.change.snapshot.as_ref_slot(),
         metadata: row.change.metadata.as_ref_slot(),
+        analytical_base_coordinate: None,
     }
 }
 
@@ -1587,6 +1594,7 @@ async fn stage_tracked_commit_delta_index(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &mut PreparedStateBatch,
+    entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     commit_rows: &[FinalizedCommitRow],
@@ -1635,6 +1643,15 @@ async fn stage_tracked_commit_delta_index(
                 let deltas = state_row_indices.iter().map(|&row_index| {
                     let row = state_rows.row(row_index);
                     let mut delta = tracked_commit_delta_from_state_row(row)?;
+                    delta.base_coordinate = entity_columnar_write_sets
+                        .state_row_location(row_index)
+                        .map(
+                            |location| crate::tracked_state::TrackedStateBaseCoordinate {
+                                base_commit_id: root.commit_id,
+                                group_index: location.group_index,
+                                row_index: location.row_index,
+                            },
+                        );
                     delta.certified = root.publish_head
                         && host_certified_batch_owns_live_row(
                             row,
@@ -1669,6 +1686,15 @@ async fn stage_tracked_commit_delta_index(
             let row = state_rows.row(row_index);
             addressable.push(row.addressable_change_id);
             let mut delta = tracked_commit_delta_from_state_row(row)?;
+            delta.base_coordinate = entity_columnar_write_sets
+                .state_row_location(row_index)
+                .map(
+                    |location| crate::tracked_state::TrackedStateBaseCoordinate {
+                        base_commit_id: root.commit_id,
+                        group_index: location.group_index,
+                        row_index: location.row_index,
+                    },
+                );
             delta.certified = root.publish_head
                 && host_certified_batch_owns_live_row(
                     row,
@@ -2921,6 +2947,7 @@ async fn stage_tracked_head(
                             updated_at: change_ref.updated_at,
                             snapshot: snapshot.as_ref_slot(),
                             metadata: metadata.as_ref_slot(),
+                            analytical_base_coordinate: None,
                         }
                     }),
             );
@@ -3863,27 +3890,27 @@ fn prepare_entity_columnar_write_sets(
     entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
 ) -> Result<crate::live_state::EntityColumnarWriteSets, LixError> {
     if state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS {
-        return Ok(BTreeMap::new());
+        return Ok(crate::live_state::EntityColumnarWriteSets::new());
     }
     let publishes_ordered_insert =
         insert_selection.len() == state_rows.len() && insert_selection.covers_all(state_rows.len());
     let publishes_complete_replacement =
         state_rows.certified_complete_collection_replacement() && insert_selection.is_empty();
     if !publishes_ordered_insert && !publishes_complete_replacement {
-        return Ok(BTreeMap::new());
+        return Ok(crate::live_state::EntityColumnarWriteSets::new());
     }
     if (publishes_ordered_insert || publishes_complete_replacement)
         && let Some((commit_id, schema_key, snapshots)) = state_rows.dense_entity_columnar_input()
     {
         let Some(schema) = entity_schema_catalog.and_then(|catalog| catalog.schema(schema_key))
         else {
-            return Ok(BTreeMap::new());
+            return Ok(crate::live_state::EntityColumnarWriteSets::new());
         };
         if !crate::schema::materializes_entity_columnar_sidecar(schema) {
             return Ok(BTreeMap::new());
         }
         let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(schema) else {
-            return Ok(BTreeMap::new());
+            return Ok(crate::live_state::EntityColumnarWriteSets::new());
         };
         let rows = state_rows.iter().zip(snapshots).map(|(row, snapshot)| {
             crate::sql2::EntityColumnarRowRef {
@@ -3892,16 +3919,21 @@ fn prepare_entity_columnar_write_sets(
                 snapshot_value: snapshot.value(),
             }
         });
-        let mut encoded = BTreeMap::new();
+        let mut encoded =
+            crate::live_state::EntityColumnarWriteSets::with_state_row_count(state_rows.len());
         if let Some(row_groups) = crate::sql2::encode_registered_entity_row_groups(&spec, rows)? {
-            encoded.insert((commit_id, schema_key.to_string()), row_groups);
+            let (row_group_set, input_locations) = row_groups.into_parts();
+            for (state_row_index, location) in input_locations.into_iter().enumerate() {
+                encoded.set_state_row_location(state_row_index, location);
+            }
+            encoded.insert((commit_id, schema_key.to_string()), row_group_set);
         }
         return Ok(encoded);
     }
     let mut indices = BTreeMap::<(CommitId, String), Vec<usize>>::new();
     for (index, row) in state_rows.iter().enumerate() {
         if !publishes_complete_replacement && !insert_selection.contains(index) {
-            return Ok(BTreeMap::new());
+            return Ok(crate::live_state::EntityColumnarWriteSets::new());
         }
         let (Some(commit_id), Some(_snapshot)) = (row.commit_id, row.snapshot) else {
             continue;
@@ -3914,7 +3946,8 @@ fn prepare_entity_columnar_write_sets(
             .or_default()
             .push(index);
     }
-    let mut encoded = BTreeMap::new();
+    let mut encoded =
+        crate::live_state::EntityColumnarWriteSets::with_state_row_count(state_rows.len());
     for ((commit_id, schema_key), row_indices) in indices {
         if row_indices.len() < PACKED_CURRENT_BASE_MIN_ROWS {
             continue;
@@ -3941,7 +3974,11 @@ fn prepare_entity_columnar_write_sets(
             }
         });
         if let Some(row_groups) = crate::sql2::encode_registered_entity_row_groups(&spec, rows)? {
-            encoded.insert((commit_id, schema_key), row_groups);
+            let (row_group_set, input_locations) = row_groups.into_parts();
+            for (&state_row_index, location) in row_indices.iter().zip(input_locations) {
+                encoded.set_state_row_location(state_row_index, location);
+            }
+            encoded.insert((commit_id, schema_key), row_group_set);
         }
     }
     Ok(encoded)
@@ -5022,6 +5059,7 @@ mod tests {
             updated_at: timestamp,
             snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"value":1}"#),
             metadata: crate::json_store::JsonSlotRef::None,
+            analytical_base_coordinate: None,
         };
         let guard = TrackedStateKeyRef {
             schema_key: "untracked_schema",
@@ -5218,6 +5256,7 @@ mod tests {
             &read,
             &mut writes,
             &mut state_rows,
+            &crate::live_state::EntityColumnarWriteSets::new(),
             &BTreeMap::from([(commit_id, vec![0])]),
             &roots,
             &commits,

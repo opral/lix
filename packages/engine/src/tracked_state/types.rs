@@ -49,6 +49,21 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
 }
 
+/// Physical location of an entity snapshot in an immutable analytical base.
+///
+/// Commit deltas carry this coordinate alongside their authoritative payload,
+/// allowing exact identity lookups to reconcile an overlay row with its base
+/// row without reading a second index. The commit id owns the referenced base
+/// layout; group and row ordinals are intentionally fixed-width so the packed
+/// commit-delta sidecar remains compact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct TrackedStateBaseCoordinate {
+    pub(crate) base_commit_id: CommitId,
+    pub(crate) group_index: u32,
+    pub(crate) row_index: u32,
+}
+
 /// Payload-bearing immutable commit member.
 ///
 /// Root mutation logic consumes only [`TrackedStateDeltaRef`]. Packed commit
@@ -60,6 +75,7 @@ pub(crate) struct TrackedStateCommitDeltaRef<'a> {
     pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
     pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
     pub(crate) origin_key: Option<&'a str>,
+    pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
     pub(crate) authored: bool,
     /// The durable payload is already present in a host-certified batch for
     /// this commit and identity.

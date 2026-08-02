@@ -391,6 +391,7 @@ impl PackedHistoryDelta {
             snapshot,
             metadata: JsonSlotRef::None,
             origin_key: None,
+            base_coordinate: None,
             authored: true,
             certified: false,
         }
