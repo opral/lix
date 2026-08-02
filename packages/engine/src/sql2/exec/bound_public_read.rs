@@ -38,6 +38,45 @@ pub(crate) async fn try_execute_bound_public_read<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
+    if let Some(shape) = strict_entity_count_read(statement, params) {
+        // Validate before using publication metadata so a fast path never
+        // widens the accepted public SQL surface.
+        crate::sql2::bind_read_statement(sql, statement)?;
+        let catalog = ctx.public_catalog().await?;
+        let Some(surface) = catalog.surface(&shape.table_name) else {
+            return Ok(None);
+        };
+        let PublicSurfaceKind::EntityBase { schema_key } = &surface.kind else {
+            return Ok(None);
+        };
+        let Some(reader) = ctx.entity_snapshot_reader() else {
+            return Ok(None);
+        };
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![schema_key.clone()],
+                branch_ids: vec![ctx.active_branch_id().to_owned()],
+                include_tombstones: false,
+                ..LiveStateFilter::default()
+            },
+            projection: LiveStateProjection::default(),
+            limit: None,
+        };
+        if let Some(count) = reader.count_entity_snapshots(request).await? {
+            let count = i64::try_from(count).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "entity collection count exceeds the SQL INTEGER range",
+                )
+            })?;
+            return Ok(Some(SqlQueryResult {
+                columns: vec![shape.alias],
+                rows: vec![vec![Value::Integer(count)]],
+                notices: Vec::new(),
+            }));
+        }
+        return Ok(None);
+    }
     if let Some(shape) = strict_entity_left_join_read(statement, params) {
         crate::sql2::bind_read_statement(sql, statement)?;
         let catalog = ctx.public_catalog().await?;
@@ -530,6 +569,12 @@ struct StrictEntityBroadRead {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+struct StrictEntityCountRead {
+    table_name: String,
+    alias: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct StrictEntityJoinProjection {
     table: String,
     column: String,
@@ -738,6 +783,68 @@ fn strict_entity_broad_read(
         projection: strict_projection(&select.projection)?,
         primary_key_column: canonical_ascending_order_column(query)?,
     })
+}
+
+/// Recognizes only `COUNT(*)` over one active entity table. Any predicate,
+/// grouping, distinct modifier, or expression remains with DataFusion because
+/// the collection-control cardinality is not a substitute for those SQL
+/// semantics.
+fn strict_entity_count_read(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<StrictEntityCountRead> {
+    if !params.is_empty() {
+        return None;
+    }
+    let (query, select, table_name) = strict_single_table_select(statement)?;
+    if query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || select.selection.is_some()
+    {
+        return None;
+    }
+    let [projection] = select.projection.as_slice() else {
+        return None;
+    };
+    let (expression, alias) = match projection {
+        // Match DataFusion's public column name for an unaliased aggregate.
+        // The metadata route must not expose a different result schema.
+        SelectItem::UnnamedExpr(expression) => (expression, "count(*)".to_owned()),
+        SelectItem::ExprWithAlias { expr, alias } => (expr, strict_identifier_name(alias)),
+        _ => return None,
+    };
+    let Expr::Function(function) = expression else {
+        return None;
+    };
+    if function.name.0.len() != 1
+        || function
+            .name
+            .0
+            .first()
+            .and_then(|part| part.as_ident())
+            .is_none_or(|ident| !ident.value.eq_ignore_ascii_case("count"))
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+        || function.uses_odbc_syntax
+    {
+        return None;
+    }
+    let datafusion::sql::sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return None;
+    }
+    matches!(
+        arguments.args.as_slice(),
+        [datafusion::sql::sqlparser::ast::FunctionArg::Unnamed(
+            datafusion::sql::sqlparser::ast::FunctionArgExpr::Wildcard
+        )]
+    )
+    .then_some(StrictEntityCountRead { table_name, alias })
 }
 
 fn strict_single_table_select(
@@ -998,6 +1105,36 @@ mod tests {
         assert_eq!(shape.table_name, "json_pointer");
         assert_eq!(shape.projection, ["path", "value"]);
         assert_eq!(shape.primary_key_column, "path");
+    }
+
+    #[test]
+    fn recognizes_unfiltered_entity_count() {
+        let shape =
+            strict_entity_count_read(&parse("SELECT COUNT(*) AS total FROM json_pointer"), &[])
+                .expect("unfiltered entity count should use collection metadata");
+
+        assert_eq!(shape.table_name, "json_pointer");
+        assert_eq!(shape.alias, "total");
+
+        let unaliased = strict_entity_count_read(&parse("SELECT COUNT(*) FROM json_pointer"), &[])
+            .expect("unaliased entity count should use collection metadata");
+        assert_eq!(unaliased.alias, "count(*)");
+    }
+
+    #[test]
+    fn count_read_rejects_semantics_not_covered_by_collection_metadata() {
+        for sql in [
+            "SELECT COUNT(value) FROM json_pointer",
+            "SELECT COUNT(*) FROM json_pointer WHERE path = '/a'",
+            "SELECT COUNT(DISTINCT path) FROM json_pointer",
+            "SELECT COUNT(*) FROM json_pointer GROUP BY path",
+            "SELECT COUNT(*) FROM json_pointer LIMIT 1",
+        ] {
+            assert!(
+                strict_entity_count_read(&parse(sql), &[]).is_none(),
+                "query must retain DataFusion semantics: {sql}"
+            );
+        }
     }
 
     #[test]

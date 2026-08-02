@@ -26,6 +26,17 @@ use crate::storage_adapter::StorageAdapterRead;
 /// stronger tie order must retain the general SQL path.
 #[async_trait]
 pub(crate) trait EntitySnapshotReader: Send + Sync {
+    /// Returns the exact cardinality of a broad current-state entity scan
+    /// without materializing its snapshots. `None` preserves the normal scan
+    /// when this reader cannot prove that one collection control owns the
+    /// complete visible result.
+    async fn count_entity_snapshots(
+        &self,
+        _request: LiveStateScanRequest,
+    ) -> Result<Option<u64>, LixError> {
+        Ok(None)
+    }
+
     async fn scan_entity_snapshots(
         &self,
         request: LiveStateScanRequest,
@@ -57,6 +68,19 @@ impl<S> EntitySnapshotReader for CurrentEntitySnapshotReader<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    async fn count_entity_snapshots(
+        &self,
+        request: LiveStateScanRequest,
+    ) -> Result<Option<u64>, LixError> {
+        if !direct_entity_snapshot_request(&request) || !request.filter.entity_pks.is_empty() {
+            return Ok(None);
+        }
+        self.live_state
+            .reader(self.store.clone())
+            .count_direct_entity_snapshots(&request)
+            .await
+    }
+
     async fn scan_entity_snapshots(
         &self,
         request: LiveStateScanRequest,
