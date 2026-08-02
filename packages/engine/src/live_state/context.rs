@@ -337,6 +337,32 @@ where
         }))
     }
 
+    /// Returns committed entity identities under the same narrow visibility
+    /// proof as [`Self::scan_direct_entity_snapshots`].  The packed reader
+    /// still resolves the authoritative current rows; callers may avoid JSON
+    /// decoding only when their projected SQL fields are exact key components.
+    pub(crate) async fn scan_direct_entity_primary_keys(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Option<Vec<EntityPk>>, LixError> {
+        let Some((branch_id, control, schema_key)) =
+            self.direct_entity_snapshot_scope(request).await?
+        else {
+            return Ok(None);
+        };
+        self.tracked_head
+            .reader(&self.store)
+            .scan_entity_primary_keys(
+                &branch_id,
+                control,
+                &schema_key,
+                &request.filter.entity_pks,
+                request.limit,
+            )
+            .await
+            .map(Some)
+    }
+
     pub(crate) async fn scan_direct_entity_snapshots_by_string_field(
         &self,
         request: &LiveStateScanRequest,

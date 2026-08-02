@@ -254,11 +254,11 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
             "unknown LIX_TRACKED_STATE_CRUD_PROFILE_OP '{other}'; expected insert_all, read_all, read_one, read_many, update_all, update_one, delete_all, or delete_one"
         ),
     };
-    if sql_session_read_shape() == "aggregate_count" {
+    if sql_session_read_shape() != "full_result" {
         assert_eq!(
             std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_LAYER").as_deref(),
             Ok("sql_session"),
-            "LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE=aggregate_count requires LIX_TRACKED_STATE_CRUD_PROFILE_LAYER=sql_session"
+            "non-default LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE values require LIX_TRACKED_STATE_CRUD_PROFILE_LAYER=sql_session"
         );
     }
     let read_many_pk_count = profile_read_many_pk_count(operation, rows.len());
@@ -534,9 +534,11 @@ fn profile_hot_transaction_operations(
 fn sql_session_read_shape() -> &'static str {
     match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE").as_deref() {
         Ok("aggregate_count") => "aggregate_count",
+        Ok("general_filter_sort") => "general_filter_sort",
+        Ok("general_aggregate") => "general_aggregate",
         Ok("full_result") | Err(_) => "full_result",
         Ok(other) => panic!(
-            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE '{other}'; expected full_result or aggregate_count"
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE '{other}'; expected full_result, aggregate_count, general_filter_sort, or general_aggregate"
         ),
     }
 }
