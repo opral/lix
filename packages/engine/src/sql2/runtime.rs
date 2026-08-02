@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -7,8 +8,9 @@ use datafusion::common::{DataFusionError, internal_err};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::execution_plan::CardinalityEffect;
+use datafusion::physical_plan::execution_plan::{CardinalityEffect, EmissionType};
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -17,6 +19,9 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
+use tokio::sync::OnceCell;
+
+use super::providers::{SpecScanExec, StatementScanKey};
 
 pub(crate) async fn collect_dataframe(dataframe: DataFrame) -> Result<Vec<RecordBatch>> {
     let task_ctx = Arc::new(dataframe.task_ctx());
@@ -41,12 +46,43 @@ pub(crate) async fn collect_input_plan(
     Ok(batches)
 }
 
-fn adapt_runtime_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+pub(crate) fn adapt_runtime_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    // DataFusion expands each CTE reference into an independent physical tree.
+    // Share only provider-certified identical scan leaves: residual expressions
+    // still run independently, so volatile SQL expressions retain their normal
+    // evaluation semantics while storage and Arrow decoding happen once.
+    let mut scan_counts = HashMap::new();
+    collect_statement_scan_counts(&plan, &mut scan_counts);
+    let mut caches = HashMap::new();
+    adapt_runtime_plan_inner(plan, &scan_counts, &mut caches)
+}
+
+fn collect_statement_scan_counts(
+    plan: &Arc<dyn ExecutionPlan>,
+    counts: &mut HashMap<StatementScanKey, usize>,
+) {
+    if let Some(key) = plan
+        .as_any()
+        .downcast_ref::<SpecScanExec>()
+        .and_then(SpecScanExec::statement_cache_key)
+    {
+        *counts.entry(key.clone()).or_default() += 1;
+    }
+    for child in plan.children() {
+        collect_statement_scan_counts(child, counts);
+    }
+}
+
+fn adapt_runtime_plan_inner(
+    plan: Arc<dyn ExecutionPlan>,
+    scan_counts: &HashMap<StatementScanKey, usize>,
+    caches: &mut HashMap<StatementScanKey, Arc<StatementScanCacheState>>,
+) -> Result<Arc<dyn ExecutionPlan>> {
     let mut children_changed = false;
     let mut children = Vec::new();
     for child in plan.children() {
         let original = Arc::clone(child);
-        let adapted = adapt_runtime_plan(Arc::clone(child))?;
+        let adapted = adapt_runtime_plan_inner(Arc::clone(child), scan_counts, caches)?;
         children_changed |= !Arc::ptr_eq(&original, &adapted);
         children.push(adapted);
     }
@@ -56,6 +92,20 @@ fn adapt_runtime_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionP
         plan
     };
 
+    if let Some(key) = plan
+        .as_any()
+        .downcast_ref::<SpecScanExec>()
+        .and_then(SpecScanExec::statement_cache_key)
+        .filter(|key| scan_counts.get(*key).copied().unwrap_or_default() > 1)
+        .cloned()
+    {
+        let state = caches
+            .entry(key)
+            .or_insert_with(|| Arc::new(StatementScanCacheState::new(Arc::clone(&plan))))
+            .clone();
+        return Ok(Arc::new(StatementScanCacheExec::new(state)));
+    }
+
     let Some(coalesce) = plan.as_any().downcast_ref::<CoalescePartitionsExec>() else {
         return Ok(plan);
     };
@@ -63,6 +113,159 @@ fn adapt_runtime_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionP
         Arc::clone(coalesce.input()),
         coalesce.fetch(),
     )))
+}
+
+#[derive(Debug)]
+enum CachedScanPartition {
+    Ready {
+        batches: Vec<RecordBatch>,
+        _reservation: MemoryReservation,
+    },
+    Failed {
+        error: Arc<DataFusionError>,
+    },
+}
+
+#[derive(Debug)]
+struct StatementScanCacheState {
+    // Owned only by the adapted physical plan, so cached batches cannot cross
+    // a statement boundary or outlive that statement's pinned Lix snapshot.
+    input: Arc<dyn ExecutionPlan>,
+    partitions: Vec<Arc<OnceCell<CachedScanPartition>>>,
+}
+
+impl StatementScanCacheState {
+    fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        let partition_count = input.output_partitioning().partition_count();
+        Self {
+            input,
+            partitions: (0..partition_count)
+                .map(|_| Arc::new(OnceCell::new()))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StatementScanCacheExec {
+    state: Arc<StatementScanCacheState>,
+    properties: Arc<PlanProperties>,
+}
+
+impl StatementScanCacheExec {
+    fn new(state: Arc<StatementScanCacheState>) -> Self {
+        Self {
+            properties: Arc::new(
+                state
+                    .input
+                    .properties()
+                    .as_ref()
+                    .clone()
+                    .with_emission_type(EmissionType::Final),
+            ),
+            state,
+        }
+    }
+}
+
+impl DisplayAs for StatementScanCacheExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StatementScanCacheExec")
+    }
+}
+
+impl ExecutionPlan for StatementScanCacheExec {
+    fn name(&self) -> &'static str {
+        "StatementScanCacheExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.state.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Plan(format!(
+                "StatementScanCacheExec expects one child, got {}",
+                children.len()
+            )));
+        }
+        Ok(Arc::new(Self::new(Arc::new(StatementScanCacheState::new(
+            children.swap_remove(0),
+        )))))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let cell = self
+            .state
+            .partitions
+            .get(partition)
+            .cloned()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "StatementScanCacheExec exposes {} partitions, got {partition}",
+                    self.state.partitions.len()
+                ))
+            })?;
+        let input = Arc::clone(&self.state.input);
+        let schema = self.schema();
+        let cached = stream::once(async move {
+            let partition = cell
+                .get_or_init(|| async {
+                    let loaded = async {
+                        let reservation = MemoryConsumer::new("StatementScanCacheExec")
+                            .register(context.memory_pool());
+                        let mut input = input.execute(partition, Arc::clone(&context))?;
+                        let mut batches = Vec::new();
+                        while let Some(batch) = input.try_next().await? {
+                            reservation.try_grow(batch.get_array_memory_size())?;
+                            batches.push(batch);
+                        }
+                        Ok::<_, DataFusionError>((batches, reservation))
+                    }
+                    .await;
+                    match loaded {
+                        Ok((batches, reservation)) => CachedScanPartition::Ready {
+                            batches,
+                            _reservation: reservation,
+                        },
+                        Err(error) => CachedScanPartition::Failed {
+                            error: Arc::new(error),
+                        },
+                    }
+                })
+                .await;
+            match partition {
+                CachedScanPartition::Ready { batches, .. } => {
+                    Ok(stream::iter(batches.clone().into_iter().map(Ok)))
+                }
+                CachedScanPartition::Failed { error } => {
+                    Err(DataFusionError::Shared(Arc::clone(error)))
+                }
+            }
+        })
+        .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, cached)))
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        self.state.input.partition_statistics(partition)
+    }
 }
 
 /// Runtime-neutral partition coalescing.

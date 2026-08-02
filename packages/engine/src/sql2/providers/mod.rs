@@ -27,6 +27,7 @@ mod filesystem_working_change;
 mod history_table_function;
 mod history_util;
 mod spec;
+pub(crate) use spec::{SpecScanExec, StatementScanKey};
 mod upsert;
 mod values;
 mod working_change;
