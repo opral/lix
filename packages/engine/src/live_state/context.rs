@@ -1605,7 +1605,10 @@ async fn load_branch_head_control_ids(
 mod tests {
     use super::*;
     use crate::NullableKeyFilter;
-    use crate::changelog::{ChangeId, ChangeRecord, ChangelogAppend, CommitId};
+    use crate::changelog::{
+        ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader, CommitId,
+        CommitLoadRequest,
+    };
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
     use crate::live_state::{
@@ -2684,6 +2687,7 @@ mod tests {
             append.commits.push(crate::changelog::CommitRecord {
                 format_version: 1,
                 commit_id: CommitId::for_test_label(&commit_id_text),
+                generation: 0,
                 parent_commit_ids: Vec::new(),
                 tracked_state_rootless: false,
                 change_id: ChangeId::for_test_label(&commit_change_id),
@@ -2692,8 +2696,7 @@ mod tests {
             });
         }
         let mut changelog_read = read;
-        let mut writer =
-            crate::changelog::ChangelogContext::new().writer(&mut changelog_read, &mut writes);
+        let mut writer = ChangelogContext::new().writer(&mut changelog_read, &mut writes);
         crate::changelog::ChangelogWriter::stage_append(&mut writer, append)
             .await
             .expect("empty changelog commits should stage");
@@ -2760,6 +2763,7 @@ mod tests {
             }
         }
 
+        let mut generations = std::collections::BTreeMap::<String, u64>::new();
         for (commit_id, rows) in tracked_rows_by_commit {
             let parent_commit_id = parent_by_commit.remove(&commit_id).flatten();
             let parent_ids = parent_commit_id
@@ -2771,10 +2775,38 @@ mod tests {
                 .map(|(change, _, _)| change.created_at)
                 .unwrap_or_else(|| ts("1970-01-01T00:00:00.000Z"));
             let commit_change_id = format!("{commit_id}:commit");
+            let generation = if let Some(parent) = parent_ids.first() {
+                let parent_generation = if let Some(generation) = generations.get(parent) {
+                    *generation
+                } else {
+                    let typed_parent = CommitId::for_test_label(parent);
+                    let mut changelog_read = store;
+                    ChangelogContext::new()
+                        .reader(&mut changelog_read)
+                        .load_commits(CommitLoadRequest {
+                            commit_ids: &[typed_parent],
+                        })
+                        .await?
+                        .entries
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .ok_or_else(|| {
+                            LixError::unknown("test changelog parent commit is missing")
+                        })?
+                        .generation
+                };
+                parent_generation
+                    .checked_add(1)
+                    .ok_or_else(|| LixError::unknown("test commit generation exceeds u64"))?
+            } else {
+                0
+            };
             let mut append = ChangelogAppend::default();
             append.commits.push(crate::changelog::CommitRecord {
                 format_version: 1,
                 commit_id: CommitId::for_test_label(&commit_id),
+                generation,
                 parent_commit_ids: parent_ids
                     .iter()
                     .map(|id| CommitId::for_test_label(id))
@@ -2785,10 +2817,10 @@ mod tests {
                 created_at: commit_created_at,
             });
             let mut changelog_read = store;
-            let mut writer =
-                crate::changelog::ChangelogContext::new().writer(&mut changelog_read, writes);
+            let mut writer = ChangelogContext::new().writer(&mut changelog_read, writes);
             crate::changelog::ChangelogWriter::stage_append(&mut writer, append).await?;
             drop(writer);
+            generations.insert(commit_id.clone(), generation);
             let typed_commit_id = CommitId::for_test_label(&commit_id);
             let root_deltas = rows
                 .iter()

@@ -314,6 +314,9 @@ pub(crate) struct ChangelogAppend {
 pub(crate) struct CommitRecord {
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
+    /// Longest-path distance from a graph root. Every parent has a strictly
+    /// smaller generation, enabling bounded priority graph walks.
+    pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
     /// Normal serial tracked commits carry all required state in the
     /// changelog/delta index and intentionally omit an immutable root. Root

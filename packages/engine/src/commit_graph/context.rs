@@ -392,6 +392,7 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
 fn commit_graph_commit_record_from_commit_record(record: CommitRecord) -> CommitGraphCommitRecord {
     CommitGraphCommitRecord {
         commit_id: record.commit_id,
+        generation: record.generation,
         parent_commit_ids: record.parent_commit_ids,
         created_at: record.created_at,
     }
@@ -467,6 +468,7 @@ fn commit_graph_commit_from_commit_record(
         canonical_change: change.clone(),
         change,
         commit_id: record.commit_id,
+        generation: record.generation,
         change_ids,
         author_account_ids: record.author_account_ids,
         parent_commit_ids: record.parent_commit_ids,
@@ -1041,6 +1043,7 @@ mod tests {
         let mut writer = changelog.writer(&mut read, &mut writes);
         let mut append = ChangelogAppend::default();
         let mut commit_members = Vec::<(CommitId, Vec<ChangeRecord>)>::new();
+        let mut generations = BTreeMap::<CommitId, u64>::new();
         for change in changes.iter().filter(|change| change.is_commit()) {
             let commit_label = change
                 .change
@@ -1052,6 +1055,7 @@ mod tests {
                 canonical_change: change.change.clone(),
                 change: change.change.clone(),
                 commit_id: CommitId::for_test_label(&commit_label),
+                generation: 0,
                 change_ids: change.commit_change_ids.clone(),
                 author_account_ids: change.author_account_ids.clone(),
                 parent_commit_ids: change.parent_commit_ids.clone(),
@@ -1061,8 +1065,17 @@ mod tests {
                     && staged_commit_ids.insert(*parent_commit_id)
                 {
                     append_empty_commit(&mut append, *parent_commit_id);
+                    generations.insert(*parent_commit_id, 0);
                 }
             }
+            let generation = commit
+                .parent_commit_ids
+                .iter()
+                .filter_map(|parent| generations.get(parent).copied())
+                .max()
+                .map_or(0, |parent_generation| parent_generation + 1);
+            let mut commit = commit;
+            commit.generation = generation;
             let mut members = Vec::new();
             for change_id in &commit.change_ids {
                 if let Some(change) = changes_by_id.get(change_id) {
@@ -1073,6 +1086,7 @@ mod tests {
             append.commits.push(CommitRecord {
                 format_version: 1,
                 commit_id: commit.commit_id,
+                generation: commit.generation,
                 parent_commit_ids: commit.parent_commit_ids.clone(),
                 tracked_state_rootless: false,
                 change_id: commit.canonical_change.id,
@@ -1081,6 +1095,7 @@ mod tests {
             });
             commit_members.push((commit.commit_id, members));
             staged_commit_ids.insert(commit.commit_id);
+            generations.insert(commit.commit_id, generation);
         }
         writer
             .stage_append(append)
@@ -1121,6 +1136,7 @@ mod tests {
         append.commits.push(CommitRecord {
             format_version: 1,
             commit_id,
+            generation: 0,
             parent_commit_ids: Vec::new(),
             tracked_state_rootless: false,
             change_id: ChangeId::for_test_label(&change_id),
@@ -1170,6 +1186,7 @@ mod tests {
             canonical_change: change.clone(),
             change,
             commit_id,
+            generation: 0,
             change_ids: change_ids
                 .iter()
                 .map(|change_id| ChangeId::for_test_label(change_id))

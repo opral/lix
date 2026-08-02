@@ -1,6 +1,7 @@
 use crate::changelog::CommitId;
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitRecord,
+    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader, ChangelogWriter,
+    CommitLoadRequest, CommitRecord,
 };
 use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 #[cfg(test)]
@@ -544,6 +545,28 @@ async fn stage_test_changelog_commit(
         .map(|parent| test_commit_id(parent))
         .collect::<Vec<_>>();
     let typed_commit_change_id = test_change_id(commit_change_id);
+    let parent_records = ChangelogContext::new()
+        .reader(&mut *read)
+        .load_commits(CommitLoadRequest {
+            commit_ids: &typed_parent_ids,
+        })
+        .await?;
+    let generation = parent_records
+        .entries
+        .into_iter()
+        .map(|record| {
+            record
+                .map(|record| record.generation)
+                .ok_or_else(|| crate::LixError::unknown("test changelog parent commit is missing"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .map_or(Ok(0), |generation| {
+            generation
+                .checked_add(1)
+                .ok_or_else(|| crate::LixError::unknown("test commit generation exceeds u64"))
+        })?;
     let winner_indices = final_state_row_winner_indices(rows)?;
     let mut append = ChangelogAppend::default();
     let mut change_commit_ids = Vec::new();
@@ -566,6 +589,7 @@ async fn stage_test_changelog_commit(
     append.commits.push(CommitRecord {
         format_version: 1,
         commit_id: typed_commit_id,
+        generation,
         parent_commit_ids: typed_parent_ids,
         tracked_state_rootless,
         change_id: typed_commit_change_id,

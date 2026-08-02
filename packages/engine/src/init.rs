@@ -46,7 +46,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"lxcd9-root-backed-branches.v42";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"lxcd9-generation-indexed-commits.v43";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -545,6 +545,7 @@ async fn stage_init_changelog_commit(
     let commit = CommitRecord {
         format_version: 1,
         commit_id: plan.commit.id,
+        generation: 0,
         parent_commit_ids: plan.commit.parent_ids.clone(),
         tracked_state_rootless: false,
         change_id: plan.commit.change_id,

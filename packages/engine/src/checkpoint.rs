@@ -82,6 +82,7 @@ where
                 record.commit_id,
                 CommitGraphCommitRecord {
                     commit_id: record.commit_id,
+                    generation: record.generation,
                     parent_commit_ids: record.parent_commit_ids,
                     created_at: record.created_at,
                 },
@@ -426,10 +427,11 @@ mod tests {
         LixTimestamp::expect_parse("checkpoint scan timestamp", "2026-07-24T00:00:00Z")
     }
 
-    fn commit_record(id: CommitId, parent: Option<CommitId>) -> CommitRecord {
+    fn commit_record(id: CommitId, generation: u64, parent: Option<CommitId>) -> CommitRecord {
         CommitRecord {
             format_version: 1,
             commit_id: id,
+            generation,
             parent_commit_ids: parent.into_iter().collect(),
             tracked_state_rootless: false,
             change_id: ChangeId::for_test_label(&format!("{id}-change")),
@@ -454,7 +456,9 @@ mod tests {
         // the map-backed depth calculation too.
         for index in 0..1_025 {
             let commit_id = CommitId::for_test_label(&format!("checkpoint-{index}"));
-            append.commits.push(commit_record(commit_id, parent));
+            append
+                .commits
+                .push(commit_record(commit_id, index as u64, parent));
             parent = Some(commit_id);
         }
         let latest_checkpoint = parent.expect("fixture should create checkpoints");
@@ -462,10 +466,10 @@ mod tests {
         let second_auto = CommitId::for_test_label("checkpoint-auto-2");
         append
             .commits
-            .push(commit_record(first_auto, Some(latest_checkpoint)));
+            .push(commit_record(first_auto, 1_025, Some(latest_checkpoint)));
         append
             .commits
-            .push(commit_record(second_auto, Some(first_auto)));
+            .push(commit_record(second_auto, 1_026, Some(first_auto)));
 
         ChangelogContext::new()
             .writer(&mut read, &mut writes)
