@@ -38,6 +38,7 @@ use crate::sql2::entity_projection::{
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
+use crate::sql2::write_normalization::{SqlCell, UpdateAssignmentValues, UpdateCell};
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
 
 use crate::sql2::{
@@ -55,9 +56,9 @@ use datafusion::physical_plan::{ExecutionPlan, Statistics};
 use futures_util::stream;
 
 use super::spec::{
-    InsertApply, PlannedDml, PlannedScan, TableSpec,
+    DmlReturning, InsertApply, PlannedDml, PlannedScan, TableSpec,
     batch_stream_source_with_statistics_and_source, projected_schema, register_spec_table,
-    row_source, scan_row_source,
+    row_source, scan_row_source, take_record_batch_rows,
 };
 use super::values::{
     optional_bool_value, optional_string_value, required_string_value, string_expr_literal,
@@ -202,6 +203,7 @@ fn catalog_entity_spec(
 /// One spec type covers every registered entity schema: the runtime
 /// [`EntitySurfaceSpec`] carries the per-schema column layout, and the
 /// surface name follows the catalog naming for the base/by-branch shapes.
+#[derive(Clone)]
 struct EntitySpec {
     surface_name: String,
     spec: Arc<EntitySurfaceSpec>,
@@ -306,6 +308,201 @@ impl EntitySpec {
         apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
         Ok((projected_schema, request, row_filters))
     }
+
+    fn returning_key_from_batch(
+        &self,
+        batch: &RecordBatch,
+        row_index: usize,
+    ) -> Result<EntityReturningKey> {
+        let entity_pk = EntityPk::from_json_array_text(&required_string_value(
+            batch,
+            row_index,
+            "lixcol_entity_pk",
+            "UPDATE entity surface RETURNING",
+        )?)
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "UPDATE entity surface RETURNING has invalid lixcol_entity_pk: {error}"
+            ))
+        })?;
+        let branch_id = match self.branch_binding {
+            BranchBinding::Active { .. } => String::new(),
+            BranchBinding::Explicit => required_string_value(
+                batch,
+                row_index,
+                "lixcol_branch_id",
+                "UPDATE entity surface RETURNING",
+            )?,
+        };
+        Ok(EntityReturningKey {
+            entity_pk,
+            branch_id,
+        })
+    }
+
+    async fn returning_post_image(
+        &self,
+        write_ctx: &SqlWriteContext,
+        keys: &[EntityReturningKey],
+    ) -> Result<RecordBatch> {
+        if keys.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
+        }
+        let mut request = entity_live_state_scan_request(
+            &self.spec.schema_key,
+            self.branch_binding.active_branch_id(),
+            Some(self.schema.as_ref()),
+            None,
+            false,
+        );
+        request.filter.entity_pks = keys
+            .iter()
+            .map(|key| key.entity_pk.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if matches!(self.branch_binding, BranchBinding::Explicit) {
+            request.filter.branch_ids = keys
+                .iter()
+                .map(|key| key.branch_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+        let rows = WriteContextLiveStateReader::new(write_ctx.clone())
+            .scan_batch(&request)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        let batch = entity_record_batch_with_parsed(
+            &self.spec,
+            Arc::clone(&self.schema),
+            &rows,
+            EntityBatchProjection::for_request(&request),
+            None,
+        )?;
+        let mut post_rows = BTreeMap::new();
+        for row_index in 0..batch.num_rows() {
+            let key = self.returning_key_from_batch(&batch, row_index)?;
+            let index = u32::try_from(row_index).map_err(|_| {
+                DataFusionError::Execution("entity UPDATE RETURNING row index overflow".into())
+            })?;
+            if post_rows.insert(key.clone(), index).is_some() {
+                return Err(DataFusionError::Execution(format!(
+                    "entity UPDATE RETURNING post-image contains duplicate row for identity {:?}",
+                    key.entity_pk
+                )));
+            }
+        }
+        let indices = keys
+            .iter()
+            .map(|key| {
+                post_rows.get(key).copied().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "entity UPDATE RETURNING post-image is missing updated row {:?}",
+                        key.entity_pk
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        take_record_batch_rows(&batch, &indices)
+    }
+
+    async fn plan_update_with_post_image(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        returning: Option<DmlReturning>,
+    ) -> Result<PlannedDml> {
+        reject_read_only_entity_surface(&self.spec.schema_key, "UPDATE")?;
+        let (schema, request, row_filters) = self.plan_scan_parts(None, filters, None).await?;
+        let batch_projection = EntityBatchProjection::for_request(&request);
+        let source = row_source(
+            (
+                Arc::clone(&self.spec),
+                Arc::clone(&self.live_state),
+                schema,
+                request,
+                row_filters,
+                batch_projection,
+            ),
+            |(spec, live_state, schema, request, row_filters, batch_projection)| async move {
+                let rows = live_state
+                    .scan_batch(&request)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+                let filtered = apply_entity_batch_filters(rows, &row_filters)?;
+                entity_record_batch_with_parsed(
+                    &spec,
+                    schema,
+                    &filtered.rows,
+                    batch_projection,
+                    filtered.parsed_snapshots.as_deref(),
+                )
+            },
+        );
+        let spec = Arc::clone(&self.spec);
+        let branch_binding = self.branch_binding.clone();
+        let returning_spec = self.clone();
+        Ok(PlannedDml {
+            source,
+            apply: Arc::new(move |matched_batch| {
+                let write_ctx = write_ctx.clone();
+                let spec = Arc::clone(&spec);
+                let branch_binding = branch_binding.clone();
+                let assignments = assignments.clone();
+                let returning = returning.clone();
+                let returning_spec = returning_spec.clone();
+                async move {
+                    let keys = returning
+                        .as_ref()
+                        .map(|_| {
+                            (0..matched_batch.num_rows())
+                                .map(|row_index| {
+                                    returning_spec
+                                        .returning_key_from_batch(&matched_batch, row_index)
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .transpose()?;
+                    let assignment_values =
+                        UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
+                    let rows = entity_update_stage_rows_from_batch(
+                        &matched_batch,
+                        &assignment_values,
+                        spec.as_ref(),
+                        &branch_binding,
+                    )?;
+                    let count = u64::try_from(rows.len()).map_err(|_| {
+                        DataFusionError::Execution("UPDATE row count overflow".to_string())
+                    })?;
+                    if count > 0 {
+                        write_ctx
+                            .stage_write(TransactionWrite::Rows {
+                                mode: TransactionWriteMode::Replace,
+                                rows,
+                            })
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                    }
+                    if let (Some(returning), Some(keys)) = (returning, keys) {
+                        let post_image = returning_spec
+                            .returning_post_image(&write_ctx, &keys)
+                            .await?;
+                        returning.capture(returning.project(&post_image)?);
+                    }
+                    Ok(count)
+                }
+                .boxed()
+            }),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct EntityReturningKey {
+    entity_pk: EntityPk,
+    branch_id: String,
 }
 
 #[async_trait]
@@ -533,11 +730,23 @@ impl TableSpec for EntitySpec {
 
     async fn plan_update(
         &self,
-        _write_ctx: SqlWriteContext,
-        _assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
-        _filters: &[Expr],
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
     ) -> Result<PlannedDml> {
-        not_impl_err!("raw DataFusion UPDATE is disabled; use the sql2 bound write pipeline")
+        self.plan_update_with_post_image(write_ctx, assignments, filters, None)
+            .await
+    }
+
+    async fn plan_update_with_returning(
+        &self,
+        write_ctx: SqlWriteContext,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: &[Expr],
+        returning: DmlReturning,
+    ) -> Result<PlannedDml> {
+        self.plan_update_with_post_image(write_ctx, assignments, filters, Some(returning))
+            .await
     }
 }
 
@@ -1172,6 +1381,214 @@ fn entity_delete_stage_rows_from_batch(
         );
     }
     Ok(rows)
+}
+
+fn entity_update_stage_rows_from_batch(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    spec: &EntitySurfaceSpec,
+    branch_binding: &BranchBinding,
+) -> Result<RawWriteBatch> {
+    let mut rows = RawWriteBatch::with_capacity(batch.num_rows());
+    for row_index in 0..batch.num_rows() {
+        let global =
+            optional_bool_value(batch, row_index, "lixcol_global", "UPDATE entity surface")?
+                .unwrap_or(false);
+        let source_branch_id = optional_string_value(
+            batch,
+            row_index,
+            "lixcol_branch_id",
+            "UPDATE entity surface",
+        )?;
+        if matches!(branch_binding, BranchBinding::Explicit)
+            && global
+            && source_branch_id.as_deref() != Some(GLOBAL_BRANCH_ID)
+        {
+            return Err(DataFusionError::Execution(
+                "UPDATE through an entity by-branch surface cannot mutate a projected global row"
+                    .to_string(),
+            ));
+        }
+        let branch_id = if global {
+            GLOBAL_BRANCH_ID.to_string()
+        } else {
+            source_branch_id
+                .or_else(|| branch_binding.active_branch_id().map(ToOwned::to_owned))
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "UPDATE entity by-branch requires lixcol_branch_id".to_string(),
+                    )
+                })?
+        };
+        let entity_pk = EntityPk::from_json_array_text(&required_string_value(
+            batch,
+            row_index,
+            "lixcol_entity_pk",
+            "UPDATE entity surface",
+        )?)
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "UPDATE entity surface has invalid lixcol_entity_pk: {error}"
+            ))
+        })?;
+        let mut snapshot = parse_snapshot_value(&required_string_value(
+            batch,
+            row_index,
+            "lixcol_snapshot_content",
+            "UPDATE entity surface",
+        )?)
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "UPDATE entity surface has invalid lixcol_snapshot_content: {error}"
+            ))
+        })?;
+        let object = snapshot.as_object_mut().ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "UPDATE entity surface expected object snapshot for schema '{}'",
+                spec.schema_key
+            ))
+        })?;
+        for column in &spec.columns {
+            let UpdateCell::Assigned(cell) =
+                assignment_values.assigned_cell(row_index, &column.name)?
+            else {
+                continue;
+            };
+            object.insert(
+                column.name.clone(),
+                entity_update_json_value(cell, column.column_type, spec, &column.name)?,
+            );
+        }
+        let metadata = match assignment_values.assigned_cell(row_index, "lixcol_metadata")? {
+            UpdateCell::Unassigned => {
+                optional_string_value(batch, row_index, "lixcol_metadata", "UPDATE entity surface")?
+                    .map(|value| entity_update_metadata(&value, spec))
+                    .transpose()?
+            }
+            UpdateCell::Assigned(SqlCell::Null) => None,
+            UpdateCell::Assigned(SqlCell::Value(value)) => {
+                let raw = scalar_utf8(value, "lixcol_metadata", spec)?;
+                Some(entity_update_metadata(&raw, spec)?)
+            }
+        };
+        let file_id =
+            optional_string_value(batch, row_index, "lixcol_file_id", "UPDATE entity surface")?
+                .map(Into::into);
+        let untracked = optional_bool_value(
+            batch,
+            row_index,
+            "lixcol_untracked",
+            "UPDATE entity surface",
+        )?
+        .unwrap_or(false);
+        rows.push_parts(
+            Some(entity_pk),
+            spec.schema_key.as_str().into(),
+            file_id,
+            Some(
+                TransactionJson::from_value(
+                    snapshot,
+                    &format!("{} update snapshot_content", spec.schema_key),
+                )
+                .map_err(lix_error_to_datafusion_error)?,
+            ),
+            metadata,
+            None,
+            None,
+            None,
+            global,
+            None,
+            None,
+            untracked,
+            branch_id.into(),
+        );
+    }
+    Ok(rows)
+}
+
+fn entity_update_json_value(
+    cell: SqlCell,
+    column_type: EntityColumnType,
+    spec: &EntitySurfaceSpec,
+    column_name: &str,
+) -> Result<JsonValue> {
+    let SqlCell::Value(value) = cell else {
+        return Ok(JsonValue::Null);
+    };
+    match column_type {
+        EntityColumnType::String => scalar_utf8(value, column_name, spec).map(JsonValue::String),
+        EntityColumnType::Json => {
+            let raw = scalar_utf8(value, column_name, spec)?;
+            serde_json::from_str(&raw).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "UPDATE {} column '{column_name}' produced invalid JSON: {error}",
+                    spec.schema_key
+                ))
+            })
+        }
+        EntityColumnType::Integer => match value {
+            ScalarValue::Int64(Some(value)) => Ok(JsonValue::from(value)),
+            other => Err(entity_update_type_error(
+                spec,
+                column_name,
+                "BIGINT",
+                &other,
+            )),
+        },
+        EntityColumnType::Number => match value {
+            ScalarValue::Float64(Some(value)) => serde_json::Number::from_f64(value)
+                .map(JsonValue::Number)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "UPDATE {} column '{column_name}' produced non-finite DOUBLE PRECISION",
+                        spec.schema_key
+                    ))
+                }),
+            other => Err(entity_update_type_error(
+                spec,
+                column_name,
+                "DOUBLE PRECISION",
+                &other,
+            )),
+        },
+        EntityColumnType::Boolean => match value {
+            ScalarValue::Boolean(Some(value)) => Ok(JsonValue::Bool(value)),
+            other => Err(entity_update_type_error(
+                spec,
+                column_name,
+                "BOOLEAN",
+                &other,
+            )),
+        },
+    }
+}
+
+fn scalar_utf8(value: ScalarValue, column_name: &str, spec: &EntitySurfaceSpec) -> Result<String> {
+    match value {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Ok(value),
+        other => Err(entity_update_type_error(spec, column_name, "TEXT", &other)),
+    }
+}
+
+fn entity_update_type_error(
+    spec: &EntitySurfaceSpec,
+    column_name: &str,
+    expected: &str,
+    actual: &ScalarValue,
+) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "UPDATE {} column '{column_name}' expected {expected}, got {actual:?}",
+        spec.schema_key
+    ))
+}
+
+fn entity_update_metadata(raw: &str, spec: &EntitySurfaceSpec) -> Result<TransactionJson> {
+    let metadata =
+        parse_row_metadata_value(raw, &spec.schema_key).map_err(lix_error_to_datafusion_error)?;
+    TransactionJson::from_value(metadata, &format!("{} metadata", spec.schema_key))
+        .map_err(lix_error_to_datafusion_error)
 }
 
 pub(super) fn entity_pks_from_primary_key_filters(

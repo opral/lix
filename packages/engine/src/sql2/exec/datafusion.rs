@@ -30,7 +30,7 @@ use std::ops::ControlFlow;
 
 use crate::branch::BranchHead;
 use crate::functions::FunctionContext;
-use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
+use crate::sql2::bind::expr::{BoundBinaryOperator, BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{BoundInsertValues, BoundReturning, FileWriteSurface};
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
@@ -1512,6 +1512,10 @@ fn bound_expr_column_names(expr: &BoundExpr, columns: &mut BTreeSet<String>) {
                 bound_expr_column_names(arg, columns);
             }
         }
+        BoundExpr::Binary { left, right, .. } => {
+            bound_expr_column_names(left, columns);
+            bound_expr_column_names(right, columns);
+        }
     }
 }
 
@@ -1899,6 +1903,17 @@ fn datafusion_expr_from_bound_expr(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expr::ScalarFunction(ScalarFunction::new_udf(udf, args)))
         }
+        BoundExpr::Binary { left, op, right } => Ok(Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(datafusion_expr_from_bound_expr(session, left, params)?),
+            match op {
+                BoundBinaryOperator::Add => Operator::Plus,
+                BoundBinaryOperator::Subtract => Operator::Minus,
+                BoundBinaryOperator::Multiply => Operator::Multiply,
+                BoundBinaryOperator::Divide => Operator::Divide,
+                BoundBinaryOperator::Modulo => Operator::Modulo,
+            },
+            Box::new(datafusion_expr_from_bound_expr(session, right, params)?),
+        ))),
     }
 }
 
@@ -1960,10 +1975,16 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
     match &plan.bound.target {
         BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::Base {
             schema_key,
-        }) if bound_predicate_contains_like(&plan.bound.predicate) => Ok(schema_key.clone()),
+        }) if bound_predicate_contains_like(&plan.bound.predicate)
+            || bound_update_contains_binary(plan) =>
+        {
+            Ok(schema_key.clone())
+        }
         BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::ByBranch {
             schema_key,
-        }) if bound_predicate_contains_like(&plan.bound.predicate) => {
+        }) if bound_predicate_contains_like(&plan.bound.predicate)
+            || bound_update_contains_binary(plan) =>
+        {
             Ok(format!("{schema_key}_by_branch"))
         }
         BoundWriteTarget::File(FileWriteSurface::Base) => Ok("lix_file".to_string()),
@@ -1986,6 +2007,55 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
             LixError::CODE_UNSUPPORTED_SQL,
             "sql2 DataFusion reference writer does not support this entity write",
         )),
+    }
+}
+
+fn bound_update_contains_binary(plan: &LogicalWritePlan) -> bool {
+    matches!(plan.bound.op, BoundWriteOp::Update)
+        && (plan
+            .bound
+            .assignments
+            .iter()
+            .any(|assignment| bound_expr_contains_binary(&assignment.value))
+            || bound_predicate_contains_binary(&plan.bound.predicate)
+            || plan.bound.returning.as_ref().is_some_and(|returning| {
+                returning
+                    .items
+                    .iter()
+                    .any(|item| bound_expr_contains_binary(&item.expr))
+            }))
+}
+
+fn bound_expr_contains_binary(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Binary { .. } => true,
+        BoundExpr::Cast { expr, .. } => bound_expr_contains_binary(expr),
+        BoundExpr::Function { args, .. } => args.iter().any(bound_expr_contains_binary),
+        BoundExpr::Column(_)
+        | BoundExpr::ExcludedColumn(_)
+        | BoundExpr::Param(_)
+        | BoundExpr::Literal(_) => false,
+    }
+}
+
+fn bound_predicate_contains_binary(predicate: &BoundPredicate) -> bool {
+    match predicate {
+        BoundPredicate::Eq(left, right) => {
+            bound_expr_contains_binary(left) || bound_expr_contains_binary(right)
+        }
+        BoundPredicate::Like { expr, pattern, .. } => {
+            bound_expr_contains_binary(expr) || bound_expr_contains_binary(pattern)
+        }
+        BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
+            bound_expr_contains_binary(expr)
+        }
+        BoundPredicate::In { expr, values, .. } => {
+            bound_expr_contains_binary(expr) || values.iter().any(bound_expr_contains_binary)
+        }
+        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {
+            predicates.iter().any(bound_predicate_contains_binary)
+        }
+        BoundPredicate::True | BoundPredicate::False => false,
     }
 }
 

@@ -2182,6 +2182,10 @@ fn bound_expr_references_active_branch_commit_id(expr: &BoundExpr) -> bool {
                     .any(bound_expr_references_active_branch_commit_id)
         }
         BoundExpr::Cast { expr, .. } => bound_expr_references_active_branch_commit_id(expr),
+        BoundExpr::Binary { left, right, .. } => {
+            bound_expr_references_active_branch_commit_id(left)
+                || bound_expr_references_active_branch_commit_id(right)
+        }
         BoundExpr::Column(_)
         | BoundExpr::ExcludedColumn(_)
         | BoundExpr::Param(_)
@@ -5539,6 +5543,10 @@ fn eval_expr_value(
             LixError::CODE_UNSUPPORTED_SQL,
             format!("bound entity write does not support function '{name}' yet"),
         )),
+        BoundExpr::Binary { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound entity write evaluates binary expressions through DataFusion",
+        )),
     }
 }
 
@@ -5850,6 +5858,10 @@ fn returning_expr_requires_staged_postimage(expr: &BoundExpr) -> bool {
         BoundExpr::Function { args, .. } => {
             args.iter().any(returning_expr_requires_staged_postimage)
         }
+        BoundExpr::Binary { left, right, .. } => {
+            returning_expr_requires_staged_postimage(left)
+                || returning_expr_requires_staged_postimage(right)
+        }
         BoundExpr::Column(_)
         | BoundExpr::ExcludedColumn(_)
         | BoundExpr::Param(_)
@@ -6040,6 +6052,10 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         | BoundExpr::Param(_)
         | BoundExpr::Literal(_) => Ok(()),
         BoundExpr::Cast { expr, .. } => validate_expr_supported(expr),
+        BoundExpr::Binary { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound entity write evaluates binary expressions through DataFusion",
+        )),
         BoundExpr::Function { name, args } => {
             match name.as_str() {
                 "lix_json" if args.len() == 1 => {}

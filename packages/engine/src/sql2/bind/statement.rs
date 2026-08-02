@@ -17,7 +17,9 @@ use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKi
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
 
-use super::expr::{BoundExpr, BoundLiteral, BoundParamRef, bind_public_cast_type};
+use super::expr::{
+    BoundBinaryOperator, BoundExpr, BoundLiteral, BoundParamRef, bind_public_cast_type,
+};
 use super::read::BoundRead;
 use super::table::{
     BoundTable, bind_public_column_ref, bind_public_table, require_writable_column,
@@ -938,6 +940,11 @@ fn bind_expr(
             expr,
         } => bind_negative_number_expr(expr),
         Expr::Function(function) => bind_function_expr(table, function, params),
+        Expr::BinaryOp { left, op, right } => Ok(BoundExpr::Binary {
+            left: Box::new(bind_expr(table, left, params)?),
+            op: bind_arithmetic_operator(op)?,
+            right: Box::new(bind_expr(table, right, params)?),
+        }),
         _ => Err(super::error::unsupported(format!(
             "unsupported SQL expression '{expr}'"
         ))),
@@ -980,7 +987,25 @@ fn bind_conflict_expr(
         Expr::Function(function) => bind_function(function, params, |expr, params| {
             bind_conflict_expr(table, expr, params)
         }),
+        Expr::BinaryOp { left, op, right } => Ok(BoundExpr::Binary {
+            left: Box::new(bind_conflict_expr(table, left, params)?),
+            op: bind_arithmetic_operator(op)?,
+            right: Box::new(bind_conflict_expr(table, right, params)?),
+        }),
         _ => bind_expr(table, expr, params),
+    }
+}
+
+fn bind_arithmetic_operator(op: &BinaryOperator) -> Result<BoundBinaryOperator, LixError> {
+    match op {
+        BinaryOperator::Plus => Ok(BoundBinaryOperator::Add),
+        BinaryOperator::Minus => Ok(BoundBinaryOperator::Subtract),
+        BinaryOperator::Multiply => Ok(BoundBinaryOperator::Multiply),
+        BinaryOperator::Divide => Ok(BoundBinaryOperator::Divide),
+        BinaryOperator::Modulo => Ok(BoundBinaryOperator::Modulo),
+        _ => Err(super::error::unsupported(format!(
+            "unsupported SQL binary operator '{op}'"
+        ))),
     }
 }
 

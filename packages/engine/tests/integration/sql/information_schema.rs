@@ -1620,3 +1620,172 @@ simulation_test!(
         assert_rows_eq(deleted, vec![vec![Value::Integer(2), Value::Real(1.0)]]);
     }
 );
+
+simulation_test!(
+    typed_update_evaluates_arithmetic_assignments_and_predicates,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) \
+                 VALUES (lix_json('{\"x-lix-key\":\"engine_arithmetic_update\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"quantity\":{\"type\":[\"integer\",\"null\"]},\"order_key\":{\"type\":\"integer\"},\"line_number\":{\"type\":[\"integer\",\"null\"]}},\"required\":[\"id\",\"quantity\",\"order_key\",\"line_number\"],\"additionalProperties\":false}'))",
+                &[],
+            )
+            .await
+            .expect("arithmetic update schema should register");
+        session
+            .execute(
+                "INSERT INTO engine_arithmetic_update \
+                 (id, quantity, order_key, line_number) VALUES \
+                 ('a', 10, 1, 13), ('b', 20, 2, 6), ('c', 30, 3, 1), \
+                 ('d', NULL, 4, 12)",
+                &[],
+            )
+            .await
+            .expect("arithmetic update rows should insert");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("arithmetic update transaction should begin");
+        let updated = transaction
+            .execute(
+                "UPDATE engine_arithmetic_update \
+                 SET quantity = quantity + 1, line_number = quantity \
+                 WHERE (order_key * 7 + line_number) % 20 = 0 \
+                 RETURNING id, quantity, line_number",
+                &[],
+            )
+            .await
+            .expect("arithmetic assignment and modulo predicate should execute");
+        assert_eq!(updated.rows_affected(), 3);
+        assert_rows_eq(
+            updated,
+            vec![
+                vec![
+                    Value::Text("a".to_string()),
+                    Value::Integer(11),
+                    Value::Integer(10),
+                ],
+                vec![
+                    Value::Text("b".to_string()),
+                    Value::Integer(21),
+                    Value::Integer(20),
+                ],
+                vec![Value::Text("d".to_string()), Value::Null, Value::Null],
+            ],
+        );
+        let overlay_updated = transaction
+            .execute(
+                "UPDATE engine_arithmetic_update \
+                 SET quantity = quantity + 1 WHERE id = 'a' \
+                 RETURNING quantity, line_number",
+                &[],
+            )
+            .await
+            .expect("arithmetic assignment should read a prior staged post-image");
+        assert_eq!(overlay_updated.rows_affected(), 1);
+        assert_rows_eq(
+            overlay_updated,
+            vec![vec![Value::Integer(12), Value::Integer(10)]],
+        );
+        let returning_expression = transaction
+            .execute(
+                "UPDATE engine_arithmetic_update \
+                 SET line_number = line_number WHERE id = 'c' \
+                 RETURNING quantity + 1",
+                &[],
+            )
+            .await
+            .expect("binary RETURNING alone should select the generic UPDATE executor");
+        assert_eq!(returning_expression.rows_affected(), 1);
+        assert_rows_eq(returning_expression, vec![vec![Value::Integer(31)]]);
+        assert_rows_eq(
+            transaction
+                .execute(
+                    "SELECT id, quantity, line_number \
+                     FROM engine_arithmetic_update ORDER BY id",
+                    &[],
+                )
+                .await
+                .expect("updated quantities should remain readable"),
+            vec![
+                vec![
+                    Value::Text("a".to_string()),
+                    Value::Integer(12),
+                    Value::Integer(10),
+                ],
+                vec![
+                    Value::Text("b".to_string()),
+                    Value::Integer(21),
+                    Value::Integer(20),
+                ],
+                vec![
+                    Value::Text("c".to_string()),
+                    Value::Integer(30),
+                    Value::Integer(1),
+                ],
+                vec![Value::Text("d".to_string()), Value::Null, Value::Null],
+            ],
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("arithmetic update transaction should roll back");
+
+        let error = session
+            .execute(
+                "UPDATE engine_arithmetic_update \
+                 SET quantity = quantity / (order_key - order_key) \
+                 WHERE id IN ('a', 'b')",
+                &[],
+            )
+            .await
+            .expect_err("division by zero should fail the whole UPDATE");
+        assert!(
+            error.message.to_ascii_lowercase().contains("divide")
+                || error.message.to_ascii_lowercase().contains("division"),
+            "{error:?}"
+        );
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT id, quantity, line_number \
+                     FROM engine_arithmetic_update ORDER BY id",
+                    &[],
+                )
+                .await
+                .expect("failed and rolled-back updates must leave base rows unchanged"),
+            vec![
+                vec![
+                    Value::Text("a".to_string()),
+                    Value::Integer(10),
+                    Value::Integer(13),
+                ],
+                vec![
+                    Value::Text("b".to_string()),
+                    Value::Integer(20),
+                    Value::Integer(6),
+                ],
+                vec![
+                    Value::Text("c".to_string()),
+                    Value::Integer(30),
+                    Value::Integer(1),
+                ],
+                vec![
+                    Value::Text("d".to_string()),
+                    Value::Null,
+                    Value::Integer(12),
+                ],
+            ],
+        );
+    }
+);

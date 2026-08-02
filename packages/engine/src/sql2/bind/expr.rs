@@ -16,6 +16,20 @@ pub(crate) enum BoundExpr {
         name: String,
         args: Vec<Self>,
     },
+    Binary {
+        left: Box<Self>,
+        op: BoundBinaryOperator,
+        right: Box<Self>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BoundBinaryOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
