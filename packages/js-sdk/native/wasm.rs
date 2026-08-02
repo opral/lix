@@ -8,9 +8,9 @@ use js_sys::{Array, Function, Reflect};
 use lix_sdk::{
     CallbackTelemetrySink, CreateBranchOptions as RsCreateBranchOptions,
     ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteOptions as RsExecuteOptions,
-    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
-    Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
+    ExecuteResult as RsExecuteResult, ExecutionPriority, Lix as RsLix, LixError,
+    LixTransaction as RsLixTransaction, Memory, MergeBranchOptions as RsMergeBranchOptions,
+    MergeBranchOutcome, MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
     OpenLixOptions as RsOpenLixOptions, SqlScriptPlan,
     SwitchBranchOptions as RsSwitchBranchOptions, TelemetrySink, Value, open_lix,
     open_lix_with_telemetry, parse_sql_script as parse_rs_sql_script,
@@ -397,6 +397,8 @@ impl WasmObserveEvents {
 #[serde(rename_all = "camelCase")]
 struct ExecuteOptionsDto {
     origin_key: Option<String>,
+    #[serde(default)]
+    priority: ExecutionPriority,
 }
 
 #[derive(Serialize)]
@@ -442,6 +444,7 @@ fn execute_options_from_js(options: Option<JsValue>) -> Result<RsExecuteOptions,
             let options: ExecuteOptionsDto = from_js(value)?;
             Ok(RsExecuteOptions {
                 origin_key: options.origin_key,
+                priority: options.priority,
             })
         }
         _ => Ok(RsExecuteOptions::default()),

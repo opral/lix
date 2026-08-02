@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::ExecutionPriority;
 use crate::telemetry::{
     ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, TelemetrySpanKind, TelemetrySpanStart,
     TelemetrySpanStatus, unix_time_ms,
@@ -41,6 +42,24 @@ impl SqlStatementTelemetry {
 
     pub(crate) fn finish(self, result: &Result<ExecuteResult, LixError>) {
         let (status, attributes) = statement_end(result);
+        self.span.finish(status, attributes);
+    }
+
+    pub(crate) fn finish_workload(
+        self,
+        result: &Result<ExecuteResult, LixError>,
+        queue_wait: std::time::Duration,
+        execution_time: std::time::Duration,
+        queue_depth: usize,
+        priority: ExecutionPriority,
+    ) {
+        let (status, mut attributes) = statement_end(result);
+        attributes.extend(workload_attributes(
+            queue_wait,
+            execution_time,
+            queue_depth,
+            priority,
+        ));
         self.span.finish(status, attributes);
     }
 }
@@ -154,6 +173,65 @@ pub(crate) fn finish_operation<T>(span: ActiveTelemetrySpan, result: &Result<T, 
             ],
         ),
     }
+}
+
+pub(crate) fn finish_workload_operation<T>(
+    span: ActiveTelemetrySpan,
+    result: &Result<T, LixError>,
+    queue_wait: std::time::Duration,
+    execution_time: std::time::Duration,
+    queue_depth: usize,
+    priority: ExecutionPriority,
+) {
+    let (status, mut attributes) = match result {
+        Ok(_) => (
+            TelemetrySpanStatus::Ok,
+            vec![TelemetryAttribute::string("otel.status_code", "OK")],
+        ),
+        Err(error) => (
+            TelemetrySpanStatus::Error,
+            vec![
+                TelemetryAttribute::string("error.type", error.code.clone()),
+                TelemetryAttribute::string("otel.status_code", "ERROR"),
+            ],
+        ),
+    };
+    attributes.extend(workload_attributes(
+        queue_wait,
+        execution_time,
+        queue_depth,
+        priority,
+    ));
+    span.finish(status, attributes);
+}
+
+fn workload_attributes(
+    queue_wait: std::time::Duration,
+    execution_time: std::time::Duration,
+    queue_depth: usize,
+    priority: ExecutionPriority,
+) -> Vec<TelemetryAttribute> {
+    vec![
+        TelemetryAttribute::string(
+            "lix.workload.priority",
+            match priority {
+                ExecutionPriority::Foreground => "foreground",
+                ExecutionPriority::Background => "background",
+            },
+        ),
+        TelemetryAttribute::u64(
+            "lix.workload.queue_wait_ns",
+            u64::try_from(queue_wait.as_nanos()).unwrap_or(u64::MAX),
+        ),
+        TelemetryAttribute::u64(
+            "lix.workload.execution_ns",
+            u64::try_from(execution_time.as_nanos()).unwrap_or(u64::MAX),
+        ),
+        TelemetryAttribute::u64(
+            "lix.workload.queue_depth",
+            u64::try_from(queue_depth).unwrap_or(u64::MAX),
+        ),
+    ]
 }
 
 #[cfg(test)]

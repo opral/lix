@@ -85,6 +85,8 @@ export type SqlParam = JsonValue | Uint8Array | import("./value.js").Value;
 
 export type ExecuteOptions = {
 	originKey?: string;
+	/** Scheduling intent. Background work is cooperatively admitted between statements. */
+	priority?: "foreground" | "background";
 	/**
 	 * Stable identity for one logical remote SQL mutation. Supply the same key
 	 * when retrying after a lost response; remote Lix generates one per call
@@ -100,6 +102,8 @@ export type LixBatchStatement = {
 
 export type LixBatchOptions = {
 	originKey?: string;
+	/** Scheduling intent. Background work is cooperatively admitted between batches. */
+	priority?: "foreground" | "background";
 	/** See {@link ExecuteOptions.idempotencyKey}. */
 	idempotencyKey?: string;
 };

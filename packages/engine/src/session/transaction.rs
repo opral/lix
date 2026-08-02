@@ -32,6 +32,7 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) has_started_statement: bool,
+    pub(super) workload_coordinator: Arc<crate::workload::WorkloadCoordinator>,
 }
 
 impl<StorageImpl> SessionContext<StorageImpl>
@@ -90,6 +91,7 @@ where
             commit_coordinator: Arc::clone(&self.commit_coordinator),
             telemetry: self.telemetry.clone(),
             has_started_statement: false,
+            workload_coordinator: Arc::clone(&self.workload_coordinator),
         })
     }
 }
@@ -114,6 +116,10 @@ where
     }
 
     pub async fn commit(mut self) -> Result<(), LixError> {
+        let workload_coordinator = Arc::clone(&self.workload_coordinator);
+        let _workload_permit = workload_coordinator
+            .acquire(crate::ExecutionPriority::Foreground)
+            .await?;
         // Explicit transactions may remain open across application awaits, so
         // they do not hold the collaboration gate while planning. Serialize
         // their commit-time revalidation and persistence with bounded writes.
@@ -144,6 +150,10 @@ where
     }
 
     pub async fn rollback(mut self) -> Result<(), LixError> {
+        let workload_coordinator = Arc::clone(&self.workload_coordinator);
+        let _workload_permit = workload_coordinator
+            .acquire(crate::ExecutionPriority::Foreground)
+            .await?;
         let transaction = self
             .transaction
             .take()
@@ -287,6 +297,16 @@ impl SessionTransactionManager {
             return Err(closed_error());
         }
         Ok(())
+    }
+
+    pub(super) async fn wait_until_closed(&self) {
+        loop {
+            let notified = self.inner.state_changed.notified();
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub(super) fn ensure_observe_registration_allowed(&self) -> Result<(), LixError> {

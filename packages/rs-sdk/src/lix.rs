@@ -4,9 +4,10 @@ use lix_engine::wasm::WasmTransitionCounters;
 use lix_engine::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, EngineOptions,
     ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
-    ExecuteStatementMetadata, ExecutionDisposition, LixError, Memory, MergeBranchOptions,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, RedoReceipt,
-    SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
+    ExecuteStatementMetadata, ExecutionDisposition, ExecutionPriority, LixError, Memory,
+    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    ObserveEvents, RedoReceipt, SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt,
+    UndoReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -207,6 +208,18 @@ where
         self.session.execute(sql, params).await
     }
 
+    /// Executes one statement with explicit foreground or background intent.
+    pub async fn execute_with_priority(
+        &self,
+        sql: &str,
+        params: &[Value],
+        priority: ExecutionPriority,
+    ) -> Result<ExecuteResult, LixError> {
+        self.session
+            .execute_with_priority(sql, params, priority)
+            .await
+    }
+
     pub async fn execute_with_options(
         &self,
         sql: &str,
@@ -330,6 +343,17 @@ where
         statements: &[ExecuteBatchStatement],
     ) -> Result<Vec<ExecuteResult>, LixError> {
         self.session.execute_batch(statements).await
+    }
+
+    /// Executes one atomic batch with explicit foreground or background intent.
+    pub async fn execute_batch_with_priority(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        priority: ExecutionPriority,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.session
+            .execute_batch_with_priority(statements, priority)
+            .await
     }
 
     pub async fn execute_batch_with_options(

@@ -194,6 +194,10 @@ fn tracing_span(start: &TelemetrySpanStart) -> tracing::Span {
             "lix.batch.index" = tracing::field::Empty,
             "db.response.returned_rows" = tracing::field::Empty,
             "lix.rows_affected" = tracing::field::Empty,
+            "lix.workload.priority" = tracing::field::Empty,
+            "lix.workload.queue_wait_ns" = tracing::field::Empty,
+            "lix.workload.execution_ns" = tracing::field::Empty,
+            "lix.workload.queue_depth" = tracing::field::Empty,
             "error.type" = tracing::field::Empty,
             "otel.status_code" = tracing::field::Empty,
         ),
@@ -205,6 +209,10 @@ fn tracing_span(start: &TelemetrySpanStart) -> tracing::Span {
             "db.system.name" = tracing::field::Empty,
             "db.operation.batch.size" = tracing::field::Empty,
             "lix.execution.kind" = tracing::field::Empty,
+            "lix.workload.priority" = tracing::field::Empty,
+            "lix.workload.queue_wait_ns" = tracing::field::Empty,
+            "lix.workload.execution_ns" = tracing::field::Empty,
+            "lix.workload.queue_depth" = tracing::field::Empty,
             "error.type" = tracing::field::Empty,
             "otel.status_code" = tracing::field::Empty,
         ),
@@ -291,4 +299,56 @@ pub(crate) fn unix_time_ms() -> u64 {
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EnabledSubscriber;
+
+    impl tracing::Subscriber for EnabledSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn tracing_sql_spans_declare_workload_fields() {
+        let _subscriber = tracing::subscriber::set_default(EnabledSubscriber);
+        for kind in [TelemetrySpanKind::SqlQuery, TelemetrySpanKind::SqlBatch] {
+            let span = tracing_span(&TelemetrySpanStart {
+                kind,
+                name: "test",
+                started_at_unix_ms: 0,
+                attributes: Vec::new(),
+            });
+            let fields = span.metadata().expect("span metadata").fields();
+            for field in [
+                "lix.workload.priority",
+                "lix.workload.queue_wait_ns",
+                "lix.workload.execution_ns",
+                "lix.workload.queue_depth",
+            ] {
+                assert!(
+                    fields.field(field).is_some(),
+                    "missing tracing field {field}"
+                );
+            }
+        }
+    }
 }

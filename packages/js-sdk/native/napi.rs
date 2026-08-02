@@ -1,21 +1,22 @@
 use lix_sdk::{
     CallbackTelemetrySink, CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
     CreateCheckpointReceipt, ExecuteBatchStatement as RsExecuteBatchStatement,
-    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, Lix as RsLix, LixError,
-    LixTransaction as RsLixTransaction, LocalFilesystem, LocalFilesystemOpenOptions, Memory,
-    MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
-    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
-    ObserveEvents as RsObserveEvents, OpenLixOptions as RsOpenLixOptions, RedoReceipt, SQLite,
-    SQLiteOptions, SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt,
-    TelemetrySink, UndoReceipt, Value, open_lix, open_lix_with_telemetry,
+    ExecuteOptions as RsExecuteOptions, ExecuteResult as RsExecuteResult, ExecutionPriority,
+    Lix as RsLix, LixError, LixTransaction as RsLixTransaction, LocalFilesystem,
+    LocalFilesystemOpenOptions, Memory, MergeBranchOptions as RsMergeBranchOptions,
+    MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
+    ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents,
+    OpenLixOptions as RsOpenLixOptions, RedoReceipt, SQLite, SQLiteOptions,
+    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, TelemetrySink, UndoReceipt,
+    Value, open_lix, open_lix_with_telemetry,
 };
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -31,6 +32,7 @@ type SharedJsTelemetryDispatch = Arc<JsTelemetryDispatch>;
 // and live-state async futures before their first suspension point. They must
 // not inherit the platform's small default thread stack for that graph.
 const NATIVE_ENGINE_ACTOR_STACK_SIZE: usize = 32 * 1024 * 1024;
+const NATIVE_BACKGROUND_QUEUE_DEPTH: usize = 64;
 
 fn optional_telemetry_dispatch(
     dispatch: Option<Function<'_, String, ()>>,
@@ -69,12 +71,24 @@ enum NativeObserveEventsInner {
 pub struct NativeExecuteOptions {
     #[napi(js_name = "originKey")]
     pub origin_key: Option<String>,
+    pub priority: Option<NativeExecutionPriority>,
+}
+
+#[napi(string_enum = "lowercase")]
+#[derive(Debug, Clone, Copy)]
+pub enum NativeExecutionPriority {
+    Foreground,
+    Background,
 }
 
 impl From<NativeExecuteOptions> for RsExecuteOptions {
     fn from(options: NativeExecuteOptions) -> Self {
         Self {
             origin_key: options.origin_key,
+            priority: match options.priority {
+                Some(NativeExecutionPriority::Background) => ExecutionPriority::Background,
+                Some(NativeExecutionPriority::Foreground) | None => ExecutionPriority::Foreground,
+            },
         }
     }
 }
@@ -97,6 +111,7 @@ struct NativeLixActor {
 struct NativeLixActorState {
     lix: NativeLixInner,
     transactions: HashMap<u64, NativeLixTransactionInner>,
+    background: Option<NativeBackgroundActor>,
 }
 
 type NativeResult<T> = std::result::Result<T, LixError>;
@@ -183,6 +198,157 @@ enum LixCommand {
     },
 }
 
+struct NativeBackgroundActor {
+    commands: SyncSender<BackgroundCommand>,
+    closed: Arc<AtomicBool>,
+}
+
+enum BackgroundCommand {
+    Execute {
+        sql: String,
+        params: Vec<Value>,
+        options: RsExecuteOptions,
+        deferred: NativeExecuteDeferred,
+    },
+    ExecuteBatch {
+        statements: Vec<RsExecuteBatchStatement>,
+        options: RsExecuteOptions,
+        deferred: NativeExecuteBatchDeferred,
+    },
+    Close(SyncSender<std::result::Result<(), LixError>>),
+}
+
+impl NativeBackgroundActor {
+    fn start(lix: NativeLixInner) -> std::result::Result<Self, LixError> {
+        let (commands, receiver) = mpsc::sync_channel(NATIVE_BACKGROUND_QUEUE_DEPTH);
+        let closed = Arc::new(AtomicBool::new(false));
+        let actor_closed = Arc::clone(&closed);
+        thread::Builder::new()
+            .name("lix-native-background".to_string())
+            .stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
+            .spawn(move || {
+                let runtime = match Builder::new_current_thread().enable_all().build() {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        while let Ok(command) = receiver.recv() {
+                            match command {
+                                BackgroundCommand::Execute { deferred, .. } => {
+                                    deferred.reject(to_napi_error(&error));
+                                }
+                                BackgroundCommand::ExecuteBatch { deferred, .. } => {
+                                    deferred.reject(to_napi_error(&error));
+                                }
+                                BackgroundCommand::Close(completed) => {
+                                    let _ = completed.send(Err(LixError::new(
+                                        LixError::CODE_INTERNAL_ERROR,
+                                        error.to_string(),
+                                    )));
+                                    break;
+                                }
+                            }
+                        }
+                        return;
+                    }
+                };
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        BackgroundCommand::Execute {
+                            sql,
+                            params,
+                            options,
+                            deferred,
+                        } => {
+                            if actor_closed.load(Ordering::Acquire) {
+                                settle_deferred(deferred, Err(lix_closed_error()));
+                                continue;
+                            }
+                            let result = runtime
+                                .block_on(lix.execute(&sql, &params, options))
+                                .and_then(ExecuteResult::try_from);
+                            settle_deferred(deferred, result);
+                        }
+                        BackgroundCommand::ExecuteBatch {
+                            statements,
+                            options,
+                            deferred,
+                        } => {
+                            if actor_closed.load(Ordering::Acquire) {
+                                settle_deferred(deferred, Err(lix_closed_error()));
+                                continue;
+                            }
+                            let result = runtime
+                                .block_on(lix.execute_batch(&statements, options))
+                                .and_then(|results| {
+                                    results
+                                        .into_iter()
+                                        .map(ExecuteResult::try_from)
+                                        .collect::<std::result::Result<Vec<_>, _>>()
+                                });
+                            settle_deferred(deferred, result);
+                        }
+                        BackgroundCommand::Close(completed) => {
+                            let _ = completed.send(runtime.block_on(lix.close()));
+                            return;
+                        }
+                    }
+                }
+                let _ = runtime.block_on(lix.close());
+            })
+            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?;
+        Ok(Self { commands, closed })
+    }
+
+    fn send(&self, command: BackgroundCommand) {
+        if self.closed.load(Ordering::Acquire) {
+            match command {
+                BackgroundCommand::Execute { deferred, .. } => {
+                    settle_deferred(deferred, Err(lix_closed_error()));
+                }
+                BackgroundCommand::ExecuteBatch { deferred, .. } => {
+                    settle_deferred(deferred, Err(lix_closed_error()));
+                }
+                BackgroundCommand::Close(completed) => {
+                    let _ = completed.send(Err(lix_closed_error()));
+                }
+            }
+            return;
+        }
+        if let Err(error) = self.commands.try_send(command) {
+            let (command, error) = match error {
+                TrySendError::Full(command) => (
+                    command,
+                    LixError::new(
+                        LixError::CODE_WORKLOAD_QUEUE_FULL,
+                        "native background execution queue is full",
+                    )
+                    .with_hint("Retry background work with backoff."),
+                ),
+                TrySendError::Disconnected(command) => (command, lix_closed_error()),
+            };
+            match command {
+                BackgroundCommand::Execute { deferred, .. } => {
+                    settle_deferred(deferred, Err(error));
+                }
+                BackgroundCommand::ExecuteBatch { deferred, .. } => {
+                    settle_deferred(deferred, Err(error));
+                }
+                BackgroundCommand::Close(completed) => {
+                    let _ = completed.send(Err(error));
+                }
+            }
+        }
+    }
+
+    fn close(self) -> std::result::Result<(), LixError> {
+        self.closed.store(true, Ordering::Release);
+        let (completed, result) = mpsc::sync_channel(1);
+        self.commands
+            .send(BackgroundCommand::Close(completed))
+            .map_err(|_| lix_closed_error())?;
+        result.recv().unwrap_or_else(|_| Err(lix_closed_error()))
+    }
+}
+
 impl NativeLixActor {
     fn start(lix: NativeLixInner) -> Result<Self> {
         let (commands, receiver) = mpsc::channel();
@@ -265,6 +431,7 @@ fn run_lix_actor(
     let mut state = Some(NativeLixActorState {
         lix,
         transactions: HashMap::new(),
+        background: None,
     });
 
     while let Ok(command) = receiver.recv() {
@@ -341,6 +508,22 @@ fn handle_lix_command(
             options,
             deferred,
         } => {
+            if options.priority == ExecutionPriority::Background {
+                let background = match state.background_actor(rt) {
+                    Ok(background) => background,
+                    Err(error) => {
+                        settle_deferred(deferred, Err(error));
+                        return false;
+                    }
+                };
+                background.send(BackgroundCommand::Execute {
+                    sql,
+                    params,
+                    options,
+                    deferred,
+                });
+                return false;
+            }
             let result = rt
                 .block_on(state.lix.execute(&sql, &params, options))
                 .and_then(ExecuteResult::try_from);
@@ -352,6 +535,21 @@ fn handle_lix_command(
             options,
             deferred,
         } => {
+            if options.priority == ExecutionPriority::Background {
+                let background = match state.background_actor(rt) {
+                    Ok(background) => background,
+                    Err(error) => {
+                        settle_deferred(deferred, Err(error));
+                        return false;
+                    }
+                };
+                background.send(BackgroundCommand::ExecuteBatch {
+                    statements,
+                    options,
+                    deferred,
+                });
+                return false;
+            }
             let result = rt
                 .block_on(state.lix.execute_batch(&statements, options))
                 .and_then(|results| {
@@ -407,9 +605,15 @@ fn handle_lix_command(
             false
         }
         LixCommand::SwitchBranch { options, deferred } => {
-            let result = rt
-                .block_on(state.lix.switch_branch(options))
-                .map(SwitchBranchReceiptDto::from);
+            // A background actor owns an independent workspace session and
+            // therefore its own cached branch selector. Drain and recreate it
+            // around a switch so priority never changes branch semantics.
+            let result = match state.background.take() {
+                Some(background) => background.close(),
+                None => Ok(()),
+            }
+            .and_then(|()| rt.block_on(state.lix.switch_branch(options)))
+            .map(SwitchBranchReceiptDto::from);
             settle_deferred(deferred, result);
             false
         }
@@ -438,7 +642,11 @@ fn handle_lix_command(
             false
         }
         LixCommand::Close(deferred) => {
-            let result = rt.block_on(state.lix.close());
+            let result = match state.background.take() {
+                Some(background) => background.close(),
+                None => Ok(()),
+            }
+            .and_then(|()| rt.block_on(state.lix.close()));
             let should_drop_state = result.is_ok();
             if result.is_ok() {
                 closed.store(true, Ordering::SeqCst);
@@ -507,6 +715,22 @@ fn handle_lix_command(
     }
 }
 
+impl NativeLixActorState {
+    fn background_actor(
+        &mut self,
+        runtime: &Runtime,
+    ) -> std::result::Result<&NativeBackgroundActor, LixError> {
+        if self.background.is_none() {
+            let session = runtime.block_on(self.lix.open_workspace_session())?;
+            self.background = Some(NativeBackgroundActor::start(session)?);
+        }
+        Ok(self
+            .background
+            .as_ref()
+            .expect("background actor initialized"))
+    }
+}
+
 fn settle_command_after_close(command: LixCommand) {
     match command {
         LixCommand::Close(deferred) => settle_deferred(deferred, Ok(())),
@@ -562,6 +786,17 @@ fn transaction_closed_error() -> LixError {
 }
 
 impl NativeLixInner {
+    async fn open_workspace_session(&self) -> std::result::Result<Self, LixError> {
+        match self {
+            Self::Memory(lix) => Ok(Self::Memory(lix.open_workspace_session().await?)),
+            Self::SQLite(lix) => Ok(Self::SQLite(lix.open_workspace_session().await?)),
+            Self::LocalFilesystem(lix, storage) => Ok(Self::LocalFilesystem(
+                lix.open_workspace_session().await?,
+                storage.clone(),
+            )),
+        }
+    }
+
     async fn execute(
         &self,
         sql: &str,

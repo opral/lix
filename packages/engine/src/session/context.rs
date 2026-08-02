@@ -38,6 +38,7 @@ use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAd
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{CertifiedHistoryStoreReader, Transaction, open_transaction};
+use crate::workload::WorkloadCoordinator;
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
 use crate::transaction::CommitCoordinator;
@@ -147,6 +148,7 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) file_views: SessionFileViews,
     pub(super) observe_coordinator: Arc<ObserveCoordinator>,
     pub(super) observe_invalidation: Arc<ObserveInvalidation>,
+    pub(super) workload_coordinator: Arc<WorkloadCoordinator>,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     transaction_manager: SessionTransactionManager,
@@ -169,6 +171,7 @@ where
         commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        workload_coordinator: Arc<WorkloadCoordinator>,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Result<Self, LixError> {
@@ -194,6 +197,7 @@ where
             commit_coordinator,
             observe_coordinator,
             observe_invalidation,
+            workload_coordinator,
             plugin_host,
             telemetry,
         ))
@@ -213,6 +217,7 @@ where
         commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        workload_coordinator: Arc<WorkloadCoordinator>,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Result<Self, LixError> {
@@ -232,6 +237,7 @@ where
             commit_coordinator,
             observe_coordinator,
             observe_invalidation,
+            workload_coordinator,
             plugin_host,
             telemetry,
         ))
@@ -251,6 +257,7 @@ where
         commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        workload_coordinator: Arc<WorkloadCoordinator>,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
     ) -> Self {
@@ -268,6 +275,7 @@ where
             commit_coordinator,
             observe_coordinator,
             observe_invalidation,
+            workload_coordinator,
             plugin_host,
             telemetry,
             SessionTransactionManager::new(),
@@ -289,6 +297,7 @@ where
         commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
         observe_coordinator: Arc<ObserveCoordinator>,
         observe_invalidation: Arc<ObserveInvalidation>,
+        workload_coordinator: Arc<WorkloadCoordinator>,
         plugin_host: PluginRuntimeHost,
         telemetry: Option<Arc<dyn TelemetrySink>>,
         transaction_manager: SessionTransactionManager,
@@ -309,6 +318,7 @@ where
             file_views,
             observe_coordinator,
             observe_invalidation,
+            workload_coordinator,
             plugin_host,
             telemetry,
             transaction_manager,
@@ -325,6 +335,10 @@ where
 
     pub fn is_closed(&self) -> bool {
         self.transaction_manager.is_closed()
+    }
+
+    pub(super) async fn wait_until_closed(&self) {
+        self.transaction_manager.wait_until_closed().await;
     }
 
     #[doc(hidden)]

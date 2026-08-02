@@ -103,7 +103,7 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 			{ nested: [1, false] },
 			new Uint8Array([1, 2, 3]),
 		],
-		{ originKey: "remote-test" },
+		{ originKey: "remote-test", priority: "background" },
 	);
 
 	expect(result.rows[0]?.get("n")).toBe(42);
@@ -133,7 +133,7 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 			{ kind: "json", value: { nested: [1, false] } },
 			{ kind: "blob", base64: "AQID" },
 		],
-		options: { originKey: "remote-test" },
+		options: { originKey: "remote-test", priority: "background" },
 	});
 
 	await lix.close();
@@ -248,7 +248,7 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 			{ sql: "SELECT $1 AS value", params: [1] },
 			{ sql: "SELECT $1 AS value", params: ["two"] },
 		],
-		{ originKey: "batch-test" },
+		{ originKey: "batch-test", priority: "background" },
 	);
 	expect(results.map((result) => result.rows[0]?.get("value"))).toEqual([
 		1,
@@ -268,7 +268,7 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 				params: [{ kind: "text", value: "two" }],
 			},
 		],
-		options: { originKey: "batch-test" },
+		options: { originKey: "batch-test", priority: "background" },
 	});
 
 	await lix.close();

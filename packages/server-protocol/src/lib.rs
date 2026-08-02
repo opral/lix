@@ -22,9 +22,9 @@ use axum::{
 use lix_sdk::FILE_UPLOAD_PART_BYTES;
 use lix_sdk::{
     Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions,
-    ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, LixTransaction,
-    ObserveEvent, ObserveEvents, Storage, SwitchBranchOptions, Value, VerifiedRequestBlob,
-    WireValue,
+    ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, ExecutionPriority, Lix,
+    LixError, LixTransaction, ObserveEvent, ObserveEvents, Storage, SwitchBranchOptions, Value,
+    VerifiedRequestBlob, WireValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -3217,6 +3217,7 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
             StatusCode::CONFLICT
         }
         LixError::CODE_IDEMPOTENCY_KEY_REUSED => StatusCode::CONFLICT,
+        LixError::CODE_WORKLOAD_QUEUE_FULL => StatusCode::TOO_MANY_REQUESTS,
         LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
         | LixError::CODE_STORAGE_DURABILITY_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
         LixError::CODE_IDEMPOTENCY_RESPONSE_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
@@ -3284,12 +3285,15 @@ struct BinaryFileReadRequest {
 #[serde(rename_all = "camelCase")]
 struct ExecuteOptionsRequest {
     origin_key: Option<String>,
+    #[serde(default)]
+    priority: ExecutionPriority,
 }
 
 impl From<ExecuteOptionsRequest> for ExecuteOptions {
     fn from(value: ExecuteOptionsRequest) -> Self {
         Self {
             origin_key: value.origin_key,
+            priority: value.priority,
         }
     }
 }
@@ -9970,5 +9974,11 @@ mod tests {
             panic!("zero request blob cache capacity must be rejected");
         };
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    }
+
+    #[test]
+    fn workload_queue_saturation_maps_to_retryable_http_status() {
+        let error = LixError::new(LixError::CODE_WORKLOAD_QUEUE_FULL, "queue full");
+        assert_eq!(status_for_lix_error(&error), StatusCode::TOO_MANY_REQUESTS);
     }
 }

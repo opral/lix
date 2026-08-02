@@ -459,6 +459,19 @@ function assertExecuteArgs(
 			receiver,
 		);
 	}
+	if (
+		options.priority !== undefined &&
+		options.priority !== "foreground" &&
+		options.priority !== "background"
+	) {
+		throw invalidArgument(
+			"execute",
+			"options.priority",
+			'"foreground" or "background"',
+			typeof options.priority,
+			receiver,
+		);
+	}
 }
 
 function assertSqlArgs(
@@ -570,6 +583,18 @@ function assertBatchOptions(options?: LixBatchOptions) {
 			"options.idempotencyKey",
 			"string",
 			typeof options.idempotencyKey,
+		);
+	}
+	if (
+		options.priority !== undefined &&
+		options.priority !== "foreground" &&
+		options.priority !== "background"
+	) {
+		throw invalidArgument(
+			"executeBatch",
+			"options.priority",
+			'"foreground" or "background"',
+			typeof options.priority,
 		);
 	}
 }

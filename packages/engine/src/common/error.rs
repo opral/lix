@@ -113,6 +113,10 @@ impl LixError {
     /// Optimistic transaction publication lost a race with a newer commit.
     pub const CODE_TRANSACTION_CONFLICT: &'static str = "LIX_TRANSACTION_CONFLICT";
 
+    /// The bounded background admission queue is full. Callers may retry with
+    /// backoff after currently admitted work has completed.
+    pub const CODE_WORKLOAD_QUEUE_FULL: &'static str = "LIX_WORKLOAD_QUEUE_FULL";
+
     /// An internal engine invariant failed.
     pub const CODE_INTERNAL_ERROR: &'static str = "LIX_INTERNAL_ERROR";
 

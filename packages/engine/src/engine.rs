@@ -28,6 +28,7 @@ use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
 use crate::wasm::WasmTransitionCounters;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
+use crate::workload::WorkloadCoordinator;
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
@@ -45,6 +46,7 @@ pub struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter::Memor
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     observe_coordinator: Arc<ObserveCoordinator>,
     observe_invalidation: Arc<ObserveInvalidation>,
+    workload_coordinator: Arc<WorkloadCoordinator>,
     plugin_host: PluginRuntimeHost,
     telemetry: Option<Arc<dyn TelemetrySink>>,
 }
@@ -191,6 +193,7 @@ where
             commit_coordinator,
             observe_coordinator: Arc::new(ObserveCoordinator::new()),
             observe_invalidation,
+            workload_coordinator: Arc::new(WorkloadCoordinator::default()),
             plugin_host,
             telemetry: options.telemetry,
         })
@@ -241,6 +244,7 @@ where
             Arc::clone(&self.commit_coordinator),
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
+            Arc::clone(&self.workload_coordinator),
             self.plugin_host.clone(),
             self.telemetry.clone(),
         )
@@ -261,6 +265,7 @@ where
             Arc::clone(&self.commit_coordinator),
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
+            Arc::clone(&self.workload_coordinator),
             self.plugin_host.clone(),
             self.telemetry.clone(),
         )

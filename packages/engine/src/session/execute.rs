@@ -4,12 +4,15 @@ use std::ops::ControlFlow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
 use crate::common::ExecuteStatementMetadata;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
-use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
+use crate::sql_telemetry::{
+    SqlStatementTelemetry, finish_operation, finish_workload_operation, start_batch,
+};
 use crate::sql2;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
@@ -18,7 +21,7 @@ use crate::storage_adapter::{
 };
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
-use crate::{Blob, LixError, LixNotice, SqlQueryResult, Value};
+use crate::{Blob, ExecutionPriority, LixError, LixNotice, SqlQueryResult, Value};
 use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -478,6 +481,8 @@ impl RowRef<'_> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecuteOptions {
     pub origin_key: Option<String>,
+    /// Workload scheduling intent. Foreground is the compatibility default.
+    pub priority: ExecutionPriority,
 }
 
 /// Whether abandoning an in-flight SQL execution can discard its work.
@@ -658,6 +663,32 @@ where
     /// catalog inspection. Lix owns transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
+    }
+
+    /// Executes one statement with explicit foreground or background intent.
+    ///
+    /// Background statements normally defer at statement boundaries while
+    /// foreground work is active. This is intended for independently retryable
+    /// sync, indexing, and maintenance loops; it does not change SQL semantics.
+    pub async fn execute_with_priority(
+        &self,
+        sql: &str,
+        params: &[Value],
+        priority: ExecutionPriority,
+    ) -> Result<ExecuteResult, LixError> {
+        Box::pin(self.execute_with_kind(
+            sql,
+            params,
+            ExecuteOptions {
+                priority,
+                ..ExecuteOptions::default()
+            },
+            ExecuteStatementMetadata::default(),
+            "execute",
+            None,
+            false,
+        ))
+        .await
     }
 
     pub async fn execute_with_options(
@@ -896,8 +927,24 @@ where
         idempotency: Option<ExecuteIdempotency>,
         require_idempotency_for_writes: bool,
     ) -> Result<ExecuteResult, LixError> {
+        let priority = options.priority;
         let telemetry =
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, execution_kind, None);
+        let workload_permit = tokio::select! {
+            permit = self.workload_coordinator.acquire(priority) => permit,
+            () = self.wait_until_closed() => Err(super::context::closed_error()),
+        };
+        let _workload_permit = match workload_permit {
+            Ok(permit) => permit,
+            Err(error) => {
+                let result = Err(error);
+                if let Some(telemetry) = telemetry {
+                    telemetry.finish_workload(&result, Duration::ZERO, Duration::ZERO, 0, priority);
+                }
+                return result;
+            }
+        };
+        let execution_started = web_time::Instant::now();
         let operation = self.execute_with_options_inner(
             sql,
             params,
@@ -912,7 +959,13 @@ where
             None => operation.await,
         };
         if let Some(telemetry) = telemetry {
-            telemetry.finish(&result);
+            telemetry.finish_workload(
+                &result,
+                _workload_permit.queue_wait(),
+                execution_started.elapsed(),
+                _workload_permit.queue_depth(),
+                priority,
+            );
         }
         result
     }
@@ -1331,6 +1384,25 @@ where
         .await
     }
 
+    /// Executes one atomic batch with explicit foreground or background intent.
+    pub async fn execute_batch_with_priority(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        priority: ExecutionPriority,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        Box::pin(self.execute_batch_with_options_and_metadata_inner(
+            statements,
+            ExecuteOptions {
+                priority,
+                ..ExecuteOptions::default()
+            },
+            vec![ExecuteStatementMetadata::default(); statements.len()],
+            None,
+            false,
+        ))
+        .await
+    }
+
     #[doc(hidden)]
     pub async fn execute_batch_with_options_and_metadata(
         &self,
@@ -1356,11 +1428,34 @@ where
         idempotency: Option<ExecuteIdempotency>,
         require_idempotency_for_writes: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
+        let priority = options.priority;
         let telemetry = start_batch(
             self.telemetry.as_ref(),
             TelemetrySpanKind::SqlBatch,
             statements.len(),
         );
+        let workload_permit = tokio::select! {
+            permit = self.workload_coordinator.acquire(priority) => permit,
+            () = self.wait_until_closed() => Err(super::context::closed_error()),
+        };
+        let _workload_permit = match workload_permit {
+            Ok(permit) => permit,
+            Err(error) => {
+                let result = Err(error);
+                if let Some(telemetry) = telemetry {
+                    finish_workload_operation(
+                        telemetry,
+                        &result,
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        0,
+                        priority,
+                    );
+                }
+                return result;
+            }
+        };
+        let execution_started = web_time::Instant::now();
         let operation = self.execute_batch_with_options_inner(
             statements,
             options,
@@ -1373,7 +1468,14 @@ where
             None => operation.await,
         };
         if let Some(telemetry) = telemetry {
-            finish_operation(telemetry, &result);
+            finish_workload_operation(
+                telemetry,
+                &result,
+                _workload_permit.queue_wait(),
+                execution_started.elapsed(),
+                _workload_permit.queue_depth(),
+                priority,
+            );
         }
         result
     }
@@ -2508,8 +2610,22 @@ where
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
+        if options.priority == ExecutionPriority::Background {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "background priority is not supported inside an explicit transaction",
+            )
+            .with_hint(
+                "Set background priority on independent statements or atomic batches instead.",
+            ));
+        }
+        let workload_coordinator = Arc::clone(&self.workload_coordinator);
+        let workload_permit = workload_coordinator
+            .acquire(ExecutionPriority::Foreground)
+            .await?;
         let telemetry =
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, "transaction", None);
+        let execution_started = web_time::Instant::now();
         let may_reuse_literal_shape = self.has_started_statement;
         self.has_started_statement = true;
         let operation = async {
@@ -2586,7 +2702,13 @@ where
             None => operation.await,
         };
         if let Some(telemetry) = telemetry {
-            telemetry.finish(&result);
+            telemetry.finish_workload(
+                &result,
+                workload_permit.queue_wait(),
+                execution_started.elapsed(),
+                workload_permit.queue_depth(),
+                ExecutionPriority::Foreground,
+            );
         }
         result
     }
@@ -3968,6 +4090,62 @@ mod tests {
             .open_workspace_session()
             .await
             .expect("workspace session should open")
+    }
+
+    #[tokio::test]
+    async fn closing_session_cancels_queued_background_execution() {
+        let session = open_session().await;
+        let foreground_permit = session
+            .workload_coordinator
+            .acquire(ExecutionPriority::Foreground)
+            .await
+            .expect("foreground admission");
+        let queued_session = session.clone();
+        let mut queued = Box::pin(queued_session.execute_with_options(
+            "SELECT 1",
+            &[],
+            ExecuteOptions {
+                priority: ExecutionPriority::Background,
+                ..ExecuteOptions::default()
+            },
+        ));
+        tokio::select! {
+            biased;
+            result = &mut queued => panic!("background execution completed before close: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        session.close().await.expect("session closes");
+        let error = queued
+            .await
+            .expect_err("queued background execution is cancelled by close");
+        assert_eq!(error.code, LixError::CODE_CLOSED);
+        drop(foreground_permit);
+    }
+
+    #[tokio::test]
+    async fn explicit_transaction_rejects_background_priority() {
+        let session = open_session().await;
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction opens");
+        let error = transaction
+            .execute_with_options(
+                "SELECT 1",
+                &[],
+                ExecuteOptions {
+                    priority: ExecutionPriority::Background,
+                    ..ExecuteOptions::default()
+                },
+            )
+            .await
+            .expect_err("transaction priority must not be silently ignored");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rolls back");
     }
 
     async fn assert_columnar_lifecycle_current(

@@ -40,13 +40,13 @@ export type RemoteHandshakeRequest = {
 export type RemoteExecuteRequest = {
 	sql: string;
 	params: WireRequestValue[];
-	options?: { originKey?: string };
+	options?: { originKey?: string; priority?: "foreground" | "background" };
 	cacheBlobs?: true;
 };
 
 export type RemoteExecuteBatchRequest = {
 	statements: Array<{ sql: string; params: WireRequestValue[] }>;
-	options?: { originKey?: string };
+	options?: { originKey?: string; priority?: "foreground" | "background" };
 	cacheBlobs?: true;
 };
 

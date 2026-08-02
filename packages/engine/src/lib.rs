@@ -73,6 +73,7 @@ pub mod transaction;
 pub(crate) mod transaction;
 pub(crate) mod undo_redo;
 pub mod wasm;
+mod workload;
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
@@ -113,6 +114,7 @@ pub use storage::{
     ScanChunk, ScanOptions, SnapshotRef, SpaceId, Storage, StorageError, StorageRead, StorageSpace,
     StorageWrite, StoredValue, ValueSemantics, WriteOptions, WriteStats,
 };
+pub use workload::ExecutionPriority;
 
 /// Reserved high UUID sentinel for repository-global state.
 pub const GLOBAL_BRANCH_ID: &str = "ffffffff-ffff-7fff-bfff-ffffffffffff";

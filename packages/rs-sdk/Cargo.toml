@@ -44,6 +44,7 @@ tokio = { version = "1", features = ["rt", "sync"] }
 [dev-dependencies]
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 criterion = { package = "codspeed-criterion-compat", version = "4" }
+core_affinity = "0.8"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
 wasm-encoder = "0.248"
@@ -107,3 +108,8 @@ name = "sqlite"
 path = "benches/sqlite.rs"
 harness = false
 required-features = ["sqlite"]
+
+[[bench]]
+name = "workload_isolation"
+path = "benches/workload_isolation.rs"
+harness = false

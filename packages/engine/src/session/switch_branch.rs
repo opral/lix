@@ -97,6 +97,7 @@ where
             Arc::clone(&self.commit_coordinator),
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
+            Arc::clone(&self.workload_coordinator),
             self.plugin_host.clone(),
             self.telemetry.clone(),
             self.transaction_manager(),

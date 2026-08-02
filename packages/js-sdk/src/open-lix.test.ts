@@ -113,6 +113,9 @@ test("openLix exposes the lix-sdk e2e flow", async () => {
 	const mainHead = await lix.execute("SELECT lix_active_branch_commit_id()");
 	const mainHeadCommitId = get(mainHead, "lix_active_branch_commit_id()");
 	expect(typeof mainHeadCommitId).toBe("string");
+	// Initialize the native background session before switching branches. The
+	// actor must be recreated after the switch rather than retaining this cache.
+	await lix.execute("SELECT 1", [], { priority: "background" });
 
 	const draft = await lix.createBranch({
 		id: NATIVE_DRAFT_BRANCH_ID,
@@ -126,10 +129,11 @@ test("openLix exposes the lix-sdk e2e flow", async () => {
 	});
 
 	await lix.switchBranch({ branchId: draft.id });
-	await lix.execute("UPDATE crm_task SET done = $1 WHERE id = $2", [
-		true,
-		"task-1",
-	]);
+	await lix.execute(
+		"UPDATE crm_task SET done = $1 WHERE id = $2",
+		[true, "task-1"],
+		{ priority: "background" },
+	);
 	expect(await taskDone(lix, "task-1")).toBe(true);
 
 	await lix.switchBranch({ branchId: mainBranchId });

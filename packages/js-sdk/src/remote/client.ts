@@ -882,9 +882,9 @@ function base64EncodedLength(byteLength: number): number {
 
 function remoteExecuteOptions(
 	options: ExecuteOptions | LixBatchOptions | undefined,
-): { originKey?: string } | undefined {
-	if (options?.originKey === undefined) return undefined;
-	return { originKey: options.originKey };
+): { originKey?: string; priority?: "foreground" | "background" } | undefined {
+	if (options?.originKey === undefined && options?.priority === undefined) return undefined;
+	return { originKey: options.originKey, priority: options.priority };
 }
 
 function idempotencyKeyFor(provided: string | undefined): string {
