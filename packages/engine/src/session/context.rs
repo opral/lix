@@ -552,7 +552,7 @@ where
         // functions; that coherent opening snapshot remains the source of
         // truth for the mode.
         let _deterministic_runtime_guard = self.lock_deterministic_runtime().await;
-        let opened = open_transaction(
+        let opened = Box::pin(open_transaction(
             &self.mode,
             self.storage.clone(),
             Arc::clone(&self.live_state),
@@ -563,7 +563,7 @@ where
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),
             self.file_views.clone(),
-        )
+        ))
         .instrument(tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.transaction_open"
@@ -586,7 +586,7 @@ where
         {
             Ok(value) => {
                 self.ensure_open()?;
-                let outcome = transaction.commit(&runtime_functions).await?;
+                let outcome = Box::pin(transaction.commit(&runtime_functions)).await?;
                 #[cfg(feature = "storage-benches")]
                 crate::storage_bench::record_crud_physical_writes(outcome.storage_stats);
                 drop(write_access);
