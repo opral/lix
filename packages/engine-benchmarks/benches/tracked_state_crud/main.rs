@@ -254,6 +254,13 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
             "unknown LIX_TRACKED_STATE_CRUD_PROFILE_OP '{other}'; expected insert_all, read_all, read_one, read_many, update_all, update_one, delete_all, or delete_one"
         ),
     };
+    if sql_session_read_shape() == "aggregate_count" {
+        assert_eq!(
+            std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_LAYER").as_deref(),
+            Ok("sql_session"),
+            "LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE=aggregate_count requires LIX_TRACKED_STATE_CRUD_PROFILE_LAYER=sql_session"
+        );
+    }
     let read_many_pk_count = profile_read_many_pk_count(operation, rows.len());
     let sample_count = profile_sample_count();
     let hot_repeats = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS")
@@ -524,6 +531,16 @@ fn profile_hot_transaction_operations(
     black_box(row_count);
 }
 
+fn sql_session_read_shape() -> &'static str {
+    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE").as_deref() {
+        Ok("aggregate_count") => "aggregate_count",
+        Ok("full_result") | Err(_) => "full_result",
+        Ok(other) => panic!(
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE '{other}'; expected full_result or aggregate_count"
+        ),
+    }
+}
+
 fn profile_hot_sql_session_operations(
     runtime: &tokio::runtime::Runtime,
     rows: &[WorkloadRow],
@@ -551,7 +568,11 @@ fn profile_hot_sql_session_operations(
         row_count += runtime.block_on(run_sql_session_operation(operation, &fixture));
     }
     let elapsed = start.elapsed();
-    let profile_detail = profile_read_many_detail(operation, read_many_pk_count);
+    let profile_detail = format!(
+        "{} read_shape={}",
+        profile_read_many_detail(operation, read_many_pk_count),
+        sql_session_read_shape()
+    );
     println!(
         "tracked_state_crud hot profile: sql_session/{}/{}/{} repeats{profile_detail}: total={elapsed:?} per_operation={:?}",
         profile.name(),
@@ -888,12 +909,16 @@ fn profile_sql_session_operation(
         samples.push(start.elapsed());
         black_box(result);
     }
-    print_profile_samples(
-        &format!("sql_session/{}", profile.name()),
-        operation,
-        read_many_pk_count,
-        samples,
-    );
+    let profile_layer = if matches!(operation, TransactionBenchOp::ReadAll) {
+        format!(
+            "sql_session/{}/{}",
+            profile.name(),
+            sql_session_read_shape()
+        )
+    } else {
+        format!("sql_session/{}", profile.name())
+    };
+    print_profile_samples(&profile_layer, operation, read_many_pk_count, samples);
 }
 
 fn profile_sql_session_bound_updates(

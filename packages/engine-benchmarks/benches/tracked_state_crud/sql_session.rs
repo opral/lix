@@ -216,11 +216,28 @@ impl SqlFixture {
     }
 
     pub(crate) async fn read_all(&self) -> usize {
+        if std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_SHAPE").as_deref()
+            == Ok("aggregate_count")
+        {
+            return self.count_all().await;
+        }
         match self {
             Self::SQLite(fixture) => fixture.read_all().await,
             Self::RocksDB(fixture) => fixture.read_all().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_all().await,
+        }
+    }
+
+    /// Opt-in OLAP profile shape. Keeping it behind the profile selector
+    /// leaves the historical full-result CRUD benchmark unchanged while
+    /// making the exact scan-vs-aggregate boundary reproducible at 1M rows.
+    async fn count_all(&self) -> usize {
+        match self {
+            Self::SQLite(fixture) => fixture.count_all().await,
+            Self::RocksDB(fixture) => fixture.count_all().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.count_all().await,
         }
     }
 
@@ -416,6 +433,19 @@ where
         let result = std::hint::black_box(self.read_all_result().await);
         assert_eq!(result.len(), self.visible_row_count);
         result.len()
+    }
+
+    async fn count_all(&self) -> usize {
+        let result = std::hint::black_box(
+            execute(&self.session, "SELECT COUNT(*) AS count FROM json_pointer").await,
+        );
+        assert_eq!(result.columns(), ["count"]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.rows()[0].get_index(0),
+            Some(&Value::Integer(self.visible_row_count as i64))
+        );
+        1
     }
 
     async fn insert_untracked_probe(&self) {

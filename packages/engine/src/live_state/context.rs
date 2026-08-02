@@ -249,6 +249,36 @@ impl<S> LiveStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    /// Counts one directly-addressable entity collection from its publication
+    /// control. The direct snapshot route already proves that no global or
+    /// multi-branch visibility composition is required; retaining that proof
+    /// here makes `COUNT(*)` a metadata read rather than a million-row scan.
+    pub(crate) async fn count_direct_entity_snapshots(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Option<u64>, LixError> {
+        if !request.filter.entity_pks.is_empty() || request.limit.is_some() {
+            return Ok(None);
+        }
+        let Some((branch_id, control, schema_key)) =
+            self.direct_entity_snapshot_scope(request).await?
+        else {
+            return Ok(None);
+        };
+        self.tracked_head
+            .reader(&self.store)
+            .collection_generation(
+                &branch_id,
+                control.generation,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key: &schema_key,
+                    file_id: None,
+                },
+            )
+            .await
+            .map(|generation| Some(generation.live_count))
+    }
+
     /// Returns raw current-state snapshot bytes for one current SQL entity scan.
     ///
     /// `None` means the normal materialized visibility path remains
