@@ -608,7 +608,7 @@ impl CertifiedParameterBatch {
                 facts: certificate.facts,
                 schema_key: schema_key_ordinal,
                 origin_key,
-                timestamp,
+                timestamps: DenseParameterTimestamps::Scalar(timestamp),
                 commit_id: None,
                 branch_id: branch_id_ordinal,
                 direct_change_ids: None,
@@ -691,28 +691,6 @@ impl RawWriteBatch {
             #[cfg(test)]
             origin_promotions: 0,
         }
-    }
-
-    /// Constructs a fixed-shape, complete tracked replacement batch.
-    ///
-    /// The SQL certificate has already proven that every row is an ordinary
-    /// unfiled, branch-local replacement with canonical row content. Keeping
-    /// this separate from mutable `push_parts` ingress preserves one shared
-    /// snapshot arena and one schema/branch dictionary for the whole batch.
-    pub(crate) fn from_certified_parameter_replacement(
-        entity_pks: Vec<EntityPk>,
-        snapshots: Vec<TransactionJson>,
-        schema_key: SharedStr,
-        branch_id: SharedStr,
-        certificate: CertifiedRawWriteBatchPreparation,
-    ) -> Result<Self, LixError> {
-        Self::from_certified_parameter_rows(
-            entity_pks,
-            snapshots,
-            schema_key,
-            branch_id,
-            certificate,
-        )
     }
 
     fn from_certified_parameter_rows(
@@ -2543,12 +2521,50 @@ struct DenseCertifiedParameterSlots {
     facts: PreparedRowFacts,
     schema_key: u32,
     origin_key: Option<u32>,
-    timestamp: LixTimestamp,
+    timestamps: DenseParameterTimestamps,
     commit_id: Option<CommitId>,
     branch_id: u32,
     /// Absent until commit-delta publication assigns direct addresses. The
     /// compact segment map derives every UUID without a million-row column.
     direct_change_ids: Option<OrderedAddressableCommitDeltaStage>,
+}
+
+#[derive(Debug, Clone)]
+enum DenseParameterTimestamps {
+    Scalar(LixTimestamp),
+    PerRow(Vec<LixTimestamp>),
+}
+
+impl DenseParameterTimestamps {
+    fn get(&self, row_index: usize) -> LixTimestamp {
+        match self {
+            Self::Scalar(timestamp) => *timestamp,
+            Self::PerRow(timestamps) => timestamps[row_index],
+        }
+    }
+
+    fn append(&mut self, left_len: usize, right_len: usize, right: Self) {
+        if let (Self::Scalar(left), Self::Scalar(right)) = (&*self, &right)
+            && left == right
+        {
+            return;
+        }
+        let mut timestamps = match self {
+            Self::Scalar(timestamp) => {
+                let mut timestamps = Vec::with_capacity(left_len.saturating_add(right_len));
+                timestamps.resize(left_len, *timestamp);
+                timestamps
+            }
+            Self::PerRow(timestamps) => std::mem::take(timestamps),
+        };
+        match right {
+            Self::Scalar(timestamp) => {
+                timestamps.resize(timestamps.len().saturating_add(right_len), timestamp);
+            }
+            Self::PerRow(mut right) => timestamps.append(&mut right),
+        }
+        *self = Self::PerRow(timestamps);
+    }
 }
 
 /// Borrowed row projection over a [`PreparedStateBatch`].
@@ -2678,8 +2694,8 @@ impl PreparedStateBatch {
                 metadata: None,
                 origin: None,
                 origin_key: dense.origin_key.map(|index| &self.strings[index as usize]),
-                created_at: dense.timestamp,
-                updated_at: dense.timestamp,
+                created_at: dense.timestamps.get(index),
+                updated_at: dense.timestamps.get(index),
                 global: false,
                 change_id: Some(dense.direct_change_ids.as_ref().map_or_else(
                     ChangeId::default,
@@ -2875,8 +2891,8 @@ impl PreparedStateBatch {
                 metadata: None,
                 origin: None,
                 origin_key: dense.origin_key,
-                created_at: dense.timestamp,
-                updated_at: dense.timestamp,
+                created_at: dense.timestamps.get(row_index),
+                updated_at: dense.timestamps.get(row_index),
                 global: false,
                 change_id: Some(dense.direct_change_ids.as_ref().map_or_else(
                     ChangeId::default,
@@ -2909,6 +2925,74 @@ impl PreparedStateBatch {
         });
     }
 
+    /// Extends one fixed-shape certified parameter journal without expanding
+    /// either side into row slots. Repeated `Transaction::execute` calls
+    /// arrive as singleton batches; compatible ordered writes are one logical
+    /// columnar morsel and only need row-cardinal identity, JSON, and timestamp
+    /// columns.
+    fn try_append_dense_certified_parameter(&mut self, other: &mut Self) -> bool {
+        let compatible = match (
+            self.dense_certified_parameter.as_ref(),
+            other.dense_certified_parameter.as_ref(),
+        ) {
+            (Some(left), Some(right)) => {
+                let same_origin_key = match (left.origin_key, right.origin_key) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => {
+                        self.strings[left as usize] == other.strings[right as usize]
+                    }
+                    (None, Some(_)) | (Some(_), None) => false,
+                };
+                left.schema_plan_id == right.schema_plan_id
+                    && left.facts == right.facts
+                    && self.strings[left.schema_key as usize]
+                        == other.strings[right.schema_key as usize]
+                    && self.strings[left.branch_id as usize]
+                        == other.strings[right.branch_id as usize]
+                    && same_origin_key
+                    && left.commit_id == right.commit_id
+                    && left.direct_change_ids.is_none()
+                    && right.direct_change_ids.is_none()
+                    && self.durable_predecessors.is_empty()
+                    && other.durable_predecessors.is_empty()
+                    && self.origins.is_empty()
+                    && other.origins.is_empty()
+                    && self.origin_column_sets.is_empty()
+                    && other.origin_column_sets.is_empty()
+                    && self.certified_tracked_keys_strictly_ordered
+                    && other.certified_tracked_keys_strictly_ordered
+                    && self
+                        .entity_pks
+                        .last()
+                        .zip(other.entity_pks.first())
+                        .is_some_and(|(left, right)| left < right)
+            }
+            (None, _) | (_, None) => false,
+        };
+        if !compatible {
+            return false;
+        }
+
+        let right = other
+            .dense_certified_parameter
+            .take()
+            .expect("compatible dense parameter batch");
+        let left = self
+            .dense_certified_parameter
+            .as_mut()
+            .expect("compatible dense parameter batch");
+        left.timestamps
+            .append(left.len, right.len, right.timestamps);
+        left.len = left
+            .len
+            .checked_add(right.len)
+            .expect("prepared dense parameter row count overflowed");
+        self.entity_pks.append(&mut other.entity_pks);
+        self.json.append(&mut other.json);
+        self.certified_complete_collection_replacement = false;
+        true
+    }
+
     /// Appends another batch without materializing row-owned intermediates.
     pub(crate) fn append(&mut self, mut other: Self) {
         if other.is_empty() {
@@ -2916,6 +3000,9 @@ impl PreparedStateBatch {
         }
         if self.is_empty() {
             *self = other;
+            return;
+        }
+        if self.try_append_dense_certified_parameter(&mut other) {
             return;
         }
         self.expand_dense_certified_parameter();
@@ -3232,6 +3319,20 @@ impl PreparedStateBatch {
             dense.facts,
             self.strings[dense.schema_key as usize].as_str(),
             self.strings[dense.branch_id as usize].as_str(),
+        ))
+    }
+
+    /// Returns the contiguous snapshot column for a single certified entity
+    /// generation. Commit-time derived indexes can consume this column
+    /// directly instead of first allocating row ordinals and projecting the
+    /// same fixed metadata through `PreparedStateRowRef` for every row.
+    pub(crate) fn dense_entity_columnar_input(&self) -> Option<(CommitId, &str, &[StageJson])> {
+        let dense = self.dense_certified_parameter.as_ref()?;
+        let commit_id = dense.commit_id?;
+        Some((
+            commit_id,
+            self.strings[dense.schema_key as usize].as_str(),
+            &self.json[..dense.len],
         ))
     }
 
@@ -3980,6 +4081,63 @@ mod tests {
         assert!(!prepared.certified_complete_collection_replacement());
         assert!(!prepared.certified_tracked_keys_strictly_ordered());
         assert_eq!(prepared.row(0).entity_pk, &EntityPk::single("a"));
+    }
+
+    #[test]
+    fn compatible_dense_replacements_coalesce_with_per_row_timestamps() {
+        let certificate = CertifiedRawWriteBatchPreparation {
+            schema_plan_id: SchemaPlanId::for_test(9),
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+            tracked_keys_strictly_ordered: true,
+            complete_collection_replacement: false,
+        };
+        let prepare = |key: &str, timestamp| {
+            CertifiedParameterReplacementBatch::new(
+                vec![EntityPk::single(key)],
+                vec![
+                    TransactionJson::from_certified_shared_normalized_row_content(
+                        format!(r#"{{"id":"{key}"}}"#).into(),
+                    ),
+                ],
+                "dense_replacement".into(),
+                "main".into(),
+                certificate,
+            )
+            .expect("certified replacement should construct")
+            .into_dense_prepared(None, timestamp)
+            .expect("certified replacement should prepare")
+        };
+        let first_timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z");
+        let second_timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:01.000Z");
+        let commit_id = CommitId::for_test_label("dense-coalesced-replacements");
+        let mut prepared = prepare("a", first_timestamp);
+        prepared.set_commit_id_all(commit_id);
+        let mut second = prepare("b", second_timestamp);
+        second.set_commit_id_all(commit_id);
+
+        prepared.append(second);
+
+        assert!(prepared.is_dense_certified_parameter());
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared.row(0).created_at, first_timestamp);
+        assert_eq!(prepared.row(1).created_at, second_timestamp);
+        assert_eq!(prepared.row(0).commit_id, Some(commit_id));
+        assert_eq!(prepared.row(1).commit_id, Some(commit_id));
+        assert!(prepared.certified_tracked_keys_strictly_ordered());
+        let (columnar_commit_id, schema_key, snapshots) = prepared
+            .dense_entity_columnar_input()
+            .expect("coalesced replacement retains contiguous columnar input");
+        assert_eq!(columnar_commit_id, commit_id);
+        assert_eq!(schema_key, "dense_replacement");
+        assert_eq!(snapshots.len(), 2);
+
+        prepared.append(prepare("a", second_timestamp));
+        assert!(!prepared.is_dense_certified_parameter());
+        assert!(!prepared.certified_tracked_keys_strictly_ordered());
+        assert_eq!(prepared.len(), 3);
     }
 
     #[test]
