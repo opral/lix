@@ -1440,10 +1440,9 @@ where
             )?;
         }
 
-        let statements = statements.to_vec();
-        match classify_execute_batch(&statements, &self.sql_planning_cache)? {
+        match classify_execute_batch(statements, &self.sql_planning_cache)? {
             ExecuteBatchExecution::ReadOnly(parsed) => {
-                self.execute_read_only_batch(&statements, parsed).await
+                self.execute_read_only_batch(statements, parsed).await
             }
             ExecuteBatchExecution::Transaction(parsed) => {
                 let contains_write = parsed.contains_write()?;
@@ -1520,140 +1519,133 @@ where
 
     async fn execute_transaction_batch(
         &self,
-        statements: Vec<ExecuteBatchStatement>,
+        statements: &[ExecuteBatchStatement],
         parsed: TransactionBatchStatements,
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let telemetry_sink = self.telemetry.clone();
-        let statements = Arc::new(statements);
-        let transaction_statements = Arc::clone(&statements);
         let parameter_route = Arc::new(AtomicBool::new(false));
         let transaction_parameter_route = Arc::clone(&parameter_route);
         let transaction_telemetry_sink = telemetry_sink.clone();
         let result = self
-            .with_write_transaction(move |transaction| {
-                Box::pin(async move {
-                    if let Some(results) = try_execute_transaction_parameter_batch(
-                        transaction,
-                        &transaction_statements,
-                        &parsed,
-                        &options,
-                        &statement_metadata,
-                        &transaction_parameter_route,
-                    )
-                    .await?
-                    {
-                        if let Some(idempotency) = &idempotency {
-                            let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
-                            transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
-                        }
-                        return Ok(results);
-                    }
-                    let mut results = Vec::with_capacity(transaction_statements.len());
-                    match parsed {
-                        TransactionBatchStatements::AutoParameterizedUpdate {
-                            sql,
-                            statement: parsed,
-                            parameter_batch,
-                        } => {
-                            for (statement_index, (statement, metadata)) in transaction_statements
-                                .iter()
-                                .zip(statement_metadata)
-                                .enumerate()
-                            {
-                                let params = sql2::parameter_row(&parameter_batch, statement_index)
-                                    .map_err(|error| {
-                                        with_batch_statement_index(error, statement_index)
-                                    })?;
-                                let telemetry = SqlStatementTelemetry::start(
-                                    transaction_telemetry_sink.as_ref(),
-                                    &statement.sql,
-                                    "batch",
-                                    Some(statement_index),
-                                );
-                                let operation = async {
-                                    execute_transaction_statement(
-                                        transaction,
-                                        &sql,
-                                        parsed.clone(),
-                                        &params,
-                                        options.clone(),
-                                        metadata,
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        with_batch_statement_index(
-                                            normalize_sql_surface_error(error, &statement.sql),
-                                            statement_index,
-                                        )
-                                    })
-                                };
-                                let result = match telemetry.as_ref() {
-                                    Some(telemetry) => telemetry.instrument(operation).await,
-                                    None => operation.await,
-                                };
-                                if let Some(telemetry) = telemetry {
-                                    telemetry.finish(&result);
-                                }
-                                results.push(result?);
-                            }
-                        }
-                        parsed => {
-                            for (statement_index, ((statement, parsed), metadata)) in
-                                transaction_statements
-                                    .iter()
-                                    .zip(parsed.into_vec())
-                                    .zip(statement_metadata)
-                                    .enumerate()
-                            {
-                                let telemetry = SqlStatementTelemetry::start(
-                                    transaction_telemetry_sink.as_ref(),
-                                    &statement.sql,
-                                    "batch",
-                                    Some(statement_index),
-                                );
-                                let operation = async {
-                                    execute_transaction_statement(
-                                        transaction,
-                                        &statement.sql,
-                                        parsed,
-                                        &statement.params,
-                                        options.clone(),
-                                        metadata,
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        with_batch_statement_index(
-                                            normalize_sql_surface_error(error, &statement.sql),
-                                            statement_index,
-                                        )
-                                    })
-                                };
-                                let result = match telemetry.as_ref() {
-                                    Some(telemetry) => telemetry.instrument(operation).await,
-                                    None => operation.await,
-                                };
-                                if let Some(telemetry) = telemetry {
-                                    telemetry.finish(&result);
-                                }
-                                results.push(result?);
-                            }
-                        }
-                    }
+            .with_write_transaction_lending(async move |transaction| {
+                if let Some(results) = try_execute_transaction_parameter_batch(
+                    transaction,
+                    statements,
+                    &parsed,
+                    &options,
+                    &statement_metadata,
+                    &transaction_parameter_route,
+                )
+                .await?
+                {
                     if let Some(idempotency) = &idempotency {
                         let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
                         transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
                     }
-                    Ok(results)
-                })
+                    return Ok(results);
+                }
+                let mut results = Vec::with_capacity(statements.len());
+                match parsed {
+                    TransactionBatchStatements::AutoParameterizedUpdate {
+                        sql,
+                        statement: parsed,
+                        parameter_batch,
+                    } => {
+                        for (statement_index, (statement, metadata)) in
+                            statements.iter().zip(statement_metadata).enumerate()
+                        {
+                            let params = sql2::parameter_row(&parameter_batch, statement_index)
+                                .map_err(|error| {
+                                    with_batch_statement_index(error, statement_index)
+                                })?;
+                            let telemetry = SqlStatementTelemetry::start(
+                                transaction_telemetry_sink.as_ref(),
+                                &statement.sql,
+                                "batch",
+                                Some(statement_index),
+                            );
+                            let operation = async {
+                                execute_transaction_statement(
+                                    transaction,
+                                    &sql,
+                                    parsed.clone(),
+                                    &params,
+                                    options.clone(),
+                                    metadata,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    with_batch_statement_index(
+                                        normalize_sql_surface_error(error, &statement.sql),
+                                        statement_index,
+                                    )
+                                })
+                            };
+                            let result = match telemetry.as_ref() {
+                                Some(telemetry) => telemetry.instrument(operation).await,
+                                None => operation.await,
+                            };
+                            if let Some(telemetry) = telemetry {
+                                telemetry.finish(&result);
+                            }
+                            results.push(result?);
+                        }
+                    }
+                    parsed => {
+                        for (statement_index, ((statement, parsed), metadata)) in statements
+                            .iter()
+                            .zip(parsed.into_vec())
+                            .zip(statement_metadata)
+                            .enumerate()
+                        {
+                            let telemetry = SqlStatementTelemetry::start(
+                                transaction_telemetry_sink.as_ref(),
+                                &statement.sql,
+                                "batch",
+                                Some(statement_index),
+                            );
+                            let operation = async {
+                                execute_transaction_statement(
+                                    transaction,
+                                    &statement.sql,
+                                    parsed,
+                                    &statement.params,
+                                    options.clone(),
+                                    metadata,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    with_batch_statement_index(
+                                        normalize_sql_surface_error(error, &statement.sql),
+                                        statement_index,
+                                    )
+                                })
+                            };
+                            let result = match telemetry.as_ref() {
+                                Some(telemetry) => telemetry.instrument(operation).await,
+                                None => operation.await,
+                            };
+                            if let Some(telemetry) = telemetry {
+                                telemetry.finish(&result);
+                            }
+                            results.push(result?);
+                        }
+                    }
+                }
+                if let Some(idempotency) = &idempotency {
+                    let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
+                    transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
+                }
+                Ok(results)
             })
             .await;
         if parameter_route.load(Ordering::Relaxed) {
             finish_parameter_batch_statement_telemetry(
                 telemetry_sink.as_ref(),
-                &statements,
+                statements,
                 &result,
             );
         }
@@ -3756,15 +3748,22 @@ fn classify_execute_batch(
             builder.append_value(value);
             builders.push(builder);
         }
+        let mut decoded_params = first
+            .params
+            .iter()
+            .map(|param| match param {
+                Value::Text(value) => String::with_capacity(value.len()),
+                _ => unreachable!("auto-parameterized string literals produce text parameters"),
+            })
+            .collect::<Vec<_>>();
         for statement in &statements[1..] {
-            let params = planning_cache
-                .update_literal_params_for_shape(&statement.sql, first.sql.as_ref())
-                .expect("the non-retaining pass certified this UPDATE shape");
-            for (builder, param) in builders.iter_mut().zip(params) {
-                let Value::Text(value) = param else {
-                    unreachable!("auto-parameterized string literals produce text parameters")
-                };
-                builder.append_value(&value);
+            assert!(
+                planning_cache
+                    .decode_certified_update_literals_into(&statement.sql, &mut decoded_params,),
+                "the non-retaining pass certified this UPDATE shape"
+            );
+            for (builder, value) in builders.iter_mut().zip(&decoded_params) {
+                builder.append_value(value);
             }
         }
         let data_type = if large_offsets {

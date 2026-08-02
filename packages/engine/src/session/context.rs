@@ -499,9 +499,25 @@ where
             &'tx mut Transaction<StorageImpl>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
+        self.with_write_transaction_lending(async move |transaction| f(transaction).await)
+            .await
+    }
+
+    /// Runs a transaction with a lending async closure.
+    ///
+    /// Unlike the boxed compatibility entrypoint above, `AsyncFnOnce` ties
+    /// the returned future to both the transaction borrow and the closure's
+    /// captured borrows. Large callers can therefore borrow prepared input
+    /// for the duration of the transaction instead of deep-cloning it into a
+    /// `'static` closure environment.
+    pub(crate) async fn with_write_transaction_lending<T, F>(&self, f: F) -> Result<T, LixError>
+    where
+        F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
+    {
         self.ensure_open()?;
         let write_access = self.begin_session_write_access().await?;
-        self.with_write_transaction_reserved(write_access, f).await
+        self.with_write_transaction_reserved_lending(write_access, f)
+            .await
     }
 
     pub(super) async fn with_write_transaction_reserved<T, F>(
@@ -513,6 +529,20 @@ where
         F: for<'tx> FnOnce(
             &'tx mut Transaction<StorageImpl>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
+    {
+        self.with_write_transaction_reserved_lending(write_access, async move |transaction| {
+            f(transaction).await
+        })
+        .await
+    }
+
+    pub(super) async fn with_write_transaction_reserved_lending<T, F>(
+        &self,
+        write_access: SessionWriteAccess,
+        f: F,
+    ) -> Result<T, LixError>
+    where
+        F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
     {
         let planner_validation_is_serialized = write_access.serializes_collaboration_writes();
         // Automatic writes already hold the collaboration gate, so taking the
