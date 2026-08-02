@@ -16,8 +16,7 @@ use crate::changelog::{
 use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_commits};
 use crate::commit_graph::{
     CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
-    CommitGraphCommit, CommitGraphCommitRecord, CommitGraphEdge, CommitGraphReader,
-    ReachableCommitGraphCommit,
+    CommitGraphCommit, CommitGraphCommitRecord, CommitGraphReader, ReachableCommitGraphCommit,
 };
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::StorageAdapterRead;
@@ -202,22 +201,6 @@ where
                     .collect(),
             )),
         }
-    }
-
-    /// Derives parent/child edges from parsed commits.
-    pub(crate) fn commit_edges(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge> {
-        commits
-            .iter()
-            .flat_map(|commit| {
-                commit.parent_commit_ids.iter().enumerate().map(
-                    |(parent_order, parent_commit_id)| CommitGraphEdge {
-                        parent_commit_id: *parent_commit_id,
-                        child_commit_id: commit.commit_id,
-                        parent_order: parent_order as u32,
-                    },
-                )
-            })
-            .collect()
     }
 
     /// Returns canonical changes reachable from `start_commit_id`.
@@ -662,22 +645,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn commit_edges_are_derived_from_parent_commit_ids() {
-        let graph = CommitGraphContext::new();
-        let storage = StorageAdapter::new(Memory::new());
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let reader = graph.reader(read);
+    #[test]
+    fn commit_edges_are_derived_from_parent_commit_ids() {
         let commits = vec![parsed_commit(
             "commit-head",
             &[],
             &["commit-left", "commit-right"],
         )];
 
-        let edges = reader.commit_edges(&commits);
+        let edges = crate::commit_graph::commit_edges(&commits);
 
         assert_eq!(
             edges
