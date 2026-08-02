@@ -79,6 +79,11 @@ const HOT_DIFF_SEGMENT_MAX_IDENTITIES: u32 = 4_096;
 // Real-repository profiling showed that smaller batches contribute negligible
 // storage amplification, so retain their allocation-free direct-key path.
 const HOT_DIFF_PACK_MIN_IDENTITIES: usize = 64;
+// Native analytical reads materialize their complete public result, so a
+// one-base payload pass may scale with that requested result. Keep the eager
+// compatibility path bounded while covering the 1M-row (about 2k-segment)
+// analytical scan target; multi-base scans retain their smaller merge bound.
+const PACKED_BROAD_SNAPSHOT_MAX_SEGMENTS: usize = 4_096;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V1: &[u8; 4] = b"CEB1";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V2: &[u8; 4] = b"CEB2";
@@ -2926,7 +2931,18 @@ async fn scan_packed_current_base_rows(
                     store,
                     base_ref.commit_id,
                     &request.filter.schema_keys,
-                    512,
+                    // A direct public scan over one base must return every
+                    // visible row anyway. Limiting that one-pass route by
+                    // *segment* count turned large collections into a
+                    // two-pass scan: first the identity/value plane, then a
+                    // million owned key lookups for the payloads. Keep the
+                    // resource bound for multi-base winner merges, but let
+                    // the one-base route decode every selected segment once.
+                    if single_base {
+                        PACKED_BROAD_SNAPSHOT_MAX_SEGMENTS
+                    } else {
+                        512
+                    },
                 )
                 .await?;
             if single_base {

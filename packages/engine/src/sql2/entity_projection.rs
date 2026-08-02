@@ -360,6 +360,15 @@ fn parse_json_value(raw: &RawValue) -> Result<JsonValue, LixError> {
 }
 
 fn raw_string_text(raw: &RawValue) -> Result<Option<String>, LixError> {
+    // String-valued entity fields dominate broad public reads. Deserializing
+    // through `serde_json::Value` first allocates the string and then clones
+    // it again in `json_value_to_string`. Decode the JSON string directly;
+    // all non-string coercions retain the established general path below.
+    if raw.get().trim_start().starts_with('"') {
+        return serde_json::from_str(raw.get())
+            .map(Some)
+            .map_err(snapshot_decode_error);
+    }
     crate::common::json_value_to_string(&parse_json_value(raw)?)
 }
 
