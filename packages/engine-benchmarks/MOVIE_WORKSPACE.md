@@ -63,8 +63,7 @@ hashing records only ordered key identities and lengths; the identity hasher is
 never updated with payload bytes, so publication has no second payload-sized
 hashing pass.
 
-Across the four-part latency cases, SlateDB recorded 600 locator-row staging
-operations, 128–136 logical object-store calls, 90 cache filesystem read
-attempts, 16 write attempts, no remove attempts, and 0.063–0.077 ms total
-writer-gate wait. Locator staging includes retry attempts; only atomically
-committed locators become visible.
+The harness reports locator staging attempts, logical object-store calls,
+cache filesystem attempts, and writer-gate wait for every run. Locator staging
+includes optimistic retry work; only atomically committed locators become
+visible.

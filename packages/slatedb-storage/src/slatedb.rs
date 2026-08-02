@@ -144,6 +144,7 @@ struct ImmutableValueStore {
     prefix: ObjectPath,
     cache: Option<ImmutableValueCache>,
     counters: Option<SlateDBIoCounters>,
+    process_segments: Arc<AsyncMutex<HashSet<Key>>>,
 }
 
 impl ImmutableValueStore {
@@ -158,6 +159,7 @@ impl ImmutableValueStore {
             prefix: ObjectPath::from(join_db_path(db_path, IMMUTABLE_VALUE_PATH)),
             cache: cache.map(|options| ImmutableValueCache::new(options, counters.clone())),
             counters,
+            process_segments: Arc::new(AsyncMutex::new(HashSet::new())),
         }
     }
 
@@ -174,6 +176,11 @@ impl ImmutableValueStore {
     }
 
     async fn put_segments(&self, segments: Vec<ImmutableSegment>) -> Result<(), StorageError> {
+        {
+            let mut process_segments = self.process_segments.lock().await;
+            process_segments.extend(segments.iter().map(|segment| segment.id.clone()));
+        }
+        tokio::task::yield_now().await;
         let results = stream::iter(segments)
             .map(|segment| {
                 let store = Arc::clone(&self.object_store);
@@ -419,13 +426,27 @@ impl ImmutableValueStore {
             .map(|key| self.location(key))
             .collect::<Result<HashSet<_>, _>>()?;
         let mut objects = self.object_store.list(Some(&self.prefix));
+        let mut candidates = Vec::new();
         while let Some(object) = objects.next().await {
             let object = object.map_err(object_store_error)?;
             if !reachable.contains(&object.location)
                 && SystemTime::from(object.last_modified) <= cutoff
             {
+                candidates.push(object.location);
+            }
+        }
+        // Segments uploaded or reused by this process are protected until
+        // restart. Hold registration across the short candidate sweep so a
+        // concurrent upload cannot pass the check and then lose its object.
+        let process_segments = self.process_segments.lock().await;
+        let process_locations = process_segments
+            .iter()
+            .map(|key| self.location(key))
+            .collect::<Result<HashSet<_>, _>>()?;
+        for location in candidates {
+            if !process_locations.contains(&location) {
                 self.object_store
-                    .delete(&object.location)
+                    .delete(&location)
                     .await
                     .map_err(object_store_error)?;
             }
@@ -800,7 +821,7 @@ pub struct SlateDB {
     write_gate: WriteGate,
     write_pipeline: WritePipeline,
     point_cache: SnapshotPointCache,
-    startup_gc: Arc<tokio::sync::OnceCell<()>>,
+    startup_gc: Arc<tokio::sync::OnceCell<Result<(), String>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2332,18 +2353,24 @@ impl SlateDB {
         })
     }
 
-    fn schedule_startup_immutable_gc(&self) {
-        if self.startup_gc.set(()).is_err() {
-            return;
-        }
+    async fn ensure_startup_immutable_gc(&self) -> Result<(), StorageError> {
+        // Qualification targets one active SlateDB adapter per namespace;
+        // distributed multi-writer sidecar GC is intentionally out of scope.
         let worker = self.worker.clone();
         let store = self.immutable_value_store.clone();
         let cutoff = SystemTime::now()
             .checked_sub(IMMUTABLE_GC_GRACE)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        tokio::spawn(async move {
-            let _ = collect_startup_immutable_garbage(&worker, &store, cutoff).await;
-        });
+        self.startup_gc
+            .get_or_init(|| async move {
+                collect_startup_immutable_garbage(&worker, &store, cutoff)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .as_ref()
+            .map_err(|error| StorageError::Io(error.clone()))
+            .copied()
     }
 
     pub fn path(&self) -> &Path {
@@ -2450,7 +2477,7 @@ impl Storage for SlateDB {
         opts: WriteOptions,
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
-            self.schedule_startup_immutable_gc();
+            self.ensure_startup_immutable_gc().await?;
             Ok(SlateDBWrite {
                 worker: self.worker.clone(),
                 immutable_value_store: self.immutable_value_store.clone(),
@@ -5002,7 +5029,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_gc_grace_protects_new_segments_then_removes_old_orphans() {
+    async fn startup_gc_protects_recent_and_reused_segments() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let storage = SlateDB::open_object_store_with_options(
             "startup-immutable-gc",
@@ -5014,9 +5041,16 @@ mod tests {
         writer
             .insert(Key(Bytes::from(vec![8; 32])), Bytes::from_static(b"orphan"))
             .expect("stage orphan");
-        storage
+        let segment = writer.finish(|_| true).expect("finish orphan").remove(0);
+        let orphan_location = storage
             .immutable_value_store
-            .put_segments(writer.finish(|_| true).expect("finish orphan"))
+            .location(&segment.id)
+            .expect("locate orphan");
+        object_store
+            .put(
+                &orphan_location,
+                segment.frames.clone().into_iter().collect::<PutPayload>(),
+            )
             .await
             .expect("upload orphan");
         collect_startup_immutable_garbage(
@@ -5036,6 +5070,11 @@ mod tests {
             1,
             "new in-flight segments must survive the GC grace window"
         );
+        storage
+            .immutable_value_store
+            .put_segments(vec![segment])
+            .await
+            .expect("reuse old orphan before publication");
         collect_startup_immutable_garbage(
             &storage.worker,
             &storage.immutable_value_store,
@@ -5048,7 +5087,46 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .expect("list immutable objects");
-        assert!(objects.is_empty(), "startup GC must remove orphan segments");
+        assert_eq!(
+            objects.len(),
+            1,
+            "GC must not delete an old segment reused by an in-flight write"
+        );
+        let mut stale_writer = ImmutableSegmentWriter::default();
+        stale_writer
+            .insert(Key(Bytes::from(vec![9; 32])), Bytes::from_static(b"stale"))
+            .expect("stage stale orphan");
+        let stale = stale_writer
+            .finish(|_| true)
+            .expect("finish stale orphan")
+            .remove(0);
+        object_store
+            .put(
+                &storage
+                    .immutable_value_store
+                    .location(&stale.id)
+                    .expect("locate stale orphan"),
+                stale.frames.into_iter().collect::<PutPayload>(),
+            )
+            .await
+            .expect("upload stale orphan");
+        collect_startup_immutable_garbage(
+            &storage.worker,
+            &storage.immutable_value_store,
+            SystemTime::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("collect stale orphan");
+        assert_eq!(
+            object_store
+                .list(Some(&storage.immutable_value_store.prefix))
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("list after stale collection")
+                .len(),
+            1,
+            "GC must remove unreferenced segments not used by this process"
+        );
     }
 
     #[tokio::test]
@@ -7236,7 +7314,7 @@ mod tests {
             .await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
     async fn immutable_uploads_overlap_without_blocking_mutable_publication() {
         let store = BlockingStore::new(Arc::new(InMemory::new()));
         let storage = SlateDB::open_object_store_with_options(
@@ -7478,7 +7556,11 @@ mod tests {
             let mut state = self.block.state.lock().expect("lock operation block");
             while state.entries < expected {
                 let now = Instant::now();
-                assert!(now < deadline, "timed out waiting for {description}");
+                assert!(
+                    now < deadline,
+                    "timed out waiting for {description}; observed {}",
+                    state.entries
+                );
                 let (next_state, _) = self
                     .block
                     .available
