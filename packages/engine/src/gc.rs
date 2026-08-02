@@ -1511,7 +1511,7 @@ mod tests {
                 .find(|member| member.value.change_id == source_change.change_id)
                 .and_then(|member| member.base_coordinate),
             Some(base_coordinate),
-            "GC promotion must preserve the immutable analytical-base address"
+            "GC promotion must preserve the immutable columnar-base address"
         );
         assert_eq!(
             alias
@@ -1931,7 +1931,7 @@ mod tests {
                     updated_at: timestamp,
                     snapshot: snapshot_slot.as_ref_slot(),
                     metadata: crate::json_store::JsonSlotRef::None,
-                    analytical_base_coordinate: None,
+                    columnar_base_coordinate: None,
                 }],
                 &BTreeSet::new(),
                 None,

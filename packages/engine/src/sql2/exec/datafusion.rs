@@ -2566,10 +2566,6 @@ mod tests {
         snapshots: Vec<Option<Bytes>>,
         requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
     }
-    struct CountingEntitySnapshotReader {
-        count: u64,
-        requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
-    }
     struct SchemaEntitySnapshotReader {
         snapshots: std::collections::BTreeMap<String, Vec<Option<Bytes>>>,
     }
@@ -3312,27 +3308,6 @@ mod tests {
     }
 
     #[async_trait]
-    impl EntitySnapshotReader for CountingEntitySnapshotReader {
-        async fn count_entity_snapshots(
-            &self,
-            request: LiveStateScanRequest,
-        ) -> Result<Option<u64>, LixError> {
-            self.requests
-                .lock()
-                .expect("captured count requests lock")
-                .push(request);
-            Ok(Some(self.count))
-        }
-
-        async fn scan_entity_snapshots(
-            &self,
-            _request: LiveStateScanRequest,
-        ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-            panic!("metadata count must not materialize entity snapshots");
-        }
-    }
-
-    #[async_trait]
     impl EntitySnapshotReader for SchemaEntitySnapshotReader {
         async fn scan_entity_snapshots(
             &self,
@@ -3765,58 +3740,6 @@ mod tests {
                 crate::entity_pk::EntityPk::single("entity-b"),
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn native_entity_count_reads_collection_metadata_without_scanning_rows() {
-        let sql = "SELECT COUNT(*) AS total FROM test_state_schema";
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let scans = Arc::new(AtomicUsize::new(0));
-        let ctx = DummySqlExecutionContext {
-            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
-            blob_reader: Arc::new(DummyBlobReader),
-            live_state: Arc::new(CountingRowsLiveStateReader {
-                rows: Vec::new(),
-                scans: Arc::clone(&scans),
-            }),
-            entity_snapshot_reader: Some(Arc::new(CountingEntitySnapshotReader {
-                count: 1_000_000,
-                requests: Arc::clone(&requests),
-            })),
-            schema_definitions: vec![json!({
-                "x-lix-key": "test_state_schema",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
-                "additionalProperties": false
-            })],
-        };
-        let statement = crate::sql2::parse_statement(sql).expect("test SQL should parse");
-
-        let result = super::super::bound_public_read::try_execute_bound_public_read(
-            &ctx,
-            sql,
-            &statement,
-            &[],
-        )
-        .await
-        .expect("metadata count should execute")
-        .expect("strict count should use the metadata route");
-
-        assert_eq!(result.columns, ["total"]);
-        assert_eq!(result.rows, vec![vec![Value::Integer(1_000_000)]]);
-        assert_eq!(scans.load(Ordering::SeqCst), 0);
-        let requests = requests.lock().expect("captured count requests lock");
-        let [request] = requests.as_slice() else {
-            panic!("native count must issue one metadata request");
-        };
-        assert_eq!(request.filter.schema_keys, ["test_state_schema"]);
-        assert_eq!(
-            request.filter.branch_ids,
-            ["01920000-0000-7000-8000-0000000000a1"]
-        );
-        assert!(request.projection.columns.is_empty());
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! Repository-owned decoded columns for immutable analytical row groups.
+//! Repository-owned decoded columns for immutable columnar row groups.
 //!
 //! Entries are addressed only by persisted content. Visibility artifacts
 //! (providers, overlays, coordinate masks, and transaction state) deliberately

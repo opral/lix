@@ -7,7 +7,6 @@ use crate::common::top_level_property_name;
 use crate::entity_pk::canonical_json_text;
 
 const DOC_ONLY_SCHEMA_FIELDS: &[&str] = &["$comment", "deprecated", "description", "title"];
-const STORAGE_POLICY_FIELDS: &[&str] = &["x-lix-columnar"];
 const CONSTRAINT_FIELDS: &[&str] = &[
     "x-lix-primary-key",
     "x-lix-unique",
@@ -247,10 +246,7 @@ fn top_level_semantic_fields(schema: &JsonValue) -> BTreeMap<String, JsonValue> 
     object
         .into_iter()
         .filter(|(key, _)| {
-            key != "properties"
-                && key != "required"
-                && !CONSTRAINT_FIELDS.contains(&key.as_str())
-                && !STORAGE_POLICY_FIELDS.contains(&key.as_str())
+            key != "properties" && key != "required" && !CONSTRAINT_FIELDS.contains(&key.as_str())
         })
         .collect()
 }
@@ -389,22 +385,6 @@ mod tests {
         next["properties"]["title"]["deprecated"] = json!(true);
 
         validate_schema_amendment(&previous, &next).expect("doc-only changes are compatible");
-    }
-
-    #[test]
-    fn allows_columnar_storage_policy_amendments() {
-        let previous = base_schema();
-        let mut opt_out = base_schema();
-        opt_out["x-lix-columnar"] = json!(false);
-        validate_schema_amendment(&previous, &opt_out)
-            .expect("an existing schema can opt out of derived columnar storage");
-
-        let mut explicit_default = base_schema();
-        explicit_default["x-lix-columnar"] = json!(true);
-        validate_schema_amendment(&previous, &explicit_default)
-            .expect("absent and explicit default columnar policies are compatible");
-        validate_schema_amendment(&opt_out, &explicit_default)
-            .expect("an existing schema can opt back into derived columnar storage");
     }
 
     #[test]

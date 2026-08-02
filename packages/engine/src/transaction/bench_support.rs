@@ -394,7 +394,7 @@ where
                 updated_at: timestamp,
                 snapshot: snapshot.as_ref_slot(),
                 metadata: crate::json_store::JsonSlotRef::None,
-                analytical_base_coordinate: None,
+                columnar_base_coordinate: None,
             }],
             &BTreeSet::new(),
             None,

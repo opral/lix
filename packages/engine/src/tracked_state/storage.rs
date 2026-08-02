@@ -74,7 +74,7 @@ const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
 const GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const GENERIC_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
 const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
-// Version 10 adds optional analytical-base coordinates to indexed payload
+// Version 10 adds optional columnar-base coordinates to indexed payload
 // records. Reject version 9 as a whole instead of letting coordinate-aware
 // decoders ambiguously interpret its shorter authored/certified records.
 const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD10";
@@ -6507,7 +6507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_packed_lookup_round_trips_analytical_base_coordinates() {
+    async fn exact_packed_lookup_round_trips_columnar_base_coordinates() {
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = CommitId::for_test_label("base-coordinate-owner");
         let base_commit_id = CommitId::for_test_label("base-coordinate-layout");
@@ -7629,7 +7629,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_payload_kinds_round_trip_analytical_base_coordinates() {
+    fn indexed_payload_kinds_round_trip_columnar_base_coordinates() {
         let commit_id = CommitId::for_test_label("coordinate-codec-owner");
         let base_commit_id = CommitId::for_test_label("coordinate-codec-base");
         let fixtures = packed_commit_delta_fixtures()

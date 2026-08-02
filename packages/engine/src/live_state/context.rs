@@ -98,7 +98,7 @@ struct CachedEntityColumnarLayout {
 
 #[derive(Debug, Default)]
 struct EntityColumnarLayoutCache {
-    // Oldest entry first. Analytical planning is infrequent relative to batch
+    // Oldest entry first. Columnar planning is infrequent relative to batch
     // execution, so a tiny vector keeps the synchronization and bookkeeping
     // cost below that of a second index.
     entries: StdMutex<Vec<std::sync::Arc<CachedEntityColumnarLayout>>>,
@@ -433,40 +433,6 @@ impl<S> LiveStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    /// Counts one directly-addressable entity collection from its publication
-    /// control. The direct snapshot route already proves that no global or
-    /// multi-branch visibility composition is required; retaining that proof
-    /// here makes `COUNT(*)` a metadata read rather than a million-row scan.
-    pub(crate) async fn count_direct_entity_snapshots(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<Option<u64>, LixError> {
-        if !request.filter.entity_pks.is_empty() || request.limit.is_some() {
-            return Ok(None);
-        }
-        let Some((branch_id, control, schema_key)) =
-            self.direct_entity_snapshot_scope(request).await?
-        else {
-            return Ok(None);
-        };
-        let generation = self
-            .tracked_head
-            .reader(&self.store)
-            .collection_generation(
-                &branch_id,
-                control.generation,
-                crate::collection_generation::CollectionScopeRef {
-                    schema_key: &schema_key,
-                    file_id: None,
-                },
-            )
-            .await?;
-        Ok(
-            (generation.live_count != crate::collection_generation::DEFERRED_LIVE_COUNT)
-                .then_some(generation.live_count),
-        )
-    }
-
     /// Returns raw current-state snapshot bytes for one current SQL entity scan.
     ///
     /// `None` means the normal materialized visibility path remains
@@ -2691,7 +2657,7 @@ mod tests {
                     updated_at: ts(&row.updated_at),
                     snapshot: snapshot.as_ref_slot(),
                     metadata: metadata.as_ref_slot(),
-                    analytical_base_coordinate: None,
+                    columnar_base_coordinate: None,
                 })
                 .collect::<Vec<_>>();
             let schema_keys = parent_rows
@@ -2774,7 +2740,7 @@ mod tests {
                     updated_at: ts(&row.updated_at),
                     snapshot: snapshot.as_ref_slot(),
                     metadata: metadata.as_ref_slot(),
-                    analytical_base_coordinate: None,
+                    columnar_base_coordinate: None,
                 })
                 .collect::<Vec<_>>();
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();

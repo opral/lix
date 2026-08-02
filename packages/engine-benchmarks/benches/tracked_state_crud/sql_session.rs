@@ -58,30 +58,25 @@ impl OlapReadShape {
     pub(crate) const fn sql(self) -> &'static str {
         match self {
             Self::Scan => {
-                "WITH source AS (SELECT id, ordinal, lane, score, active FROM olap_row) \
-                 SELECT id, ordinal, lane, score, active FROM source WHERE ordinal >= 0"
+                "SELECT id, ordinal, lane, score, active FROM olap_row WHERE ordinal >= 0"
             }
             Self::Filter => {
-                "WITH source AS (SELECT id, ordinal, lane, score, active FROM olap_row) \
-                 SELECT ordinal, lane, score FROM source \
+                "SELECT ordinal, lane, score FROM olap_row \
                  WHERE active = TRUE AND lane IN ('lane-07', 'lane-19') ORDER BY ordinal"
             }
             Self::Sort => {
-                "WITH source AS (SELECT id, ordinal, lane, score, active FROM olap_row) \
-                 SELECT id, ordinal, score FROM source WHERE active = TRUE \
+                "SELECT id, ordinal, score FROM olap_row WHERE active = TRUE \
                  ORDER BY score DESC, ordinal ASC LIMIT 10000"
             }
             Self::Group => {
-                "WITH source AS (SELECT id, ordinal, lane, score, active FROM olap_row) \
-                 SELECT lane, COUNT(*) AS rows, SUM(ordinal) AS ordinal_sum, \
+                "SELECT lane, COUNT(*) AS rows, SUM(ordinal) AS ordinal_sum, \
                  AVG(score) AS score_avg, MIN(score) AS score_min, MAX(score) AS score_max \
-                 FROM source WHERE active = TRUE GROUP BY lane ORDER BY lane"
+                 FROM olap_row WHERE active = TRUE GROUP BY lane ORDER BY lane"
             }
             Self::Aggregate => {
-                "WITH source AS (SELECT id, ordinal, lane, score, active FROM olap_row) \
-                 SELECT COUNT(*) AS rows, SUM(ordinal) AS ordinal_sum, AVG(score) AS score_avg, \
+                "SELECT COUNT(*) AS rows, SUM(ordinal) AS ordinal_sum, AVG(score) AS score_avg, \
                  MIN(ordinal) AS min_ordinal, MAX(ordinal) AS max_ordinal \
-                 FROM source WHERE active = TRUE"
+                 FROM olap_row WHERE active = TRUE"
             }
         }
     }
@@ -1597,7 +1592,6 @@ where
     let schema = serde_json::json!({
         "x-lix-key": "tracked_crud_insert",
         "x-lix-primary-key": ["/path"],
-        "x-lix-columnar": false,
         "type": "object",
         "required": ["path", "value"],
         "properties": {

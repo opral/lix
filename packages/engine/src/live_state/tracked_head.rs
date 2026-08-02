@@ -19,12 +19,12 @@ pub(crate) use hot::{
     materialize_certified_root_rows, scan_certified_history_rows, stage_certified_entity_batches,
 };
 
-/// Stable physical address of a row in an immutable analytical base.
+/// Stable physical address of a row in an immutable columnar base.
 ///
 /// The owner commit is part of the address so consumers can fail closed when
 /// a stale coordinate is presented against a different base.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct AnalyticalBaseCoordinate {
+pub(crate) struct ColumnarBaseCoordinate {
     pub(crate) base_commit_id: CommitId,
     pub(crate) group_index: u32,
     pub(crate) row_index: u32,
@@ -231,7 +231,7 @@ struct HeadValue {
     updated_at: LixTimestamp,
     snapshot: JsonSlot,
     metadata: JsonSlot,
-    analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
+    columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
 }
 
 #[cfg(test)]
@@ -246,7 +246,7 @@ impl HeadValue {
             updated_at: self.updated_at,
             snapshot: self.snapshot.as_ref_slot(),
             metadata: self.metadata.as_ref_slot(),
-            analytical_base_coordinate: self.analytical_base_coordinate,
+            columnar_base_coordinate: self.columnar_base_coordinate,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         }
     }
@@ -262,7 +262,7 @@ struct HeadValueRef<'a> {
     updated_at: LixTimestamp,
     snapshot: JsonSlotRef<'a>,
     metadata: JsonSlotRef<'a>,
-    analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
+    columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
 }
 
@@ -313,7 +313,7 @@ impl<'a> TrackedHeadDeltaRef<'a> {
             updated_at: self.updated_at,
             snapshot: self.snapshot,
             metadata: self.metadata,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         }
     }
 }
@@ -337,7 +337,7 @@ pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
     pub(crate) snapshot: JsonSlotRef<'a>,
     pub(crate) metadata: JsonSlotRef<'a>,
-    pub(crate) analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
+    pub(crate) columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
 }
 
 /// Durable exact-read evidence aligned with a transaction delta.
@@ -367,7 +367,7 @@ pub(crate) struct PackedHeadValue {
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
     checkpoint_commit_id: Option<CommitId>,
-    analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
+    columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
 }
 
 impl<'a> CurrentStateDeltaRef<'a> {
@@ -393,7 +393,7 @@ impl<'a> CurrentStateDeltaRef<'a> {
             } else {
                 self.metadata
             },
-            analytical_base_coordinate: self.analytical_base_coordinate,
+            columnar_base_coordinate: self.columnar_base_coordinate,
             working_diff_baseline,
         }
     }
@@ -1324,7 +1324,7 @@ fn working_diff_error(message: &str) -> LixError {
 /// 42..50  updated_at packed timestamp (big endian)
 /// 50..54  snapshot payload byte length (big endian u32)
 /// 54..58  metadata payload byte length (big endian u32)
-/// 58      analytical base-coordinate presence (0 or 1)
+/// 58      columnar base-coordinate presence (0 or 1)
 /// 59..    snapshot payload, metadata payload, then an optional fixed
 ///          checkpoint before-image, then an optional 24-byte base coordinate
 /// ```
@@ -1336,7 +1336,7 @@ fn working_diff_error(message: &str) -> LixError {
 /// current state.
 const HEAD_VALUE_VERSION: u8 = 8;
 const HEAD_VALUE_HEADER_BYTES: usize = 59;
-const ANALYTICAL_BASE_COORDINATE_BYTES: usize = 16 + 4 + 4;
+const COLUMNAR_BASE_COORDINATE_BYTES: usize = 16 + 4 + 4;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
 const HEAD_VALUE_SNAPSHOT_SHIFT: u8 = 1;
 const HEAD_VALUE_METADATA_SHIFT: u8 = 3;
@@ -1373,7 +1373,7 @@ struct HeadValueView<'a> {
     updated_at: LixTimestamp,
     snapshot: HeadSlotView<'a>,
     metadata: HeadSlotView<'a>,
-    analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
+    columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
 }
 
@@ -1393,7 +1393,7 @@ impl CertifiedCurrentStatePredecessor {
                 // payload fingerprint is needed to preserve that baseline.
                 snapshot: HeadSlotView::None,
                 metadata: HeadSlotView::None,
-                analytical_base_coordinate: value.analytical_base_coordinate,
+                columnar_base_coordinate: value.columnar_base_coordinate,
                 working_diff_baseline: value.checkpoint_commit_id.map_or(
                     WorkingDiffBaseline::Disabled,
                     |checkpoint_commit_id| WorkingDiffBaseline::BeforeAbsent {
@@ -1538,7 +1538,7 @@ struct HeadValueEncode<'a> {
     updated_at: LixTimestamp,
     snapshot: HeadSlotEncode<'a>,
     metadata: HeadSlotEncode<'a>,
-    analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
+    columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
 }
 
@@ -1563,7 +1563,7 @@ fn append_head_value(
             updated_at: value.updated_at,
             snapshot: value.snapshot.into(),
             metadata: value.metadata.into(),
-            analytical_base_coordinate: value.analytical_base_coordinate,
+            columnar_base_coordinate: value.columnar_base_coordinate,
             working_diff_baseline: value.working_diff_baseline,
         },
     )
@@ -1582,7 +1582,7 @@ fn reencode_head_value_with_baseline(
         updated_at: value.updated_at,
         snapshot: value.snapshot.into(),
         metadata: value.metadata.into(),
-        analytical_base_coordinate: value.analytical_base_coordinate,
+        columnar_base_coordinate: value.columnar_base_coordinate,
         working_diff_baseline,
     })
 }
@@ -1636,17 +1636,17 @@ fn append_head_value_parts(
             "untracked current-state rows must not carry a working-diff baseline",
         ));
     }
-    if value.untracked && value.analytical_base_coordinate.is_some() {
+    if value.untracked && value.columnar_base_coordinate.is_some() {
         return Err(head_value_error(
-            "untracked current-state rows must not carry an analytical base coordinate",
+            "untracked current-state rows must not carry an columnar base coordinate",
         ));
     }
     if value
-        .analytical_base_coordinate
+        .columnar_base_coordinate
         .is_some_and(|coordinate| coordinate.base_commit_id == CommitId::default())
     {
         return Err(head_value_error(
-            "analytical base coordinate must carry a non-nil owner commit",
+            "columnar base coordinate must carry a non-nil owner commit",
         ));
     }
     let snapshot_len = encoded_slot_len(value.snapshot, fingerprint_inline);
@@ -1666,8 +1666,8 @@ fn append_head_value_parts(
         .and_then(|bytes| {
             bytes.checked_add(
                 value
-                    .analytical_base_coordinate
-                    .map_or(0, |_| ANALYTICAL_BASE_COORDINATE_BYTES),
+                    .columnar_base_coordinate
+                    .map_or(0, |_| COLUMNAR_BASE_COORDINATE_BYTES),
             )
         })
         .ok_or_else(|| head_value_error("encoded row length overflow"))?;
@@ -1697,7 +1697,7 @@ fn append_head_value_parts(
             .map_err(|_| head_value_error("metadata payload exceeds v8 u32 limit"))?
             .to_be_bytes(),
     );
-    bytes.push(u8::from(value.analytical_base_coordinate.is_some()));
+    bytes.push(u8::from(value.columnar_base_coordinate.is_some()));
     append_slot_payload(bytes, value.snapshot, fingerprint_inline);
     append_slot_payload(bytes, value.metadata, fingerprint_inline);
     match value.working_diff_baseline {
@@ -1713,7 +1713,7 @@ fn append_head_value_parts(
         }
         WorkingDiffBaseline::Disabled | WorkingDiffBaseline::Clean => {}
     }
-    if let Some(coordinate) = value.analytical_base_coordinate {
+    if let Some(coordinate) = value.columnar_base_coordinate {
         bytes.extend_from_slice(coordinate.base_commit_id.as_uuid().as_bytes());
         bytes.extend_from_slice(&coordinate.group_index.to_be_bytes());
         bytes.extend_from_slice(&coordinate.row_index.to_be_bytes());
@@ -1796,10 +1796,10 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         .map_err(|_| head_value_error("snapshot length exceeds usize"))?;
     let metadata_len = usize::try_from(read_u32(&bytes[54..58], "metadata length")?)
         .map_err(|_| head_value_error("metadata length exceeds usize"))?;
-    let has_analytical_base_coordinate = match bytes[58] {
+    let has_columnar_base_coordinate = match bytes[58] {
         0 => false,
         1 => true,
-        _ => return Err(head_value_error("invalid analytical base-coordinate tag")),
+        _ => return Err(head_value_error("invalid columnar base-coordinate tag")),
     };
     let snapshot_end = HEAD_VALUE_HEADER_BYTES
         .checked_add(snapshot_len)
@@ -1831,35 +1831,30 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         },
         _ => unreachable!("two-bit working-diff baseline tag is exhaustive"),
     };
-    let analytical_base_coordinate = if has_analytical_base_coordinate {
+    let columnar_base_coordinate = if has_columnar_base_coordinate {
         let base_commit_id = CommitId::new(uuid_from_head_bytes(
             take_head_bytes(
                 bytes,
                 &mut baseline_offset,
                 UUID_BYTES,
-                "analytical base commit id",
+                "columnar base commit id",
             )?,
-            "analytical base commit id",
+            "columnar base commit id",
         )?);
         if base_commit_id == CommitId::default() {
             return Err(head_value_error(
-                "analytical base coordinate has a nil owner commit",
+                "columnar base coordinate has a nil owner commit",
             ));
         }
         let group_index = read_u32(
-            take_head_bytes(
-                bytes,
-                &mut baseline_offset,
-                4,
-                "analytical base group index",
-            )?,
-            "analytical base group index",
+            take_head_bytes(bytes, &mut baseline_offset, 4, "columnar base group index")?,
+            "columnar base group index",
         )?;
         let row_index = read_u32(
-            take_head_bytes(bytes, &mut baseline_offset, 4, "analytical base row index")?,
-            "analytical base row index",
+            take_head_bytes(bytes, &mut baseline_offset, 4, "columnar base row index")?,
+            "columnar base row index",
         )?;
-        Some(AnalyticalBaseCoordinate {
+        Some(ColumnarBaseCoordinate {
             base_commit_id,
             group_index,
             row_index,
@@ -1895,9 +1890,9 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
                 "untracked current-state rows must not carry a working-diff baseline",
             ));
         }
-        if analytical_base_coordinate.is_some() {
+        if columnar_base_coordinate.is_some() {
             return Err(head_value_error(
-                "untracked current-state rows must not carry an analytical base coordinate",
+                "untracked current-state rows must not carry an columnar base coordinate",
             ));
         }
         (None, None)
@@ -1921,7 +1916,7 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         updated_at,
         snapshot,
         metadata,
-        analytical_base_coordinate,
+        columnar_base_coordinate,
         working_diff_baseline,
     })
 }
@@ -2167,8 +2162,8 @@ where
             value.untracked,
             branch_id,
         );
-        if let Some(coordinate) = value.analytical_base_coordinate {
-            rows.set_analytical_base_coordinate(row_index, coordinate);
+        if let Some(coordinate) = value.columnar_base_coordinate {
+            rows.set_columnar_base_coordinate(row_index, coordinate);
         }
         rows.set_durable_predecessor(row_index, CertifiedCurrentStatePredecessor::Encoded(bytes));
     }
@@ -2270,7 +2265,7 @@ mod tests {
             updated_at: ts("2026-01-01T00:00:00Z"),
             snapshot: JsonSlot::from_json("{\"value\":true}"),
             metadata: JsonSlot::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         }
     }
 
@@ -2394,8 +2389,8 @@ mod tests {
     #[test]
     fn v8_value_codec_roundtrips_clean_inline_ref_and_base_coordinate() {
         let snapshot_ref = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
-        let analytical_base_coordinate = AnalyticalBaseCoordinate {
-            base_commit_id: CommitId::for_test_label("analytical-base"),
+        let columnar_base_coordinate = ColumnarBaseCoordinate {
+            base_commit_id: CommitId::for_test_label("columnar-base"),
             group_index: 17,
             row_index: 42,
         };
@@ -2408,7 +2403,7 @@ mod tests {
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
             metadata: JsonSlotRef::Ref(&snapshot_ref),
-            analytical_base_coordinate: Some(analytical_base_coordinate),
+            columnar_base_coordinate: Some(columnar_base_coordinate),
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
 
@@ -2419,7 +2414,7 @@ mod tests {
             HEAD_VALUE_HEADER_BYTES
                 + "{\"snapshot\":true}".len()
                 + JSON_REF_BYTES
-                + ANALYTICAL_BASE_COORDINATE_BYTES
+                + COLUMNAR_BASE_COORDINATE_BYTES
         );
         let decoded = decode_head_value(&bytes).expect("decode v8 row");
         assert_eq!(decoded.change_id, value.change_id);
@@ -2427,8 +2422,8 @@ mod tests {
         assert_eq!(decoded.created_at, value.created_at);
         assert_eq!(decoded.updated_at, value.updated_at);
         assert_eq!(
-            decoded.analytical_base_coordinate,
-            Some(analytical_base_coordinate)
+            decoded.columnar_base_coordinate,
+            Some(columnar_base_coordinate)
         );
         assert_eq!(
             decoded.snapshot,
@@ -2448,7 +2443,7 @@ mod tests {
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
             metadata: JsonSlotRef::Inline("{\"source\":\"test\"}"),
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
         let bytes = Bytes::from(encode_head_value(&value).expect("encode v8 row"));
@@ -2510,7 +2505,7 @@ mod tests {
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"current\":true}"),
             metadata: JsonSlotRef::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::BeforePresent {
                 checkpoint_commit_id,
                 version: baseline,
@@ -3560,7 +3555,7 @@ mod tests {
                 updated_at: ts("2026-01-02T00:00:00Z"),
                 snapshot: JsonSlot::Ref(snapshot_ref),
                 metadata: JsonSlot::Ref(metadata_ref),
-                analytical_base_coordinate: None,
+                columnar_base_coordinate: None,
             },
         )
         .expect("stage v3 row");
@@ -3576,7 +3571,7 @@ mod tests {
                 updated_at: ts("2026-01-02T00:00:00Z"),
                 snapshot: JsonSlot::None,
                 metadata: JsonSlot::None,
-                analytical_base_coordinate: None,
+                columnar_base_coordinate: None,
             },
         )
         .expect("stage tombstone member");
@@ -3729,7 +3724,7 @@ mod tests {
                     updated_at: ts("2026-01-01T00:00:00Z"),
                     snapshot: JsonSlot::from_json(&format!(r#"{{"entity":"{entity}"}}"#)),
                     metadata: JsonSlot::None,
-                    analytical_base_coordinate: None,
+                    columnar_base_coordinate: None,
                 },
             )
             .expect("stage file-backed row");
@@ -4171,7 +4166,7 @@ mod tests {
             updated_at: ts("2026-01-01T00:00:01Z"),
             snapshot: JsonSlot::from_json("{\"id\":\"row\"}"),
             metadata: JsonSlot::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         };
         let mut writes = StorageWriteSet::new();
         stage_put(&mut writes, &identity, &value).expect("stage row");
@@ -5113,7 +5108,7 @@ mod tests {
             updated_at: timestamp,
             snapshot: JsonSlot::Ref(snapshot),
             metadata: JsonSlot::None,
-            analytical_base_coordinate: None,
+            columnar_base_coordinate: None,
         };
         let mut writes = StorageWriteSet::new();
         stage_put(&mut writes, &active_identity, &untracked(active_snapshot))

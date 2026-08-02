@@ -670,7 +670,7 @@ where
         Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
     }
 
-    /// Executes one statement and reports neutral analytical phase timings.
+    /// Executes one statement and reports neutral columnar phase timings.
     ///
     /// This diagnostic API is available only to storage benchmarks. It uses
     /// the normal public execution path and does not alter query semantics.
@@ -4084,41 +4084,6 @@ mod tests {
         assert_eq!(manifest.row_count(), expected_rows);
     }
 
-    async fn assert_current_head_lacks_columnar_manifest(
-        session: &SessionContext<Memory>,
-        schema_key: &str,
-    ) {
-        let branch_id = session
-            .active_branch_id()
-            .await
-            .expect("active branch should resolve");
-        let head_read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("branch-head read should open");
-        let head = session
-            .branch_ctx
-            .ref_reader(head_read)
-            .load_head(&branch_id)
-            .await
-            .expect("branch head should load")
-            .expect("active branch should have a head");
-        let sidecar_read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("sidecar read should open");
-        let id = crate::live_state::entity_row_group_set_id(head.commit_id, schema_key);
-        assert!(
-            crate::columnar_row_group::load_row_group_manifest(&sidecar_read, id)
-                .await
-                .expect("sidecar manifest lookup should succeed")
-                .is_none(),
-            "write-oriented schema must not publish a columnar sidecar"
-        );
-    }
-
     async fn open_session_with_telemetry(
         spans: Arc<std::sync::Mutex<Vec<CompletedTelemetrySpan>>>,
     ) -> SessionContext<Memory> {
@@ -4928,125 +4893,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn columnar_opt_out_covers_certified_insert_and_complete_replacement() {
-        const ROW_COUNT: usize = 1_024;
-        let session = open_session().await;
-        let schema = serde_json::json!({
-            "x-lix-key": "columnar_opt_out_probe",
-            "x-lix-primary-key": ["/path"],
-            "x-lix-columnar": false,
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .expect("write-oriented schema should register");
-
-        let sql = "INSERT INTO columnar_opt_out_probe (path, value) VALUES ($1, lix_json($2))";
-        let inserts = (0..ROW_COUNT)
-            .map(|index| ExecuteBatchStatement {
-                sql: sql.to_owned(),
-                params: vec![
-                    Value::Text(format!("/{index:04}")),
-                    Value::Text(format!(r#"{{"before":{index}}}"#)),
-                ],
-            })
-            .collect::<Vec<_>>();
-        let inserted = session
-            .execute_batch(&inserts)
-            .await
-            .expect("certified parameter batch should insert")
-            .iter()
-            .map(ExecuteResult::rows_affected)
-            .sum::<u64>();
-        assert_eq!(inserted, ROW_COUNT as u64);
-        assert_current_head_lacks_columnar_manifest(&session, "columnar_opt_out_probe").await;
-
-        crate::transaction::take_complete_replacement_packed_current_base_publications();
-        let update_sql = "UPDATE columnar_opt_out_probe SET value = lix_json($1) WHERE path = $2";
-        let updates = (0..ROW_COUNT)
-            .map(|index| ExecuteBatchStatement {
-                sql: update_sql.to_owned(),
-                params: vec![
-                    Value::Text(format!(r#"{{"after":{index}}}"#)),
-                    Value::Text(format!("/{index:04}")),
-                ],
-            })
-            .collect::<Vec<_>>();
-        let updated = session
-            .execute_batch(&updates)
-            .await
-            .expect("complete replacement should update")
-            .iter()
-            .map(ExecuteResult::rows_affected)
-            .sum::<u64>();
-        assert_eq!(updated, ROW_COUNT as u64);
-        assert_eq!(
-            crate::transaction::take_complete_replacement_packed_current_base_publications(),
-            1,
-            "fixture must publish the certified complete replacement as a packed base"
-        );
-        assert_current_head_lacks_columnar_manifest(&session, "columnar_opt_out_probe").await;
-    }
-
-    #[tokio::test]
-    async fn columnar_opt_out_covers_generic_literal_batch_insert() {
-        const ROW_COUNT: usize = 1_024;
-        let session = open_session().await;
-        let schema = serde_json::json!({
-            "x-lix-key": "columnar_opt_out_literal_probe",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-columnar": false,
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .expect("write-oriented literal schema should register");
-
-        let inserts = (0..ROW_COUNT)
-            .map(|index| ExecuteBatchStatement {
-                sql: format!(
-                    "INSERT INTO columnar_opt_out_literal_probe (id, value) VALUES ('{index:04}', 'literal-{index:04}')"
-                ),
-                params: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        let inserted = session
-            .execute_batch(&inserts)
-            .await
-            .expect("generic literal batch should insert")
-            .iter()
-            .map(ExecuteResult::rows_affected)
-            .sum::<u64>();
-        assert_eq!(inserted, ROW_COUNT as u64);
-        assert_current_head_lacks_columnar_manifest(&session, "columnar_opt_out_literal_probe")
-            .await;
-    }
-
-    #[tokio::test]
     async fn large_certified_insert_publishes_rootless_history_and_reads_packed_head() {
         use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
 
@@ -5055,7 +4901,6 @@ mod tests {
         let schema = serde_json::json!({
             "x-lix-key": "rootless_ordered_insert_probe",
             "x-lix-primary-key": ["/id"],
-            "x-lix-columnar": false,
             "type": "object",
             "properties": {
                 "id": { "type": "string" },
@@ -5580,7 +5425,7 @@ mod tests {
         let manifest = crate::columnar_row_group::load_row_group_manifest(&read, row_group_id)
             .await
             .expect("typed lifecycle sidecar manifest should load")
-            .expect("fixture must publish a typed analytical sidecar");
+            .expect("fixture must publish a typed columnar sidecar");
         assert_eq!(manifest.row_count(), ROW_COUNT as u64);
 
         assert_columnar_lifecycle_current(&main, "base-0000", "base-1023").await;
@@ -5623,6 +5468,48 @@ mod tests {
         .await
         .expect("sparse typed update should commit");
         assert_columnar_layout_selected(&main, "columnar_lifecycle_probe", 1).await;
+
+        let limited = main
+            .execute(
+                "SELECT id, value FROM columnar_lifecycle_probe ORDER BY id LIMIT 3",
+                &[],
+            )
+            .await
+            .expect("DataFusion LIMIT should remain above the columnar scan");
+        assert_eq!(limited.len(), 3);
+        assert_eq!(limited.rows()[0].get::<String>("id").unwrap(), "0000");
+        assert_eq!(limited.rows()[2].get::<String>("id").unwrap(), "0002");
+        let zero = main
+            .execute(
+                "SELECT id FROM columnar_lifecycle_probe ORDER BY id LIMIT 0",
+                &[],
+            )
+            .await
+            .expect("zero LIMIT should retain DataFusion semantics");
+        assert!(zero.is_empty());
+
+        // The immutable groups can all be pruned for this value, but the HOT
+        // winner must still be reconciled and filtered before LIMIT executes.
+        let overlay_match = main
+            .execute(
+                "SELECT id FROM columnar_lifecycle_probe \
+                 WHERE value = 'sparse-0512' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("pruned columnar scan should retain matching overlay winner");
+        assert_eq!(overlay_match.len(), 1);
+        assert_eq!(overlay_match.rows()[0].get::<String>("id").unwrap(), "0512");
+        let no_match = main
+            .execute(
+                "SELECT id FROM columnar_lifecycle_probe \
+                 WHERE value = 'not-present' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("fully pruned columnar scan should return an exact empty result");
+        assert!(no_match.is_empty());
+
         main.execute(
             "UPDATE columnar_lifecycle_probe SET value = 'base-0512' WHERE id = '0512'",
             &[],
@@ -5781,7 +5668,6 @@ mod tests {
         session.execute_batch(&insert_statements).await.unwrap();
 
         crate::transaction::take_complete_replacement_packed_current_base_retirements();
-        crate::transaction::take_certified_entity_columnar_reuses();
         let update_sql =
             "UPDATE ordered_packed_update_probe SET value = lix_json($1) WHERE path = $2";
         for version in 1..=2 {
@@ -5802,11 +5688,6 @@ mod tests {
                 .map(ExecuteResult::rows_affected)
                 .sum::<u64>();
             assert_eq!(affected, ROW_COUNT as u64);
-            assert_eq!(
-                crate::transaction::take_certified_entity_columnar_reuses(),
-                1,
-                "complete certified replacements should retain their executor-built columnar vectors"
-            );
             assert_eq!(
                 crate::transaction::take_complete_replacement_packed_current_base_retirements(),
                 1,
@@ -5849,7 +5730,6 @@ mod tests {
             "replacing a packed base must preserve its working-diff epoch"
         );
 
-        crate::transaction::take_certified_entity_columnar_reuses();
         let partial_update_statements = (0..PARTIAL_ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 sql: update_sql.to_string(),
@@ -5867,11 +5747,6 @@ mod tests {
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
         assert_eq!(partial_affected, PARTIAL_ROW_COUNT as u64);
-        assert_eq!(
-            crate::transaction::take_certified_entity_columnar_reuses(),
-            0,
-            "a large partial replacement must not build an unpublished columnar base"
-        );
         assert_eq!(
             crate::transaction::take_complete_replacement_packed_current_base_retirements(),
             0,
