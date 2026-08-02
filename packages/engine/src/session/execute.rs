@@ -1568,14 +1568,18 @@ where
                                 Some(statement_index),
                             );
                             let operation = async {
-                                execute_transaction_statement(
+                                // Keep the large statement executor behind a heap boundary. The
+                                // lending transaction closure already carries the whole parsed
+                                // batch; embedding this future in it makes debug poll stacks exceed
+                                // the standard 2 MiB worker stack for ordinary entity writes.
+                                Box::pin(execute_transaction_statement(
                                     transaction,
                                     &sql,
                                     parsed.clone(),
                                     &params,
                                     options.clone(),
                                     metadata,
-                                )
+                                ))
                                 .await
                                 .map_err(|error| {
                                     with_batch_statement_index(
@@ -1608,14 +1612,16 @@ where
                                 Some(statement_index),
                             );
                             let operation = async {
-                                execute_transaction_statement(
+                                // See the auto-parameterized branch above. Both batch routes need
+                                // the same bounded poll-stack boundary.
+                                Box::pin(execute_transaction_statement(
                                     transaction,
                                     &statement.sql,
                                     parsed,
                                     &statement.params,
                                     options.clone(),
                                     metadata,
-                                )
+                                ))
                                 .await
                                 .map_err(|error| {
                                     with_batch_statement_index(
