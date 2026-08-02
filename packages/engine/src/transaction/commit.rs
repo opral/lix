@@ -3862,6 +3862,18 @@ fn prepare_entity_columnar_write_sets(
     {
         return Ok(BTreeMap::new());
     }
+    if insert_selection.covers_all(state_rows.len())
+        && let Some((commit_id, schema_key, snapshots)) = state_rows.dense_entity_columnar_input()
+    {
+        let snapshots = snapshots.iter().map(|snapshot| snapshot.value());
+        let mut encoded = BTreeMap::new();
+        if let Some(row_groups) =
+            crate::live_state::encode_entity_scalar_row_groups(schema_key, snapshots)?
+        {
+            encoded.insert((commit_id, schema_key.to_string()), row_groups);
+        }
+        return Ok(encoded);
+    }
     let mut indices = BTreeMap::<(CommitId, String), Vec<usize>>::new();
     for (index, row) in state_rows.iter().enumerate() {
         if !insert_selection.contains(index) {

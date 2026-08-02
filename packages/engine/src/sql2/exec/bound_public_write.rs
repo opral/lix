@@ -1976,8 +1976,14 @@ async fn execute_entity_write(
         ));
     }
 
-    let spec = entity_spec(ctx, schema_key)?;
-    validate_bound_write_supported(plan, &spec)?;
+    let catalog = ctx.public_catalog()?;
+    let spec = catalog.entity_spec(schema_key).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!("entity surface '{schema_key}' is not visible"),
+        )
+    })?;
+    validate_bound_write_supported(plan, spec)?;
     // Only `lix_active_branch_commit_id()` needs the current branch head.
     // Normal entity mutations already stage against the transaction's active
     // branch, so eagerly opening another read here makes the common write
@@ -1992,20 +1998,20 @@ async fn execute_entity_write(
     match plan.bound.op {
         BoundWriteOp::Insert => {
             if no_op {
-                entity_insert_batch(ctx, plan, &spec, params, active_branch_commit_id.as_ref())?;
+                entity_insert_batch(ctx, plan, spec, params, active_branch_commit_id.as_ref())?;
                 return Ok(empty_entity_returning_result(plan));
             }
             if plan.bound.conflict.is_some() {
-                entity_upsert(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
+                entity_upsert(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
             } else {
-                entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
+                entity_insert(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
             }
         }
         BoundWriteOp::Update => {
             if no_op {
                 return Ok(empty_entity_returning_result(plan));
             }
-            entity_update(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
+            entity_update(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
         }
         BoundWriteOp::Delete => {
             if no_op {
@@ -2018,7 +2024,7 @@ async fn execute_entity_write(
             {
                 return Ok(result);
             }
-            entity_delete(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
+            entity_delete(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await
         }
     }
 }
@@ -2762,7 +2768,9 @@ async fn try_execute_direct_path_value_replacement(
         return Ok(None);
     }
 
-    let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
+    let entity_pk = EntityPk::single(primary_key.clone());
+    let candidates =
+        scan_entity_candidates_for_pks(ctx, plan, spec, vec![entity_pk.clone()], false).await?;
     if candidates.is_empty() {
         return Ok(Some(SqlWriteResult::affected(0)));
     }
@@ -2795,8 +2803,8 @@ async fn try_execute_direct_path_value_replacement(
         TransactionJson::from_certified_row_content_arena(normalized, vec![(0, normalized_len)])?
             .pop()
             .expect("one certified replacement snapshot");
-    let rows = RawWriteBatch::from_certified_parameter_replacement(
-        vec![EntityPk::single(primary_key.clone())],
+    let rows = CertifiedParameterReplacementBatch::new(
+        vec![entity_pk],
         vec![snapshot],
         spec.schema_key.as_str().into(),
         ctx.active_branch_id().into(),
@@ -2810,7 +2818,7 @@ async fn try_execute_direct_path_value_replacement(
             complete_collection_replacement: false,
         },
     )?;
-    ctx.stage_parameter_batch_replace(rows).await?;
+    ctx.stage_certified_parameter_batch_replace(rows).await?;
     #[cfg(test)]
     CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| {
         executions.set(executions.get().saturating_add(1));
