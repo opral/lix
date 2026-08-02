@@ -11,8 +11,8 @@ use crate::changelog::ChangeRecordProjection;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::DERIVED_FILE_REF_SCHEMA_KEY;
 use crate::plugin::{
-    PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
-    inferred_media_type_for_path,
+    ConflictRank, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry,
+    PluginRegistryEntry, inferred_media_type_for_path,
 };
 use crate::storage_adapter::Storage;
 #[cfg(test)]
@@ -1402,10 +1402,9 @@ fn canonical_conflict_variants_ref<'a>(
             "merge conflict source side omitted its resulting row",
         )
     })?;
-    let ordering = target_after
-        .updated_at
-        .cmp(&source_after.updated_at)
-        .then_with(|| target_after.change_id.cmp(&source_after.change_id));
+    let ordering = ConflictRank::new(target_after.updated_at, target_after.change_id).cmp(
+        &ConflictRank::new(source_after.updated_at, source_after.change_id),
+    );
     if ordering.is_eq() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,

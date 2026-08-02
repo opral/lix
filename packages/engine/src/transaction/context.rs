@@ -61,7 +61,7 @@ use crate::live_state::{
     overlay_load_exact_batch, overlay_scan_batch,
 };
 use crate::plugin::{
-    ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256,
+    ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
     LiveBatchEntitySource, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorCache,
     PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
     PluginActorStagedCheckpoint, PluginActorStore, PluginActorStorePermit,
@@ -113,6 +113,9 @@ use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{
     PreparedStateRowOverlay, PreparedWriteSet, TransactionWriteBuffer,
     TransactionWriteBufferCheckpoint,
+};
+use crate::transaction::stale_commit::{
+    StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
 use crate::transaction::types::{
     PreparedRowFacts, PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
@@ -750,47 +753,97 @@ where
         };
 
         let mut tracked = self.tracked_state.reader(read);
-        let concurrent = tracked
-            .diff_commits(
-                &opening_head.to_string(),
-                &current_head.to_string(),
-                &TrackedStateDiffRequest::default(),
-            )
+        let opening_head_text = opening_head.to_string();
+        let current_head_text = current_head.to_string();
+        let generation_write_set = tracked
+            .changed_identities_in_first_parent_interval(&opening_head_text, &current_head_text)
+            .instrument(tracing::debug_span!(
+                target: "lix_transaction",
+                "lix.transaction.stale.generation_write_set"
+            ))
             .await?;
-        let overlapping_row_indices = prepared_writes
-            .state_rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, row)| {
-                concurrent
-                    .entries
-                    .iter()
-                    .any(|entry| {
-                        row.schema_key.as_str() == entry.identity.schema_key()
-                            && row.file_id.map(SharedStr::as_str) == entry.identity.file_id()
-                            && row.entity_pk == entry.identity.entity_pk()
-                    })
-                    .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        if !overlapping_row_indices.is_empty() {
-            // Ordinary INSERT races keep their established constraint surface:
-            // commit-time validation reports the exact UNIQUE/statement-index
-            // error from the current snapshot. Updates and file-scoped semantic
-            // rows cannot safely use that absence-check lane.
-            let ordinary_insert_race = overlapping_row_indices.iter().all(|&index| {
-                prepared_writes.insert_selection.contains(index)
-                    && prepared_writes.state_rows.row(index).file_id.is_none()
-            });
-            if !ordinary_insert_race {
-                self.resolve_stale_plugin_overlaps(
+        let (plan, concurrent_change_count, discovery) = match generation_write_set {
+            Some(identities) => {
+                let count = identities.len();
+                let plan = {
+                    let span = tracing::debug_span!(
+                        target: "lix_transaction",
+                        "lix.transaction.stale.classify",
+                        prepared_rows = prepared_writes.state_rows.len(),
+                        concurrent_changes = count,
+                    );
+                    let _entered = span.enter();
+                    classify_stale_commit(
+                        prepared_writes,
+                        identities.iter().map(|identity| identity.as_key_ref()),
+                    )
+                };
+                (plan, count, "generation_write_set")
+            }
+            None => {
+                let concurrent = tracked
+                    .diff_commits(
+                        &opening_head_text,
+                        &current_head_text,
+                        &TrackedStateDiffRequest::default(),
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_transaction",
+                        "lix.transaction.stale.general_diff"
+                    ))
+                    .await?;
+                let count = concurrent.entries.len();
+                let plan = {
+                    let span = tracing::debug_span!(
+                        target: "lix_transaction",
+                        "lix.transaction.stale.classify",
+                        prepared_rows = prepared_writes.state_rows.len(),
+                        concurrent_changes = count,
+                    );
+                    let _entered = span.enter();
+                    classify_stale_commit(
+                        prepared_writes,
+                        concurrent
+                            .entries
+                            .iter()
+                            .map(|entry| entry.identity.as_key_ref()),
+                    )
+                };
+                (plan, count, "general_diff")
+            }
+        };
+        tracing::debug!(
+            target: "lix_transaction",
+            plan = plan.kind(),
+            discovery,
+            prepared_rows = prepared_writes.state_rows.len(),
+            concurrent_changes = concurrent_change_count,
+            "classified stale transaction commit"
+        );
+        match plan {
+            StaleCommitPlan::Direct | StaleCommitPlan::RevalidateOrdinaryInsert => {}
+            StaleCommitPlan::ReconcilePlugin(plan) => {
+                let file_count = plan.file_ids.len();
+                let semantic_conflict_count = plan.semantic_conflict_indices.len();
+                self.reconcile_stale_plugin_writes(
                     read,
                     prepared_writes,
-                    &concurrent,
+                    plan,
                     opening_head,
                     current_head,
                 )
+                .instrument(tracing::debug_span!(
+                    target: "lix_transaction",
+                    "lix.transaction.stale.reconcile",
+                    file_count,
+                    semantic_conflict_count,
+                ))
                 .await?;
+            }
+            StaleCommitPlan::Unsafe => {
+                return Err(conflict(
+                    "concurrent transaction changed an overlapping entity outside a stable plugin-owned file",
+                ));
             }
         }
 
@@ -799,11 +852,11 @@ where
         Ok(())
     }
 
-    async fn resolve_stale_plugin_overlaps<S>(
+    async fn reconcile_stale_plugin_writes<S>(
         &mut self,
         read: &S,
         prepared_writes: &mut PreparedWriteSet,
-        concurrent: &crate::tracked_state::TrackedStateDiff,
+        plan: StalePluginReconciliationPlan,
         opening_head: CommitId,
         current_head: CommitId,
     ) -> Result<(), LixError>
@@ -817,65 +870,10 @@ where
             )
             .with_hint("Retry the transaction against the latest committed state.")
         };
-        let concurrent_keys = concurrent
-            .entries
-            .iter()
-            .map(|entry| TrackedStateKey {
-                schema_key: entry.identity.schema_key().to_owned(),
-                file_id: entry.identity.file_id().map(str::to_owned),
-                entity_pk: entry.identity.entity_pk().clone(),
-            })
-            .collect::<BTreeSet<_>>();
-        let overlapping_indices = prepared_writes
-            .state_rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, row)| {
-                let key = TrackedStateKey {
-                    schema_key: row.schema_key.to_string(),
-                    file_id: row.file_id.map(|file_id| file_id.to_string()),
-                    entity_pk: row.entity_pk.clone(),
-                };
-                concurrent_keys.contains(&key).then_some(index)
-            })
-            .collect::<Vec<_>>();
-        let candidate_indices = overlapping_indices
-            .iter()
-            .copied()
-            .filter(|&index| {
-                let row = prepared_writes.state_rows.row(index);
-                row.file_id.is_some()
-                    && !matches!(
-                        row.schema_key.as_str(),
-                        BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
-                    )
-            })
-            .collect::<Vec<_>>();
-        let file_ids = overlapping_indices
-            .iter()
-            .filter_map(|&index| {
-                prepared_writes
-                    .state_rows
-                    .row(index)
-                    .file_id
-                    .map(ToString::to_string)
-            })
-            .collect::<BTreeSet<_>>();
-        if file_ids.is_empty()
-            || overlapping_indices.iter().any(|&index| {
-                let row = prepared_writes.state_rows.row(index);
-                let Some(file_id) = row.file_id.map(SharedStr::as_str) else {
-                    return true;
-                };
-                !file_ids.contains(file_id)
-                    || (!matches!(
-                        row.schema_key.as_str(),
-                        BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
-                    ) && !candidate_indices.contains(&index))
-            })
-        {
-            return Err(conflict_error());
-        }
+        let StalePluginReconciliationPlan {
+            semantic_conflict_indices: candidate_indices,
+            file_ids,
+        } = plan;
 
         let owner_keys = file_ids
             .iter()
@@ -1038,9 +1036,10 @@ where
                     "staged tracked plugin row is missing change_id",
                 )
             })?;
-            let source_order = (source.updated_at, source_change_id);
-            let target_order = target.map(|row| (row.updated_at(), row.change_id()));
-            let (a, b) = if target_order.is_some_and(|order| order < source_order) {
+            let source_rank = ConflictRank::new(source.updated_at, source_change_id);
+            let target_rank =
+                target.map(|row| ConflictRank::new(row.updated_at(), row.change_id()));
+            let (a, b) = if target_rank.is_some_and(|rank| rank < source_rank) {
                 (target_payload, source_payload)
             } else {
                 (source_payload, target_payload)
@@ -1066,12 +1065,8 @@ where
         self.pending_file_view_mutations
             .retain(|key, _| !file_ids.contains(&key.file_id));
 
-        let mut reconciliation_batches = Vec::<RawWriteBatch>::with_capacity(
-            candidate_indices
-                .len()
-                .saturating_add(prepared_writes.state_rows.len()),
-        );
-        for group in groups.values() {
+        let mut reconciliation_batches = BTreeMap::<String, RawWriteBatch>::new();
+        for (file_id, group) in &groups {
             if group.conflicts.is_empty() {
                 continue;
             }
@@ -1099,16 +1094,18 @@ where
                 .collect::<Result<Vec<_>, LixError>>()?;
             let resolutions = self
                 .resolve_plugin_conflicts(&group.plugin, group.descriptor.clone(), conflicts)
+                .instrument(tracing::debug_span!(
+                    target: "lix_transaction",
+                    "lix.transaction.stale.resolve_plugin",
+                    plugin_key = group.plugin.key(),
+                    conflict_count = group.conflicts.len(),
+                ))
                 .await?;
+            let rows = reconciliation_batches
+                .entry(file_id.clone())
+                .or_insert_with(|| RawWriteBatch::with_capacity(group.conflicts.len()));
             for (conflict, resolution) in group.conflicts.iter().zip(resolutions.resolutions) {
-                let mut rows = RawWriteBatch::with_capacity(1);
-                push_stale_conflict_resolution(
-                    &mut rows,
-                    conflict,
-                    resolution,
-                    &self.active_branch_id,
-                )?;
-                reconciliation_batches.push(rows);
+                push_stale_conflict_resolution(rows, conflict, resolution, &self.active_branch_id)?;
             }
         }
         let conflict_row_indices = candidate_indices.iter().copied().collect::<BTreeSet<_>>();
@@ -1130,42 +1127,54 @@ where
             {
                 continue;
             }
-            let mut rows = RawWriteBatch::with_capacity(1);
-            rows.push_parts(
-                Some(row.entity_pk.clone()),
-                row.schema_key.clone(),
-                row.file_id.cloned(),
-                row.snapshot.map(|snapshot| {
-                    TransactionJson::from_unvalidated_shared_normalized_content(
-                        snapshot.materialize_shared(),
-                    )
-                }),
-                row.metadata.map(|metadata| {
-                    TransactionJson::from_unvalidated_shared_normalized_content(
-                        metadata.materialize_shared(),
-                    )
-                }),
-                row.origin.cloned(),
-                Some(row.created_at.to_string().into()),
-                Some(row.updated_at.to_string().into()),
-                row.global,
-                row.change_id.map(|change_id| change_id.to_string().into()),
-                None,
-                row.untracked,
-                row.branch_id.clone(),
-            );
-            reconciliation_batches.push(rows);
+            reconciliation_batches
+                .entry(file_id.to_owned())
+                .or_insert_with(RawWriteBatch::new)
+                .push_parts(
+                    Some(row.entity_pk.clone()),
+                    row.schema_key.clone(),
+                    row.file_id.cloned(),
+                    row.snapshot.map(|snapshot| {
+                        TransactionJson::from_unvalidated_shared_normalized_content(
+                            snapshot.materialize_shared(),
+                        )
+                    }),
+                    row.metadata.map(|metadata| {
+                        TransactionJson::from_unvalidated_shared_normalized_content(
+                            metadata.materialize_shared(),
+                        )
+                    }),
+                    row.origin.cloned(),
+                    Some(row.created_at.to_string().into()),
+                    Some(row.updated_at.to_string().into()),
+                    row.global,
+                    row.change_id.map(|change_id| change_id.to_string().into()),
+                    None,
+                    row.untracked,
+                    row.branch_id.clone(),
+                );
         }
-        // Plugins may deliberately accept only one semantic edit per warm
-        // transition. Preserve the accumulated conflict decision while
-        // replaying its resolved and retained edits through one actor in order.
-        for rows in reconciliation_batches {
-            self.stage_write(TransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows,
-            })
-            .await?;
+        // Conflict discovery and resolution already operate per file. Replay
+        // the complete resolved write set through the same boundary so each
+        // file performs one semantic transition and one render, independent
+        // of how many conflicts and retained edits it contains.
+        let replay_batch_count = reconciliation_batches.len();
+        async {
+            for rows in reconciliation_batches.into_values() {
+                self.stage_write(TransactionWrite::Rows {
+                    mode: TransactionWriteMode::Replace,
+                    rows,
+                })
+                .await?;
+            }
+            Ok::<(), LixError>(())
         }
+        .instrument(tracing::debug_span!(
+            target: "lix_transaction",
+            "lix.transaction.stale.replay",
+            replay_batch_count,
+        ))
+        .await?;
         let mut replacement = self.staged_writes.drain()?;
         let mut latest_file_data = BTreeMap::new();
         for write in replacement.file_data_writes.drain(..) {

@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::changelog::{
@@ -26,9 +27,9 @@ use crate::tracked_state::codec::{
     decode_key_shared, encode_key, encode_key_ref_into, encode_value_ref,
 };
 use crate::tracked_state::diff::{
-    TrackedStateDiff, TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStatePayloadBatch,
-    TrackedStateTreeDiffBatch, TrackedStateTreeDiffBatchBuilder, TrackedStateTreeDiffRowRef,
-    diff_commits,
+    TrackedStateDiff, TrackedStateDiffIdentity, TrackedStateDiffRequest, TrackedStateDiffRow,
+    TrackedStatePayloadBatch, TrackedStateTreeDiffBatch, TrackedStateTreeDiffBatchBuilder,
+    TrackedStateTreeDiffRowRef, diff_commits,
 };
 #[cfg(test)]
 use crate::tracked_state::merge::{self, TrackedStateMergePlan};
@@ -947,7 +948,7 @@ pub(crate) struct TrackedStateStoreReader<S> {
     /// Reused by one reader's repeated historical point probes. SQL history
     /// providers often resolve a descriptor, its ancestors, and plugin state
     /// at the same observed commit.
-    point_replay_intervals: HashMap<String, (Vec<CommitId>, Option<TrackedStateRootId>)>,
+    point_replay_intervals: HashMap<CommitId, PointReplayInterval>,
     point_value_cache: HashMap<(String, TrackedStateKey), Option<TrackedStateIndexValue>>,
     /// Reuses direct delta lookups when several observed commits share a
     /// rootless first-parent interval. This stays identity-routed: a cache
@@ -972,6 +973,40 @@ struct PointReplayCommit {
     parent_commit_id: Option<CommitId>,
     root_id: Option<TrackedStateRootId>,
     rootless: bool,
+}
+
+/// One immutable first-parent interval shared by every cached suffix view.
+/// A reader that discovers `n` commits retains `n` commit ids, not the
+/// `n * (n + 1) / 2` ids required by cloning every suffix.
+#[derive(Clone)]
+struct PointReplayInterval {
+    commits: Arc<[CommitId]>,
+    start: usize,
+    baseline_root: Option<TrackedStateRootId>,
+}
+
+impl PointReplayInterval {
+    fn new(commits: Vec<CommitId>, baseline_root: Option<TrackedStateRootId>) -> Self {
+        Self {
+            commits: commits.into(),
+            start: 0,
+            baseline_root,
+        }
+    }
+
+    fn commits(&self) -> &[CommitId] {
+        &self.commits[self.start..]
+    }
+
+    fn cache_suffixes(&self, cache: &mut HashMap<CommitId, Self>) {
+        for (offset, commit_id) in self.commits().iter().copied().enumerate() {
+            cache.entry(commit_id).or_insert_with(|| Self {
+                commits: Arc::clone(&self.commits),
+                start: self.start + offset,
+                baseline_root: self.baseline_root.clone(),
+            });
+        }
+    }
 }
 
 impl DiffCommitRootValidationCache {
@@ -1238,6 +1273,17 @@ where
         commit_id: CommitId,
     ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
         storage::scan_commit_delta_members(&self.store, commit_id).await
+    }
+
+    /// Loads only the requested schema ranges from one commit delta. Semantic
+    /// classification uses this to avoid hydrating unrelated commit members.
+    pub(crate) async fn commit_delta_values_for_schemas(
+        &mut self,
+        commit_id: CommitId,
+        schema_keys: &[String],
+    ) -> Result<storage::DecodedCommitDeltaBatch, LixError> {
+        self.scan_replayed_commit_delta_values(commit_id, schema_keys)
+            .await
     }
 
     /// True only for the sparse immutable checkpoints. A false result does
@@ -2276,6 +2322,59 @@ where
         entries.finish()
     }
 
+    /// Returns the compact write-set union for an ancestor/descendant
+    /// first-parent interval.
+    ///
+    /// Stale transaction admission needs to know whether a prepared identity
+    /// was touched, not the endpoint payload or before value. Reading the
+    /// immutable per-commit delta generations directly avoids tree diffing,
+    /// ancestor point reads, and changelog payload hydration. `None` means the
+    /// pair is not representable by the rootless first-parent journal and the
+    /// caller must use the general commit diff.
+    pub(crate) async fn changed_identities_in_first_parent_interval(
+        &mut self,
+        ancestor_commit_id: &str,
+        descendant_commit_id: &str,
+    ) -> Result<Option<Vec<TrackedStateDiffIdentity>>, LixError> {
+        let Some(interval) = self
+            .first_parent_interval_between(ancestor_commit_id, descendant_commit_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut batches = Vec::with_capacity(interval.len());
+        for commit_id in interval {
+            batches.push(
+                self.scan_replayed_commit_delta_values(commit_id, &[])
+                    .await?,
+            );
+        }
+        let row_count = batches
+            .iter()
+            .try_fold(0usize, |count, batch| count.checked_add(batch.len()))
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "first-parent write-set row count overflows usize",
+                )
+            })?;
+        let mut seen = HashSet::with_capacity(row_count);
+        let mut keys = Vec::with_capacity(row_count);
+        for batch in &batches {
+            for row in batch.iter() {
+                let key = row.key_ref();
+                if seen.insert(key) {
+                    keys.push(key);
+                }
+            }
+        }
+        keys.sort_unstable();
+        Ok(Some(TrackedStateDiffIdentity::from_key_refs(
+            keys.len(),
+            |index| keys[index],
+        )?))
+    }
+
     /// Diffs an ancestor/descendant pair from immutable per-commit deltas.
     ///
     /// Merge always compares its merge base with each head. Walking only that
@@ -2583,13 +2682,14 @@ where
         commit_id: &str,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<RootlessReplayBatch, LixError> {
-        let (commits, baseline_root) = self.point_replay_interval(commit_id).await?;
+        let interval = self.point_replay_interval(commit_id).await?;
+        let commits = interval.commits();
         let scanned_schema_keys = schema_keys_with_file_descriptors(&request.schema_keys);
         let mut decoded_batches = Vec::with_capacity(commits.len());
         let mut delta_rows = 0usize;
         let mut encoded_key_bytes = 0usize;
         let mut cascade_capacity = 0usize;
-        for replay_commit_id in &commits {
+        for replay_commit_id in commits {
             let batch = self
                 .scan_replayed_commit_delta_values(*replay_commit_id, &scanned_schema_keys)
                 .await?;
@@ -2621,9 +2721,9 @@ where
             limit: None,
             ..request.clone()
         };
-        let baseline = if let Some(root_id) = baseline_root {
+        let baseline = if let Some(root_id) = interval.baseline_root.as_ref() {
             self.tree
-                .scan(&self.store, &root_id, &baseline_request)
+                .scan(&self.store, root_id, &baseline_request)
                 .await?
         } else {
             Vec::new()
@@ -3057,24 +3157,45 @@ where
     async fn point_replay_interval(
         &mut self,
         commit_id: &str,
-    ) -> Result<(Vec<CommitId>, Option<TrackedStateRootId>), LixError> {
-        if let Some(interval) = self.point_replay_intervals.get(commit_id) {
+    ) -> Result<PointReplayInterval, LixError> {
+        let requested_commit_id =
+            CommitId::parse_lix(commit_id, "tracked-state point replay commit_id")?;
+        if let Some(interval) = self.point_replay_intervals.get(&requested_commit_id) {
             return Ok(interval.clone());
         }
-        let interval =
-            crate::tracked_state::commit_root_rebuild::load_first_parent_point_replay_interval(
-                &self.store,
-                commit_id,
-                &self.point_replay_intervals,
-            )
-            .await?;
-        for index in 0..interval.0.len() {
-            self.point_replay_intervals
-                .entry(interval.0[index].to_string())
-                .or_insert_with(|| (interval.0[index..].to_vec(), interval.1.clone()));
-        }
+
+        let mut commits = Vec::new();
+        let mut current_commit_id = requested_commit_id;
+        let mut seen_commit_ids = HashSet::new();
+        let baseline_root = loop {
+            if !seen_commit_ids.insert(current_commit_id) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot point-replay tracked_state commit '{commit_id}': first-parent cycle includes commit '{current_commit_id}'"
+                    ),
+                ));
+            }
+            let replay_commit = self.load_point_replay_commit(current_commit_id).await?;
+            if !replay_commit.rootless
+                && let Some(root_id) = replay_commit.root_id
+            {
+                break Some(root_id);
+            }
+            commits.push(current_commit_id);
+            let Some(parent_commit_id) = replay_commit.parent_commit_id else {
+                break None;
+            };
+            if let Some(tail) = self.point_replay_intervals.get(&parent_commit_id) {
+                commits.extend_from_slice(tail.commits());
+                break tail.baseline_root.clone();
+            }
+            current_commit_id = parent_commit_id;
+        };
+        let interval = PointReplayInterval::new(commits, baseline_root);
+        interval.cache_suffixes(&mut self.point_replay_intervals);
         self.point_replay_intervals
-            .entry(commit_id.to_string())
+            .entry(requested_commit_id)
             .or_insert_with(|| interval.clone());
         Ok(interval)
     }
@@ -4057,6 +4178,8 @@ fn nullable_key_filter_allows(filters: &[NullableKeyFilter<String>], value: Opti
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::NullableKeyFilter;
     use crate::branch::BranchHeadControl;
@@ -4065,6 +4188,84 @@ mod tests {
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::wasm::{WasmCertifiedEntityBatch, WasmCreateContext};
+
+    #[test]
+    fn point_replay_interval_suffixes_share_one_backing_buffer() {
+        const COMMIT_COUNT: usize = 1_024;
+        let commits = (0..COMMIT_COUNT)
+            .map(|index| CommitId::for_test_label(&format!("replay-interval-{index}")))
+            .collect::<Vec<_>>();
+        let interval = PointReplayInterval::new(commits.clone(), None);
+        let mut cache = HashMap::new();
+
+        interval.cache_suffixes(&mut cache);
+
+        assert_eq!(cache.len(), COMMIT_COUNT);
+        let backing_buffers = cache
+            .values()
+            .map(|suffix| suffix.commits.as_ptr())
+            .collect::<HashSet<_>>();
+        assert_eq!(backing_buffers.len(), 1);
+        assert_eq!(interval.commits.len(), COMMIT_COUNT);
+        assert_eq!(
+            cache
+                .values()
+                .map(|suffix| suffix.commits().len())
+                .sum::<usize>(),
+            COMMIT_COUNT * (COMMIT_COUNT + 1) / 2,
+            "logical suffix coverage must not require physical suffix copies"
+        );
+        for (index, commit_id) in commits.iter().enumerate() {
+            assert_eq!(cache[commit_id].commits(), &commits[index..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn point_replay_interval_reuses_cached_suffix_and_commit_topology() {
+        const COMMIT_COUNT: usize = 32;
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(&storage, &tracked_state, "interval-base", None, &[])
+            .await
+            .expect("baseline root should write");
+        let mut parent = "interval-base".to_string();
+        let mut commits = Vec::with_capacity(COMMIT_COUNT);
+        for index in 0..COMMIT_COUNT {
+            let commit = format!("interval-rootless-{index}");
+            write_rootless_commit_for_test(&storage, &commit, &parent, &[]).await;
+            commits.push(CommitId::for_test_label(&commit));
+            parent = commit;
+        }
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("interval read should open"),
+        );
+
+        let head = reader
+            .point_replay_interval(&parent)
+            .await
+            .expect("head interval should load");
+        assert_eq!(head.commits().len(), COMMIT_COUNT);
+        assert!(head.baseline_root.is_some());
+        assert_eq!(reader.point_replay_intervals.len(), COMMIT_COUNT);
+        assert_eq!(reader.point_replay_commits.len(), COMMIT_COUNT + 1);
+
+        let middle_commit = commits[COMMIT_COUNT / 2];
+        let middle_offset = head
+            .commits()
+            .iter()
+            .position(|commit_id| *commit_id == middle_commit)
+            .expect("middle commit should belong to the head interval");
+        let middle = reader
+            .point_replay_interval(&middle_commit.to_string())
+            .await
+            .expect("cached suffix should load");
+        assert_eq!(middle.commits(), &head.commits()[middle_offset..]);
+        assert!(Arc::ptr_eq(&head.commits, &middle.commits));
+        assert_eq!(reader.point_replay_commits.len(), COMMIT_COUNT + 1);
+    }
 
     fn commit_root_key(label: &str) -> crate::storage_adapter::StorageKey {
         crate::storage_adapter::StorageKey(Bytes::copy_from_slice(
@@ -6802,6 +7003,151 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("rootless commit should commit");
+    }
+
+    #[tokio::test]
+    async fn first_parent_generation_write_set_deduplicates_touched_identities() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-a", "base-a", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        write_rootless_commit_for_test(
+            &storage,
+            "generation-1",
+            "base",
+            &[
+                row_with_value("entity-a", "generation-1-a", "generation-1", "middle"),
+                row_with_value("entity-b", "generation-1-b", "generation-1", "created"),
+            ],
+        )
+        .await;
+        write_rootless_commit_for_test(
+            &storage,
+            "generation-2",
+            "generation-1",
+            &[
+                // The endpoint payload returns to the base value, but stale
+                // admission must still know that this identity was touched.
+                row_with_value("entity-a", "generation-2-a", "generation-2", "base"),
+                row_with_value("entity-c", "generation-2-c", "generation-2", "created"),
+            ],
+        )
+        .await;
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("write-set read should open");
+        let identities = tracked_state
+            .reader(read)
+            .changed_identities_in_first_parent_interval("base", "generation-2")
+            .await
+            .expect("generation write set should load")
+            .expect("rootless first-parent interval should be supported");
+        assert_eq!(
+            identities
+                .iter()
+                .map(|identity| { identity.entity_pk().as_single_string().unwrap().to_owned() })
+                .collect::<Vec<_>>(),
+            ["entity-a", "entity-b", "entity-c"]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "release-only generation write-set benchmark probe"]
+    async fn generation_write_set_benchmark_probe() {
+        let rows = std::env::var("LIX_GENERATION_WRITE_SET_BENCH_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5_000);
+        let rounds = std::env::var("LIX_GENERATION_WRITE_SET_BENCH_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8);
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let base_rows = (0..rows)
+            .map(|index| {
+                row_with_value(
+                    &format!("entity-{index:05}"),
+                    &format!("base-change-{index:05}"),
+                    "base",
+                    "base",
+                )
+            })
+            .collect::<Vec<_>>();
+        write_root_for_test(&storage, &tracked_state, "base", None, &base_rows)
+            .await
+            .expect("benchmark base should write");
+        let changed_rows = (0..rows)
+            .map(|index| {
+                row_with_value(
+                    &format!("entity-{index:05}"),
+                    &format!("changed-{index:05}"),
+                    "after",
+                    "after",
+                )
+            })
+            .collect::<Vec<_>>();
+        write_rootless_commit_for_test(&storage, "after", "base", &changed_rows).await;
+
+        let mut write_set_samples = Vec::with_capacity(rounds);
+        let mut diff_samples = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("write-set benchmark read should open");
+            let started = Instant::now();
+            let identities = tracked_state
+                .reader(read)
+                .changed_identities_in_first_parent_interval("base", "after")
+                .await
+                .expect("generation write set should load")
+                .expect("benchmark interval should be rootless");
+            write_set_samples.push(started.elapsed());
+            assert_eq!(identities.len(), rows);
+
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("diff benchmark read should open");
+            let started = Instant::now();
+            let diff = tracked_state
+                .reader(read)
+                .diff_commits("base", "after", &TrackedStateDiffRequest::default())
+                .await
+                .expect("general diff should load");
+            diff_samples.push(started.elapsed());
+            assert_eq!(diff.entries.len(), rows);
+        }
+        write_set_samples.sort_unstable();
+        diff_samples.sort_unstable();
+        let p50 = |samples: &[std::time::Duration]| samples[(samples.len() - 1) / 2];
+        let write_set_p50 = p50(&write_set_samples);
+        let diff_p50 = p50(&diff_samples);
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "lix.generation-write-set.v1",
+                "rows": rows,
+                "rounds": rounds,
+                "general_diff_p50_us": diff_p50.as_micros(),
+                "generation_write_set_p50_us": write_set_p50.as_micros(),
+                "speedup": diff_p50.as_secs_f64() / write_set_p50.as_secs_f64(),
+            })
+        );
+        assert!(
+            write_set_p50 < diff_p50,
+            "generation write-set discovery should beat general endpoint diffing"
+        );
     }
 
     #[tokio::test]

@@ -25,6 +25,7 @@ use crate::storage_adapter::{
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
+use crate::transaction::CommitCoordinator;
 use crate::wasm::WasmTransitionCounters;
 use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
@@ -41,6 +42,7 @@ pub struct Engine<StorageImpl: Storage = crate::storage_adapter::Memory> {
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
+    commit_coordinator: Arc<CommitCoordinator>,
     observe_coordinator: Arc<ObserveCoordinator>,
     observe_invalidation: Arc<ObserveInvalidation>,
     plugin_host: PluginRuntimeHost,
@@ -170,6 +172,10 @@ where
         // execution-scoped SQL context, optionally wrapped by a transaction
         // overlay for writes.
 
+        let collaboration_write_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let commit_coordinator = Arc::new(CommitCoordinator::new(Arc::clone(
+            &collaboration_write_gate,
+        )));
         Ok(Self {
             binary_cas: Arc::new(BinaryCasContext::new()),
             storage,
@@ -179,7 +185,8 @@ where
             catalog_context: Arc::new(CatalogContext::new()),
             sql_planning_cache: Arc::new(SqlPlanningCache::default()),
             deterministic_runtime_gate: Arc::new(tokio::sync::Mutex::new(())),
-            collaboration_write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            collaboration_write_gate,
+            commit_coordinator,
             observe_coordinator: Arc::new(ObserveCoordinator::new()),
             observe_invalidation: Arc::new(ObserveInvalidation::new()),
             plugin_host,
@@ -229,6 +236,7 @@ where
             Arc::clone(&self.sql_planning_cache),
             Arc::clone(&self.deterministic_runtime_gate),
             Arc::clone(&self.collaboration_write_gate),
+            Arc::clone(&self.commit_coordinator),
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
             self.plugin_host.clone(),
@@ -248,6 +256,7 @@ where
             Arc::clone(&self.sql_planning_cache),
             Arc::clone(&self.deterministic_runtime_gate),
             Arc::clone(&self.collaboration_write_gate),
+            Arc::clone(&self.commit_coordinator),
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
             self.plugin_host.clone(),

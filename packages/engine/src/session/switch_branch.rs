@@ -94,6 +94,7 @@ where
             Arc::clone(&self.sql_planning_cache),
             Arc::clone(&self.deterministic_runtime_gate),
             Arc::clone(&self.collaboration_write_gate),
+            Arc::clone(&self.commit_coordinator),
             Arc::clone(&self.observe_coordinator),
             Arc::clone(&self.observe_invalidation),
             self.plugin_host.clone(),

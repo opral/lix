@@ -2702,7 +2702,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
     assert!(
         direct_structure_error
             .message
-            .contains("one existing scalar value only")
+            .contains("existing scalar values only")
     );
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(lww));
     lix.execute(
@@ -2721,27 +2721,23 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
         read_file(&lix, path).await.unwrap(),
         Some(scalar_after_direct_reject.clone())
     );
-    let direct_batch_error = lix
-        .execute(
-            "UPDATE json_object_member SET scalar_json = $1 \
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = $1 \
              WHERE parent_id = 'root' AND lixcol_file_id = $2",
-            &[
-                Value::Text(r#""BULK""#.to_owned()),
-                Value::Text(file_id.clone()),
-            ],
-        )
-        .await
-        .expect_err("a direct JSON semantic transition must contain one scalar change");
-    assert_eq!(direct_batch_error.code, LixError::CODE_INVALID_PLUGIN);
-    assert!(
-        direct_batch_error
-            .message
-            .contains("one existing scalar value only")
-    );
+        &[
+            Value::Text(r#""BULK""#.to_owned()),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .expect("a direct JSON semantic transition accepts an existing-scalar batch");
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
-        Some(scalar_after_direct_reject.clone())
+        Some(b"{\"left\":\"BULK\",\"right\":\"BULK\",\"gone\":\"BULK\"}".to_vec())
     );
+    write_file(&lix, path, scalar_after_direct_reject.clone())
+        .await
+        .unwrap();
 
     // Structure is byte-owned. A stale scalar delta is not allowed to
     // recreate an entity after another writer removes its containing slot.
@@ -2767,7 +2763,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
     .await
     .expect_err("a stale scalar must not resurrect a byte-deleted JSON node");
     assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
-    assert!(error.message.contains("one existing scalar value only"));
+    assert!(error.message.contains("existing scalar values only"));
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(without_gone.clone())
@@ -6004,19 +6000,174 @@ async fn stale_json_transaction_renders_retained_same_file_edits_with_resolution
 
     stale_client.reset_plugin_transition_counters();
     winner.commit().await.unwrap();
+    stale_client.reset_plugin_transition_counters();
     stale.commit().await.unwrap();
-    assert_eq!(
-        stale_client
-            .plugin_transition_counters()
-            .conflict_resolution_calls,
-        1
-    );
+    let counters = stale_client.plugin_transition_counters();
+    assert_eq!(counters.conflict_resolution_calls, 1);
+    assert_eq!(counters.conflict_resolution_records, 1);
+    assert_eq!(counters.guest_export_calls, 3);
+    assert_eq!(counters.durable_semantic_changes, 2);
     let bytes = read_file(&stale_client, path).await.unwrap().unwrap();
     let rendered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(rendered["retained"], "stale");
     assert_eq!(read_file(&winner_client, path).await.unwrap(), Some(bytes));
     winner_client.close().await.unwrap();
     stale_client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_json_transaction_batches_conflicts_into_one_render_transition() {
+    const CONFLICTS: usize = 32;
+    let archive = build_json_plugin_archive();
+    let stale_client = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &stale_client,
+        "plugin_json",
+        &archive,
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/batched-transaction-conflict.json";
+    let base = serde_json::Value::Object(
+        (0..CONFLICTS)
+            .map(|index| (format!("key-{index:02}"), serde_json::json!("base")))
+            .collect(),
+    );
+    write_file(
+        &stale_client,
+        path,
+        serde_json::to_vec(&base).expect("base JSON should encode"),
+    )
+    .await
+    .unwrap();
+    let winner_client = stale_client.open_workspace_session().await.unwrap();
+    let mut stale = stale_client.begin_transaction().await.unwrap();
+    let mut winner = winner_client.begin_transaction().await.unwrap();
+    for (transaction, value) in [(&mut stale, "stale"), (&mut winner, "winner")] {
+        let changed = serde_json::Value::Object(
+            (0..CONFLICTS)
+                .map(|index| (format!("key-{index:02}"), serde_json::json!(value)))
+                .collect(),
+        );
+        transaction
+            .execute(
+                "UPDATE lix_file SET data = $1 WHERE path = $2",
+                &[
+                    Value::Blob(
+                        serde_json::to_vec(&changed)
+                            .expect("changed JSON should encode")
+                            .into(),
+                    ),
+                    Value::Text(path.to_owned()),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    winner.commit().await.unwrap();
+    stale_client.reset_plugin_transition_counters();
+    stale.commit().await.unwrap();
+    let counters = stale_client.plugin_transition_counters();
+    assert_eq!(counters.conflict_resolution_calls, 1);
+    assert_eq!(counters.conflict_resolution_records, CONFLICTS as u64);
+    assert_eq!(counters.guest_export_calls, 3);
+    assert_eq!(counters.durable_semantic_changes, CONFLICTS as u64);
+    assert_eq!(
+        read_file(&stale_client, path).await.unwrap(),
+        read_file(&winner_client, path).await.unwrap()
+    );
+    winner_client.close().await.unwrap();
+    stale_client.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "release-only stale plugin replay benchmark"]
+async fn stale_plugin_replay_batch_benchmark_probe() {
+    let conflicts = std::env::var("LIX_STALE_REPLAY_BENCH_CONFLICTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64);
+    let rounds = std::env::var("LIX_STALE_REPLAY_BENCH_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8);
+    let archive = build_json_plugin_archive();
+    let mut samples = Vec::with_capacity(rounds);
+    let mut guest_export_calls = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        let stale_client = open_lix(OpenLixOptions::default()).await.unwrap();
+        install_reference_plugin_in_blank_registry(
+            &stale_client,
+            "plugin_json",
+            &archive,
+            &["json_root", "json_object_member", "json_array_item"],
+        )
+        .await;
+        let path = format!("/batched-transaction-conflict-{round}.json");
+        let document = |value: &str| {
+            serde_json::Value::Object(
+                (0..conflicts)
+                    .map(|index| (format!("key-{index:04}"), serde_json::json!(value)))
+                    .collect(),
+            )
+        };
+        write_file(
+            &stale_client,
+            &path,
+            serde_json::to_vec(&document("base")).unwrap(),
+        )
+        .await
+        .unwrap();
+        let winner_client = stale_client.open_workspace_session().await.unwrap();
+        let mut stale = stale_client.begin_transaction().await.unwrap();
+        let mut winner = winner_client.begin_transaction().await.unwrap();
+        for (transaction, value) in [(&mut stale, "stale"), (&mut winner, "winner")] {
+            transaction
+                .execute(
+                    "UPDATE lix_file SET data = $1 WHERE path = $2",
+                    &[
+                        Value::Blob(serde_json::to_vec(&document(value)).unwrap().into()),
+                        Value::Text(path.clone()),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        winner.commit().await.unwrap();
+        stale_client.reset_plugin_transition_counters();
+        let started = Instant::now();
+        stale.commit().await.unwrap();
+        samples.push(started.elapsed());
+        let counters = stale_client.plugin_transition_counters();
+        assert_eq!(counters.conflict_resolution_calls, 1);
+        assert_eq!(counters.conflict_resolution_records, conflicts as u64);
+        assert_eq!(counters.durable_semantic_changes, conflicts as u64);
+        guest_export_calls.push(counters.guest_export_calls);
+        assert_eq!(
+            read_file(&stale_client, &path).await.unwrap(),
+            read_file(&winner_client, &path).await.unwrap()
+        );
+        winner_client.close().await.unwrap();
+        stale_client.close().await.unwrap();
+    }
+    samples.sort_unstable();
+    guest_export_calls.sort_unstable();
+    let percentile = |values: &[Duration], percentile: usize| {
+        values[(values.len() - 1).saturating_mul(percentile) / 100]
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": "lix.stale-plugin-replay.v1",
+            "conflicts": conflicts,
+            "rounds": rounds,
+            "commit_p50_us": percentile(&samples, 50).as_micros(),
+            "commit_p95_us": percentile(&samples, 95).as_micros(),
+            "guest_export_calls_min": guest_export_calls[0],
+            "guest_export_calls_max": guest_export_calls[guest_export_calls.len() - 1],
+        })
+    );
 }
 
 #[tokio::test]
@@ -6027,36 +6178,36 @@ async fn same_base_transactions_resolve_reference_plugin_file_overlaps() {
             "plugin_json",
             build_json_plugin_archive(),
             vec!["json_root", "json_object_member", "json_array_item"],
-            b"{\"value\":\"base\"}\n".to_vec(),
-            b"{\"value\":\"first\"}\n".to_vec(),
-            b"{\"value\":\"second\"}\n".to_vec(),
+            b"{\"a\":\"base\",\"b\":\"base\"}\n".to_vec(),
+            b"{\"a\":\"first\",\"b\":\"first\"}\n".to_vec(),
+            b"{\"a\":\"second\",\"b\":\"second\"}\n".to_vec(),
         ),
         (
             "csv",
             "plugin_csv",
             build_csv_plugin_archive(),
             vec!["csv_v2_table", "csv_v2_row"],
-            b"name,value\nitem,base\n".to_vec(),
-            b"name,value\nitem,first\n".to_vec(),
-            b"name,value\nitem,second\n".to_vec(),
+            b"name,value\nitem,base\nother,base\n".to_vec(),
+            b"name,value\nitem,first\nother,first\n".to_vec(),
+            b"name,value\nitem,second\nother,second\n".to_vec(),
         ),
         (
             "markdown",
             "plugin_markdown",
             build_markdown_plugin_archive(),
             vec!["markdown_node_v2"],
-            b"# Base\n".to_vec(),
-            b"# First\n".to_vec(),
-            b"# Second\n".to_vec(),
+            b"# Base\n\nBase paragraph\n".to_vec(),
+            b"# First\n\nFirst paragraph\n".to_vec(),
+            b"# Second\n\nSecond paragraph\n".to_vec(),
         ),
         (
             "text",
             "plugin_git_text",
             build_text_plugin_archive(),
             vec!["git_text_line_v2"],
-            b"base\n".to_vec(),
-            b"first\n".to_vec(),
-            b"second\n".to_vec(),
+            b"base one\nbase two\n".to_vec(),
+            b"first one\nfirst two\n".to_vec(),
+            b"second one\nsecond two\n".to_vec(),
         ),
     ];
 
@@ -6083,6 +6234,7 @@ async fn same_base_transactions_resolve_reference_plugin_file_overlaps() {
 
         first.reset_plugin_transition_counters();
         first_transaction.commit().await.unwrap();
+        first.reset_plugin_transition_counters();
         second_transaction
             .commit()
             .await
@@ -6091,6 +6243,14 @@ async fn same_base_transactions_resolve_reference_plugin_file_overlaps() {
         assert!(
             counters.conflict_resolution_calls > 0,
             "{extension} must invoke its conflict resolver"
+        );
+        assert!(
+            counters.conflict_resolution_records >= 2,
+            "{extension} must resolve the multi-entity fixture as one batch"
+        );
+        assert_eq!(
+            counters.guest_export_calls, 3,
+            "{extension} must use one resolver and one render transition"
         );
         let first_bytes = read_file(&first, &path).await.unwrap().unwrap();
         let second_bytes = read_file(&second, &path).await.unwrap().unwrap();

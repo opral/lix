@@ -14,8 +14,12 @@ p95 below 100 ms with 50-100 active collaborators on one document.
   next wave's convergence latency.
 - Two writers overlap in every fourth wave. That is exactly 10% overlapping
   operations; the other 90% target distinct semantic entities.
-- A wave converges only after every client observes the marker through its own
-  query stream. The timer begins before commits are scheduled, so it includes
+- A wave converges only after every client reaches the marker's mutation
+  generation through its own query stream. One designated observer verifies
+  the marker bytes and publishes that generation as the wave receipt; the
+  remaining observers compare their scalar `mutation_sequence` instead of
+  rescanning and, remotely, Base64-decoding the complete document. The timer
+  begins before commits are scheduled, so it includes
   commit queueing, stale conflict discovery, plugin reconciliation, the
   in-memory storage commit, invalidation, query reevaluation, and observation
   fan-out.
@@ -23,6 +27,14 @@ p95 below 100 ms with 50-100 active collaborators on one document.
   capacity gate.
 - Every non-overlapping edit must survive, conflict waves must invoke the
   owning plugin resolver, final bytes must parse, and all clients must agree.
+- Local SDK and server-protocol measurements run through the same private
+  phase adapter. The shared driver owns wave construction, arrival deadlines,
+  overlap percentage, percentile calculation, convergence assertions, and the
+  100 ms gate; adapters own only transport-specific read, stage, commit, and
+  observation delivery.
+- Every run emits one machine-readable
+  `lix.collaboration-capacity.v1` JSON record. It includes p50/p95/p99 samples,
+  schedule lag, resolver calls, and deterministic logical resource counts.
 
 ## Results
 
@@ -50,6 +62,26 @@ engine and transport paths. A deployment using SQLite, RocksDB, SlateDB, or a
 remote object store must run the same gate on that storage before claiming its
 own production capacity.
 
+After the shared-driver and private tracing cut, one full 100-client release
+validation reported 14.422 ms local JSON convergence p95 and 21.754 ms
+in-process server-protocol p95. The corresponding pre-refactor worst values
+above were 18.095 ms and 25.977 ms. These single post-refactor runs are a
+regression check, not a replacement for the six-process worst-value matrix;
+they show that structured reporting and disabled-by-default stage spans did
+not consume the latency budget.
+
+After switching convergence detection to the verified generation receipt, one
+100-client release validation reported 12.547 ms local JSON convergence p95
+and 18.172 ms in-process server-protocol p95. The immediately preceding local
+JSON run on the stacked transaction changes was 16.420 ms. The receipt changes
+benchmark bookkeeping, not commit or observation semantics: every client still
+consumes its own event at or beyond the verified marker generation.
+
+Replacing split protocol lease/transaction flags with one RAII-owned activity
+state left the same server workload flat at 18.068 ms convergence p95 versus
+18.172 ms immediately before (-0.6%, within run variance). This cut is a
+cancellation-safety and maintainability change, not a throughput claim.
+
 ## Profile and change
 
 The first realistic run failed before producing a latency result. Same-file
@@ -63,6 +95,11 @@ bookkeeping rows, rebases the retained semantic edits through the existing
 plugin actor, keeps the final combined rendering, and commits once. Disjoint
 edits do not call the conflict resolver. Actual semantic overlaps remain
 grouped by file and invoke the resolver once for the accumulated conflict set.
+
+Private `lix_transaction` tracing spans now split stale commit work into diff,
+classification, reconciliation, resolver invocation, and semantic replay.
+They add no SDK method or protocol field and can be enabled only by a host
+subscriber when a slower capacity run needs attribution.
 
 Across the corrected six-run matrix, worst local service p95 was 7.952 ms and
 worst local convergence p95 was 24.780 ms. Absolute-deadline schedule-lag p95
@@ -86,7 +123,10 @@ write becomes visible. On the measured run:
 - allowed post-warmup growth: 67,108,864 bytes
 
 RSS is allocator- and platform-dependent, so the bound detects unbounded
-retention rather than promising a fixed production memory footprint.
+retention rather than promising a fixed production memory footprint. The soak
+also emits a `lix.collaboration-soak.v1` JSON record with exact opened, closed,
+staged, abandoned, and visible-write counts so lifecycle regressions are not
+inferred from RSS alone.
 
 ## Reproduction
 
@@ -114,5 +154,6 @@ cargo test -p lix_server_protocol --release \
   -- --ignored --exact --nocapture
 ```
 
-`LIX_COLLAB_GATE_MS` defaults to 100. The benchmark asserts the gate rather than
-only printing it.
+`LIX_COLLAB_GATE_MS` defaults to 100. Both adapters accept the same client,
+operation, arrival, and gate environment variables. The benchmark asserts the
+gate rather than only printing it.

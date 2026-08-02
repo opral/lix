@@ -1011,6 +1011,14 @@ impl TrackedStateDiffIdentity {
         self.batch.schema_key(self.ordinal)
     }
 
+    pub(crate) fn as_key_ref(&self) -> TrackedStateKeyRef<'_> {
+        TrackedStateKeyRef {
+            schema_key: self.schema_key(),
+            file_id: self.file_id(),
+            entity_pk: self.entity_pk(),
+        }
+    }
+
     /// Clones the shared schema owner without allocating decoded text.
     ///
     /// Downstream typed batches use this when re-dictionary-encoding an

@@ -1,11 +1,13 @@
 #[cfg(feature = "storage-benches")]
 mod bench_support;
 mod commit;
+mod commit_coordinator;
 mod context;
 mod normalization;
 pub(crate) mod plugin_checkpoint;
 mod schema_resolver;
 mod staging;
+mod stale_commit;
 pub(crate) mod types;
 mod validation;
 
@@ -20,12 +22,14 @@ pub(crate) use commit::take_complete_replacement_packed_current_base_publication
 pub(crate) use commit::take_complete_replacement_packed_current_base_retirements;
 #[cfg(test)]
 pub(crate) use commit::take_ordered_packed_current_base_publications;
+pub(crate) use commit_coordinator::CommitCoordinator;
 pub(crate) use context::CertifiedHistoryStoreReader;
 #[cfg(test)]
 pub(crate) use context::CommitBoundaryGuard;
 pub(crate) use context::CommitBoundaryState;
 pub(crate) use context::Transaction;
 pub(crate) use context::TransactionCommitBoundary;
+pub(crate) use context::TransactionCommitOutcome;
 pub(crate) use context::begin_commit_boundary;
 pub(crate) use context::commit_at_boundary;
 pub(crate) use context::open_transaction;

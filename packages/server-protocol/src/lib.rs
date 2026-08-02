@@ -111,6 +111,8 @@ const MAX_COMPLETED_REMOTE_TRANSACTIONS: usize = 8;
 const MAX_IDEMPOTENCY_COMPONENT_BYTES: usize = 255;
 const SESSION_OPEN_GATE_CLOSING: usize = 1 << (usize::BITS - 1);
 const SESSION_OPEN_GATE_COUNT_MASK: usize = !SESSION_OPEN_GATE_CLOSING;
+const SESSION_ACTIVITY_TRANSACTION: usize = 1 << (usize::BITS - 1);
+const SESSION_ACTIVITY_LEASE_COUNT_MASK: usize = !SESSION_ACTIVITY_TRANSACTION;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// A stable principal namespace injected by an authenticated protocol host.
@@ -292,8 +294,7 @@ where
     lix: Arc<AsyncRwLock<Arc<Lix<S>>>>,
     transactions: AsyncMutex<RemoteTransactionRegistry<S>>,
     last_used: Mutex<Instant>,
-    leases: AtomicUsize,
-    transaction_active: std::sync::atomic::AtomicBool,
+    activity: Arc<SessionActivity>,
     request_blobs: Mutex<RequestBlobCache>,
     max_reconstructed_request_blob_bytes: usize,
 }
@@ -312,6 +313,84 @@ where
 {
     id: String,
     transaction: LixTransaction<S>,
+    _pin: RemoteTransactionPin,
+}
+
+#[derive(Debug)]
+struct RemoteTransactionPin {
+    activity: Arc<SessionActivity>,
+}
+
+impl RemoteTransactionPin {
+    fn acquire(activity: Arc<SessionActivity>) -> Result<Self, LixError> {
+        activity.acquire_transaction()?;
+        Ok(Self { activity })
+    }
+}
+
+impl Drop for RemoteTransactionPin {
+    fn drop(&mut self) {
+        self.activity.release_transaction();
+    }
+}
+
+#[derive(Debug, Default)]
+struct SessionActivity {
+    state: AtomicUsize,
+}
+
+impl SessionActivity {
+    fn acquire_lease(&self) {
+        let previous = self.state.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            previous & SESSION_ACTIVITY_LEASE_COUNT_MASK < SESSION_ACTIVITY_LEASE_COUNT_MASK,
+            "session lease count overflow"
+        );
+    }
+
+    fn release_lease(&self) {
+        let previous = self.state.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            previous & SESSION_ACTIVITY_LEASE_COUNT_MASK > 0,
+            "session lease count underflow"
+        );
+    }
+
+    fn acquire_transaction(&self) -> Result<(), LixError> {
+        let previous = self
+            .state
+            .fetch_or(SESSION_ACTIVITY_TRANSACTION, Ordering::AcqRel);
+        if previous & SESSION_ACTIVITY_TRANSACTION != 0 {
+            return Err(remote_transaction_state_error(
+                "Lix session already has an active transaction",
+            ));
+        }
+        Ok(())
+    }
+
+    fn release_transaction(&self) {
+        let previous = self
+            .state
+            .fetch_and(!SESSION_ACTIVITY_TRANSACTION, Ordering::AcqRel);
+        assert!(
+            previous & SESSION_ACTIVITY_TRANSACTION != 0,
+            "session transaction pin was not active"
+        );
+    }
+
+    #[cfg(test)]
+    fn lease_count(&self) -> usize {
+        self.state.load(Ordering::Acquire) & SESSION_ACTIVITY_LEASE_COUNT_MASK
+    }
+
+    fn is_idle(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 0
+    }
+
+    #[cfg(test)]
+    fn transaction_is_active(&self) -> bool {
+        self.state.load(Ordering::Acquire) & SESSION_ACTIVITY_TRANSACTION != 0
+    }
 }
 
 #[derive(Clone)]
@@ -498,15 +577,14 @@ where
             lix: Arc::new(AsyncRwLock::new(Arc::new(lix))),
             transactions: AsyncMutex::new(RemoteTransactionRegistry::default()),
             last_used: Mutex::new(now),
-            leases: AtomicUsize::new(0),
-            transaction_active: std::sync::atomic::AtomicBool::new(false),
+            activity: Arc::new(SessionActivity::default()),
             request_blobs: Mutex::new(RequestBlobCache::new(request_blob_budget)),
             max_reconstructed_request_blob_bytes,
         }
     }
 
     fn acquire(&self, now: Instant) {
-        self.leases.fetch_add(1, Ordering::AcqRel);
+        self.activity.acquire_lease();
         *self
             .last_used
             .lock()
@@ -518,12 +596,12 @@ where
             .last_used
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
-        let previous = self.leases.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "session lease count underflow");
+        self.activity.release_lease();
     }
 
+    #[cfg(test)]
     fn lease_count(&self) -> usize {
-        self.leases.load(Ordering::Acquire)
+        self.activity.lease_count()
     }
 
     fn last_used(&self) -> Instant {
@@ -534,9 +612,11 @@ where
     }
 
     fn is_idle_expired(&self, now: Instant, timeout: Duration) -> bool {
-        self.lease_count() == 0
-            && !self.transaction_active.load(Ordering::Acquire)
-            && now.saturating_duration_since(self.last_used()) >= timeout
+        self.is_idle() && now.saturating_duration_since(self.last_used()) >= timeout
+    }
+
+    fn is_idle(&self) -> bool {
+        self.activity.is_idle()
     }
 
     fn request_blob(&self, sha256: &str) -> Option<VerifiedRequestBlob> {
@@ -779,13 +859,12 @@ where
         }
         let lix = Arc::clone(&*self.record.lix.read().await);
         let id = generate_capability_id()?;
+        let pin = RemoteTransactionPin::acquire(Arc::clone(&self.record.activity))?;
         transactions.active = Some(ActiveRemoteTransaction {
             id: id.clone(),
             transaction: lix.begin_transaction().await?,
+            _pin: pin,
         });
-        self.record
-            .transaction_active
-            .store(true, Ordering::Release);
         Ok(id)
     }
 
@@ -886,9 +965,6 @@ where
         while transactions.completed.len() > MAX_COMPLETED_REMOTE_TRANSACTIONS {
             transactions.completed.pop_front();
         }
-        self.record
-            .transaction_active
-            .store(false, Ordering::Release);
         result.map(|_| ())
     }
 
@@ -1379,9 +1455,7 @@ where
             let lru_idle_id = registry
                 .sessions
                 .iter()
-                .filter(|(_, record)| {
-                    record.lease_count() == 0 && !record.transaction_active.load(Ordering::Acquire)
-                })
+                .filter(|(_, record)| record.is_idle())
                 .min_by_key(|(_, record)| record.last_used())
                 .map(|(session_id, _)| session_id.clone());
             let Some(lru_idle_id) = lru_idle_id else {
@@ -1465,7 +1539,6 @@ where
         Some(active) => active.transaction.rollback().await,
         None => Ok(()),
     };
-    record.transaction_active.store(false, Ordering::Release);
     let lix = record.lix.write().await;
     let close_result = lix.close().await;
     rollback_result.and(close_result)
@@ -2441,21 +2514,17 @@ where
             "subscriptions must contain at most {MAX_MULTIPLEX_SUBSCRIPTIONS} entries"
         )));
     }
+    let groups = group_multiplex_subscriptions(request.subscriptions)?;
     let (sender, mut receiver) = mpsc::channel::<MultiplexObserveMessage>(64);
     let (terminal_sender, terminal_signal) = TerminalStorageStreamSignal::new();
-    // Own every task before validating the next subscription. Dropping a bare
-    // JoinHandle detaches it, which could otherwise leave an abandoned
-    // observation (and its terminal-storage sender) alive if validation fails
-    // or the response body is never polled.
-    let mut task_guard = Some(ObserveTaskGuard(Vec::with_capacity(
-        request.subscriptions.len(),
-    )));
-    for subscription in request.subscriptions {
-        let subscription_id = required_non_empty(subscription.id, "subscriptions[].id")?;
-        let sql = required_non_empty(subscription.sql, "subscriptions[].sql")?;
-        let params = decode_params(subscription.params)?;
+    // Own each group task while opening the remaining observations. Dropping a
+    // bare JoinHandle detaches it, which could otherwise leave an abandoned
+    // observation (and its terminal-storage sender) alive if a later open
+    // fails or the response body is never polled.
+    let mut task_guard = Some(ObserveTaskGuard(Vec::with_capacity(groups.len())));
+    for group in groups {
         let events = lease
-            .observe(&sql, &params, terminal_sender.clone())
+            .observe(&group.sql, &group.params, terminal_sender.clone())
             .await?;
         let sender = sender.clone();
         let terminal_sender = terminal_sender.clone();
@@ -2467,41 +2536,59 @@ where
             .push(tokio::spawn(
                 async move {
                     let mut delta_base = None;
-                    loop {
-                        let message = match events.next().await {
+                    'events: loop {
+                        let messages = match events.next().await {
                             Ok(Some(event)) => {
                                 match multiplex_observe_payload(event, delta_base.as_ref()) {
                                     Ok((payload, next_delta_base)) => {
-                                        let message = MultiplexObserveMessage::Next {
-                                            subscription_id: subscription_id.clone(),
-                                            payload,
-                                        };
-                                        if sender.send(message).await.is_err() {
-                                            break;
-                                        }
                                         delta_base = next_delta_base;
-                                        continue;
+                                        let payload = Arc::new(payload);
+                                        group
+                                            .subscription_ids
+                                            .iter()
+                                            .map(|subscription_id| MultiplexObserveMessage::Next {
+                                                subscription_id: subscription_id.clone(),
+                                                payload: Arc::clone(&payload),
+                                            })
+                                            .collect::<Vec<_>>()
                                     }
                                     Err(error) => {
                                         terminal_sender.signal_if_terminal(&error);
-                                        MultiplexObserveMessage::Error {
-                                            subscription_id: subscription_id.clone(),
-                                            error: ErrorEnvelope::from_lix_error(&error),
-                                        }
+                                        let error = ErrorEnvelope::from_lix_error(&error);
+                                        group
+                                            .subscription_ids
+                                            .iter()
+                                            .map(|subscription_id| MultiplexObserveMessage::Error {
+                                                subscription_id: subscription_id.clone(),
+                                                error: error.clone(),
+                                            })
+                                            .collect()
                                     }
                                 }
                             }
                             Ok(None) => break,
                             Err(error) => {
                                 terminal_sender.signal_if_terminal(&error);
-                                MultiplexObserveMessage::Error {
-                                    subscription_id: subscription_id.clone(),
-                                    error: ErrorEnvelope::from_lix_error(&error),
-                                }
+                                let error = ErrorEnvelope::from_lix_error(&error);
+                                group
+                                    .subscription_ids
+                                    .iter()
+                                    .map(|subscription_id| MultiplexObserveMessage::Error {
+                                        subscription_id: subscription_id.clone(),
+                                        error: error.clone(),
+                                    })
+                                    .collect()
                             }
                         };
-                        let terminal = matches!(message, MultiplexObserveMessage::Error { .. });
-                        if sender.send(message).await.is_err() || terminal {
+                        let terminal = messages.first().is_some_and(|message| {
+                            matches!(message, MultiplexObserveMessage::Error { .. })
+                        });
+                        for message in messages {
+                            if sender.send(message).await.is_err() {
+                                break 'events;
+                            }
+                        }
+                        if terminal {
                             break;
                         }
                     }
@@ -2519,11 +2606,8 @@ where
             match message {
                 MultiplexObserveMessage::Next { subscription_id, payload } => {
                     yield Ok::<Event, Infallible>(sse_json_event("next", &MultiplexObserveEventResponse {
-                        subscription_id,
-                        sequence: payload.sequence,
-                        mutation_sequence: payload.mutation_sequence,
-                        result: payload.result,
-                        delta: payload.delta,
+                        subscription_id: &subscription_id,
+                        payload: payload.as_ref(),
                     }));
                 }
                 MultiplexObserveMessage::Error { subscription_id, error } => {
@@ -3070,12 +3154,12 @@ pub fn terminal_storage_stream_signal(response: &Response) -> Option<TerminalSto
         .cloned()
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct ErrorEnvelope {
     error: ErrorBody,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct ErrorBody {
     code: String,
     message: String,
@@ -3466,6 +3550,51 @@ struct MultiplexObserveSubscription {
     params: Vec<WireValue>,
 }
 
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct MultiplexObserveGroupKey {
+    sql: String,
+    params_json: String,
+}
+
+struct MultiplexObserveGroup {
+    subscription_ids: Vec<String>,
+    sql: String,
+    params: Vec<Value>,
+}
+
+fn group_multiplex_subscriptions(
+    subscriptions: Vec<MultiplexObserveSubscription>,
+) -> Result<Vec<MultiplexObserveGroup>, ApiError> {
+    let mut group_indexes = HashMap::<MultiplexObserveGroupKey, usize>::new();
+    let mut groups = Vec::<MultiplexObserveGroup>::new();
+    for subscription in subscriptions {
+        let subscription_id = required_non_empty(subscription.id, "subscriptions[].id")?;
+        let sql = required_non_empty(subscription.sql, "subscriptions[].sql")?;
+        let params_json = serde_json::to_string(&subscription.params).map_err(|error| {
+            ApiError::from(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("encode multiplex observation parameters: {error}"),
+            ))
+        })?;
+        let key = MultiplexObserveGroupKey {
+            sql: sql.clone(),
+            params_json,
+        };
+        if let Some(index) = group_indexes.get(&key).copied() {
+            groups[index].subscription_ids.push(subscription_id);
+            continue;
+        }
+        let index = groups.len();
+        groups.push(MultiplexObserveGroup {
+            subscription_ids: vec![subscription_id],
+            sql,
+            params: decode_params(subscription.params)?,
+        });
+        group_indexes.insert(key, index);
+    }
+    Ok(groups)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ObserveEventResponse {
@@ -3489,7 +3618,7 @@ impl TryFrom<ObserveEvent> for ObserveEventResponse {
 enum MultiplexObserveMessage {
     Next {
         subscription_id: String,
-        payload: MultiplexObservePayload,
+        payload: Arc<MultiplexObservePayload>,
     },
     Error {
         subscription_id: String,
@@ -3544,14 +3673,10 @@ struct RowSplice {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MultiplexObserveEventResponse {
-    subscription_id: String,
-    sequence: u64,
-    mutation_sequence: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<ExecuteResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    delta: Option<ObserveDelta>,
+struct MultiplexObserveEventResponse<'a> {
+    subscription_id: &'a str,
+    #[serde(flatten)]
+    payload: &'a MultiplexObservePayload,
 }
 
 const MIN_BLOB_DELTA_BYTES: usize = 32 * 1024;
@@ -3833,6 +3958,9 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use http_body_util::BodyExt as _;
+    use lix_collaboration_test_support::{
+        CapacityConfig, CollaborationCapacityBackend, WavePlan, run_capacity_workload,
+    };
     use lix_sdk::{
         Blob, CommitResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite, OpenLixOptions,
         PutBatch, ReadOptions, RequestBlobSpliceProvenance, StorageError, StorageSpace,
@@ -3842,6 +3970,7 @@ mod tests {
     use object_store::memory::InMemory as ObjectStoreMemory;
     use serde_json::{Value as JsonValue, json};
     use std::{
+        collections::BTreeMap,
         io::{Cursor, Read as _, Write as _},
         path::Path,
         sync::{Arc, Mutex, atomic::AtomicBool},
@@ -7192,100 +7321,126 @@ mod tests {
         assert_eq!(converged_rows[0], converged_rows[1]);
     }
 
-    #[tokio::test]
-    #[ignore = "manual release-mode remote commit-to-observation capacity gate"]
-    async fn remote_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95() {
-        const CLIENTS: usize = 100;
-        const OPERATIONS: usize = 100;
-        const WAVE_SIZE: usize = 5;
-        const ARRIVAL_INTERVAL: Duration = Duration::from_millis(50);
-        const GATE: Duration = Duration::from_millis(100);
+    struct RemoteCapacityBackend {
+        app: TestApp,
+        path: &'static str,
+        sessions: Vec<String>,
+        observations: Vec<TestSseStream>,
+    }
 
-        let app = app_with_options(ProtocolServerOptions {
-            max_sessions: 128,
-            ..ProtocolServerOptions::default()
-        })
-        .await;
-        let root = &app.server.inner.root;
-        root.execute(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-            &[
-                Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
-                Value::Blob(build_json_plugin_archive().into()),
-            ],
-        )
-        .await
-        .expect("JSON plugin should install");
-        let path = "/remote-collaboration-capacity.json";
-        let base = (0..=OPERATIONS)
-            .map(|slot| (format!("k{slot}"), JsonValue::String("base".into())))
-            .collect::<serde_json::Map<_, _>>();
-        root.execute(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-            &[
-                Value::Text(path.to_owned()),
-                Value::Blob(serde_json::to_vec(&base).unwrap().into()),
-            ],
-        )
-        .await
-        .expect("capacity document should import");
-
-        let mut sessions = Vec::with_capacity(CLIENTS);
-        let mut observations = Vec::with_capacity(CLIENTS);
-        for _ in 0..CLIENTS {
-            let (session_id, _) = new_session(&app.router).await;
-            let response = request(
-                &app.router,
-                "POST",
-                "/lix/v1/observe",
-                Some(&session_id),
-                Some(json!({
-                    "sql": "SELECT data FROM lix_file WHERE path = $1",
-                    "params": [{ "kind": "text", "value": path }]
-                })),
-            )
+    impl RemoteCapacityBackend {
+        async fn open(clients: usize, operations: usize) -> Self {
+            let app = app_with_options(ProtocolServerOptions {
+                max_sessions: 128,
+                ..ProtocolServerOptions::default()
+            })
             .await;
-            let mut stream = TestSseStream::new(response);
-            let initial = stream.next().await;
-            assert_eq!(initial["sequence"].as_u64(), Some(0));
-            sessions.push(session_id);
-            observations.push(stream);
+            let root = &app.server.inner.root;
+            root.execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                &[
+                    Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
+                    Value::Blob(build_json_plugin_archive().into()),
+                ],
+            )
+            .await
+            .expect("JSON plugin should install");
+            let path = "/remote-collaboration-capacity.json";
+            let base = (0..=operations)
+                .map(|slot| (format!("k{slot}"), JsonValue::String("base".into())))
+                .collect::<serde_json::Map<_, _>>();
+            root.execute(
+                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                &[
+                    Value::Text(path.to_owned()),
+                    Value::Blob(serde_json::to_vec(&base).unwrap().into()),
+                ],
+            )
+            .await
+            .expect("capacity document should import");
+
+            let mut sessions = Vec::with_capacity(clients);
+            let mut observations = Vec::with_capacity(clients);
+            for _ in 0..clients {
+                let (session_id, _) = new_session(&app.router).await;
+                let response = request(
+                    &app.router,
+                    "POST",
+                    "/lix/v1/observe",
+                    Some(&session_id),
+                    Some(json!({
+                        "sql": "SELECT data FROM lix_file WHERE path = $1",
+                        "params": [{ "kind": "text", "value": path }]
+                    })),
+                )
+                .await;
+                let mut stream = TestSseStream::new(response);
+                let initial = stream.next().await;
+                assert_eq!(initial["sequence"].as_u64(), Some(0));
+                sessions.push(session_id);
+                observations.push(stream);
+            }
+            root.reset_plugin_transition_counters();
+            Self {
+                app,
+                path,
+                sessions,
+                observations,
+            }
         }
 
-        let mut convergence_latencies = Vec::with_capacity(CLIENTS * OPERATIONS / WAVE_SIZE);
-        let mut service_latencies = Vec::with_capacity(OPERATIONS);
-        let mut schedule_lags = Vec::with_capacity(OPERATIONS / WAVE_SIZE);
-        let schedule_origin = Instant::now() + ARRIVAL_INTERVAL;
-        root.reset_plugin_transition_counters();
-        for wave in 0..OPERATIONS / WAVE_SIZE {
-            let current = root
+        async fn close(mut self) {
+            self.observations.clear();
+            self.app
+                .server
+                .close()
+                .await
+                .expect("capacity server should close");
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl CollaborationCapacityBackend for RemoteCapacityBackend {
+        type StagedWave = Vec<(String, String)>;
+
+        fn backend_name(&self) -> &'static str {
+            "server_protocol_in_process"
+        }
+
+        fn format_name(&self) -> &'static str {
+            "json"
+        }
+
+        async fn read_base(&self) -> Vec<u8> {
+            self.app
+                .server
+                .inner
+                .root
                 .execute(
                     "SELECT data FROM lix_file WHERE path = $1",
-                    &[Value::Text(path.to_owned())],
+                    &[Value::Text(self.path.to_owned())],
                 )
                 .await
                 .expect("wave base should read")
                 .rows()[0]
                 .get::<Vec<u8>>("data")
-                .expect("wave base should be bytes");
-            let current = serde_json::from_slice::<serde_json::Map<String, JsonValue>>(&current)
+                .expect("wave base should be bytes")
+        }
+
+        async fn stage_wave(&mut self, wave: &WavePlan, base: &[u8]) -> Self::StagedWave {
+            let current = serde_json::from_slice::<serde_json::Map<String, JsonValue>>(base)
                 .expect("wave base should parse");
-            let mut capabilities = Vec::with_capacity(WAVE_SIZE);
-            let mut marker = String::new();
-            for participant in 0..WAVE_SIZE {
-                let operation = wave * WAVE_SIZE + participant;
-                let conflict = wave.is_multiple_of(4) && participant < 2;
-                let slot = if conflict { 0 } else { operation + 1 };
-                let token = format!("wave-{wave}-client-{operation}");
-                if participant == WAVE_SIZE - 1 {
-                    marker.clone_from(&token);
-                }
-                let mut edit = current.clone();
-                edit.insert(format!("k{slot}"), JsonValue::String(token));
-                let session_id = &sessions[operation % CLIENTS];
-                let transaction_id = begin_remote_transaction(&app.router, session_id).await;
+            let mut capabilities = Vec::with_capacity(wave.edits.len());
+            for edit in &wave.edits {
+                let mut document = current.clone();
+                document.insert(
+                    format!("k{}", edit.slot),
+                    JsonValue::String(edit.token.clone()),
+                );
+                let session_id = &self.sessions[edit.operation % self.sessions.len()];
+                let transaction_id = begin_remote_transaction(&self.app.router, session_id).await;
                 let staged = remote_transaction_request(
-                    &app.router,
+                    &self.app.router,
                     "POST",
                     "/lix/v1/transaction/execute",
                     session_id,
@@ -7295,9 +7450,9 @@ mod tests {
                         "params": [
                             {
                                 "kind": "blob",
-                                "base64": BASE64_STANDARD.encode(serde_json::to_vec(&edit).unwrap())
+                                "base64": BASE64_STANDARD.encode(serde_json::to_vec(&document).unwrap())
                             },
-                            { "kind": "text", "value": path }
+                            { "kind": "text", "value": self.path }
                         ]
                     })),
                 )
@@ -7305,15 +7460,14 @@ mod tests {
                 assert_eq!(staged.status(), StatusCode::OK);
                 capabilities.push((session_id.clone(), transaction_id));
             }
+            capabilities
+        }
 
-            let wave_started = schedule_origin
-                + ARRIVAL_INTERVAL.saturating_mul(u32::try_from(wave).expect("wave fits u32"));
-            tokio::time::sleep_until(tokio::time::Instant::from_std(wave_started)).await;
-            schedule_lags.push(wave_started.elapsed());
-            let marker_capability = capabilities.pop().expect("marker capability");
+        async fn commit_wave(&mut self, mut staged: Self::StagedWave) -> Vec<Duration> {
+            let marker_capability = staged.pop().expect("marker capability");
             let mut commits = tokio::task::JoinSet::new();
-            for (session_id, transaction_id) in capabilities {
-                let router = app.router.clone();
+            for (session_id, transaction_id) in staged {
+                let router = self.app.router.clone();
                 commits.spawn(async move {
                     let started = Instant::now();
                     let response = remote_transaction_request(
@@ -7328,14 +7482,15 @@ mod tests {
                     (started.elapsed(), response.status())
                 });
             }
+            let mut services = Vec::with_capacity(5);
             while let Some(joined) = commits.join_next().await {
                 let (elapsed, status) = joined.expect("remote commit task should not panic");
                 assert_eq!(status, StatusCode::NO_CONTENT);
-                service_latencies.push(elapsed);
+                services.push(elapsed);
             }
             let marker_started = Instant::now();
             let marker_response = remote_transaction_request(
-                &app.router,
+                &self.app.router,
                 "POST",
                 "/lix/v1/transaction/commit",
                 &marker_capability.0,
@@ -7344,67 +7499,158 @@ mod tests {
             )
             .await;
             assert_eq!(marker_response.status(), StatusCode::NO_CONTENT);
-            service_latencies.push(marker_started.elapsed());
+            services.push(marker_started.elapsed());
+            services
+        }
 
-            let marker = marker.into_bytes();
+        async fn await_convergence(
+            &mut self,
+            marker: &[u8],
+            wave_started: Instant,
+        ) -> Vec<Duration> {
+            let mut observations = std::mem::take(&mut self.observations);
+            let marker = marker.to_vec();
+            let mut receipt_stream = observations
+                .pop()
+                .expect("capacity workload has an observation");
+            let (receipt_generation, receipt_elapsed) = loop {
+                let event = receipt_stream.next().await;
+                let encoded = event["result"]["rows"][0][0]["base64"]
+                    .as_str()
+                    .expect("receipt file should be a blob");
+                let bytes = BASE64_STANDARD
+                    .decode(encoded)
+                    .expect("receipt blob should decode");
+                if bytes.windows(marker.len()).any(|window| window == marker) {
+                    break (
+                        event["mutationSequence"]
+                            .as_u64()
+                            .expect("receipt carries a mutation generation"),
+                        wave_started.elapsed(),
+                    );
+                }
+            };
             let mut deliveries = tokio::task::JoinSet::new();
             for mut stream in observations {
-                let marker = marker.clone();
                 deliveries.spawn(async move {
                     loop {
                         let event = stream.next().await;
-                        let encoded = event["result"]["rows"][0][0]["base64"]
-                            .as_str()
-                            .expect("observed file should be a blob");
-                        let bytes = BASE64_STANDARD
-                            .decode(encoded)
-                            .expect("observed blob should decode");
-                        if bytes.windows(marker.len()).any(|window| window == marker) {
+                        let generation = event["mutationSequence"]
+                            .as_u64()
+                            .expect("observation carries a mutation generation");
+                        if generation >= receipt_generation {
                             return (stream, wave_started.elapsed());
                         }
                     }
                 });
             }
-            observations = Vec::with_capacity(CLIENTS);
+            let mut convergences = vec![receipt_elapsed];
+            self.observations.push(receipt_stream);
             while let Some(joined) = deliveries.join_next().await {
                 let (stream, elapsed) = joined.expect("delivery task should not panic");
-                observations.push(stream);
-                convergence_latencies.push(elapsed);
+                self.observations.push(stream);
+                convergences.push(elapsed);
+            }
+            convergences
+        }
+
+        async fn assert_final_state(&self, expected_tokens: &[String]) {
+            let final_bytes = self.read_base().await;
+            for token in expected_tokens {
+                assert!(
+                    final_bytes
+                        .windows(token.len())
+                        .any(|window| window == token.as_bytes()),
+                    "non-overlapping edit {token} was not retained"
+                );
+            }
+            for session_id in &self.sessions {
+                let response = request(
+                    &self.app.router,
+                    "POST",
+                    "/lix/v1/execute",
+                    Some(session_id),
+                    Some(json!({
+                        "sql": "SELECT data FROM lix_file WHERE path = $1",
+                        "params": [{ "kind": "text", "value": self.path }]
+                    })),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response_json(response).await;
+                let encoded = body["rows"][0][0]["base64"]
+                    .as_str()
+                    .expect("final remote file should be bytes");
+                assert_eq!(
+                    BASE64_STANDARD.decode(encoded).expect("final blob decodes"),
+                    final_bytes
+                );
             }
         }
 
-        service_latencies.sort_unstable();
-        convergence_latencies.sort_unstable();
-        schedule_lags.sort_unstable();
-        let service_p95 = service_latencies[(service_latencies.len() * 95)
-            .div_ceil(100)
-            .saturating_sub(1)];
-        let convergence_p95 = convergence_latencies[(convergence_latencies.len() * 95)
-            .div_ceil(100)
-            .saturating_sub(1)];
-        let schedule_lag_p95 =
-            schedule_lags[(schedule_lags.len() * 95).div_ceil(100).saturating_sub(1)];
-        eprintln!(
-            "remote_collaboration_capacity clients={CLIENTS} operations={OPERATIONS} \
-             wave_size={WAVE_SIZE} arrival_ms={} overlap_percent=10 service_p95_ms={:.3} \
-             convergence_p95_ms={:.3} schedule_lag_p95_ms={:.3} resolver_calls={}",
-            ARRIVAL_INTERVAL.as_millis(),
-            service_p95.as_secs_f64() * 1_000.0,
-            convergence_p95.as_secs_f64() * 1_000.0,
-            schedule_lag_p95.as_secs_f64() * 1_000.0,
-            root.plugin_transition_counters().conflict_resolution_calls,
+        fn resolver_calls(&self) -> u64 {
+            self.app
+                .server
+                .inner
+                .root
+                .plugin_transition_counters()
+                .conflict_resolution_calls
+        }
+
+        fn resource_counters(&self) -> BTreeMap<String, u64> {
+            BTreeMap::from([
+                ("protocol_sessions".to_owned(), self.sessions.len() as u64),
+                (
+                    "open_observations".to_owned(),
+                    self.observations.len() as u64,
+                ),
+            ])
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "manual release-mode remote commit-to-observation capacity gate"]
+    async fn remote_protocol_converges_to_one_hundred_clients_below_one_hundred_ms_p95() {
+        const WAVE_SIZE: usize = 5;
+        let clients = capacity_env_usize("LIX_COLLAB_CLIENTS", 100);
+        let operations = capacity_env_usize("LIX_COLLAB_OPERATIONS", 100);
+        let arrival_interval = Duration::from_millis(
+            capacity_env_usize("LIX_COLLAB_ARRIVAL_MS", 50)
+                .try_into()
+                .expect("arrival interval fits u64"),
         );
-        assert!(root.plugin_transition_counters().conflict_resolution_calls > 0);
-        assert!(
-            convergence_p95 < GATE,
-            "remote commit-to-convergence p95 was {:.3} ms",
-            convergence_p95.as_secs_f64() * 1_000.0
+        let gate = Duration::from_millis(
+            capacity_env_usize("LIX_COLLAB_GATE_MS", 100)
+                .try_into()
+                .expect("gate fits u64"),
         );
-        drop(observations);
-        app.server
-            .close()
-            .await
-            .expect("capacity server should close");
+        assert!((50..=100).contains(&clients));
+        let mut backend = RemoteCapacityBackend::open(clients, operations).await;
+        let report = run_capacity_workload(
+            &mut backend,
+            CapacityConfig {
+                clients,
+                operations,
+                wave_size: WAVE_SIZE,
+                conflict_wave_interval: 4,
+                arrival_interval,
+                convergence_gate: gate,
+            },
+        )
+        .await;
+        report.emit_json();
+        backend.close().await;
+    }
+
+    fn capacity_env_usize(key: &str, default: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .map(|value| {
+                value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{key} should be numeric"))
+            })
+            .unwrap_or(default)
     }
 
     #[tokio::test]
@@ -8260,6 +8506,81 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn multiplex_observe_fans_one_identical_snapshot_to_each_subscription() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/observe/multiplex",
+            Some(&session_id),
+            Some(json!({
+                "subscriptions": [
+                    {
+                        "id": "first",
+                        "sql": "SELECT $1 AS value",
+                        "params": [{ "kind": "text", "value": "shared" }]
+                    },
+                    {
+                        "id": "second",
+                        "sql": "SELECT $1 AS value",
+                        "params": [{ "kind": "text", "value": "shared" }]
+                    }
+                ]
+            })),
+        )
+        .await;
+        let mut events = TestSseStream::new(response);
+        let first = events.next().await;
+        let second = events.next().await;
+
+        assert_eq!(
+            [
+                first["subscriptionId"].as_str(),
+                second["subscriptionId"].as_str()
+            ],
+            [Some("first"), Some("second")]
+        );
+        for event in [first, second] {
+            assert_eq!(event["sequence"], 0);
+            assert_eq!(event["result"]["rows"][0][0]["value"], "shared");
+        }
+    }
+
+    #[test]
+    fn multiplex_observe_groups_identical_queries_for_shared_fanout() {
+        let subscriptions = vec![
+            MultiplexObserveSubscription {
+                id: Some("first".to_owned()),
+                sql: Some("SELECT $1".to_owned()),
+                params: vec![WireValue::Text {
+                    value: "same".to_owned(),
+                }],
+            },
+            MultiplexObserveSubscription {
+                id: Some("second".to_owned()),
+                sql: Some("SELECT $1".to_owned()),
+                params: vec![WireValue::Text {
+                    value: "same".to_owned(),
+                }],
+            },
+            MultiplexObserveSubscription {
+                id: Some("different".to_owned()),
+                sql: Some("SELECT $1".to_owned()),
+                params: vec![WireValue::Text {
+                    value: "other".to_owned(),
+                }],
+            },
+        ];
+
+        let groups = group_multiplex_subscriptions(subscriptions).expect("valid subscriptions");
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].subscription_ids, ["first", "second"]);
+        assert_eq!(groups[1].subscription_ids, ["different"]);
+    }
+
     fn point_blob_event(sequence: u64, bytes: Vec<u8>) -> ObserveEvent {
         ObserveEvent {
             sequence,
@@ -8621,7 +8942,8 @@ mod tests {
                             .expect("blob base")
                     })
                     .collect::<Vec<_>>();
-                let mut samples = Vec::with_capacity(SAMPLES);
+                let mut repeated_samples = Vec::with_capacity(SAMPLES);
+                let mut shared_samples = Vec::with_capacity(SAMPLES);
                 for _ in 0..SAMPLES {
                     let started = Instant::now();
                     for base in &bases {
@@ -8630,21 +8952,36 @@ mod tests {
                                 .expect("delta payload"),
                         );
                     }
-                    samples.push(started.elapsed());
+                    repeated_samples.push(started.elapsed());
+
+                    let started = Instant::now();
+                    let (payload, _) = multiplex_observe_payload(event.clone(), bases.first())
+                        .expect("shared delta payload");
+                    let payload = Arc::new(payload);
+                    for _ in 0..fanout {
+                        black_box(Arc::clone(&payload));
+                    }
+                    shared_samples.push(started.elapsed());
                 }
-                samples.sort_unstable();
-                let p50 = samples[SAMPLES / 2];
-                let p95 = samples[SAMPLES * 95 / 100];
+                repeated_samples.sort_unstable();
+                shared_samples.sort_unstable();
+                let repeated_p50 = repeated_samples[SAMPLES / 2];
+                let repeated_p95 = repeated_samples[SAMPLES * 95 / 100];
+                let shared_p50 = shared_samples[SAMPLES / 2];
+                let shared_p95 = shared_samples[SAMPLES * 95 / 100];
                 let total_bytes = u32::try_from(size_mib * 1024 * 1024 * fanout)
                     .expect("diagnostic byte count should fit u32");
                 let throughput = |elapsed: Duration| {
                     f64::from(total_bytes) / elapsed.as_secs_f64() / (1024.0 * 1024.0)
                 };
                 eprintln!(
-                    "observe_fanout size_mib={size_mib} subscribers={fanout} p50_us={} p95_us={} logical_mib_s_p50={:.1}",
-                    p50.as_micros(),
-                    p95.as_micros(),
-                    throughput(p50),
+                    "observe_fanout size_mib={size_mib} subscribers={fanout} repeated_p50_us={} repeated_p95_us={} shared_p50_us={} shared_p95_us={} speedup_p50={:.2} logical_mib_s_p50={:.1}",
+                    repeated_p50.as_micros(),
+                    repeated_p95.as_micros(),
+                    shared_p50.as_micros(),
+                    shared_p95.as_micros(),
+                    repeated_p50.as_secs_f64() / shared_p50.as_secs_f64(),
+                    throughput(shared_p50),
                 );
             }
         }
@@ -9071,6 +9408,46 @@ mod tests {
         assert_eq!(replacement.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn remote_transaction_pin_is_exclusive_and_releases_on_drop() {
+        let activity = Arc::new(SessionActivity::default());
+        let pin = RemoteTransactionPin::acquire(Arc::clone(&activity)).expect("first pin opens");
+        assert!(activity.transaction_is_active());
+        let error = RemoteTransactionPin::acquire(Arc::clone(&activity))
+            .expect_err("a second transaction pin must be rejected");
+        assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+        drop(pin);
+
+        assert!(!activity.transaction_is_active());
+        let replacement =
+            RemoteTransactionPin::acquire(Arc::clone(&activity)).expect("released pin reopens");
+        drop(replacement);
+        assert!(!activity.transaction_is_active());
+    }
+
+    #[test]
+    fn session_activity_keeps_lease_count_and_transaction_pin_coherent() {
+        let activity = Arc::new(SessionActivity::default());
+        activity.acquire_lease();
+        let transaction =
+            RemoteTransactionPin::acquire(Arc::clone(&activity)).expect("transaction pin opens");
+        activity.acquire_lease();
+
+        assert_eq!(activity.lease_count(), 2);
+        assert!(activity.transaction_is_active());
+        assert!(!activity.is_idle());
+
+        activity.release_lease();
+        drop(transaction);
+        assert_eq!(activity.lease_count(), 1);
+        assert!(!activity.transaction_is_active());
+        assert!(!activity.is_idle());
+
+        activity.release_lease();
+        assert!(activity.is_idle());
+    }
+
     #[tokio::test]
     async fn server_shutdown_discards_abandoned_remote_transaction_and_session() {
         let app = app().await;
@@ -9342,6 +9719,94 @@ mod tests {
         }
         let replacement = request(&router, "GET", "/lix/v1", None, None).await;
         assert_eq!(replacement.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cancelled_remote_commit_releases_transaction_pin_after_detached_work() {
+        let storage = BlockingFencedWriteStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open lix"),
+        );
+        let server = LixProtocolServer::with_options(
+            root,
+            ProtocolServerOptions {
+                max_sessions: 1,
+                session_idle_timeout: Duration::from_mins(1),
+                ..ProtocolServerOptions::default()
+            },
+        )
+        .expect("protocol server");
+        let router = handler(server.clone());
+        let (session_id, _) = new_session(&router).await;
+        let transaction_id = begin_remote_transaction(&router, &session_id).await;
+        let staged = remote_transaction_request(
+            &router,
+            "POST",
+            "/lix/v1/transaction/execute",
+            &session_id,
+            &transaction_id,
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('cancelled-commit', 'value')"
+            })),
+        )
+        .await;
+        assert_eq!(staged.status(), StatusCode::OK);
+        let record = server
+            .inner
+            .registry
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .expect("transaction session remains registered");
+
+        storage.block_next_write();
+        let commit_router = router.clone();
+        let commit_session_id = session_id.clone();
+        let commit_transaction_id = transaction_id.clone();
+        let commit = tokio::spawn(async move {
+            remote_transaction_request(
+                &commit_router,
+                "POST",
+                "/lix/v1/transaction/commit",
+                &commit_session_id,
+                &commit_transaction_id,
+                None,
+            )
+            .await
+        });
+        storage.wait_for_blocked_write().await;
+
+        commit.abort();
+        assert!(
+            commit
+                .await
+                .expect_err("outer commit request was cancelled")
+                .is_cancelled()
+        );
+        assert_eq!(
+            request(&router, "GET", "/lix/v1", None, None)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "detached storage work must keep its operation lease"
+        );
+
+        storage.release_blocked_write();
+        while record.lease_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!record.activity.transaction_is_active());
+        assert_eq!(
+            request(&router, "GET", "/lix/v1", None, None)
+                .await
+                .status(),
+            StatusCode::OK,
+            "dropped transaction state must release the lifecycle pin"
+        );
     }
 
     #[tokio::test]
