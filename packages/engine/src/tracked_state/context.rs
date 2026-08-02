@@ -8027,6 +8027,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: Some("certified-origin"),
+                base_coordinate: None,
                 authored: true,
                 certified: true,
             }],

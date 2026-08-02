@@ -2661,6 +2661,7 @@ mod tests {
                     updated_at: ts(&row.updated_at),
                     snapshot: snapshot.as_ref_slot(),
                     metadata: metadata.as_ref_slot(),
+                    analytical_base_coordinate: None,
                 })
                 .collect::<Vec<_>>();
             let schema_keys = parent_rows
@@ -2743,6 +2744,7 @@ mod tests {
                     updated_at: ts(&row.updated_at),
                     snapshot: snapshot.as_ref_slot(),
                     metadata: metadata.as_ref_slot(),
+                    analytical_base_coordinate: None,
                 })
                 .collect::<Vec<_>>();
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
@@ -3190,6 +3192,7 @@ mod tests {
                     snapshot: change.snapshot.as_ref_slot(),
                     metadata: change.metadata.as_ref_slot(),
                     origin_key: change.origin_key.as_deref(),
+                    base_coordinate: None,
                     authored: true,
                     certified: false,
                 })

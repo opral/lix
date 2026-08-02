@@ -24,9 +24,9 @@ use crate::tracked_state::codec::{
     encode_value_ref,
 };
 use crate::tracked_state::types::{
-    TRACKED_STATE_HASH_BYTES, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
-    TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
-    TrackedStateRootId,
+    TRACKED_STATE_HASH_BYTES, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
+    TrackedStateCommitRoot, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
+    TrackedStateKeyRef, TrackedStateRootId,
 };
 use crate::{LixError, storage_codec};
 use bytes::Bytes;
@@ -73,7 +73,10 @@ const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
 const GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const GENERIC_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
 const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
-const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD9";
+// Version 10 adds optional analytical-base coordinates to indexed payload
+// records. Reject version 9 as a whole instead of letting coordinate-aware
+// decoders ambiguously interpret its shorter authored/certified records.
+const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD10";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -126,6 +129,8 @@ struct CommitDeltaPayloadRef<'a> {
     metadata: crate::json_store::JsonSlotRef<'a>,
     #[musli(with = storage_codec::option)]
     origin_key: Option<&'a str>,
+    #[musli(with = storage_codec::option)]
+    base_coordinate: Option<TrackedStateBaseCoordinate>,
     authored: bool,
     certified: bool,
 }
@@ -139,6 +144,8 @@ struct CommitDeltaAuthoredPayloadRef<'a> {
     metadata: crate::json_store::JsonSlotRef<'a>,
     #[musli(with = storage_codec::option)]
     origin_key: Option<&'a str>,
+    #[musli(with = storage_codec::option)]
+    base_coordinate: Option<TrackedStateBaseCoordinate>,
 }
 
 #[derive(Clone, Copy, musli::Encode)]
@@ -146,6 +153,8 @@ struct CommitDeltaAuthoredPayloadRef<'a> {
 struct CommitDeltaCertifiedPayloadRef<'a> {
     #[musli(with = storage_codec::option)]
     origin_key: Option<&'a str>,
+    #[musli(with = storage_codec::option)]
+    base_coordinate: Option<TrackedStateBaseCoordinate>,
 }
 
 #[derive(Debug, musli::Decode)]
@@ -153,6 +162,8 @@ struct CommitDeltaCertifiedPayloadRef<'a> {
 struct CommitDeltaCertifiedPayload {
     #[musli(with = storage_codec::option)]
     origin_key: Option<String>,
+    #[musli(with = storage_codec::option)]
+    base_coordinate: Option<TrackedStateBaseCoordinate>,
 }
 
 const COMMIT_DELTA_PAYLOAD_AUTHORED: u8 = 0;
@@ -169,14 +180,19 @@ struct CommitDeltaAuthoredPayload {
     metadata: crate::json_store::JsonSlot,
     #[musli(with = storage_codec::option)]
     origin_key: Option<String>,
+    #[musli(with = storage_codec::option)]
+    base_coordinate: Option<TrackedStateBaseCoordinate>,
 }
 
 #[derive(Debug)]
 enum CommitDeltaPayload {
     Authored(CommitDeltaAuthoredPayload),
-    SelectedRef,
-    SelectedTombstone,
-    CertifiedRef(Option<String>),
+    SelectedRef(Option<TrackedStateBaseCoordinate>),
+    SelectedTombstone(Option<TrackedStateBaseCoordinate>),
+    CertifiedRef {
+        origin_key: Option<String>,
+        base_coordinate: Option<TrackedStateBaseCoordinate>,
+    },
 }
 
 #[cfg(test)]
@@ -232,17 +248,19 @@ where
         }
         match self.layout {
             CommitDeltaPayloadLayout::UniformCertifiedRef => {
-                return Ok(CommitDeltaPayload::CertifiedRef(
-                    if self.sidecar.as_ref().is_empty() {
-                        None
-                    } else {
-                        storage_codec::decode::<CommitDeltaCertifiedPayload>(
-                            "tracked_state uniform certified commit_delta payload",
-                            self.sidecar.as_ref(),
-                        )?
-                        .origin_key
-                    },
-                ));
+                let (origin_key, base_coordinate) = if self.sidecar.as_ref().is_empty() {
+                    (None, None)
+                } else {
+                    let payload = storage_codec::decode::<CommitDeltaCertifiedPayload>(
+                        "tracked_state uniform certified commit_delta payload",
+                        self.sidecar.as_ref(),
+                    )?;
+                    (payload.origin_key, payload.base_coordinate)
+                };
+                return Ok(CommitDeltaPayload::CertifiedRef {
+                    origin_key,
+                    base_coordinate,
+                });
             }
             CommitDeltaPayloadLayout::AuthoredInline => {
                 let payload = self.payload_range(entry_index)?;
@@ -262,6 +280,7 @@ where
                     snapshot: crate::json_store::JsonSlot::Inline(json.into()),
                     metadata: crate::json_store::JsonSlot::None,
                     origin_key: None,
+                    base_coordinate: None,
                 }));
             }
             CommitDeltaPayloadLayout::Indexed => {}
@@ -287,23 +306,26 @@ where
                 )?;
                 Ok(CommitDeltaPayload::Authored(payload))
             }
-            COMMIT_DELTA_PAYLOAD_SELECTED_REF if payload.is_empty() => {
-                Ok(CommitDeltaPayload::SelectedRef)
-            }
-            COMMIT_DELTA_PAYLOAD_SELECTED_TOMBSTONE if payload.is_empty() => {
-                Ok(CommitDeltaPayload::SelectedTombstone)
-            }
+            COMMIT_DELTA_PAYLOAD_SELECTED_REF => Ok(CommitDeltaPayload::SelectedRef(
+                decode_optional_base_coordinate(payload)?,
+            )),
+            COMMIT_DELTA_PAYLOAD_SELECTED_TOMBSTONE => Ok(CommitDeltaPayload::SelectedTombstone(
+                decode_optional_base_coordinate(payload)?,
+            )),
             COMMIT_DELTA_PAYLOAD_CERTIFIED_REF => {
-                let origin_key = if payload.is_empty() {
-                    None
+                let (origin_key, base_coordinate) = if payload.is_empty() {
+                    (None, None)
                 } else {
-                    storage_codec::decode::<CommitDeltaCertifiedPayload>(
+                    let payload = storage_codec::decode::<CommitDeltaCertifiedPayload>(
                         "tracked_state indexed certified commit_delta payload",
                         payload,
-                    )?
-                    .origin_key
+                    )?;
+                    (payload.origin_key, payload.base_coordinate)
                 };
-                Ok(CommitDeltaPayload::CertifiedRef(origin_key))
+                Ok(CommitDeltaPayload::CertifiedRef {
+                    origin_key,
+                    base_coordinate,
+                })
             }
             _ => Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -365,6 +387,16 @@ where
     }
 }
 
+fn decode_optional_base_coordinate(
+    payload: &[u8],
+) -> Result<Option<TrackedStateBaseCoordinate>, LixError> {
+    if payload.is_empty() {
+        Ok(None)
+    } else {
+        storage_codec::decode("tracked_state commit_delta base coordinate", payload).map(Some)
+    }
+}
+
 impl CommitDeltaPayloadIndexRef<'_> {
     fn into_owned(self) -> OwnedCommitDeltaPayloadIndex {
         OwnedCommitDeltaPayloadIndex {
@@ -383,6 +415,7 @@ impl CommitDeltaPayloadIndexRef<'_> {
 pub(crate) struct LoadedCommitDeltaEntry {
     pub(crate) value: TrackedStateIndexValue,
     pub(crate) change_record: crate::changelog::ChangeRecord,
+    pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
     selected_ref: bool,
     certified_ref: bool,
     owner_commit_id: CommitId,
@@ -468,6 +501,7 @@ pub(crate) struct CommitDeltaMember {
     pub(crate) segment_index: u32,
     pub(crate) ordinal: u32,
     pub(crate) authored: bool,
+    pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
     selected_tombstone: bool,
     certified_ref: bool,
 }
@@ -1452,6 +1486,7 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
             snapshot: delta.snapshot,
             metadata: delta.metadata,
             origin_key: delta.origin_key,
+            base_coordinate: delta.base_coordinate,
             authored: delta.authored,
             certified: delta.certified,
         });
@@ -1514,6 +1549,7 @@ fn stage_commit_deltas_inner(
             snapshot: delta.snapshot,
             metadata: delta.metadata,
             origin_key: delta.origin_key,
+            base_coordinate: delta.base_coordinate,
             authored: delta.authored,
             certified: delta.certified,
         });
@@ -2134,20 +2170,27 @@ where
         ));
     }
     let key = decode_key(entry.key)?;
-    let (snapshot, metadata, origin_key, certified_ref) = match payloads.decode(ordinal)? {
+    let (snapshot, metadata, origin_key, base_coordinate, certified_ref) = match payloads
+        .decode(ordinal)?
+    {
         CommitDeltaPayload::Authored(payload) => (
             payload.snapshot,
             payload.metadata,
             payload.origin_key,
+            payload.base_coordinate,
             false,
         ),
-        CommitDeltaPayload::CertifiedRef(origin_key) => (
+        CommitDeltaPayload::CertifiedRef {
+            origin_key,
+            base_coordinate,
+        } => (
             crate::json_store::JsonSlot::None,
             crate::json_store::JsonSlot::None,
             origin_key,
+            base_coordinate,
             true,
         ),
-        CommitDeltaPayload::SelectedRef | CommitDeltaPayload::SelectedTombstone => {
+        CommitDeltaPayload::SelectedRef(_) | CommitDeltaPayload::SelectedTombstone(_) => {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -2170,6 +2213,7 @@ where
             created_at: updated_at,
             origin_key,
         },
+        base_coordinate,
         selected_ref: false,
         certified_ref,
         owner_commit_id: locator.commit_id,
@@ -3533,6 +3577,7 @@ async fn hydrate_certified_loaded_entries(
                         index,
                         entry.owner_commit_id,
                         entry.change_record.change_id,
+                        entry.base_coordinate,
                         TrackedStateKey {
                             schema_key: entry.change_record.schema_key.clone(),
                             file_id: entry.change_record.file_id.clone(),
@@ -3547,35 +3592,38 @@ async fn hydrate_certified_loaded_entries(
     }
     let mut members = pending
         .iter()
-        .map(|(_, commit_id, change_id, key)| CommitDeltaMember {
-            key: key.clone(),
-            value: TrackedStateIndexValue {
-                change_id: *change_id,
-                commit_id: *commit_id,
-                deleted: false,
-                created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
-                updated_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+        .map(
+            |(_, commit_id, change_id, base_coordinate, key)| CommitDeltaMember {
+                key: key.clone(),
+                value: TrackedStateIndexValue {
+                    change_id: *change_id,
+                    commit_id: *commit_id,
+                    deleted: false,
+                    created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+                    updated_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+                },
+                change: crate::changelog::ChangeRecord {
+                    format_version: 2,
+                    change_id: *change_id,
+                    schema_key: key.schema_key.clone(),
+                    entity_pk: key.entity_pk.clone(),
+                    file_id: key.file_id.clone(),
+                    snapshot: crate::json_store::JsonSlot::None,
+                    metadata: crate::json_store::JsonSlot::None,
+                    created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+                    origin_key: None,
+                },
+                segment_index: 0,
+                ordinal: 0,
+                authored: true,
+                base_coordinate: *base_coordinate,
+                selected_tombstone: false,
+                certified_ref: true,
             },
-            change: crate::changelog::ChangeRecord {
-                format_version: 2,
-                change_id: *change_id,
-                schema_key: key.schema_key.clone(),
-                entity_pk: key.entity_pk.clone(),
-                file_id: key.file_id.clone(),
-                snapshot: crate::json_store::JsonSlot::None,
-                metadata: crate::json_store::JsonSlot::None,
-                created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
-                origin_key: None,
-            },
-            segment_index: 0,
-            ordinal: 0,
-            authored: true,
-            selected_tombstone: false,
-            certified_ref: true,
-        })
+        )
         .collect::<Vec<_>>();
     hydrate_certified_members(store, &mut members).await?;
-    for ((index, _, _, _), member) in pending.into_iter().zip(members) {
+    for ((index, _, _, _, _), member) in pending.into_iter().zip(members) {
         let entry = entries[index]
             .as_mut()
             .expect("certified entry came from the output batch");
@@ -4316,41 +4364,55 @@ fn collect_strict_commit_delta_members(
         }
         let payload = payloads.decode(entry_index)?;
         let key = decode_key(entry.key)?;
-        let (snapshot, metadata, origin_key, authored, selected_tombstone, certified_ref) =
-            match payload {
-                CommitDeltaPayload::Authored(payload) => (
-                    payload.snapshot,
-                    payload.metadata,
-                    payload.origin_key,
-                    true,
-                    false,
-                    false,
-                ),
-                CommitDeltaPayload::SelectedRef => (
-                    crate::json_store::JsonSlot::None,
-                    crate::json_store::JsonSlot::None,
-                    None,
-                    false,
-                    false,
-                    false,
-                ),
-                CommitDeltaPayload::SelectedTombstone => (
-                    crate::json_store::JsonSlot::None,
-                    crate::json_store::JsonSlot::None,
-                    None,
-                    false,
-                    true,
-                    false,
-                ),
-                CommitDeltaPayload::CertifiedRef(origin_key) => (
-                    crate::json_store::JsonSlot::None,
-                    crate::json_store::JsonSlot::None,
-                    origin_key,
-                    true,
-                    false,
-                    true,
-                ),
-            };
+        let (
+            snapshot,
+            metadata,
+            origin_key,
+            base_coordinate,
+            authored,
+            selected_tombstone,
+            certified_ref,
+        ) = match payload {
+            CommitDeltaPayload::Authored(payload) => (
+                payload.snapshot,
+                payload.metadata,
+                payload.origin_key,
+                payload.base_coordinate,
+                true,
+                false,
+                false,
+            ),
+            CommitDeltaPayload::SelectedRef(base_coordinate) => (
+                crate::json_store::JsonSlot::None,
+                crate::json_store::JsonSlot::None,
+                None,
+                base_coordinate,
+                false,
+                false,
+                false,
+            ),
+            CommitDeltaPayload::SelectedTombstone(base_coordinate) => (
+                crate::json_store::JsonSlot::None,
+                crate::json_store::JsonSlot::None,
+                None,
+                base_coordinate,
+                false,
+                true,
+                false,
+            ),
+            CommitDeltaPayload::CertifiedRef {
+                origin_key,
+                base_coordinate,
+            } => (
+                crate::json_store::JsonSlot::None,
+                crate::json_store::JsonSlot::None,
+                origin_key,
+                base_coordinate,
+                true,
+                false,
+                true,
+            ),
+        };
         let change = crate::changelog::ChangeRecord {
             format_version: 2,
             change_id: value.change_id,
@@ -4369,6 +4431,7 @@ fn collect_strict_commit_delta_members(
             segment_index,
             ordinal: u32::try_from(entry_index).expect("segment ordinal fits u32"),
             authored,
+            base_coordinate,
             selected_tombstone,
             certified_ref,
         });
@@ -4681,6 +4744,7 @@ fn encode_commit_delta_segment(entries: &[EncodedLeafEntry]) -> Vec<u8> {
             snapshot: crate::json_store::JsonSlotRef::None,
             metadata: crate::json_store::JsonSlotRef::None,
             origin_key: None,
+            base_coordinate: None,
             authored: true,
             certified: false,
         };
@@ -4721,7 +4785,10 @@ fn encode_commit_delta_segment_layout(
         payloads
             .iter()
             .all(|payload| {
-                payload.authored && payload.certified && payload.origin_key == first.origin_key
+                payload.authored
+                    && payload.certified
+                    && payload.origin_key == first.origin_key
+                    && payload.base_coordinate.is_none()
             })
             .then_some(first.origin_key)
     });
@@ -4737,7 +4804,10 @@ fn encode_commit_delta_segment_layout(
             storage_codec::append(
                 "tracked_state uniform certified commit_delta payload",
                 &mut encoded,
-                &CommitDeltaCertifiedPayloadRef { origin_key },
+                &CommitDeltaCertifiedPayloadRef {
+                    origin_key,
+                    base_coordinate: None,
+                },
             )
             .map_err(CommitDeltaSegmentEncodeError::Codec)?;
         }
@@ -4749,6 +4819,7 @@ fn encode_commit_delta_segment_layout(
             && matches!(payload.snapshot, crate::json_store::JsonSlotRef::Inline(_))
             && matches!(payload.metadata, crate::json_store::JsonSlotRef::None)
             && payload.origin_key.is_none()
+            && payload.base_coordinate.is_none()
     });
     if authored_inline {
         let entry_count = u32::try_from(entries.len()).expect("commit-delta entry count fits u32");
@@ -4812,12 +4883,13 @@ fn encode_commit_delta_segment_layout(
         if payload.certified {
             debug_assert!(payload.authored);
             payload_bytes.push(COMMIT_DELTA_PAYLOAD_CERTIFIED_REF);
-            if payload.origin_key.is_some() {
+            if payload.origin_key.is_some() || payload.base_coordinate.is_some() {
                 storage_codec::append(
                     "tracked_state indexed certified commit_delta payload",
                     &mut payload_bytes,
                     &CommitDeltaCertifiedPayloadRef {
                         origin_key: payload.origin_key,
+                        base_coordinate: payload.base_coordinate,
                     },
                 )
                 .map_err(CommitDeltaSegmentEncodeError::Codec)?;
@@ -4828,6 +4900,7 @@ fn encode_commit_delta_segment_layout(
                 snapshot: payload.snapshot,
                 metadata: payload.metadata,
                 origin_key: payload.origin_key,
+                base_coordinate: payload.base_coordinate,
             };
             storage_codec::append(
                 "tracked_state indexed authored commit_delta payload",
@@ -4847,6 +4920,14 @@ fn encode_commit_delta_segment_layout(
             } else {
                 COMMIT_DELTA_PAYLOAD_SELECTED_REF
             });
+            if let Some(base_coordinate) = payload.base_coordinate {
+                storage_codec::append(
+                    "tracked_state commit_delta base coordinate",
+                    &mut payload_bytes,
+                    &base_coordinate,
+                )
+                .map_err(CommitDeltaSegmentEncodeError::Codec)?;
+            }
         }
     }
     payload_offsets
@@ -5362,36 +5443,44 @@ where
     }
     let payload = payloads.decode(index)?;
     let key = decode_key(entry.key)?;
-    let (snapshot, metadata, origin_key, selected_ref, certified_ref) = match payload {
-        CommitDeltaPayload::Authored(payload) => (
-            payload.snapshot,
-            payload.metadata,
-            payload.origin_key,
-            false,
-            false,
-        ),
-        CommitDeltaPayload::SelectedRef => (
-            crate::json_store::JsonSlot::None,
-            crate::json_store::JsonSlot::None,
-            None,
-            true,
-            false,
-        ),
-        CommitDeltaPayload::SelectedTombstone => (
-            crate::json_store::JsonSlot::None,
-            crate::json_store::JsonSlot::None,
-            None,
-            false,
-            false,
-        ),
-        CommitDeltaPayload::CertifiedRef(origin_key) => (
-            crate::json_store::JsonSlot::None,
-            crate::json_store::JsonSlot::None,
-            origin_key,
-            false,
-            true,
-        ),
-    };
+    let (snapshot, metadata, origin_key, base_coordinate, selected_ref, certified_ref) =
+        match payload {
+            CommitDeltaPayload::Authored(payload) => (
+                payload.snapshot,
+                payload.metadata,
+                payload.origin_key,
+                payload.base_coordinate,
+                false,
+                false,
+            ),
+            CommitDeltaPayload::SelectedRef(base_coordinate) => (
+                crate::json_store::JsonSlot::None,
+                crate::json_store::JsonSlot::None,
+                None,
+                base_coordinate,
+                true,
+                false,
+            ),
+            CommitDeltaPayload::SelectedTombstone(base_coordinate) => (
+                crate::json_store::JsonSlot::None,
+                crate::json_store::JsonSlot::None,
+                None,
+                base_coordinate,
+                false,
+                false,
+            ),
+            CommitDeltaPayload::CertifiedRef {
+                origin_key,
+                base_coordinate,
+            } => (
+                crate::json_store::JsonSlot::None,
+                crate::json_store::JsonSlot::None,
+                origin_key,
+                base_coordinate,
+                false,
+                true,
+            ),
+        };
     let change_record = crate::changelog::ChangeRecord {
         format_version: 2,
         change_id: value.change_id,
@@ -5406,6 +5495,7 @@ where
     Ok(LoadedCommitDeltaEntry {
         value,
         change_record,
+        base_coordinate,
         selected_ref,
         certified_ref,
         owner_commit_id: expected_commit_id,
@@ -5690,9 +5780,9 @@ mod tests {
         encode_key_ref, encode_value_ref, hash_bytes,
     };
     use crate::tracked_state::types::{
-        TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateCommitRootParent,
-        TrackedStateDeltaRef, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
-        TrackedStateKeyRef, TrackedStateRootId,
+        TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
+        TrackedStateCommitRootParent, TrackedStateDeltaRef, TrackedStateIndexValue,
+        TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateRootId,
     };
 
     use super::{
@@ -5901,6 +5991,7 @@ mod tests {
             snapshot,
             metadata,
             origin_key,
+            base_coordinate: None,
             authored: true,
             certified: false,
         }
@@ -6426,6 +6517,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_packed_lookup_round_trips_analytical_base_coordinates() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("base-coordinate-owner");
+        let base_commit_id = CommitId::for_test_label("base-coordinate-layout");
+        let fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let mut deltas = commit_delta_refs(commit_id, &fixtures);
+        let coordinates = [
+            TrackedStateBaseCoordinate {
+                base_commit_id,
+                group_index: 7,
+                row_index: 41,
+            },
+            TrackedStateBaseCoordinate {
+                base_commit_id,
+                group_index: u32::MAX,
+                row_index: u32::MAX,
+            },
+        ];
+        deltas[0].base_coordinate = Some(coordinates[0]);
+        deltas[1].base_coordinate = Some(coordinates[1]);
+
+        let mut writes = storage.new_write_set();
+        stage_commit_deltas(&mut writes, &deltas).expect("coordinated deltas should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("coordinated deltas should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("coordinate read should open");
+        let requests = fixtures
+            .iter()
+            .map(|fixture| (commit_id, fixture.key()))
+            .collect::<Vec<_>>();
+        let loaded = load_owned_commit_delta_entries(&read, &requests)
+            .await
+            .expect("exact coordinated lookup should succeed");
+        assert_eq!(loaded.len(), coordinates.len());
+        for (entry, coordinate) in loaded.into_iter().zip(coordinates) {
+            assert_eq!(
+                entry.expect("coordinated row should exist").base_coordinate,
+                Some(coordinate)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn public_membership_dedupes_ids_but_payload_authority_rejects_conflicts() {
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = CommitId::for_test_label("duplicate-change-id");
@@ -6536,6 +6679,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             }],
@@ -7234,6 +7378,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(&snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             }],
@@ -7328,6 +7473,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[0]),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: Some("first"),
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             },
@@ -7335,6 +7481,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[1]),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             },
@@ -7342,6 +7489,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[2]),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: Some("last"),
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             },
@@ -7435,6 +7583,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                base_coordinate: None,
                 authored: true,
                 certified: true,
             };
@@ -7460,7 +7609,10 @@ mod tests {
         for index in 0..entries.len() {
             assert!(matches!(
                 decoded.decode(index).expect("payload should decode"),
-                super::CommitDeltaPayload::CertifiedRef(None)
+                super::CommitDeltaPayload::CertifiedRef {
+                    origin_key: None,
+                    base_coordinate: None
+                }
             ));
         }
 
@@ -7478,10 +7630,109 @@ mod tests {
         for index in 0..entries.len() {
             assert!(matches!(
                 decoded.decode(index).expect("payload should decode"),
-                super::CommitDeltaPayload::CertifiedRef(Some(origin))
-                    if origin == "shared-origin"
+                super::CommitDeltaPayload::CertifiedRef {
+                    origin_key: Some(origin),
+                    base_coordinate: None
+                } if origin == "shared-origin"
             ));
         }
+    }
+
+    #[test]
+    fn indexed_payload_kinds_round_trip_analytical_base_coordinates() {
+        let commit_id = CommitId::for_test_label("coordinate-codec-owner");
+        let base_commit_id = CommitId::for_test_label("coordinate-codec-base");
+        let fixtures = packed_commit_delta_fixtures()
+            .into_iter()
+            .filter(|fixture| fixture.schema_key == "alpha")
+            .take(3)
+            .collect::<Vec<_>>();
+        let entries = fixtures
+            .iter()
+            .map(|fixture| EncodedLeafEntry {
+                key: encode_key_ref(TrackedStateKeyRef {
+                    schema_key: &fixture.schema_key,
+                    file_id: fixture.file_id.as_deref(),
+                    entity_pk: &fixture.entity_pk,
+                })
+                .into(),
+                value: encode_value_ref(TrackedStateIndexValueRef {
+                    change_id: fixture.change_id,
+                    commit_id,
+                    deleted: fixture.deleted,
+                    created_at: fixture.created_at,
+                    updated_at: fixture.updated_at,
+                })
+                .into(),
+            })
+            .collect::<Vec<_>>();
+        let coordinates = [
+            TrackedStateBaseCoordinate {
+                base_commit_id,
+                group_index: 1,
+                row_index: 2,
+            },
+            TrackedStateBaseCoordinate {
+                base_commit_id,
+                group_index: 3,
+                row_index: 4,
+            },
+            TrackedStateBaseCoordinate {
+                base_commit_id,
+                group_index: 5,
+                row_index: 6,
+            },
+        ];
+        let payloads = [
+            CommitDeltaPayloadRef {
+                snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"authored":true}"#),
+                metadata: crate::json_store::JsonSlotRef::None,
+                origin_key: None,
+                base_coordinate: Some(coordinates[0]),
+                authored: true,
+                certified: false,
+            },
+            CommitDeltaPayloadRef {
+                snapshot: crate::json_store::JsonSlotRef::None,
+                metadata: crate::json_store::JsonSlotRef::None,
+                origin_key: None,
+                base_coordinate: Some(coordinates[1]),
+                authored: false,
+                certified: false,
+            },
+            CommitDeltaPayloadRef {
+                snapshot: crate::json_store::JsonSlotRef::None,
+                metadata: crate::json_store::JsonSlotRef::None,
+                origin_key: None,
+                base_coordinate: Some(coordinates[2]),
+                authored: true,
+                certified: true,
+            },
+        ];
+        let encoded = encode_commit_delta_segment_with_raw_sidecar(&entries, &payloads);
+        let (_, decoded) =
+            decode_commit_delta_with_payloads(&encoded, None).expect("coordinates should decode");
+
+        assert_eq!(
+            decoded
+                .decode(0)
+                .expect("authored coordinate should decode")
+                .authored_payload()
+                .base_coordinate,
+            Some(coordinates[0])
+        );
+        assert!(matches!(
+            decoded.decode(1).expect("selected coordinate should decode"),
+            super::CommitDeltaPayload::SelectedRef(Some(coordinate))
+                if coordinate == coordinates[1]
+        ));
+        assert!(matches!(
+            decoded.decode(2).expect("certified coordinate should decode"),
+            super::CommitDeltaPayload::CertifiedRef {
+                origin_key: None,
+                base_coordinate: Some(coordinate),
+            } if coordinate == coordinates[2]
+        ));
     }
 
     #[test]
@@ -7517,6 +7768,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(&first_snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             },
@@ -7524,6 +7776,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(&second_snapshot),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             },
@@ -7602,6 +7855,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             }],
@@ -7651,6 +7905,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             },
@@ -7658,6 +7913,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"second":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             },
@@ -7805,15 +8061,16 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"ok":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             }],
         );
 
         let mut old = encoded.clone();
-        old[..COMMIT_DELTA_FORMAT_MAGIC.len()].copy_from_slice(b"LXCD8");
+        old[..COMMIT_DELTA_FORMAT_MAGIC.len()].copy_from_slice(b"LXCD09");
         let error = decode_commit_delta_with_payloads(&old, None)
-            .expect_err("LXCD8 segments must be rejected");
+            .expect_err("older commit-delta segments must be rejected");
         assert!(
             error
                 .to_string()

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use ahash::RandomState;
 use bytes::Bytes;
 
-use super::tracked_head::CertifiedCurrentStatePredecessor;
+use super::tracked_head::{AnalyticalBaseCoordinate, CertifiedCurrentStatePredecessor};
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
@@ -120,6 +120,10 @@ pub(crate) struct MaterializedLiveStateBatch {
     /// projection column. SQL UPDATE can carry it into commit materialization
     /// and avoid reading the same current row a second time.
     durable_predecessor: Vec<Option<CertifiedCurrentStatePredecessor>>,
+    /// Lazily allocated fixed-width coordinate column. Most materialized
+    /// batches contain no analytical coordinates, so they pay no per-row
+    /// storage. Once present, the default/nil owner is the absent sentinel.
+    analytical_base_coordinate: Option<Vec<AnalyticalBaseCoordinate>>,
 }
 
 /// Row-oriented storage for the overwhelmingly common one-row point-read
@@ -129,6 +133,7 @@ pub(crate) struct MaterializedLiveStateBatch {
 struct MaterializedLiveStateSingleton {
     row: MaterializedLiveStateRow,
     durable_predecessor: Option<CertifiedCurrentStatePredecessor>,
+    analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
 }
 
 impl MaterializedLiveStateBatch {
@@ -379,6 +384,11 @@ impl MaterializedLiveStateBatch {
             self.change_id.capacity() * size_of::<Option<ChangeId>>(),
             self.commit_id.capacity() * size_of::<Option<CommitId>>(),
             self.untracked.capacity() * size_of::<bool>(),
+            self.analytical_base_coordinate
+                .as_ref()
+                .map_or(0, |coordinates| {
+                    coordinates.capacity() * size_of::<AnalyticalBaseCoordinate>()
+                }),
             self.strings.bytes.len(),
             self.strings.ranges.capacity() * size_of::<Range<u32>>(),
         ]
@@ -497,6 +507,21 @@ impl<'a> MaterializedLiveStateRowRef<'a> {
         self.singleton().map_or_else(
             || self.batch.durable_predecessor[self.index].as_ref(),
             |singleton| singleton.durable_predecessor.as_ref(),
+        )
+    }
+
+    pub(crate) fn analytical_base_coordinate(self) -> Option<AnalyticalBaseCoordinate> {
+        self.singleton().map_or_else(
+            || {
+                let coordinate = self
+                    .batch
+                    .analytical_base_coordinate
+                    .as_ref()?
+                    .get(self.index)
+                    .copied()?;
+                (coordinate.base_commit_id != CommitId::default()).then_some(coordinate)
+            },
+            |singleton| singleton.analytical_base_coordinate,
         )
     }
 
@@ -969,6 +994,7 @@ pub(crate) struct MaterializedLiveStateBatchBuilder {
     commit_id: Vec<Option<CommitId>>,
     untracked: Vec<bool>,
     durable_predecessor: Vec<Option<CertifiedCurrentStatePredecessor>>,
+    analytical_base_coordinate: Option<Vec<AnalyticalBaseCoordinate>>,
 }
 
 impl MaterializedLiveStateBatchBuilder {
@@ -1033,6 +1059,7 @@ impl MaterializedLiveStateBatchBuilder {
             commit_id: Vec::with_capacity(column_capacity),
             untracked: Vec::with_capacity(column_capacity),
             durable_predecessor: Vec::with_capacity(column_capacity),
+            analytical_base_coordinate: None,
         }
     }
 
@@ -1055,11 +1082,12 @@ impl MaterializedLiveStateBatchBuilder {
             self.singleton = Some(Box::new(MaterializedLiveStateSingleton {
                 row,
                 durable_predecessor: None,
+                analytical_base_coordinate: None,
             }));
             return;
         }
         self.promote_singleton();
-        self.push_owned_columnar(row, None);
+        self.push_owned_columnar(row, None, None);
     }
 
     fn promote_singleton(&mut self) {
@@ -1068,13 +1096,18 @@ impl MaterializedLiveStateBatchBuilder {
             return;
         };
         self.singleton_capacity = false;
-        self.push_owned_columnar(singleton.row, singleton.durable_predecessor);
+        self.push_owned_columnar(
+            singleton.row,
+            singleton.durable_predecessor,
+            singleton.analytical_base_coordinate,
+        );
     }
 
     fn push_owned_columnar(
         &mut self,
         row: MaterializedLiveStateRow,
         durable_predecessor: Option<CertifiedCurrentStatePredecessor>,
+        analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
     ) {
         let MaterializedLiveStateRow {
             entity_pk,
@@ -1113,6 +1146,9 @@ impl MaterializedLiveStateBatchBuilder {
             .durable_predecessor
             .last_mut()
             .expect("pushed live-state row has a predecessor slot") = durable_predecessor;
+        if let Some(coordinate) = analytical_base_coordinate {
+            self.set_analytical_base_coordinate(self.len() - 1, coordinate);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1238,9 +1274,13 @@ impl MaterializedLiveStateBatchBuilder {
         if self.singleton_capacity {
             let branch_id = branch_override.map_or_else(|| row.branch_owner(), Arc::from);
             let durable_predecessor = row.durable_predecessor().cloned();
+            let analytical_base_coordinate = row.analytical_base_coordinate();
             self.push_owned(row.to_owned_with_branch(branch_id));
             if let Some(durable_predecessor) = durable_predecessor {
                 self.set_durable_predecessor(ordinal, durable_predecessor);
+            }
+            if let Some(coordinate) = analytical_base_coordinate {
+                self.set_analytical_base_coordinate(ordinal, coordinate);
             }
             return ordinal;
         }
@@ -1269,6 +1309,9 @@ impl MaterializedLiveStateBatchBuilder {
             .last_mut()
             .expect("pushed live-state row has a predecessor slot")
             .clone_from(&row.durable_predecessor().cloned());
+        if let Some(coordinate) = row.analytical_base_coordinate() {
+            self.set_analytical_base_coordinate(ordinal, coordinate);
+        }
         ordinal
     }
 
@@ -1303,6 +1346,9 @@ impl MaterializedLiveStateBatchBuilder {
         self.commit_id.push(commit_id);
         self.untracked.push(untracked);
         self.durable_predecessor.push(None);
+        if let Some(coordinates) = &mut self.analytical_base_coordinate {
+            coordinates.push(AnalyticalBaseCoordinate::default());
+        }
     }
 
     pub(crate) fn set_snapshot_content(&mut self, row: usize, value: SharedStr) {
@@ -1336,6 +1382,22 @@ impl MaterializedLiveStateBatchBuilder {
         self.durable_predecessor[row] = Some(value);
     }
 
+    pub(crate) fn set_analytical_base_coordinate(
+        &mut self,
+        row: usize,
+        value: AnalyticalBaseCoordinate,
+    ) {
+        if let Some(singleton) = self.singleton.as_mut() {
+            assert_eq!(row, 0, "singleton live-state row ordinal must be zero");
+            singleton.analytical_base_coordinate = Some(value);
+            return;
+        }
+        assert!(row < self.len(), "live-state row ordinal out of bounds");
+        self.analytical_base_coordinate.get_or_insert_with(|| {
+            vec![AnalyticalBaseCoordinate::default(); self.entity_pks.len()]
+        })[row] = value;
+    }
+
     pub(crate) fn finish(self) -> MaterializedLiveStateBatch {
         MaterializedLiveStateBatch {
             singleton: self.singleton,
@@ -1354,6 +1416,7 @@ impl MaterializedLiveStateBatchBuilder {
             commit_id: self.commit_id,
             untracked: self.untracked,
             durable_predecessor: self.durable_predecessor,
+            analytical_base_coordinate: self.analytical_base_coordinate,
         }
     }
 }
@@ -1623,7 +1686,13 @@ mod batch_tests {
     #[test]
     fn singleton_builder_promotes_when_capacity_hint_is_exceeded() {
         let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(1);
+        let coordinate = AnalyticalBaseCoordinate {
+            base_commit_id: CommitId::for_test_label("batch-coordinate-base"),
+            group_index: 3,
+            row_index: 19,
+        };
         builder.push_owned(row(EntityPk::single("first")));
+        builder.set_analytical_base_coordinate(0, coordinate);
         builder.push_owned(row(EntityPk::single("second")));
 
         let batch = builder.finish();
@@ -1638,6 +1707,52 @@ mod batch_tests {
             batch.row(1).entity_pk().as_single_string().unwrap(),
             "second"
         );
+        assert_eq!(batch.row(0).analytical_base_coordinate(), Some(coordinate));
+        assert_eq!(batch.row(1).analytical_base_coordinate(), None);
+    }
+
+    #[test]
+    fn coordinate_free_multi_row_batch_does_not_allocate_coordinate_column() {
+        let batch = MaterializedLiveStateBatch::from_rows(vec![
+            row(EntityPk::single("first")),
+            row(EntityPk::single("second")),
+            row(EntityPk::single("third")),
+        ]);
+
+        assert!(batch.singleton.is_none());
+        assert!(batch.analytical_base_coordinate.is_none());
+        assert!(
+            batch
+                .iter()
+                .all(|row| row.analytical_base_coordinate().is_none())
+        );
+    }
+
+    #[test]
+    fn late_coordinate_allocation_backfills_existing_rows_and_extends_with_none() {
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(4);
+        builder.push_owned(row(EntityPk::single("first")));
+        builder.push_owned(row(EntityPk::single("second")));
+        builder.push_owned(row(EntityPk::single("third")));
+        assert!(builder.analytical_base_coordinate.is_none());
+
+        let coordinate = AnalyticalBaseCoordinate {
+            base_commit_id: CommitId::for_test_label("late-coordinate-base"),
+            group_index: 7,
+            row_index: 23,
+        };
+        builder.set_analytical_base_coordinate(1, coordinate);
+        builder.push_owned(row(EntityPk::single("fourth")));
+
+        let batch = builder.finish();
+        assert_eq!(
+            batch.analytical_base_coordinate.as_ref().map(Vec::len),
+            Some(4)
+        );
+        assert_eq!(batch.row(0).analytical_base_coordinate(), None);
+        assert_eq!(batch.row(1).analytical_base_coordinate(), Some(coordinate));
+        assert_eq!(batch.row(2).analytical_base_coordinate(), None);
+        assert_eq!(batch.row(3).analytical_base_coordinate(), None);
     }
 
     #[test]

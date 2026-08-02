@@ -1,6 +1,6 @@
 //! Unified, materialized live state for one branch head.
 //!
-//! The V18 hot state has one authoritative file-first row per full identity
+//! The V21 hot state has one authoritative file-first row per full identity
 //! plus one conservative file-membership marker per schema. Each row is tagged
 //! `tracked` or `untracked`: tracked mutations also enter history, while
 //! untracked mutations exist only in this serving plane. Normal reads consult
@@ -18,6 +18,17 @@ pub(crate) use hot::{
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, ROOT_CURRENT_BASE_SPACE,
     materialize_certified_root_rows, scan_certified_history_rows, stage_certified_entity_batches,
 };
+
+/// Stable physical address of a row in an immutable analytical base.
+///
+/// The owner commit is part of the address so consumers can fail closed when
+/// a stale coordinate is presented against a different base.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AnalyticalBaseCoordinate {
+    pub(crate) base_commit_id: CommitId,
+    pub(crate) group_index: u32,
+    pub(crate) row_index: u32,
+}
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -220,6 +231,7 @@ struct HeadValue {
     updated_at: LixTimestamp,
     snapshot: JsonSlot,
     metadata: JsonSlot,
+    analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
 }
 
 #[cfg(test)]
@@ -234,6 +246,7 @@ impl HeadValue {
             updated_at: self.updated_at,
             snapshot: self.snapshot.as_ref_slot(),
             metadata: self.metadata.as_ref_slot(),
+            analytical_base_coordinate: self.analytical_base_coordinate,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         }
     }
@@ -249,6 +262,7 @@ struct HeadValueRef<'a> {
     updated_at: LixTimestamp,
     snapshot: JsonSlotRef<'a>,
     metadata: JsonSlotRef<'a>,
+    analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
 }
 
@@ -299,6 +313,7 @@ impl<'a> TrackedHeadDeltaRef<'a> {
             updated_at: self.updated_at,
             snapshot: self.snapshot,
             metadata: self.metadata,
+            analytical_base_coordinate: None,
         }
     }
 }
@@ -322,6 +337,7 @@ pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
     pub(crate) snapshot: JsonSlotRef<'a>,
     pub(crate) metadata: JsonSlotRef<'a>,
+    pub(crate) analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
 }
 
 /// Durable exact-read evidence aligned with a transaction delta.
@@ -351,6 +367,7 @@ pub(crate) struct PackedHeadValue {
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
     checkpoint_commit_id: Option<CommitId>,
+    analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
 }
 
 impl<'a> CurrentStateDeltaRef<'a> {
@@ -376,6 +393,7 @@ impl<'a> CurrentStateDeltaRef<'a> {
             } else {
                 self.metadata
             },
+            analytical_base_coordinate: self.analytical_base_coordinate,
             working_diff_baseline,
         }
     }
@@ -1292,13 +1310,13 @@ fn working_diff_error(message: &str) -> LixError {
     )
 }
 
-/// V5 current-state values are intentionally a small, fixed-header wire record rather
+/// Current-state values are intentionally a small, fixed-header wire record rather
 /// than a general Musli struct. The normal read path needs only these fields,
 /// and decoding a Musli `JsonSlot` first allocated an intermediate value for
 /// every row before it was copied into a live-state row.
 ///
 /// ```text
-///  0      format version (6)
+///  0      format version (8)
 ///  1      deleted + untracked + snapshot/metadata kinds + diff baseline kind
 ///  2..18  change UUID
 /// 18..34  commit UUID
@@ -1306,8 +1324,9 @@ fn working_diff_error(message: &str) -> LixError {
 /// 42..50  updated_at packed timestamp (big endian)
 /// 50..54  snapshot payload byte length (big endian u32)
 /// 54..58  metadata payload byte length (big endian u32)
-/// 58..    snapshot payload, metadata payload, then an optional fixed
-///          checkpoint before-image when the baseline kind is BeforePresent
+/// 58      analytical base-coordinate presence (0 or 1)
+/// 59..    snapshot payload, metadata payload, then an optional fixed
+///          checkpoint before-image, then an optional 24-byte base coordinate
 /// ```
 ///
 /// Slot payloads are either inline UTF-8 JSON, a fixed 32-byte `JsonRef`, or
@@ -1315,8 +1334,9 @@ fn working_diff_error(message: &str) -> LixError {
 /// Persisting fingerprints only while a row is dirty keeps repeated diff
 /// classification independent of payload size without taxing checkpointed
 /// current state.
-const HEAD_VALUE_VERSION: u8 = 7;
-const HEAD_VALUE_HEADER_BYTES: usize = 58;
+const HEAD_VALUE_VERSION: u8 = 8;
+const HEAD_VALUE_HEADER_BYTES: usize = 59;
+const ANALYTICAL_BASE_COORDINATE_BYTES: usize = 16 + 4 + 4;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
 const HEAD_VALUE_SNAPSHOT_SHIFT: u8 = 1;
 const HEAD_VALUE_METADATA_SHIFT: u8 = 3;
@@ -1353,6 +1373,7 @@ struct HeadValueView<'a> {
     updated_at: LixTimestamp,
     snapshot: HeadSlotView<'a>,
     metadata: HeadSlotView<'a>,
+    analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
 }
 
@@ -1372,6 +1393,7 @@ impl CertifiedCurrentStatePredecessor {
                 // payload fingerprint is needed to preserve that baseline.
                 snapshot: HeadSlotView::None,
                 metadata: HeadSlotView::None,
+                analytical_base_coordinate: value.analytical_base_coordinate,
                 working_diff_baseline: value.checkpoint_commit_id.map_or(
                     WorkingDiffBaseline::Disabled,
                     |checkpoint_commit_id| WorkingDiffBaseline::BeforeAbsent {
@@ -1516,6 +1538,7 @@ struct HeadValueEncode<'a> {
     updated_at: LixTimestamp,
     snapshot: HeadSlotEncode<'a>,
     metadata: HeadSlotEncode<'a>,
+    analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
     working_diff_baseline: WorkingDiffBaseline,
 }
 
@@ -1540,6 +1563,7 @@ fn append_head_value(
             updated_at: value.updated_at,
             snapshot: value.snapshot.into(),
             metadata: value.metadata.into(),
+            analytical_base_coordinate: value.analytical_base_coordinate,
             working_diff_baseline: value.working_diff_baseline,
         },
     )
@@ -1558,6 +1582,7 @@ fn reencode_head_value_with_baseline(
         updated_at: value.updated_at,
         snapshot: value.snapshot.into(),
         metadata: value.metadata.into(),
+        analytical_base_coordinate: value.analytical_base_coordinate,
         working_diff_baseline,
     })
 }
@@ -1611,6 +1636,19 @@ fn append_head_value_parts(
             "untracked current-state rows must not carry a working-diff baseline",
         ));
     }
+    if value.untracked && value.analytical_base_coordinate.is_some() {
+        return Err(head_value_error(
+            "untracked current-state rows must not carry an analytical base coordinate",
+        ));
+    }
+    if value
+        .analytical_base_coordinate
+        .is_some_and(|coordinate| coordinate.base_commit_id == CommitId::default())
+    {
+        return Err(head_value_error(
+            "analytical base coordinate must carry a non-nil owner commit",
+        ));
+    }
     let snapshot_len = encoded_slot_len(value.snapshot, fingerprint_inline);
     let metadata_len = encoded_slot_len(value.metadata, fingerprint_inline);
     let capacity = HEAD_VALUE_HEADER_BYTES
@@ -1624,6 +1662,13 @@ fn append_head_value_parts(
                 WorkingDiffBaseline::BeforeAbsent { .. } => WORKING_DIFF_CHECKPOINT_BYTES,
                 WorkingDiffBaseline::Disabled | WorkingDiffBaseline::Clean => 0,
             })
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(
+                value
+                    .analytical_base_coordinate
+                    .map_or(0, |_| ANALYTICAL_BASE_COORDINATE_BYTES),
+            )
         })
         .ok_or_else(|| head_value_error("encoded row length overflow"))?;
     let start = bytes.len();
@@ -1644,14 +1689,15 @@ fn append_head_value_parts(
     bytes.extend_from_slice(&value.updated_at.packed().to_be_bytes());
     bytes.extend_from_slice(
         &u32::try_from(snapshot_len)
-            .map_err(|_| head_value_error("snapshot payload exceeds v6 u32 limit"))?
+            .map_err(|_| head_value_error("snapshot payload exceeds v8 u32 limit"))?
             .to_be_bytes(),
     );
     bytes.extend_from_slice(
         &u32::try_from(metadata_len)
-            .map_err(|_| head_value_error("metadata payload exceeds v6 u32 limit"))?
+            .map_err(|_| head_value_error("metadata payload exceeds v8 u32 limit"))?
             .to_be_bytes(),
     );
+    bytes.push(u8::from(value.analytical_base_coordinate.is_some()));
     append_slot_payload(bytes, value.snapshot, fingerprint_inline);
     append_slot_payload(bytes, value.metadata, fingerprint_inline);
     match value.working_diff_baseline {
@@ -1666,6 +1712,11 @@ fn append_head_value_parts(
             encode_working_diff_version(bytes, version);
         }
         WorkingDiffBaseline::Disabled | WorkingDiffBaseline::Clean => {}
+    }
+    if let Some(coordinate) = value.analytical_base_coordinate {
+        bytes.extend_from_slice(coordinate.base_commit_id.as_uuid().as_bytes());
+        bytes.extend_from_slice(&coordinate.group_index.to_be_bytes());
+        bytes.extend_from_slice(&coordinate.row_index.to_be_bytes());
     }
     debug_assert_eq!(bytes.len() - start, capacity);
     Ok(start..bytes.len())
@@ -1724,7 +1775,7 @@ fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
 
 fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     if bytes.len() < HEAD_VALUE_HEADER_BYTES {
-        return Err(head_value_error("row is shorter than the v6 fixed header"));
+        return Err(head_value_error("row is shorter than the v8 fixed header"));
     }
     if bytes[0] != HEAD_VALUE_VERSION {
         return Err(head_value_error(&format!(
@@ -1745,6 +1796,11 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         .map_err(|_| head_value_error("snapshot length exceeds usize"))?;
     let metadata_len = usize::try_from(read_u32(&bytes[54..58], "metadata length")?)
         .map_err(|_| head_value_error("metadata length exceeds usize"))?;
+    let has_analytical_base_coordinate = match bytes[58] {
+        0 => false,
+        1 => true,
+        _ => return Err(head_value_error("invalid analytical base-coordinate tag")),
+    };
     let snapshot_end = HEAD_VALUE_HEADER_BYTES
         .checked_add(snapshot_len)
         .ok_or_else(|| head_value_error("snapshot payload length overflow"))?;
@@ -1775,6 +1831,42 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         },
         _ => unreachable!("two-bit working-diff baseline tag is exhaustive"),
     };
+    let analytical_base_coordinate = if has_analytical_base_coordinate {
+        let base_commit_id = CommitId::new(uuid_from_head_bytes(
+            take_head_bytes(
+                bytes,
+                &mut baseline_offset,
+                UUID_BYTES,
+                "analytical base commit id",
+            )?,
+            "analytical base commit id",
+        )?);
+        if base_commit_id == CommitId::default() {
+            return Err(head_value_error(
+                "analytical base coordinate has a nil owner commit",
+            ));
+        }
+        let group_index = read_u32(
+            take_head_bytes(
+                bytes,
+                &mut baseline_offset,
+                4,
+                "analytical base group index",
+            )?,
+            "analytical base group index",
+        )?;
+        let row_index = read_u32(
+            take_head_bytes(bytes, &mut baseline_offset, 4, "analytical base row index")?,
+            "analytical base row index",
+        )?;
+        Some(AnalyticalBaseCoordinate {
+            base_commit_id,
+            group_index,
+            row_index,
+        })
+    } else {
+        None
+    };
     if baseline_offset != bytes.len() {
         return Err(head_value_error(
             "row payload lengths do not match the buffer",
@@ -1803,6 +1895,11 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
                 "untracked current-state rows must not carry a working-diff baseline",
             ));
         }
+        if analytical_base_coordinate.is_some() {
+            return Err(head_value_error(
+                "untracked current-state rows must not carry an analytical base coordinate",
+            ));
+        }
         (None, None)
     } else {
         if change_uuid == uuid::Uuid::nil() || commit_uuid == uuid::Uuid::nil() {
@@ -1824,14 +1921,31 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         updated_at,
         snapshot,
         metadata,
+        analytical_base_coordinate,
         working_diff_baseline,
     })
+}
+
+fn take_head_bytes<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+    length: usize,
+    field: &str,
+) -> Result<&'a [u8], LixError> {
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| head_value_error(format!("{field} offset overflow")))?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or_else(|| head_value_error(format!("{field} is truncated")))?;
+    *offset = end;
+    Ok(value)
 }
 
 fn uuid_from_head_bytes(bytes: &[u8], field: &str) -> Result<uuid::Uuid, LixError> {
     let bytes: [u8; UUID_BYTES] = bytes.try_into().map_err(|_| {
         head_value_error(&format!(
-            "{field} must have {UUID_BYTES} bytes in the v6 header"
+            "{field} must have {UUID_BYTES} bytes in the v8 header"
         ))
     })?;
     Ok(uuid::Uuid::from_bytes(bytes))
@@ -2053,6 +2167,9 @@ where
             value.untracked,
             branch_id,
         );
+        if let Some(coordinate) = value.analytical_base_coordinate {
+            rows.set_analytical_base_coordinate(row_index, coordinate);
+        }
         rows.set_durable_predecessor(row_index, CertifiedCurrentStatePredecessor::Encoded(bytes));
     }
     if json_refs.is_empty() {
@@ -2153,6 +2270,7 @@ mod tests {
             updated_at: ts("2026-01-01T00:00:00Z"),
             snapshot: JsonSlot::from_json("{\"value\":true}"),
             metadata: JsonSlot::None,
+            analytical_base_coordinate: None,
         }
     }
 
@@ -2274,8 +2392,13 @@ mod tests {
     }
 
     #[test]
-    fn v6_value_codec_roundtrips_clean_inline_and_ref_slots() {
+    fn v8_value_codec_roundtrips_clean_inline_ref_and_base_coordinate() {
         let snapshot_ref = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
+        let analytical_base_coordinate = AnalyticalBaseCoordinate {
+            base_commit_id: CommitId::for_test_label("analytical-base"),
+            group_index: 17,
+            row_index: 42,
+        };
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("change")),
             commit_id: Some(CommitId::for_test_label("commit")),
@@ -2285,20 +2408,28 @@ mod tests {
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
             metadata: JsonSlotRef::Ref(&snapshot_ref),
+            analytical_base_coordinate: Some(analytical_base_coordinate),
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
 
-        let bytes = encode_head_value(&value).expect("encode v6 row");
+        let bytes = encode_head_value(&value).expect("encode v8 row");
         assert_eq!(bytes[0], HEAD_VALUE_VERSION);
         assert_eq!(
             bytes.len(),
-            HEAD_VALUE_HEADER_BYTES + "{\"snapshot\":true}".len() + JSON_REF_BYTES
+            HEAD_VALUE_HEADER_BYTES
+                + "{\"snapshot\":true}".len()
+                + JSON_REF_BYTES
+                + ANALYTICAL_BASE_COORDINATE_BYTES
         );
-        let decoded = decode_head_value(&bytes).expect("decode v6 row");
+        let decoded = decode_head_value(&bytes).expect("decode v8 row");
         assert_eq!(decoded.change_id, value.change_id);
         assert_eq!(decoded.commit_id, value.commit_id);
         assert_eq!(decoded.created_at, value.created_at);
         assert_eq!(decoded.updated_at, value.updated_at);
+        assert_eq!(
+            decoded.analytical_base_coordinate,
+            Some(analytical_base_coordinate)
+        );
         assert_eq!(
             decoded.snapshot,
             HeadSlotView::Inline("{\"snapshot\":true}")
@@ -2317,10 +2448,11 @@ mod tests {
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
             metadata: JsonSlotRef::Inline("{\"source\":\"test\"}"),
+            analytical_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
-        let bytes = Bytes::from(encode_head_value(&value).expect("encode v6 row"));
-        let decoded = decode_head_value(&bytes).expect("decode v6 row");
+        let bytes = Bytes::from(encode_head_value(&value).expect("encode v8 row"));
+        let decoded = decode_head_value(&bytes).expect("decode v8 row");
         let mut json_refs = Vec::new();
         let mut deferred = Vec::new();
         let snapshot = materialize_live_slot(
@@ -2352,7 +2484,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_value_codec_embeds_a_checkpoint_owned_tracked_first_before_baseline() {
+    fn v8_value_codec_embeds_a_checkpoint_owned_tracked_first_before_baseline() {
         let checkpoint_commit_id = CommitId::for_test_label("baseline-checkpoint");
         let baseline = WorkingDiffVersion {
             change_id: ChangeId::for_test_label("before-change"),
@@ -2378,13 +2510,14 @@ mod tests {
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"current\":true}"),
             metadata: JsonSlotRef::None,
+            analytical_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::BeforePresent {
                 checkpoint_commit_id,
                 version: baseline,
             },
         };
 
-        let bytes = encode_head_value(&value).expect("encode v7 row with baseline");
+        let bytes = encode_head_value(&value).expect("encode v8 row with baseline");
         assert_eq!(
             bytes.len(),
             HEAD_VALUE_HEADER_BYTES
@@ -2393,7 +2526,7 @@ mod tests {
                 + WORKING_DIFF_CHECKPOINT_BYTES
                 + WORKING_DIFF_VERSION_BYTES
         );
-        let decoded = decode_head_value(&bytes).expect("decode v7 row with baseline");
+        let decoded = decode_head_value(&bytes).expect("decode v8 row with baseline");
         assert_eq!(
             decoded.working_diff_baseline,
             WorkingDiffBaseline::BeforePresent {
@@ -3427,6 +3560,7 @@ mod tests {
                 updated_at: ts("2026-01-02T00:00:00Z"),
                 snapshot: JsonSlot::Ref(snapshot_ref),
                 metadata: JsonSlot::Ref(metadata_ref),
+                analytical_base_coordinate: None,
             },
         )
         .expect("stage v3 row");
@@ -3442,6 +3576,7 @@ mod tests {
                 updated_at: ts("2026-01-02T00:00:00Z"),
                 snapshot: JsonSlot::None,
                 metadata: JsonSlot::None,
+                analytical_base_coordinate: None,
             },
         )
         .expect("stage tombstone member");
@@ -3594,6 +3729,7 @@ mod tests {
                     updated_at: ts("2026-01-01T00:00:00Z"),
                     snapshot: JsonSlot::from_json(&format!(r#"{{"entity":"{entity}"}}"#)),
                     metadata: JsonSlot::None,
+                    analytical_base_coordinate: None,
                 },
             )
             .expect("stage file-backed row");
@@ -4035,6 +4171,7 @@ mod tests {
             updated_at: ts("2026-01-01T00:00:01Z"),
             snapshot: JsonSlot::from_json("{\"id\":\"row\"}"),
             metadata: JsonSlot::None,
+            analytical_base_coordinate: None,
         };
         let mut writes = StorageWriteSet::new();
         stage_put(&mut writes, &identity, &value).expect("stage row");
@@ -4976,6 +5113,7 @@ mod tests {
             updated_at: timestamp,
             snapshot: JsonSlot::Ref(snapshot),
             metadata: JsonSlot::None,
+            analytical_base_coordinate: None,
         };
         let mut writes = StorageWriteSet::new();
         stage_put(&mut writes, &active_identity, &untracked(active_snapshot))

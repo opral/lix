@@ -147,6 +147,7 @@ pub(crate) async fn seed_branch_head_with_rows(
             updated_at: crate::common::LixTimestamp::expect_parse("updated_at", &row.updated_at),
             snapshot: snapshot.as_ref_slot(),
             metadata: metadata.as_ref_slot(),
+            analytical_base_coordinate: None,
         })
         .collect::<Vec<_>>();
     let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
@@ -279,6 +280,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
                 origin_key: change.origin_key.as_deref(),
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             }
@@ -360,6 +362,7 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
                 origin_key: change.origin_key.as_deref(),
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             }
@@ -435,6 +438,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
                 origin_key: change.origin_key.as_deref(),
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             }

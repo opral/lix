@@ -734,6 +734,7 @@ where
                 snapshot: member.change.snapshot.as_ref_slot(),
                 metadata: member.change.metadata.as_ref_slot(),
                 origin_key: member.change.origin_key.as_deref(),
+                base_coordinate: member.base_coordinate,
                 authored: member.authored
                     || (borrowed_source_is_swept && !member.is_selected_tombstone())
                     || (dead_packed_change_ids.contains(&member.value.change_id)
@@ -1428,7 +1429,14 @@ mod tests {
             })
             .await
             .expect("tombstone alias headers should stage");
-        let source_deltas = commit_delta_refs(source_commit, std::slice::from_ref(&source_change));
+        let base_coordinate = crate::tracked_state::TrackedStateBaseCoordinate {
+            base_commit_id: source_commit,
+            group_index: 7,
+            row_index: 11,
+        };
+        let mut source_deltas =
+            commit_delta_refs(source_commit, std::slice::from_ref(&source_change));
+        source_deltas[0].base_coordinate = Some(base_coordinate);
         let source_locators = stage_commit_deltas(&mut writes, &source_deltas)
             .expect("source tombstone should stage");
         stage_change_locators(&mut writes, &source_locators);
@@ -1484,6 +1492,15 @@ mod tests {
         assert_eq!(alias.selected_source_commit_id, None);
         assert_eq!(alias.members.len(), 2);
         assert!(alias.members.iter().all(|member| member.value.deleted));
+        assert_eq!(
+            alias
+                .members
+                .iter()
+                .find(|member| member.value.change_id == source_change.change_id)
+                .and_then(|member| member.base_coordinate),
+            Some(base_coordinate),
+            "GC promotion must preserve the immutable analytical-base address"
+        );
         assert_eq!(
             alias
                 .members
@@ -1882,6 +1899,7 @@ mod tests {
                     updated_at: timestamp,
                     snapshot: snapshot_slot.as_ref_slot(),
                     metadata: crate::json_store::JsonSlotRef::None,
+                    analytical_base_coordinate: None,
                 }],
                 &BTreeSet::new(),
                 None,
@@ -1994,6 +2012,7 @@ mod tests {
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
                 origin_key: change.origin_key.as_deref(),
+                base_coordinate: None,
                 authored: true,
                 certified: false,
             })

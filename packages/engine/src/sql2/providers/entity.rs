@@ -9,7 +9,7 @@ use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::{ColumnStatistics, Precision};
-use datafusion::common::{DataFusionError, Result, ScalarValue, not_impl_err};
+use datafusion::common::{DataFusionError, Result, ScalarValue, exec_err, not_impl_err};
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
@@ -599,18 +599,25 @@ async fn entity_columnar_scan_source(
                 "entity columnar sidecar is missing its hidden entity identity".to_owned(),
             )
         })?;
-    let mut shadow_identities = layout
-        .overlay
-        .iter()
-        .map(|row| {
-            row.entity_pk
-                .as_json_array_text()
-                .map_err(lix_error_to_datafusion_error)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let coordinate_shadow_masks = entity_columnar_coordinate_shadow_masks(&layout, &spec)?;
+    let mut shadow_identities = if coordinate_shadow_masks.is_some() {
+        Vec::new()
+    } else {
+        layout
+            .overlay
+            .iter()
+            .map(|row| {
+                row.entity_pk
+                    .as_json_array_text()
+                    .map_err(lix_error_to_datafusion_error)
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
     shadow_identities.sort_unstable();
     shadow_identities.dedup();
-    let shadow_identity_digest = {
+    let shadow_identity_digest = if coordinate_shadow_masks.is_some() {
+        *blake3::hash(b"lix.entity_columnar.coordinate_masks.v1").as_bytes()
+    } else {
         let mut hasher = blake3::Hasher::new();
         for identity in &shadow_identities {
             hasher.update(&(identity.len() as u64).to_be_bytes());
@@ -684,6 +691,18 @@ async fn entity_columnar_scan_source(
     } else {
         let mut cached = Vec::with_capacity(group_indices.len());
         for &group_index in &group_indices {
+            if coordinate_shadow_masks
+                .as_ref()
+                .is_some_and(|masks| masks[group_index].is_none())
+            {
+                base_statistics_cached.push(true);
+                cached.push(entity_columnar_group_statistics(
+                    &layout.manifest.groups[group_index],
+                    &projection,
+                    schema.as_ref(),
+                ));
+                continue;
+            }
             match reader
                 .cached_entity_columnar_statistics(
                     &layout,
@@ -752,11 +771,20 @@ async fn entity_columnar_scan_source(
             let statistics_projection = projection.clone();
             let statistics_cached = base_statistics_cached[partition];
             let shadow_identities = Arc::clone(&shadow_identities);
+            let coordinate_shadow_masks = coordinate_shadow_masks.clone();
             let group_index = group_indices[partition];
             let schema = Arc::clone(&stream_schema);
             let batch_schema = Arc::clone(&schema);
             let batches = stream::once(async move {
-                let batch = if shadow_identities.is_empty() {
+                let coordinate_keep = coordinate_shadow_masks
+                    .as_ref()
+                    .and_then(|masks| masks[group_index].as_ref())
+                    .cloned();
+                let coordinates_prove_unshadowed =
+                    coordinate_shadow_masks.is_some() && coordinate_keep.is_none();
+                let batch = if (shadow_identities.is_empty() && coordinate_shadow_masks.is_none())
+                    || coordinates_prove_unshadowed
+                {
                     Arc::new(
                         reader
                             .load_entity_columnar_group(
@@ -779,16 +807,20 @@ async fn entity_columnar_scan_source(
                 {
                     batch
                 } else {
-                    let keep = reader
-                        .entity_columnar_shadow_mask(
-                            layout.clone(),
-                            group_index,
-                            identity_column,
-                            Arc::clone(&shadow_identities),
-                            shadow_identity_digest,
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
+                    let keep = if let Some(keep) = coordinate_keep {
+                        keep
+                    } else {
+                        reader
+                            .entity_columnar_shadow_mask(
+                                layout.clone(),
+                                group_index,
+                                identity_column,
+                                Arc::clone(&shadow_identities),
+                                shadow_identity_digest,
+                            )
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
+                    };
                     let batch = reader
                         .load_entity_columnar_group(
                             layout.clone(),
@@ -828,6 +860,59 @@ async fn entity_columnar_scan_source(
             Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
         },
     ))
+}
+
+fn entity_columnar_coordinate_shadow_masks(
+    layout: &crate::sql2::entity_batch::EntityColumnarScanLayout,
+    spec: &EntitySurfaceSpec,
+) -> Result<Option<Arc<Vec<Option<Arc<BooleanArray>>>>>> {
+    if layout
+        .manifest
+        .metadata
+        .get(crate::sql2::ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY)
+        .map(String::as_str)
+        != Some("true")
+    {
+        return Ok(None);
+    }
+    let mut keep_rows = layout
+        .manifest
+        .groups
+        .iter()
+        .map(|_| None)
+        .collect::<Vec<Option<Vec<bool>>>>();
+    for row in layout.overlay.iter() {
+        let Some(coordinate) = row.analytical_base_coordinate else {
+            // This row was inserted after the immutable base and therefore
+            // has no stale base member to suppress.
+            continue;
+        };
+        let owner =
+            crate::live_state::entity_row_group_set_id(coordinate.base_commit_id, &spec.schema_key);
+        if owner != layout.id {
+            return exec_err!(
+                "entity overlay analytical coordinate belongs to a different immutable base"
+            );
+        }
+        let group_index = coordinate.group_index as usize;
+        let group = layout.manifest.groups.get(group_index).ok_or_else(|| {
+            DataFusionError::Execution(
+                "entity overlay analytical coordinate has an invalid group index".to_owned(),
+            )
+        })?;
+        if coordinate.row_index >= group.row_count {
+            return exec_err!("entity overlay analytical coordinate has an invalid row index");
+        }
+        let keep =
+            keep_rows[group_index].get_or_insert_with(|| vec![true; group.row_count as usize]);
+        keep[coordinate.row_index as usize] = false;
+    }
+    Ok(Some(Arc::new(
+        keep_rows
+            .into_iter()
+            .map(|keep| keep.map(|keep| Arc::new(BooleanArray::from(keep))))
+            .collect(),
+    )))
 }
 
 fn entity_columnar_overlay_partition(
@@ -4082,16 +4167,19 @@ mod tests {
                 entity_pk: TestEntityPk::single("a"),
                 snapshot_content: Some(Bytes::from_static(br#"{"active":false,"lane":"new-a"}"#)),
                 deleted: false,
+                analytical_base_coordinate: None,
             },
             crate::live_state::EntityColumnarOverlayRow {
                 entity_pk: TestEntityPk::single("b"),
                 snapshot_content: None,
                 deleted: true,
+                analytical_base_coordinate: None,
             },
             crate::live_state::EntityColumnarOverlayRow {
                 entity_pk: TestEntityPk::single("c"),
                 snapshot_content: Some(Bytes::from_static(br#"{"active":true,"lane":"insert-c"}"#)),
                 deleted: false,
+                analytical_base_coordinate: None,
             },
         ];
         let filters = [super::EntityRowFilter::ColumnEq {
@@ -4156,5 +4244,88 @@ mod tests {
             20
         );
         assert!(super::entity_columnar_overlay_partition(&overlays, 3, 5).is_none());
+    }
+
+    #[test]
+    fn columnar_coordinate_masks_touch_only_the_affected_physical_groups() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "coordinate_mask_fixture",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "active": { "type": "boolean" }
+            },
+            "required": ["id", "active"]
+        }))
+        .expect("schema");
+        let snapshots = [
+            json!({"id":"a","active":true}),
+            json!({"id":"b","active":true}),
+            json!({"id":"c","active":false}),
+            json!({"id":"d","active":false}),
+        ];
+        let canonical = snapshots
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>();
+        let identities = ["a", "b", "c", "d"].map(TestEntityPk::single);
+        let encoded = crate::sql2::encode_registered_entity_row_groups(
+            &spec,
+            identities.iter().zip(&snapshots).zip(&canonical).map(
+                |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
+                    entity_pk,
+                    snapshot_bytes: canonical.as_bytes(),
+                    snapshot_value: snapshot,
+                },
+            ),
+        )
+        .expect("encode")
+        .expect("registered sidecar");
+        let base_commit_id = CommitId::for_test_label("coordinate-base");
+        let location = encoded.input_locations[0];
+        let layout = crate::sql2::entity_batch::EntityColumnarScanLayout {
+            id: crate::live_state::entity_row_group_set_id(base_commit_id, &spec.schema_key),
+            manifest: Arc::new(encoded.manifest.clone()),
+            overlay: Arc::new(vec![
+                crate::live_state::EntityColumnarOverlayRow {
+                    entity_pk: identities[0].clone(),
+                    snapshot_content: Some(Bytes::from_static(br#"{"id":"a","active":false}"#)),
+                    deleted: false,
+                    analytical_base_coordinate: Some(crate::live_state::AnalyticalBaseCoordinate {
+                        base_commit_id,
+                        group_index: location.group_index,
+                        row_index: location.row_index,
+                    }),
+                },
+                // A post-base insert has no stale physical row to suppress.
+                crate::live_state::EntityColumnarOverlayRow {
+                    entity_pk: TestEntityPk::single("inserted"),
+                    snapshot_content: Some(Bytes::from_static(
+                        br#"{"id":"inserted","active":true}"#,
+                    )),
+                    deleted: false,
+                    analytical_base_coordinate: None,
+                },
+            ]),
+            branch_id: Arc::from("main"),
+            head_commit_id: base_commit_id,
+            current_state_revision: 1,
+            live_count: identities.len() as u64 + 1,
+        };
+
+        let masks = super::entity_columnar_coordinate_shadow_masks(&layout, &spec)
+            .expect("coordinate masks")
+            .expect("coordinate-capable layout");
+        assert_eq!(masks.len(), encoded.manifest.groups.len());
+        for (group_index, mask) in masks.iter().enumerate() {
+            if group_index == location.group_index as usize {
+                let mask = mask.as_ref().expect("affected group mask");
+                assert!(!mask.value(location.row_index as usize));
+                assert_eq!(mask.iter().filter(|value| *value == Some(false)).count(), 1);
+            } else {
+                assert!(mask.is_none(), "unaffected group must avoid mask work");
+            }
+        }
     }
 }

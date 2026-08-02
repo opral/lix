@@ -1096,6 +1096,7 @@ mod tests {
                     snapshot: change.snapshot.as_ref_slot(),
                     metadata: change.metadata.as_ref_slot(),
                     origin_key: change.origin_key.as_deref(),
+                    base_coordinate: None,
                     authored: true,
                     certified: false,
                 })

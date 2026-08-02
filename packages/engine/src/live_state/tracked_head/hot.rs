@@ -1,4 +1,4 @@
-//! V20 row-addressable current state with checkpoint-owned dirty baselines.
+//! V21 row-addressable current state with analytical-base coordinates.
 //!
 //! V12 packed every file member of one logical entity into a group. That made
 //! a logical-PK lookup cheap, but it also made every normal commit read,
@@ -28,7 +28,7 @@ use crate::wasm::WasmCertifiedEntityBatch;
 
 use super::*;
 
-pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v20";
+pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v21";
 pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
 pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
 pub(crate) const HOT_COLLECTION_CONTROL_NAMESPACE: &str = "live_state.hot_collection_control.v1";
@@ -184,11 +184,13 @@ impl DeferredFreshHotPlan {
                 delta.file_id,
             )
             .ok_or_else(|| head_value_error("deferred fresh hot key length overflowed"))?;
-            let value_len =
-                checked_add_hot_next_value_capacity(0, &delta, checkpoint_commit_id.is_some())
-                    .ok_or_else(|| {
-                        head_value_error("deferred fresh hot value length overflowed")
-                    })?;
+            let value_len = checked_add_hot_next_value_capacity(
+                0,
+                &delta,
+                checkpoint_commit_id.is_some(),
+                false,
+            )
+            .ok_or_else(|| head_value_error("deferred fresh hot value length overflowed"))?;
             if delta.file_id.is_some() {
                 file_schema_keys.insert(delta.schema_key.to_owned());
             }
@@ -374,6 +376,7 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
                 value_capacity,
                 &delta,
                 self.plan.checkpoint_commit_id.is_some(),
+                false,
             )
             .unwrap_or(0);
         }
@@ -2772,6 +2775,7 @@ pub(crate) struct EntityColumnarOverlayRow {
     pub(crate) entity_pk: EntityPk,
     pub(crate) snapshot_content: Option<Bytes>,
     pub(crate) deleted: bool,
+    pub(crate) analytical_base_coordinate: Option<AnalyticalBaseCoordinate>,
 }
 
 // Moderate analytical workloads deliberately keep a few hundred thousand
@@ -3100,6 +3104,7 @@ fn push_root_current_base_row(
             created_at: row.created_at(),
             updated_at: row.updated_at(),
             checkpoint_commit_id: active_checkpoint_commit_id,
+            analytical_base_coordinate: None,
         }),
     );
 }
@@ -3763,7 +3768,7 @@ async fn load_packed_current_base_exact(
     let mut deferred = Vec::new();
     let global = branch_id == crate::GLOBAL_BRANCH_ID;
     for entry in winners {
-        let Some((value, change_record)) = entry else {
+        let Some((value, change_record, base_coordinate)) = entry else {
             slots.push(None);
             continue;
         };
@@ -3772,6 +3777,12 @@ async fn load_packed_current_base_exact(
             continue;
         }
         let row_index = rows.len();
+        let analytical_base_coordinate =
+            base_coordinate.map(|coordinate| AnalyticalBaseCoordinate {
+                base_commit_id: coordinate.base_commit_id,
+                group_index: coordinate.group_index,
+                row_index: coordinate.row_index,
+            });
         let durable_predecessor = CertifiedCurrentStatePredecessor::Packed(PackedHeadValue {
             change_id: value.change_id,
             commit_id: value.commit_id,
@@ -3779,6 +3790,7 @@ async fn load_packed_current_base_exact(
             created_at: value.created_at,
             updated_at: value.updated_at,
             checkpoint_commit_id: active_checkpoint_commit_id,
+            analytical_base_coordinate,
         });
         let snapshot = materialize_packed_slot(
             projection.snapshot_content,
@@ -3815,6 +3827,9 @@ async fn load_packed_current_base_exact(
             branch_id,
         );
         rows.set_durable_predecessor(row_index, durable_predecessor);
+        if let Some(coordinate) = analytical_base_coordinate {
+            rows.set_analytical_base_coordinate(row_index, coordinate);
+        }
     }
     if !json_refs.is_empty() {
         let mut json_values = JsonStoreContext::new()
@@ -3854,6 +3869,7 @@ async fn load_packed_current_base_exact_entries(
         Option<(
             crate::tracked_state::TrackedStateIndexValue,
             crate::changelog::ChangeRecord,
+            Option<crate::tracked_state::TrackedStateBaseCoordinate>,
         )>,
     >,
     LixError,
@@ -3892,7 +3908,9 @@ async fn load_packed_current_base_exact_entries(
             )
             .await?
             .into_iter()
-            .map(|entry| entry.map(|entry| (entry.value, entry.change_record)))
+            .map(|entry| {
+                entry.map(|entry| (entry.value, entry.change_record, entry.base_coordinate))
+            })
             .collect(),
         );
     }
@@ -3918,6 +3936,7 @@ async fn load_packed_current_base_exact_entries(
         Option<(
             crate::tracked_state::TrackedStateIndexValue,
             crate::changelog::ChangeRecord,
+            Option<crate::tracked_state::TrackedStateBaseCoordinate>,
         )>,
     >>();
     for entries in loaded.chunks(keys.len()) {
@@ -3927,9 +3946,13 @@ async fn load_packed_current_base_exact_entries(
             };
             if slot
                 .as_ref()
-                .is_none_or(|(previous, _)| previous.commit_id < entry.value.commit_id)
+                .is_none_or(|(previous, _, _)| previous.commit_id < entry.value.commit_id)
             {
-                *slot = Some((entry.value.clone(), entry.change_record.clone()));
+                *slot = Some((
+                    entry.value.clone(),
+                    entry.change_record.clone(),
+                    entry.base_coordinate,
+                ));
             }
         }
     }
@@ -4487,6 +4510,7 @@ where
                     .snapshot_content()
                     .map(|snapshot| Bytes::copy_from_slice(snapshot.as_bytes())),
                 deleted: row.deleted(),
+                analytical_base_coordinate: row.analytical_base_coordinate(),
             });
         }
         Ok(Some((id, manifest, overlay, live_count)))
@@ -5336,6 +5360,7 @@ impl HotTrackedSnapshot {
                     .metadata
                     .as_deref()
                     .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
+                analytical_base_coordinate: None,
                 working_diff_baseline: WorkingDiffBaseline::Disabled,
             };
             if rows
@@ -6259,7 +6284,7 @@ where
         for (index, packed_previous) in packed_previous_indices.iter().copied().zip(packed_previous)
         {
             let previous = &mut previous_values[index];
-            let Some((packed_value, _)) = &packed_previous else {
+            let Some((packed_value, _, base_coordinate)) = &packed_previous else {
                 continue;
             };
             let packed_is_newer = match (
@@ -6286,6 +6311,13 @@ where
                 created_at: packed_value.created_at,
                 updated_at: packed_value.updated_at,
                 checkpoint_commit_id: working_diff_capture_checkpoint_commit_id,
+                analytical_base_coordinate: base_coordinate.map(|coordinate| {
+                    AnalyticalBaseCoordinate {
+                        base_commit_id: coordinate.base_commit_id,
+                        group_index: coordinate.group_index,
+                        row_index: coordinate.row_index,
+                    }
+                }),
             }));
         }
         let root_previous = if load_root_current_base_commit(self.store, branch_id, generation)
@@ -6513,11 +6545,20 @@ where
         let mut diff_puts = Vec::with_capacity(diff_scope.as_ref().map_or(0, |_| sorted.len()));
         let next_value_capacity = sorted
             .iter()
-            .try_fold(0_usize, |total, delta| {
+            .zip(&previous_values)
+            .try_fold(0_usize, |total, (delta, previous)| {
+                let inherited_coordinate = previous.as_ref().is_some_and(|previous| {
+                    previous
+                        .view()
+                        .expect("HOT predecessor was validated before capacity planning")
+                        .analytical_base_coordinate
+                        .is_some()
+                });
                 checked_add_hot_next_value_capacity(
                     total,
                     delta,
                     working_diff_capture_checkpoint_commit_id.is_some(),
+                    inherited_coordinate,
                 )
             })
             // Preserve the encoder's fallible behavior for impossible input:
@@ -6580,10 +6621,13 @@ where
                 next_value_ranges.push(if delta.physically_deletes() {
                     None
                 } else {
-                    Some(append_head_value(
-                        &mut next_value_bytes,
-                        &delta.value_ref(*created_at, working_diff_baseline),
-                    )?)
+                    let mut value = delta.value_ref(*created_at, working_diff_baseline);
+                    value.analytical_base_coordinate = next_analytical_base_coordinate(
+                        reset_working_diff_baselines,
+                        delta,
+                        previous.as_ref(),
+                    )?;
+                    Some(append_head_value(&mut next_value_bytes, &value)?)
                 });
             }
         }
@@ -6867,6 +6911,7 @@ async fn stage_incremental_file_delete_cascades(
                 updated_at: cascade.updated_at,
                 snapshot: JsonSlotRef::None,
                 metadata: JsonSlotRef::None,
+                analytical_base_coordinate: existing.analytical_base_coordinate,
                 working_diff_baseline: baseline,
             },
         )?;
@@ -6909,7 +6954,9 @@ impl HotCascadeMutationBuffers {
         } else {
             0
         };
-        let value_bytes_per_row = HEAD_VALUE_HEADER_BYTES.checked_add(checkpoint_bytes);
+        let value_bytes_per_row = HEAD_VALUE_HEADER_BYTES
+            .checked_add(checkpoint_bytes)
+            .and_then(|bytes| bytes.checked_add(ANALYTICAL_BASE_COORDINATE_BYTES));
         let value_capacity = value_bytes_per_row
             .and_then(|value_bytes| row_capacity.checked_mul(value_bytes))
             .unwrap_or(0);
@@ -7069,6 +7116,20 @@ fn next_hot_working_diff_baseline(
     }
 }
 
+fn next_analytical_base_coordinate(
+    reset_working_diff_baselines: bool,
+    delta: &CurrentStateDeltaRef<'_>,
+    previous: Option<&CertifiedCurrentStatePredecessor>,
+) -> Result<Option<AnalyticalBaseCoordinate>, LixError> {
+    if reset_working_diff_baselines {
+        return Ok(None);
+    }
+    Ok(delta.analytical_base_coordinate.or(previous
+        .map(CertifiedCurrentStatePredecessor::view)
+        .transpose()?
+        .and_then(|value| value.analytical_base_coordinate)))
+}
+
 async fn load_hot_untracked_generation(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -7215,9 +7276,11 @@ fn apply_complete_hot_snapshot_delta(
             .map_or(delta.created_at, |value| value.created_at);
         rows.insert(
             identity,
-            Bytes::from(encode_head_value(
-                &delta.value_ref(created_at, WorkingDiffBaseline::Disabled),
-            )?),
+            Bytes::from(encode_head_value(&{
+                let mut value = delta.value_ref(created_at, WorkingDiffBaseline::Disabled);
+                value.analytical_base_coordinate = None;
+                value
+            })?),
         );
     }
     Ok(())
@@ -7260,6 +7323,7 @@ fn apply_complete_file_delete_cascade(
                 updated_at: delta.updated_at,
                 snapshot: JsonSlotRef::None,
                 metadata: JsonSlotRef::None,
+                analytical_base_coordinate: existing.analytical_base_coordinate,
                 working_diff_baseline: WorkingDiffBaseline::Disabled,
             })?),
         );
@@ -7517,6 +7581,7 @@ fn checked_add_hot_next_value_capacity(
     total: usize,
     delta: &CurrentStateDeltaRef<'_>,
     active_checkpoint: bool,
+    inherited_coordinate: bool,
 ) -> Option<usize> {
     if delta.physically_deletes() {
         return Some(total);
@@ -7540,7 +7605,12 @@ fn checked_add_hot_next_value_capacity(
     let encoded_len = HEAD_VALUE_HEADER_BYTES
         .checked_add(snapshot_len)?
         .checked_add(metadata_len)?
-        .checked_add(baseline_len)?;
+        .checked_add(baseline_len)?
+        .checked_add(
+            (delta.analytical_base_coordinate.is_some() || inherited_coordinate)
+                .then_some(ANALYTICAL_BASE_COORDINATE_BYTES)
+                .unwrap_or(0),
+        )?;
     total.checked_add(encoded_len)
 }
 
@@ -7917,6 +7987,7 @@ fn stage_hot_bootstrap(
                 .metadata
                 .as_deref()
                 .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
+            analytical_base_coordinate: None,
             working_diff_baseline: tracked_baseline,
         };
         if rows
@@ -7963,6 +8034,7 @@ fn stage_hot_bootstrap(
                 .metadata
                 .as_deref()
                 .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
+            analytical_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
         if rows
@@ -8005,14 +8077,18 @@ fn stage_hot_bootstrap(
                 .map_or(delta.created_at, |value| value.created_at);
             rows.insert(
                 identity,
-                Bytes::from(encode_head_value(&delta.value_ref(
-                    created_at,
-                    if delta.untracked {
-                        WorkingDiffBaseline::Disabled
-                    } else {
-                        tracked_baseline
-                    },
-                ))?),
+                Bytes::from(encode_head_value(&{
+                    let mut value = delta.value_ref(
+                        created_at,
+                        if delta.untracked {
+                            WorkingDiffBaseline::Disabled
+                        } else {
+                            tracked_baseline
+                        },
+                    );
+                    value.analytical_base_coordinate = None;
+                    value
+                })?),
             );
         }
     }
@@ -10775,7 +10851,7 @@ mod tests {
             admitted_read_counts,
             "a transaction snapshot must reuse an admitted packed segment by immutable address"
         );
-        let (_, change) = entries[0].as_ref().expect("packed predecessor exists");
+        let (_, change, _) = entries[0].as_ref().expect("packed predecessor exists");
         assert!(
             matches!(change.snapshot, JsonSlot::Ref(_)),
             "mutation lookup must retain the out-of-band slot instead of materializing its payload"
@@ -11189,6 +11265,7 @@ mod tests {
             updated_at: created_at,
             snapshot: JsonSlotRef::Inline(snapshot),
             metadata: JsonSlotRef::None,
+            analytical_base_coordinate: None,
         };
         let mut checkpoint_writes = StorageWriteSet::new();
         let mut coverage = WorkingDiffIndexCoverage::default();
@@ -12166,6 +12243,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn analytical_base_coordinate_survives_repeated_hot_updates_and_tombstones() {
+        let entity_pk = EntityPk::single("coordinated-row");
+        let coordinate = AnalyticalBaseCoordinate {
+            base_commit_id: CommitId::for_test_label("coordinate-base"),
+            group_index: 7,
+            row_index: 31,
+        };
+        let previous = HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("coordinate-before-change")),
+            commit_id: Some(CommitId::for_test_label("coordinate-before-commit")),
+            untracked: false,
+            deleted: false,
+            created_at: timestamp(),
+            updated_at: timestamp(),
+            snapshot: JsonSlotRef::Inline("{}"),
+            metadata: JsonSlotRef::None,
+            analytical_base_coordinate: Some(coordinate),
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
+        };
+        let mut predecessor = CertifiedCurrentStatePredecessor::Encoded(Bytes::from(
+            encode_head_value(&previous).expect("encode coordinated predecessor"),
+        ));
+        for deleted in [false, true] {
+            let delta = CurrentStateDeltaRef {
+                schema_key: "schema",
+                file_id: None,
+                entity_pk: &entity_pk,
+                change_id: Some(ChangeId::for_test_label(if deleted {
+                    "coordinate-delete-change"
+                } else {
+                    "coordinate-update-change"
+                })),
+                commit_id: Some(CommitId::for_test_label(if deleted {
+                    "coordinate-delete-commit"
+                } else {
+                    "coordinate-update-commit"
+                })),
+                untracked: false,
+                deleted,
+                created_at: timestamp(),
+                updated_at: timestamp(),
+                snapshot: JsonSlotRef::Inline("{\"updated\":true}"),
+                metadata: JsonSlotRef::None,
+                analytical_base_coordinate: None,
+            };
+            let inherited = next_analytical_base_coordinate(false, &delta, Some(&predecessor))
+                .expect("inherit coordinate");
+            assert_eq!(inherited, Some(coordinate));
+            assert_eq!(
+                next_analytical_base_coordinate(true, &delta, Some(&predecessor))
+                    .expect("clear coordinate for new base"),
+                None
+            );
+            let mut next = delta.value_ref(timestamp(), WorkingDiffBaseline::Disabled);
+            next.analytical_base_coordinate = inherited;
+            predecessor = CertifiedCurrentStatePredecessor::Encoded(Bytes::from(
+                encode_head_value(&next).expect("encode repeated coordinated mutation"),
+            ));
+        }
+        assert!(predecessor.view().expect("decode tombstone").deleted);
+        assert_eq!(
+            predecessor
+                .view()
+                .expect("decode tombstone coordinate")
+                .analytical_base_coordinate,
+            Some(coordinate)
+        );
+    }
+
     #[tokio::test]
     async fn hot_diff_segments_preserve_identity_coverage_with_bounded_puts() {
         const IDENTITY_COUNT: usize = 10_000;
@@ -12254,6 +12401,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
+            analytical_base_coordinate: None,
         };
         let second = CurrentStateDeltaRef {
             schema_key: "schema_without_file",
@@ -12267,6 +12415,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
+            analytical_base_coordinate: None,
         };
         let deltas = [&first, &second];
         let capacity = encoded_hot_mutation_identity_capacity(scope.len(), &deltas)
@@ -12356,6 +12505,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Inline("{\"tracked\":true}"),
             metadata: JsonSlotRef::Inline("{\"source\":\"test\"}"),
+            analytical_base_coordinate: None,
         };
         let tombstone = CurrentStateDeltaRef {
             schema_key: "tracked_schema",
@@ -12370,6 +12520,7 @@ mod tests {
             // Deleted values deliberately ignore both supplied slots.
             snapshot: JsonSlotRef::Inline("{\"ignored\":true}"),
             metadata: JsonSlotRef::Ref(&snapshot_ref),
+            analytical_base_coordinate: None,
         };
         let untracked = CurrentStateDeltaRef {
             schema_key: "untracked_schema",
@@ -12383,6 +12534,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::Ref(&snapshot_ref),
             metadata: JsonSlotRef::None,
+            analytical_base_coordinate: None,
         };
         let removed = CurrentStateDeltaRef {
             schema_key: "untracked_schema",
@@ -12396,13 +12548,14 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::None,
             metadata: JsonSlotRef::None,
+            analytical_base_coordinate: None,
         };
         let deltas = [&tracked, &tombstone, &untracked, &removed];
 
         let ordinary_capacity = deltas
             .iter()
             .try_fold(0_usize, |total, delta| {
-                checked_add_hot_next_value_capacity(total, delta, false)
+                checked_add_hot_next_value_capacity(total, delta, false, false)
             })
             .expect("ordinary test values have a representable encoded size");
         let mut ordinary = Vec::with_capacity(ordinary_capacity);
@@ -12452,7 +12605,7 @@ mod tests {
         let checkpoint_capacity = [&tracked, &tombstone, &untracked, &removed]
             .iter()
             .try_fold(0_usize, |total, delta| {
-                checked_add_hot_next_value_capacity(total, delta, true)
+                checked_add_hot_next_value_capacity(total, delta, true, false)
             })
             .expect("checkpoint test values have a representable encoded size");
         let checkpoint_baselines = [
@@ -12496,8 +12649,9 @@ mod tests {
         );
         let before_absent_bytes =
             encode_head_value(&before_absent).expect("encode before-absent checkpoint value");
-        let tracked_checkpoint_capacity = checked_add_hot_next_value_capacity(0, &tracked, true)
-            .expect("tracked checkpoint value has a representable size");
+        let tracked_checkpoint_capacity =
+            checked_add_hot_next_value_capacity(0, &tracked, true, false)
+                .expect("tracked checkpoint value has a representable size");
         assert_eq!(
             tracked_checkpoint_capacity,
             before_absent_bytes.len() + WORKING_DIFF_VERSION_BYTES,
@@ -12505,11 +12659,11 @@ mod tests {
         );
 
         assert!(
-            checked_add_hot_next_value_capacity(usize::MAX, &tracked, false).is_none(),
+            checked_add_hot_next_value_capacity(usize::MAX, &tracked, false, false).is_none(),
             "overflow must select the caller's zero-capacity fallback"
         );
         assert_eq!(
-            checked_add_hot_next_value_capacity(usize::MAX, &tracked, false).unwrap_or(0),
+            checked_add_hot_next_value_capacity(usize::MAX, &tracked, false, false).unwrap_or(0),
             0
         );
     }
@@ -12575,6 +12729,7 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::None,
             metadata: JsonSlotRef::None,
+            analytical_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::BeforePresent {
                 checkpoint_commit_id: CommitId::for_test_label("cascade-reserve-checkpoint"),
                 version: working_diff_version("cascade-reserve-before"),
@@ -12642,6 +12797,7 @@ mod tests {
             updated_at: timestamp,
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
+            analytical_base_coordinate: None,
         };
         let deltas = vec![&delta; DELTAS];
         let generation = CommitId::for_test_label("ordinary-import-generation");
@@ -12694,6 +12850,7 @@ mod tests {
                 updated_at: timestamp,
                 snapshot: JsonSlotRef::Inline("{}"),
                 metadata: JsonSlotRef::None,
+                analytical_base_coordinate: None,
             })
             .collect::<Vec<_>>();
         let delta_refs = deltas.iter().collect::<Vec<_>>();
