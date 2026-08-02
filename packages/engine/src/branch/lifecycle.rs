@@ -1,6 +1,6 @@
 use crate::LixError;
 use crate::changelog::CommitId;
-use crate::commit_graph::{CommitGraphCommit, CommitGraphReader};
+use crate::commit_graph::{CommitGraphNode, CommitGraphReader};
 use crate::common::validate_non_empty_identity_value;
 
 use super::{BranchHead, BranchRefReader};
@@ -73,9 +73,9 @@ impl<'a> BranchLifecycle<'a> {
         commit_id: CommitId,
         operation: BranchOperation,
         role: BranchReferenceRole,
-    ) -> Result<CommitGraphCommit, LixError> {
+    ) -> Result<CommitGraphNode, LixError> {
         commit_graph
-            .load_commit(&commit_id)
+            .load_node(&commit_id)
             .await?
             .ok_or_else(|| LixError::commit_not_found(commit_id, operation.label(), role.label()))
     }

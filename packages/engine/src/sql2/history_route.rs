@@ -372,29 +372,26 @@ where
     for as_of_commit_id in as_of_commit_ids {
         let as_of_commit_id =
             CommitId::parse_lix(as_of_commit_id, "history lixcol_as_of_commit_id")?;
-        let (entries, reachable_commits) = {
+        let (entries, reachable_nodes) = {
             let mut guard = commit_graph.lock().await;
-            let entries = guard
+            let history = guard
                 .change_history_from_commit(&as_of_commit_id, &request)
                 .await?;
-            let reachable_commits = if metadata_projection.commit_created_at
+            let reachable_nodes = if metadata_projection.commit_created_at
                 || query_source.certified_history_reader.is_some()
             {
-                guard.reachable_commits(&as_of_commit_id).await?
+                history.reachable_nodes
             } else {
-                Vec::new()
+                Arc::from([])
             };
-            (entries, reachable_commits)
+            (history.entries, reachable_nodes)
         };
-        let reachable_by_id = reachable_commits
+        let reachable_by_id = reachable_nodes
             .iter()
             .map(|reachable| {
                 (
                     reachable.commit.commit_id,
-                    (
-                        reachable.depth,
-                        reachable.commit.change.created_at.to_string(),
-                    ),
+                    (reachable.depth, reachable.commit.created_at.to_string()),
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -837,7 +834,7 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::commit_graph::{
         CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
-        CommitGraphCommit, CommitGraphReader, ReachableCommitGraphCommit,
+        CommitGraphNode, CommitGraphReader, ReachableCommitGraphNode,
     };
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonSlot, JsonStoreContext};
@@ -965,7 +962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_loader_preserves_projected_commit_timestamp() {
+    async fn history_loader_reuses_history_topology_for_projected_commit_timestamp() {
         let reachable_calls = Arc::new(AtomicUsize::new(0));
         let start_commit_id = CommitId::for_test_label("start");
         let metadata_schema = Arc::new(Schema::new(vec![Field::new(
@@ -990,7 +987,11 @@ mod tests {
         .await
         .expect("history load should enrich commit metadata");
 
-        assert_eq!(reachable_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reachable_calls.load(Ordering::SeqCst),
+            0,
+            "commit metadata must not trigger a second topology walk",
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].commit_created_at,
@@ -1041,47 +1042,59 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommitGraphReader for CountingCommitGraphReader {
-        async fn load_commit(
+        async fn load_node(
             &mut self,
             _commit_id: &CommitId,
-        ) -> Result<Option<CommitGraphCommit>, LixError> {
+        ) -> Result<Option<CommitGraphNode>, LixError> {
             Ok(None)
         }
 
-        async fn reachable_commits(
+        async fn reachable_nodes(
             &mut self,
             _head_commit_id: &CommitId,
-        ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
+        ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
             self.reachable_calls.fetch_add(1, Ordering::SeqCst);
             if !self.include_reachable_commit {
-                return Ok(Vec::new());
+                return Ok(Arc::from([]));
             }
-            let change = test_change("commit-change", commit_timestamp());
-            Ok(vec![ReachableCommitGraphCommit {
-                commit: CommitGraphCommit {
-                    canonical_change: change.clone(),
-                    change,
+            Ok(Arc::from([ReachableCommitGraphNode {
+                commit: CommitGraphNode {
                     commit_id: self.start_commit_id,
+                    change_id: ChangeId::for_test_label("commit-change"),
                     generation: 0,
-                    change_ids: vec![ChangeId::for_test_label("entity-change")],
-                    author_account_ids: Vec::new(),
                     parent_commit_ids: Vec::new(),
+                    created_at: commit_timestamp(),
                 },
                 depth: 0,
-            }])
+            }]))
         }
 
         async fn change_history_from_commit(
             &mut self,
             _start_commit_id: &CommitId,
             _request: &CommitGraphChangeHistoryRequest,
-        ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
-            Ok(vec![CommitGraphChangeHistoryEntry {
-                change: test_change("entity-change", event_timestamp()),
-                observed_commit_id: self.start_commit_id,
-                start_commit_id: self.start_commit_id,
-                depth: 0,
-            }])
+        ) -> Result<crate::commit_graph::CommitGraphHistory, LixError> {
+            let reachable_nodes = self
+                .include_reachable_commit
+                .then(|| ReachableCommitGraphNode {
+                    commit: CommitGraphNode {
+                        commit_id: self.start_commit_id,
+                        change_id: ChangeId::for_test_label("commit-change"),
+                        generation: 0,
+                        parent_commit_ids: Vec::new(),
+                        created_at: commit_timestamp(),
+                    },
+                    depth: 0,
+                });
+            Ok(crate::commit_graph::CommitGraphHistory {
+                entries: vec![CommitGraphChangeHistoryEntry {
+                    change: test_change("entity-change", event_timestamp()),
+                    observed_commit_id: self.start_commit_id,
+                    start_commit_id: self.start_commit_id,
+                    depth: 0,
+                }],
+                reachable_nodes: reachable_nodes.into_iter().collect::<Vec<_>>().into(),
+            })
         }
     }
 

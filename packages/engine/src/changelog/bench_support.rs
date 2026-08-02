@@ -245,6 +245,31 @@ pub fn append_ordered_commits(
     Ok(BenchAppend { append })
 }
 
+/// Builds one production-shaped first-parent chain for topology benchmarks.
+pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend, LixError> {
+    let mut append = ChangelogAppend::default();
+    append.commits.reserve(commit_count);
+    let mut parent_commit_id = None;
+    for commit_index in 0..commit_count {
+        let commit_id = CommitId::new(ordered_bench_uuid(commit_index, 0));
+        append.commits.push(CommitRecord {
+            format_version: 1,
+            commit_id,
+            generation: u64::try_from(commit_index).expect("benchmark commit index fits u64"),
+            parent_commit_ids: parent_commit_id.into_iter().collect(),
+            tracked_state_rootless: false,
+            change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
+            author_account_ids: Vec::new(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
+                "2026-05-20T00:00:00Z",
+            ),
+        });
+        parent_commit_id = Some(commit_id);
+    }
+    Ok(BenchAppend { append })
+}
+
 pub fn append_1c_with_commit_change_id(
     name: &str,
     commit_change_id: &str,

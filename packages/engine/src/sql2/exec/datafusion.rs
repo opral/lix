@@ -2429,8 +2429,8 @@ mod tests {
     use crate::branch::BranchRefReader;
     use crate::changelog::{ChangeId, CommitId};
     use crate::commit_graph::{
-        CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
-        CommitGraphReader, ReachableCommitGraphCommit,
+        CommitGraphChangeHistoryRequest, CommitGraphNode, CommitGraphReader,
+        ReachableCommitGraphNode,
     };
     use crate::common::LixTimestamp;
     use crate::functions::FunctionProviderHandle;
@@ -3063,17 +3063,17 @@ mod tests {
 
     #[async_trait]
     impl CommitGraphReader for DummyCommitGraphReader {
-        async fn load_commit(
+        async fn load_node(
             &mut self,
             _commit_id: &CommitId,
-        ) -> Result<Option<CommitGraphCommit>, LixError> {
+        ) -> Result<Option<CommitGraphNode>, LixError> {
             Ok(None)
         }
 
-        async fn reachable_commits(
+        async fn reachable_nodes(
             &mut self,
             _head_commit_id: &CommitId,
-        ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
+        ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
             Ok(Vec::new().into())
         }
 
@@ -3081,8 +3081,11 @@ mod tests {
             &mut self,
             _start_commit_id: &CommitId,
             _request: &CommitGraphChangeHistoryRequest,
-        ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
-            Ok(Vec::new().into())
+        ) -> Result<crate::commit_graph::CommitGraphHistory, LixError> {
+            Ok(crate::commit_graph::CommitGraphHistory {
+                entries: Vec::new(),
+                reachable_nodes: Arc::from([]),
+            })
         }
     }
 

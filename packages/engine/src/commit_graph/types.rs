@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use crate::LixError;
-use crate::changelog::{ChangeId, CommitId};
+use crate::changelog::{ChangeId, CommitId, CommitRecord};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 
@@ -15,26 +17,13 @@ pub(crate) struct CommitGraphChange {
     pub(crate) origin_key: Option<String>,
 }
 
-/// Parsed `lix_commit` entity from the changelog.
+/// One topology-first commit fact.
 ///
-/// The graph reader projects direct changelog commit records into explicit
-/// parent ids plus the commit's referenced canonical changes. A merge commit
-/// points at selected existing change ids; it does not mint row/entity changes
-/// for the merge itself.
+/// Nodes contain exactly the changelog fields needed by graph algorithms and
+/// derived commit surfaces. Entity/change payloads are loaded separately only
+/// by history APIs that explicitly request them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommitGraphCommit {
-    pub(crate) canonical_change: CommitGraphChange,
-    pub(crate) change: CommitGraphChange,
-    pub(crate) commit_id: CommitId,
-    pub(crate) generation: u64,
-    pub(crate) change_ids: Vec<ChangeId>,
-    pub(crate) author_account_ids: Vec<String>,
-    pub(crate) parent_commit_ids: Vec<CommitId>,
-}
-
-/// Lightweight commit metadata for graph walks that do not inspect members.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommitGraphCommitRecord {
+pub(crate) struct CommitGraphNode {
     pub(crate) commit_id: CommitId,
     pub(crate) change_id: ChangeId,
     pub(crate) generation: u64,
@@ -42,10 +31,22 @@ pub(crate) struct CommitGraphCommitRecord {
     pub(crate) created_at: LixTimestamp,
 }
 
+impl From<CommitRecord> for CommitGraphNode {
+    fn from(record: CommitRecord) -> Self {
+        Self {
+            commit_id: record.commit_id,
+            change_id: record.change_id,
+            generation: record.generation,
+            parent_commit_ids: record.parent_commit_ids,
+            created_at: record.created_at,
+        }
+    }
+}
+
 /// Commit reachable from a requested graph head.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReachableCommitGraphCommit {
-    pub(crate) commit: CommitGraphCommit,
+pub(crate) struct ReachableCommitGraphNode {
+    pub(crate) commit: CommitGraphNode,
     pub(crate) depth: u32,
 }
 
@@ -57,7 +58,7 @@ pub(crate) struct CommitGraphEdge {
     pub(crate) parent_order: u32,
 }
 
-pub(crate) fn commit_edges(commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge> {
+pub(crate) fn commit_edges(commits: &[CommitGraphNode]) -> Vec<CommitGraphEdge> {
     commits
         .iter()
         .flat_map(|commit| {
@@ -97,41 +98,31 @@ pub(crate) struct CommitGraphChangeHistoryEntry {
     pub(crate) depth: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitGraphHistory {
+    pub(crate) entries: Vec<CommitGraphChangeHistoryEntry>,
+    pub(crate) reachable_nodes: Arc<[ReachableCommitGraphNode]>,
+}
+
 /// Execution-scoped reader for commit graph facts.
 ///
 /// SQL surfaces consume this trait so they depend on graph semantics, not on
 /// changelog storage or traversal details.
 #[async_trait::async_trait]
 pub(crate) trait CommitGraphReader: Send + Sync {
-    async fn load_commit(
+    async fn load_node(
         &mut self,
         commit_id: &CommitId,
-    ) -> Result<Option<CommitGraphCommit>, LixError>;
+    ) -> Result<Option<CommitGraphNode>, LixError>;
 
-    async fn load_commit_record(
-        &mut self,
-        commit_id: &CommitId,
-    ) -> Result<Option<CommitGraphCommitRecord>, LixError> {
-        Ok(self
-            .load_commit(commit_id)
-            .await?
-            .map(|commit| CommitGraphCommitRecord {
-                commit_id: commit.commit_id,
-                change_id: commit.canonical_change.id,
-                generation: commit.generation,
-                parent_commit_ids: commit.parent_commit_ids,
-                created_at: commit.canonical_change.created_at,
-            }))
-    }
-
-    async fn reachable_commits(
+    async fn reachable_nodes(
         &mut self,
         head_commit_id: &CommitId,
-    ) -> Result<Vec<ReachableCommitGraphCommit>, LixError>;
+    ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError>;
 
     async fn change_history_from_commit(
         &mut self,
         start_commit_id: &CommitId,
         request: &CommitGraphChangeHistoryRequest,
-    ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError>;
+    ) -> Result<CommitGraphHistory, LixError>;
 }

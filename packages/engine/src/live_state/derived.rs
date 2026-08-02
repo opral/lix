@@ -10,9 +10,7 @@ use tracing::Instrument;
 
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::{ChangeId, CommitId};
-use crate::commit_graph::{
-    CommitGraphCommit, CommitGraphCommitRecord, CommitGraphContext, CommitGraphEdge, commit_edges,
-};
+use crate::commit_graph::{CommitGraphContext, CommitGraphEdge, CommitGraphNode, commit_edges};
 use crate::entity_pk::{EntityPk, EntityPkComponent};
 use crate::live_state::{LiveStateRowFilter, LiveStateScanRequest, MaterializedLiveStateRow};
 use crate::storage_adapter::StorageAdapterRead;
@@ -77,7 +75,7 @@ where
 {
     store: &'a S,
     commit_graph: &'a CommitGraphContext,
-    all_commits: Option<Vec<CommitGraphCommit>>,
+    all_nodes: Option<Vec<CommitGraphNode>>,
 }
 
 impl<'a, S> DerivedReadContext<'a, S>
@@ -88,16 +86,16 @@ where
         Self {
             store,
             commit_graph,
-            all_commits: None,
+            all_nodes: None,
         }
     }
 
-    async fn all_commits(&mut self) -> Result<&[CommitGraphCommit], LixError> {
-        if self.all_commits.is_none() {
-            self.all_commits = Some(self.commit_graph.reader(self.store).all_commits().await?);
+    async fn all_nodes(&mut self) -> Result<&[CommitGraphNode], LixError> {
+        if self.all_nodes.is_none() {
+            self.all_nodes = Some(self.commit_graph.reader(self.store).all_nodes().await?);
         }
         Ok(self
-            .all_commits
+            .all_nodes
             .as_deref()
             .expect("derived commit scan cache was initialized"))
     }
@@ -152,14 +150,14 @@ where
         reads: &mut DerivedReadContext<'_, S>,
         scope: &DerivedScanScope<'_>,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        let commits = reads.all_commits().await?;
+        let commits = reads.all_nodes().await?;
         let mut rows = Vec::with_capacity(commits.len() * scope.branch_ids.len());
         for branch_id in scope.branch_ids {
             for commit in commits {
                 rows.push(commit_row(
                     commit.commit_id,
-                    commit.change.id,
-                    commit.change.created_at,
+                    commit.change_id,
+                    commit.created_at,
                     branch_id,
                 )?);
             }
@@ -191,7 +189,7 @@ where
         let records = reads
             .commit_graph
             .reader(reads.store)
-            .load_commit_records(&commit_ids)
+            .load_nodes(&commit_ids)
             .await?;
         let mut rows = Vec::with_capacity(records.len() * scope.branch_ids.len());
         for branch_id in scope.branch_ids {
@@ -228,8 +226,65 @@ where
         reads: &mut DerivedReadContext<'_, S>,
         scope: &DerivedScanScope<'_>,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        let commits = reads.all_commits().await?;
+        let commits = reads.all_nodes().await?;
         let edges = commit_edges(commits);
+        let mut rows = Vec::with_capacity(edges.len() * scope.branch_ids.len());
+        for branch_id in scope.branch_ids {
+            for edge in &edges {
+                rows.push(commit_edge_row(edge, branch_id)?);
+            }
+        }
+        Ok(rows)
+    }
+}
+
+#[async_trait]
+impl<S> DerivedEntityPointProvider<S> for CommitEdgeProvider
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    async fn load_entity_points(
+        &self,
+        reads: &mut DerivedReadContext<'_, S>,
+        entity_pks: &[EntityPk],
+        scope: &DerivedScanScope<'_>,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let edge_ids = entity_pks
+            .iter()
+            .filter_map(commit_edge_id_from_entity_pk)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let child_ids = edge_ids
+            .iter()
+            .map(|(child_commit_id, _)| *child_commit_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let nodes = reads
+            .commit_graph
+            .reader(reads.store)
+            .load_nodes(&child_ids)
+            .await?;
+        let nodes_by_id = child_ids
+            .into_iter()
+            .zip(nodes)
+            .filter_map(|(commit_id, node)| node.map(|node| (commit_id, node)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut edges = Vec::with_capacity(edge_ids.len());
+        for (child_commit_id, parent_order) in edge_ids {
+            let Some(node) = nodes_by_id.get(&child_commit_id) else {
+                continue;
+            };
+            let Some(parent_commit_id) = node.parent_commit_ids.get(parent_order as usize) else {
+                continue;
+            };
+            edges.push(CommitGraphEdge {
+                parent_commit_id: *parent_commit_id,
+                child_commit_id,
+                parent_order,
+            });
+        }
         let mut rows = Vec::with_capacity(edges.len() * scope.branch_ids.len());
         for branch_id in scope.branch_ids {
             for edge in &edges {
@@ -366,7 +421,7 @@ where
             append_point_provider_rows(&CommitProvider, reads, request, scope, rows).await
         }
         RegisteredDerivedProvider::CommitEdge => {
-            append_full_scan_provider_rows(&CommitEdgeProvider, reads, request, scope, rows).await
+            append_point_provider_rows(&CommitEdgeProvider, reads, request, scope, rows).await
         }
         RegisteredDerivedProvider::BranchRef => {
             append_point_provider_rows(&BranchRefProvider, reads, request, scope, rows).await
@@ -409,36 +464,6 @@ where
             ))
             .await?
     };
-    if !request.filter.entity_pks.is_empty() {
-        provider_rows.retain(|row| request.filter.entity_pks.contains(&row.entity_pk));
-    }
-    rows.extend(provider_rows);
-    Ok(())
-}
-
-async fn append_full_scan_provider_rows<S, P>(
-    provider: &P,
-    reads: &mut DerivedReadContext<'_, S>,
-    request: &LiveStateScanRequest,
-    scope: &DerivedScanScope<'_>,
-    rows: &mut Vec<MaterializedLiveStateRow>,
-) -> Result<(), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-    P: DerivedLiveStateProvider<S>,
-{
-    let descriptor = provider.descriptor();
-    if !provider_filter_allows(request, scope, descriptor) {
-        return Ok(());
-    }
-    let mut provider_rows = provider
-        .scan_all(reads, scope)
-        .instrument(tracing::debug_span!(
-            target: "lix_perf",
-            "lix.perf.derived.full_scan",
-            schema_key = descriptor.schema_key,
-        ))
-        .await?;
     if !request.filter.entity_pks.is_empty() {
         provider_rows.retain(|row| request.filter.entity_pks.contains(&row.entity_pk));
     }
@@ -507,6 +532,20 @@ fn commit_id_from_entity_pk(entity_pk: &EntityPk) -> Option<CommitId> {
     Some(CommitId::new(uuid::Uuid::from_bytes(*bytes)))
 }
 
+fn commit_edge_id_from_entity_pk(entity_pk: &EntityPk) -> Option<(CommitId, u32)> {
+    let [
+        EntityPkComponent::Uuid(bytes),
+        EntityPkComponent::Integer(parent_order),
+    ] = entity_pk.components.as_slice()
+    else {
+        return None;
+    };
+    Some((
+        CommitId::new(uuid::Uuid::from_bytes(*bytes)),
+        u32::try_from(*parent_order).ok()?,
+    ))
+}
+
 fn uuid_string_from_entity_pk(entity_pk: &EntityPk) -> Option<String> {
     let [EntityPkComponent::Uuid(bytes)] = entity_pk.components.as_slice() else {
         return None;
@@ -516,7 +555,7 @@ fn uuid_string_from_entity_pk(entity_pk: &EntityPk) -> Option<String> {
 
 fn validate_commit_point_identity(
     requested_commit_id: CommitId,
-    record: &CommitGraphCommitRecord,
+    record: &CommitGraphNode,
 ) -> Result<(), LixError> {
     if record.commit_id == requested_commit_id {
         return Ok(());

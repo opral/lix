@@ -195,9 +195,9 @@ where
             })
             .await?;
         for commit in scan.entries {
-            changes.push(LixChangeRow::DerivedCommit(commit_record_canonical_change(
-                &commit,
-            )));
+            changes.push(LixChangeRow::DerivedCommit(
+                crate::commit_graph::canonical_commit_change(&commit.into()),
+            ));
         }
         let Some(next) = scan.next_start_after else {
             break;
@@ -321,7 +321,7 @@ where
             )
         })?;
     Ok(Some(LixChangeRow::DerivedCommit(
-        commit_record_canonical_change(&commit),
+        crate::commit_graph::canonical_commit_change(&commit.into()),
     )))
 }
 
@@ -336,25 +336,6 @@ impl LixChangeRow {
             Self::Direct(change) => change.change_id,
             Self::DerivedCommit(change) => change.id,
         }
-    }
-}
-
-fn commit_record_canonical_change(
-    commit: &crate::changelog::CommitRecord,
-) -> crate::commit_graph::CommitGraphChange {
-    let snapshot_content =
-        crate::changelog::commit_row_snapshot_json(&commit.commit_id.to_string())
-            .expect("lix_commit snapshot serialization should not fail");
-    crate::commit_graph::CommitGraphChange {
-        id: commit.change_id,
-        entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(&commit.commit_id.to_string())
-            .expect("commit IDs are canonical UUIDs"),
-        schema_key: "lix_commit".to_string(),
-        file_id: None,
-        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
-        metadata: crate::json_store::JsonSlot::None,
-        created_at: commit.created_at,
-        origin_key: None,
     }
 }
 
