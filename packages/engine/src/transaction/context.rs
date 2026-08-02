@@ -1532,6 +1532,7 @@ where
         let (mut writes, materialization_preconditions) =
             match commit::commit_prepared_writes_with_parent_heads(
                 &transaction.binary_cas,
+                &transaction.tracked_state,
                 Some(runtime_functions),
                 &commit_parent_heads,
                 &mut read,

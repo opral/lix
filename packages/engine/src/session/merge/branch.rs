@@ -1363,11 +1363,6 @@ fn verify_historical_conflict_row_ref(
     match (row, expected) {
         (None, None) => Ok(()),
         (Some(row), Some(expected)) if row.change_id() == expected.change_id => Ok(()),
-        // Certified fresh-import rows intentionally have no expanded
-        // tracked-root entry. Merge analysis can therefore represent their
-        // common ancestor as absent even though the authoritative certified
-        // segment at the base commit contains the row.
-        (Some(_), None) if side == "base" => Ok(()),
         _ => Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("historical {side} row did not match merge analysis"),
@@ -2103,7 +2098,7 @@ mod tests {
     }
 
     #[test]
-    fn certified_base_row_may_fill_merge_analysis_absence() {
+    fn certified_rows_must_match_merge_analysis_roots() {
         let batch = crate::tracked_state::MaterializedTrackedStateBatch::from_rows(vec![
             MaterializedTrackedStateRow {
                 entity_pk: EntityPk::single("certified-row"),
@@ -2120,12 +2115,12 @@ mod tests {
         ])
         .expect("certified base fixture should materialize");
 
-        verify_historical_conflict_row_ref(Some(batch.row(0)), None, "base")
-            .expect("certified base may be absent from expanded tracked roots");
-        assert!(
-            verify_historical_conflict_row_ref(Some(batch.row(0)), None, "target").is_err(),
-            "target/source variants must still match merge analysis"
-        );
+        for side in ["base", "target", "source"] {
+            assert!(
+                verify_historical_conflict_row_ref(Some(batch.row(0)), None, side).is_err(),
+                "{side} certified rows must have matching tracked-root entries"
+            );
+        }
     }
 
     fn derived_file_ref_conflict(file_id: &str) -> TrackedStateMergeConflict {

@@ -13,7 +13,6 @@ use crate::changelog::{
 };
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
-use crate::live_state::MaterializedLiveStateRow;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};
@@ -308,105 +307,6 @@ impl MaterializedTrackedStateExactBatch {
             .map(|ordinal| self.batch.row(ordinal as usize))
     }
 
-    pub(crate) fn has_missing(&self) -> bool {
-        self.slots.iter().any(Option::is_none)
-    }
-
-    /// Fills missing historical exact-read slots from immutable certified
-    /// segment rows without changing the tracked-tree result for any present
-    /// identity.
-    pub(crate) fn fill_missing_from_certified(
-        &self,
-        keys: &[TrackedStateKeyRef<'_>],
-        certified_rows: Vec<MaterializedLiveStateRow>,
-    ) -> Result<Self, LixError> {
-        if keys.len() != self.slots.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "certified historical fallback lost exact-read alignment",
-            ));
-        }
-        let certified = certified_rows
-            .into_iter()
-            .filter_map(|row| {
-                Some((
-                    TrackedStateKey {
-                        schema_key: row.schema_key.clone(),
-                        file_id: row.file_id.clone(),
-                        entity_pk: row.entity_pk.clone(),
-                    },
-                    (
-                        TrackedStateIndexValue {
-                            change_id: row.change_id?,
-                            commit_id: row.commit_id?,
-                            deleted: row.deleted,
-                            created_at: row.created_at,
-                            updated_at: row.updated_at,
-                        },
-                        row.snapshot_content,
-                        row.metadata,
-                    ),
-                ))
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        let mut builder = MaterializedTrackedStateBatchBuilder::with_capacity(keys.len());
-        let mut slots = Vec::with_capacity(keys.len());
-        let mut ordinal_by_key = BTreeMap::<TrackedStateKey, u32>::new();
-        for (index, key) in keys.iter().copied().enumerate() {
-            let lookup = TrackedStateKey {
-                schema_key: key.schema_key.to_owned(),
-                file_id: key.file_id.map(str::to_owned),
-                entity_pk: key.entity_pk.clone(),
-            };
-            if let Some(ordinal) = ordinal_by_key.get(&lookup).copied() {
-                slots.push(Some(ordinal));
-                continue;
-            }
-            if let Some(row) = self.row(index) {
-                let ordinal = u32::try_from(builder.rows.len()).map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "historical exact-read fallback exceeds u32 rows",
-                    )
-                })?;
-                builder.push_ref(
-                    TrackedStateKeyRef {
-                        schema_key: row.schema_key(),
-                        file_id: row.file_id(),
-                        entity_pk: row.entity_pk(),
-                    },
-                    TrackedStateIndexValue {
-                        change_id: row.change_id(),
-                        commit_id: row.commit_id(),
-                        deleted: row.deleted(),
-                        created_at: row.created_at(),
-                        updated_at: row.updated_at(),
-                    },
-                    row.snapshot_content().cloned(),
-                    row.metadata().cloned(),
-                );
-                ordinal_by_key.insert(lookup, ordinal);
-                slots.push(Some(ordinal));
-                continue;
-            }
-            let Some((value, snapshot, metadata)) = certified.get(&lookup) else {
-                slots.push(None);
-                continue;
-            };
-            let ordinal = u32::try_from(builder.rows.len()).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "certified historical fallback exceeds u32 rows",
-                )
-            })?;
-            builder.push_ref(key, value.clone(), snapshot.clone(), metadata.clone());
-            ordinal_by_key.insert(lookup, ordinal);
-            slots.push(Some(ordinal));
-        }
-        Self::new(builder.finish(), slots)
-    }
-
     pub(crate) fn into_rows(self) -> Vec<Option<MaterializedTrackedStateRow>> {
         let Self { batch, slots } = self;
         slots
@@ -634,6 +534,7 @@ struct MaterializedTrackedStateBatchBuilder {
 }
 
 impl MaterializedTrackedStateBatchBuilder {
+    #[cfg(test)]
     fn with_capacity(row_count: usize) -> Self {
         Self::with_capacities(row_count, row_count.saturating_mul(2), 0)
     }

@@ -106,10 +106,12 @@ pub(crate) async fn commit_prepared_writes(
     read: &mut impl StorageAdapterRead,
     prepared_writes: PreparedWriteSet,
 ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
+    let tracked_state = TrackedStateContext::new();
     let commit_parent_heads =
         resolve_prepared_commit_parent_heads(branch_ctx, &*read, &prepared_writes, false).await?;
     commit_prepared_writes_with_parent_heads(
         binary_cas,
+        &tracked_state,
         runtime_functions,
         &commit_parent_heads,
         read,
@@ -122,6 +124,7 @@ pub(crate) async fn commit_prepared_writes(
 /// caller's coherent commit snapshot.
 pub(crate) async fn commit_prepared_writes_with_parent_heads(
     binary_cas: &BinaryCasContext,
+    tracked_state: &TrackedStateContext,
     runtime_functions: Option<&FunctionContext>,
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     read: &mut impl StorageAdapterRead,
@@ -318,6 +321,114 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     .await?;
     let commit_rows = finalized.commit_rows;
     let tracked_roots = finalized.tracked_roots;
+    let mut certified_packet_root_rows = BTreeMap::<CommitId, Vec<MaterializedLiveStateRow>>::new();
+    let mut certified_replacement_markers = BTreeMap::<CommitId, BTreeSet<TrackedStateKey>>::new();
+    for file in prepared_writes
+        .file_data_writes
+        .iter()
+        .filter(|file| !file.certified_entity_batches().is_empty())
+    {
+        let root = tracked_roots
+            .iter()
+            .find(|root| root.publish_head && root.branch_id == file.branch_id)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified entity batch has no matching published commit",
+                )
+            })?;
+        let timestamp = commit_rows
+            .iter()
+            .find(|commit| commit.commit_id == root.commit_id)
+            .map(|commit| commit.created_at)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "certified entity batch commit has no timestamp",
+                )
+            })?;
+        let mut expanded_rows = Vec::new();
+        let mut replacement_schemas = BTreeSet::new();
+        for batch in file
+            .certified_entity_batches()
+            .iter()
+            .filter(|batch| certified_batch_requires_root_expansion(batch))
+        {
+            if batch.complete_file_state {
+                replacement_schemas.extend(batch.schema_keys.iter().cloned());
+            }
+            expanded_rows.extend(
+                crate::live_state::materialize_certified_root_rows(
+                    &file.branch_id,
+                    &file.file_id,
+                    root.commit_id,
+                    timestamp,
+                    batch,
+                )?
+                .into_rows(),
+            );
+        }
+        for schema_key in replacement_schemas {
+            let marker = certified_collection_replacement_marker(
+                &file.branch_id,
+                &file.file_id,
+                &schema_key,
+                root.commit_id,
+                timestamp,
+            )?;
+            certified_replacement_markers
+                .entry(root.commit_id)
+                .or_default()
+                .insert(TrackedStateKey {
+                    schema_key: marker.schema_key.clone(),
+                    file_id: marker.file_id.clone(),
+                    entity_pk: marker.entity_pk.clone(),
+                });
+            expanded_rows.push(marker);
+        }
+        if !expanded_rows.is_empty() {
+            certified_packet_root_rows
+                .entry(root.commit_id)
+                .or_default()
+                .append(&mut expanded_rows);
+        }
+    }
+    for (commit_id, rows) in &mut certified_packet_root_rows {
+        let ordinary_identities = state_rows
+            .iter()
+            .filter(|row| row.commit_id == Some(*commit_id))
+            .map(|row| {
+                (
+                    row.schema_key.to_string(),
+                    row.file_id.map(ToString::to_string),
+                    row.entity_pk.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        rows.retain(|row| {
+            !ordinary_identities.contains(&(
+                row.schema_key.clone(),
+                row.file_id.clone(),
+                row.entity_pk.clone(),
+            ))
+        });
+        rows.sort_unstable_by(|left, right| {
+            (&left.schema_key, &left.file_id, &left.entity_pk).cmp(&(
+                &right.schema_key,
+                &right.file_id,
+                &right.entity_pk,
+            ))
+        });
+        if rows.windows(2).any(|pair| {
+            (&pair[0].schema_key, &pair[0].file_id, &pair[0].entity_pk)
+                == (&pair[1].schema_key, &pair[1].file_id, &pair[1].entity_pk)
+        }) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified entity batches contain duplicate root identities",
+            ));
+        }
+    }
     let checkpoint_epochs = checkpoint_epoch_bindings(&prepared_writes.checkpoint_publications)?;
     // The current-state protocol removes the automatic mutable branch-ref
     // row for a normal branch-head advance, but `lix_change` remains an
@@ -328,14 +439,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .filter(|root| root.publish_head)
         .map(branch_ref_change_record)
         .collect::<Result<Vec<_>, _>>()?;
-    // Checkpoints are logical compaction boundaries, not full immutable-tree
-    // snapshots. Their absolute commit-delta segments plus the previous
-    // checkpoint parent already form the persistent history representation;
-    // forcing a second full-state root made N checkpoints rewrite
-    // 1 + 2 + ... + N rows. Rootless history readers reconstruct from the
-    // nearest available ancestor root when a historical scan actually needs
-    // one, while eager HOT state remains complete at publication time.
-    let force_root_fence = false;
+    // Every commit publishes an immutable, structurally shared tracked-state
+    // root. Historical diff, merge, and point reads can therefore traverse
+    // endpoint trees instead of replaying the first-parent changelog.
     // The current-state protocol publishes automatic tracked heads through
     // one direct control record.
     // Do not also synthesize a mutable `lix_branch_ref` current row for every
@@ -379,6 +485,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &commit_rows,
         &selected_change_records,
         &host_certified_file_schemas,
+        &certified_packet_root_rows,
     )
     .await?;
 
@@ -391,7 +498,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &[],
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
-        force_root_fence,
+        &certified_packet_root_rows,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -420,6 +527,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     .await?;
 
     stage_tracked_roots(
+        tracked_state,
         read,
         &mut writes,
         &state_rows,
@@ -427,7 +535,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &tracked_roots,
         &staged_commits,
         &insert_selection,
-        force_root_fence,
+        &certified_packet_root_rows,
+        &certified_replacement_markers,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -533,6 +642,63 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         stage_path_index_revision(&mut writes);
     }
     Ok((writes, preconditions))
+}
+
+fn certified_batch_requires_root_expansion(batch: &crate::wasm::WasmCertifiedEntityBatch) -> bool {
+    !matches!(
+        batch.format,
+        crate::wasm::HOST_CERTIFIED_PACKET_FORMAT | crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+    )
+}
+
+fn certified_collection_replacement_marker(
+    branch_id: &str,
+    file_id: &str,
+    schema_key: &str,
+    commit_id: CommitId,
+    timestamp: LixTimestamp,
+) -> Result<MaterializedLiveStateRow, LixError> {
+    use crate::collection_generation::{
+        COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_key,
+    };
+
+    let scope_key = collection_scope_key(CollectionScopeRef {
+        schema_key,
+        file_id: Some(file_id),
+    });
+    let snapshot = serde_json::to_string(&serde_json::json!({
+        "scope_key": scope_key,
+        "schema_key": schema_key,
+        "file_id": file_id,
+        "live_count": 0,
+    }))
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to encode certified collection replacement: {error}"),
+        )
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lix.certified.collection-replacement.v1\0");
+    hasher.update(commit_id.as_uuid().as_bytes());
+    hasher.update(scope_key.as_bytes());
+    let mut change_bytes = [0_u8; 16];
+    change_bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Ok(MaterializedLiveStateRow {
+        entity_pk: EntityPk::single(scope_key),
+        schema_key: COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+        file_id: None,
+        snapshot_content: Some(snapshot.into()),
+        metadata: None,
+        deleted: false,
+        created_at: timestamp,
+        updated_at: timestamp,
+        global: false,
+        change_id: Some(ChangeId::new(uuid::Uuid::from_bytes(change_bytes))),
+        commit_id: Some(commit_id),
+        untracked: false,
+        branch_id: Arc::from(branch_id),
+    })
 }
 
 fn retain_untracked_rows_not_superseded_by_engine(
@@ -718,7 +884,7 @@ async fn stage_changelog_commits(
     compact_change_ids: &[ChangeId],
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     commit_rows: &[FinalizedCommitRow],
-    force_root_fence: bool,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
     let changes = state_rows
@@ -762,16 +928,16 @@ async fn stage_changelog_commits(
             format_version: 1,
             commit_id: commit_row.commit_id,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
-            // Every commit carries absolute per-identity deltas against its
-            // first parent. Additional ancestry and selected historical refs
-            // therefore do not require eagerly materializing the full root.
-            tracked_state_rootless: !force_root_fence,
+            tracked_state_rootless: false,
             change_id: commit_row.change_id,
             author_account_ids: Vec::new(),
             created_at: commit_row.created_at,
         });
-        let change_count =
-            state_row_indices.len() + selected_change_count(&commit_row.selected_change_batches);
+        let change_count = state_row_indices.len()
+            + certified_packet_root_rows
+                .get(&commit_row.commit_id)
+                .map_or(0, Vec::len)
+            + selected_change_count(&commit_row.selected_change_batches);
         staged.insert(
             commit_row.commit_id,
             StagedChangelogCommit {
@@ -994,6 +1160,54 @@ fn tracked_commit_delta_from_state_row(
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
         authored: true,
         certified: false,
+    })
+}
+
+fn tracked_delta_from_certified_root_row(
+    row: &MaterializedLiveStateRow,
+) -> Result<TrackedStateDeltaRef<'_>, LixError> {
+    Ok(TrackedStateDeltaRef {
+        schema_key: &row.schema_key,
+        file_id: row.file_id.as_deref(),
+        entity_pk: &row.entity_pk,
+        change_id: row.change_id.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified root row is missing change_id",
+            )
+        })?,
+        commit_id: row.commit_id.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified root row is missing commit_id",
+            )
+        })?,
+        deleted: row.deleted,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+fn tracked_commit_delta_from_certified_root_row(
+    row: &MaterializedLiveStateRow,
+) -> Result<TrackedStateCommitDeltaRef<'_>, LixError> {
+    Ok(TrackedStateCommitDeltaRef {
+        delta: tracked_delta_from_certified_root_row(row)?,
+        snapshot: row
+            .snapshot_content
+            .as_ref()
+            .map_or(crate::json_store::JsonSlotRef::None, |snapshot| {
+                crate::json_store::JsonSlotRef::Inline(snapshot.as_str())
+            }),
+        metadata: row
+            .metadata
+            .as_ref()
+            .map_or(crate::json_store::JsonSlotRef::None, |metadata| {
+                crate::json_store::JsonSlotRef::Inline(metadata.as_str())
+            }),
+        origin_key: None,
+        authored: true,
+        certified: row.snapshot_content.is_none() && row.metadata.is_none(),
     })
 }
 
@@ -1279,6 +1493,7 @@ async fn stage_tracked_commit_delta_index(
     commit_rows: &[FinalizedCommitRow],
     selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
     host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
 ) -> Result<BTreeSet<CommitId>, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let commit_rows = commit_rows
@@ -1287,6 +1502,10 @@ async fn stage_tracked_commit_delta_index(
         .collect::<BTreeMap<_, _>>();
     for root in tracked_roots {
         let state_row_indices = tracked_row_indices_by_commit
+            .get(&root.commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let certified_root_rows = certified_packet_root_rows
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
@@ -1299,7 +1518,8 @@ async fn stage_tracked_commit_delta_index(
                 ),
             )
         })?;
-        let can_stream_ordered_addressable = !state_row_indices.is_empty()
+        let can_stream_ordered_addressable = certified_root_rows.is_empty()
+            && !state_row_indices.is_empty()
             && staged.selected_change_batches.is_empty()
             && state_row_indices
                 .iter()
@@ -1351,7 +1571,9 @@ async fn stage_tracked_commit_delta_index(
             }
         }
         let mut deltas = Vec::with_capacity(
-            state_row_indices.len() + selected_change_count(&staged.selected_change_batches),
+            state_row_indices.len()
+                + certified_root_rows.len()
+                + selected_change_count(&staged.selected_change_batches),
         );
         let mut addressable = Vec::with_capacity(deltas.capacity());
         let mut selected_members_by_source = BTreeMap::<CommitId, usize>::new();
@@ -1367,6 +1589,12 @@ async fn stage_tracked_commit_delta_index(
                     host_certified_file_schemas,
                 );
             deltas.push(delta);
+        }
+        for row in certified_root_rows {
+            deltas.push(tracked_commit_delta_from_certified_root_row(row)?);
+            // Certified rows are addressed by commit plus identity. They do
+            // not need standalone change locators in the public ledger.
+            addressable.push(false);
         }
         for change_ref in selected_changes(&staged.selected_change_batches) {
             *selected_members_by_source
@@ -1398,7 +1626,9 @@ async fn stage_tracked_commit_delta_index(
         let is_checkpoint_commit = state_row_indices.iter().any(|&row_index| {
             state_rows.row(row_index).schema_key.as_str() == CHECKPOINT_MARKER_SCHEMA_KEY
         });
-        let selected_source_alias = if is_checkpoint_commit && selected_members_by_source.len() == 1
+        let selected_source_alias = if certified_root_rows.is_empty()
+            && is_checkpoint_commit
+            && selected_members_by_source.len() == 1
         {
             let source_commit_id = *selected_members_by_source
                 .first_key_value()
@@ -3678,6 +3908,7 @@ async fn observe_branch_head_controls(
 }
 
 async fn stage_tracked_roots(
+    tracked_state: &TrackedStateContext,
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &PreparedStateBatch,
@@ -3685,30 +3916,18 @@ async fn stage_tracked_roots(
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     insert_selection: &PreparedInsertSelection,
-    force_root_fence: bool,
+    certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    certified_replacement_markers_by_commit: &BTreeMap<CommitId, BTreeSet<TrackedStateKey>>,
 ) -> Result<(), LixError> {
-    let root_fence_ids = tracked_root_fence_ids(tracked_roots, force_root_fence);
+    let root_fence_ids = tracked_root_fence_ids(tracked_roots);
     if root_fence_ids.is_empty() {
         return Ok(());
     }
-    let tracked_state = TrackedStateContext::new();
     let mut tracked_writer = tracked_state.writer(read, writes);
+    let empty_certified_replacement_markers = BTreeSet::new();
     for root in tracked_roots_parent_first(tracked_roots)? {
         if !root_fence_ids.contains(&root.commit_id) {
             continue;
-        }
-        if let Some(parent_commit_id) = root.parent_commit_id
-            && !root_fence_ids.contains(&parent_commit_id)
-        {
-            // Ordinary commits deliberately omit immutable roots. A
-            // merge/checkpoint fence still needs a canonical first-parent
-            // root, so reconstruct the cold chain in this same root writer
-            // before staging the fence. Keeping one overlay makes the newly
-            // staged ancestors visible to the fence without a second storage
-            // transaction.
-            tracked_writer
-                .stage_missing_commit_root_chain(&parent_commit_id.to_string())
-                .await?;
         }
         let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
             LixError::new(
@@ -3723,6 +3942,13 @@ async fn stage_tracked_roots(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        let certified_root_rows = certified_packet_root_rows
+            .get(&root.commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let certified_replacement_markers = certified_replacement_markers_by_commit
+            .get(&root.commit_id)
+            .unwrap_or(&empty_certified_replacement_markers);
         if state_row_indices.len() > staged.change_count {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -3738,7 +3964,9 @@ async fn stage_tracked_roots(
         // When they cover a substantial fraction of a parent root, stream the
         // parent/changes directly into canonical chunks instead of point
         // reading every key and materializing two more full-workload vectors.
-        if !state_row_indices.is_empty()
+        if certified_root_rows.is_empty()
+            && certified_replacement_markers.is_empty()
+            && !state_row_indices.is_empty()
             && staged.selected_change_batches.is_empty()
             && tracked_state_rows_are_strictly_sorted(state_rows, state_row_indices)
         {
@@ -3797,6 +4025,11 @@ async fn stage_tracked_roots(
             .iter()
             .map(|&row_index| tracked_delta_from_state_row(state_rows.row(row_index)))
             .chain(
+                certified_root_rows
+                    .iter()
+                    .map(tracked_delta_from_certified_root_row),
+            )
+            .chain(
                 selected_changes(&staged.selected_change_batches).map(|change_ref| {
                     tracked_delta_from_selected_change_ref(change_ref, root.commit_id)
                 }),
@@ -3834,25 +4067,16 @@ async fn stage_tracked_roots(
                 parent_commit_id_text.as_deref(),
                 deltas,
                 &absence_guards,
+                certified_replacement_markers,
             )
             .await?;
     }
     Ok(())
 }
 
-/// Immutable roots are an optional cold-path history accelerator. A caller
-/// that explicitly requests a fence also stages any missing first-parent
-/// ancestors in the same atomic write set. Normal serial and checkpoint
-/// commits use compact absolute deltas plus the durable current-state
-/// projection.
-fn tracked_root_fence_ids(
-    tracked_roots: &[PendingTrackedRoot],
-    force_all: bool,
-) -> BTreeSet<CommitId> {
-    if force_all {
-        return tracked_roots.iter().map(|root| root.commit_id).collect();
-    }
-    BTreeSet::new()
+/// Every current-protocol commit is a root fence.
+fn tracked_root_fence_ids(tracked_roots: &[PendingTrackedRoot]) -> BTreeSet<CommitId> {
+    tracked_roots.iter().map(|root| root.commit_id).collect()
 }
 
 fn tracked_state_rows_are_strictly_sorted(
@@ -4351,6 +4575,27 @@ mod tests {
     }
 
     #[test]
+    fn host_dense_packets_reuse_ordinary_root_members() {
+        let batch = |format| crate::wasm::WasmCertifiedEntityBatch {
+            format,
+            schema_keys: vec!["test_schema".to_owned()],
+            row_count: 1,
+            creates: crate::wasm::WasmCreateContext { high: 0, low: 0 },
+            create_ranges: Vec::new(),
+            complete_file_state: true,
+            pages: Vec::new(),
+        };
+        assert!(!certified_batch_requires_root_expansion(&batch(
+            crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+        )));
+        assert!(!certified_batch_requires_root_expansion(&batch(
+            crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+        )));
+        assert!(certified_batch_requires_root_expansion(&batch(1)));
+        assert!(certified_batch_requires_root_expansion(&batch(2)));
+    }
+
+    #[test]
     fn lifecycle_file_delete_cascade_survives_descriptor_recreation() {
         let semantic_key = TrackedStateKey {
             schema_key: "semantic".to_string(),
@@ -4657,7 +4902,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_tracked_commit_appends_changelog_without_materializing_root() {
+    async fn ordered_commit_delta_keeps_non_overlapping_certified_packet_rows() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_4321_0000_0000,
+        ));
+        let timestamp = ts("2026-01-01T00:00:00Z");
+        let mut state_rows = PreparedStateBatch::new();
+        state_rows.push_parts_with_change_addressability(
+            SchemaPlanId::for_test(0),
+            PreparedRowFacts::default(),
+            EntityPk::single("ordinary"),
+            "ordinary_schema".into(),
+            None,
+            Some(
+                crate::transaction::types::stage_json_from_value(
+                    crate::transaction::types::TransactionJson::from_value_for_test(
+                        serde_json::json!({ "value": 1 }),
+                    ),
+                    "mixed certified ordinary snapshot",
+                )
+                .expect("ordinary snapshot should stage"),
+            ),
+            None,
+            None,
+            None,
+            timestamp,
+            timestamp,
+            true,
+            Some(ChangeId::default()),
+            true,
+            Some(commit_id),
+            false,
+            GLOBAL_BRANCH_ID.into(),
+        );
+        let certified_change_id = change_id("mixed-certified-change");
+        let certified_rows = BTreeMap::from([(
+            commit_id,
+            vec![MaterializedLiveStateRow {
+                entity_pk: EntityPk::single("certified"),
+                schema_key: "certified_schema".to_owned(),
+                file_id: Some("certified.csv".to_owned()),
+                snapshot_content: None,
+                metadata: None,
+                deleted: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+                global: true,
+                change_id: Some(certified_change_id),
+                commit_id: Some(commit_id),
+                untracked: false,
+                branch_id: Arc::from(GLOBAL_BRANCH_ID),
+            }],
+        )]);
+        let roots = [PendingTrackedRoot {
+            branch_id: GLOBAL_BRANCH_ID.to_owned(),
+            commit_id,
+            parent_commit_id: None,
+            ref_change_id: change_id("mixed-certified-ref"),
+            ref_updated_at: timestamp,
+            publish_head: true,
+        }];
+        let commits = [FinalizedCommitRow {
+            commit_id,
+            parent_commit_ids: Vec::new(),
+            created_at: timestamp,
+            change_id: change_id("mixed-certified-commit"),
+            selected_change_batches: Vec::new(),
+        }];
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("mixed certified read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_tracked_commit_delta_index(
+            &read,
+            &mut writes,
+            &mut state_rows,
+            &BTreeMap::from([(commit_id, vec![0])]),
+            &roots,
+            &commits,
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &certified_rows,
+        )
+        .await
+        .expect("mixed certified delta should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("mixed certified delta should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("mixed certified verification read should open");
+        let records = crate::tracked_state::scan_commit_delta_members(&read, commit_id)
+            .await
+            .expect("mixed certified records should load");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0.schema_key, "certified_schema");
+        assert_eq!(
+            records[0].1.change_id, certified_change_id,
+            "certified packet identity must be present in the commit delta"
+        );
+        assert_eq!(records[1].0.schema_key, "ordinary_schema");
+    }
+
+    #[tokio::test]
+    async fn ordinary_tracked_commit_appends_changelog_and_root() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -4689,12 +5041,12 @@ mod tests {
         .await
         .expect("commit should flush staged rows");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE),
-            "an ordinary tracked commit must not write immutable tree chunks"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE),
+            "an ordinary tracked commit must write immutable tree chunks"
         );
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "an ordinary tracked commit must not write commit-root metadata"
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "an ordinary tracked commit must write commit-root metadata"
         );
         assert!(
             writes.has_mutations_in_space(HOT_ROW_SPACE),
@@ -4725,6 +5077,7 @@ mod tests {
             panic!("changelog commit should exist");
         };
         assert_eq!(record.change_id, change_id("test-uuid-2"));
+        assert!(!record.tracked_state_rootless);
         let membership_read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -4779,7 +5132,7 @@ mod tests {
                 },
             )
             .await
-            .expect("rootless commit history should replay")
+            .expect("rooted commit history should scan")
             .into_rows();
         assert!(
             commit_rows.is_empty(),
@@ -5357,7 +5710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rootless_serial_history_replays_scan_and_diff() {
+    async fn serial_history_publishes_roots_and_diffs() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -5395,11 +5748,11 @@ mod tests {
             },
         )
         .await
-        .expect("first rootless commit should stage");
+        .expect("first rooted commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "first ordinary commit must remain rootless"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "first ordinary commit must publish its immutable root"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5448,11 +5801,11 @@ mod tests {
             },
         )
         .await
-        .expect("second rootless commit should stage");
+        .expect("second rooted commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "serial ordinary commit must remain rootless"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "serial ordinary commit must publish its immutable root"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5501,11 +5854,11 @@ mod tests {
             },
         )
         .await
-        .expect("third rootless commit should stage");
+        .expect("third rooted commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "serial ordinary commit must remain rootless"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "serial ordinary commit must publish its immutable root"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5546,11 +5899,11 @@ mod tests {
             },
         )
         .await
-        .expect("rootless delete commit should stage");
+        .expect("rooted delete commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "serial delete commit must remain rootless"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "serial delete commit must publish its immutable root"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5672,7 +6025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_reference_commit_stays_rootless_and_replays_first_parent() {
+    async fn selected_reference_commit_publishes_root() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -5708,10 +6061,10 @@ mod tests {
             },
         )
         .await
-        .expect("normal rootless commit should stage");
+        .expect("normal rooted commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "ordinary parent must not materialize a root"
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "ordinary parent must publish a root"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5755,9 +6108,8 @@ mod tests {
         .await
         .expect("selected-reference commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "absolute selected-reference deltas must keep the commit rootless"
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "selected-reference commits must publish root metadata"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -5776,7 +6128,7 @@ mod tests {
                 &TrackedStateScanRequest::default(),
             )
             .await
-            .expect("rootless selected-reference commit should replay history")
+            .expect("rooted selected-reference commit should scan")
             .into_rows();
         assert!(matches!(
             rows.as_slice(),
@@ -5816,12 +6168,12 @@ mod tests {
         .await
         .expect("normal tracked commit should stage");
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE),
-            "an ordinary tracked commit must not write immutable tree chunks"
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE),
+            "an ordinary tracked commit must write immutable tree chunks"
         );
         assert!(
-            !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "an ordinary tracked commit must not write commit-root metadata"
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "an ordinary tracked commit must write commit-root metadata"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -6487,7 +6839,7 @@ mod tests {
                 (CommitId::for_test_label("child-commit"), vec![1]),
             ]),
             &commits,
-            false,
+            &BTreeMap::new(),
         )
         .await
         .expect("child-before-parent input should still stage parent first");
@@ -7175,6 +7527,11 @@ mod tests {
         crate::test_support::stage_empty_changelog_commit(&mut read, &mut writes, label, None)
             .await
             .expect("empty commit target should stage");
+        TrackedStateContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit_root(label, None, std::iter::empty())
+            .await
+            .expect("empty commit target root should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
