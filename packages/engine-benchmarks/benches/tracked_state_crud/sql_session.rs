@@ -13,6 +13,10 @@ const BOUND_INSERT_ALL_SQL: &str = "INSERT INTO tracked_crud_insert (path, value
 const BOUND_SEED_JSON_SQL: &str =
     "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))";
 const BOUND_UPDATE_ALL_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
+const BOUND_OLAP_UPDATE_LANE_SQL: &str = "UPDATE olap_row SET lane = $1 WHERE id = $2";
+const BOUND_OLAP_UPDATE_SCORE_SQL: &str = "UPDATE olap_row SET score = $1 WHERE id = $2";
+const BOUND_OLAP_UPDATE_ACTIVE_SQL: &str = "UPDATE olap_row SET active = $1 WHERE id = $2";
+const OLAP_ROWS_PER_STATEMENT: usize = 4_096;
 const UNTRACKED_PROBE_PATH: &str = "/__lix_untracked_probe";
 // These deliberately miss the native entity-read recognizer so profile mode
 // can measure the general DataFusion execution path rather than a specialized
@@ -87,6 +91,40 @@ impl OlapReadShape {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OlapMutationProfile {
+    Pristine,
+    Sparse,
+    Moderate,
+}
+
+impl OlapMutationProfile {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Pristine => "pristine",
+            Self::Sparse => "sparse",
+            Self::Moderate => "moderate",
+        }
+    }
+
+    const fn stride(self) -> Option<usize> {
+        match self {
+            Self::Pristine => None,
+            Self::Sparse => Some(1_000),
+            Self::Moderate => Some(10),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OlapRowExpected {
+    id: String,
+    ordinal: i64,
+    lane_index: usize,
+    score: f64,
+    active: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct OlapGroupExpected {
     rows: i64,
@@ -98,6 +136,9 @@ struct OlapGroupExpected {
 
 #[derive(Clone, Debug)]
 struct OlapExpected {
+    initial_row_count: usize,
+    mutation_profile: OlapMutationProfile,
+    visible_rows: usize,
     active_rows: i64,
     active_ordinal_sum: i64,
     active_score_sum: f64,
@@ -238,8 +279,12 @@ pub(crate) async fn seeded_fixture_with_read_many_pk_count(
     } else {
         empty_fixture_with_read_many_pk_count(profile, rows, read_many_by_pk_count).await
     };
-    fixture.seed_rows().await;
-    if selected_olap_read_shape().is_none() {
+    if selected_olap_read_shape().is_some() {
+        fixture
+            .seed_rows_with_olap_mutations(selected_olap_mutation_profile())
+            .await;
+    } else {
+        fixture.seed_rows().await;
         fixture.insert_untracked_probe().await;
     }
     fixture
@@ -251,14 +296,27 @@ pub(crate) async fn seeded_olap_fixture(
     profile: StorageProfile,
     rows: &[WorkloadRow],
 ) -> SqlFixture {
-    let fixture = empty_fixture_with_shape(
+    seeded_olap_fixture_with_mutations(profile, rows, OlapMutationProfile::Pristine).await
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) async fn seeded_olap_fixture_with_mutations(
+    profile: StorageProfile,
+    rows: &[WorkloadRow],
+    mutation_profile: OlapMutationProfile,
+) -> SqlFixture {
+    let mut fixture = empty_fixture_with_shape(
         profile,
         rows,
         READ_MANY_PK_COUNT.min(rows.len()),
         FixtureShape::Olap,
     )
     .await;
-    fixture.seed_rows().await;
+    fixture.install_olap_mutation_profile(mutation_profile);
+    fixture
+        .seed_rows_with_olap_mutations(mutation_profile)
+        .await;
     fixture
 }
 
@@ -284,6 +342,15 @@ pub(crate) async fn seeded_bound_update_fixture_with_read_many_pk_count(
 }
 
 impl SqlFixture {
+    fn install_olap_mutation_profile(&mut self, mutation_profile: OlapMutationProfile) {
+        match self {
+            Self::SQLite(fixture) => fixture.install_olap_mutation_profile(mutation_profile),
+            Self::RocksDB(fixture) => fixture.install_olap_mutation_profile(mutation_profile),
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.install_olap_mutation_profile(mutation_profile),
+        }
+    }
+
     fn release_bound_update_setup(&mut self) {
         match self {
             Self::SQLite(fixture) => fixture.release_bound_update_setup(),
@@ -329,6 +396,22 @@ impl SqlFixture {
         }
     }
 
+    async fn seed_rows_with_olap_mutations(&self, mutation_profile: OlapMutationProfile) {
+        self.seed_rows().await;
+        if !matches!(mutation_profile, OlapMutationProfile::Pristine) {
+            self.apply_olap_mutations(mutation_profile).await;
+        }
+    }
+
+    async fn apply_olap_mutations(&self, mutation_profile: OlapMutationProfile) {
+        match self {
+            Self::SQLite(fixture) => fixture.apply_olap_mutations(mutation_profile).await,
+            Self::RocksDB(fixture) => fixture.apply_olap_mutations(mutation_profile).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.apply_olap_mutations(mutation_profile).await,
+        }
+    }
+
     async fn insert_untracked_probe(&self) {
         match self {
             Self::SQLite(fixture) => fixture.insert_untracked_probe().await,
@@ -343,7 +426,7 @@ impl SqlFixture {
         if let Ok(label) = shape.as_deref()
             && let Some(shape) = OlapReadShape::from_label(label)
         {
-            return self.read_olap(shape).await;
+            return self.read_olap_timed(shape).await;
         }
         match shape.as_deref() {
             Ok("aggregate_count") => return self.count_all().await,
@@ -398,6 +481,21 @@ impl SqlFixture {
             Self::RocksDB(fixture) => fixture.read_olap(shape).await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.read_olap(shape).await,
+        }
+    }
+
+    async fn read_olap_timed(&self, shape: OlapReadShape) -> usize {
+        match self {
+            Self::SQLite(fixture) => fixture.read_olap_timed(shape).await,
+            Self::RocksDB(fixture) => fixture.read_olap_timed(shape).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.read_olap_timed(shape).await,
+        }
+    }
+
+    pub(crate) async fn validate_selected_olap(&self) {
+        if let Some(shape) = selected_olap_read_shape() {
+            self.read_olap(shape).await;
         }
     }
 
@@ -523,6 +621,11 @@ impl<StorageImpl> GenericSqlFixture<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    fn install_olap_mutation_profile(&mut self, mutation_profile: OlapMutationProfile) {
+        assert!(self.olap_expected.is_some(), "typed OLAP fixture required");
+        self.olap_expected = Some(olap_expected(self.row_count, mutation_profile));
+    }
+
     fn release_bound_update_setup(&mut self) {
         self.bound_seed_json_batch = Arc::from([]);
     }
@@ -594,15 +697,14 @@ where
     }
 
     async fn seed_olap_rows(&self) {
-        const ROWS_PER_STATEMENT: usize = 4_096;
         let mut transaction = self
             .session
             .begin_transaction()
             .await
             .expect("begin typed OLAP seed transaction");
         let mut affected = 0_u64;
-        for start in (0..self.row_count).step_by(ROWS_PER_STATEMENT) {
-            let end = (start + ROWS_PER_STATEMENT).min(self.row_count);
+        for start in (0..self.row_count).step_by(OLAP_ROWS_PER_STATEMENT) {
+            let end = (start + OLAP_ROWS_PER_STATEMENT).min(self.row_count);
             affected += transaction
                 .execute(&olap_insert_sql(start..end), &[])
                 .await
@@ -616,6 +718,121 @@ where
         assert_eq!(
             usize::try_from(affected).expect("OLAP affected rows fit usize"),
             self.row_count
+        );
+    }
+
+    async fn apply_olap_mutations(&self, mutation_profile: OlapMutationProfile) {
+        let stride = mutation_profile
+            .stride()
+            .expect("pristine OLAP fixtures do not apply mutations");
+        let updated_rows = (1..self.row_count)
+            .step_by(stride)
+            .map(|ordinal| {
+                olap_expected_row(self.row_count, mutation_profile, ordinal)
+                    .expect("updated OLAP row remains visible")
+            })
+            .collect::<Vec<_>>();
+        let update_lane_rows = updated_rows
+            .iter()
+            .map(|row| {
+                Arc::from(vec![
+                    Value::Text(olap_lane(row.lane_index)),
+                    Value::Text(row.id.clone()),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let update_score_rows = updated_rows
+            .iter()
+            .map(|row| Arc::from(vec![Value::Real(row.score), Value::Text(row.id.clone())]))
+            .collect::<Vec<_>>();
+        let update_active_rows = updated_rows
+            .iter()
+            .map(|row| {
+                Arc::from(vec![
+                    Value::Boolean(row.active),
+                    Value::Text(row.id.clone()),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let delete_ordinals = (2..self.row_count).step_by(stride).collect::<Vec<_>>();
+
+        for (sql, parameter_rows, expected_affected) in [
+            (
+                BOUND_OLAP_UPDATE_LANE_SQL,
+                update_lane_rows,
+                mutation_count(self.row_count, 1, stride),
+            ),
+            (
+                BOUND_OLAP_UPDATE_SCORE_SQL,
+                update_score_rows,
+                mutation_count(self.row_count, 1, stride),
+            ),
+            (
+                BOUND_OLAP_UPDATE_ACTIVE_SQL,
+                update_active_rows,
+                mutation_count(self.row_count, 1, stride),
+            ),
+        ] {
+            let affected = self
+                .session
+                .execute_homogeneous_write_batch(Arc::from(sql), parameter_rows.into())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("execute typed OLAP mutation batch '{sql}': {error:?}")
+                })
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .sum::<u64>();
+            assert_eq!(
+                usize::try_from(affected).expect("OLAP mutation count fits usize"),
+                expected_affected
+            );
+        }
+
+        let mut transaction = self
+            .session
+            .begin_transaction()
+            .await
+            .expect("begin typed OLAP delete transaction");
+        let mut deleted = 0_u64;
+        for ordinals in delete_ordinals.chunks(OLAP_ROWS_PER_STATEMENT) {
+            deleted += transaction
+                .execute(&olap_delete_sql(ordinals), &[])
+                .await
+                .expect("execute typed OLAP delete statement")
+                .rows_affected();
+        }
+        transaction
+            .commit()
+            .await
+            .expect("commit typed OLAP delete transaction");
+        assert_eq!(
+            usize::try_from(deleted).expect("OLAP delete count fits usize"),
+            mutation_count(self.row_count, 2, stride)
+        );
+
+        let mut transaction = self
+            .session
+            .begin_transaction()
+            .await
+            .expect("begin typed OLAP replacement insert transaction");
+        let mut inserted = 0_u64;
+        let insert_end = self.row_count + delete_ordinals.len();
+        for start in (self.row_count..insert_end).step_by(OLAP_ROWS_PER_STATEMENT) {
+            let end = (start + OLAP_ROWS_PER_STATEMENT).min(insert_end);
+            inserted += transaction
+                .execute(&olap_insert_sql(start..end), &[])
+                .await
+                .expect("execute typed OLAP replacement insert statement")
+                .rows_affected();
+        }
+        transaction
+            .commit()
+            .await
+            .expect("commit typed OLAP replacement insert transaction");
+        assert_eq!(
+            usize::try_from(inserted).expect("OLAP insert count fits usize"),
+            mutation_count(self.row_count, 2, stride)
         );
     }
 
@@ -662,26 +879,29 @@ where
             .expect("typed OLAP query requires a typed OLAP fixture");
         let result = std::hint::black_box(execute(&self.session, shape.sql()).await);
         match shape {
-            OlapReadShape::Scan => {
-                assert_eq!(
-                    result.columns(),
-                    ["id", "ordinal", "lane", "score", "active"]
-                );
-                assert_eq!(result.len(), self.row_count);
-            }
-            OlapReadShape::Filter => {
-                assert_eq!(result.columns(), ["ordinal", "lane", "score"]);
-                assert_eq!(result.len(), expected.filtered_rows);
-                assert_eq!(integer_at(&result, 0, 0), expected.filtered_first_ordinal);
-                assert_eq!(
-                    integer_at(&result, result.len() - 1, 0),
-                    expected.filtered_last_ordinal
-                );
-            }
+            OlapReadShape::Scan => assert_olap_scan(&result, expected),
+            OlapReadShape::Filter => assert_olap_filter(&result, expected),
             OlapReadShape::Sort => assert_olap_sort(&result, expected),
             OlapReadShape::Group => assert_olap_group(&result, expected),
             OlapReadShape::Aggregate => assert_olap_aggregate(&result, expected),
         }
+        result.len()
+    }
+
+    async fn read_olap_timed(&self, shape: OlapReadShape) -> usize {
+        let expected = self
+            .olap_expected
+            .as_ref()
+            .expect("typed OLAP query requires a typed OLAP fixture");
+        let result = std::hint::black_box(execute(&self.session, shape.sql()).await);
+        let expected_len = match shape {
+            OlapReadShape::Scan => expected.visible_rows,
+            OlapReadShape::Filter => expected.filtered_rows,
+            OlapReadShape::Sort => 10_000.min(expected.active_rows as usize),
+            OlapReadShape::Group => expected.groups.len(),
+            OlapReadShape::Aggregate => 1,
+        };
+        assert_eq!(result.len(), expected_len);
         result.len()
     }
 
@@ -845,7 +1065,10 @@ where
         rows
     };
     let olap_expected = if matches!(shape, FixtureShape::Olap) {
-        Some(olap_expected(tracked_rows.len()))
+        Some(olap_expected(
+            tracked_rows.len(),
+            selected_olap_mutation_profile(),
+        ))
     } else {
         None
     };
@@ -917,7 +1140,7 @@ where
     }
 }
 
-fn olap_expected(row_count: usize) -> OlapExpected {
+fn olap_expected(row_count: usize, mutation_profile: OlapMutationProfile) -> OlapExpected {
     assert!(
         row_count >= 20,
         "typed OLAP fixture needs at least 20 rows to populate both selected lanes"
@@ -938,35 +1161,44 @@ fn olap_expected(row_count: usize) -> OlapExpected {
         score_max: f64::NEG_INFINITY,
     }; 32];
 
-    for index in 0..row_count {
-        let ordinal = i64::try_from(index).expect("OLAP row ordinal must fit in i64");
-        let lane_index = index % groups.len();
-        #[expect(clippy::cast_precision_loss)]
-        let score = (index % 10_000) as f64 / 8.0;
-        let active = index % 3 != 0;
-        if !active {
+    let inserted_rows = mutation_profile
+        .stride()
+        .map_or(0, |stride| mutation_count(row_count, 2, stride));
+    for row in (0..row_count + inserted_rows)
+        .filter_map(|ordinal| olap_expected_row(row_count, mutation_profile, ordinal))
+    {
+        if !row.active {
             continue;
         }
 
         active_rows += 1;
-        active_ordinal_sum += ordinal;
-        active_score_sum += score;
-        active_min_ordinal.get_or_insert(ordinal);
-        active_max_ordinal = Some(ordinal);
-        let group = &mut groups[lane_index];
+        active_ordinal_sum += row.ordinal;
+        active_score_sum += row.score;
+        active_min_ordinal =
+            Some(active_min_ordinal.map_or(row.ordinal, |value: i64| value.min(row.ordinal)));
+        active_max_ordinal =
+            Some(active_max_ordinal.map_or(row.ordinal, |value: i64| value.max(row.ordinal)));
+        let group = &mut groups[row.lane_index];
         group.rows += 1;
-        group.ordinal_sum += ordinal;
-        group.score_sum += score;
-        group.score_min = group.score_min.min(score);
-        group.score_max = group.score_max.max(score);
-        if matches!(lane_index, 7 | 19) {
+        group.ordinal_sum += row.ordinal;
+        group.score_sum += row.score;
+        group.score_min = group.score_min.min(row.score);
+        group.score_max = group.score_max.max(row.score);
+        if matches!(row.lane_index, 7 | 19) {
             filtered_rows += 1;
-            filtered_first_ordinal.get_or_insert(ordinal);
-            filtered_last_ordinal = Some(ordinal);
+            filtered_first_ordinal = Some(
+                filtered_first_ordinal.map_or(row.ordinal, |value: i64| value.min(row.ordinal)),
+            );
+            filtered_last_ordinal = Some(
+                filtered_last_ordinal.map_or(row.ordinal, |value: i64| value.max(row.ordinal)),
+            );
         }
     }
 
     OlapExpected {
+        initial_row_count: row_count,
+        mutation_profile,
+        visible_rows: row_count,
         active_rows,
         active_ordinal_sum,
         active_score_sum,
@@ -981,47 +1213,185 @@ fn olap_expected(row_count: usize) -> OlapExpected {
     }
 }
 
+fn mutation_count(row_count: usize, residue: usize, stride: usize) -> usize {
+    if row_count <= residue {
+        0
+    } else {
+        (row_count - 1 - residue) / stride + 1
+    }
+}
+
+fn olap_id(ordinal: usize) -> String {
+    format!("/~lix-olap/{ordinal:09}")
+}
+
+fn olap_lane(lane_index: usize) -> String {
+    format!("lane-{lane_index:02}")
+}
+
+fn olap_base_row(ordinal: usize) -> OlapRowExpected {
+    #[expect(clippy::cast_precision_loss)]
+    let score = (ordinal % 10_000) as f64 / 8.0;
+    OlapRowExpected {
+        id: olap_id(ordinal),
+        ordinal: i64::try_from(ordinal).expect("OLAP row ordinal must fit in i64"),
+        lane_index: ordinal % 32,
+        score,
+        active: ordinal % 3 != 0,
+    }
+}
+
+fn olap_expected_row(
+    initial_row_count: usize,
+    mutation_profile: OlapMutationProfile,
+    ordinal: usize,
+) -> Option<OlapRowExpected> {
+    let Some(stride) = mutation_profile.stride() else {
+        return (ordinal < initial_row_count).then(|| olap_base_row(ordinal));
+    };
+    let inserted_rows = mutation_count(initial_row_count, 2, stride);
+    if ordinal >= initial_row_count {
+        return (ordinal < initial_row_count + inserted_rows).then(|| olap_base_row(ordinal));
+    }
+    if ordinal % stride == 2 {
+        return None;
+    }
+    let mut row = olap_base_row(ordinal);
+    if ordinal % stride == 1 {
+        row.lane_index = (row.lane_index + 11) % 32;
+        row.score += 2_048.0;
+        row.active = !row.active;
+    }
+    Some(row)
+}
+
+fn olap_delete_sql(ordinals: &[usize]) -> String {
+    assert!(
+        !ordinals.is_empty(),
+        "OLAP delete statement cannot be empty"
+    );
+    let mut sql = String::from("DELETE FROM olap_row WHERE id IN (");
+    for (position, &ordinal) in ordinals.iter().enumerate() {
+        if position != 0 {
+            sql.push(',');
+        }
+        write!(sql, "'{}'", olap_id(ordinal)).expect("write typed OLAP DELETE SQL");
+    }
+    sql.push(')');
+    sql
+}
+
 fn olap_insert_sql(ordinals: Range<usize>) -> String {
     let mut sql = String::from("INSERT INTO olap_row (id, ordinal, lane, score, active) VALUES ");
     for (position, ordinal) in ordinals.enumerate() {
         if position != 0 {
             sql.push(',');
         }
-        let lane = ordinal % 32;
-        #[expect(clippy::cast_precision_loss)]
-        let score = (ordinal % 10_000) as f64 / 8.0;
-        let active = if ordinal % 3 == 0 { "FALSE" } else { "TRUE" };
+        let row = olap_base_row(ordinal);
+        let active = if row.active { "TRUE" } else { "FALSE" };
         write!(
             sql,
-            "('/~lix-olap/{ordinal:09}', {ordinal}, 'lane-{lane:02}', {score}, {active})"
+            "('{}', {}, '{}', {}, {active})",
+            row.id,
+            row.ordinal,
+            olap_lane(row.lane_index),
+            row.score,
         )
         .expect("write typed OLAP INSERT SQL");
     }
     sql
 }
 
+fn expected_olap_rows(expected: &OlapExpected) -> impl Iterator<Item = OlapRowExpected> + '_ {
+    let inserted_rows = expected.mutation_profile.stride().map_or(0, |stride| {
+        mutation_count(expected.initial_row_count, 2, stride)
+    });
+    (0..expected.initial_row_count + inserted_rows).filter_map(|ordinal| {
+        olap_expected_row(
+            expected.initial_row_count,
+            expected.mutation_profile,
+            ordinal,
+        )
+    })
+}
+
+fn assert_olap_scan(result: &ExecuteResult, expected: &OlapExpected) {
+    assert_eq!(
+        result.columns(),
+        ["id", "ordinal", "lane", "score", "active"]
+    );
+    assert_eq!(result.len(), expected.visible_rows);
+    let max_ordinal = expected_olap_rows(expected)
+        .map(|row| usize::try_from(row.ordinal).expect("nonnegative OLAP ordinal"))
+        .max()
+        .expect("typed OLAP fixture is not empty");
+    let mut seen = vec![false; max_ordinal + 1];
+    for row_index in 0..result.len() {
+        let ordinal = usize::try_from(integer_at(result, row_index, 1))
+            .expect("OLAP scan ordinal must be nonnegative");
+        let row = olap_expected_row(
+            expected.initial_row_count,
+            expected.mutation_profile,
+            ordinal,
+        )
+        .expect("OLAP scan returned a deleted or unknown row");
+        assert!(
+            !std::mem::replace(&mut seen[ordinal], true),
+            "duplicate OLAP row"
+        );
+        assert_eq!(text_at(result, row_index, 0), row.id);
+        assert_eq!(text_at(result, row_index, 2), olap_lane(row.lane_index));
+        assert_eq!(real_at(result, row_index, 3), row.score);
+        assert_eq!(boolean_at(result, row_index, 4), row.active);
+    }
+    for row in expected_olap_rows(expected) {
+        assert!(
+            seen[usize::try_from(row.ordinal).expect("nonnegative OLAP ordinal")],
+            "OLAP scan omitted {}",
+            row.id
+        );
+    }
+}
+
+fn assert_olap_filter(result: &ExecuteResult, expected: &OlapExpected) {
+    assert_eq!(result.columns(), ["ordinal", "lane", "score"]);
+    let rows = expected_olap_rows(expected)
+        .filter(|row| row.active && matches!(row.lane_index, 7 | 19))
+        .collect::<Vec<_>>();
+    assert_eq!(result.len(), rows.len());
+    assert_eq!(result.len(), expected.filtered_rows);
+    for (row_index, row) in rows.iter().enumerate() {
+        assert_eq!(integer_at(result, row_index, 0), row.ordinal);
+        assert_eq!(text_at(result, row_index, 1), olap_lane(row.lane_index));
+        assert_eq!(real_at(result, row_index, 2), row.score);
+    }
+    assert_eq!(
+        rows.first().map(|row| row.ordinal),
+        Some(expected.filtered_first_ordinal)
+    );
+    assert_eq!(
+        rows.last().map(|row| row.ordinal),
+        Some(expected.filtered_last_ordinal)
+    );
+}
+
 fn assert_olap_sort(result: &ExecuteResult, expected: &OlapExpected) {
     assert_eq!(result.columns(), ["id", "ordinal", "score"]);
-    assert_eq!(result.len(), 10_000.min(expected.active_rows as usize));
-    let mut previous = None;
-    for row_index in 0..result.len() {
-        let ordinal = integer_at(result, row_index, 1);
-        let score = real_at(result, row_index, 2);
-        assert_ne!(ordinal % 3, 0, "sorted result must retain active rows only");
-        assert_eq!(
-            text_at(result, row_index, 0),
-            format!("/~lix-olap/{ordinal:09}")
-        );
-        #[expect(clippy::cast_precision_loss)]
-        let expected_score = (ordinal.rem_euclid(10_000)) as f64 / 8.0;
-        assert_eq!(score, expected_score);
-        if let Some((previous_score, previous_ordinal)) = previous {
-            assert!(
-                previous_score > score || (previous_score == score && previous_ordinal < ordinal),
-                "OLAP top-k must be ordered by score DESC, ordinal ASC"
-            );
-        }
-        previous = Some((score, ordinal));
+    let mut rows = expected_olap_rows(expected)
+        .filter(|row| row.active)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.ordinal.cmp(&right.ordinal))
+    });
+    rows.truncate(10_000);
+    assert_eq!(result.len(), rows.len());
+    for (row_index, row) in rows.iter().enumerate() {
+        assert_eq!(text_at(result, row_index, 0), row.id);
+        assert_eq!(integer_at(result, row_index, 1), row.ordinal);
+        assert_eq!(real_at(result, row_index, 2), row.score);
     }
 }
 
@@ -1103,6 +1473,13 @@ fn text_at(result: &ExecuteResult, row: usize, column: usize) -> &str {
     }
 }
 
+fn boolean_at(result: &ExecuteResult, row: usize, column: usize) -> bool {
+    match result.rows()[row].get_index(column) {
+        Some(Value::Boolean(value)) => *value,
+        value => panic!("expected boolean at row {row}, column {column}, got {value:?}"),
+    }
+}
+
 fn assert_close(actual: f64, expected: f64) {
     let tolerance = 1e-10 * expected.abs().max(1.0);
     assert!(
@@ -1152,6 +1529,17 @@ pub(crate) fn selected_olap_read_shape() -> Option<OlapReadShape> {
         .ok()
         .as_deref()
         .and_then(OlapReadShape::from_label)
+}
+
+pub(crate) fn selected_olap_mutation_profile() -> OlapMutationProfile {
+    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_OLAP_STATE").as_deref() {
+        Ok("sparse") => OlapMutationProfile::Sparse,
+        Ok("moderate") => OlapMutationProfile::Moderate,
+        Ok("pristine") | Err(_) => OlapMutationProfile::Pristine,
+        Ok(other) => panic!(
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_OLAP_STATE '{other}'; expected pristine, sparse, or moderate"
+        ),
+    }
 }
 
 async fn prepare_session<StorageImpl>(storage: StorageImpl) -> SessionContext<StorageImpl>
