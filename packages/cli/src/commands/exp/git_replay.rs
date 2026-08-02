@@ -857,15 +857,7 @@ fn seed_parent_tree<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let changes = read_tree_snapshot_changes(repo_path, parent_commit)?
-        .into_iter()
-        .filter(|change| {
-            change
-                .new_path
-                .as_ref()
-                .is_some_and(|path| replay_scope.contains(path))
-        })
-        .collect::<Vec<_>>();
+    let changes = read_scoped_tree_snapshot_changes(repo_path, parent_commit, replay_scope)?;
     let mut pending = PreparedBatch::default();
     let mut result = SeedResult::default();
     for change_batch in changes.chunks(TREE_BLOB_READ_BATCH_ROWS) {
@@ -947,12 +939,6 @@ fn read_tree_snapshot_changes(repo_path: &Path, commit_sha: &str) -> Result<Vec<
                 "malformed git ls-tree record: {header}"
             )));
         }
-        let is_regular_file = fields[1] == "blob" && mode_is_regular_file(fields[0]);
-        if !is_regular_file {
-            return Err(CliError::msg(format!(
-                "unsupported Git tree entry {header}; lix_file stores regular file contents only"
-            )));
-        }
         changes.push(Change {
             status: 'A',
             old_mode: "000000".to_string(),
@@ -962,6 +948,28 @@ fn read_tree_snapshot_changes(repo_path: &Path, commit_sha: &str) -> Result<Vec<
             new_path: Some(GitPath::from_diff_token(path)?),
         });
     }
+    Ok(changes)
+}
+
+fn read_scoped_tree_snapshot_changes(
+    repo_path: &Path,
+    commit_sha: &str,
+    replay_scope: &HashSet<GitPath>,
+) -> Result<Vec<Change>, CliError> {
+    let changes = read_tree_snapshot_changes(repo_path, commit_sha)?
+        .into_iter()
+        .filter(|change| {
+            change
+                .new_path
+                .as_ref()
+                .is_some_and(|path| replay_scope.contains(path))
+        })
+        .collect::<Vec<_>>();
+
+    for change in &changes {
+        reject_unsupported_git_mode(&change.new_mode, change.new_path.as_ref())?;
+    }
+
     Ok(changes)
 }
 
@@ -1921,15 +1929,7 @@ fn verify_final_git_tree<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let tree_changes = read_tree_snapshot_changes(repo_path, commit_sha)?
-        .into_iter()
-        .filter(|change| {
-            change
-                .new_path
-                .as_ref()
-                .is_some_and(|path| replay_scope.contains(path))
-        })
-        .collect::<Vec<_>>();
+    let tree_changes = read_scoped_tree_snapshot_changes(repo_path, commit_sha, replay_scope)?;
     let mut expected_by_path = HashMap::<String, ExpectedFile>::with_capacity(tree_changes.len());
     for change_batch in tree_changes.chunks(TREE_BLOB_READ_BATCH_ROWS) {
         let blob_by_oid = blob_reader.read_blobs(&collect_wanted_blob_ids(change_batch))?;
@@ -2778,6 +2778,39 @@ mod tests {
         extend_replay_scope_with_tree(&repo, parent, &mut scope)
             .expect("full parent tree should extend scope");
         assert!(scope.contains(&git_path(b"untouched.txt")));
+        fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_tree_snapshot_ignores_unrelated_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = unique_temp_dir();
+        let repo = fixture.join("repo");
+        fs::create_dir_all(&repo).expect("fixture repository should be created");
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        git_ok(&repo, &["config", "user.email", "replay@example.test"]);
+        git_ok(&repo, &["config", "user.name", "Replay Test"]);
+        fs::write(repo.join("selected.txt"), b"selected\n").expect("fixture should write");
+        symlink("selected.txt", repo.join("unrelated-link")).expect("fixture should link");
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "root"]);
+        let commit = run_git_text(&repo, &["rev-parse".to_string(), "HEAD".to_string()], None)
+            .expect("fixture commit should resolve");
+
+        let window_scope = HashSet::from([git_path(b"selected.txt")]);
+        let changes = read_scoped_tree_snapshot_changes(&repo, commit.trim(), &window_scope)
+            .expect("an unrelated symbolic link should not fail window scope");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].new_path, Some(git_path(b"selected.txt")));
+
+        let full_scope = HashSet::from([git_path(b"selected.txt"), git_path(b"unrelated-link")]);
+        let error = read_scoped_tree_snapshot_changes(&repo, commit.trim(), &full_scope)
+            .expect_err("a symbolic link inside replay scope should be rejected");
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(error.to_string().contains("/unrelated-link"));
+
         fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
     }
 
