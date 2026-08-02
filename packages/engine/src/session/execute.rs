@@ -5743,8 +5743,77 @@ mod tests {
             .await
             .unwrap();
 
-        sql2::take_certified_replacement_parameter_batch_executions();
         let sql = "UPDATE certified_replacement_probe SET value = lix_json($1) WHERE path = $2";
+        let missing_results = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("invalid-missing-1".to_string()),
+                        Value::Text("/missing".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("invalid-missing-2".to_string()),
+                        Value::Text("/missing".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .expect("missing rows must not evaluate their replacement expression");
+        assert_eq!(
+            missing_results
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .collect::<Vec<_>>(),
+            vec![0, 0]
+        );
+
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("not-json".to_string()),
+                        Value::Text("/b".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text(r#"{"later":"valid"}"#.to_string()),
+                        Value::Text("/b".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .expect_err("a later replacement must not hide earlier invalid JSON");
+        assert_eq!(error.details.unwrap()["statementIndex"], 0);
+
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("invalid-b".to_string()),
+                        Value::Text("/b".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("invalid-a".to_string()),
+                        Value::Text("/a".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .expect_err("errors must retain statement order when identities are sorted");
+        assert_eq!(error.details.unwrap()["statementIndex"], 0);
+
+        sql2::take_certified_replacement_parameter_batch_executions();
         let results = session
             .execute_batch(&[
                 ExecuteBatchStatement {
