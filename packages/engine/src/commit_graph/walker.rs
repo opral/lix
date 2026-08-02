@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LixError;
 use crate::changelog::CommitId;
-use crate::commit_graph::{CommitGraphCommit, CommitGraphStoreReader, ReachableCommitGraphCommit};
+use crate::commit_graph::{
+    CommitGraphCommit, CommitGraphCommitRecord, CommitGraphReader, CommitGraphStoreReader,
+    ReachableCommitGraphCommit,
+};
 use crate::storage_adapter::StorageAdapterRead;
 
 /// Walks parent links from `head_commit_id` and returns reachable commits
@@ -51,10 +54,11 @@ pub(crate) async fn best_common_ancestors<S>(
 where
     S: StorageAdapterRead,
 {
-    // Both walks share almost all commits in ordinary diverged history. Keep
-    // one loader so the second side reuses the first side's immutable parsed
-    // commit facts instead of crossing the storage boundary again.
-    let mut loader = CommitTraversalLoader::new(reader);
+    // Merge-base graph math only needs parent links. Loading full commits also
+    // decodes every tracked delta payload, multiplying history traversal by
+    // unrelated commit width. Share one lightweight record loader across both
+    // sides and hydrate only the final best candidates.
+    let mut loader = CommitRecordTraversalLoader::new(reader);
     let left_reachable = loader.walk(left_commit_id).await?;
     let right_reachable = loader.walk(right_commit_id).await?;
     let right_ids = right_reachable
@@ -91,10 +95,141 @@ where
             common_ids.contains(&reachable.commit.commit_id)
                 && !superseded.contains(&reachable.commit.commit_id)
         })
-        .map(|reachable| reachable.commit)
+        .map(|reachable| reachable.commit.commit_id)
         .collect::<Vec<_>>();
-    best.sort_by_key(|left| left.commit_id);
-    Ok(best)
+    best.sort_unstable();
+    drop(loader);
+    let mut hydrated = Vec::with_capacity(best.len());
+    for commit_id in best {
+        let Some(commit) = reader.load_commit(&commit_id).await? else {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("commit_graph missing commit '{commit_id}'"),
+            ));
+        };
+        hydrated.push(commit);
+    }
+    Ok(hydrated)
+}
+
+struct ReachableCommitRecord {
+    commit: CommitGraphCommitRecord,
+    depth: u32,
+}
+
+struct CommitRecordTraversalLoader<'a, S>
+where
+    S: StorageAdapterRead,
+{
+    reader: &'a mut CommitGraphStoreReader<S>,
+    loaded: BTreeMap<CommitId, CommitGraphCommitRecord>,
+}
+
+impl<'a, S> CommitRecordTraversalLoader<'a, S>
+where
+    S: StorageAdapterRead,
+{
+    fn new(reader: &'a mut CommitGraphStoreReader<S>) -> Self {
+        Self {
+            reader,
+            loaded: BTreeMap::new(),
+        }
+    }
+
+    async fn walk(
+        &mut self,
+        head_commit_id: &CommitId,
+    ) -> Result<Vec<ReachableCommitRecord>, LixError> {
+        let mut visiting = BTreeSet::new();
+        let mut nearest_depths = BTreeMap::new();
+        self.walk_commit(head_commit_id, 0, &mut visiting, &mut nearest_depths)
+            .await?;
+        let mut commits = nearest_depths
+            .into_iter()
+            .map(|(commit_id, depth)| ReachableCommitRecord {
+                commit: self
+                    .loaded
+                    .get(&commit_id)
+                    .expect("visited commit record should be cached")
+                    .clone(),
+                depth,
+            })
+            .collect::<Vec<_>>();
+        commits.sort_by(|left, right| {
+            left.depth
+                .cmp(&right.depth)
+                .then_with(|| left.commit.commit_id.cmp(&right.commit.commit_id))
+        });
+        Ok(commits)
+    }
+
+    async fn walk_commit(
+        &mut self,
+        commit_id: &CommitId,
+        depth: u32,
+        visiting: &mut BTreeSet<CommitId>,
+        nearest_depths: &mut BTreeMap<CommitId, u32>,
+    ) -> Result<(), LixError> {
+        let mut stack = vec![TraversalFrame {
+            commit_id: *commit_id,
+            depth,
+            expanded: false,
+        }];
+        while let Some(frame) = stack.pop() {
+            if frame.expanded {
+                visiting.remove(&frame.commit_id);
+                continue;
+            }
+            if visiting.contains(&frame.commit_id) {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "commit_graph cycle detected at commit '{}'",
+                        frame.commit_id
+                    ),
+                ));
+            }
+            if nearest_depths
+                .get(&frame.commit_id)
+                .is_some_and(|previous_depth| *previous_depth <= frame.depth)
+            {
+                continue;
+            }
+            let commit = self.load_commit_record(&frame.commit_id).await?;
+            nearest_depths.insert(frame.commit_id, frame.depth);
+            visiting.insert(frame.commit_id);
+            stack.push(TraversalFrame {
+                commit_id: frame.commit_id,
+                depth: frame.depth,
+                expanded: true,
+            });
+            for parent_commit_id in commit.parent_commit_ids.iter().rev() {
+                stack.push(TraversalFrame {
+                    commit_id: *parent_commit_id,
+                    depth: frame.depth + 1,
+                    expanded: false,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn load_commit_record(
+        &mut self,
+        commit_id: &CommitId,
+    ) -> Result<CommitGraphCommitRecord, LixError> {
+        if let Some(commit) = self.loaded.get(commit_id) {
+            return Ok(commit.clone());
+        }
+        let Some(commit) = self.reader.load_commit_record(commit_id).await? else {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("commit_graph missing commit '{commit_id}'"),
+            ));
+        };
+        self.loaded.insert(*commit_id, commit.clone());
+        Ok(commit)
+    }
 }
 
 struct CommitTraversalLoader<'a, S>
