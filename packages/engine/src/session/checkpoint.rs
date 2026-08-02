@@ -44,8 +44,7 @@ where
     /// the foreground checkpoint latency.
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
         let outcome = self
-            .with_write_transaction(|transaction| {
-                Box::pin(async move {
+            .with_write_transaction_lending(async move |transaction| {
                     let branch_id = transaction.active_branch_id().to_string();
                     let (previous_recovery, mut gc_state) = transaction
                         .checkpoint_publication_state(&branch_id)
@@ -173,8 +172,7 @@ where
                         receipt: CreateCheckpointReceipt { commit_id },
                         gc_due,
                     })
-                })
-        })
+            })
             .await?;
         if outcome.gc_due {
             // GC debt is durable in the checkpoint transaction. The sweep is

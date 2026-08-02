@@ -151,6 +151,59 @@ async fn observe_initial_next_waits_without_rejecting_same_session_write() {
 }
 
 #[tokio::test]
+async fn observe_close_during_initial_evaluation_does_not_publish_a_final_snapshot() {
+    let storage = BlockingBeginReadStorage::new();
+    let gate = storage.gate();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage).await.expect("engine should open");
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
+    let mut events = session
+        .observe("SELECT 1", &[])
+        .expect("observe should open");
+
+    gate.block_next_read();
+    let observer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("observer runtime should build");
+        runtime.block_on(async move { events.next().await })
+    });
+    gate.wait_until_blocked();
+
+    let closing_session = Arc::clone(&session);
+    let close = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("close runtime should build");
+        runtime.block_on(async move { closing_session.close().await })
+    });
+    while !session.is_closed() {
+        thread::yield_now();
+    }
+    gate.release();
+
+    assert!(
+        observer
+            .join()
+            .expect("observer thread should join")
+            .expect("observe next should not fail")
+            .is_none(),
+        "closing a session must suppress an in-flight initial snapshot"
+    );
+    close
+        .join()
+        .expect("close thread should join")
+        .expect("session should close");
+}
+
+#[tokio::test]
 async fn observe_registration_allows_automatic_write_instead_of_rejecting() {
     let storage = BlockingBeginWriteStorage::new();
     let gate = storage.gate();
@@ -563,6 +616,42 @@ async fn observe_identical_queries_share_one_evaluation_per_generation() {
     );
 }
 
+#[tokio::test]
+async fn closing_retained_observer_releases_external_watcher_demand() {
+    let storage = CountingReadStorage::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage.clone())
+        .await
+        .expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+    let mut events = session
+        .observe("SELECT 1", &[])
+        .expect("observe should open");
+    let _initial = next_event(&mut events, "initial snapshot").await;
+    events.close();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let settled_revision_reads = storage.mutation_revision_read_count();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert_eq!(
+        storage.mutation_revision_read_count(),
+        settled_revision_reads,
+        "a closed observer must not retain external mutation polling demand"
+    );
+    assert!(
+        events
+            .next()
+            .await
+            .expect("closed next should succeed")
+            .is_none()
+    );
+}
+
 simulation_test!(
     observe_new_subscriber_receives_current_rows_after_unchanged_generation,
     |sim| async move {
@@ -768,6 +857,7 @@ simulation_test!(
 struct CountingReadStorage {
     inner: Memory,
     read_count: Arc<AtomicUsize>,
+    mutation_revision_read_count: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -948,6 +1038,7 @@ struct BlockingReadState {
 struct CountingRead {
     inner: MemoryRead,
     read_count: Arc<AtomicUsize>,
+    mutation_revision_read_count: Arc<AtomicUsize>,
     counted: AtomicBool,
 }
 
@@ -956,6 +1047,7 @@ impl CountingReadStorage {
         Self {
             inner: Memory::new(),
             read_count: Arc::new(AtomicUsize::new(0)),
+            mutation_revision_read_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -965,6 +1057,10 @@ impl CountingReadStorage {
 
     fn read_count(&self) -> usize {
         self.read_count.load(Ordering::SeqCst)
+    }
+
+    fn mutation_revision_read_count(&self) -> usize {
+        self.mutation_revision_read_count.load(Ordering::SeqCst)
     }
 }
 
@@ -983,6 +1079,7 @@ impl Storage for CountingReadStorage {
         Ok(CountingRead {
             inner: self.inner.begin_read(opts).await?,
             read_count: Arc::clone(&self.read_count),
+            mutation_revision_read_count: Arc::clone(&self.mutation_revision_read_count),
             counted: AtomicBool::new(false),
         })
     }
@@ -1016,7 +1113,10 @@ impl StorageRead for CountingRead {
 
 impl CountingRead {
     fn count_user_read(&self, space: lix_engine::storage::StorageSpace) {
-        if space.id != SpaceId(0x0007_0001) && !self.counted.swap(true, Ordering::SeqCst) {
+        if space.id == SpaceId(0x0007_0001) {
+            self.mutation_revision_read_count
+                .fetch_add(1, Ordering::SeqCst);
+        } else if !self.counted.swap(true, Ordering::SeqCst) {
             self.read_count.fetch_add(1, Ordering::SeqCst);
         }
     }

@@ -278,18 +278,13 @@ where
         let path = state.path.clone();
         let write_access = self.begin_session_write_access().await?;
         let publish_result = self
-            .with_write_transaction_reserved(write_access, |transaction| {
-                Box::pin(async move {
-                    transaction.stage_atomic_cas_publication(
-                        finalization_writes,
-                        finalization_preconditions,
-                        publication_blob_id,
-                    )?;
-                    crate::sql2::execute_fast_lix_file_prepared_path_write(
-                        transaction,
-                        path,
-                        receipt,
-                    )
+            .with_write_transaction_reserved_lending(write_access, async move |transaction| {
+                transaction.stage_atomic_cas_publication(
+                    finalization_writes,
+                    finalization_preconditions,
+                    publication_blob_id,
+                )?;
+                crate::sql2::execute_fast_lix_file_prepared_path_write(transaction, path, receipt)
                     .await?
                     .ok_or_else(|| {
                         LixError::new(
@@ -297,7 +292,6 @@ where
                             "resumable file publication requires an unambiguous filesystem layout",
                         )
                     })
-                })
             })
             .await;
         if let Err(error) = publish_result {

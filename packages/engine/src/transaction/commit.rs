@@ -4474,17 +4474,7 @@ async fn stage_tracked_roots(
                     state_row_indices.len(),
                     &first_mutation_key,
                     &file_delete_cascades,
-                    state_row_indices.iter().map(|&row_index| {
-                        let row = state_rows.row(row_index);
-                        Ok(TrackedStateRootMutationRef {
-                            delta: tracked_delta_from_state_row(row)?,
-                            require_absence: tracked_row_requires_absence(
-                                row_index,
-                                row,
-                                insert_selection,
-                            ),
-                        })
-                    }),
+                    OrderedStateRowMutations::new(state_row_indices, state_rows, insert_selection),
                 )
                 .await?
                 .is_some()
@@ -4575,6 +4565,51 @@ fn tracked_row_requires_absence(
     }
     row.snapshot.is_some() && !row.untracked && insert_selection.contains(row_index)
 }
+
+struct OrderedStateRowMutations<'a> {
+    row_indices: std::slice::Iter<'a, RowIndex>,
+    state_rows: &'a PreparedStateBatch,
+    insert_selection: &'a PreparedInsertSelection,
+}
+
+impl<'a> OrderedStateRowMutations<'a> {
+    fn new(
+        row_indices: &'a [RowIndex],
+        state_rows: &'a PreparedStateBatch,
+        insert_selection: &'a PreparedInsertSelection,
+    ) -> Self {
+        Self {
+            row_indices: row_indices.iter(),
+            state_rows,
+            insert_selection,
+        }
+    }
+}
+
+impl<'a> Iterator for OrderedStateRowMutations<'a> {
+    type Item = Result<TrackedStateRootMutationRef<'a>, LixError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let row_index = *self.row_indices.next()?;
+        let row = self.state_rows.row(row_index);
+        Some(
+            tracked_delta_from_state_row(row).map(|delta| TrackedStateRootMutationRef {
+                delta,
+                require_absence: tracked_row_requires_absence(
+                    row_index,
+                    row,
+                    self.insert_selection,
+                ),
+            }),
+        )
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.row_indices.size_hint()
+    }
+}
+
+impl ExactSizeIterator for OrderedStateRowMutations<'_> {}
 
 fn tracked_roots_parent_first(
     tracked_roots: &[PendingTrackedRoot],

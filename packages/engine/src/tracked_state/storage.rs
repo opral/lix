@@ -6,7 +6,9 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::future::Future;
 use std::ops::{Bound, Deref, Range};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::changelog::CommitId;
@@ -1966,7 +1968,7 @@ async fn load_change_records_by_ids(
     {
         return stream::iter(change_ids.iter().copied())
             .map(|change_id| async move {
-                load_change_record_by_id(store, change_id)
+                load_change_record_by_id_boxed(store, change_id)
                     .await?
                     .ok_or_else(|| {
                         LixError::new(
@@ -2005,6 +2007,18 @@ async fn load_change_records_by_ids(
         })
         .collect::<Result<Vec<_>, _>>()?;
     load_change_records_at_locators(store, &locators).await
+}
+
+fn load_change_record_by_id_boxed<'a, S>(
+    store: &'a S,
+    change_id: crate::changelog::ChangeId,
+) -> Pin<
+    Box<dyn Future<Output = Result<Option<crate::changelog::ChangeRecord>, LixError>> + Send + 'a>,
+>
+where
+    S: StorageAdapterRead + ?Sized + 'a,
+{
+    Box::pin(load_change_record_by_id(store, change_id))
 }
 
 async fn load_change_records_at_locators(

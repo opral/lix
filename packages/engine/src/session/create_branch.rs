@@ -42,58 +42,56 @@ where
         &self,
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError> {
-        self.with_write_transaction(|transaction| {
-            Box::pin(async move {
-                let branch_id = options
-                    .id
-                    .unwrap_or_else(|| transaction.functions().call_uuid_v7().to_string());
-                let source_head = if let Some(from_commit_id) = options.from_commit_id {
-                    let from_commit_id = BranchLifecycle::parse_commit_id(
-                        &from_commit_id,
+        self.with_write_transaction_lending(async move |transaction| {
+            let branch_id = options
+                .id
+                .unwrap_or_else(|| transaction.functions().call_uuid_v7().to_string());
+            let source_head = if let Some(from_commit_id) = options.from_commit_id {
+                let from_commit_id = BranchLifecycle::parse_commit_id(
+                    &from_commit_id,
+                    BranchOperation::CreateBranch,
+                    BranchReferenceRole::CommitSource,
+                )?;
+                let mut commit_graph = transaction.commit_graph_reader().await;
+                let commit = BranchLifecycle::require_existing_commit(
+                    &mut commit_graph,
+                    from_commit_id,
+                    BranchOperation::CreateBranch,
+                    BranchReferenceRole::CommitSource,
+                )
+                .await?;
+                commit.commit_id
+            } else {
+                let active_branch_id = transaction.active_branch_id().to_string();
+                let reader = transaction.branch_ref_reader().await;
+                BranchLifecycle::new(&reader)
+                    .require_existing_commit_id(
+                        &active_branch_id,
                         BranchOperation::CreateBranch,
-                        BranchReferenceRole::CommitSource,
-                    )?;
-                    let mut commit_graph = transaction.commit_graph_reader().await;
-                    let commit = BranchLifecycle::require_existing_commit(
-                        &mut commit_graph,
-                        from_commit_id,
-                        BranchOperation::CreateBranch,
-                        BranchReferenceRole::CommitSource,
+                        BranchReferenceRole::Source,
                     )
-                    .await?;
-                    commit.commit_id
-                } else {
-                    let active_branch_id = transaction.active_branch_id().to_string();
-                    let reader = transaction.branch_ref_reader().await;
-                    BranchLifecycle::new(&reader)
-                        .require_existing_commit_id(
-                            &active_branch_id,
-                            BranchOperation::CreateBranch,
-                            BranchReferenceRole::Source,
-                        )
-                        .await?
-                };
+                    .await?
+            };
 
-                let mut rows = RawWriteBatch::with_capacity(2);
-                rows.push(branch_descriptor_stage_row(
-                    &branch_id,
-                    &options.name,
-                    false,
-                ));
-                rows.push(branch_ref_stage_row(&branch_id, &source_head));
-                transaction
-                    .stage_write(TransactionWrite::Rows {
-                        mode: TransactionWriteMode::Insert,
-                        rows,
-                    })
-                    .await?;
-
-                Ok(CreateBranchReceipt {
-                    id: branch_id,
-                    name: options.name,
-                    hidden: false,
-                    commit_id: source_head.to_string(),
+            let mut rows = RawWriteBatch::with_capacity(2);
+            rows.push(branch_descriptor_stage_row(
+                &branch_id,
+                &options.name,
+                false,
+            ));
+            rows.push(branch_ref_stage_row(&branch_id, &source_head));
+            transaction
+                .stage_write(TransactionWrite::Rows {
+                    mode: TransactionWriteMode::Insert,
+                    rows,
                 })
+                .await?;
+
+            Ok(CreateBranchReceipt {
+                id: branch_id,
+                name: options.name,
+                hidden: false,
+                commit_id: source_head.to_string(),
             })
         })
         .await

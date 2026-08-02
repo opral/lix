@@ -1,7 +1,5 @@
 #![allow(clippy::match_wild_err_arm, clippy::option_if_let_else)]
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -493,23 +491,12 @@ where
         }
     }
 
-    pub(crate) async fn with_write_transaction<T, F>(&self, f: F) -> Result<T, LixError>
-    where
-        F: for<'tx> FnOnce(
-            &'tx mut Transaction<StorageImpl>,
-        ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
-    {
-        self.with_write_transaction_lending(async move |transaction| f(transaction).await)
-            .await
-    }
-
     /// Runs a transaction with a lending async closure.
     ///
-    /// Unlike the boxed compatibility entrypoint above, `AsyncFnOnce` ties
-    /// the returned future to both the transaction borrow and the closure's
-    /// captured borrows. Large callers can therefore borrow prepared input
-    /// for the duration of the transaction instead of deep-cloning it into a
-    /// `'static` closure environment.
+    /// `AsyncFnOnce` ties the returned future to both the transaction borrow
+    /// and the closure's captured borrows. Large callers can therefore borrow
+    /// prepared input for the duration of the transaction instead of
+    /// deep-cloning it into a `'static` closure environment.
     pub(crate) async fn with_write_transaction_lending<T, F>(&self, f: F) -> Result<T, LixError>
     where
         F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
@@ -518,22 +505,6 @@ where
         let write_access = self.begin_session_write_access().await?;
         self.with_write_transaction_reserved_lending(write_access, f)
             .await
-    }
-
-    pub(super) async fn with_write_transaction_reserved<T, F>(
-        &self,
-        write_access: SessionWriteAccess,
-        f: F,
-    ) -> Result<T, LixError>
-    where
-        F: for<'tx> FnOnce(
-            &'tx mut Transaction<StorageImpl>,
-        ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
-    {
-        self.with_write_transaction_reserved_lending(write_access, async move |transaction| {
-            f(transaction).await
-        })
-        .await
     }
 
     pub(super) async fn with_write_transaction_reserved_lending<T, F>(

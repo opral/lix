@@ -107,7 +107,7 @@ fn load_available_root<'a, S>(
     store: &'a S,
     commit_id: &'a str,
     seen: &'a mut HashSet<String>,
-) -> Pin<Box<dyn Future<Output = Result<Option<TrackedStateRootId>, LixError>> + 'a>>
+) -> Pin<Box<dyn Future<Output = Result<Option<TrackedStateRootId>, LixError>> + Send + 'a>>
 where
     S: StorageAdapterRead + ?Sized + 'a,
 {
@@ -315,12 +315,7 @@ where
                 deltas.len(),
                 &first_key,
                 &file_delete_cascades,
-                deltas.iter().copied().map(|delta| {
-                    Ok(TrackedStateRootMutationRef {
-                        delta,
-                        require_absence: false,
-                    })
-                }),
+                RebuildRootMutations::new(&deltas),
             )
             .await?
         {
@@ -331,6 +326,37 @@ where
         .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
         .await
 }
+
+struct RebuildRootMutations<'iter, 'delta> {
+    inner: std::slice::Iter<'iter, TrackedStateDeltaRef<'delta>>,
+}
+
+impl<'iter, 'delta> RebuildRootMutations<'iter, 'delta> {
+    fn new(deltas: &'iter [TrackedStateDeltaRef<'delta>]) -> Self {
+        Self {
+            inner: deltas.iter(),
+        }
+    }
+}
+
+impl<'delta> Iterator for RebuildRootMutations<'_, 'delta> {
+    type Item = Result<TrackedStateRootMutationRef<'delta>, LixError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().copied().map(|delta| {
+            Ok(TrackedStateRootMutationRef {
+                delta,
+                require_absence: false,
+            })
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ExactSizeIterator for RebuildRootMutations<'_, '_> {}
 
 fn first_parent_commit_id(commit: &CommitRecord) -> Option<CommitId> {
     commit.parent_commit_ids.first().copied()

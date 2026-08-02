@@ -5007,7 +5007,7 @@ mod tests {
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
-        prime_external_observe_watcher(&router, &session_id).await;
+        let _priming_observer = prime_external_observe_watcher(&router, &session_id).await;
         let _paused_watcher = storage.pause_next_read();
         tokio::time::timeout(Duration::from_secs(1), storage.wait_for_paused_read())
             .await
@@ -5096,7 +5096,7 @@ mod tests {
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
-        prime_external_observe_watcher(&router, &session_id).await;
+        let _priming_observer = prime_external_observe_watcher(&router, &session_id).await;
         let _paused_watcher = storage.pause_next_read();
         tokio::time::timeout(Duration::from_secs(1), storage.wait_for_paused_read())
             .await
@@ -5141,7 +5141,7 @@ mod tests {
         );
     }
 
-    async fn prime_external_observe_watcher(router: &Router, session_id: &str) {
+    async fn prime_external_observe_watcher(router: &Router, session_id: &str) -> Body {
         let response = request(
             router,
             "POST",
@@ -5157,6 +5157,7 @@ mod tests {
             .expect("priming observe should produce an initial frame")
             .expect("priming observe stream should not end immediately")
             .expect("priming observe initial frame should be valid");
+        body
     }
 
     async fn app() -> TestApp {
