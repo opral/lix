@@ -882,6 +882,53 @@ async fn try_execute_direct_path_value_replacement_batch(
         }
         candidates
     };
+    // Sorting identities changes expression evaluation order. Once this route
+    // is fully certified, validate JSON arguments for live rows in original
+    // statement order so a later replacement cannot hide an earlier error.
+    // Missing-row UPDATEs do not evaluate SET expressions, so first derive
+    // liveness from the certified generation or the exact candidate scan.
+    if !primary_keys_strictly_ordered {
+        let live_unique_identities = if certified_generation_identity {
+            None
+        } else {
+            let mut live = vec![false; unique_row_count];
+            let mut candidate_index = 0;
+            for (identity_index, entity_pk) in unique_entity_pks.iter().enumerate() {
+                while candidate_index < candidates.len()
+                    && candidates.row(candidate_index).entity_pk() < entity_pk
+                {
+                    candidate_index += 1;
+                }
+                live[identity_index] = candidate_index < candidates.len()
+                    && candidates.row(candidate_index).entity_pk() == entity_pk;
+            }
+            Some(live)
+        };
+        let mut scratch = Vec::new();
+        for (statement_index, entity_pk) in entity_pks.iter().enumerate() {
+            let identity_index = unique_entity_pks
+                .binary_search(entity_pk)
+                .expect("every statement identity belongs to the unique identity set");
+            if live_unique_identities
+                .as_ref()
+                .is_some_and(|live| !live[identity_index])
+            {
+                continue;
+            }
+            match parameter_batch.value(replacement.value_param_index, statement_index) {
+                DirectParameterValue::Null => {}
+                DirectParameterValue::String(raw) => {
+                    scratch.clear();
+                    append_canonical_json_parameter(&mut scratch, raw).map_err(|error| {
+                        with_parameter_batch_statement_index(error, statement_index)
+                    })?;
+                }
+                DirectParameterValue::Boolean(_) => {
+                    unreachable!("the certified replacement value parameter is text")
+                }
+            }
+        }
+    }
     let complete_collection_replacement = certified_generation_identity
         || (candidates.len() == unique_row_count
             && collection_generation
