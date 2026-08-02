@@ -87,7 +87,7 @@ fn cpu_scorecard() -> Result<Vec<(&'static str, Duration)>, LixError> {
 
 async fn storage_scorecard() -> Result<Vec<StorageScoreRow>, LixError> {
     let mut rows = Vec::new();
-    let samples = 1;
+    let samples = 5;
 
     rows.push(
         storage_row(
@@ -153,6 +153,45 @@ async fn storage_scorecard() -> Result<Vec<StorageScoreRow>, LixError> {
                     let append = changelog_bench::append_1c_100ch()?;
                     let store = changelog_bench::prepare_store(storage.create(), &append).await?;
                     let commit_ids = append.commit_ids();
+                    let start = Instant::now();
+                    black_box(changelog_bench::load_commits_direct(&store, &commit_ids).await?);
+                    Ok(start.elapsed())
+                })
+            },
+        )
+        .await?,
+    );
+
+    rows.push(
+        storage_row(
+            "load_commits_direct_batched / 1000c ordered",
+            samples,
+            |storage| {
+                Box::pin(async move {
+                    let append = changelog_bench::append_ordered_commits(0, 1000)?;
+                    let store = changelog_bench::prepare_store(storage.create(), &append).await?;
+                    let commit_ids = append.commit_ids();
+                    let start = Instant::now();
+                    black_box(changelog_bench::load_commits_direct(&store, &commit_ids).await?);
+                    Ok(start.elapsed())
+                })
+            },
+        )
+        .await?,
+    );
+
+    rows.push(
+        storage_row(
+            "load_commits_direct_batched / 1000c reversed_duplicate_missing",
+            samples,
+            |storage| {
+                Box::pin(async move {
+                    let append = changelog_bench::append_ordered_commits(0, 1000)?;
+                    let store = changelog_bench::prepare_store(storage.create(), &append).await?;
+                    let mut commit_ids = append.commit_ids();
+                    commit_ids.reverse();
+                    commit_ids.extend(commit_ids.iter().step_by(10).cloned().collect::<Vec<_>>());
+                    commit_ids.extend((0..100).map(|index| format!("missing-{index}")));
                     let start = Instant::now();
                     black_box(changelog_bench::load_commits_direct(&store, &commit_ids).await?);
                     Ok(start.elapsed())

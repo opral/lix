@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId, CommitRecord};
-use crate::common::LixTimestamp;
+use crate::common::{ExactValue, LixTimestamp};
 use crate::entity_pk::EntityPk;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +29,12 @@ pub(crate) struct CommitGraphNode {
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
     pub(crate) created_at: LixTimestamp,
+}
+
+impl ExactValue<CommitId> for CommitGraphNode {
+    fn matches_exact_key(&self, key: &CommitId) -> bool {
+        self.commit_id == *key
+    }
 }
 
 impl From<CommitRecord> for CommitGraphNode {

@@ -1,4 +1,5 @@
 pub(crate) mod error;
+pub(crate) mod exact_batch;
 mod execution_metadata;
 pub(crate) mod identity;
 pub(crate) mod json_pointer;
@@ -9,6 +10,7 @@ pub(crate) mod types;
 pub(crate) mod wire;
 
 pub use error::LixError;
+pub(crate) use exact_batch::{ExactBatch, ExactValue};
 pub use execution_metadata::{
     ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance, VerifiedRequestBlob,
 };

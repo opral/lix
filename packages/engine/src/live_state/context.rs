@@ -3136,10 +3136,9 @@ mod tests {
                             commit_ids: &[typed_parent],
                         })
                         .await?
-                        .entries
                         .into_iter()
                         .next()
-                        .flatten()
+                        .and_then(|(_, value)| value)
                         .ok_or_else(|| {
                             LixError::unknown("test changelog parent commit is missing")
                         })?

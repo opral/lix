@@ -820,13 +820,14 @@ mod tests {
                 .await
                 .expect("read should open"),
         );
+        let commit_ids = [CommitId::for_test_label(&receipt.initial_commit_id)];
         let commits = reader
             .load_commits(crate::changelog::CommitLoadRequest {
-                commit_ids: &[CommitId::for_test_label(&receipt.initial_commit_id)],
+                commit_ids: &commit_ids,
             })
             .await
             .expect("commit should load");
-        let Some(record) = commits.entries.into_iter().next().flatten() else {
+        let Some(record) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("initial commit should exist");
         };
 
@@ -862,23 +863,25 @@ mod tests {
                 .any(|member| member.change.change_id == sampled_change_id),
             "initial tracked changes are authoritative in the packed commit delta"
         );
+        let change_ids = [sampled_change_id];
         let changes = reader
             .load_changes(crate::changelog::ChangeLoadRequest {
-                change_ids: &[sampled_change_id],
+                change_ids: &change_ids,
             })
             .await
             .expect("standalone change index should load");
         assert!(
-            matches!(changes.entries.as_slice(), [None]),
+            changes.iter().all(|(_, value)| value.is_none()),
             "packed tracked changes must not be duplicated in the standalone change space"
         );
+        let derivable_change_ids = [commit_change_id];
         let missing_derivable = reader
             .load_changes(crate::changelog::ChangeLoadRequest {
-                change_ids: &[commit_change_id],
+                change_ids: &derivable_change_ids,
             })
             .await
             .expect("derivable change lookup should load");
-        assert!(matches!(missing_derivable.entries.as_slice(), [None]));
+        assert!(missing_derivable.iter().all(|(_, value)| value.is_none()));
         {
             let read = storage
                 .begin_read(crate::storage_adapter::StorageReadOptions::default())

@@ -19,7 +19,7 @@ mod tests {
     };
     use crate::storage_adapter::{
         PointReadPlan, ScanPlan, SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead,
-        StorageAdapterReadScope, StorageReadStats, StorageSpace,
+        StorageAdapterReadScope, StorageReadStats, StorageSpace, exact_get_many,
     };
 
     fn key(bytes: &'static str) -> Key {
@@ -87,6 +87,29 @@ mod tests {
     struct OverlapRead {
         entered: Arc<tokio::sync::Barrier>,
         release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct WrongCardinalityRead {
+        returned: usize,
+    }
+
+    impl StorageRead for WrongCardinalityRead {
+        async fn get_many(
+            &self,
+            _requests: &[GetManyRequest<'_>],
+        ) -> Result<GetManyResult, StorageError> {
+            Ok(GetManyResult::new(vec![None; self.returned]))
+        }
+
+        async fn scan(
+            &self,
+            _space: StorageSpace,
+            _range: KeyRange,
+            _opts: ScanOptions,
+        ) -> Result<ScanChunk, StorageError> {
+            unreachable!("wrong-cardinality test does not scan")
+        }
     }
 
     impl StorageRead for OverlapRead {
@@ -199,6 +222,54 @@ mod tests {
             assert_eq!(result.stats.storage_calls, 1);
         }
         assert_eq!(*seen.lock().expect("spy lock"), [key("a"), key("b")]);
+    }
+
+    #[tokio::test]
+    async fn point_reads_reject_short_and_long_backend_results() {
+        let plan = PointReadPlan::from_unique_keys(space(), vec![key("a"), key("b")]);
+        for returned in [1, 3] {
+            let read = StorageAdapterReadScope::new(WrongCardinalityRead { returned });
+            let error = plan
+                .materialize(&read, GetOptions::default())
+                .await
+                .expect_err("malformed backend result must fail");
+            assert!(matches!(error, StorageError::Corruption(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("2 requested keys in a 1-request batch")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_multi_request_reads_reject_short_and_long_backend_results() {
+        let left_keys = [key("a")];
+        let right_keys = [key("b"), key("c")];
+        let requests = [
+            GetManyRequest {
+                space: space(),
+                keys: &left_keys,
+                opts: GetOptions::default(),
+            },
+            GetManyRequest {
+                space: space(),
+                keys: &right_keys,
+                opts: GetOptions::default(),
+            },
+        ];
+        for returned in [2, 4] {
+            let read = StorageAdapterReadScope::new(WrongCardinalityRead { returned });
+            let error = exact_get_many(&read, &requests)
+                .await
+                .expect_err("malformed multi-request backend result must fail");
+            assert!(matches!(error, StorageError::Corruption(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("3 requested keys in a 2-request batch")
+            );
+        }
     }
 
     #[tokio::test]

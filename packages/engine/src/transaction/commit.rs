@@ -919,12 +919,11 @@ async fn stage_changelog_commits(
             commit_ids: &external_parent_ids,
         })
         .await?;
-    let mut generations = external_parent_ids
+    let mut generations = external_parent_records
         .into_iter()
-        .zip(external_parent_records.entries)
         .map(|(commit_id, record)| {
             record
-                .map(|record| (commit_id, record.generation))
+                .map(|record| (*commit_id, record.generation))
                 .ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -4141,7 +4140,7 @@ async fn ensure_explicit_branch_ref_targets_exist(
             commit_ids: &target_ids,
         })
         .await?;
-    for (commit_id, entry) in target_ids.into_iter().zip(commits.entries) {
+    for (commit_id, entry) in commits {
         if entry.is_none() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -5345,13 +5344,14 @@ mod tests {
                 .await
                 .expect("read should open"),
         );
+        let commit_ids = [commit_id("test-uuid-1")];
         let commits = changelog_reader
             .load_commits(crate::changelog::CommitLoadRequest {
-                commit_ids: &[commit_id("test-uuid-1")],
+                commit_ids: &commit_ids,
             })
             .await
             .expect("changelog commit should load");
-        let Some(record) = commits.entries.into_iter().next().flatten() else {
+        let Some(record) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
         assert_eq!(record.change_id, change_id("test-uuid-2"));
@@ -5380,14 +5380,15 @@ mod tests {
             .map(|member| &member.change)
             .expect("tracked change should have an authoritative packed payload");
         assert_eq!(change.schema_key, "test_schema");
+        let change_ids = [change_id("change-1"), record.change_id];
         let changes = changelog_reader
             .load_changes(crate::changelog::ChangeLoadRequest {
-                change_ids: &[change_id("change-1"), record.change_id],
+                change_ids: &change_ids,
             })
             .await
             .expect("changelog change should load");
         assert!(
-            changes.entries.iter().all(Option::is_none),
+            changes.iter().all(|(_, value)| value.is_none()),
             "tracked and derived commit changes must not be duplicated in changelog.change"
         );
 
@@ -7132,18 +7133,21 @@ mod tests {
                 .await
                 .expect("read should open"),
         );
+        let commit_ids = [
+            CommitId::for_test_label("parent-commit"),
+            CommitId::for_test_label("child-commit"),
+        ];
         let commits = changelog_reader
             .load_commits(crate::changelog::CommitLoadRequest {
-                commit_ids: &[
-                    CommitId::for_test_label("parent-commit"),
-                    CommitId::for_test_label("child-commit"),
-                ],
+                commit_ids: &commit_ids,
             })
             .await
             .expect("commits should load");
-        assert!(commits.entries.iter().all(Option::is_some));
-        assert_eq!(commits.entries[0].as_ref().unwrap().generation, 0);
-        assert_eq!(commits.entries[1].as_ref().unwrap().generation, 1);
+        let generations = commits
+            .into_iter()
+            .map(|(_, commit)| commit.expect("commit").generation)
+            .collect::<Vec<_>>();
+        assert_eq!(generations, [0, 1]);
     }
 
     #[tokio::test]
@@ -7205,15 +7209,16 @@ mod tests {
                 .await
                 .expect("read should open"),
         );
+        let change_ids = [change_id("change-untracked")];
         let changes = changelog_reader
             .load_changes(crate::changelog::ChangeLoadRequest {
-                change_ids: &[change_id("change-untracked")],
+                change_ids: &change_ids,
             })
             .await
             .expect("untracked changelog lookup should load");
         assert_eq!(
-            changes.entries,
-            vec![None],
+            changes.iter().all(|(_, value)| value.is_none()),
+            true,
             "untracked state is history-free and must not enter the changelog"
         );
     }
@@ -7422,13 +7427,14 @@ mod tests {
                 .await
                 .expect("read should open"),
         );
+        let commit_ids = [commit_id("test-uuid-1")];
         let commits = changelog_reader
             .load_commits(crate::changelog::CommitLoadRequest {
-                commit_ids: &[commit_id("test-uuid-1")],
+                commit_ids: &commit_ids,
             })
             .await
             .expect("changelog commit should load");
-        let Some(commit) = commits.entries.into_iter().next().flatten() else {
+        let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
         assert_eq!(commit.change_id, change_id("test-uuid-2"));
@@ -7559,13 +7565,14 @@ mod tests {
                 .await
                 .expect("read should open"),
         );
+        let commit_ids = [commit_id("test-uuid-1")];
         let commits = changelog_reader
             .load_commits(crate::changelog::CommitLoadRequest {
-                commit_ids: &[commit_id("test-uuid-1")],
+                commit_ids: &commit_ids,
             })
             .await
             .expect("changelog commit should load");
-        let Some(commit) = commits.entries.into_iter().next().flatten() else {
+        let Some(commit) = commits.into_iter().next().and_then(|(_, value)| value) else {
             panic!("changelog commit should exist");
         };
         assert_eq!(commit.change_id, change_id("test-uuid-2"));

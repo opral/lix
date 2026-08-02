@@ -1675,23 +1675,34 @@ mod tests {
             .await
             .expect("verification read should open");
         let mut reader = ChangelogContext::new().reader(&read);
+        let commit_ids = [live_parent, live_head, dead_commit];
         let commits = reader
             .load_commits(CommitLoadRequest {
-                commit_ids: &[live_parent, live_head, dead_commit],
+                commit_ids: &commit_ids,
             })
             .await
             .expect("commit headers should load");
-        assert!(commits.entries[0].is_some());
-        assert!(commits.entries[1].is_some());
-        assert!(commits.entries[2].is_none());
+        assert_eq!(
+            commits
+                .iter()
+                .map(|(_, value)| value.is_some())
+                .collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        let change_ids = [live_standalone.change_id, dead_standalone.change_id];
         let changes = reader
             .load_changes(ChangeLoadRequest {
-                change_ids: &[live_standalone.change_id, dead_standalone.change_id],
+                change_ids: &change_ids,
             })
             .await
             .expect("standalone facts should load");
-        assert!(changes.entries[0].is_some());
-        assert!(changes.entries[1].is_none());
+        assert_eq!(
+            changes
+                .iter()
+                .map(|(_, value)| value.is_some())
+                .collect::<Vec<_>>(),
+            [true, false]
+        );
         assert!(
             load_change_record_by_id(&read, live_member.change_id)
                 .await

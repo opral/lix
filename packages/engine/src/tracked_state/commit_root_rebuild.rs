@@ -206,12 +206,18 @@ where
             commit_ids: &commit_ids,
         })
         .await?;
-    let entry = batch.entries.into_iter().next().flatten().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("cannot rebuild tracked_state commit_root for unknown commit '{commit_id}'"),
-        )
-    })?;
+    let entry = batch
+        .into_iter()
+        .next()
+        .and_then(|(_, value)| value)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot rebuild tracked_state commit_root for unknown commit '{commit_id}'"
+                ),
+            )
+        })?;
     let commit = entry;
     // The packed delta is the sole membership and payload authority. Preserve
     // the identity value's original created_at independently from this

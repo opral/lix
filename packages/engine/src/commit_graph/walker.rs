@@ -343,6 +343,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_graph_read_rejects_record_stored_under_another_commit_key() {
+        let storage = StorageAdapter::new(Memory::new());
+        let requested = commit_id("requested-commit");
+        let embedded = commit_id("embedded-commit");
+        let mut writes = storage.new_write_set();
+        writes.put(
+            crate::changelog::COMMIT_SPACE,
+            StorageKey(Bytes::copy_from_slice(requested.as_uuid().as_bytes())),
+            crate::changelog::encode_commit_record(&CommitRecord {
+                format_version: 1,
+                commit_id: embedded,
+                generation: 0,
+                parent_commit_ids: Vec::new(),
+                tracked_state_rootless: false,
+                change_id: ChangeId::for_test_label("mismatched-key-change"),
+                author_account_ids: Vec::new(),
+                created_at: ts("2026-01-01T00:00:00Z"),
+            })
+            .expect("mismatched commit should encode"),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("mismatched commit should persist");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        let error = reader
+            .load_node(&requested)
+            .await
+            .expect_err("exact read must reject a mismatched embedded commit id");
+
+        assert!(
+            error
+                .message
+                .contains("identity does not match requested key")
+        );
+    }
+
+    #[tokio::test]
     async fn reachable_nodes_errors_on_cycle() {
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();

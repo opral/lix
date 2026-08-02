@@ -13,6 +13,7 @@ use crate::storage_adapter::{
     StorageWriteSetError, StorageWriteSetStats,
 };
 
+use super::exact_get_many;
 use super::spaces::{MUTATION_REVISION_SPACE, TRACKED_MUTATION_REVISION_SPACE};
 
 const MUTATION_REVISION_KEY: &[u8] = b"global";
@@ -156,15 +157,17 @@ where
     where
         R: StorageAdapterRead + ?Sized,
     {
-        let values = read
-            .get_many(&[crate::storage::GetManyRequest {
+        let values = exact_get_many(
+            read,
+            &[crate::storage::GetManyRequest {
                 space: MUTATION_REVISION_SPACE,
                 keys: &[mutation_revision_key()],
                 opts: GetOptions {
                     projection: CoreProjection::FullValue,
                 },
-            }])
-            .await?;
+            }],
+        )
+        .await?;
         Ok(values
             .values
             .into_iter()
@@ -182,15 +185,17 @@ where
     where
         R: StorageAdapterRead + ?Sized,
     {
-        let values = read
-            .get_many(&[crate::storage::GetManyRequest {
+        let values = exact_get_many(
+            read,
+            &[crate::storage::GetManyRequest {
                 space: TRACKED_MUTATION_REVISION_SPACE,
                 keys: &[mutation_revision_key()],
                 opts: GetOptions {
                     projection: CoreProjection::FullValue,
                 },
-            }])
-            .await?;
+            }],
+        )
+        .await?;
         Ok(values
             .values
             .into_iter()

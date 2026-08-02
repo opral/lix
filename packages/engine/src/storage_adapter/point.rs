@@ -2,12 +2,45 @@ use std::collections::{HashMap, HashSet};
 
 use ahash::RandomState;
 
-use crate::storage::{GetOptions, Key, ProjectedValue, StorageError};
+use crate::storage::{
+    GetManyRequest, GetManyResult, GetOptions, Key, ProjectedValue, StorageError,
+};
 use crate::storage_adapter::{
     StorageAdapterRead, StorageReadResult, StorageReadStats, StorageSpace,
 };
 
 type FastHashBuilder = RandomState;
+
+/// Executes one flattened exact-read batch and enforces the storage contract.
+///
+/// Every consumer that interprets `get_many` slots must pass through this
+/// boundary so malformed backends cannot turn short reads into misses or
+/// shift extra values into a later logical request.
+pub(crate) async fn exact_get_many<R>(
+    read: &R,
+    requests: &[GetManyRequest<'_>],
+) -> Result<GetManyResult, StorageError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let expected = requests.iter().try_fold(0usize, |total, request| {
+        total.checked_add(request.keys.len())
+    });
+    let Some(expected) = expected else {
+        return Err(StorageError::Corruption(
+            "exact point-read request cardinality overflowed usize".to_string(),
+        ));
+    };
+    let result = read.get_many(requests).await?;
+    if result.values.len() != expected {
+        return Err(StorageError::Corruption(format!(
+            "exact point read returned {} values for {expected} requested keys in a {}-request batch",
+            result.values.len(),
+            requests.len()
+        )));
+    }
+    Ok(result)
+}
 
 #[derive(Clone, Debug)]
 pub struct PointReadPlan {
@@ -91,14 +124,16 @@ impl PointReadPlan {
     where
         R: StorageAdapterRead + ?Sized,
     {
-        let unique_values = read
-            .get_many(&[crate::storage::GetManyRequest {
+        let unique_values = exact_get_many(
+            read,
+            &[GetManyRequest {
                 space: self.space,
                 keys: &self.logical_unique_keys,
                 opts,
-            }])
-            .await?
-            .values;
+            }],
+        )
+        .await?
+        .values;
         Ok(StorageReadResult::new(
             PointValues {
                 unique_values,

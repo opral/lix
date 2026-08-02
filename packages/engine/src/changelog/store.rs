@@ -79,20 +79,20 @@ fn uuid_from_key(key: &[u8], kind: &str) -> Result<uuid::Uuid, LixError> {
 
 #[async_trait]
 pub(crate) trait ChangelogReader {
-    async fn load_commits(
+    async fn load_commits<'a>(
         &mut self,
-        request: CommitLoadRequest<'_>,
-    ) -> Result<CommitLoadBatch, LixError>;
+        request: CommitLoadRequest<'a>,
+    ) -> Result<CommitLoadBatch<'a>, LixError>;
 
     async fn scan_commits(
         &mut self,
         request: CommitScanRequest<'_>,
     ) -> Result<CommitScanBatch, LixError>;
 
-    async fn load_changes(
+    async fn load_changes<'a>(
         &mut self,
-        request: ChangeLoadRequest<'_>,
-    ) -> Result<ChangeLoadBatch, LixError>;
+        request: ChangeLoadRequest<'a>,
+    ) -> Result<ChangeLoadBatch<'a>, LixError>;
 
     async fn scan_changes(
         &mut self,
