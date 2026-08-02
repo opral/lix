@@ -21,6 +21,13 @@ pub fn lix_schema_definition_json() -> &'static str {
     include_str!("definition.json")
 }
 
+pub(crate) fn materializes_entity_columnar_sidecar(schema: &JsonValue) -> bool {
+    schema
+        .get("x-lix-columnar")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(true)
+}
+
 pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError> {
     if let Some(err) = detect_missing_pointer_slash(schema) {
         return Err(err);
@@ -488,6 +495,7 @@ fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixErro
             key.as_str(),
             "x-lix-key"
                 | "x-lix-primary-key"
+                | "x-lix-columnar"
                 | "x-lix-unique"
                 | "x-lix-foreign-keys"
                 | "x-lix-state-foreign-keys"

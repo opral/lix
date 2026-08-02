@@ -239,6 +239,7 @@ fn certifies_path_value_replacement(schema: &JsonValue) -> bool {
         "additionalProperties",
         "x-lix-key",
         "x-lix-primary-key",
+        "x-lix-columnar",
     ];
     if object
         .keys()
