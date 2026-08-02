@@ -65,10 +65,10 @@ jobs:
           BINSTALL_NO_CONFIRM=true
           EOF
 
-      - name: Install LLVM build dependencies
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-dev libclang-dev clang
+          sudo apt-get install -y llvm-dev libclang-dev clang mold
 
       - name: Restore compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -151,7 +151,13 @@ jobs:
         if: matrix.runtime == 'native'
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-dev libclang-dev clang
+          sudo apt-get install -y llvm-dev libclang-dev clang mold
+
+      - name: Install mold for WebAssembly host tooling
+        if: matrix.runtime == 'browser'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
 
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
