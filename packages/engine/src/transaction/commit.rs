@@ -29,10 +29,11 @@ use crate::live_state::{
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateContext,
-    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef,
-    TrackedStateReadColumns, TrackedStateRootMutationRef, TrackedStateScanRequest, encode_key_ref,
-    load_commit_delta_change_records, stage_addressable_commit_deltas, stage_change_locators,
+    CommitDeltaReplacementGeneration, CommitDeltaReplacementScope, MaterializedTrackedStateRow,
+    TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter,
+    TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
+    TrackedStateScanRequest, encode_key_ref, load_commit_delta_change_records,
+    load_commit_delta_replay_metadata, stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
 use crate::transaction::staging::{PreparedInsertSelection, PreparedWriteSet};
@@ -56,13 +57,12 @@ type RowIndex = usize;
 const PACKED_CURRENT_BASE_MIN_ROWS: usize = 1_024;
 
 // Large certified commits already retain one ordered, payload-bearing delta
-// journal and publish a packed current head. Rebuilding the same identities
-// into an immutable tree in the synchronous commit window duplicates the
-// dominant write work. Keep small commits rooted for cheap cold point reads;
-// large ordered commits and a bounded run of first-parent descendants use the
-// existing rootless replay protocol. Periodic root fences rebuild that short
-// interval, keeping cold point/history/merge work bounded without putting the
-// duplicate tree build back in every bulk commit window.
+// run and publish a packed current head. Rebuilding the same identities into
+// an immutable tree in the synchronous commit window duplicates the dominant
+// write work. Complete replacements persist an authoritative partition scope;
+// that scope begins a new base generation and therefore resets its replay
+// accounting without a foreground tree fence. Sparse intervals remain bounded
+// until the remaining tracked-state shapes move to partition manifests too.
 const ROOTLESS_ORDERED_COMMIT_MIN_ROWS: usize = 32 * 1_024;
 const ROOTLESS_MAX_FIRST_PARENT_DEPTH: u16 = 32;
 const ROOTLESS_MAX_REPLAY_ROWS: u64 = 1_048_576;
@@ -86,6 +86,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_RETIREMENTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static ROOTLESS_REPLACEMENT_GENERATION_PUBLICATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -102,6 +104,11 @@ pub(crate) fn take_complete_replacement_packed_current_base_publications() -> us
 #[cfg(test)]
 pub(crate) fn take_complete_replacement_packed_current_base_retirements() -> usize {
     COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_RETIREMENTS.with(|retirements| retirements.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_rootless_replacement_generation_publications() -> usize {
+    ROOTLESS_REPLACEMENT_GENERATION_PUBLICATIONS.with(|count| count.replace(0))
 }
 
 /// Commits prepared transaction rows into tracked history and unified current
@@ -492,6 +499,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     }
 
     let selected_change_records = load_selected_change_records(read, &commit_rows).await?;
+    let replacement_generations = certify_complete_replacement_generations(
+        read,
+        &state_rows,
+        &row_index.tracked_row_indices_by_commit,
+        &tracked_roots,
+    )
+    .await?;
 
     let ordered_addressable_commits = stage_tracked_commit_delta_index(
         read,
@@ -504,6 +518,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &selected_change_records,
         &host_certified_file_schemas,
         &certified_packet_root_rows,
+        &insert_selection,
+        &replacement_generations,
     )
     .await?;
 
@@ -514,6 +530,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &ordered_addressable_commits,
         &certified_packet_root_rows,
     );
+    let replacement_generation_commits = replacement_generations
+        .keys()
+        .filter(|commit_id| rootless_ordered_commits.contains(commit_id))
+        .copied()
+        .collect::<BTreeSet<_>>();
     let mut durable_root_rebuild_parents = BTreeSet::new();
     let mut staged_root_rebuild_commits = BTreeSet::new();
 
@@ -525,6 +546,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &engine_rows,
         &[],
         &mut rootless_ordered_commits,
+        &replacement_generation_commits,
         &mut durable_root_rebuild_parents,
         &mut staged_root_rebuild_commits,
         &row_index.tracked_row_indices_by_commit,
@@ -921,6 +943,7 @@ async fn stage_changelog_commits(
     _branch_ref_rows: &[EngineCurrentRow],
     compact_change_ids: &[ChangeId],
     rootless_commit_ids: &mut BTreeSet<CommitId>,
+    replacement_generation_commit_ids: &BTreeSet<CommitId>,
     durable_root_rebuild_parents: &mut BTreeSet<CommitId>,
     staged_root_rebuild_commits: &mut BTreeSet<CommitId>,
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
@@ -1045,7 +1068,21 @@ async fn stage_changelog_commits(
             .checked_add(commit_delta_bytes)
             .ok_or_else(|| LixError::unknown("tracked-state rootless byte count exceeds u64"))?;
         let (rootless_depth, cumulative_rootless_rows, cumulative_rootless_bytes) =
-            if parent_rootless_depth > 0 {
+            if selected_as_new_rootless
+                && replacement_generation_commit_ids.contains(&commit_id)
+                && commit_delta_rows <= ROOTLESS_MAX_REPLAY_ROWS
+                && commit_delta_bytes <= ROOTLESS_MAX_REPLAY_BYTES
+                && !has_unbounded_payload_sources
+            {
+                // A persisted partition replacement is a new immutable base
+                // generation. Reads stop at its scope descriptor, so prior
+                // rows in that partition do not contribute to replay cost.
+                #[cfg(test)]
+                ROOTLESS_REPLACEMENT_GENERATION_PUBLICATIONS.with(|count| {
+                    count.set(count.get().saturating_add(1));
+                });
+                (1, commit_delta_rows, commit_delta_bytes)
+            } else if parent_rootless_depth > 0 {
                 let next_depth = parent_rootless_depth
                     .checked_add(1)
                     .ok_or_else(|| LixError::unknown("tracked-state rootless depth exceeds u16"))?;
@@ -1362,6 +1399,11 @@ fn tracked_delta_from_state_row(
             "tracked staged row is missing commit_id before tracked root staging",
         ));
     };
+    let created_at = row
+        .durable_predecessor
+        .map(crate::live_state::CertifiedCurrentStatePredecessor::created_at)
+        .transpose()?
+        .unwrap_or(row.created_at);
     Ok(TrackedStateDeltaRef {
         schema_key: row.schema_key,
         file_id: row.file_id.map(crate::common::SharedStr::as_str),
@@ -1369,7 +1411,7 @@ fn tracked_delta_from_state_row(
         change_id,
         commit_id,
         deleted: row.snapshot.is_none(),
-        created_at: row.created_at,
+        created_at,
         updated_at: row.updated_at,
     })
 }
@@ -1731,6 +1773,8 @@ async fn stage_tracked_commit_delta_index(
     selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
     host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    insert_selection: &PreparedInsertSelection,
+    replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
 ) -> Result<BTreeSet<CommitId>, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let commit_rows = commit_rows
@@ -1762,6 +1806,17 @@ async fn stage_tracked_commit_delta_index(
                 .iter()
                 .all(|&row_index| state_rows.row(row_index).addressable_change_id);
         if can_stream_ordered_addressable {
+            let replacement_generation = replacement_generations.get(&root.commit_id);
+            let lifecycle_created_at = replacement_generation
+                .map(|generation| generation.lifecycle_summary.uniform_created_at);
+            let publish_lifecycle_summary = replacement_generation.is_some()
+                || state_row_indices.iter().all(|&row_index| {
+                    tracked_row_requires_absence(
+                        row_index,
+                        state_rows.row(row_index),
+                        insert_selection,
+                    )
+                });
             let ordered_stage = {
                 let _span = tracing::debug_span!(
                     target: "lix_perf",
@@ -1773,6 +1828,9 @@ async fn stage_tracked_commit_delta_index(
                 let deltas = state_row_indices.iter().map(|&row_index| {
                     let row = state_rows.row(row_index);
                     let mut delta = tracked_commit_delta_from_state_row(row)?;
+                    if let Some(created_at) = lifecycle_created_at {
+                        delta.delta.created_at = created_at;
+                    }
                     delta.base_coordinate = entity_columnar_write_sets
                         .state_row_location(row_index)
                         .map(
@@ -1797,7 +1855,13 @@ async fn stage_tracked_commit_delta_index(
                         .iter()
                         .enumerate()
                         .all(|(index, &row_index)| index == row_index);
-                stage_ordered_addressable_commit_deltas(writes, deltas, order_certified)?
+                stage_ordered_addressable_commit_deltas(
+                    writes,
+                    deltas,
+                    order_certified,
+                    publish_lifecycle_summary,
+                    replacement_generation,
+                )?
             };
             if let Some(ordered_stage) = ordered_stage {
                 state_rows.set_ordered_addressable_change_ids(state_row_indices, ordered_stage)?;
@@ -1982,6 +2046,183 @@ async fn stage_tracked_commit_delta_index(
         stage_change_locators(writes, &authored_locators);
     }
     Ok(ordered_addressable_commits)
+}
+
+async fn certify_complete_replacement_generations(
+    read: &(impl StorageAdapterRead + ?Sized),
+    state_rows: &PreparedStateBatch,
+    tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
+    tracked_roots: &[PendingTrackedRoot],
+) -> Result<BTreeMap<CommitId, CommitDeltaReplacementGeneration>, LixError> {
+    let mut generations = BTreeMap::new();
+    for root in tracked_roots {
+        let row_indices = tracked_row_indices_by_commit
+            .get(&root.commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let Some(scope) =
+            certified_complete_replacement_scope(state_rows, row_indices, root.commit_id)
+        else {
+            continue;
+        };
+        let Some(ordered_identity_digest) =
+            crate::collection_generation::ordered_single_string_identity_digest(
+                row_indices
+                    .iter()
+                    .map(|&row_index| state_rows.row(row_index).entity_pk),
+            )
+        else {
+            continue;
+        };
+        let mut current = root.parent_commit_id;
+        let mut seen = BTreeSet::new();
+        let mut lifecycle_summary = None;
+        let fallback_commit_id = loop {
+            let Some(commit_id) = current else {
+                break None;
+            };
+            if !seen.insert(commit_id) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot certify replacement generation '{}': first-parent cycle includes '{commit_id}'",
+                        root.commit_id
+                    ),
+                ));
+            }
+            let commit_ids = [commit_id];
+            let record = ChangelogContext::new()
+                .reader(read)
+                .load_commits(ChangelogCommitLoadRequest {
+                    commit_ids: &commit_ids,
+                })
+                .await?
+                .into_iter()
+                .next()
+                .and_then(|(_, record)| record)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "replacement generation '{}' has missing parent '{commit_id}'",
+                            root.commit_id
+                        ),
+                    )
+                })?;
+            if !record.tracked_state_rootless {
+                break Some(commit_id);
+            }
+            let Some(metadata) = load_commit_delta_replay_metadata(read, commit_id).await? else {
+                // Missing replay evidence cannot certify that this interval
+                // belongs exclusively to the replaced partition.
+                break Some(commit_id);
+            };
+            if metadata.single_partition.as_ref() != Some(&scope) {
+                // Resetting global replay accounting is safe only when the
+                // entire skipped interval belongs to the replaced partition.
+                break Some(commit_id);
+            }
+            if let Some(parent_generation) = metadata.replacement_generation {
+                if parent_generation.scope != scope {
+                    break Some(commit_id);
+                }
+                if usize::try_from(metadata.member_count).ok() != Some(row_indices.len())
+                    || parent_generation.lifecycle_summary.ordered_identity_digest
+                        != ordered_identity_digest
+                {
+                    break Some(commit_id);
+                }
+                lifecycle_summary = Some(parent_generation.lifecycle_summary);
+                break parent_generation.fallback_commit_id;
+            }
+            let Some(summary) = metadata.lifecycle_summary.as_ref() else {
+                // A same-partition sparse commit may have deleted and later
+                // reinserted one identity with a new lifecycle. Do not carry
+                // an older full-set summary across any commit that does not
+                // itself prove the complete ordered identity set.
+                break Some(commit_id);
+            };
+            if usize::try_from(metadata.member_count).ok() != Some(row_indices.len())
+                || summary.scope != scope
+                || summary.ordered_identity_digest != ordered_identity_digest
+            {
+                break Some(commit_id);
+            }
+            lifecycle_summary = Some(summary.clone());
+            current = record.parent_commit_ids.first().copied();
+        };
+        // A fallback that is itself rootless means the interval contained an
+        // uncertified partition shape. Decline the hard cut and let the normal
+        // root fence preserve bounded replay.
+        if let Some(fallback_commit_id) = fallback_commit_id {
+            let commit_ids = [fallback_commit_id];
+            let fallback = ChangelogContext::new()
+                .reader(read)
+                .load_commits(ChangelogCommitLoadRequest {
+                    commit_ids: &commit_ids,
+                })
+                .await?
+                .into_iter()
+                .next()
+                .and_then(|(_, record)| record)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("replacement fallback '{fallback_commit_id}' is missing"),
+                    )
+                })?;
+            if fallback.tracked_state_rootless {
+                continue;
+            }
+        }
+        let Some(lifecycle_summary) = lifecycle_summary else {
+            continue;
+        };
+        generations.insert(
+            root.commit_id,
+            CommitDeltaReplacementGeneration {
+                scope,
+                fallback_commit_id,
+                lifecycle_summary,
+            },
+        );
+    }
+    Ok(generations)
+}
+
+fn certified_complete_replacement_scope(
+    state_rows: &PreparedStateBatch,
+    row_indices: &[RowIndex],
+    commit_id: CommitId,
+) -> Option<CommitDeltaReplacementScope> {
+    if !state_rows.certified_complete_collection_replacement()
+        || row_indices.is_empty()
+        || row_indices.len() < ROOTLESS_ORDERED_COMMIT_MIN_ROWS
+        || row_indices.len() != state_rows.len()
+    {
+        return None;
+    }
+    let first = state_rows.row(row_indices[0]);
+    if first.commit_id != Some(commit_id)
+        || first.snapshot.is_none()
+        || first.untracked
+        || first.global
+        || row_indices.iter().any(|&row_index| {
+            let row = state_rows.row(row_index);
+            row.commit_id != Some(commit_id)
+                || row.schema_key != first.schema_key
+                || row.file_id != first.file_id
+                || row.snapshot.is_none()
+                || row.untracked
+                || row.global
+        })
+    {
+        return None;
+    }
+    Some(CommitDeltaReplacementScope {
+        schema_key: first.schema_key.to_string(),
+        file_id: first.file_id.map(ToString::to_string),
+    })
 }
 
 fn prepared_state_row_replay_bytes(row: PreparedStateRowRef<'_>) -> Result<u64, LixError> {
@@ -5493,6 +5734,8 @@ mod tests {
             &HashMap::new(),
             &BTreeMap::new(),
             &certified_rows,
+            &PreparedInsertSelection::new(),
+            &BTreeMap::new(),
         )
         .await
         .expect("mixed certified delta should stage");
@@ -7348,6 +7591,7 @@ mod tests {
             &[],
             &[],
             &mut rootless_commit_ids,
+            &BTreeSet::new(),
             &mut durable_root_rebuild_parents,
             &mut staged_root_rebuild_commits,
             &BTreeMap::from([

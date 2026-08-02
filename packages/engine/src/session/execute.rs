@@ -6956,7 +6956,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_replacement_publishes_packed_current_base_and_accepts_later_overlays() {
-        const ROW_COUNT: usize = 1_024;
+        const ROW_COUNT: usize = 32 * 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
             "x-lix-key": "packed_replacement_probe",
@@ -6987,7 +6987,7 @@ mod tests {
             .map(|row_index| ExecuteBatchStatement {
                 sql: insert_sql.to_string(),
                 params: vec![
-                    Value::Text(format!("/{row_index:04}")),
+                    Value::Text(format!("/{row_index:05}")),
                     Value::Text(format!(r#"{{"old":{row_index}}}"#)),
                 ],
             })
@@ -6995,6 +6995,7 @@ mod tests {
         session.execute_batch(&inserts).await.unwrap();
 
         crate::transaction::take_complete_replacement_packed_current_base_publications();
+        crate::transaction::take_rootless_replacement_generation_publications();
         sql2::take_certified_generation_identity_replacements();
         let update_sql = "UPDATE packed_replacement_probe SET value = lix_json($1) WHERE path = $2";
         let updates = (0..ROW_COUNT)
@@ -7002,7 +7003,7 @@ mod tests {
                 sql: update_sql.to_string(),
                 params: vec![
                     Value::Text(format!(r#"{{"updated":{row_index}}}"#)),
-                    Value::Text(format!("/{row_index:04}")),
+                    Value::Text(format!("/{row_index:05}")),
                 ],
             })
             .collect::<Vec<_>>();
@@ -7024,6 +7025,210 @@ mod tests {
             1,
             "the certified full replacement must publish one packed current base"
         );
+        assert_eq!(
+            crate::transaction::take_rootless_replacement_generation_publications(),
+            1,
+            "the certified replacement must publish a rootless partition generation"
+        );
+
+        let update_commit_id = session
+            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let historical = session
+            .tracked_state
+            .reader(read)
+            .scan_batch_at_commit(
+                &update_commit_id,
+                &crate::tracked_state::TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["packed_replacement_probe".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(historical.len(), ROW_COUNT);
+        assert!(
+            historical
+                .iter()
+                .all(|row| row.snapshot_content().is_some_and(|snapshot| {
+                    snapshot.contains("updated") && !snapshot.contains("old")
+                })),
+            "historical replay must stop at the replacement generation"
+        );
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let historical_all = session
+            .tracked_state
+            .reader(read)
+            .scan_batch_at_commit(
+                &update_commit_id,
+                &crate::tracked_state::TrackedStateScanRequest::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            historical_all
+                .iter()
+                .filter(|row| row.schema_key() == "packed_replacement_probe")
+                .count(),
+            ROW_COUNT,
+            "an unfiltered replay must compose the replacement with inherited partitions"
+        );
+        assert!(
+            historical_all
+                .iter()
+                .any(|row| row.schema_key() == "lix_registered_schema"),
+            "the replacement generation must retain unrelated durable partitions"
+        );
+
+        let mut rebuild_writes = session.storage.new_write_set();
+        {
+            let read = session
+                .storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            session
+                .tracked_state
+                .root_rebuilder(&read, &mut rebuild_writes)
+                .rebuild_commit_root_at(&update_commit_id)
+                .await
+                .unwrap();
+        }
+        session
+            .storage
+            .commit_write_set(rebuild_writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let rebuilt = session
+            .tracked_state
+            .reader(read)
+            .scan_batch_at_commit(
+                &update_commit_id,
+                &crate::tracked_state::TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["packed_replacement_probe".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let rebuilt_rows = rebuilt.into_rows();
+        let historical_rows = historical.into_rows();
+        assert_eq!(rebuilt_rows.len(), historical_rows.len());
+        for (row_index, (rebuilt_row, historical_row)) in
+            rebuilt_rows.iter().zip(&historical_rows).enumerate()
+        {
+            assert_eq!(
+                rebuilt_row, historical_row,
+                "rebuilt replacement row {row_index} must equal replayed state"
+            );
+        }
+
+        crate::transaction::take_rootless_replacement_generation_publications();
+        let second_updates = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: update_sql.to_string(),
+                params: vec![
+                    Value::Text(format!(r#"{{"second":{row_index}}}"#)),
+                    Value::Text(format!("/{row_index:05}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session.execute_batch(&second_updates).await.unwrap();
+        assert_eq!(
+            crate::transaction::take_rootless_replacement_generation_publications(),
+            1,
+            "a repeated replacement must collapse to one generation over the same durable fallback"
+        );
+        let second_commit_id = session
+            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        for (before, after) in [
+            (&update_commit_id, &second_commit_id),
+            (&second_commit_id, &update_commit_id),
+        ] {
+            let diff = session
+                .execute(
+                    "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
+                     WHERE schema_key = 'packed_replacement_probe' AND diff_type = 'modified'",
+                    &[Value::Text(before.clone()), Value::Text(after.clone())],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                diff.rows()[0].get::<i64>("entries").unwrap(),
+                ROW_COUNT as i64,
+                "replacement generations must retain the real commit graph in both diff directions"
+            );
+        }
+        let main_branch_id = session.active_branch_id().await.unwrap();
+        let historical_branch = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-00000000b002".to_string()),
+                name: "replacement-generation-history".to_string(),
+                from_commit_id: Some(update_commit_id.clone()),
+            })
+            .await
+            .unwrap();
+        let (historical_session, _) = session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: historical_branch.id,
+            })
+            .await
+            .unwrap();
+        let historical_points = historical_session
+            .execute(
+                "SELECT path, value FROM packed_replacement_probe \
+                 WHERE path IN ('/00000', '/32767') ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            historical_points.rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"updated": 0})
+        );
+        assert_eq!(
+            historical_points.rows()[1]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"updated": ROW_COUNT - 1})
+        );
+        let (session, _) = historical_session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: main_branch_id.clone(),
+            })
+            .await
+            .unwrap();
 
         let broad_rows = session
             .execute(
@@ -7037,18 +7242,18 @@ mod tests {
             broad_rows.rows()[0]
                 .get::<serde_json::Value>("value")
                 .unwrap(),
-            serde_json::json!({"updated": 0})
+            serde_json::json!({"second": 0})
         );
         assert_eq!(
             broad_rows.rows()[ROW_COUNT - 1]
                 .get::<serde_json::Value>("value")
                 .unwrap(),
-            serde_json::json!({"updated": ROW_COUNT - 1})
+            serde_json::json!({"second": ROW_COUNT - 1})
         );
 
         let rows = session
             .execute(
-                "SELECT path, value FROM packed_replacement_probe WHERE path IN ('/0000', '/1023') ORDER BY path",
+                "SELECT path, value FROM packed_replacement_probe WHERE path IN ('/00000', '/32767') ORDER BY path",
                 &[],
             )
             .await
@@ -7056,23 +7261,128 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!({"updated": 0})
+            serde_json::json!({"second": 0})
         );
         assert_eq!(
             rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!({"updated": 1023})
+            serde_json::json!({"second": ROW_COUNT - 1})
         );
+
+        let merge_base_branch = session
+            .create_branch(crate::CreateBranchOptions {
+                id: Some("01930000-0000-7000-8000-00000000b003".to_string()),
+                name: "replacement-generation-merge".to_string(),
+                from_commit_id: Some(second_commit_id.clone()),
+            })
+            .await
+            .unwrap();
+        let (merge_source, _) = session
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: merge_base_branch.id.clone(),
+            })
+            .await
+            .unwrap();
+        merge_source
+            .execute(
+                "UPDATE packed_replacement_probe SET value = lix_json('{\"branch\":true}') WHERE path = '/00000'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let (session, _) = merge_source
+            .switch_branch(crate::SwitchBranchOptions {
+                branch_id: main_branch_id.clone(),
+            })
+            .await
+            .unwrap();
+        session
+            .execute(
+                "UPDATE packed_replacement_probe SET value = lix_json('{\"main\":true}') WHERE path = '/32767'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let merge = session
+            .merge_branch(crate::MergeBranchOptions {
+                source_branch_id: merge_base_branch.id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(merge.outcome, crate::MergeBranchOutcome::MergeCommitted);
+
+        let merged_commit_id = session
+            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        let merged_rows = session
+            .execute(
+                "SELECT path, value FROM packed_replacement_probe ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            merged_rows.len(),
+            ROW_COUNT,
+            "merging sparse descendants of a replacement generation must not lose rows"
+        );
+        assert_eq!(
+            merged_rows.rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"branch": true})
+        );
+        assert_eq!(
+            merged_rows.rows()[ROW_COUNT - 1]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"main": true})
+        );
+        let merged_diff = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
+                 WHERE schema_key = 'packed_replacement_probe' AND diff_type = 'modified'",
+                &[
+                    Value::Text(second_commit_id.clone()),
+                    Value::Text(merged_commit_id.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(merged_diff.rows()[0].get::<i64>("entries").unwrap(), 2);
+        let merged_history = session
+            .execute(
+                &format!(
+                    "SELECT value FROM packed_replacement_probe_history('{merged_commit_id}') \
+                     WHERE path = '/00000' ORDER BY lixcol_depth"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            merged_history.rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"branch": true})
+        );
+        assert!(merged_history.rows().iter().any(|row| {
+            row.get::<serde_json::Value>("value").ok() == Some(serde_json::json!({"second": 0}))
+        }));
 
         session
             .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"overlay\":true}') WHERE path = '/0000'",
+                "UPDATE packed_replacement_probe SET value = lix_json('{\"overlay\":true}') WHERE path = '/00000'",
                 &[],
             )
             .await
             .unwrap();
         session
             .execute(
-                "DELETE FROM packed_replacement_probe WHERE path = '/1023'",
+                "DELETE FROM packed_replacement_probe WHERE path = '/32767'",
                 &[],
             )
             .await
@@ -7085,10 +7395,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), ROW_COUNT - 1);
-        assert_eq!(rows.rows()[0].get::<String>("path").unwrap(), "/0000");
+        assert_eq!(rows.rows()[0].get::<String>("path").unwrap(), "/00000");
         assert_eq!(
             rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
             serde_json::json!({"overlay": true})
+        );
+
+        session
+            .execute(
+                "INSERT INTO packed_replacement_probe (path, value) VALUES ('/32767', lix_json('{\"reinserted\":true}'))",
+                &[],
+            )
+            .await
+            .unwrap();
+        let reinsert_commit_id = session
+            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let reinserted = session
+            .tracked_state
+            .reader(read)
+            .scan_batch_at_commit(
+                &reinsert_commit_id,
+                &crate::tracked_state::TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["packed_replacement_probe".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let reinserted_created_at = reinserted
+            .iter()
+            .find(|row| row.entity_pk().as_single_string().ok() == Some("/32767"))
+            .expect("reinserted row must be visible")
+            .created_at();
+
+        crate::transaction::take_rootless_replacement_generation_publications();
+        let post_reinsert_updates = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: update_sql.to_string(),
+                params: vec![
+                    Value::Text(format!(r#"{{"post_reinsert":{row_index}}}"#)),
+                    Value::Text(format!("/{row_index:05}")),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session.execute_batch(&post_reinsert_updates).await.unwrap();
+        assert_eq!(
+            crate::transaction::take_rootless_replacement_generation_publications(),
+            0,
+            "a delete/reinsert interval must decline replacement certification without complete lifecycle evidence"
+        );
+        let post_reinsert_commit_id = session
+            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let post_reinsert = session
+            .tracked_state
+            .reader(read)
+            .scan_batch_at_commit(
+                &post_reinsert_commit_id,
+                &crate::tracked_state::TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["packed_replacement_probe".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            post_reinsert
+                .iter()
+                .find(|row| row.entity_pk().as_single_string().ok() == Some("/32767"))
+                .expect("updated reinserted row must be visible")
+                .created_at(),
+            reinserted_created_at,
+            "full updates must preserve the newer lifecycle of a reinserted identity"
         );
     }
 
