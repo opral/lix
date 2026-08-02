@@ -30,7 +30,7 @@ use std::ops::ControlFlow;
 
 use crate::branch::BranchHead;
 use crate::functions::FunctionContext;
-use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
+use crate::sql2::bind::expr::{BoundBinaryOperator, BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{BoundInsertValues, BoundReturning, FileWriteSurface};
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
@@ -1512,6 +1512,10 @@ fn bound_expr_column_names(expr: &BoundExpr, columns: &mut BTreeSet<String>) {
                 bound_expr_column_names(arg, columns);
             }
         }
+        BoundExpr::Binary { left, right, .. } => {
+            bound_expr_column_names(left, columns);
+            bound_expr_column_names(right, columns);
+        }
     }
 }
 
@@ -1899,6 +1903,17 @@ fn datafusion_expr_from_bound_expr(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expr::ScalarFunction(ScalarFunction::new_udf(udf, args)))
         }
+        BoundExpr::Binary { left, op, right } => Ok(Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(datafusion_expr_from_bound_expr(session, left, params)?),
+            match op {
+                BoundBinaryOperator::Add => Operator::Plus,
+                BoundBinaryOperator::Subtract => Operator::Minus,
+                BoundBinaryOperator::Multiply => Operator::Multiply,
+                BoundBinaryOperator::Divide => Operator::Divide,
+                BoundBinaryOperator::Modulo => Operator::Modulo,
+            },
+            Box::new(datafusion_expr_from_bound_expr(session, right, params)?),
+        ))),
     }
 }
 
@@ -1960,12 +1975,10 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
     match &plan.bound.target {
         BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::Base {
             schema_key,
-        }) if bound_predicate_contains_like(&plan.bound.predicate) => Ok(schema_key.clone()),
+        }) => Ok(schema_key.clone()),
         BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::ByBranch {
             schema_key,
-        }) if bound_predicate_contains_like(&plan.bound.predicate) => {
-            Ok(format!("{schema_key}_by_branch"))
-        }
+        }) => Ok(format!("{schema_key}_by_branch")),
         BoundWriteTarget::File(FileWriteSurface::Base) => Ok("lix_file".to_string()),
         BoundWriteTarget::File(FileWriteSurface::ByBranch) => Ok("lix_file_by_branch".to_string()),
         BoundWriteTarget::Directory(DirectoryWriteSurface::Base) => Ok("lix_directory".to_string()),
@@ -1982,25 +1995,6 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
         BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint) => {
             Ok("lix_create_checkpoint".to_string())
         }
-        BoundWriteTarget::Entity(_) => Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "sql2 DataFusion reference writer does not support this entity write",
-        )),
-    }
-}
-
-fn bound_predicate_contains_like(predicate: &BoundPredicate) -> bool {
-    match predicate {
-        BoundPredicate::Like { .. } => true,
-        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {
-            predicates.iter().any(bound_predicate_contains_like)
-        }
-        BoundPredicate::True
-        | BoundPredicate::False
-        | BoundPredicate::Eq(_, _)
-        | BoundPredicate::IsNull(_)
-        | BoundPredicate::IsNotNull(_)
-        | BoundPredicate::In { .. } => false,
     }
 }
 
