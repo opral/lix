@@ -2799,6 +2799,7 @@ async fn stage_tracked_head(
                     root.commit_id,
                     schema_key,
                     state_row_indices.len(),
+                    entity_columnar_write_sets,
                     working_diff_capture_checkpoint_commit_id,
                     &mut coverage,
                 )
@@ -3861,13 +3862,42 @@ fn prepare_entity_columnar_write_sets(
     insert_selection: &PreparedInsertSelection,
     entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
 ) -> Result<crate::live_state::EntityColumnarWriteSets, LixError> {
-    if state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS || insert_selection.len() != state_rows.len()
-    {
+    if state_rows.len() < PACKED_CURRENT_BASE_MIN_ROWS {
         return Ok(BTreeMap::new());
+    }
+    let publishes_ordered_insert =
+        insert_selection.len() == state_rows.len() && insert_selection.covers_all(state_rows.len());
+    let publishes_complete_replacement =
+        state_rows.certified_complete_collection_replacement() && insert_selection.is_empty();
+    if !publishes_ordered_insert && !publishes_complete_replacement {
+        return Ok(BTreeMap::new());
+    }
+    if (publishes_ordered_insert || publishes_complete_replacement)
+        && let Some((commit_id, schema_key, snapshots)) = state_rows.dense_entity_columnar_input()
+    {
+        let Some(schema) = entity_schema_catalog.and_then(|catalog| catalog.schema(schema_key))
+        else {
+            return Ok(BTreeMap::new());
+        };
+        let Ok(spec) = crate::sql2::derive_entity_surface_spec_from_schema(schema) else {
+            return Ok(BTreeMap::new());
+        };
+        let rows = state_rows.iter().zip(snapshots).map(|(row, snapshot)| {
+            crate::sql2::EntityColumnarRowRef {
+                entity_pk: row.entity_pk,
+                snapshot_bytes: snapshot.normalized().as_bytes(),
+                snapshot_value: snapshot.value(),
+            }
+        });
+        let mut encoded = BTreeMap::new();
+        if let Some(row_groups) = crate::sql2::encode_registered_entity_row_groups(&spec, rows)? {
+            encoded.insert((commit_id, schema_key.to_string()), row_groups);
+        }
+        return Ok(encoded);
     }
     let mut indices = BTreeMap::<(CommitId, String), Vec<usize>>::new();
     for (index, row) in state_rows.iter().enumerate() {
-        if !insert_selection.contains(index) {
+        if !publishes_complete_replacement && !insert_selection.contains(index) {
             return Ok(BTreeMap::new());
         }
         let (Some(commit_id), Some(_snapshot)) = (row.commit_id, row.snapshot) else {

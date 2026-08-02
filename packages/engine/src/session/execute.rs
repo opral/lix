@@ -3996,6 +3996,64 @@ mod tests {
         );
     }
 
+    async fn assert_columnar_layout_selected(
+        session: &SessionContext<Memory>,
+        schema_key: &str,
+        expected_overlay_rows: usize,
+    ) {
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should resolve");
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("columnar route read should open");
+        let overlay_rows = session
+            .live_state
+            .reader(&read)
+            .entity_columnar_overlay_len_for_test(&branch_id, schema_key)
+            .await
+            .expect("columnar route should plan")
+            .expect("fixture must retain the authenticated columnar path");
+        assert_eq!(overlay_rows, expected_overlay_rows);
+    }
+
+    async fn assert_current_head_has_columnar_manifest(
+        session: &SessionContext<Memory>,
+        schema_key: &str,
+        expected_rows: u64,
+    ) {
+        let branch_id = session
+            .active_branch_id()
+            .await
+            .expect("active branch should resolve");
+        let head_read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch-head read should open");
+        let head = session
+            .branch_ctx
+            .ref_reader(head_read)
+            .load_head(&branch_id)
+            .await
+            .expect("branch head should load")
+            .expect("active branch should have a head");
+        let sidecar_read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("sidecar read should open");
+        let id = crate::live_state::entity_row_group_set_id(head.commit_id, schema_key);
+        let manifest = crate::columnar_row_group::load_row_group_manifest(&sidecar_read, id)
+            .await
+            .expect("sidecar manifest should load")
+            .expect("current packed base must publish its typed sidecar atomically");
+        assert_eq!(manifest.row_count(), expected_rows);
+    }
+
     async fn open_session_with_telemetry(
         spans: Arc<std::sync::Mutex<Vec<CompletedTelemetrySpan>>>,
     ) -> SessionContext<Memory> {
@@ -4924,6 +4982,20 @@ mod tests {
             ROW_COUNT as i64
         );
 
+        main.execute(
+            "UPDATE columnar_lifecycle_probe SET value = 'sparse-0512' WHERE id = '0512'",
+            &[],
+        )
+        .await
+        .expect("sparse typed update should commit");
+        assert_columnar_layout_selected(&main, "columnar_lifecycle_probe", 1).await;
+        main.execute(
+            "UPDATE columnar_lifecycle_probe SET value = 'base-0512' WHERE id = '0512'",
+            &[],
+        )
+        .await
+        .expect("sparse typed restoration should commit");
+
         let checkpoint = main
             .create_checkpoint()
             .await
@@ -5099,6 +5171,12 @@ mod tests {
                 1,
                 "each complete certified replacement should swap one packed base reference"
             );
+            assert_current_head_has_columnar_manifest(
+                &session,
+                "ordered_packed_update_probe",
+                ROW_COUNT as u64,
+            )
+            .await;
         }
 
         let rows = session
@@ -6437,6 +6515,27 @@ mod tests {
             "the certified full replacement must publish one packed current base"
         );
 
+        let broad_rows = session
+            .execute(
+                "SELECT path, value FROM packed_replacement_probe ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(broad_rows.len(), ROW_COUNT);
+        assert_eq!(
+            broad_rows.rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"updated": 0})
+        );
+        assert_eq!(
+            broad_rows.rows()[ROW_COUNT - 1]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"updated": ROW_COUNT - 1})
+        );
+
         let rows = session
             .execute(
                 "SELECT path, value FROM packed_replacement_probe WHERE path IN ('/0000', '/1023') ORDER BY path",
@@ -6470,12 +6569,12 @@ mod tests {
             .unwrap();
         let rows = session
             .execute(
-                "SELECT path, value FROM packed_replacement_probe WHERE path IN ('/0000', '/1023') ORDER BY path",
+                "SELECT path, value FROM packed_replacement_probe ORDER BY path",
                 &[],
             )
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), ROW_COUNT - 1);
         assert_eq!(rows.rows()[0].get::<String>("path").unwrap(), "/0000");
         assert_eq!(
             rows.rows()[0].get::<serde_json::Value>("value").unwrap(),

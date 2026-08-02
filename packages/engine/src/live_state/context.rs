@@ -599,6 +599,27 @@ where
         }))
     }
 
+    #[cfg(test)]
+    pub(crate) async fn entity_columnar_overlay_len_for_test(
+        &self,
+        branch_id: &str,
+        schema_key: &str,
+    ) -> Result<Option<usize>, LixError> {
+        let Some(control) = BranchHeadControlContext::new()
+            .reader(&self.store)
+            .load(branch_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .tracked_head
+            .reader(&self.store)
+            .entity_columnar_layout(branch_id, control, schema_key)
+            .await?
+            .map(|(_, _, overlay, _)| overlay.len()))
+    }
+
     pub(crate) async fn scan_direct_entity_snapshots_by_string_field(
         &self,
         request: &LiveStateScanRequest,

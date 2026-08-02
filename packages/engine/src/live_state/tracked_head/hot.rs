@@ -4253,6 +4253,14 @@ where
         entity_pks: &[EntityPk],
         limit: Option<usize>,
     ) -> Result<Vec<Option<Bytes>>, LixError> {
+        if entity_pks.is_empty()
+            && limit.is_none()
+            && let Some(snapshots) = self
+                .scan_exclusive_entity_snapshots(branch_id, control, schema_key)
+                .await?
+        {
+            return Ok(snapshots);
+        }
         self.scan_entity_snapshots_for_generation(
             branch_id,
             control.generation,
@@ -4262,6 +4270,86 @@ where
             limit,
         )
         .await
+    }
+
+    /// Reads one atomically published exclusive collection straight from its
+    /// packed commit payload column. The publication proof excludes HOT,
+    /// root, certified, and multi-base winners, so manufacturing a generic
+    /// live-state batch only to discard every column except the snapshot is
+    /// unnecessary read and allocation amplification.
+    async fn scan_exclusive_entity_snapshots(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        let Some((commit_id, live_count)) = self
+            .exclusive_entity_base(branch_id, control, schema_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(members) =
+            crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
+                &self.store,
+                commit_id,
+                &[schema_key.to_owned()],
+                PACKED_BROAD_SNAPSHOT_MAX_SEGMENTS,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let capacity = usize::try_from(live_count)
+            .map_err(|_| head_value_error("exclusive entity live count exceeds usize"))?;
+        let mut snapshots = Vec::with_capacity(capacity);
+        let mut deferred_refs = Vec::new();
+        let mut deferred_rows = Vec::new();
+        for member in members {
+            if member.value.deleted
+                || member.key.schema_key != schema_key
+                || member.key.file_id.is_some()
+            {
+                return Err(head_value_error(
+                    "exclusive entity base contains a non-live or file-scoped member",
+                ));
+            }
+            match member.change.snapshot {
+                JsonSlot::None => snapshots.push(None),
+                JsonSlot::Inline(json) => {
+                    snapshots.push(Some(Bytes::from(json.into_string())));
+                }
+                JsonSlot::Ref(json_ref) => {
+                    deferred_rows.push(snapshots.len());
+                    deferred_refs.push(json_ref);
+                    snapshots.push(None);
+                }
+            }
+        }
+        if snapshots.len() != capacity {
+            return Err(head_value_error(format!(
+                "exclusive entity base expected {live_count} live rows, decoded {}",
+                snapshots.len()
+            )));
+        }
+        if !deferred_refs.is_empty() {
+            let loaded = JsonStoreContext::new()
+                .load_bytes_many(
+                    &self.store,
+                    JsonLoadRequestRef {
+                        refs: &deferred_refs,
+                        scope: JsonReadScopeRef::OutOfBand,
+                    },
+                )
+                .await?
+                .into_values();
+            for (row_index, value) in deferred_rows.into_iter().zip(loaded) {
+                snapshots[row_index] = Some(value.ok_or_else(|| {
+                    head_value_error("exclusive entity snapshot payload is missing")
+                })?);
+            }
+        }
+        Ok(Some(snapshots))
     }
 
     pub(crate) async fn scan_entity_primary_keys(
@@ -4301,9 +4389,9 @@ where
         Ok(rows.into_identity_ordered_primary_keys())
     }
 
-    /// Plans a typed analytical scan only when one immutable packed base is
-    /// the complete current collection and its atomically staged row-group
-    /// sidecar agrees with the publication control.
+    /// Plans a typed analytical scan when one immutable packed base plus a
+    /// bounded HOT overlay is the complete current collection and its
+    /// atomically staged row-group sidecar agrees with publication control.
     pub(crate) async fn entity_columnar_layout(
         &self,
         branch_id: &str,
@@ -4318,30 +4406,13 @@ where
         )>,
         LixError,
     > {
-        let collection = load_hot_collection_control(
-            &self.store,
-            branch_id,
-            control.generation,
-            crate::collection_generation::CollectionScopeRef {
-                schema_key,
-                file_id: None,
-            },
-        )
-        .await?;
-        if collection.active_generation != control.generation {
-            return Ok(None);
-        }
-        let base_refs = packed_exclusive_schema_base_refs(
-            &self.store,
-            branch_id,
-            control.generation,
-            schema_key,
-        )
-        .await?;
-        let [base_ref] = base_refs.as_slice() else {
+        let Some((base_commit_id, live_count)) = self
+            .analytical_entity_base(branch_id, control, schema_key)
+            .await?
+        else {
             return Ok(None);
         };
-        let id = crate::live_state::entity_row_group_set_id(base_ref.commit_id, schema_key);
+        let id = crate::live_state::entity_row_group_set_id(base_commit_id, schema_key);
         let Some(manifest) =
             crate::columnar_row_group::load_row_group_manifest(&self.store, id).await?
         else {
@@ -4395,13 +4466,13 @@ where
             if row.file_id().is_some() || row.untracked() || row.global() {
                 return Ok(None);
             }
-            let Some(commit_id) = row.commit_id() else {
+            let Some(row_commit_id) = row.commit_id() else {
                 return Ok(None);
             };
             // A complete packed replacement can be newer than stale HOT
             // records in the same generation. Mirror the authoritative merge:
             // equal/newer HOT wins; older HOT is ignored.
-            if commit_id < base_ref.commit_id {
+            if row_commit_id < base_commit_id {
                 continue;
             }
             snapshot_bytes = snapshot_bytes
@@ -4418,7 +4489,107 @@ where
                 deleted: row.deleted(),
             });
         }
-        Ok(Some((id, manifest, overlay, collection.live_count)))
+        Ok(Some((id, manifest, overlay, live_count)))
+    }
+
+    async fn analytical_entity_base(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+    ) -> Result<Option<(CommitId, u64)>, LixError> {
+        let collection = load_hot_collection_control(
+            &self.store,
+            branch_id,
+            control.generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: None,
+            },
+        )
+        .await?;
+        if collection.active_generation != control.generation {
+            return Ok(None);
+        }
+        let base_refs = packed_exclusive_schema_base_refs(
+            &self.store,
+            branch_id,
+            control.generation,
+            schema_key,
+        )
+        .await?;
+        let [base_ref] = base_refs.as_slice() else {
+            return Ok(None);
+        };
+        let active_base_refs =
+            packed_current_base_refs(&self.store, branch_id, control.generation).await?;
+        if !active_base_refs
+            .iter()
+            .any(|active| active.commit_id == base_ref.commit_id)
+        {
+            return Err(head_value_error(
+                "exclusive schema index references an inactive packed current base",
+            ));
+        }
+        for active in active_base_refs
+            .iter()
+            .filter(|active| active.commit_id != base_ref.commit_id)
+        {
+            if crate::tracked_state::commit_delta_contains_schema(
+                &self.store,
+                active.commit_id,
+                schema_key,
+            )
+            .await?
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some((base_ref.commit_id, collection.live_count)))
+    }
+
+    async fn exclusive_entity_base(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+    ) -> Result<Option<(CommitId, u64)>, LixError> {
+        let collection = load_hot_collection_control(
+            &self.store,
+            branch_id,
+            control.generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: None,
+            },
+        )
+        .await?;
+        if collection.active_generation != control.generation
+            || collection.ordered_identity_digest.is_none()
+        {
+            return Ok(None);
+        }
+        let base_refs = packed_exclusive_schema_base_refs(
+            &self.store,
+            branch_id,
+            control.generation,
+            schema_key,
+        )
+        .await?;
+        let [base_ref] = base_refs.as_slice() else {
+            return Ok(None);
+        };
+        let active_base_refs =
+            packed_current_base_refs(&self.store, branch_id, control.generation).await?;
+        if !active_base_refs
+            .iter()
+            .any(|active| active.commit_id == base_ref.commit_id)
+        {
+            return Err(head_value_error(
+                "exclusive schema index references an inactive packed current base",
+            ));
+        }
+        Ok(Some((base_ref.commit_id, collection.live_count)))
     }
 
     #[cfg(test)]
@@ -5305,6 +5476,7 @@ where
         new_head: CommitId,
         schema_key: &str,
         row_count: usize,
+        entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(CommitId, bool), LixError> {
@@ -5420,6 +5592,13 @@ where
                         head_value_error("packed current-base diff count exceeds u64")
                     })?;
             }
+        }
+        if let Some(encoded) = entity_columnar_write_sets.get(&(new_head, schema_key.to_string())) {
+            crate::columnar_row_group::stage_row_group_set(
+                self.writes,
+                crate::live_state::entity_row_group_set_id(new_head, schema_key),
+                encoded,
+            )?;
         }
         self.writes.put(
             PACKED_CURRENT_BASE_SPACE,
@@ -10718,6 +10897,7 @@ mod tests {
             replacement_head,
             SCHEMA_KEY,
             1_024,
+            &crate::live_state::EntityColumnarWriteSets::new(),
             None,
             &mut coverage,
         )

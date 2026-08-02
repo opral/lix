@@ -46,7 +46,7 @@ pub(crate) fn encode_registered_entity_row_groups<'a, I>(
     rows: I,
 ) -> Result<Option<EncodedRowGroupSet>, LixError>
 where
-    I: ExactSizeIterator<Item = EntityColumnarRowRef<'a>> + Clone,
+    I: ExactSizeIterator<Item = EntityColumnarRowRef<'a>>,
 {
     if rows.len() == 0 {
         return Ok(None);
@@ -64,7 +64,7 @@ fn encode_registered_entity_row_groups_impl<'a, I>(
     rows: I,
 ) -> Result<EncodedRowGroupSet, LixError>
 where
-    I: ExactSizeIterator<Item = EntityColumnarRowRef<'a>> + Clone,
+    I: ExactSizeIterator<Item = EntityColumnarRowRef<'a>>,
 {
     let mut fields = entity_visible_fields(spec);
     fields.push(Field::new(
@@ -289,6 +289,40 @@ mod tests {
     fn derived_encoding_failure_falls_back_without_rejecting_authoritative_rows() {
         assert!(
             optional_derived_row_group_set(Err(entity_columnar_error("physical limit"))).is_none()
+        );
+    }
+
+    #[test]
+    fn any_json_property_encodes_in_registered_layout() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "json_layout",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": [
+                        "object", "array", "string", "number", "integer", "boolean", "null"
+                    ]
+                }
+            },
+            "required": ["path", "value"]
+        }))
+        .expect("spec");
+        let snapshot = json!({"path":"a","value":"value-a"});
+        let canonical = snapshot.to_string();
+        let identity = EntityPk::single("a");
+        assert!(
+            encode_registered_entity_row_groups(
+                &spec,
+                std::iter::once(EntityColumnarRowRef {
+                    entity_pk: &identity,
+                    snapshot_bytes: canonical.as_bytes(),
+                    snapshot_value: &snapshot,
+                }),
+            )
+            .expect("encode")
+            .is_some()
         );
     }
 
