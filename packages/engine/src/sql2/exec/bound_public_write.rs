@@ -2021,12 +2021,21 @@ async fn entity_delete_collection(
     if ctx.has_staged_collection_rows(&active_branch_id, scope)? {
         return Ok(None);
     }
-    let Some(previous) = ctx
+    let Some(mut previous) = ctx
         .load_collection_generation(&active_branch_id, scope)
         .await?
     else {
         return Ok(None);
     };
+    if previous.live_count == crate::collection_generation::DEFERRED_LIVE_COUNT {
+        let Some(live_count) = ctx
+            .load_exact_collection_live_count(&active_branch_id, scope)
+            .await?
+        else {
+            return Ok(None);
+        };
+        previous.live_count = live_count;
+    }
     if previous.live_count == 0 {
         return Ok(Some(SqlWriteResult::affected(0)));
     }

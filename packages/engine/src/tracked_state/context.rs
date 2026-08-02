@@ -7723,6 +7723,7 @@ mod tests {
             &controls,
             &BTreeMap::new(),
             &commit_created_at,
+            &BTreeSet::new(),
         )
         .await
         .expect("certified batch should stage");

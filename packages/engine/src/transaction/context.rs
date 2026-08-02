@@ -8122,6 +8122,30 @@ where
         Ok(Some(generation))
     }
 
+    async fn load_exact_collection_live_count(
+        &mut self,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<Option<u64>, LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let Some(control) = BranchHeadControlContext::new()
+            .reader(read.clone())
+            .load(branch_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        TrackedHeadContext::new()
+            .reader(read)
+            .exact_collection_live_count(branch_id, control.generation, scope)
+            .await
+            .map(Some)
+    }
+
     fn has_staged_collection_rows(
         &self,
         branch_id: &str,
