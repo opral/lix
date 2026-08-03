@@ -73,6 +73,12 @@ pub enum BenchCurrentStatePointMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchCurrentStateDirectoryDiffMode {
+    Flatten,
+    Merkle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchCurrentStateSparseShape {
     UnrelatedScopes,
     TouchedScope,
@@ -88,6 +94,7 @@ pub enum BenchCurrentStatePointTarget {
 pub struct BenchCurrentStatePointFixture<StorageImpl: Storage> {
     storage: StorageAdapter<StorageImpl>,
     commits: Vec<CommitId>,
+    base_manifest: CommitStateManifest,
     current_manifest: CommitStateManifest,
     encoded_key: bytes::Bytes,
     catalog_entry_count: usize,
@@ -367,6 +374,7 @@ where
         refresh_id
     };
 
+    let base_manifest = current_manifest.clone();
     let mut commits = vec![replay_base_id];
     let mut catalog_manifest_bytes = 0u64;
     let mut replay_manifest_bytes = 0u64;
@@ -533,6 +541,7 @@ where
     BenchCurrentStatePointFixture {
         storage,
         commits,
+        base_manifest,
         current_manifest,
         encoded_key,
         catalog_entry_count,
@@ -679,6 +688,102 @@ where
             }
             BenchCurrentStatePointMode::FirstParentReplay => self.read_point_by_replay(&read).await,
         }
+    }
+
+    pub async fn diff_current_state_directory(
+        &self,
+        mode: BenchCurrentStateDirectoryDiffMode,
+    ) -> [u8; 32] {
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("begin benchmark current-state directory diff");
+        let scope = super::types::CommitDeltaReplacementScope {
+            schema_key: "bench_current_state_alpha".to_string(),
+            file_id: None,
+        };
+        let left_state = super::storage::load_published_commit_state_manifest(
+            &read,
+            self.base_manifest.commit_id,
+        )
+        .await
+        .expect("load benchmark base published manifest")
+        .expect("benchmark base published manifest exists");
+        let right_state = super::storage::load_published_commit_state_manifest(
+            &read,
+            self.current_manifest.commit_id,
+        )
+        .await
+        .expect("load benchmark head published manifest")
+        .expect("benchmark head published manifest exists");
+        let left = super::storage::load_complete_current_state_part_set_from_published_manifest(
+            &read,
+            &left_state,
+            &scope,
+        )
+        .await
+        .expect("authenticate benchmark base current-state entry")
+        .expect("benchmark base scope is covered");
+        let right = super::storage::load_complete_current_state_part_set_from_published_manifest(
+            &read,
+            &right_state,
+            &scope,
+        )
+        .await
+        .expect("authenticate benchmark head current-state entry")
+        .expect("benchmark head scope is covered");
+        let windows = match mode {
+            BenchCurrentStateDirectoryDiffMode::Flatten => {
+                let left = super::current_state_part::load_current_state_part_descriptors(
+                    &read,
+                    &left.directory,
+                )
+                .await
+                .expect("flatten benchmark base directory");
+                let right = super::current_state_part::load_current_state_part_descriptors(
+                    &read,
+                    &right.directory,
+                )
+                .await
+                .expect("flatten benchmark head directory");
+                super::current_state_part::diff_current_state_part_descriptor_slices(&left, &right)
+                    .expect("compare flattened benchmark directories")
+            }
+            BenchCurrentStateDirectoryDiffMode::Merkle => {
+                super::current_state_part::diff_current_state_part_descriptors(
+                    &read,
+                    &left.directory,
+                    &right.directory,
+                )
+                .await
+                .expect("Merkle-diff benchmark directories")
+            }
+        };
+        let mut digest = blake3::Hasher::new_derive_key(
+            "lix benchmark current-state descriptor diff windows v1",
+        );
+        for window in windows {
+            digest.update(&(window.first_key.len() as u64).to_be_bytes());
+            digest.update(&window.first_key);
+            digest.update(&(window.last_key.len() as u64).to_be_bytes());
+            digest.update(&window.last_key);
+            let left = crate::storage_codec::encode(
+                "benchmark current-state descriptor diff left window",
+                &window.left,
+            )
+            .expect("encode benchmark left descriptor window");
+            let right = crate::storage_codec::encode(
+                "benchmark current-state descriptor diff right window",
+                &window.right,
+            )
+            .expect("encode benchmark right descriptor window");
+            digest.update(&(left.len() as u64).to_be_bytes());
+            digest.update(&left);
+            digest.update(&(right.len() as u64).to_be_bytes());
+            digest.update(&right);
+        }
+        *digest.finalize().as_bytes()
     }
 
     async fn read_point_by_replay(&self, read: &(impl StorageAdapterRead + ?Sized)) -> usize {
