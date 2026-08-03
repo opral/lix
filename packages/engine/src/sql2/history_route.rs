@@ -1061,6 +1061,7 @@ mod tests {
                 commit: CommitGraphNode {
                     commit_id: self.start_commit_id,
                     change_id: ChangeId::for_test_label("commit-change"),
+                    account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     generation: 0,
                     parent_commit_ids: Vec::new(),
                     created_at: commit_timestamp(),
@@ -1080,6 +1081,7 @@ mod tests {
                     commit: CommitGraphNode {
                         commit_id: self.start_commit_id,
                         change_id: ChangeId::for_test_label("commit-change"),
+                        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                         generation: 0,
                         parent_commit_ids: Vec::new(),
                         created_at: commit_timestamp(),
@@ -1112,6 +1114,7 @@ mod tests {
     fn test_change(label: &str, created_at: crate::common::LixTimestamp) -> CommitGraphChange {
         CommitGraphChange {
             id: ChangeId::for_test_label(label),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             entity_pk: EntityPk::single("entity-1"),
             schema_key: "message".to_string(),
             file_id: None,

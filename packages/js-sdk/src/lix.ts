@@ -158,6 +158,10 @@ export class Lix {
 		return this.#runOperation(() => this.binding.activeBranchId());
 	}
 
+	async activeAccountId(): Promise<string> {
+		return this.#runOperation(() => this.binding.activeAccountId());
+	}
+
 	/** Subscribes to successful branch switches made through this Lix handle. */
 	subscribeActiveBranch(listener: () => void): () => void {
 		if (typeof listener !== "function") {

@@ -81,6 +81,7 @@ where
                 CommitGraphNode {
                     commit_id: record.commit_id,
                     change_id: record.change_id,
+                    account_id: record.account_id,
                     generation: record.generation,
                     parent_commit_ids: record.parent_commit_ids,
                     created_at: record.created_at,
@@ -435,7 +436,7 @@ mod tests {
             tracked_state_rootless_rows: 0,
             tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label(&format!("{id}-change")),
-            author_account_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: timestamp(),
         }
     }

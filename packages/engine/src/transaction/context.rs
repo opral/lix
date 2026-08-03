@@ -143,27 +143,64 @@ where
         commit_ids: &BTreeSet<CommitId>,
         request: &TrackedStateScanRequest,
     ) -> Result<Vec<CertifiedHistoryChange>, LixError> {
-        Ok(
-            crate::live_state::scan_certified_history_rows(&self.store, commit_ids, request)
-                .await?
-                .into_iter()
-                .filter_map(|row| {
-                    Some(CertifiedHistoryChange {
-                        commit_id: row.commit_id?,
-                        change: MaterializedChange {
-                            id: row.change_id?.to_string(),
-                            entity_pk: row.entity_pk,
-                            schema_key: row.schema_key,
-                            file_id: row.file_id,
-                            snapshot_content: row.snapshot_content,
-                            metadata: row.metadata,
-                            created_at: row.created_at.to_string(),
-                            origin_key: None,
-                        },
+        let rows = crate::live_state::scan_certified_history_rows(&self.store, commit_ids, request)
+            .await?;
+        // Certified rows may use generated IDs that intentionally have no
+        // standalone or packed change record. Their embedded commit is the
+        // immutable authoring authority and survives inherited manifests.
+        let commit_ids = rows
+            .iter()
+            .filter_map(|row| row.commit_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let accounts_by_commit = commit_ids
+            .iter()
+            .copied()
+            .zip(crate::tracked_state::load_commit_state_manifests(&self.store, &commit_ids).await?)
+            .map(|(commit_id, manifest)| {
+                manifest
+                    .map(|manifest| (commit_id, manifest.account_id))
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "certified historical row references missing commit '{commit_id}'"
+                            ),
+                        )
                     })
-                })
-                .collect(),
-        )
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        let mut changes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (Some(commit_id), Some(change_id)) = (row.commit_id, row.change_id) else {
+                continue;
+            };
+            let account_id = accounts_by_commit
+                .get(&commit_id)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("certified historical row references missing commit '{commit_id}'"),
+                    )
+                })?
+                .clone();
+            changes.push(CertifiedHistoryChange {
+                commit_id,
+                change: MaterializedChange {
+                    id: change_id.to_string(),
+                    account_id,
+                    entity_pk: row.entity_pk,
+                    schema_key: row.schema_key,
+                    file_id: row.file_id,
+                    snapshot_content: row.snapshot_content,
+                    metadata: row.metadata,
+                    created_at: row.created_at.to_string(),
+                    origin_key: None,
+                },
+            });
+        }
+        Ok(changes)
     }
 }
 use crate::transaction::validation::{
@@ -473,6 +510,7 @@ fn record_transaction_path_index_build(descriptor_rows: usize) {
 /// helpers.
 pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     active_branch_id: String,
+    active_account_id: String,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
@@ -1302,6 +1340,7 @@ where
     /// Opens an execution-scoped staging area for SQL/provider hooks.
     async fn open(
         mode: &SessionMode,
+        active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
@@ -1401,6 +1440,7 @@ where
         Ok(OpenTransaction {
             transaction: Self {
                 active_branch_id,
+                active_account_id,
                 live_state,
                 tracked_state,
                 binary_cas,
@@ -1579,6 +1619,7 @@ where
                 &transaction.tracked_state,
                 Some(transaction.sql_schema_snapshot.as_ref()),
                 Some(runtime_functions),
+                &transaction.active_account_id,
                 &commit_parent_heads,
                 &mut read,
                 prepared_writes,
@@ -7017,6 +7058,7 @@ where
 
         let read_ctx = TransactionSqlReadExecutionContext {
             active_branch_id,
+            active_account_id: self.active_account_id.clone(),
             read_store,
             live_state,
             binary_cas,
@@ -7958,6 +8000,7 @@ fn incremental_filesystem_index_enabled() -> bool {
 
 pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::StorageRead> {
     active_branch_id: String,
+    active_account_id: String,
     read_store: SharedStorageAdapterRead<R>,
     live_state: Arc<LiveStateContext>,
     binary_cas: Arc<BinaryCasContext>,
@@ -7981,6 +8024,10 @@ where
 
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
+    }
+
+    fn active_account_id(&self) -> &str {
+        &self.active_account_id
     }
 
     fn live_state(&self) -> Arc<dyn LiveStateReader> {
@@ -8424,6 +8471,7 @@ pub(crate) struct OpenTransaction<StorageImpl: Storage + 'static = Memory> {
 
 pub(crate) async fn open_transaction<StorageImpl>(
     mode: &SessionMode,
+    active_account_id: String,
     storage: StorageAdapter<StorageImpl>,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
@@ -8439,6 +8487,7 @@ where
 {
     Transaction::open(
         mode,
+        active_account_id,
         storage,
         live_state,
         tracked_state,
@@ -8459,6 +8508,10 @@ where
 {
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
+    }
+
+    fn active_account_id(&self) -> &str {
+        &self.active_account_id
     }
 
     fn functions(&self) -> FunctionProviderHandle {
@@ -12304,6 +12357,7 @@ mod tests {
             &SessionMode::Pinned {
                 branch_id: Arc::new(std::sync::RwLock::new(GLOBAL_BRANCH_ID.to_string())),
             },
+            crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             storage.clone(),
             Arc::clone(&live_state),
             Arc::clone(&tracked_state),
@@ -12619,6 +12673,7 @@ mod tests {
             &SessionMode::Pinned {
                 branch_id: Arc::new(std::sync::RwLock::new(GLOBAL_BRANCH_ID.to_string())),
             },
+            crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             storage.clone(),
             Arc::clone(&live_state),
             Arc::new(TrackedStateContext::new()),
@@ -12911,7 +12966,7 @@ mod tests {
             schema_key: "lix_account".into(),
             file_id: None,
             snapshot: Some(TransactionJson::from_value_for_test(
-                json!({ "name": name }),
+                json!({ "name": name, "kind": "human", "status": "active" }),
             )),
             metadata: None,
             origin: None,
@@ -13071,6 +13126,7 @@ mod tests {
             &SessionMode::Pinned {
                 branch_id: Arc::new(std::sync::RwLock::new(GLOBAL_BRANCH_ID.to_string())),
             },
+            crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             storage,
             Arc::clone(&live_state),
             Arc::new(TrackedStateContext::new()),
@@ -13232,6 +13288,8 @@ mod tests {
             file_id: None,
             snapshot: Some(TransactionJson::from_value_for_test(json!({
                 "name": "Ada",
+                "kind": "human",
+                "status": "active",
             }))),
             metadata: None,
             origin: None,

@@ -133,6 +133,7 @@ enum LixCommand {
         deferred: NativeTransactionDeferred,
     },
     ActiveBranchId(NativeStringDeferred),
+    ActiveAccountId(NativeStringDeferred),
     CreateBranch {
         options: RsCreateBranchOptions,
         deferred: NativeCreateBranchDeferred,
@@ -303,6 +304,7 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<LixCommand>, error: std:
             LixCommand::ExecuteBatch { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::BeginTransaction { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
+            LixCommand::ActiveAccountId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateCheckpoint(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::Undo(deferred) => deferred.reject(to_napi_error(&error)),
@@ -380,6 +382,10 @@ fn handle_lix_command(
         LixCommand::ActiveBranchId(deferred) => {
             let result = rt.block_on(state.lix.active_branch_id());
             settle_deferred(deferred, result);
+            false
+        }
+        LixCommand::ActiveAccountId(deferred) => {
+            settle_deferred(deferred, Ok(state.lix.active_account_id().to_string()));
             false
         }
         LixCommand::CreateBranch { options, deferred } => {
@@ -522,6 +528,9 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::ActiveBranchId(deferred) => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
+        LixCommand::ActiveAccountId(deferred) => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
         LixCommand::CreateBranch { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -622,6 +631,14 @@ impl NativeLixInner {
             Self::Memory(lix) => lix.active_branch_id().await,
             Self::SQLite(lix) => lix.active_branch_id().await,
             Self::LocalFilesystem(lix, _) => lix.active_branch_id().await,
+        }
+    }
+
+    fn active_account_id(&self) -> &str {
+        match self {
+            Self::Memory(lix) => lix.active_account_id(),
+            Self::SQLite(lix) => lix.active_account_id(),
+            Self::LocalFilesystem(lix, _) => lix.active_account_id(),
         }
     }
 
@@ -1058,6 +1075,14 @@ impl NativeLix {
         let (deferred, promise): (NativeStringDeferred, Object<'env>) = env.create_deferred()?;
         self.actor
             .send_with_deferred(deferred, LixCommand::ActiveBranchId);
+        Ok(promise)
+    }
+
+    #[napi(js_name = "activeAccountId")]
+    pub fn active_account_id<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeStringDeferred, Object<'env>) = env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, LixCommand::ActiveAccountId);
         Ok(promise)
     }
 

@@ -180,6 +180,17 @@ where
         &self,
         active_branch_id: impl Into<String>,
     ) -> Result<Self, LixError> {
+        self.open_session_with_account(active_branch_id, lix_engine::ANONYMOUS_ACCOUNT_ID)
+            .await
+    }
+
+    /// Opens an independent branch-pinned session whose changes are attributed
+    /// to `active_account_id`.
+    pub async fn open_session_with_account(
+        &self,
+        active_branch_id: impl Into<String>,
+        active_account_id: impl Into<String>,
+    ) -> Result<Self, LixError> {
         if self.session.is_closed() {
             return Err(LixError::new(
                 LixError::CODE_CLOSED,
@@ -199,7 +210,10 @@ where
                 "target",
             ));
         }
-        let session = self.engine.open_session(active_branch_id).await?;
+        let session = self
+            .engine
+            .open_session_with_account(active_branch_id, active_account_id)
+            .await?;
         Ok(Self {
             engine: self.engine.clone(),
             session: Arc::new(session),
@@ -405,6 +419,35 @@ where
 
     pub async fn active_branch_id(&self) -> Result<String, LixError> {
         self.session.active_branch_id().await
+    }
+
+    pub fn active_account_id(&self) -> &str {
+        self.session.active_account_id()
+    }
+
+    /// Creates an active global account if it does not exist. Existing mutable
+    /// account fields are deliberately left unchanged.
+    pub async fn ensure_account(&self, id: &str, name: &str, kind: &str) -> Result<(), LixError> {
+        let branch_id = self.active_branch_id().await?;
+        let system = self
+            .open_session_with_account(branch_id, lix_engine::SYSTEM_ACCOUNT_ID)
+            .await?;
+        system
+            .execute(
+                "INSERT INTO lix_account_by_branch \
+                 (id, name, kind, status, lixcol_branch_id, lixcol_global, lixcol_untracked) \
+                 VALUES ($1, $2, $3, 'active', $4, true, false) \
+                 ON CONFLICT (id, lixcol_branch_id) \
+                 DO NOTHING",
+                &[
+                    Value::Text(id.to_string()),
+                    Value::Text(name.to_string()),
+                    Value::Text(kind.to_string()),
+                    Value::Text(lix_engine::GLOBAL_BRANCH_ID.to_string()),
+                ],
+            )
+            .await?;
+        system.close().await
     }
 
     pub async fn create_branch(
@@ -638,5 +681,162 @@ mod tests {
             panic!("missing branch must not open");
         };
         assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn accounts_are_mutable_and_changes_have_one_required_account() {
+        const AUTHOR_ID: &str = "01920000-0000-7000-8000-000000000601";
+        const UNUSED_ID: &str = "01920000-0000-7000-8000-000000000602";
+        let root = open_lix(OpenLixOptions::<Memory>::default())
+            .await
+            .expect("open root Lix");
+
+        root.ensure_account(AUTHOR_ID, "Ada", "human")
+            .await
+            .expect("provision author");
+        root.ensure_account(UNUSED_ID, "Unused", "human")
+            .await
+            .expect("provision unused account");
+
+        let author = root
+            .open_session_with_account(
+                root.active_branch_id().await.expect("active branch"),
+                AUTHOR_ID,
+            )
+            .await
+            .expect("open attributed session");
+        assert_eq!(author.active_account_id(), AUTHOR_ID);
+        let active = author
+            .execute("SELECT lix_active_account_id() AS account_id", &[])
+            .await
+            .expect("read SQL active account");
+        assert_eq!(
+            active.rows()[0].values(),
+            &[Value::Text(AUTHOR_ID.to_string())]
+        );
+
+        author
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('account-test', lix_json('true'))",
+                &[],
+            )
+            .await
+            .expect("write attributed change");
+        let attribution = author
+            .execute(
+                "SELECT account_id FROM lix_change WHERE schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("query attribution");
+        assert_eq!(
+            attribution
+                .rows()
+                .last()
+                .expect("attributed key-value change")
+                .values(),
+            &[Value::Text(AUTHOR_ID.to_string())]
+        );
+
+        let system = root
+            .open_session_with_account(
+                root.active_branch_id().await.expect("active branch"),
+                lix_engine::SYSTEM_ACCOUNT_ID,
+            )
+            .await
+            .expect("open system session");
+        system
+            .execute(
+                "UPDATE lix_account_by_branch SET name = 'Ada Lovelace' \
+                 WHERE id = $1 AND lixcol_branch_id = $2",
+                &[
+                    Value::Text(AUTHOR_ID.to_string()),
+                    Value::Text(lix_engine::GLOBAL_BRANCH_ID.to_string()),
+                ],
+            )
+            .await
+            .expect("rename account");
+        let account = system
+            .execute(
+                "SELECT name FROM lix_account WHERE id = $1",
+                &[Value::Text(AUTHOR_ID.to_string())],
+            )
+            .await
+            .expect("read renamed account");
+        assert_eq!(
+            account.rows()[0].values(),
+            &[Value::Text("Ada Lovelace".to_string())]
+        );
+
+        let unused = root
+            .open_session_with_account(
+                root.active_branch_id().await.expect("active branch"),
+                UNUSED_ID,
+            )
+            .await
+            .expect("open unused account session");
+
+        system
+            .execute(
+                "DELETE FROM lix_account_by_branch WHERE id = $1 AND lixcol_branch_id = $2",
+                &[
+                    Value::Text(UNUSED_ID.to_string()),
+                    Value::Text(lix_engine::GLOBAL_BRANCH_ID.to_string()),
+                ],
+            )
+            .await
+            .expect("delete unused account");
+        let error = unused
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('deleted-account', lix_json('true'))",
+                &[],
+            )
+            .await
+            .expect_err("deleted account must not keep writing through an open session");
+        assert_eq!(error.code, "LIX_ACCOUNT_NOT_FOUND");
+        let error = system
+            .execute(
+                "DELETE FROM lix_account_by_branch WHERE id = $1 AND lixcol_branch_id = $2",
+                &[
+                    Value::Text(AUTHOR_ID.to_string()),
+                    Value::Text(lix_engine::GLOBAL_BRANCH_ID.to_string()),
+                ],
+            )
+            .await
+            .expect_err("authored changes must restrict account deletion");
+        assert_eq!(error.code, "LIX_FOREIGN_KEY_VIOLATION");
+
+        system
+            .execute(
+                "UPDATE lix_account_by_branch SET status = 'disabled' \
+                 WHERE id = $1 AND lixcol_branch_id = $2",
+                &[
+                    Value::Text(AUTHOR_ID.to_string()),
+                    Value::Text(lix_engine::GLOBAL_BRANCH_ID.to_string()),
+                ],
+            )
+            .await
+            .expect("disable author");
+        let error = author
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('disabled-account', lix_json('true'))",
+                &[],
+            )
+            .await
+            .expect_err("disabled account must not keep writing through an open session");
+        assert_eq!(error.code, "LIX_ACCOUNT_DISABLED");
+
+        let error = system
+            .execute(
+                "UPDATE lix_account_by_branch SET status = 'disabled' \
+                 WHERE id = $1 AND lixcol_branch_id = $2",
+                &[
+                    Value::Text(lix_engine::ANONYMOUS_ACCOUNT_ID.to_string()),
+                    Value::Text(lix_engine::GLOBAL_BRANCH_ID.to_string()),
+                ],
+            )
+            .await
+            .expect_err("built-in accounts must remain active");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
     }
 }

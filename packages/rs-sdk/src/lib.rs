@@ -36,8 +36,8 @@ pub use lix_engine::telemetry::{
 pub use lix_engine::wasm::*;
 pub use lix_engine::wasm::{WasmLimits, WasmRuntime};
 pub use lix_engine::{
-    Blob, CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt,
-    CreateBranchReceipt as CreateBranchResult, CreateCheckpointReceipt,
+    ANONYMOUS_ACCOUNT_ID, Blob, CommitResult, CoreProjection, CreateBranchOptions,
+    CreateBranchReceipt, CreateBranchReceipt as CreateBranchResult, CreateCheckpointReceipt,
     CreateCheckpointReceipt as CreateCheckpointResult, ExecuteBatchStatement, ExecuteIdempotency,
     ExecuteOptions, ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition,
     FILE_UPLOAD_PART_BYTES, FileRead, FileUploadProgress, GLOBAL_BRANCH_ID, GetManyRequest,
@@ -46,14 +46,14 @@ pub use lix_engine::{
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeBranchReceipt as MergeBranchResult,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
     MutationIdentity, ObserveEvent, ObserveEvents, ProjectedValue, PutBatch, ReadDurability,
-    ReadEntry, ReadOptions, RedoReceipt, RequestBlobSpliceProvenance, Row, ScanChunk, ScanOptions,
-    SpaceId, SqlQueryResult, SqlScriptPlan, SqlScriptStatement, Storage, StorageConformanceReport,
-    StorageConformanceResult, StorageConformanceStatus, StorageConformanceTest, StorageError,
-    StorageFactory, StorageFixture, StorageRead, StorageSpace, StorageTestConfig, StorageWrite,
-    StoredValue, SwitchBranchOptions, SwitchBranchReceipt,
-    SwitchBranchReceipt as SwitchBranchResult, TryFromValue, UndoReceipt, Value, ValueSemantics,
-    VerifiedRequestBlob, WireValue, WriteOptions, WriteStats, parse_sql_script,
-    run_storage_conformance, validate_lix_path_segment,
+    ReadEntry, ReadOptions, RedoReceipt, RequestBlobSpliceProvenance, Row, SYSTEM_ACCOUNT_ID,
+    ScanChunk, ScanOptions, SpaceId, SqlQueryResult, SqlScriptPlan, SqlScriptStatement, Storage,
+    StorageConformanceReport, StorageConformanceResult, StorageConformanceStatus,
+    StorageConformanceTest, StorageError, StorageFactory, StorageFixture, StorageRead,
+    StorageSpace, StorageTestConfig, StorageWrite, StoredValue, SwitchBranchOptions,
+    SwitchBranchReceipt, SwitchBranchReceipt as SwitchBranchResult, TryFromValue, UndoReceipt,
+    Value, ValueSemantics, VerifiedRequestBlob, WireValue, WriteOptions, WriteStats,
+    parse_sql_script, run_storage_conformance, validate_lix_path_segment,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, SQLiteFixture, SQLiteOptions};

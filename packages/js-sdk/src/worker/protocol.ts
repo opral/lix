@@ -42,6 +42,7 @@ export type WorkerOperation =
 	| { kind: "transaction.commit"; transactionId: number }
 	| { kind: "transaction.rollback"; transactionId: number }
 	| { kind: "activeBranchId" }
+	| { kind: "activeAccountId" }
 	| { kind: "clientState.entries" }
 	| { kind: "clientState.get"; key: string }
 	| { kind: "clientState.set"; key: string; value: JsonValue }

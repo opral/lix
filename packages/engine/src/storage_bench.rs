@@ -29,7 +29,7 @@ fn stage_bench_commit_deltas(
             commit_change_id: crate::changelog::ChangeId::for_test_label(&format!(
                 "{commit_id}:bench-commit"
             )),
-            author_account_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
             replay_debt: crate::tracked_state::CommitStateReplayDebt {
                 depth: 1,

@@ -5,6 +5,7 @@ pub(crate) fn test_change_record() -> ChangeRecord {
     ChangeRecord {
         format_version: 1,
         change_id: ChangeId::for_test_label("change-1"),
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         schema_key: "message".to_string(),
         entity_pk: EntityPk::single("entity-1"),
         file_id: Some("file-1".to_string()),

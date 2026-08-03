@@ -186,6 +186,7 @@ pub(crate) mod option_id_string {
 }
 
 /// A length-prefixed sequence of [`id_string`] values.
+#[cfg(test)]
 pub(crate) mod id_string_seq {
     use musli::de::SequenceDecoder;
     use musli::en::SequenceEncoder;

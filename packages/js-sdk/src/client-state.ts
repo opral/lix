@@ -4,6 +4,7 @@ import type { JsonValue, LixSnapshotStorage } from "./types.js";
 import { Value } from "./value.js";
 
 export const ACTIVE_BRANCH_CLIENT_STATE_KEY = "lix_active_branch_id";
+export const ACTIVE_ACCOUNT_CLIENT_STATE_KEY = "lix_active_account_id";
 const STORED_CLIENT_STATE_HEADER = "lix-client-state-v1\n";
 
 export type LixClientState = {

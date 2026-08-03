@@ -79,9 +79,7 @@ test("createCheckpoint returns the new active head through browser WASM", async 
 			["checkpoint-test", "working"],
 		);
 		const before = (
-			await lix.execute(
-				"SELECT lix_active_branch_commit_id() AS commit_id",
-			)
+			await lix.execute("SELECT lix_active_branch_commit_id() AS commit_id")
 		).rows[0]?.get("commit_id");
 
 		const checkpoint = await lix.createCheckpoint();
@@ -89,9 +87,7 @@ test("createCheckpoint returns the new active head through browser WASM", async 
 		expect(checkpoint.commitId).not.toBe(before);
 		expect(
 			(
-				await lix.execute(
-					"SELECT lix_active_branch_commit_id() AS commit_id",
-				)
+				await lix.execute("SELECT lix_active_branch_commit_id() AS commit_id")
 			).rows[0]?.get("commit_id"),
 		).toBe(checkpoint.commitId);
 	} finally {
@@ -137,6 +133,7 @@ test("remote client state and active branch survive reopen without reaching the 
 	const sessions = new Map<string, string>();
 	const availableBranches = new Set(["main", "draft"]);
 	const initialBranchRequests: Array<string | null> = [];
+	const initialAccountRequests: Array<string | null> = [];
 	const requestBodies: string[] = [];
 	let nextSession = 0;
 	const remoteFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -147,6 +144,7 @@ test("remote client state and active branch survive reopen without reaching the 
 			const requestedBranch = url.searchParams.get("activeBranchId");
 			if (!suppliedSession) {
 				initialBranchRequests.push(requestedBranch);
+				initialAccountRequests.push(url.searchParams.get("activeAccountId"));
 				if (requestedBranch && !availableBranches.has(requestedBranch)) {
 					return Response.json(
 						{
@@ -165,8 +163,9 @@ test("remote client state and active branch survive reopen without reaching the 
 				sessions.set(sessionId, requestedBranch ?? "main");
 			}
 			return Response.json({
-				protocolVersion: 1,
+				protocolVersion: 2,
 				activeBranchId: sessions.get(sessionId),
+				activeAccountId: "00000000-0000-7000-8000-000000000002",
 				sessionId,
 			});
 		}
@@ -225,6 +224,13 @@ test("remote client state and active branch survive reopen without reaching the 
 			null,
 			"main",
 		]);
+		expect(initialAccountRequests).toEqual([
+			null,
+			"00000000-0000-7000-8000-000000000002",
+			"00000000-0000-7000-8000-000000000002",
+			"00000000-0000-7000-8000-000000000002",
+			"00000000-0000-7000-8000-000000000002",
+		]);
 	} finally {
 		await reopenedFallback.close();
 	}
@@ -247,15 +253,15 @@ test("a failed client snapshot save does not reject a completed remote branch sw
 		const pathname = new URL(request.url).pathname;
 		if (pathname.endsWith("/lix/v1/")) {
 			return Response.json({
-				protocolVersion: 1,
+				protocolVersion: 2,
 				activeBranchId,
+				activeAccountId: "00000000-0000-7000-8000-000000000002",
 				sessionId: "save-failure-session",
 			});
 		}
 		if (pathname.endsWith("/branch/switch")) {
-			activeBranchId = (
-				(await request.json()) as { branchId: string }
-			).branchId;
+			activeBranchId = ((await request.json()) as { branchId: string })
+				.branchId;
 			return Response.json({ branchId: activeBranchId });
 		}
 		if (pathname.endsWith("/lix/v1/session")) {
@@ -363,10 +369,10 @@ test("a committed transaction releases its lifecycle when snapshot saving fails"
 	};
 	const lix = await openLix({ storage });
 	const tx = await lix.beginTransaction();
-	await tx.execute(
-		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-		["committed-before-save", true],
-	);
+	await tx.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
+		"committed-before-save",
+		true,
+	]);
 
 	failSaves = true;
 	await expect(tx.commit()).rejects.toMatchObject({

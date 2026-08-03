@@ -14,6 +14,7 @@ use crate::{LixError, parse_row_metadata};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaterializedChange {
     pub(crate) id: String,
+    pub(crate) account_id: String,
     pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -63,6 +64,7 @@ where
         json_reader,
         crate::commit_graph::CommitGraphChange {
             id: change.change_id,
+            account_id: change.account_id,
             entity_pk: change.entity_pk,
             schema_key: change.schema_key,
             file_id: change.file_id,
@@ -101,6 +103,7 @@ where
     };
     Ok(MaterializedChange {
         id: change.id.to_string(),
+        account_id: change.account_id,
         entity_pk: change.entity_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
@@ -165,6 +168,7 @@ mod tests {
     fn change(snapshot: JsonSlot, metadata: JsonSlot) -> CommitGraphChange {
         CommitGraphChange {
             id: ChangeId::for_test_label("change-projection"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             entity_pk: EntityPk::single("entity-1"),
             schema_key: "example".to_string(),
             file_id: Some("file-1".to_string()),

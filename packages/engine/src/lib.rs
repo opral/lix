@@ -120,3 +120,9 @@ pub use storage::{
 
 /// Reserved high UUID sentinel for repository-global state.
 pub const GLOBAL_BRANCH_ID: &str = "ffffffff-ffff-7fff-bfff-ffffffffffff";
+
+/// Fixed author for engine-owned initialization and maintenance changes.
+pub const SYSTEM_ACCOUNT_ID: &str = "00000000-0000-7000-8000-000000000001";
+
+/// Fixed author used when a host opens a session without an authenticated account.
+pub const ANONYMOUS_ACCOUNT_ID: &str = "00000000-0000-7000-8000-000000000002";

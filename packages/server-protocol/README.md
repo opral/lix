@@ -55,8 +55,15 @@ route to another instance intentionally makes the old session return `410`.
 An initial `GET /lix/v1` without `Lix-Session-Id` opens an independent session
 pinned to the root workspace's current branch. Supplying
 `?activeBranchId=<branch-id>` instead pins the new session to that existing
-branch. Its response contains `protocolVersion`, `activeBranchId`, and a
-cryptographically random `sessionId`. The client sends that value as
+branch. Supplying `activeAccountId` attributes every change from the new
+session to that existing active global account. The query parameter is a
+trusted-deployment convenience, not authentication. Internet-facing hosts
+must derive the account from authentication and attach
+`TrustedActiveAccountId` as an in-process request extension on every request;
+it overrides the creation query and rejects later use of the session by a
+different account. Omitting both selects the built-in anonymous account. The
+response contains `protocolVersion`, `activeBranchId`, `activeAccountId`,
+`activeAccountId`, and a cryptographically random `sessionId`. The client sends that value as
 `Lix-Session-Id` on every later request, including a resumed handshake and
 observation streams. Switching one pinned session never changes another
 session or the root workspace selector.

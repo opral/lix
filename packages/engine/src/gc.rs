@@ -612,7 +612,7 @@ where
         if topology.generation != commit.generation
             || topology.parent_commit_ids != commits.parent_commit_ids(commit)
             || topology.commit_change_id != commit.change_id
-            || topology.author_account_ids != commit.author_account_ids
+            || topology.account_id != commit.account_id
             || topology.created_at != commit.created_at
             || manifest_rootless != commit.tracked_state_rootless
             || topology.replay_debt.depth != commit.tracked_state_rootless_depth
@@ -1126,7 +1126,7 @@ struct GcCommitInventoryEntry {
     tracked_state_rootless_rows: u64,
     tracked_state_rootless_bytes: u64,
     change_id: ChangeId,
-    author_account_ids: Vec<String>,
+    account_id: String,
     created_at: crate::common::LixTimestamp,
     parent_start: usize,
     parent_len: usize,
@@ -1196,7 +1196,7 @@ where
                 tracked_state_rootless_rows: commit.tracked_state_rootless_rows,
                 tracked_state_rootless_bytes: commit.tracked_state_rootless_bytes,
                 change_id: commit.change_id,
-                author_account_ids: commit.author_account_ids,
+                account_id: commit.account_id,
                 created_at: commit.created_at,
                 parent_start,
                 parent_len,
@@ -1739,7 +1739,7 @@ mod tests {
             generation: live.generation,
             parent_commit_ids: live.parent_commit_ids.clone(),
             commit_change_id: live.change_id,
-            author_account_ids: live.author_account_ids.clone(),
+            account_id: live.account_id.clone(),
             created_at: live.created_at,
             replay_debt: CommitStateReplayDebt {
                 depth: live.tracked_state_rootless_depth,
@@ -1815,7 +1815,7 @@ mod tests {
                 tracked_state_rootless_rows: 1,
                 tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-source-header"),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
@@ -1828,7 +1828,7 @@ mod tests {
                 tracked_state_rootless_rows: 1,
                 tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-live-header"),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
@@ -1841,7 +1841,7 @@ mod tests {
                 tracked_state_rootless_rows: 1,
                 tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-authority-header"),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
@@ -1854,7 +1854,7 @@ mod tests {
                 tracked_state_rootless_rows: 2,
                 tracked_state_rootless_bytes: 2,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-head-header"),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
         ];
@@ -2022,7 +2022,7 @@ mod tests {
                 tracked_state_rootless_rows: 1,
                 tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("authority-gc-live-parent-header"),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
@@ -2035,7 +2035,7 @@ mod tests {
                 tracked_state_rootless_rows: 2,
                 tracked_state_rootless_bytes: 2,
                 change_id: ChangeId::for_test_label("authority-gc-live-head-header"),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
             CommitRecord {
@@ -2048,7 +2048,7 @@ mod tests {
                 tracked_state_rootless_rows: 1,
                 tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("authority-gc-dead-header"),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
             },
         ];
@@ -2423,6 +2423,7 @@ mod tests {
         ChangeRecord {
             format_version: 2,
             change_id: ChangeId::for_test_label(change_label),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             entity_pk: EntityPk::single(entity_label),
             schema_key: "authority_gc".to_string(),
             file_id: None,
@@ -2447,7 +2448,7 @@ mod tests {
             tracked_state_rootless_rows: 0,
             tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label(&format!("{label}-header")),
-            author_account_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::expect_parse(
                 "authority GC record timestamp",
                 "2026-01-01T00:00:00.000Z",
@@ -2493,7 +2494,7 @@ mod tests {
                 generation: record.generation,
                 parent_commit_ids: record.parent_commit_ids.clone(),
                 commit_change_id: record.change_id,
-                author_account_ids: record.author_account_ids.clone(),
+                account_id: record.account_id.clone(),
                 created_at: record.created_at,
                 replay_debt: CommitStateReplayDebt {
                     depth: record.tracked_state_rootless_depth,

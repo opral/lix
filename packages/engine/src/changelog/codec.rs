@@ -21,6 +21,7 @@ pub(crate) fn append_commit_record(
 pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, LixError> {
     encode_change_record_ref(&ChangeRecordRef {
         format_version: record.format_version,
+        account_id: &record.account_id,
         schema_key: &record.schema_key,
         entity_pk: &record.entity_pk,
         file_id: record.file_id.as_deref(),
@@ -39,6 +40,7 @@ pub(crate) fn append_change_record(
         bytes,
         &ChangeRecordRef {
             format_version: record.format_version,
+            account_id: &record.account_id,
             schema_key: &record.schema_key,
             entity_pk: &record.entity_pk,
             file_id: record.file_id.as_deref(),
@@ -56,6 +58,7 @@ pub(crate) fn encode_transaction_change_record(
 ) -> Result<Vec<u8>, LixError> {
     encode_change_record_ref(&ChangeRecordRef {
         format_version: record.format_version,
+        account_id: record.account_id,
         schema_key: record.schema_key,
         entity_pk: record.entity_pk,
         file_id: record.file_id,
@@ -74,6 +77,7 @@ pub(crate) fn append_transaction_change_record(
         bytes,
         &ChangeRecordRef {
             format_version: record.format_version,
+            account_id: record.account_id,
             schema_key: record.schema_key,
             entity_pk: record.entity_pk,
             file_id: record.file_id,
@@ -107,6 +111,7 @@ pub(crate) fn decode_change_record(
     Ok(ChangeRecord {
         format_version: view.format_version,
         change_id,
+        account_id: view.account_id.to_string(),
         schema_key: view.schema_key.to_string(),
         entity_pk: view.entity_pk,
         file_id: view.file_id,
@@ -129,6 +134,7 @@ mod tests {
         ChangeRecord {
             format_version: 1,
             change_id: ChangeId::for_test_label("roundtrip-change"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             schema_key: "schema-\u{00e9}\u{4e2d}".to_string(),
             entity_pk: EntityPk::from_parts(vec!["part-a".to_string(), "part-b".to_string()])
                 .expect("entity pk should build"),

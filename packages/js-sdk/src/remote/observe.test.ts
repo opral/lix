@@ -693,8 +693,9 @@ test("closing Lix stops observations before an earlier finite request settles", 
 
 function handshake(): Response {
 	return Response.json({
-		protocolVersion: 1,
+		protocolVersion: 2,
 		activeBranchId: "main-id",
+		activeAccountId: "00000000-0000-7000-8000-000000000002",
 		sessionId: "session-1",
 	});
 }

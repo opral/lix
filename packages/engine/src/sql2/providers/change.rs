@@ -324,6 +324,7 @@ impl LixChangeRow {
 pub(super) fn lix_change_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
+        Field::new("account_id", DataType::Utf8, false),
         json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
@@ -337,6 +338,7 @@ pub(super) fn lix_change_schema() -> SchemaRef {
 static LIX_CHANGE_COLS: ColumnTable<MaterializedChange> = ColumnTable {
     columns: &[
         ("id", Col::Utf8(|row| Some(row.id.as_str()))),
+        ("account_id", Col::Utf8(|row| Some(row.account_id.as_str()))),
         (
             "entity_pk",
             Col::Utf8Owned(|row| {

@@ -8,6 +8,7 @@ use crate::entity_pk::EntityPk;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChange {
     pub(crate) id: ChangeId,
+    pub(crate) account_id: String,
     pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -26,6 +27,7 @@ pub(crate) struct CommitGraphChange {
 pub(crate) struct CommitGraphNode {
     pub(crate) commit_id: CommitId,
     pub(crate) change_id: ChangeId,
+    pub(crate) account_id: String,
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
     pub(crate) created_at: LixTimestamp,

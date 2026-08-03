@@ -4,7 +4,7 @@ import type {
 } from "../binding-types.js";
 import type { NativeLixValue } from "../value.js";
 
-export const REMOTE_PROTOCOL_VERSION = 1;
+export const REMOTE_PROTOCOL_VERSION = 2;
 export const REMOTE_PROTOCOL_PATH = "/lix/v1/";
 
 export type WireValue =
@@ -30,11 +30,13 @@ export type WireRequestValue = WireValue | WireRequestBlobSplice;
 export type RemoteHandshake = {
 	protocolVersion: number;
 	activeBranchId: string;
+	activeAccountId: string;
 	sessionId: string;
 };
 
 export type RemoteHandshakeRequest = {
 	activeBranchId?: string;
+	activeAccountId?: string;
 };
 
 export type RemoteExecuteRequest = {
@@ -235,6 +237,12 @@ export function decodeHandshake(value: unknown): RemoteHandshake {
 		throw protocolError("remote handshake requires activeBranchId");
 	}
 	if (
+		typeof handshake.activeAccountId !== "string" ||
+		handshake.activeAccountId.length === 0
+	) {
+		throw protocolError("remote handshake requires activeAccountId");
+	}
+	if (
 		typeof handshake.sessionId !== "string" ||
 		!/^[\x21-\x7e]{1,256}$/.test(handshake.sessionId)
 	) {
@@ -243,6 +251,7 @@ export function decodeHandshake(value: unknown): RemoteHandshake {
 	return {
 		protocolVersion: REMOTE_PROTOCOL_VERSION,
 		activeBranchId: handshake.activeBranchId,
+		activeAccountId: handshake.activeAccountId,
 		sessionId: handshake.sessionId,
 	};
 }

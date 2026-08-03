@@ -132,6 +132,7 @@ pub(crate) enum SessionMode {
 #[expect(missing_debug_implementations)]
 pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) mode: SessionMode,
+    pub(super) active_account_id: Arc<str>,
     pub(super) storage: StorageAdapter<StorageImpl>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) tracked_state: Arc<TrackedStateContext>,
@@ -155,6 +156,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     pub(crate) async fn open_workspace(
+        active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
@@ -180,6 +182,7 @@ where
             SessionMode::Workspace {
                 branch_id: Arc::new(RwLock::new(branch_id)),
             },
+            active_account_id,
             storage,
             live_state,
             tracked_state,
@@ -199,6 +202,7 @@ where
 
     pub(crate) async fn open(
         active_branch_id: String,
+        active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
@@ -218,6 +222,7 @@ where
             SessionMode::Pinned {
                 branch_id: Arc::new(RwLock::new(active_branch_id)),
             },
+            active_account_id,
             storage,
             live_state,
             tracked_state,
@@ -237,6 +242,7 @@ where
 
     pub(super) fn new(
         mode: SessionMode,
+        active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
@@ -254,6 +260,7 @@ where
     ) -> Self {
         Self::new_with_transaction_manager(
             mode,
+            active_account_id,
             storage,
             live_state,
             tracked_state,
@@ -275,6 +282,7 @@ where
 
     pub(super) fn new_with_transaction_manager(
         mode: SessionMode,
+        active_account_id: String,
         storage: StorageAdapter<StorageImpl>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
@@ -294,6 +302,7 @@ where
     ) -> Self {
         Self {
             mode,
+            active_account_id: Arc::from(active_account_id),
             storage,
             live_state,
             tracked_state,
@@ -323,6 +332,11 @@ where
 
     pub fn is_closed(&self) -> bool {
         self.transaction_manager.is_closed()
+    }
+
+    /// Returns the immutable account that authors every change from this session.
+    pub fn active_account_id(&self) -> &str {
+        &self.active_account_id
     }
 
     #[doc(hidden)]
@@ -526,6 +540,7 @@ where
         let _deterministic_runtime_guard = self.lock_deterministic_runtime().await;
         let opened = Box::pin(open_transaction(
             &self.mode,
+            self.active_account_id.to_string(),
             self.storage.clone(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
@@ -623,6 +638,7 @@ pub(super) fn closed_error() -> LixError {
 /// has no write stager.
 pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::StorageRead> {
     pub(super) active_branch_id: &'a str,
+    pub(super) active_account_id: &'a str,
     pub(super) read_store: SharedStorageAdapterRead<R>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
@@ -665,6 +681,10 @@ where
 
     fn active_branch_id(&self) -> &str {
         self.active_branch_id
+    }
+
+    fn active_account_id(&self) -> &str {
+        self.active_account_id
     }
 
     #[expect(trivial_casts)]

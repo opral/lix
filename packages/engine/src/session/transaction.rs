@@ -61,6 +61,7 @@ where
         };
         let mut opened = match open_transaction(
             &self.mode,
+            self.active_account_id.to_string(),
             self.storage.clone(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),

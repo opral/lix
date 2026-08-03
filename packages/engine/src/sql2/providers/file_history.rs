@@ -2245,6 +2245,7 @@ mod tests {
         HistoryEntry {
             change: MaterializedChange {
                 id: format!("change-{file_id}-{depth}"),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 entity_pk: EntityPk::single(file_id),
                 schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 file_id: Some(file_id.to_string()),

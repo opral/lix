@@ -96,6 +96,9 @@ pub(crate) trait SqlExecutionContext: Sync {
     type ReadStore: StorageAdapterRead + Clone + Send + Sync + 'static;
 
     fn active_branch_id(&self) -> &str;
+    fn active_account_id(&self) -> &str {
+        crate::ANONYMOUS_ACCOUNT_ID
+    }
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
     /// Supplies the committed tracked-head entity snapshot capability when the
     /// read context can prove it is scoped to one immutable storage snapshot.
@@ -149,6 +152,9 @@ pub(crate) trait SqlExecutionContext: Sync {
 #[async_trait]
 pub(crate) trait SqlWriteExecutionContext: Send {
     fn active_branch_id(&self) -> &str;
+    fn active_account_id(&self) -> &str {
+        crate::ANONYMOUS_ACCOUNT_ID
+    }
     fn functions(&self) -> FunctionProviderHandle;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
     fn public_catalog(&self) -> Result<Arc<PublicCatalog>, LixError> {
@@ -341,6 +347,10 @@ impl SqlWriteContext {
 
     pub(crate) fn active_branch_id(&self) -> String {
         unsafe { self.ptr.0.as_ref().active_branch_id().to_string() }
+    }
+
+    pub(crate) fn active_account_id(&self) -> String {
+        unsafe { self.ptr.0.as_ref().active_account_id().to_string() }
     }
 
     pub(crate) fn plugin_host(&self) -> PluginRuntimeHost {

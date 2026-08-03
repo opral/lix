@@ -4,6 +4,15 @@
   "x-lix-primary-key": [
     "/id"
   ],
+  "x-lix-foreign-keys": [
+    {
+      "properties": ["/account_id"],
+      "references": {
+        "schemaKey": "lix_account",
+        "properties": ["/id"]
+      }
+    }
+  ],
   "type": "object",
   "properties": {
     "id": {
@@ -11,6 +20,11 @@
       "format": "uuid",
       "x-lix-default": "lix_uuid_v7()",
       "description": "Stable identifier for this change."
+    },
+    "account_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Account whose active session authored this change."
     },
     "entity_pk": {
       "type": "array",
@@ -62,6 +76,7 @@
   },
   "required": [
     "id",
+    "account_id",
     "entity_pk",
     "schema_key",
     "file_id",
