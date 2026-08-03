@@ -7969,7 +7969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_exact_read_requires_certified_rows_to_exist_in_root() {
+    async fn historical_exact_read_uses_self_contained_commit_payload() {
         const COMMIT_LABEL: &str = "certified-historical-exact";
         const BRANCH_ID: &str = "certified-branch";
         const FILE_ID: &str = "certified.csv";
@@ -8098,12 +8098,17 @@ mod tests {
                     created_at: control.created_at,
                     updated_at: control.created_at,
                 },
-                snapshot: crate::json_store::JsonSlotRef::None,
+                snapshot: crate::json_store::JsonSlotRef::Inline(
+                    certified[0]
+                        .snapshot_content
+                        .as_ref()
+                        .expect("certified fixture has a snapshot")
+                        .as_str(),
+                ),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: Some("certified-origin"),
                 base_coordinate: None,
                 authored: true,
-                certified: true,
             }],
         )
         .expect("certified commit delta should stage");
@@ -8119,21 +8124,17 @@ mod tests {
             .expect("certified locator read should open");
         let inventory = crate::tracked_state::scan_commit_delta_inventory(&read)
             .await
-            .expect("certified inventory should hydrate");
+            .expect("authored inventory should load");
         let inventory_member = inventory
             .commits
             .get(&commit_id)
             .and_then(|entry| entry.members.first())
-            .expect("certified inventory member should exist");
+            .expect("authored inventory member should exist");
         assert!(inventory_member.change.snapshot.is_some());
-        assert!(
-            inventory_member.is_certified_payload_ref(),
-            "hydration must preserve certified wire provenance for GC re-encoding",
-        );
         let canonical = crate::tracked_state::load_change_record_by_id(&read, durable_change_id)
             .await
-            .expect("certified locator should hydrate")
-            .expect("certified locator should exist");
+            .expect("authored locator should load")
+            .expect("authored locator should exist");
         assert!(canonical.snapshot.is_some());
         assert_eq!(canonical.origin_key.as_deref(), Some("certified-origin"));
         drop(read);

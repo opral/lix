@@ -1207,9 +1207,9 @@ pub(crate) async fn scan_certified_history_rows(
     Ok(builder.finish().into_rows())
 }
 
-/// Expands only the identity metadata needed to publish a certified packet in
-/// an immutable tracked-state root. Payload bytes remain owned by the packet
-/// and are not copied into ordinary change records.
+/// Expands the authoritative rows needed to publish a host-produced packet.
+/// Commit deltas are self-contained, so the packet is decoded once here and
+/// never becomes a second durable payload authority.
 pub(crate) fn materialize_certified_root_rows(
     branch_id: &str,
     file_id: &str,
@@ -1279,7 +1279,7 @@ pub(crate) fn materialize_certified_root_rows(
         branch_id,
         &request,
         &filter_index,
-        false,
+        true,
         None,
         &mut builder,
     )?;

@@ -516,7 +516,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &tracked_roots,
         &commit_rows,
         &selected_change_records,
-        &host_certified_file_schemas,
         &certified_packet_root_rows,
         &insert_selection,
         &replacement_generations,
@@ -1432,7 +1431,6 @@ fn tracked_commit_delta_from_state_row(
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
         base_coordinate: None,
         authored: true,
-        certified: false,
     })
 }
 
@@ -1481,7 +1479,6 @@ fn tracked_commit_delta_from_certified_root_row(
         origin_key: None,
         base_coordinate: None,
         authored: true,
-        certified: row.snapshot_content.is_none() && row.metadata.is_none(),
     })
 }
 
@@ -1538,7 +1535,6 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
         origin_key: record.and_then(|record| record.origin_key.as_deref()),
         base_coordinate: None,
         authored: false,
-        certified: false,
     })
 }
 
@@ -1771,7 +1767,6 @@ async fn stage_tracked_commit_delta_index(
     tracked_roots: &[PendingTrackedRoot],
     commit_rows: &[FinalizedCommitRow],
     selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
-    host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
     insert_selection: &PreparedInsertSelection,
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
@@ -1847,15 +1842,6 @@ async fn stage_tracked_commit_delta_index(
                                 row_index: location.row_index,
                             },
                         );
-                    if replacement_generation.is_none() {
-                        delta.certified = root.publish_head
-                            && host_certified_batch_owns_live_row(
-                                row,
-                                &root.branch_id,
-                                root.commit_id,
-                                host_certified_file_schemas,
-                            );
-                    }
                     Ok(delta)
                 };
                 let order_certified = state_rows.certified_tracked_keys_strictly_ordered()
@@ -1920,13 +1906,6 @@ async fn stage_tracked_commit_delta_index(
                         group_index: location.group_index,
                         row_index: location.row_index,
                     },
-                );
-            delta.certified = root.publish_head
-                && host_certified_batch_owns_live_row(
-                    row,
-                    &root.branch_id,
-                    root.commit_id,
-                    host_certified_file_schemas,
                 );
             deltas.push(delta);
         }
@@ -5760,7 +5739,6 @@ mod tests {
             &roots,
             &commits,
             &HashMap::new(),
-            &BTreeMap::new(),
             &certified_rows,
             &PreparedInsertSelection::new(),
             &BTreeMap::new(),

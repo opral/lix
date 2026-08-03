@@ -77,9 +77,6 @@ pub(crate) struct TrackedStateCommitDeltaRef<'a> {
     pub(crate) origin_key: Option<&'a str>,
     pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
     pub(crate) authored: bool,
-    /// The durable payload is already present in a host-certified batch for
-    /// this commit and identity.
-    pub(crate) certified: bool,
 }
 
 /// One ordered tracked-root mutation with its insert-collision contract.

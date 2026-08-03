@@ -316,7 +316,6 @@ where
                 origin_key: None,
                 base_coordinate: None,
                 authored: true,
-                certified: false,
             }],
         )?;
     }
@@ -628,8 +627,6 @@ pub struct CommitDeltaLayoutAccounting {
     pub authored_members: usize,
     pub selected_members: usize,
     pub selected_tombstones: usize,
-    pub certified_members: usize,
-    pub selected_certified_members: usize,
     pub selected_direct_addresses: usize,
     pub selected_source_commits: usize,
     pub dominant_selected_source_members: usize,
@@ -690,13 +687,6 @@ where
         let locator = crate::tracked_state::decode_change_locator(change_id, &value)?;
         locator_commit_by_change_id.insert(change_id, locator.commit_id);
     }
-    let certified_change_ids = inventory
-        .commits
-        .values()
-        .flat_map(|entry| &entry.members)
-        .filter(|member| member.is_certified_payload_ref())
-        .map(|member| member.value.change_id)
-        .collect::<std::collections::BTreeSet<_>>();
     let authored_commit_by_change_id = inventory
         .commits
         .iter()
@@ -727,19 +717,6 @@ where
                 .len()
                 .saturating_sub(authored_members)
                 .saturating_sub(selected_members);
-            let certified_members = entry
-                .members
-                .iter()
-                .filter(|member| member.is_certified_payload_ref())
-                .count();
-            let selected_certified_members = entry
-                .members
-                .iter()
-                .filter(|member| {
-                    member.is_selected_payload_ref()
-                        && certified_change_ids.contains(&member.value.change_id)
-                })
-                .count();
             let selected_direct_addresses = entry
                 .members
                 .iter()
@@ -786,8 +763,6 @@ where
                 authored_members,
                 selected_members,
                 selected_tombstones,
-                certified_members,
-                selected_certified_members,
                 selected_direct_addresses,
                 selected_source_commits: selected_members_by_source.len(),
                 dominant_selected_source_members: selected_members_by_source

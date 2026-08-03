@@ -739,7 +739,6 @@ where
                     || (borrowed_source_is_swept && !member.is_selected_tombstone())
                     || (dead_packed_change_ids.contains(&member.value.change_id)
                         && member.is_selected_payload_ref()),
-                certified: member.is_certified_payload_ref(),
             })
             .collect::<Vec<_>>();
         promoted_locators.extend(authoritative_promoted_locators(
@@ -2046,7 +2045,6 @@ mod tests {
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
-                certified: false,
             })
             .collect()
     }
