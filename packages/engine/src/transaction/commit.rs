@@ -21,7 +21,9 @@ use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
-use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
+use crate::json_store::{
+    JSON_INLINE_MAX_BYTES, JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
+};
 use crate::live_state::{
     HotTrackedSnapshot, MaterializedLiveStateRow, TrackedHeadContext, TrackedWorkingDiffEpoch,
     WorkingDiffIndexCoverage, stage_delete_tracked_working_diff_epoch,
@@ -453,6 +455,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             ));
         }
     }
+    let certified_packet_json_refs = certified_root_json_refs(&certified_packet_root_rows);
     let checkpoint_epochs = checkpoint_epoch_bindings(&prepared_writes.checkpoint_publications)?;
     // The current-state protocol removes the automatic mutable branch-ref
     // row for a normal branch-head advance, but `lix_change` remains an
@@ -516,8 +519,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &tracked_roots,
         &commit_rows,
         &selected_change_records,
-        &host_certified_file_schemas,
         &certified_packet_root_rows,
+        &certified_packet_json_refs,
         &insert_selection,
         &replacement_generations,
     )
@@ -565,7 +568,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let selected_change_payloads =
         materialize_selected_change_payloads(read, &selected_change_records).await?;
 
-    stage_state_json_payloads(&mut json_writer, &mut writes, &state_rows)?;
+    stage_state_json_payloads(
+        &mut json_writer,
+        &mut writes,
+        &state_rows,
+        &certified_packet_root_rows,
+        &certified_packet_json_refs,
+    )?;
 
     let branch_control_observations =
         observe_branch_head_controls(read, &tracked_roots, &state_rows, &engine_rows).await?;
@@ -801,13 +810,66 @@ fn stage_state_json_payloads(
     json_writer: &mut crate::json_store::JsonStoreWriter,
     writes: &mut StorageWriteSet,
     state_rows: &PreparedStateBatch,
+    certified_rows_by_commit: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    certified_refs_by_commit: &BTreeMap<CommitId, Vec<CertifiedRootJsonRefs>>,
 ) -> Result<(), LixError> {
     json_writer.stage_batch(
         writes,
         JsonWritePlacementRef::OutOfBand,
-        state_rows.iter().flat_map(json_payloads_from_state_row),
+        state_rows
+            .iter()
+            .flat_map(json_payloads_from_state_row)
+            .chain(
+                certified_rows_by_commit
+                    .iter()
+                    .flat_map(|(commit_id, rows)| {
+                        let refs = &certified_refs_by_commit[commit_id];
+                        rows.iter().zip(refs).flat_map(|(row, refs)| {
+                            [
+                                row.snapshot_content.as_ref().zip(refs.snapshot.as_ref()),
+                                row.metadata.as_ref().zip(refs.metadata.as_ref()),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .map(|(json, json_ref)| {
+                                NormalizedJsonRef::trusted_prehashed(json.as_str(), *json_ref)
+                            })
+                        })
+                    }),
+            ),
     )?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Default)]
+struct CertifiedRootJsonRefs {
+    snapshot: Option<JsonRef>,
+    metadata: Option<JsonRef>,
+}
+
+fn certified_root_json_refs(
+    rows_by_commit: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+) -> BTreeMap<CommitId, Vec<CertifiedRootJsonRefs>> {
+    let mut refs_by_commit = BTreeMap::new();
+    for (&commit_id, rows) in rows_by_commit {
+        let refs = rows
+            .iter()
+            .map(|row| CertifiedRootJsonRefs {
+                snapshot: row
+                    .snapshot_content
+                    .as_ref()
+                    .filter(|json| json.len() > JSON_INLINE_MAX_BYTES)
+                    .map(|json| JsonRef::for_content(json.as_bytes())),
+                metadata: row
+                    .metadata
+                    .as_ref()
+                    .filter(|json| json.len() > JSON_INLINE_MAX_BYTES)
+                    .map(|json| JsonRef::for_content(json.as_bytes())),
+            })
+            .collect::<Vec<_>>();
+        refs_by_commit.insert(commit_id, refs);
+    }
+    refs_by_commit
 }
 
 fn json_payloads_from_state_row(
@@ -1036,17 +1098,25 @@ async fn stage_changelog_commits(
             })
             .and_then(|rows| u64::try_from(rows).ok())
             .ok_or_else(|| LixError::unknown("tracked-state rootless row count exceeds u64"))?;
-        let commit_delta_bytes = tracked_row_indices_by_commit
+        let commit_row_indices = tracked_row_indices_by_commit
             .get(&commit_id)
-            .into_iter()
-            .flatten()
-            .try_fold(0_u64, |bytes, &row_index| {
-                bytes
-                    .checked_add(prepared_state_row_replay_bytes(state_rows.row(row_index))?)
-                    .ok_or_else(|| {
-                        LixError::unknown("tracked-state rootless byte count exceeds u64")
-                    })
-            })?;
+            .map(Vec::as_slice);
+        let commit_delta_bytes = if state_rows.certified_complete_collection_replacement()
+            && commit_row_indices.is_some_and(|indices| indices.len() == state_rows.len())
+        {
+            if let Some(certified_bytes) = state_rows.certified_complete_collection_replay_bytes() {
+                #[cfg(debug_assertions)]
+                debug_assert_eq!(
+                    certified_bytes,
+                    replay_bytes_for_rows(state_rows, commit_row_indices)?
+                );
+                certified_bytes
+            } else {
+                replay_bytes_for_rows(state_rows, commit_row_indices)?
+            }
+        } else {
+            replay_bytes_for_rows(state_rows, commit_row_indices)?
+        };
         let has_unbounded_payload_sources = certified_packet_root_rows
             .get(&commit_id)
             .is_some_and(|rows| !rows.is_empty())
@@ -1322,13 +1392,13 @@ fn branch_ref_change_record(root: &PendingTrackedRoot) -> Result<ChangeRecord, L
             format!("failed to serialize direct branch-ref change: {error}"),
         )
     })?;
-    if snapshot.len() > crate::json_store::JSON_INLINE_MAX_BYTES {
+    if snapshot.len() > JSON_INLINE_MAX_BYTES {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
             format!(
                 "branch id is too long: its serialized branch ref is {} bytes, but the maximum is {} bytes",
                 snapshot.len(),
-                crate::json_store::JSON_INLINE_MAX_BYTES,
+                JSON_INLINE_MAX_BYTES,
             ),
         ));
     }
@@ -1432,7 +1502,6 @@ fn tracked_commit_delta_from_state_row(
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
         base_coordinate: None,
         authored: true,
-        certified: false,
     })
 }
 
@@ -1461,27 +1530,33 @@ fn tracked_delta_from_certified_root_row(
     })
 }
 
-fn tracked_commit_delta_from_certified_root_row(
-    row: &MaterializedLiveStateRow,
-) -> Result<TrackedStateCommitDeltaRef<'_>, LixError> {
+fn tracked_commit_delta_from_certified_root_row<'a>(
+    row: &'a MaterializedLiveStateRow,
+    json_refs: &'a CertifiedRootJsonRefs,
+) -> Result<TrackedStateCommitDeltaRef<'a>, LixError> {
     Ok(TrackedStateCommitDeltaRef {
         delta: tracked_delta_from_certified_root_row(row)?,
-        snapshot: row
-            .snapshot_content
-            .as_ref()
-            .map_or(crate::json_store::JsonSlotRef::None, |snapshot| {
-                crate::json_store::JsonSlotRef::Inline(snapshot.as_str())
-            }),
+        snapshot: row.snapshot_content.as_ref().map_or(
+            crate::json_store::JsonSlotRef::None,
+            |snapshot| {
+                json_refs.snapshot.as_ref().map_or(
+                    crate::json_store::JsonSlotRef::Inline(snapshot.as_str()),
+                    crate::json_store::JsonSlotRef::Ref,
+                )
+            },
+        ),
         metadata: row
             .metadata
             .as_ref()
             .map_or(crate::json_store::JsonSlotRef::None, |metadata| {
-                crate::json_store::JsonSlotRef::Inline(metadata.as_str())
+                json_refs.metadata.as_ref().map_or(
+                    crate::json_store::JsonSlotRef::Inline(metadata.as_str()),
+                    crate::json_store::JsonSlotRef::Ref,
+                )
             }),
         origin_key: None,
         base_coordinate: None,
         authored: true,
-        certified: row.snapshot_content.is_none() && row.metadata.is_none(),
     })
 }
 
@@ -1538,7 +1613,6 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
         origin_key: record.and_then(|record| record.origin_key.as_deref()),
         base_coordinate: None,
         authored: false,
-        certified: false,
     })
 }
 
@@ -1771,8 +1845,8 @@ async fn stage_tracked_commit_delta_index(
     tracked_roots: &[PendingTrackedRoot],
     commit_rows: &[FinalizedCommitRow],
     selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
-    host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    certified_packet_json_refs: &BTreeMap<CommitId, Vec<CertifiedRootJsonRefs>>,
     insert_selection: &PreparedInsertSelection,
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
 ) -> Result<BTreeSet<CommitId>, LixError> {
@@ -1790,6 +1864,16 @@ async fn stage_tracked_commit_delta_index(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        let certified_root_json_refs = certified_packet_json_refs
+            .get(&root.commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if certified_root_rows.len() != certified_root_json_refs.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified root JSON placement does not match materialized rows",
+            ));
+        }
         let staged = commit_rows.get(&root.commit_id).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -1847,15 +1931,6 @@ async fn stage_tracked_commit_delta_index(
                                 row_index: location.row_index,
                             },
                         );
-                    if replacement_generation.is_none() {
-                        delta.certified = root.publish_head
-                            && host_certified_batch_owns_live_row(
-                                row,
-                                &root.branch_id,
-                                root.commit_id,
-                                host_certified_file_schemas,
-                            );
-                    }
                     Ok(delta)
                 };
                 let order_certified = state_rows.certified_tracked_keys_strictly_ordered()
@@ -1921,17 +1996,12 @@ async fn stage_tracked_commit_delta_index(
                         row_index: location.row_index,
                     },
                 );
-            delta.certified = root.publish_head
-                && host_certified_batch_owns_live_row(
-                    row,
-                    &root.branch_id,
-                    root.commit_id,
-                    host_certified_file_schemas,
-                );
             deltas.push(delta);
         }
-        for row in certified_root_rows {
-            deltas.push(tracked_commit_delta_from_certified_root_row(row)?);
+        for (row, json_refs) in certified_root_rows.iter().zip(certified_root_json_refs) {
+            deltas.push(tracked_commit_delta_from_certified_root_row(
+                row, json_refs,
+            )?);
             // Certified rows are addressed by commit plus identity. They do
             // not need standalone change locators in the public ledger.
             addressable.push(false);
@@ -2097,13 +2167,25 @@ async fn certify_complete_replacement_generations(
         else {
             continue;
         };
-        let Some(ordered_identity_digest) =
+        let certified_identity_digest = state_rows.certified_complete_collection_identity_digest();
+        #[cfg(debug_assertions)]
+        if let Some(certified_identity_digest) = certified_identity_digest {
+            debug_assert_eq!(
+                Some(certified_identity_digest),
+                crate::collection_generation::ordered_single_string_identity_digest(
+                    row_indices
+                        .iter()
+                        .map(|&row_index| state_rows.row(row_index).entity_pk),
+                )
+            );
+        }
+        let Some(ordered_identity_digest) = certified_identity_digest.or_else(|| {
             crate::collection_generation::ordered_single_string_identity_digest(
                 row_indices
                     .iter()
                     .map(|&row_index| state_rows.row(row_index).entity_pk),
             )
-        else {
+        }) else {
             continue;
         };
         let mut current = root.parent_commit_id;
@@ -2274,6 +2356,20 @@ fn prepared_state_row_replay_bytes(row: PreparedStateRowRef<'_>) -> Result<u64, 
         .and_then(|bytes| bytes.checked_add(metadata_bytes))
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or_else(|| LixError::unknown("tracked-state replay row bytes exceed u64"))
+}
+
+fn replay_bytes_for_rows(
+    state_rows: &PreparedStateBatch,
+    row_indices: Option<&[RowIndex]>,
+) -> Result<u64, LixError> {
+    row_indices
+        .into_iter()
+        .flatten()
+        .try_fold(0_u64, |bytes, &row_index| {
+            bytes
+                .checked_add(prepared_state_row_replay_bytes(state_rows.row(row_index))?)
+                .ok_or_else(|| LixError::unknown("tracked-state rootless byte count exceeds u64"))
+        })
 }
 
 fn select_new_rootless_ordered_commits(
@@ -5684,6 +5780,17 @@ mod tests {
             0x0192_0000_0000_7000_8000_4321_0000_0000,
         ));
         let timestamp = ts("2026-01-01T00:00:00Z");
+        let mut large_snapshot = String::with_capacity(4 * 1024 * 1024 + 2);
+        large_snapshot.push('"');
+        let mut random = 0x9e37_79b9_u32;
+        for _ in 0..(4 * 1024 * 1024) {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            large_snapshot.push(char::from(b'a' + (random % 26) as u8));
+        }
+        large_snapshot.push('"');
+        let large_snapshot = crate::common::SharedStr::from(large_snapshot);
         let mut state_rows = PreparedStateBatch::new();
         state_rows.push_parts_with_change_addressability(
             SchemaPlanId::for_test(0),
@@ -5694,7 +5801,8 @@ mod tests {
             Some(
                 crate::transaction::types::stage_json_from_value(
                     crate::transaction::types::TransactionJson::from_value_for_test(
-                        serde_json::json!({ "value": 1 }),
+                        serde_json::from_str(large_snapshot.as_str())
+                            .expect("large ordinary snapshot should parse"),
                     ),
                     "mixed certified ordinary snapshot",
                 )
@@ -5719,7 +5827,7 @@ mod tests {
                 entity_pk: EntityPk::single("certified"),
                 schema_key: "certified_schema".to_owned(),
                 file_id: Some("certified.csv".to_owned()),
-                snapshot_content: None,
+                snapshot_content: Some(large_snapshot.clone()),
                 metadata: None,
                 deleted: false,
                 created_at: timestamp,
@@ -5751,6 +5859,18 @@ mod tests {
             .await
             .expect("mixed certified read should open");
         let mut writes = StorageWriteSet::new();
+        let certified_json_refs = certified_root_json_refs(&certified_rows);
+        stage_state_json_payloads(
+            &mut JsonStoreContext::new().writer(),
+            &mut writes,
+            &state_rows,
+            &certified_rows,
+            &certified_json_refs,
+        )
+        .expect("duplicate large ordinary and certified payload should stage once");
+        let large_snapshot_ref = certified_json_refs[&commit_id][0]
+            .snapshot
+            .expect("large certified snapshot should use a JSON ref");
         stage_tracked_commit_delta_index(
             &read,
             &mut writes,
@@ -5760,8 +5880,8 @@ mod tests {
             &roots,
             &commits,
             &HashMap::new(),
-            &BTreeMap::new(),
             &certified_rows,
+            &certified_json_refs,
             &PreparedInsertSelection::new(),
             &BTreeMap::new(),
         )
@@ -5785,6 +5905,34 @@ mod tests {
             "certified packet identity must be present in the commit delta"
         );
         assert_eq!(records[1].0.schema_key, "ordinary_schema");
+        let packed_members =
+            crate::tracked_state::load_commit_delta_members_with_payloads(&read, commit_id)
+                .await
+                .expect("mixed certified payloads should load");
+        let certified = packed_members
+            .iter()
+            .find(|member| member.change.change_id == certified_change_id)
+            .expect("certified payload should be a commit member");
+        assert_eq!(
+            certified.change.snapshot,
+            crate::json_store::JsonSlot::Ref(large_snapshot_ref)
+        );
+        let loaded = JsonStoreContext::new()
+            .load_bytes_many(
+                &read,
+                crate::json_store::JsonLoadRequestRef {
+                    refs: &[large_snapshot_ref],
+                    scope: crate::json_store::JsonReadScopeRef::OutOfBand,
+                },
+            )
+            .await
+            .expect("large certified JSON ref should resolve")
+            .into_values();
+        assert_eq!(
+            loaded[0].as_deref(),
+            Some(large_snapshot.as_bytes()),
+            "large certified history payload must round-trip exactly"
+        );
     }
 
     #[tokio::test]

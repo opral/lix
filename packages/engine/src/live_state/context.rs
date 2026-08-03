@@ -3198,7 +3198,6 @@ mod tests {
                     origin_key: change.origin_key.as_deref(),
                     base_coordinate: None,
                     authored: true,
-                    certified: false,
                 })
                 .collect::<Vec<_>>();
             stage_commit_deltas(writes, &commit_deltas)?;

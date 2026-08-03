@@ -884,14 +884,15 @@ async fn try_execute_direct_path_value_replacement_batch(
     let collection_generation = ctx
         .load_collection_generation(&active_branch_id, scope)
         .await?;
+    let ordered_identity_digest =
+        crate::collection_generation::ordered_single_string_identity_digest(
+            unique_entity_pks.iter(),
+        );
     let certified_generation_identity = !has_staged_collection_rows
         && collection_generation.is_some_and(|generation| {
             generation.live_count == unique_row_count as u64
                 && generation.ordered_identity_digest.is_some()
-                && generation.ordered_identity_digest
-                    == crate::collection_generation::ordered_single_string_identity_digest(
-                        unique_entity_pks.iter(),
-                    )
+                && generation.ordered_identity_digest == ordered_identity_digest
         });
     #[cfg(test)]
     if certified_generation_identity {
@@ -973,14 +974,24 @@ async fn try_execute_direct_path_value_replacement_batch(
             && collection_generation
                 .is_some_and(|generation| generation.live_count == unique_row_count as u64));
 
-    let estimated_row_bytes = unique_entity_pks
+    let (estimated_row_bytes, replacement_identity_replay_bytes) = unique_entity_pks
         .iter()
-        .map(|entity_pk| {
-            entity_pk
-                .as_single_string()
-                .map_or(32, |path| path.len().saturating_add(32))
+        .try_fold((0_usize, 0_usize), |(estimated, replay), entity_pk| {
+            Some((
+                estimated.checked_add(
+                    entity_pk
+                        .as_single_string()
+                        .map_or(32, |path| path.len().saturating_add(32)),
+                )?,
+                replay.checked_add(
+                    spec.schema_key
+                        .len()
+                        .checked_add(entity_pk.estimated_heap_bytes())?
+                        .checked_add(128)?,
+                )?,
+            ))
         })
-        .sum::<usize>();
+        .ok_or_else(|| LixError::unknown("certified replacement byte accounting overflowed"))?;
     let mut normalized = Vec::with_capacity(estimated_row_bytes);
     let replacement_capacity = if certified_generation_identity {
         unique_row_count
@@ -989,7 +1000,8 @@ async fn try_execute_direct_path_value_replacement_batch(
     };
     let mut snapshot_offsets = Vec::with_capacity(replacement_capacity);
     let mut replacement_entity_pks = Vec::with_capacity(replacement_capacity);
-    let mut affected_by_statement = vec![0_u64; row_count];
+    let mut affected_by_statement =
+        (!certified_generation_identity).then(|| vec![0_u64; row_count]);
     let mut candidate_index = 0;
     let mut ordinal_index = 0;
     for (identity_index, entity_pk) in unique_entity_pks.iter().enumerate() {
@@ -1045,9 +1057,11 @@ async fn try_execute_direct_path_value_replacement_batch(
         replacement_entity_pks.push(entity_pk.clone());
         if let Some(ordinals) = &sorted_statement_ordinals {
             for &affected_statement in &ordinals[first_statement_index..=last_statement_index] {
-                affected_by_statement[affected_statement] = 1;
+                if let Some(affected_by_statement) = &mut affected_by_statement {
+                    affected_by_statement[affected_statement] = 1;
+                }
             }
-        } else {
+        } else if let Some(affected_by_statement) = &mut affected_by_statement {
             affected_by_statement[statement_index] = 1;
         }
         if !certified_generation_identity {
@@ -1055,6 +1069,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         }
     }
     if !replacement_entity_pks.is_empty() {
+        let normalized_len = normalized.len();
         let snapshots =
             TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
         let rows = CertifiedParameterReplacementBatch::new(
@@ -1070,6 +1085,16 @@ async fn try_execute_direct_path_value_replacement_batch(
                 },
                 tracked_keys_strictly_ordered: true,
                 complete_collection_replacement,
+                complete_collection_identity_digest: complete_collection_replacement
+                    .then_some(ordered_identity_digest)
+                    .flatten(),
+                complete_collection_replay_bytes: complete_collection_replacement
+                    .then(|| {
+                        replacement_identity_replay_bytes
+                            .checked_add(normalized_len)
+                            .and_then(|bytes| u64::try_from(bytes).ok())
+                    })
+                    .flatten(),
             },
         )?;
         ctx.stage_certified_parameter_batch_replace(rows)
@@ -1094,12 +1119,17 @@ async fn try_execute_direct_path_value_replacement_batch(
     if record_value_certificate {
         crate::storage_bench::record_certified_entity_update_value_batch_hit(row_count);
     }
-    Ok(Some(
+    Ok(Some(if certified_generation_identity {
+        (0..row_count)
+            .map(|_| SqlWriteResult::affected(1))
+            .collect()
+    } else {
         affected_by_statement
+            .expect("uncertified replacement tracks statement effects")
             .into_iter()
             .map(SqlWriteResult::affected)
-            .collect(),
-    ))
+            .collect()
+    }))
 }
 
 struct DirectPathValueReplacement {
@@ -2820,6 +2850,8 @@ async fn try_execute_direct_path_value_replacement(
             },
             tracked_keys_strictly_ordered: true,
             complete_collection_replacement: false,
+            complete_collection_identity_digest: None,
+            complete_collection_replay_bytes: None,
         },
     )?;
     ctx.stage_certified_parameter_batch_replace(rows).await?;
@@ -4388,6 +4420,8 @@ fn certified_direct_parameter_insert_batch(
         },
         tracked_keys_strictly_ordered,
         complete_collection_replacement: false,
+        complete_collection_identity_digest: None,
+        complete_collection_replay_bytes: None,
     };
     let rows = CertifiedParameterInsertBatch::new(
         entity_pks,
@@ -4533,6 +4567,8 @@ fn certified_direct_path_value_insert_batch(
             },
             tracked_keys_strictly_ordered: true,
             complete_collection_replacement: false,
+            complete_collection_identity_digest: None,
+            complete_collection_replay_bytes: None,
         },
     )?))
 }

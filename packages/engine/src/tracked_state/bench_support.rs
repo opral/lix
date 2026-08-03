@@ -393,7 +393,6 @@ impl PackedHistoryDelta {
             origin_key: None,
             base_coordinate: None,
             authored: true,
-            certified: false,
         }
     }
 }

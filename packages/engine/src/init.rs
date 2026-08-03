@@ -363,7 +363,6 @@ where
                 origin_key: change.origin_key.as_deref(),
                 base_coordinate: None,
                 authored: true,
-                certified: false,
             })
             .collect::<Vec<_>>();
         let locators = crate::tracked_state::stage_commit_deltas(&mut writes, &commit_deltas)?;
