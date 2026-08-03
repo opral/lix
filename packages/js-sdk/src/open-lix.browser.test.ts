@@ -106,7 +106,7 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 		await lix.execute("INSERT INTO lix_directory (path) VALUES ($1)", [
 			"/docs",
 		]);
-		await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+		await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 			"/README.md",
 			new Uint8Array(),
 		]);

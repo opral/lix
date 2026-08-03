@@ -117,10 +117,10 @@ use crate::transaction::stale_commit::{
 use crate::transaction::types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
     PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
-    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileData, TransactionJson,
-    TransactionWrite, TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
-    TransactionWriteOutcome, TransactionWriteRow, canonicalize_transaction_json_batch,
-    stage_json_from_value,
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
+    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
+    TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
+    canonicalize_transaction_json_batch, stage_json_from_value,
 };
 
 pub(crate) struct CertifiedHistoryStoreReader<S> {
@@ -1275,13 +1275,13 @@ where
         ))
         .await?;
         let mut replacement = self.staged_writes.drain()?;
-        let mut latest_file_data = BTreeMap::new();
-        for write in replacement.file_data_writes.drain(..) {
-            latest_file_data.insert((write.branch_id.clone(), write.file_id.clone()), write);
+        let mut latest_file_content = BTreeMap::new();
+        for write in replacement.file_content_writes.drain(..) {
+            latest_file_content.insert((write.branch_id.clone(), write.file_id.clone()), write);
         }
         replacement
-            .file_data_writes
-            .extend(latest_file_data.into_values());
+            .file_content_writes
+            .extend(latest_file_content.into_values());
         let commit_id = prepared_writes
             .commit_change_refs_by_branch
             .get(&self.active_branch_id)
@@ -1717,7 +1717,7 @@ where
         const MAX_RETAINED_IMPORT_BYTES: usize = 8 * 1024 * 1024;
 
         let large_files = prepared_writes
-            .file_data_writes
+            .file_content_writes
             .iter()
             .filter(|write| write.len() > MAX_RETAINED_IMPORT_BYTES as u64)
             .map(|write| (write.branch_id.as_str(), write.file_id.as_str()))
@@ -2140,7 +2140,7 @@ where
     ) -> Result<(), LixError> {
         let rows = match write {
             TransactionWrite::Rows { rows, .. }
-            | TransactionWrite::RowsWithFileData { rows, .. } => rows,
+            | TransactionWrite::RowsWithFileContent { rows, .. } => rows,
         };
         let staged = self.staged_writes.staging_overlay()?;
         let mut first_checked_scope = None;
@@ -2834,16 +2834,16 @@ where
             TransactionWrite::Rows { mode, mut rows } => {
                 reject_external_plugin_registry_rows(&rows)?;
                 let count = rows.len() as u64;
-                let mut file_data = Vec::new();
+                let mut file_content = Vec::new();
                 let mut reconciliation = self
-                    .plugin_write_reconciliation(&mut rows, &mut file_data)
+                    .plugin_write_reconciliation(&mut rows, &mut file_content)
                     .await?;
-                reconciliation.attach_durable_checkpoints(&mut file_data)?;
+                reconciliation.attach_durable_checkpoints(&mut file_content)?;
                 let mut rows = reconciliation.take_reconciled_rows(rows);
                 for (file_key, version) in &reconciliation.materialization_versions {
                     let mut materialization_rows = RawWriteBatch::new();
                     let materialized_row_index = materialization_rows.len();
-                    let payload = file_data
+                    let payload = file_content
                         .iter()
                         .find(|write| PluginFileWriteKey::from(*write) == *file_key)
                         .ok_or_else(|| {
@@ -2881,13 +2881,13 @@ where
                     mark_plugin_reconciliation_batch(&mut materialization_rows, 0)?;
                     rows.append_raw_batch(materialization_rows);
                 }
-                let write = if file_data.is_empty() {
+                let write = if file_content.is_empty() {
                     ReconciledTransactionWrite::Rows { mode, rows }
                 } else {
-                    ReconciledTransactionWrite::RowsWithFileData {
+                    ReconciledTransactionWrite::RowsWithFileContent {
                         mode,
                         rows,
-                        file_data,
+                        file_content,
                         count,
                     }
                 };
@@ -2897,22 +2897,22 @@ where
                     reconciliation.actor_publications,
                 ))
             }
-            TransactionWrite::RowsWithFileData {
+            TransactionWrite::RowsWithFileContent {
                 mode,
                 rows,
-                mut file_data,
+                mut file_content,
                 count,
             } => {
                 let mut rows = rows;
                 reject_external_plugin_registry_rows(&rows)?;
                 let mut reconciliation = self
-                    .plugin_write_reconciliation(&mut rows, &mut file_data)
+                    .plugin_write_reconciliation(&mut rows, &mut file_content)
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
                         "lix.perf.plugin_reconciliation"
                     ))
                     .await?;
-                reconciliation.attach_durable_checkpoints(&mut file_data)?;
+                reconciliation.attach_durable_checkpoints(&mut file_content)?;
                 let mut rows = reconciliation.take_reconciled_rows(rows);
                 rows.retain_raw(|row| {
                     !reconciliation
@@ -2927,7 +2927,7 @@ where
                 for (file_key, version) in &reconciliation.materialization_versions {
                     let mut materialization_rows = RawWriteBatch::new();
                     let materialized_row_index = materialization_rows.len();
-                    let payload = file_data
+                    let payload = file_content
                         .iter()
                         .find(|write| PluginFileWriteKey::from(*write) == *file_key)
                         .ok_or_else(|| {
@@ -2965,7 +2965,7 @@ where
                     mark_plugin_reconciliation_batch(&mut materialization_rows, 0)?;
                     rows.append_raw_batch(materialization_rows);
                 }
-                let file_data = file_data
+                let file_content = file_content
                     .into_iter()
                     .filter_map(|mut write| {
                         let key = PluginFileWriteKey::from(&write);
@@ -2983,10 +2983,10 @@ where
                     })
                     .collect();
                 Ok((
-                    ReconciledTransactionWrite::RowsWithFileData {
+                    ReconciledTransactionWrite::RowsWithFileContent {
                         mode,
                         rows,
-                        file_data,
+                        file_content,
                         count,
                     },
                     reconciliation.file_view_mutations,
@@ -3071,7 +3071,7 @@ where
     async fn plugin_write_reconciliation(
         &mut self,
         rows: &mut RawWriteBatch,
-        file_data: &mut Vec<TransactionFileData>,
+        file_content: &mut Vec<TransactionFileContent>,
     ) -> Result<PluginWriteReconciliation, LixError> {
         let input_row_count = rows.len();
         let mut reconciliation = PluginWriteReconciliation::default();
@@ -3085,7 +3085,7 @@ where
 
         // Parse each archive exactly once. The original ZIP remains the file
         // payload; the extracted component is staged as a second CAS payload.
-        for write in file_data.iter_mut() {
+        for write in file_content.iter_mut() {
             let Some(path) = write.path.as_deref() else {
                 continue;
             };
@@ -3532,7 +3532,7 @@ where
             .cloned()
             .collect::<BTreeSet<_>>();
         if active_branch_ids.is_empty() && deleted_file_keys.is_empty() {
-            for write in file_data.iter().filter(|write| {
+            for write in file_content.iter().filter(|write| {
                 !write.global
                     && !write.untracked
                     && write
@@ -3550,7 +3550,7 @@ where
         }
 
         let mut candidate_file_keys = BTreeSet::<PluginFileWriteKey>::new();
-        for write in file_data.iter() {
+        for write in file_content.iter() {
             if write.global
                 || write.untracked
                 || !active_branch_ids.contains(&write.branch_id)
@@ -3652,7 +3652,7 @@ where
             );
         }
 
-        let file_data_keys = file_data
+        let file_content_keys = file_content
             .iter()
             .map(PluginFileWriteKey::from)
             .collect::<BTreeSet<_>>();
@@ -3721,7 +3721,7 @@ where
                     ),
                 ));
             }
-            if file_data_keys.contains(&file_key) {
+            if file_content_keys.contains(&file_key) {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     format!(
@@ -3825,7 +3825,7 @@ where
             "lix.perf.plugin_selection"
         );
         let selection_guard = selection_span.enter();
-        for write in file_data.iter() {
+        for write in file_content.iter() {
             let Some(path) = write.path.as_deref() else {
                 continue;
             };
@@ -4130,7 +4130,7 @@ where
         }
 
         let mut reconciled_file_keys = BTreeSet::<PluginFileWriteKey>::new();
-        let fresh_file_indices = file_data
+        let fresh_file_indices = file_content
             .iter()
             .enumerate()
             .filter_map(|(index, write)| {
@@ -4153,7 +4153,7 @@ where
             let mut prepared_opens = Vec::with_capacity(file_indices.len());
             let mut prepared_session_keys = BTreeSet::new();
             for &file_index in file_indices {
-                let write = &file_data[file_index];
+                let write = &file_content[file_index];
                 let path = write
                     .path
                     .as_deref()
@@ -4414,7 +4414,7 @@ where
                     &changes,
                     &validated.certified_batches,
                 )?;
-                file_data[pending.file_index]
+                file_content[pending.file_index]
                     .set_certified_entity_batches(validated.certified_batches);
                 let mut counters = validated.counters;
                 counters.host_content_classification_bytes = content_classification_bytes
@@ -4429,7 +4429,7 @@ where
 
                 rows.push(pending.owner_row);
                 rows.append(create_rows);
-                let write = &mut file_data[pending.file_index];
+                let write = &mut file_content[pending.file_index];
                 let context = FilesystemRowContext {
                     branch_id: write.branch_id.clone(),
                     global: false,
@@ -4468,7 +4468,7 @@ where
             }
         }
 
-        for write in file_data.iter_mut() {
+        for write in file_content.iter_mut() {
             let Some(path) = write.path.as_deref() else {
                 continue;
             };
@@ -5811,7 +5811,7 @@ where
                 };
             self.plugin_host.record_transition_counters(counters);
             let VisibleMaterializationBytes::Blob { hash } = visible_materialization.bytes;
-            let rendered_file = semantic_rendered_file_data(
+            let rendered_file = semantic_rendered_file_content(
                 file_key.file_id.clone(),
                 group.path,
                 group.filename,
@@ -5820,7 +5820,7 @@ where
                 rendered_bytes,
                 same_length_output_splice,
             );
-            file_data.push(rendered_file);
+            file_content.push(rendered_file);
             reconciliation
                 .materialized_file_keys
                 .insert(file_key.clone());
@@ -5883,15 +5883,15 @@ where
                 mode,
                 rows: self.prepare_reconciled_rows(rows).await?,
             },
-            ReconciledTransactionWrite::RowsWithFileData {
+            ReconciledTransactionWrite::RowsWithFileContent {
                 mode,
                 rows,
-                file_data,
+                file_content,
                 count,
-            } => PreparedTransactionWrite::RowsWithFileData {
+            } => PreparedTransactionWrite::RowsWithFileContent {
                 mode,
                 rows: self.prepare_reconciled_rows(rows).await?,
-                file_data,
+                file_content,
                 count,
             },
         })
@@ -8842,7 +8842,7 @@ fn prepared_transaction_write_filesystem_index_impact(
 fn prepared_transaction_write_rows(write: &PreparedTransactionWrite) -> &PreparedStateBatch {
     match write {
         PreparedTransactionWrite::Rows { rows, .. }
-        | PreparedTransactionWrite::RowsWithFileData { rows, .. } => rows,
+        | PreparedTransactionWrite::RowsWithFileContent { rows, .. } => rows,
     }
 }
 
@@ -8894,7 +8894,7 @@ fn v2_format_only_metadata() -> TransactionJson {
 }
 
 fn v2_file_descriptor(
-    write: &TransactionFileData,
+    write: &TransactionFileContent,
     plugin: &PluginRegistryEntry,
 ) -> WasmFileDescriptor {
     WasmFileDescriptor {
@@ -9392,8 +9392,8 @@ impl PluginFileWriteKey {
     }
 }
 
-impl From<&TransactionFileData> for PluginFileWriteKey {
-    fn from(write: &TransactionFileData) -> Self {
+impl From<&TransactionFileContent> for PluginFileWriteKey {
+    fn from(write: &TransactionFileContent) -> Self {
         Self {
             branch_id: write.branch_id.clone(),
             global: write.global,
@@ -9414,10 +9414,10 @@ enum ReconciledTransactionWrite {
         mode: TransactionWriteMode,
         rows: ReconciledRowBatch,
     },
-    RowsWithFileData {
+    RowsWithFileContent {
         mode: TransactionWriteMode,
         rows: ReconciledRowBatch,
-        file_data: Vec<TransactionFileData>,
+        file_content: Vec<TransactionFileContent>,
         count: u64,
     },
 }
@@ -9736,7 +9736,7 @@ struct DecodedDurablePluginCheckpoint {
 impl PluginWriteReconciliation {
     fn attach_durable_checkpoints(
         &self,
-        file_data: &mut [TransactionFileData],
+        file_content: &mut [TransactionFileContent],
     ) -> Result<(), LixError> {
         let mut checkpoints = BTreeMap::<
             (String, String),
@@ -9766,7 +9766,7 @@ impl PluginWriteReconciliation {
         for ((branch_id, file_id), (checkpoint, authority, generation, semantic_root)) in
             checkpoints
         {
-            let write = file_data
+            let write = file_content
                 .iter_mut()
                 .find(|write| write.branch_id == branch_id && write.file_id == file_id)
                 .ok_or_else(|| {
@@ -10095,7 +10095,7 @@ async fn retire_oldest_completed_actor(
 
 /// Builds the blob-backed file write for an accepted semantic renderer
 /// transition.
-fn semantic_rendered_file_data(
+fn semantic_rendered_file_content(
     file_id: String,
     path: String,
     filename: String,
@@ -10103,8 +10103,8 @@ fn semantic_rendered_file_data(
     base_blob_hash: BlobId,
     rendered_bytes: crate::Blob,
     same_length_output_splice: Option<ValidatedSameLengthOutputSplice>,
-) -> TransactionFileData {
-    let mut rendered_file = TransactionFileData::new(
+) -> TransactionFileContent {
+    let mut rendered_file = TransactionFileContent::new(
         file_id,
         Some(path),
         Some(filename),
@@ -10977,12 +10977,12 @@ fn transaction_write_targets_non_active_branch(
         TransactionWrite::Rows { rows, .. } => rows
             .iter()
             .any(|row| is_non_active_local(&row.branch_id, row.global)),
-        TransactionWrite::RowsWithFileData {
-            rows, file_data, ..
+        TransactionWrite::RowsWithFileContent {
+            rows, file_content, ..
         } => {
             rows.iter()
                 .any(|row| is_non_active_local(&row.branch_id, row.global))
-                || file_data
+                || file_content
                     .iter()
                     .any(|write| is_non_active_local(&write.branch_id, write.global))
         }
@@ -10990,13 +10990,13 @@ fn transaction_write_targets_non_active_branch(
 }
 
 fn transaction_write_has_plugin_lifecycle_candidate(write: &TransactionWrite) -> bool {
-    let (rows, file_data): (&RawWriteBatch, &[TransactionFileData]) = match write {
+    let (rows, file_content): (&RawWriteBatch, &[TransactionFileContent]) = match write {
         TransactionWrite::Rows { rows, .. } => (rows, &[]),
-        TransactionWrite::RowsWithFileData {
-            rows, file_data, ..
-        } => (rows, file_data),
+        TransactionWrite::RowsWithFileContent {
+            rows, file_content, ..
+        } => (rows, file_content),
     };
-    file_data
+    file_content
         .iter()
         .any(|write| write.path.as_deref().is_some_and(is_plugin_storage_path))
         || rows.iter().any(|row| {
@@ -11021,12 +11021,12 @@ fn transaction_write_branch_ids(write: &TransactionWrite) -> BTreeSet<String> {
         TransactionWrite::Rows { rows, .. } => {
             rows.iter().map(|row| row.branch_id.to_string()).collect()
         }
-        TransactionWrite::RowsWithFileData {
-            rows, file_data, ..
+        TransactionWrite::RowsWithFileContent {
+            rows, file_content, ..
         } => rows
             .iter()
             .map(|row| row.branch_id.to_string())
-            .chain(file_data.iter().map(|write| write.branch_id.clone()))
+            .chain(file_content.iter().map(|write| write.branch_id.clone()))
             .collect(),
     }
 }
@@ -11034,7 +11034,7 @@ fn transaction_write_branch_ids(write: &TransactionWrite) -> BTreeSet<String> {
 fn transaction_write_row_count(write: &TransactionWrite) -> usize {
     match write {
         TransactionWrite::Rows { rows, .. } => rows.len(),
-        TransactionWrite::RowsWithFileData { rows, .. } => rows.len(),
+        TransactionWrite::RowsWithFileContent { rows, .. } => rows.len(),
     }
 }
 
@@ -11042,7 +11042,7 @@ fn transaction_write_row_count(write: &TransactionWrite) -> usize {
 fn transaction_write_untracked_row_count(write: &TransactionWrite) -> usize {
     match write {
         TransactionWrite::Rows { rows, .. } => rows.iter().filter(|row| row.untracked).count(),
-        TransactionWrite::RowsWithFileData { rows, .. } => {
+        TransactionWrite::RowsWithFileContent { rows, .. } => {
             rows.iter().filter(|row| row.untracked).count()
         }
     }
@@ -11055,7 +11055,7 @@ fn require_valid_transaction_write_storage_scopes(
         TransactionWrite::Rows { rows, .. } => {
             require_valid_transaction_write_row_storage_scopes(rows)
         }
-        TransactionWrite::RowsWithFileData { rows, .. } => {
+        TransactionWrite::RowsWithFileContent { rows, .. } => {
             require_valid_transaction_write_row_storage_scopes(rows)
         }
     }
@@ -11066,7 +11066,7 @@ fn require_valid_reconciled_transaction_write_storage_scopes(
 ) -> Result<(), LixError> {
     match write {
         ReconciledTransactionWrite::Rows { rows, .. }
-        | ReconciledTransactionWrite::RowsWithFileData { rows, .. } => {
+        | ReconciledTransactionWrite::RowsWithFileContent { rows, .. } => {
             rows.require_valid_storage_scopes()
         }
     }
@@ -11284,7 +11284,7 @@ mod tests {
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
             intermediate_commits: Vec::new(),
-            file_data_writes: Vec::new(),
+            file_content_writes: Vec::new(),
         };
 
         assert!(prepared_writes_require_filesystem_index_rebuild(
@@ -11323,7 +11323,7 @@ mod tests {
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
             intermediate_commits: Vec::new(),
-            file_data_writes: Vec::new(),
+            file_content_writes: Vec::new(),
         };
 
         assert!(prepared_writes_require_filesystem_index_rebuild(
@@ -11377,7 +11377,7 @@ mod tests {
     #[test]
     fn semantic_renderer_splice_provenance_is_bound_to_its_visible_blob() {
         let base_blob_hash = BlobId::from_content(b"abcdef");
-        let rendered = semantic_rendered_file_data(
+        let rendered = semantic_rendered_file_content(
             "01920000-0000-7000-8000-0000000000a2".to_string(),
             "/document.md".to_string(),
             "document.md".to_string(),
@@ -11400,7 +11400,7 @@ mod tests {
             ))
         );
 
-        let malformed = semantic_rendered_file_data(
+        let malformed = semantic_rendered_file_content(
             "01920000-0000-7000-8000-0000000000a2".to_string(),
             "/document.md".to_string(),
             "document.md".to_string(),
@@ -11548,7 +11548,7 @@ mod tests {
         let mut global_row = key_value_stage_row("global-row", "value", false);
         global_row.branch_id = GLOBAL_BRANCH_ID.into();
         global_row.global = true;
-        let global_file = TransactionFileData::new(
+        let global_file = TransactionFileContent::new(
             "global-file".to_string(),
             None,
             None,
@@ -11560,10 +11560,10 @@ mod tests {
 
         assert!(
             !transaction_write_targets_non_active_branch(
-                &TransactionWrite::RowsWithFileData {
+                &TransactionWrite::RowsWithFileContent {
                     mode: TransactionWriteMode::Replace,
                     rows: raw_write_rows(vec![active_row.clone(), global_row]),
-                    file_data: vec![global_file],
+                    file_content: vec![global_file],
                     count: 1,
                 },
                 "01920000-0000-7000-8000-0000000000a1",
@@ -11929,7 +11929,7 @@ mod tests {
             .join(", ");
         session
             .execute(
-                &format!("INSERT INTO lix_file (path, data) VALUES {values}"),
+                &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
                 &[],
             )
             .await
@@ -11944,7 +11944,7 @@ mod tests {
             transaction
                 .execute(
                     &format!(
-                        "INSERT INTO lix_file (path, data) VALUES ('/staged-{index}.md', X'02')"
+                        "INSERT INTO lix_file (path, content) VALUES ('/staged-{index}.md', X'02')"
                     ),
                     &[],
                 )
@@ -11952,7 +11952,7 @@ mod tests {
                 .expect("descriptor batch should stage");
             transaction
                 .execute(
-                    "UPDATE lix_file SET data = X'03' WHERE path = '/seed-00.md'",
+                    "UPDATE lix_file SET content = X'03' WHERE path = '/seed-00.md'",
                     &[],
                 )
                 .await
@@ -12018,7 +12018,7 @@ mod tests {
             .join(", ");
         session
             .execute(
-                &format!("INSERT INTO lix_file (path, data) VALUES {values}"),
+                &format!("INSERT INTO lix_file (path, content) VALUES {values}"),
                 &[],
             )
             .await
@@ -12030,14 +12030,14 @@ mod tests {
             .expect("transaction should begin");
         transaction
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/transaction-anchor.md', X'01')",
+                "INSERT INTO lix_file (path, content) VALUES ('/transaction-anchor.md', X'01')",
                 &[],
             )
             .await
             .expect("transaction anchor descriptor should stage");
 
         reset_transaction_path_index_build_stats();
-        let sql = "UPDATE lix_file SET data = X'02' WHERE path = '/seed-00000.md'";
+        let sql = "UPDATE lix_file SET content = X'02' WHERE path = '/seed-00000.md'";
         for _ in 0..warmup_rounds {
             transaction
                 .execute(sql, &[])
@@ -12114,7 +12114,7 @@ mod tests {
             .join(", ");
         session
             .execute(
-                &format!("INSERT INTO lix_file (id, path, data) VALUES {values}"),
+                &format!("INSERT INTO lix_file (id, path, content) VALUES {values}"),
                 &[],
             )
             .await
@@ -12142,7 +12142,7 @@ mod tests {
             let started = Instant::now();
             session
                 .execute(
-                    &format!("UPDATE lix_file SET data = X'02' WHERE path = '{path}'"),
+                    &format!("UPDATE lix_file SET content = X'02' WHERE path = '{path}'"),
                     &[],
                 )
                 .await

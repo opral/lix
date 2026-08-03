@@ -37,7 +37,7 @@ const lix = await openLix({
 });
 ```
 
-Remote file data, SQL rows, and branches live on the server. An optional `LixSnapshotStorage` in remote mode stores only private client state. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
+Remote file content, SQL rows, and branches live on the server. An optional `LixSnapshotStorage` in remote mode stores only private client state. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
 
 Use `LocalFilesystem` for a filesystem workspace directory backed by RocksDB at
 `<workspace>/.lix/.internal/rocksdb`:
@@ -135,12 +135,12 @@ Example:
 
 ```ts
 const result = await lix.execute(
-  "SELECT path, data FROM lix_file WHERE path = $1",
+  "SELECT path, content FROM lix_file WHERE path = $1",
   ["/hello.txt"],
 );
 
 const path = result.rows[0]?.get("path");
-const data = result.rows[0]?.value("data").asBytes();
+const content = result.rows[0]?.value("content").asBytes();
 ```
 
 ### beginTransaction()
@@ -154,7 +154,7 @@ Starts a transaction. While it is open, execute statements on the transaction ha
 ```ts
 const tx = await lix.beginTransaction();
 try {
-  await tx.execute("INSERT INTO lix_file (path, data) VALUES (?, ?)", [
+  await tx.execute("INSERT INTO lix_file (path, content) VALUES (?, ?)", [
     "/hello.txt",
     new TextEncoder().encode("hello"),
   ]);

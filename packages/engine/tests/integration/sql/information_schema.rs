@@ -35,21 +35,30 @@ simulation_test!(
                 .any(|column| column == "lix_insert_policy")
         );
 
-        let data_row = result
+        let content_row = result
             .rows()
             .iter()
             .find(|row| {
                 row.value("column_name")
                     .expect("column_name should be present")
-                    == &Value::Text("data".to_string())
+                    == &Value::Text("content".to_string())
             })
-            .expect("lix_file data column should be described");
+            .expect("lix_file content column should be described");
         assert_eq!(
-            data_row
+            content_row
                 .value("character_octet_length")
                 .expect("character_octet_length should be present"),
             &Value::Null,
-            "unbounded binary data must not advertise an artificial i64::MAX length",
+            "unbounded binary content must not advertise an artificial i64::MAX length",
+        );
+        assert!(
+            !result.rows().iter().any(|row| {
+                matches!(
+                    row.value("column_name"),
+                    Ok(Value::Text(column_name)) if column_name == "data"
+                )
+            }),
+            "the retired data column must not appear in the public schema",
         );
     }
 );
@@ -222,7 +231,7 @@ simulation_test!(
                 "SELECT column_name, data_type, is_nullable, column_default, lix_insert_policy \
                  FROM information_schema.columns \
                  WHERE table_name = 'lix_file' \
-                   AND column_name IN ('data', 'id') \
+                   AND column_name IN ('content', 'id') \
                  ORDER BY column_name",
                 &[],
             )
@@ -232,7 +241,7 @@ simulation_test!(
             file_contract,
             vec![
                 vec![
-                    Value::Text("data".to_string()),
+                    Value::Text("content".to_string()),
                     Value::Text("BYTEA".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Text("X''".to_string()),
@@ -500,7 +509,7 @@ simulation_test!(
                     Value::Text("{\"phase\":\"update\"}".to_string()),
                     Value::Json(serde_json::json!({"phase": "update"})),
                 ),
-                ("data", None) => (
+                ("content", None) => (
                     Value::Text("before".to_string()),
                     Value::Blob(b"before".to_vec().into()),
                     Value::Blob(b"before".to_vec().into()),
@@ -543,7 +552,7 @@ simulation_test!(
                      'text_value', 'integer_value', 'number_value', \
                      'boolean_value', 'json_value'\
                    )\
-                 ) OR (table_name = 'lix_file' AND column_name = 'data') \
+                 ) OR (table_name = 'lix_file' AND column_name = 'content') \
                  ORDER BY table_name, column_name",
                 &[],
             )
@@ -583,7 +592,7 @@ simulation_test!(
                 "integer_value" => "BIGINT",
                 "number_value" => "DOUBLE PRECISION",
                 "boolean_value" => "BOOLEAN",
-                "data" => "BYTEA",
+                "content" => "BYTEA",
                 other => panic!("unexpected contract column {other}"),
             };
             assert_eq!(contract.data_type, expected_type);
@@ -703,13 +712,13 @@ simulation_test!(
         let bytea_contract = contracts
             .iter()
             .find(|contract| contract.table_name == "lix_file")
-            .expect("lix_file.data BYTEA contract should exist");
+            .expect("lix_file.content BYTEA contract should exist");
         let (file_insert_param, _, _, file_update_param, file_update_expected) =
             values_for_contract(bytea_contract);
         session
             .execute(
                 &format!(
-                    "INSERT INTO lix_file (path, data) \
+                    "INSERT INTO lix_file (path, content) \
                      VALUES ('/contract.bin', CAST($1 AS {}))",
                     bytea_contract.data_type
                 ),
@@ -720,7 +729,7 @@ simulation_test!(
         session
             .execute(
                 &format!(
-                    "UPDATE lix_file SET data = CAST($1 AS {}) \
+                    "UPDATE lix_file SET content = CAST($1 AS {}) \
                      WHERE path = '/contract.bin'",
                     bytea_contract.data_type
                 ),
@@ -730,7 +739,7 @@ simulation_test!(
             .expect("advertised BYTEA should work in a bound UPDATE");
         let file = session
             .execute(
-                "SELECT data FROM lix_file WHERE path = '/contract.bin'",
+                "SELECT content FROM lix_file WHERE path = '/contract.bin'",
                 &[],
             )
             .await
@@ -780,7 +789,7 @@ simulation_test!(
                 "'true'",
                 "engine_scalar_cast_contract",
             ),
-            ("BINARY", "data", "'legacy'", "lix_file"),
+            ("BINARY", "content", "'legacy'", "lix_file"),
         ] {
             let write_error = session
                 .execute(
@@ -797,7 +806,7 @@ simulation_test!(
 
         let binary_insert_error = session
             .execute(
-                "INSERT INTO lix_file (path, data) \
+                "INSERT INTO lix_file (path, content) \
                  VALUES ('/legacy-binary.bin', CAST('legacy' AS BINARY))",
                 &[],
             )
@@ -860,7 +869,7 @@ simulation_test!(
             .expect("upsert with an omitted file id should generate");
         session
             .execute(
-                "UPDATE lix_file SET data = X'6F6C64' WHERE path = '/generated.txt'",
+                "UPDATE lix_file SET content = X'6F6C64' WHERE path = '/generated.txt'",
                 &[],
             )
             .await
@@ -868,14 +877,14 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (path) VALUES ('/generated.txt') \
-                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[],
             )
             .await
-            .expect("excluded.data should materialize its advertised empty default");
+            .expect("excluded.content should materialize its advertised empty default");
         let defaulted_upsert = session
             .execute(
-                "SELECT data FROM lix_file WHERE path = '/generated.txt'",
+                "SELECT content FROM lix_file WHERE path = '/generated.txt'",
                 &[],
             )
             .await
@@ -1038,7 +1047,7 @@ simulation_test!(
 
         let query_generated_file = session
             .execute(
-                "SELECT id, data FROM lix_file WHERE path = '/query-generated.txt'",
+                "SELECT id, content FROM lix_file WHERE path = '/query-generated.txt'",
                 &[],
             )
             .await
@@ -1081,7 +1090,7 @@ simulation_test!(
                 LixError::CODE_TYPE_MISMATCH,
             ),
             (
-                "INSERT INTO lix_file (path, data) \
+                "INSERT INTO lix_file (path, content) \
                  VALUES ('/generated.txt', CAST(NULL AS BYTEA)) \
                  ON CONFLICT (path) DO NOTHING",
                 LixError::CODE_TYPE_MISMATCH,
@@ -1102,8 +1111,8 @@ simulation_test!(
                 LixError::CODE_TYPE_MISMATCH,
             ),
             (
-                "INSERT INTO lix_file (path, data) \
-                 SELECT '/query-null-data.txt', NULL \
+                "INSERT INTO lix_file (path, content) \
+                 SELECT '/query-null-content.txt', NULL \
                  FROM information_schema.tables \
                  WHERE table_name = 'lix_file'",
                 LixError::CODE_TYPE_MISMATCH,

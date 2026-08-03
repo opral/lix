@@ -130,7 +130,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
         .join(",");
     session
         .execute(
-            &format!("INSERT INTO lix_file (id, path, data) VALUES {unrelated_values}"),
+            &format!("INSERT INTO lix_file (id, path, content) VALUES {unrelated_values}"),
             &[],
         )
         .await
@@ -158,14 +158,16 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
         .join(",");
     session
         .execute(
-            &format!("INSERT INTO lix_file (id, path, data) VALUES {unrelated_additional_files}"),
+            &format!(
+                "INSERT INTO lix_file (id, path, content) VALUES {unrelated_additional_files}"
+            ),
             &[],
         )
         .await
         .expect("unrelated additional files should insert in one commit");
     session
         .execute(
-            "INSERT INTO lix_file (id, path, data) \
+            "INSERT INTO lix_file (id, path, content) \
              VALUES ('3faa577b-02e3-7c30-8b7d-30a9698cba93', '/3faa577b-02e3-7c30-8b7d-30a9698cba93.txt', X'746172676574')",
             &[],
         )
@@ -262,7 +264,7 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
         .expect("target ancestors should insert");
     session
         .execute(
-            "INSERT INTO lix_file (id, path, data) \
+            "INSERT INTO lix_file (id, path, content) \
              VALUES ('626f756e-6465-842d-8669-6c6500000000', '/bounded/child/target.txt', X'78')",
             &[],
         )
@@ -353,7 +355,7 @@ simulation_test!(
             .expect("nested projection directories should insert");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('70726f6a-6563-8469-8f6e-2d66696c6500', '/workspace/docs/guides/readme.md', X'78')",
                 &[],
             )
@@ -478,7 +480,7 @@ simulation_test!(
             .expect("grouped directories should insert");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('67726f75-7065-842d-8669-6c6500000000', '/grouped/child/file.txt', X'78')",
                 &[],
             )
@@ -601,7 +603,7 @@ simulation_test!(
         .await
         .expect("sibling directories should insert");
         main.execute(
-            "INSERT INTO lix_file (id, path, data) \
+            "INSERT INTO lix_file (id, path, content) \
              VALUES ('616e6365-7374-8f72-8d73-69626c696e00', '/before/child/file.txt', X'78')",
             &[],
         )
@@ -713,7 +715,7 @@ simulation_test!(
             .expect("restore directories should insert");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('72657374-6f72-852d-8669-6c6500000000', '/restore/child/file.txt', X'78')",
                 &[],
             )
@@ -782,7 +784,7 @@ simulation_test!(
             .expect("directories should restore");
         transaction
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('72657374-6f72-852d-8669-6c6500000000', '/restored/child/file.txt', X'79')",
                 &[],
             )
@@ -800,7 +802,7 @@ simulation_test!(
         let restored = session
             .execute(
                 &format!(
-                    "SELECT path, data, lixcol_source_changes \
+                    "SELECT path, content, lixcol_source_changes \
                      FROM lix_file_history('{restore_commit_id}') \
                        WHERE lixcol_depth = 0 \
                        AND id = '72657374-6f72-852d-8669-6c6500000000'"
@@ -815,7 +817,7 @@ simulation_test!(
             Value::Text("/restored/child/file.txt".to_string())
         );
         assert_eq!(
-            restored.rows()[0].get::<Value>("data").unwrap(),
+            restored.rows()[0].get::<Value>("content").unwrap(),
             Value::Blob(b"y".to_vec().into())
         );
         let Value::Json(restore_sources) = restored.rows()[0]
@@ -842,7 +844,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_history_reads_path_and_data_from_commit_graph,
+    lix_file_history_reads_path_and_content_from_commit_graph,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -855,7 +857,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('68697374-6f72-892d-8669-6c6500000000', '/docs/guides/readme.md', X'68656C6C6F')",
                 &[],
             )
@@ -886,7 +888,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, name, data, lixcol_depth \
+                "SELECT id, path, name, content, lixcol_depth \
                  FROM lix_file_history($1) \
                    WHERE id = $2 \
                    AND path LIKE $3 \
@@ -1014,7 +1016,7 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT path, data \
+                    "SELECT path, content \
                      FROM lix_file_history('{commit_id}') \
                        WHERE path = '/empty-history.txt' \
                        AND lixcol_depth = 0"
@@ -1046,7 +1048,7 @@ simulation_test!(
             &engine,
         );
         main.execute(
-            "INSERT INTO lix_file (id, path, data) \
+            "INSERT INTO lix_file (id, path, content) \
              VALUES ('6469616d-6f6e-842d-8669-6c6500000000', '/before.md', X'62617365')",
             &[],
         )
@@ -1178,7 +1180,7 @@ simulation_test!(
             .expect("directory insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('68697374-6f72-892d-8a6f-696e2d666900', '/joined/old.txt', X'6F6E65')",
                 &[],
             )
@@ -1233,7 +1235,7 @@ simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
 
     session
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES \
+            "INSERT INTO lix_file (id, path, content) VALUES \
                     ('01940000-0000-7000-8000-000000000004', '/history/in-a.txt', X'61'), \
                     ('01940000-0000-7000-8000-000000000005', '/history/in-b.txt', X'62')",
             &[],
@@ -1248,7 +1250,7 @@ simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT id, path, data \
+            "SELECT id, path, content \
                  FROM lix_file_history($1) \
                    WHERE id IN ($2, $3) \
                  ORDER BY id",
@@ -1292,7 +1294,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('6161612d-6f6c-8465-822d-686973746f00', '/older.txt', X'6F6C646572')",
                 &[],
             )
@@ -1300,7 +1302,7 @@ simulation_test!(
             .expect("older file insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('7a7a7a2d-6e65-8765-822d-686973746f00', '/newer.txt', X'6E65776572')",
                 &[],
             )
@@ -1350,7 +1352,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES \
+                "INSERT INTO lix_file (id, path, content) VALUES \
                     ('a71ca839-a7d4-7529-899d-470f3e2d56eb', '/noise/one.txt', X'6F6E65'), \
                     ('4fa4f740-1d46-781f-87b7-8d6347ada462', '/noise/two.txt', X'74776F'), \
                     ('74242a12-7491-7df8-8cfc-0a484bbfd0cb', '/target/three.txt', X'7468726565')",
@@ -1367,7 +1369,7 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, data \
+                    "SELECT id, path, content \
                      FROM lix_file_history('{commit_id}') \
                        WHERE path LIKE '/target/%' \
                      LIMIT 1"
@@ -1400,7 +1402,7 @@ simulation_test!(lix_file_history_defaults_to_active_head, |sim| async move {
 
     session
         .execute(
-            "INSERT INTO lix_file (id, path, data) \
+            "INSERT INTO lix_file (id, path, content) \
                  VALUES ('68697374-6f72-892d-8465-6661756c7401', '/history-default.txt', X'64656661756C74')",
             &[],
         )
@@ -1439,7 +1441,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('6f726469-6e61-8279-8d68-6973746f7200', '/ordinary-history.txt', X'68656C6C6F')",
                 &[],
             )
@@ -1462,7 +1464,7 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT path, data, lixcol_depth \
+                    "SELECT path, content, lixcol_depth \
                      FROM lix_file_history('{commit_id}') \
                        WHERE id = '6f726469-6e61-8279-8d68-6973746f7200' \
                      ORDER BY lixcol_depth"
@@ -1497,7 +1499,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('68697374-6f72-892d-8669-6c652d626c00', '/blob-filter.txt', X'626C6F62')",
                 &[],
             )
@@ -1505,7 +1507,7 @@ simulation_test!(
             .expect("file insert should succeed");
         session
             .execute(
-                "UPDATE lix_file SET data = X'626C6F6232' \
+                "UPDATE lix_file SET content = X'626C6F6232' \
                  WHERE id = '68697374-6f72-892d-8669-6c652d626c00'",
                 &[],
             )
@@ -1520,7 +1522,7 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, data, lixcol_source_changes \
+                    "SELECT id, path, content, lixcol_source_changes \
                      FROM lix_file_history('{commit_id}') \
                        WHERE id = '68697374-6f72-892d-8669-6c652d626c00' \
                      ORDER BY lixcol_depth"

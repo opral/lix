@@ -145,7 +145,7 @@ where
                     .field(*index)
                     .name()
                     .as_str()
-                    .eq_ignore_ascii_case("data")
+                    .eq_ignore_ascii_case("content")
             })
         });
         let mut route = HistoryRoute::from_filters(filters);
@@ -2131,7 +2131,7 @@ static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
             Col::Utf8(|row| row.descriptor().directory_id.as_deref()),
         ),
         ("name", Col::Utf8(|row| row.descriptor().name.as_deref())),
-        ("data", Col::Binary(|row| row.data.clone())),
+        ("content", Col::Binary(|row| row.data.clone())),
         (
             HISTORY_COL_ENTITY_PK,
             Col::Utf8Fallible(|row| entity_pk_json_array(&row.descriptor().id).map(Some)),
@@ -2188,7 +2188,7 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
-        Field::new("data", DataType::LargeBinary, true),
+        Field::new("content", DataType::LargeBinary, true),
         json_field(HISTORY_COL_ENTITY_PK, false),
         json_field(HISTORY_COL_SOURCE_CHANGES, false),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),

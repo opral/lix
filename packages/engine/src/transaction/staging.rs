@@ -40,7 +40,7 @@ use crate::transaction::types::{
     CertifiedParameterReplacementBatch, CertifiedRawWriteBatchPreparation,
     CompleteCollectionReplacementProof, LogicalPrimaryKey, PreparedRowFacts, PreparedStateBatch,
     PreparedStateRowRef, PreparedTransactionWrite, StageJson, StagedCommitChangeBatch,
-    TransactionFileData, TransactionJson, TransactionWriteMode, TransactionWriteOperation,
+    TransactionFileContent, TransactionJson, TransactionWriteMode, TransactionWriteOperation,
     TransactionWriteOrigin, TransactionWriteOutcome,
 };
 #[cfg(test)]
@@ -62,7 +62,7 @@ pub(crate) struct TransactionWriteBuffer {
     checkpoint_publications: Mutex<Vec<CheckpointPublication>>,
     extra_commit_parents_by_branch: Mutex<BTreeMap<String, Vec<CommitId>>>,
     intermediate_commits: Mutex<Vec<StagedIntermediateCommit>>,
-    file_data_writes: Mutex<Vec<TransactionFileData>>,
+    file_content_writes: Mutex<Vec<TransactionFileContent>>,
 }
 
 /// A transaction-local statement checkpoint.
@@ -79,7 +79,7 @@ pub(crate) struct TransactionWriteBufferCheckpoint {
     checkpoint_publications: Vec<CheckpointPublication>,
     extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     intermediate_commits: Vec<StagedIntermediateCommit>,
-    file_data_writes: Vec<TransactionFileData>,
+    file_content_writes: Vec<TransactionFileContent>,
 }
 
 /// One immutable, fixed-shape journal chunk produced by typed SQL mutation
@@ -832,7 +832,7 @@ pub(crate) struct PreparedWriteSet {
     pub(crate) checkpoint_publications: Vec<CheckpointPublication>,
     pub(crate) extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     pub(crate) intermediate_commits: Vec<StagedIntermediateCommit>,
-    pub(crate) file_data_writes: Vec<TransactionFileData>,
+    pub(crate) file_content_writes: Vec<TransactionFileContent>,
 }
 
 #[derive(Clone)]
@@ -1394,7 +1394,8 @@ impl PreparedWriteSet {
         other.state_rows.set_commit_id_all(cohort_commit_id);
         self.insert_selection.append(other.insert_selection);
         self.state_rows.append(other.state_rows);
-        self.file_data_writes.append(&mut other.file_data_writes);
+        self.file_content_writes
+            .append(&mut other.file_content_writes);
         Ok(())
     }
 
@@ -1425,10 +1426,10 @@ impl PreparedWriteSet {
         for _ in 0..replacement_count {
             self.insert_selection.push_not_insert();
         }
-        self.file_data_writes
+        self.file_content_writes
             .retain(|write| !file_ids.contains(&write.file_id));
-        self.file_data_writes
-            .append(&mut replacement.file_data_writes);
+        self.file_content_writes
+            .append(&mut replacement.file_content_writes);
         for change_refs in self.commit_change_refs_by_branch.values_mut() {
             change_refs.tracked_change_count = self
                 .state_rows
@@ -1530,7 +1531,7 @@ impl TransactionWriteBuffer {
             checkpoint_publications: Mutex::new(Vec::new()),
             extra_commit_parents_by_branch: Mutex::new(BTreeMap::new()),
             intermediate_commits: Mutex::new(Vec::new()),
-            file_data_writes: Mutex::new(Vec::new()),
+            file_content_writes: Mutex::new(Vec::new()),
         }
     }
 
@@ -1901,7 +1902,7 @@ impl TransactionWriteBuffer {
                 "failed to acquire immutable transaction mutation journal",
             )
         })?;
-        let file_data_writes = self.file_data_writes.lock().map_err(|_| {
+        let file_content_writes = self.file_content_writes.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged file data lock",
@@ -1951,7 +1952,7 @@ impl TransactionWriteBuffer {
             checkpoint_publications: checkpoint_publications.clone(),
             extra_commit_parents_by_branch: extra_commit_parents_by_branch.clone(),
             intermediate_commits: intermediate_commits.clone(),
-            file_data_writes: file_data_writes.clone(),
+            file_content_writes: file_content_writes.clone(),
         })
     }
 
@@ -1970,7 +1971,7 @@ impl TransactionWriteBuffer {
             checkpoint_publications,
             extra_commit_parents_by_branch,
             intermediate_commits,
-            file_data_writes,
+            file_content_writes,
         } = checkpoint;
         let mut rows_guard = self.rows.lock().map_err(|_| {
             LixError::new(
@@ -1984,7 +1985,7 @@ impl TransactionWriteBuffer {
                 "failed to acquire immutable transaction mutation journal",
             )
         })?;
-        let mut file_data_guard = self.file_data_writes.lock().map_err(|_| {
+        let mut file_content_guard = self.file_content_writes.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged file data lock",
@@ -2028,7 +2029,7 @@ impl TransactionWriteBuffer {
 
         *rows_guard = rows;
         *ordered_mutations_guard = ordered_mutations;
-        *file_data_guard = file_data_writes;
+        *file_content_guard = file_content_writes;
         *commit_change_refs_guard = commit_change_refs_by_branch;
         *extra_parents_guard = extra_commit_parents_by_branch;
         *intermediate_commits_guard = intermediate_commits;
@@ -2449,7 +2450,7 @@ impl TransactionWriteBuffer {
                 "failed to acquire immutable transaction mutation journal",
             )
         })?;
-        let mut file_data_guard = self.file_data_writes.lock().map_err(|_| {
+        let mut file_content_guard = self.file_content_writes.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged file data lock",
@@ -2545,7 +2546,7 @@ impl TransactionWriteBuffer {
             checkpoint_publications: std::mem::take(&mut *checkpoint_publications_guard),
             extra_commit_parents_by_branch: std::mem::take(&mut *extra_parents_guard),
             intermediate_commits: std::mem::take(&mut *intermediate_commits_guard),
-            file_data_writes: std::mem::take(&mut *file_data_guard),
+            file_content_writes: std::mem::take(&mut *file_content_guard),
         })
     }
 
@@ -2857,7 +2858,7 @@ impl TransactionWriteBuffer {
         if hashes.is_empty() {
             return Ok(BlobBytesBatch::new(Vec::new()));
         }
-        let file_data_guard = self.file_data_writes.lock().map_err(|_| {
+        let file_content_guard = self.file_content_writes.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged file data lock",
@@ -2869,7 +2870,7 @@ impl TransactionWriteBuffer {
             .map(|hash| (hash, None))
             .collect::<BTreeMap<BlobId, Option<&[u8]>>>();
         let mut remaining = requested.len();
-        'writes: for write in file_data_guard.iter() {
+        'writes: for write in file_content_guard.iter() {
             let Some(data) = write.inline_data() else {
                 // Prepared CAS content is already durable. Leaving its slot
                 // unresolved lets the transaction reader fall through to CAS.
@@ -2936,15 +2937,15 @@ impl TransactionWriteBuffer {
     ) -> Result<TransactionWriteOutcome, LixError> {
         let (mode, count) = match &write {
             PreparedTransactionWrite::Rows { mode, rows } => (Some(*mode), rows.len() as u64),
-            PreparedTransactionWrite::RowsWithFileData { .. } => {
+            PreparedTransactionWrite::RowsWithFileContent { .. } => {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "certified parameter INSERT unexpectedly contains file data",
                 ));
             }
         };
-        let (rows, file_data_writes) = self.state_rows_from_stage_write(write);
-        debug_assert!(file_data_writes.is_empty());
+        let (rows, file_content_writes) = self.state_rows_from_stage_write(write);
+        debug_assert!(file_content_writes.is_empty());
         match self.stage_append_only_if_possible(mode, rows, None)? {
             AppendOnlyStage::Staged => Ok(TransactionWriteOutcome { count }),
             AppendOnlyStage::Fallback(rows) => {
@@ -2976,16 +2977,18 @@ impl TransactionWriteBuffer {
     ) -> Result<TransactionWriteOutcome, LixError> {
         let (mode, count) = match &write {
             PreparedTransactionWrite::Rows { mode, rows } => (Some(*mode), rows.len() as u64),
-            PreparedTransactionWrite::RowsWithFileData { mode, count, .. } => (Some(*mode), *count),
+            PreparedTransactionWrite::RowsWithFileContent { mode, count, .. } => {
+                (Some(*mode), *count)
+            }
         };
-        let (mut rows, file_data_writes) = self.state_rows_from_stage_write(write);
+        let (mut rows, file_content_writes) = self.state_rows_from_stage_write(write);
         if let Some(statement_indices) = &statement_indices {
             debug_assert_eq!(mode, Some(TransactionWriteMode::Insert));
             debug_assert_eq!(statement_indices.len(), rows.len());
         }
         if rows.is_empty() {
-            if !file_data_writes.is_empty() {
-                self.file_data_writes
+            if !file_content_writes.is_empty() {
+                self.file_content_writes
                     .lock()
                     .map_err(|_| {
                         LixError::new(
@@ -2993,11 +2996,11 @@ impl TransactionWriteBuffer {
                             "failed to acquire transaction staged file data lock",
                         )
                     })?
-                    .extend(file_data_writes);
+                    .extend(file_content_writes);
             }
             return Ok(TransactionWriteOutcome { count });
         }
-        if file_data_writes.is_empty() {
+        if file_content_writes.is_empty() {
             match self.stage_append_only_if_possible(mode, rows, statement_indices.as_deref())? {
                 AppendOnlyStage::Staged => return Ok(TransactionWriteOutcome { count }),
                 AppendOnlyStage::Fallback(fallback_rows) => rows = fallback_rows,
@@ -3005,7 +3008,7 @@ impl TransactionWriteBuffer {
         } else {
             match self.stage_fresh_tracked_file_batch_if_possible(mode, rows)? {
                 AppendOnlyStage::Staged => {
-                    self.file_data_writes
+                    self.file_content_writes
                         .lock()
                         .map_err(|_| {
                             LixError::new(
@@ -3013,7 +3016,7 @@ impl TransactionWriteBuffer {
                                 "failed to acquire transaction staged file data lock",
                             )
                         })?
-                        .extend(file_data_writes);
+                        .extend(file_content_writes);
                     return Ok(TransactionWriteOutcome { count });
                 }
                 AppendOnlyStage::Fallback(fallback_rows) => rows = fallback_rows,
@@ -3126,8 +3129,8 @@ impl TransactionWriteBuffer {
                 rows.set_commit_id(index, commit_id);
             }
             *staged_rows = rows;
-            if !file_data_writes.is_empty() {
-                self.file_data_writes
+            if !file_content_writes.is_empty() {
+                self.file_content_writes
                     .lock()
                     .map_err(|_| {
                         LixError::new(
@@ -3135,7 +3138,7 @@ impl TransactionWriteBuffer {
                             "failed to acquire transaction staged file data lock",
                         )
                     })?
-                    .extend(file_data_writes);
+                    .extend(file_content_writes);
             }
             return Ok(TransactionWriteOutcome { count });
         }
@@ -3215,8 +3218,8 @@ impl TransactionWriteBuffer {
         for index in new_candidate_destinations {
             by_candidate.insert(staged_rows.row(index), RowSlot::State(index));
         }
-        if !file_data_writes.is_empty() {
-            self.file_data_writes
+        if !file_content_writes.is_empty() {
+            self.file_content_writes
                 .lock()
                 .map_err(|_| {
                     LixError::new(
@@ -3224,7 +3227,7 @@ impl TransactionWriteBuffer {
                         "failed to acquire transaction staged file data lock",
                     )
                 })?
-                .extend(file_data_writes);
+                .extend(file_content_writes);
         }
         Ok(TransactionWriteOutcome { count })
     }
@@ -3232,12 +3235,12 @@ impl TransactionWriteBuffer {
     fn state_rows_from_stage_write(
         &self,
         write: PreparedTransactionWrite,
-    ) -> (PreparedStateBatch, Vec<TransactionFileData>) {
+    ) -> (PreparedStateBatch, Vec<TransactionFileContent>) {
         match write {
             PreparedTransactionWrite::Rows { rows, .. } => (rows, Vec::new()),
-            PreparedTransactionWrite::RowsWithFileData {
-                rows, file_data, ..
-            } => (rows, file_data),
+            PreparedTransactionWrite::RowsWithFileContent {
+                rows, file_content, ..
+            } => (rows, file_content),
         }
     }
 }
@@ -5229,7 +5232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_writes_drain_preserves_file_data_payloads() {
+    async fn staged_writes_drain_preserves_file_content_payloads() {
         let staged_writes = test_staged_writes();
         let result: crate::Blob = b"hello".as_slice().into();
         let provenance = crate::common::RequestBlobSpliceProvenance::new_validated_for_test(
@@ -5239,7 +5242,7 @@ mod tests {
             1,
             b"ll".to_vec(),
         );
-        let mut file_data = TransactionFileData::new(
+        let mut file_content = TransactionFileContent::new(
             "01920000-0000-7000-8000-0000000000d2".to_string(),
             Some("/readme.md".to_string()),
             Some("readme.md".to_string()),
@@ -5248,7 +5251,7 @@ mod tests {
             true,
             result,
         );
-        file_data.set_splice_provenance(Some(provenance.clone()));
+        file_content.set_splice_provenance(Some(provenance.clone()));
 
         let rows = prepared_rows![state_row(
             "01920000-0000-7000-8000-0000000000d2",
@@ -5256,10 +5259,10 @@ mod tests {
         )];
         let input_rows_allocation = rows.slot_allocation_ptr() as usize;
         staged_writes
-            .stage_write(PreparedTransactionWrite::RowsWithFileData {
+            .stage_write(PreparedTransactionWrite::RowsWithFileContent {
                 mode: TransactionWriteMode::Replace,
                 rows,
-                file_data: vec![file_data],
+                file_content: vec![file_content],
                 count: 1,
             })
             .expect("staging rows with file data should succeed");
@@ -5272,14 +5275,14 @@ mod tests {
             input_rows_allocation,
             "indexed file writes must retain one prepared-row allocation through staging and drain"
         );
-        assert_eq!(drained.file_data_writes.len(), 1);
+        assert_eq!(drained.file_content_writes.len(), 1);
         assert_eq!(
-            drained.file_data_writes[0].file_id,
+            drained.file_content_writes[0].file_id,
             "01920000-0000-7000-8000-0000000000d2"
         );
-        assert_eq!(drained.file_data_writes[0].data(), b"hello");
+        assert_eq!(drained.file_content_writes[0].content(), b"hello");
         assert_eq!(
-            drained.file_data_writes[0].splice_provenance(),
+            drained.file_content_writes[0].splice_provenance(),
             Some(&provenance)
         );
     }
@@ -5293,7 +5296,7 @@ mod tests {
             tracked_append_row("entity-b", "second"),
         ];
         let input_rows_allocation = rows.slot_allocation_ptr() as usize;
-        let file_data = TransactionFileData::new(
+        let file_content = TransactionFileContent::new(
             "01920000-0000-7000-8000-0000000000a2".to_string(),
             Some("/batch.json".to_string()),
             Some("batch.json".to_string()),
@@ -5304,10 +5307,10 @@ mod tests {
         );
 
         staged_writes
-            .stage_write(PreparedTransactionWrite::RowsWithFileData {
+            .stage_write(PreparedTransactionWrite::RowsWithFileContent {
                 mode: TransactionWriteMode::Replace,
                 rows,
-                file_data: vec![file_data],
+                file_content: vec![file_content],
                 count: 1,
             })
             .expect("fresh tracked file batch should stage");
@@ -5341,7 +5344,7 @@ mod tests {
                 .iter()
                 .all(|row| row.commit_id == Some(refs.commit_id))
         );
-        assert_eq!(drained.file_data_writes.len(), 1);
+        assert_eq!(drained.file_content_writes.len(), 1);
     }
 
     #[test]
@@ -5351,7 +5354,7 @@ mod tests {
         first.facts.requires_transaction_validation = true;
         let mut second = tracked_append_row("entity-a", "second-source-row");
         second.facts.requires_transaction_validation = true;
-        let file_data = TransactionFileData::new(
+        let file_content = TransactionFileContent::new(
             "01920000-0000-7000-8000-0000000000a2".to_string(),
             Some("/batch.json".to_string()),
             Some("batch.json".to_string()),
@@ -5362,10 +5365,10 @@ mod tests {
         );
 
         staged_writes
-            .stage_write(PreparedTransactionWrite::RowsWithFileData {
+            .stage_write(PreparedTransactionWrite::RowsWithFileContent {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![first, second],
-                file_data: vec![file_data],
+                file_content: vec![file_content],
                 count: 1,
             })
             .expect("cross-row file batch should stage through the generic lane");
@@ -5386,9 +5389,9 @@ mod tests {
     }
 
     #[test]
-    fn file_data_lane_coalesces_repeated_identity_for_reads_and_drain() {
+    fn file_content_lane_coalesces_repeated_identity_for_reads_and_drain() {
         let staged_writes = test_staged_writes();
-        let file_data = TransactionFileData::new(
+        let file_content = TransactionFileContent::new(
             "resurrected-file".to_string(),
             Some("/resurrected.json".to_string()),
             Some("resurrected.json".to_string()),
@@ -5399,13 +5402,13 @@ mod tests {
         );
 
         staged_writes
-            .stage_write(PreparedTransactionWrite::RowsWithFileData {
+            .stage_write(PreparedTransactionWrite::RowsWithFileContent {
                 mode: TransactionWriteMode::Replace,
                 rows: prepared_rows![
                     tombstone_row("resurrected-file"),
                     state_row("resurrected-file", "latest"),
                 ],
-                file_data: vec![file_data],
+                file_content: vec![file_content],
                 count: 1,
             })
             .expect("file-data replacement sequence should stage");
@@ -5438,14 +5441,14 @@ mod tests {
                 .map(StageJson::normalized),
             Some("{\"key\":\"resurrected-file\",\"value\":\"latest\"}")
         );
-        assert_eq!(drained.file_data_writes.len(), 1);
-        assert_eq!(drained.file_data_writes[0].data(), b"payload");
+        assert_eq!(drained.file_content_writes.len(), 1);
+        assert_eq!(drained.file_content_writes[0].content(), b"payload");
     }
 
     #[test]
     fn staged_file_byte_lookup_filters_main_and_auxiliary_payloads_before_copying() {
         let staged_writes = test_staged_writes();
-        let mut requested_write = TransactionFileData::new(
+        let mut requested_write = TransactionFileContent::new(
             "requested-file".to_string(),
             Some("/requested.bin".to_string()),
             Some("requested.bin".to_string()),
@@ -5455,7 +5458,7 @@ mod tests {
             b"requested-main".to_vec(),
         );
         requested_write.add_auxiliary_payload(b"requested-auxiliary".to_vec());
-        let unrelated_write = TransactionFileData::new(
+        let unrelated_write = TransactionFileContent::new(
             "unrelated-file".to_string(),
             Some("/unrelated.bin".to_string()),
             Some("unrelated.bin".to_string()),
@@ -5465,10 +5468,10 @@ mod tests {
             b"unrelated-main".to_vec(),
         );
         staged_writes
-            .stage_write(PreparedTransactionWrite::RowsWithFileData {
+            .stage_write(PreparedTransactionWrite::RowsWithFileContent {
                 mode: TransactionWriteMode::Replace,
                 rows: PreparedStateBatch::new(),
-                file_data: vec![unrelated_write, requested_write],
+                file_content: vec![unrelated_write, requested_write],
                 count: 2,
             })
             .expect("file payloads should stage");

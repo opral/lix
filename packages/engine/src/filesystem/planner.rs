@@ -24,7 +24,7 @@ use super::{DirectoryPathRecord, derive_directory_paths};
 #[cfg(test)]
 use crate::transaction::types::TransactionWriteRow;
 use crate::transaction::types::{
-    FileContent, LogicalPrimaryKey, RawWriteBatch, TransactionFileData, TransactionJson,
+    FileContent, LogicalPrimaryKey, RawWriteBatch, TransactionFileContent, TransactionJson,
     TransactionWriteOperation, TransactionWriteOrigin,
 };
 
@@ -37,7 +37,7 @@ use crate::transaction::types::{
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FilesystemWritePlan {
     pub(crate) rows: RawWriteBatch,
-    pub(crate) file_data: Vec<TransactionFileData>,
+    pub(crate) file_content: Vec<TransactionFileContent>,
     pub(crate) count: u64,
 }
 
@@ -1066,9 +1066,9 @@ fn plan_parsed_file_path_write_with_fallback(
     }
     .append_to(&mut rows);
 
-    let mut file_data = Vec::new();
+    let mut file_content = Vec::new();
     if let Some(content) = content {
-        let file_payload = TransactionFileData::new(
+        let file_payload = TransactionFileContent::new(
             file_id.clone(),
             Some(file_path),
             Some(filename),
@@ -1092,12 +1092,12 @@ fn plan_parsed_file_path_write_with_fallback(
             }
             .append_to(&mut rows)?;
         }
-        file_data.push(file_payload);
+        file_content.push(file_payload);
     }
 
     Ok(FilesystemWritePlan {
         rows,
-        file_data,
+        file_content,
         count: 1,
     })
 }
@@ -1124,9 +1124,9 @@ pub(crate) fn plan_file_descriptor_write(
     }
     .append_to(&mut rows);
 
-    let mut file_data = Vec::new();
+    let mut file_content = Vec::new();
     if let Some(data) = input.data {
-        let file_payload = TransactionFileData::new(
+        let file_payload = TransactionFileContent::new(
             file_id.clone(),
             Some(file_path),
             Some(filename),
@@ -1150,12 +1150,12 @@ pub(crate) fn plan_file_descriptor_write(
             }
             .append_to(&mut rows)?;
         }
-        file_data.push(file_payload);
+        file_content.push(file_payload);
     }
 
     Ok(FilesystemWritePlan {
         rows,
-        file_data,
+        file_content,
         count: 1,
     })
 }
@@ -1228,7 +1228,7 @@ fn plan_parsed_file_path_update_with_fallback(
     // updates. A provider should plan blob rows only when `data` is assigned.
     Ok(FilesystemWritePlan {
         rows,
-        file_data: Vec::new(),
+        file_content: Vec::new(),
         count: 1,
     })
 }
@@ -2094,7 +2094,7 @@ mod tests {
         .expect("root file path write should plan");
 
         assert_eq!(plan.count, 1);
-        assert!(plan.file_data.is_empty());
+        assert!(plan.file_content.is_empty());
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(plan.rows.row(0).schema_key, "lix_file_descriptor");
         let snapshot: JsonValue = plan.rows.row(0).snapshot.unwrap().value().clone();
@@ -2122,16 +2122,16 @@ mod tests {
         .expect("file path write should plan");
 
         assert_eq!(plan.count, 1);
-        assert_eq!(plan.file_data.len(), 1);
+        assert_eq!(plan.file_content.len(), 1);
         assert_eq!(
-            plan.file_data[0].file_id,
+            plan.file_content[0].file_id,
             "01920000-0000-7000-8000-0000000000d2"
         );
         assert_eq!(
-            plan.file_data[0].branch_id,
+            plan.file_content[0].branch_id,
             "01920000-0000-7000-8000-0000000000a1"
         );
-        assert_eq!(plan.file_data[0].data(), b"hello");
+        assert_eq!(plan.file_content[0].content(), b"hello");
         assert_eq!(plan.rows.len(), 4);
         assert_eq!(
             plan.rows
@@ -2237,13 +2237,16 @@ mod tests {
         .expect("file descriptor write should plan");
 
         assert_eq!(plan.count, 1);
-        assert_eq!(plan.file_data.len(), 1);
+        assert_eq!(plan.file_content.len(), 1);
         assert_eq!(
-            plan.file_data[0].file_id,
+            plan.file_content[0].file_id,
             "01920000-0000-7000-8000-0000000000d2"
         );
-        assert_eq!(plan.file_data[0].path.as_deref(), Some("/docs/readme.md"));
-        assert_eq!(plan.file_data[0].data(), b"hello");
+        assert_eq!(
+            plan.file_content[0].path.as_deref(),
+            Some("/docs/readme.md")
+        );
+        assert_eq!(plan.file_content[0].content(), b"hello");
         assert_eq!(plan.rows.len(), 2);
         let file_row = plan
             .rows
@@ -2380,7 +2383,7 @@ mod tests {
         .expect("file path update should plan");
 
         assert_eq!(plan.count, 1);
-        assert!(plan.file_data.is_empty());
+        assert!(plan.file_content.is_empty());
         assert_eq!(plan.rows.len(), 1);
         assert!(
             plan.rows
@@ -2415,7 +2418,7 @@ mod tests {
         .expect("file path update should plan");
 
         assert_eq!(plan.count, 1);
-        assert!(plan.file_data.is_empty());
+        assert!(plan.file_content.is_empty());
         assert_eq!(plan.rows.len(), 3);
         assert_eq!(
             plan.rows
@@ -2541,17 +2544,17 @@ mod tests {
         );
         assert_eq!(blob.metadata, None);
 
-        assert_eq!(plan.file_data.len(), 1);
+        assert_eq!(plan.file_content.len(), 1);
         assert_eq!(
-            plan.file_data[0].file_id,
+            plan.file_content[0].file_id,
             "01920000-0000-7000-8000-0000000000d2"
         );
         assert_eq!(
-            plan.file_data[0].branch_id,
+            plan.file_content[0].branch_id,
             "01920000-0000-7000-8000-0000000000a1"
         );
-        assert_eq!(plan.file_data[0].untracked, true);
-        assert_eq!(plan.file_data[0].data(), b"hello");
+        assert_eq!(plan.file_content[0].untracked, true);
+        assert_eq!(plan.file_content[0].content(), b"hello");
     }
 
     #[test]
@@ -2569,9 +2572,9 @@ mod tests {
         .expect("empty file path write should plan");
 
         assert_eq!(plan.count, 1);
-        assert_eq!(plan.file_data.len(), 1);
-        assert_eq!(plan.file_data[0].file_id, "file-empty");
-        assert!(plan.file_data[0].is_empty());
+        assert_eq!(plan.file_content.len(), 1);
+        assert_eq!(plan.file_content[0].file_id, "file-empty");
+        assert!(plan.file_content[0].is_empty());
         assert!(
             plan.rows
                 .iter()

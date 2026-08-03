@@ -29,7 +29,7 @@ use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::exec::datafusion::LIX_INSERT_COLUMN_OMITTED_METADATA_KEY;
 use crate::sql2::write_normalization::{insert_column_is_omitted, mark_omitted_insert_columns};
 use crate::transaction::types::{
-    RawWriteBatch, TransactionFileData, TransactionWrite, TransactionWriteMode,
+    RawWriteBatch, TransactionFileContent, TransactionWrite, TransactionWriteMode,
 };
 
 use super::spec::DmlReturning;
@@ -83,11 +83,11 @@ impl UpsertConflictTarget {
 }
 
 /// The staged writes a spec produces for a slice of upsert rows: the state
-/// rows plus any file-data blobs (only `lix_file` populates the latter).
+/// rows plus any file-content blobs (only `lix_file` populates the latter).
 #[derive(Default)]
 pub(super) struct StagedUpsert {
     pub(super) rows: RawWriteBatch,
-    pub(super) file_data: Vec<TransactionFileData>,
+    pub(super) file_content: Vec<TransactionFileContent>,
 }
 
 impl StagedUpsert {
@@ -95,21 +95,24 @@ impl StagedUpsert {
     pub(super) fn rows(rows: RawWriteBatch) -> Self {
         Self {
             rows,
-            file_data: Vec::new(),
+            file_content: Vec::new(),
         }
     }
 
-    pub(super) fn with_file_data(rows: RawWriteBatch, file_data: Vec<TransactionFileData>) -> Self {
-        Self { rows, file_data }
+    pub(super) fn with_file_content(
+        rows: RawWriteBatch,
+        file_content: Vec<TransactionFileContent>,
+    ) -> Self {
+        Self { rows, file_content }
     }
 
     fn extend(&mut self, other: Self) {
         self.rows.append(other.rows);
-        self.file_data.extend(other.file_data);
+        self.file_content.extend(other.file_content);
     }
 
     fn is_empty(&self) -> bool {
-        self.rows.len() == 0 && self.file_data.is_empty()
+        self.rows.len() == 0 && self.file_content.is_empty()
     }
 }
 
@@ -468,16 +471,16 @@ async fn stage_upsert(
     if staged.is_empty() {
         return Ok(());
     }
-    let write = if staged.file_data.is_empty() {
+    let write = if staged.file_content.is_empty() {
         TransactionWrite::Rows {
             mode: TransactionWriteMode::Replace,
             rows: staged.rows,
         }
     } else {
-        TransactionWrite::RowsWithFileData {
+        TransactionWrite::RowsWithFileContent {
             mode: TransactionWriteMode::Replace,
             rows: staged.rows,
-            file_data: staged.file_data,
+            file_content: staged.file_content,
             count: affected,
         }
     };

@@ -92,7 +92,7 @@ pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
         BoundWriteTarget::Entity(_) => bound_public_write_shape_supported(plan),
         BoundWriteTarget::File(surface) => {
             fast_file_path_write_shape(plan, surface).is_some()
-                || fast_file_data_update_shape(plan, surface).is_some()
+                || fast_file_content_update_shape(plan, surface).is_some()
         }
         _ => false,
     }
@@ -1865,8 +1865,8 @@ pub(crate) async fn try_execute_bound_public_write(
                     .map_or(BoundPublicWriteExecution::Unsupported, |count| {
                         BoundPublicWriteExecution::Executed(SqlWriteResult::affected(count))
                     }))
-            } else if let Some(shape) = fast_file_data_update_shape(plan, surface) {
-                execute_file_data_update(ctx, params, metadata, &shape)
+            } else if let Some(shape) = fast_file_content_update_shape(plan, surface) {
+                execute_file_content_update(ctx, params, metadata, &shape)
                     .await
                     .map(SqlWriteResult::affected)
                     .map(BoundPublicWriteExecution::Executed)
@@ -1878,25 +1878,25 @@ pub(crate) async fn try_execute_bound_public_write(
     }
 }
 
-struct FastFileDataUpdateShape {
+struct FastFileContentUpdateShape {
     id: BoundExpr,
     data: BoundExpr,
     metadata: Option<BoundExpr>,
     data_parameter_index: Option<usize>,
 }
 
-async fn execute_file_data_update(
+async fn execute_file_content_update(
     ctx: &mut dyn SqlWriteExecutionContext,
     params: &[Value],
     metadata: &ExecuteStatementMetadata,
-    shape: &FastFileDataUpdateShape,
+    shape: &FastFileContentUpdateShape,
 ) -> Result<u64, LixError> {
     let id = eval_fast_file_nullable_text(&shape.id, params, "id")?;
-    let data = eval_fast_file_blob(&shape.data, params, "data")?;
-    let splice_provenance = fast_file_data_update_splice_provenance(shape, metadata);
+    let data = eval_fast_file_blob(&shape.data, params, "content")?;
+    let splice_provenance = fast_file_content_update_splice_provenance(shape, metadata);
     if let Some(metadata_expr) = &shape.metadata {
         let row_metadata = eval_fast_file_metadata(metadata_expr, params)?;
-        crate::sql2::providers::execute_fast_lix_file_data_update_by_id_with_metadata(
+        crate::sql2::providers::execute_fast_lix_file_content_update_by_id_with_metadata(
             ctx,
             id,
             data,
@@ -1906,7 +1906,7 @@ async fn execute_file_data_update(
         )
         .await
     } else {
-        crate::sql2::providers::execute_fast_lix_file_data_update_by_id(
+        crate::sql2::providers::execute_fast_lix_file_content_update_by_id(
             ctx,
             id,
             data,
@@ -1917,8 +1917,8 @@ async fn execute_file_data_update(
     }
 }
 
-fn fast_file_data_update_splice_provenance(
-    shape: &FastFileDataUpdateShape,
+fn fast_file_content_update_splice_provenance(
+    shape: &FastFileContentUpdateShape,
     metadata: &ExecuteStatementMetadata,
 ) -> Option<RequestBlobSpliceProvenance> {
     shape
@@ -1927,10 +1927,10 @@ fn fast_file_data_update_splice_provenance(
         .cloned()
 }
 
-fn fast_file_data_update_shape(
+fn fast_file_content_update_shape(
     plan: &LogicalWritePlan,
     surface: &FileWriteSurface,
-) -> Option<FastFileDataUpdateShape> {
+) -> Option<FastFileContentUpdateShape> {
     if !matches!(surface, FileWriteSurface::Base)
         || plan.bound.op != BoundWriteOp::Update
         || !matches!(plan.bound.input, BoundWriteInput::None)
@@ -1945,7 +1945,7 @@ fn fast_file_data_update_shape(
         .bound
         .assignments
         .iter()
-        .find(|assignment| assignment.column.name == "data")?;
+        .find(|assignment| assignment.column.name == "content")?;
     let metadata = plan
         .bound
         .assignments
@@ -1957,13 +1957,13 @@ fn fast_file_data_update_shape(
             .as_ref()
             .is_some_and(|expr| !fast_file_metadata_expr_supported(expr))
         || plan.bound.assignments.iter().any(|assignment| {
-            assignment.column.name != "data" && assignment.column.name != "lixcol_metadata"
+            assignment.column.name != "content" && assignment.column.name != "lixcol_metadata"
         })
     {
         return None;
     }
     let id = fast_file_id_predicate_value(&plan.bound.predicate)?;
-    Some(FastFileDataUpdateShape {
+    Some(FastFileContentUpdateShape {
         id: id.clone(),
         data: assignment.value.clone(),
         metadata,
@@ -2354,7 +2354,7 @@ async fn execute_file_path_write(
                 .map(|index| eval_fast_file_text(&row[index], params, "id"))
                 .transpose()?,
             eval_fast_file_text(&row[shape.path_index], params, "path")?,
-            eval_fast_file_blob(data_expr, params, "data")?,
+            eval_fast_file_blob(data_expr, params, "content")?,
             shape
                 .metadata_index
                 .map(|index| eval_fast_file_metadata(&row[index], params))
@@ -2400,7 +2400,7 @@ fn fast_file_path_write_shape(
     }
     let id_index = values.column_index("id");
     let path_index = values.column_index("path")?;
-    let data_index = values.column_index("data")?;
+    let data_index = values.column_index("content")?;
     let metadata_index = values.column_index("lixcol_metadata");
     if values.columns.len()
         != 2 + usize::from(id_index.is_some()) + usize::from(metadata_index.is_some())
@@ -2470,25 +2470,25 @@ fn fast_file_path_conflict_shape(
                         BoundExpr::ExcludedColumn(column) if column.name == name
                     )
             };
-            if assignments.len() == 1 && assigns_excluded_column(&assignments[0], "data") {
+            if assignments.len() == 1 && assigns_excluded_column(&assignments[0], "content") {
                 return Some(if by_id {
-                    crate::sql2::providers::FastLixFilePathWriteConflict::IdUpdateData
+                    crate::sql2::providers::FastLixFilePathWriteConflict::IdUpdateContent
                 } else {
-                    crate::sql2::providers::FastLixFilePathWriteConflict::UpdateData
+                    crate::sql2::providers::FastLixFilePathWriteConflict::UpdateContent
                 });
             }
             if assignments.len() == 2
                 && assignments
                     .iter()
-                    .any(|assignment| assigns_excluded_column(assignment, "data"))
+                    .any(|assignment| assigns_excluded_column(assignment, "content"))
                 && assignments
                     .iter()
                     .any(|assignment| assigns_excluded_column(assignment, "lixcol_metadata"))
             {
                 return Some(if by_id {
-                    crate::sql2::providers::FastLixFilePathWriteConflict::IdUpdateDataAndMetadata
+                    crate::sql2::providers::FastLixFilePathWriteConflict::IdUpdateContentAndMetadata
                 } else {
-                    crate::sql2::providers::FastLixFilePathWriteConflict::UpdateDataAndMetadata
+                    crate::sql2::providers::FastLixFilePathWriteConflict::UpdateContentAndMetadata
                 });
             }
             None
@@ -2555,7 +2555,7 @@ fn eval_fast_file_blob(
             Some(Value::Blob(value)) => Ok(value.clone()),
             Some(_) => Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                format!("lix_file fast write column '{column}' expects blob data"),
+                format!("lix_file fast write column '{column}' expects blob content"),
             )),
             None => Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -5548,7 +5548,7 @@ fn cast_entity_eval_value(
             "BYTEA casts require a binary SQL column",
         )
         .with_hint(
-            "Use BYTEA for lix_file.data; registered entity schemas expose no binary column type.",
+            "Use BYTEA for lix_file.content; registered entity schemas expose no binary column type.",
         ));
     }
 
@@ -7261,8 +7261,8 @@ mod primary_key_route_tests {
 #[cfg(test)]
 mod splice_provenance_tests {
     use super::{
-        BoundExpr, FastFileDataUpdateShape, fast_file_blob_expr_splice_provenance,
-        fast_file_data_update_splice_provenance,
+        BoundExpr, FastFileContentUpdateShape, fast_file_blob_expr_splice_provenance,
+        fast_file_content_update_splice_provenance,
     };
     use crate::common::{ExecuteStatementMetadata, MutationIdentity, RequestBlobSpliceProvenance};
     use crate::sql2::bind::expr::BoundParamRef;
@@ -7280,13 +7280,13 @@ mod splice_provenance_tests {
     }
 
     #[test]
-    fn fast_file_data_update_uses_the_bound_data_parameter_metadata() {
-        let expected = splice("data");
+    fn fast_file_content_update_uses_the_bound_data_parameter_metadata() {
+        let expected = splice("content");
         let metadata = ExecuteStatementMetadata {
             parameter_blob_splices: vec![Some(splice("unrelated")), None, Some(expected.clone())],
             ..ExecuteStatementMetadata::default()
         };
-        let shape = FastFileDataUpdateShape {
+        let shape = FastFileContentUpdateShape {
             id: BoundExpr::Param(BoundParamRef { index: 2 }),
             data: BoundExpr::Param(BoundParamRef { index: 3 }),
             metadata: None,
@@ -7294,36 +7294,36 @@ mod splice_provenance_tests {
         };
 
         assert_eq!(
-            fast_file_data_update_splice_provenance(&shape, &metadata),
+            fast_file_content_update_splice_provenance(&shape, &metadata),
             Some(expected)
         );
     }
 
     #[test]
-    fn fast_file_data_update_has_no_provenance_for_full_blob_or_literal() {
+    fn fast_file_content_update_has_no_provenance_for_full_blob_or_literal() {
         let full_blob_metadata = ExecuteStatementMetadata {
             parameter_blob_splices: vec![Some(splice("id")), None],
             ..ExecuteStatementMetadata::default()
         };
-        let parameter_shape = FastFileDataUpdateShape {
+        let parameter_shape = FastFileContentUpdateShape {
             id: BoundExpr::Param(BoundParamRef { index: 1 }),
             data: BoundExpr::Param(BoundParamRef { index: 2 }),
             metadata: None,
             data_parameter_index: Some(2),
         };
         assert_eq!(
-            fast_file_data_update_splice_provenance(&parameter_shape, &full_blob_metadata,),
+            fast_file_content_update_splice_provenance(&parameter_shape, &full_blob_metadata,),
             None
         );
 
-        let literal_shape = FastFileDataUpdateShape {
+        let literal_shape = FastFileContentUpdateShape {
             id: BoundExpr::Param(BoundParamRef { index: 1 }),
             data: BoundExpr::Literal(crate::sql2::bind::expr::BoundLiteral::Blob(vec![1])),
             metadata: None,
             data_parameter_index: None,
         };
         assert_eq!(
-            fast_file_data_update_splice_provenance(&literal_shape, &full_blob_metadata),
+            fast_file_content_update_splice_provenance(&literal_shape, &full_blob_metadata),
             None
         );
     }

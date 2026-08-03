@@ -237,7 +237,7 @@ where
         .await
         .expect("open seed session");
     for revision in 0..HISTORY_COMMITS {
-        seed.upsert_file_data(
+        seed.upsert_file_content(
             "/project/edit.json".to_owned(),
             format!("{{\"timelineRevision\":{revision}}}")
                 .into_bytes()
@@ -368,7 +368,7 @@ where
         .expect("open first restart session");
     let total = FILE_UPLOAD_PART_BYTES as u64 + 9;
     let progress = session
-        .upsert_file_data_part(
+        .upsert_file_content_part(
             "restart-upload".to_owned(),
             "/media/restart.mov".to_owned(),
             0,
@@ -391,7 +391,7 @@ where
         .expect("open resumed session");
     let total = FILE_UPLOAD_PART_BYTES as u64 + 9;
     let progress = session
-        .upsert_file_data_part(
+        .upsert_file_content_part(
             "restart-upload".to_owned(),
             "/media/restart.mov".to_owned(),
             FILE_UPLOAD_PART_BYTES as u64,
@@ -402,14 +402,14 @@ where
         .expect("finish post-restart part");
     assert!(progress.finalized);
     let tail = session
-        .read_file_data(
+        .read_file_content(
             "/media/restart.mov".to_owned(),
             Some(FILE_UPLOAD_PART_BYTES as u64..total),
         )
         .await
         .expect("read restarted upload")
         .expect("restarted file exists");
-    assert_eq!(tail.data().as_ref(), &[0x61; 9]);
+    assert_eq!(tail.content().as_ref(), &[0x61; 9]);
 }
 
 async fn upload<S>(
@@ -431,7 +431,7 @@ async fn upload<S>(
             .map(|offset| {
                 let len = (total_bytes - offset).min(FILE_UPLOAD_PART_BYTES);
                 let data = deterministic_bytes(len, seed ^ offset as u64);
-                session.upsert_file_data_part(
+                session.upsert_file_content_part(
                     upload_id.to_owned(),
                     path.to_owned(),
                     offset as u64,
@@ -464,14 +464,14 @@ where
         let offset = (initial_offset + sample as u64 * STREAM_READ_BYTES)
             % (PROXY_BYTES as u64 - STREAM_READ_BYTES);
         let read = session
-            .read_file_data(
+            .read_file_content(
                 "/media/proxy.mov".to_owned(),
                 Some(offset..offset + STREAM_READ_BYTES),
             )
             .await
             .expect("read proxy range")
             .expect("proxy exists");
-        assert_eq!(read.data().len(), STREAM_READ_BYTES as usize);
+        assert_eq!(read.content().len(), STREAM_READ_BYTES as usize);
         if tokio::time::Instant::now() > deadline {
             late += 1;
         } else {
@@ -497,7 +497,7 @@ where
         );
         let started = Instant::now();
         session
-            .upsert_file_data("/project/edit.json".to_owned(), payload.into_bytes().into())
+            .upsert_file_content("/project/edit.json".to_owned(), payload.into_bytes().into())
             .await
             .expect("save project file");
         timings.push(started.elapsed());

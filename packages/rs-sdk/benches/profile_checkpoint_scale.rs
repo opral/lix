@@ -347,7 +347,7 @@ where
     S: BenchmarkStorage,
 {
     let row_count = end - start;
-    let mut sql = String::from("INSERT INTO lix_file (id, path, data) VALUES ");
+    let mut sql = String::from("INSERT INTO lix_file (id, path, content) VALUES ");
     let mut params = Vec::with_capacity(row_count * 3);
     for (offset, file_index) in (start..end).enumerate() {
         if offset > 0 {
@@ -649,7 +649,7 @@ async fn update_file_group<S>(
         let file_index =
             benchmark_file_index(file_count, checkpoint_index, auto_commit_index, offset);
         statements.push(ExecuteBatchStatement {
-            sql: "UPDATE lix_file SET data = $1 WHERE id = $2".to_string(),
+            sql: "UPDATE lix_file SET content = $1 WHERE id = $2".to_string(),
             params: vec![
                 Value::Blob(payload(checkpoint_index, file_index, FILE_BYTES).into()),
                 Value::Text(format!("benchmark-file-{file_index:05}")),
@@ -699,7 +699,7 @@ async fn load_file_payloads<S>(lix: &Lix<S>) -> BTreeMap<String, Vec<u8>>
 where
     S: BenchmarkStorage,
 {
-    lix.execute("SELECT id, data FROM lix_file ORDER BY id", &[])
+    lix.execute("SELECT id, content FROM lix_file ORDER BY id", &[])
         .await
         .expect("load checkpoint benchmark file payloads")
         .rows()
@@ -708,7 +708,7 @@ where
             (
                 row.get::<String>("id")
                     .expect("benchmark file id should be text"),
-                row.get::<Vec<u8>>("data")
+                row.get::<Vec<u8>>("content")
                     .expect("benchmark file data should be a blob"),
             )
         })

@@ -498,16 +498,16 @@ pub(crate) struct FreshPluginFileImportCertificate<'a> {
 pub(crate) fn fresh_plugin_file_import_certificate(
     prepared_writes: &PreparedWriteSet,
 ) -> Option<FreshPluginFileImportCertificate<'_>> {
-    let [file_data] = prepared_writes.file_data_writes.as_slice() else {
+    let [file_content] = prepared_writes.file_content_writes.as_slice() else {
         return None;
     };
-    if file_data.global || file_data.untracked || file_data.had_blob_ref {
+    if file_content.global || file_content.untracked || file_content.had_blob_ref {
         return None;
     }
     if prepared_writes.commit_change_refs_by_branch.len() != 1
         || !prepared_writes
             .commit_change_refs_by_branch
-            .contains_key(&file_data.branch_id)
+            .contains_key(&file_content.branch_id)
         || !prepared_writes
             .first_commit_parent_override_by_branch
             .is_empty()
@@ -524,7 +524,7 @@ pub(crate) fn fresh_plugin_file_import_certificate(
     for (row_index, row) in prepared_writes.state_rows.iter().enumerate() {
         if row.global
             || row.untracked
-            || row.branch_id.as_str() != file_data.branch_id
+            || row.branch_id.as_str() != file_content.branch_id
             || row.snapshot.is_none()
             || !row.facts.row_content_validated
             || row.change_id.is_none()
@@ -536,9 +536,9 @@ pub(crate) fn fresh_plugin_file_import_certificate(
         match row.schema_key.as_str() {
             FILE_DESCRIPTOR_SCHEMA_KEY => {
                 if row.file_id.map(crate::common::SharedStr::as_str)
-                    != Some(file_data.file_id.as_str())
+                    != Some(file_content.file_id.as_str())
                     || row.entity_pk.as_single_string_owned().ok().as_deref()
-                        != Some(file_data.file_id.as_str())
+                        != Some(file_content.file_id.as_str())
                     || !filesystem_planner_validated_insert(&PreparedValidationRow::State(row))
                     || descriptor.replace((row_index, row)).is_some()
                 {
@@ -551,9 +551,9 @@ pub(crate) fn fresh_plugin_file_import_certificate(
                 // replacement deliberately has no public SQL origin, but it
                 // remains a public INSERT under the outer file INSERT mode.
                 if row.file_id.map(crate::common::SharedStr::as_str)
-                    != Some(file_data.file_id.as_str())
+                    != Some(file_content.file_id.as_str())
                     || row.entity_pk.as_single_string_owned().ok().as_deref()
-                        != Some(file_data.file_id.as_str())
+                        != Some(file_content.file_id.as_str())
                     || !(row.origin.is_none() || plugin_reconciliation_update(row))
                     || row.facts.requires_transaction_validation
                     || blob_ref.replace((row_index, row)).is_some()
@@ -566,7 +566,7 @@ pub(crate) fn fresh_plugin_file_import_certificate(
             }
             _ => {
                 if row.file_id.map(crate::common::SharedStr::as_str)
-                    != Some(file_data.file_id.as_str())
+                    != Some(file_content.file_id.as_str())
                     || row.facts.requires_transaction_validation
                     || !plugin_reconciliation_update(row)
                 {
@@ -7443,7 +7443,7 @@ mod tests {
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
             intermediate_commits: Vec::new(),
-            file_data_writes: Vec::new(),
+            file_content_writes: Vec::new(),
         }
     }
 
@@ -7984,7 +7984,7 @@ mod tests {
 
         let mut writes = PreparedWriteSet {
             state_rows: prepared_rows![descriptor.clone(), blob_ref.clone(), owner, semantic],
-            file_data_writes: vec![crate::transaction::types::TransactionFileData::new(
+            file_content_writes: vec![crate::transaction::types::TransactionFileContent::new(
                 "01920000-0000-7000-8000-0000000000a2".to_string(),
                 Some("/a.json".to_string()),
                 Some("a.json".to_string()),

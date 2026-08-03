@@ -54,7 +54,7 @@ use crate::sql2::session::{
     SqlWriteSessionOptions, build_read_session, build_read_session_at_head,
     build_transaction_read_session, build_write_session_with_options,
 };
-use crate::sql2::write_normalization::lix_file_data_type_lix_error;
+use crate::sql2::write_normalization::lix_file_content_type_lix_error;
 use crate::sql2::{SqlExecutionContext, SqlWriteExecutionContext};
 
 use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan, SqlWriteResult};
@@ -1384,15 +1384,15 @@ fn validate_bound_write_input(plan: &LogicalWritePlan, params: &[Value]) -> Resu
     if plan.bound.op == BoundWriteOp::Insert {
         match &plan.bound.input {
             BoundWriteInput::Values(values) => {
-                if let Some(column_index) = values.column_index("data") {
+                if let Some(column_index) = values.column_index("content") {
                     for row in &values.rows {
-                        validate_lix_file_data_write_expr(&row[column_index], params, false)?;
+                        validate_lix_file_content_write_expr(&row[column_index], params, false)?;
                     }
                 }
             }
             BoundWriteInput::Query { columns, .. } => {
-                if columns.iter().any(|column| column.name == "data") {
-                    return Err(lix_file_data_type_lix_error());
+                if columns.iter().any(|column| column.name == "content") {
+                    return Err(lix_file_content_type_lix_error());
                 }
             }
             BoundWriteInput::None => {}
@@ -1400,14 +1400,14 @@ fn validate_bound_write_input(plan: &LogicalWritePlan, params: &[Value]) -> Resu
     }
 
     for assignment in &plan.bound.assignments {
-        if assignment.column.name == "data" {
-            validate_lix_file_data_write_expr(&assignment.value, params, false)?;
+        if assignment.column.name == "content" {
+            validate_lix_file_content_write_expr(&assignment.value, params, false)?;
         }
     }
     if let Some(conflict) = &plan.bound.conflict {
         for assignment in conflict.action.assignments() {
-            if assignment.column.name == "data" {
-                validate_lix_file_data_write_expr(&assignment.value, params, true)?;
+            if assignment.column.name == "content" {
+                validate_lix_file_content_write_expr(&assignment.value, params, true)?;
             }
         }
     }
@@ -1415,7 +1415,7 @@ fn validate_bound_write_input(plan: &LogicalWritePlan, params: &[Value]) -> Resu
     Ok(())
 }
 
-fn validate_lix_file_data_write_expr(
+fn validate_lix_file_content_write_expr(
     expr: &BoundExpr,
     params: &[Value],
     allow_excluded_column: bool,
@@ -1424,23 +1424,23 @@ fn validate_lix_file_data_write_expr(
         BoundExpr::Literal(BoundLiteral::Blob(_)) => Ok(()),
         BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
             Some(Value::Blob(_)) => Ok(()),
-            _ => Err(lix_file_data_type_lix_error()),
+            _ => Err(lix_file_content_type_lix_error()),
         },
         BoundExpr::Cast {
             data_type: BoundCastType::Binary,
             ..
         } => Ok(()),
         BoundExpr::ExcludedColumn(_) if allow_excluded_column => Ok(()),
-        BoundExpr::ExcludedColumn(_) => Err(lix_file_data_type_lix_error()),
-        _ => Err(lix_file_data_type_lix_error()),
+        BoundExpr::ExcludedColumn(_) => Err(lix_file_content_type_lix_error()),
+        _ => Err(lix_file_content_type_lix_error()),
     }
 }
 
 fn write_session_options(plan: &LogicalWritePlan) -> SqlWriteSessionOptions {
     let mut omitted_insert_columns = BTreeSet::new();
     if let BoundWriteInput::Values(values) = &plan.bound.input {
-        if insert_column_is_omitted(values, "data") {
-            omitted_insert_columns.insert("data".to_string());
+        if insert_column_is_omitted(values, "content") {
+            omitted_insert_columns.insert("content".to_string());
         }
     }
     let explicit_insert_columns = match &plan.bound.input {
@@ -2820,11 +2820,11 @@ mod tests {
         ) -> Result<TransactionWriteOutcome, LixError> {
             let count = match &write {
                 TransactionWrite::Rows { rows, .. } => rows.len() as u64,
-                TransactionWrite::RowsWithFileData { count, .. } => *count,
+                TransactionWrite::RowsWithFileContent { count, .. } => *count,
             };
             let rows = match write {
                 TransactionWrite::Rows { rows, .. } => rows.into_rows(),
-                TransactionWrite::RowsWithFileData { rows, .. } => rows.into_rows(),
+                TransactionWrite::RowsWithFileContent { rows, .. } => rows.into_rows(),
             };
             self.staged_writes
                 .lock()
@@ -2941,10 +2941,10 @@ mod tests {
     #[tokio::test]
     async fn target_only_write_shapes_construct_only_the_target_provider() {
         for sql in [
-            "UPDATE lix_file SET data = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
+            "UPDATE lix_file SET content = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
             "DELETE FROM lix_file WHERE id = '01920000-0000-7000-8000-0000000000d2' RETURNING id, path",
-            "INSERT INTO lix_file (path, data) VALUES ('/readme.md', X'41') \
-             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+            "INSERT INTO lix_file (path, content) VALUES ('/readme.md', X'41') \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         ] {
             let (mut ctx, _, _) = counting_write_context(Vec::new());
             let plan = create_write_logical_plan(&mut ctx, sql)
@@ -4023,7 +4023,7 @@ mod tests {
             .await?;
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('01920000-0000-7000-8000-0000000000a2', '/docs/readme.md', X'68656C6C6F')",
                 &[],
             )
@@ -4499,7 +4499,7 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('01920000-0000-7000-8000-000000000302', $1, X'41')",
+                "INSERT INTO lix_file (id, path, content) VALUES ('01920000-0000-7000-8000-000000000302', $1, X'41')",
                 &[Value::Text("/Cafe\u{301}.txt".to_string())],
             )
             .await
@@ -4530,7 +4530,7 @@ mod tests {
 
         let update_result = session
             .execute(
-                "UPDATE lix_file SET data = X'42' WHERE path = $1",
+                "UPDATE lix_file SET content = X'42' WHERE path = $1",
                 &[Value::Text("/Cafe\u{301}.txt".to_string())],
             )
             .await
@@ -4692,10 +4692,10 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, data, lixcol_depth \
+                    "SELECT id, path, content, lixcol_depth \
              FROM lix_file_history('{head_commit_id}') \
              WHERE id = '01920000-0000-7000-8000-0000000000a2' \
-               AND data IS NOT NULL \
+               AND content IS NOT NULL \
              ORDER BY lixcol_depth",
                 ),
                 &[],
@@ -4708,7 +4708,7 @@ mod tests {
         );
         let (columns, rows) = rows_from_execute_result(result);
 
-        assert_eq!(columns, vec!["id", "path", "data", "lixcol_depth",]);
+        assert_eq!(columns, vec!["id", "path", "content", "lixcol_depth",]);
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0][0],
@@ -4793,7 +4793,7 @@ mod tests {
             &[],
         )
         .await
-        .expect("lix_file INSERT SELECT without data should execute");
+        .expect("lix_file INSERT SELECT without content should execute");
 
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
         let staged_writes = staged_writes.lock().expect("staged writes lock");
@@ -5227,10 +5227,10 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data, lixcol_metadata) \
+            "INSERT INTO lix_file (path, content, lixcol_metadata) \
              VALUES ('/docs/target.md', X'6E6577', '{\"size\":3}') \
              ON CONFLICT (path) DO UPDATE \
-             SET data = excluded.data, lixcol_metadata = excluded.lixcol_metadata",
+             SET content = excluded.content, lixcol_metadata = excluded.lixcol_metadata",
             &[],
             WriteExecutorMode::ForceDataFusion,
         )
@@ -5716,12 +5716,12 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_file_by_branch (\
-             id, directory_id, name, data, lixcol_branch_id\
+             id, directory_id, name, content, lixcol_branch_id\
              ) VALUES ('01920000-0000-7000-8000-0000000000d2', '01920000-0000-7000-8000-0000000000d3', 'readme.md', X'4142', '01920000-0000-7000-8000-0000000000b1')",
             &[],
         )
         .await
-        .expect("INSERT INTO lix_file_by_branch should stage descriptor and data writes");
+        .expect("INSERT INTO lix_file_by_branch should stage descriptor and content writes");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -5769,7 +5769,7 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data) \
+            "INSERT INTO lix_file (path, content) \
              VALUES ('/multi/a.md', X'61'), ('/multi/b.md', X'62')",
             &[],
             WriteExecutorMode::ForceFast,
@@ -5798,7 +5798,7 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4)",
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2), ($3, $4)",
             &[
                 Value::Text("/multi/param-a.md".to_string()),
                 Value::Blob(b"param-a".to_vec().into()),
@@ -5823,7 +5823,7 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data, lixcol_metadata) \
+            "INSERT INTO lix_file (path, content, lixcol_metadata) \
              VALUES ($1, $2, $3), ($4, $5, $6)",
             &[
                 Value::Text("/multi/param-a.md".to_string()),
@@ -5894,8 +5894,8 @@ mod tests {
             counting_write_context_with_blob_reader(rows.clone(), fast_blob_reader);
         let (mut datafusion_ctx, datafusion_staged, datafusion_scans) =
             counting_write_context_with_blob_reader(rows, datafusion_blob_reader);
-        let sql = "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, $3) \
-                   ON CONFLICT (path) DO UPDATE SET data = excluded.data, \
+        let sql = "INSERT INTO lix_file (path, content, lixcol_metadata) VALUES ($1, $2, $3) \
+                   ON CONFLICT (path) DO UPDATE SET content = excluded.content, \
                    lixcol_metadata = excluded.lixcol_metadata";
         let params = [
             Value::Text("/docs/existing.md".to_string()),
@@ -5968,10 +5968,10 @@ mod tests {
 
         let error = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, $3)",
+            "INSERT INTO lix_file (path, content, lixcol_metadata) VALUES ($1, $2, $3)",
             &[
                 Value::Text("/invalid.md".to_string()),
-                Value::Blob(b"data".to_vec().into()),
+                Value::Blob(b"content".to_vec().into()),
                 Value::Json(json!(["not", "an", "object"])),
             ],
             WriteExecutorMode::ForceFast,
@@ -5993,7 +5993,7 @@ mod tests {
     #[tokio::test]
     async fn bound_lix_file_metadata_do_nothing_stays_on_datafusion() {
         let (mut ctx, _, _) = counting_write_context(Vec::new());
-        let sql = "INSERT INTO lix_file (path, data, lixcol_metadata) \
+        let sql = "INSERT INTO lix_file (path, content, lixcol_metadata) \
                    VALUES ($1, $2, $3) ON CONFLICT (path) DO NOTHING";
         let plan = create_write_logical_plan(&mut ctx, sql)
             .await
@@ -6026,7 +6026,7 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data) \
+            "INSERT INTO lix_file (path, content) \
              VALUES ('/existing.md', X'6e6577'), ('/fresh.md', X'6672657368') \
              ON CONFLICT (path) DO NOTHING",
             &[],
@@ -6068,9 +6068,9 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data) \
+            "INSERT INTO lix_file (path, content) \
              VALUES ('/existing.md', X'6e6577'), ('/fresh.md', X'6672657368') \
-             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -6115,10 +6115,10 @@ mod tests {
             ),
         ];
         let (mut fast_ctx, fast_staged, _) = counting_write_context(rows);
-        let sql = "INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES \
+        let sql = "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES \
             ('01920000-0000-7000-8000-000000000322', '/ignored.md', X'6e6577', '{\"source\":\"update\"}'), \
             ('01920000-0000-7000-8000-000000000323', '/fresh.md', X'6672657368', '{\"source\":\"insert\"}') \
-            ON CONFLICT (id) DO UPDATE SET data = excluded.data, lixcol_metadata = excluded.lixcol_metadata";
+            ON CONFLICT (id) DO UPDATE SET content = excluded.content, lixcol_metadata = excluded.lixcol_metadata";
 
         let (fast_result, fast_path) =
             execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
@@ -6154,9 +6154,9 @@ mod tests {
         let (mut ctx, staged_writes, _) = counting_write_context(rows);
         let error = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (id, path, data) VALUES \
+            "INSERT INTO lix_file (id, path, content) VALUES \
              ('01920000-0000-7000-8000-000000000323', '/existing.md', X'6e6577') \
-             ON CONFLICT (id) DO UPDATE SET data = excluded.data",
+             ON CONFLICT (id) DO UPDATE SET content = excluded.content",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -6176,14 +6176,14 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_multi_row_lix_file_duplicate_insert_paths_reject_before_staging() {
         for sql in [
-            "INSERT INTO lix_file (path, data) \
+            "INSERT INTO lix_file (path, content) \
              VALUES ('/dupe.md', X'61'), ('/dupe.md', X'62')",
-            "INSERT INTO lix_file (path, data) \
+            "INSERT INTO lix_file (path, content) \
              VALUES ('/dupe.md', X'61'), ('/dupe.md', X'62') \
              ON CONFLICT (path) DO NOTHING",
-            "INSERT INTO lix_file (path, data) \
+            "INSERT INTO lix_file (path, content) \
              VALUES ('/dupe.md', X'61'), ('/dupe.md', X'62') \
-             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         ] {
             let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
 
@@ -6224,7 +6224,7 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data) \
+            "INSERT INTO lix_file (path, content) \
              VALUES ('/existing.md', X'61'), ('/existing.md', X'62') \
              ON CONFLICT (path) DO NOTHING",
             &[],
@@ -6251,7 +6251,7 @@ mod tests {
 
         let error = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data) \
+            "INSERT INTO lix_file (path, content) \
              VALUES ('/folder', X'61'), ('/folder/file.md', X'62')",
             &[],
             WriteExecutorMode::ForceFast,
@@ -6276,7 +6276,7 @@ mod tests {
 
         execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data) \
+            "INSERT INTO lix_file (path, content) \
              VALUES ('/ok.md', X'6f6b'), ('relative.md', X'626164')",
             &[],
             WriteExecutorMode::ForceFast,
@@ -6300,7 +6300,7 @@ mod tests {
 
         let error = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4)",
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2), ($3, $4)",
             &[
                 Value::Text("/ok.md".to_string()),
                 Value::Blob(b"ok".to_vec().into()),
@@ -6335,7 +6335,7 @@ mod tests {
 
         let error = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (path, data) \
+            "INSERT INTO lix_file (path, content) \
              VALUES ('/untracked.md', X'6e6577'), ('/fresh.md', X'6672657368') \
              ON CONFLICT (path) DO NOTHING",
             &[],
@@ -6361,7 +6361,7 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (id, path, data) \
+            "INSERT INTO lix_file (id, path, content) \
              VALUES ('01920000-0000-7000-8000-0000000000a2', '/a.md', X'61'), ('01920000-0000-7000-8000-0000000000b2', '/b.md', X'62')",
             &[],
             WriteExecutorMode::ForceFast,
@@ -6393,12 +6393,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_lix_file_id_path_data_metadata_uses_fast_shape() {
+    async fn execute_sql_lix_file_id_path_content_metadata_uses_fast_shape() {
         let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "INSERT INTO lix_file (id, path, data, lixcol_metadata) \
+            "INSERT INTO lix_file (id, path, content, lixcol_metadata) \
              VALUES ('01920000-0000-7000-8000-0000000000a2', '/a.md', X'61', '{\"source\":\"test\"}')",
             &[],
             WriteExecutorMode::ForceFast,
@@ -6501,7 +6501,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_file_data_update_by_id_fast_path_matches_datafusion() {
+    async fn execute_sql_file_content_update_by_id_fast_path_matches_datafusion() {
         let rows = vec![
             live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
@@ -6524,8 +6524,7 @@ mod tests {
         let (mut fast_ctx, fast_staged, fast_scans) = counting_write_context(rows.clone());
         let (mut datafusion_ctx, datafusion_staged, datafusion_scans) =
             counting_write_context(rows);
-        let sql =
-            "UPDATE lix_file SET data = X'4142' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
+        let sql = "UPDATE lix_file SET content = X'4142' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
 
         let (fast_result, fast_path) =
             execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
@@ -6561,7 +6560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_guarded_file_data_fallback_builds_one_write_session() {
+    async fn execute_sql_guarded_file_content_fallback_builds_one_write_session() {
         let rows = vec![
             live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
@@ -6595,7 +6594,7 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "UPDATE lix_file SET data = $1 WHERE id = $2 AND data = $3",
+            "UPDATE lix_file SET content = $1 WHERE id = $2 AND content = $3",
             &[
                 Value::Blob(b"new".to_vec().into()),
                 Value::Text("01920000-0000-7000-8000-0000000000d2".to_string()),
@@ -6642,7 +6641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_file_data_update_by_id_updates_same_path_in_every_matching_durability_lane()
+    async fn execute_sql_file_content_update_by_id_updates_same_path_in_every_matching_durability_lane()
      {
         let root = live_file_row(
             "01920000-0000-7000-8000-0000000000d2",
@@ -6662,8 +6661,7 @@ mod tests {
         let rows = vec![root, scoped];
         let (mut fast_ctx, fast_staged, _) = counting_write_context(rows.clone());
         let (mut datafusion_ctx, datafusion_staged, _) = counting_write_context(rows);
-        let sql =
-            "UPDATE lix_file SET data = X'4142' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
+        let sql = "UPDATE lix_file SET content = X'4142' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
 
         let (fast_result, fast_path) =
             execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
@@ -6697,7 +6695,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_file_data_update_by_id_validates_active_branch() {
+    async fn execute_sql_file_content_update_by_id_validates_active_branch() {
         let make_context = || {
             let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
             DummySqlWriteExecutionContext {
@@ -6709,7 +6707,7 @@ mod tests {
             }
         };
         let sql =
-            "UPDATE lix_file SET data = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
+            "UPDATE lix_file SET content = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
         let mut fast_ctx = make_context();
         let mut datafusion_ctx = make_context();
 
@@ -6731,7 +6729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_file_data_update_by_id_validates_orphan_blob_refs() {
+    async fn execute_sql_file_content_update_by_id_validates_orphan_blob_refs() {
         let mut malformed = live_blob_ref_row(
             "01920000-0000-7000-8000-0000000000d2",
             "01920000-0000-7000-8000-0000000000a1",
@@ -6741,7 +6739,7 @@ mod tests {
         let (mut fast_ctx, _, _) = counting_write_context(vec![malformed.clone()]);
         let (mut datafusion_ctx, _, _) = counting_write_context(vec![malformed]);
         let sql =
-            "UPDATE lix_file SET data = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
+            "UPDATE lix_file SET content = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2'";
 
         let fast_error =
             execute_write_sql_trace(&mut fast_ctx, sql, &[], WriteExecutorMode::ForceFast)
@@ -6760,7 +6758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_file_data_update_by_id_supports_params() {
+    async fn execute_sql_file_content_update_by_id_supports_params() {
         let (mut ctx, staged_writes, scans) = counting_write_context(vec![live_file_row(
             "01920000-0000-7000-8000-0000000000d2",
             "01920000-0000-7000-8000-0000000000a1",
@@ -6770,7 +6768,7 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "UPDATE lix_file SET data = $1 WHERE id = $2",
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
             &[
                 Value::Blob(b"parameterized".to_vec().into()),
                 Value::Text("01920000-0000-7000-8000-0000000000d2".to_string()),
@@ -6804,7 +6802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_file_data_and_metadata_update_by_id_uses_fast_path() {
+    async fn execute_sql_file_content_and_metadata_update_by_id_uses_fast_path() {
         let rows = vec![
             live_file_row(
                 "01920000-0000-7000-8000-0000000000d2",
@@ -6820,7 +6818,7 @@ mod tests {
         ];
         let (mut fast_ctx, fast_staged, _) = counting_write_context(rows.clone());
         let (mut datafusion_ctx, datafusion_staged, _) = counting_write_context(rows);
-        let sql = "UPDATE lix_file SET data = $1, lixcol_metadata = $2 WHERE id = $3";
+        let sql = "UPDATE lix_file SET content = $1, lixcol_metadata = $2 WHERE id = $3";
         let params = [
             Value::Blob(b"parameterized".to_vec().into()),
             Value::Json(serde_json::json!({"source": "git"})),
@@ -6859,7 +6857,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_file_data_update_by_id_treats_null_id_as_no_match() {
+    async fn execute_sql_file_content_update_by_id_treats_null_id_as_no_match() {
         let rows = vec![live_file_row(
             "01920000-0000-7000-8000-0000000000d2",
             "01920000-0000-7000-8000-0000000000a1",
@@ -6867,7 +6865,7 @@ mod tests {
             "readme.md",
         )];
         let (mut fast_ctx, fast_staged, fast_scans) = counting_write_context(rows);
-        let sql = "UPDATE lix_file SET data = $1 WHERE id = $2";
+        let sql = "UPDATE lix_file SET content = $1 WHERE id = $2";
         let params = [Value::Blob(b"parameterized".to_vec().into()), Value::Null];
 
         let (fast_result, fast_path) =
@@ -6887,7 +6885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_file_data_update_by_id_tombstones_blob_ref_for_empty_data() {
+    async fn execute_sql_file_content_update_by_id_tombstones_blob_ref_for_empty_data() {
         let (mut ctx, staged_writes, scans) = counting_write_context(vec![
             live_file_row(
                 "01920000-0000-7000-8000-0000000000d2",
@@ -6904,7 +6902,7 @@ mod tests {
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "UPDATE lix_file SET data = X'' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
+            "UPDATE lix_file SET content = X'' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -6924,12 +6922,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_file_data_update_by_id_returns_zero_for_missing_file() {
+    async fn execute_sql_file_content_update_by_id_returns_zero_for_missing_file() {
         let (mut ctx, staged_writes, scans) = counting_write_context(Vec::new());
 
         let (result, path) = execute_write_sql_trace(
             &mut ctx,
-            "UPDATE lix_file SET data = X'41' WHERE id = '01920000-0000-7000-8000-000000000582'",
+            "UPDATE lix_file SET content = X'41' WHERE id = '01920000-0000-7000-8000-000000000582'",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -6949,7 +6947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_file_data_update_by_id_preserves_plugin_path_restrictions() {
+    async fn execute_sql_file_content_update_by_id_preserves_plugin_path_restrictions() {
         let (mut ctx, staged_writes, scans) = counting_write_context(vec![
             live_directory_row(
                 "01920000-0000-7000-8000-000000000323",
@@ -6979,7 +6977,7 @@ mod tests {
 
         let error = execute_write_sql_trace(
             &mut ctx,
-            "UPDATE lix_file SET data = X'41' WHERE id = '01920000-0000-7000-8000-000000000352'",
+            "UPDATE lix_file SET content = X'41' WHERE id = '01920000-0000-7000-8000-000000000352'",
             &[],
             WriteExecutorMode::ForceFast,
         )
@@ -7002,13 +7000,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bound_file_data_update_fast_path_rejects_broader_shapes() {
+    async fn bound_file_content_update_fast_path_rejects_broader_shapes() {
         let (mut ctx, _, _) = counting_write_context(Vec::new());
         for sql in [
-            "UPDATE lix_file SET data = X'41' WHERE path = '/readme.md'",
-            "UPDATE lix_file SET data = X'41', name = 'renamed.md' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
-            "UPDATE lix_file SET data = data WHERE id = '01920000-0000-7000-8000-0000000000d2'",
-            "UPDATE lix_file_by_branch SET data = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2' AND lixcol_branch_id = '01920000-0000-7000-8000-0000000000a1'",
+            "UPDATE lix_file SET content = X'41' WHERE path = '/readme.md'",
+            "UPDATE lix_file SET content = X'41', name = 'renamed.md' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
+            "UPDATE lix_file SET content = content WHERE id = '01920000-0000-7000-8000-0000000000d2'",
+            "UPDATE lix_file_by_branch SET content = X'41' WHERE id = '01920000-0000-7000-8000-0000000000d2' AND lixcol_branch_id = '01920000-0000-7000-8000-0000000000a1'",
         ] {
             let plan = create_write_logical_plan(&mut ctx, sql)
                 .await
@@ -7053,11 +7051,11 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "UPDATE lix_file SET data = X'4142' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
+            "UPDATE lix_file SET content = X'4142' WHERE id = '01920000-0000-7000-8000-0000000000d2'",
             &[],
         )
         .await
-        .expect("UPDATE lix_file should stage data write");
+        .expect("UPDATE lix_file should stage content write");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -7654,7 +7652,7 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT path, name, data, lixcol_branch_id \
+                    "SELECT path, name, content, lixcol_branch_id \
                      FROM lix_file_by_branch \
                      WHERE id = '01920000-0000-7000-8000-0000000000a2' AND lixcol_branch_id = '01920000-0000-7000-8000-0000000000a1'",
                     &[],
@@ -7664,7 +7662,7 @@ mod tests {
 
                 assert_eq!(
                     result.columns,
-                    vec!["path", "name", "data", "lixcol_branch_id"]
+                    vec!["path", "name", "content", "lixcol_branch_id"]
                 );
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(
@@ -7691,7 +7689,7 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT path, name, data \
+                    "SELECT path, name, content \
                      FROM lix_file \
                      WHERE id = '01920000-0000-7000-8000-0000000000a2'",
                     &[],
@@ -7699,7 +7697,7 @@ mod tests {
                 .await
                 .expect("sql2 execute should read lix_file");
 
-                assert_eq!(result.columns, vec!["path", "name", "data"]);
+                assert_eq!(result.columns, vec!["path", "name", "content"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(
                     result.rows[0][0],

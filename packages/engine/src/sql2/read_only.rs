@@ -44,7 +44,7 @@ fn read_only_schema_message(schema_key: &str) -> Option<&'static str> {
             Some("Use the writable lix_file surface to create, update, or delete files.")
         }
         "lix_binary_blob_ref" => Some(
-            "Use the writable lix_file data column to create, update, or delete file contents.",
+            "Use the writable lix_file content column to create, update, or delete file contents.",
         ),
         "lix_commit" | "lix_commit_edge" | "lix_change" => Some(
             "Commit graph and changelog surfaces are read-only; Lix creates them when transactions commit.",

@@ -242,8 +242,8 @@ impl SimFs {
         let result = self
             .session
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[Value::Text(path.to_string()), Value::Blob(data.into())],
             )
             .await
@@ -263,14 +263,14 @@ impl SimFs {
         let result = self
             .session
             .execute(
-                "SELECT data FROM lix_file WHERE path = $1",
+                "SELECT content FROM lix_file WHERE path = $1",
                 &[Value::Text(path.to_string())],
             )
             .await?;
         Ok(result
             .rows()
             .first()
-            .and_then(|row| row.get::<Vec<u8>>("data").ok()))
+            .and_then(|row| row.get::<Vec<u8>>("content").ok()))
     }
 
     pub async fn mkdir(&self, path: &str) -> Result<(), LixError> {

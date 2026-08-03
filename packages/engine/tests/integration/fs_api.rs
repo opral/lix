@@ -80,7 +80,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data, lixcol_global) VALUES \
+                "INSERT INTO lix_file (id, path, content, lixcol_global) VALUES \
                  ('73686172-6564-8d70-8f69-6e742d666900', '/shared-point.bin', X'61', false), \
                  ('73686172-6564-8d70-8f69-6e742d666900', '/shared-point.bin', X'62', true)",
                 &[],
@@ -90,13 +90,13 @@ simulation_test!(
 
         for (fast_sql, generic_sql, parameter) in [
             (
-                "SELECT data FROM lix_file WHERE id = $1",
-                "SELECT data FROM lix_file WHERE id = $1 AND true",
+                "SELECT content FROM lix_file WHERE id = $1",
+                "SELECT content FROM lix_file WHERE id = $1 AND true",
                 "73686172-6564-8d70-8f69-6e742d666900",
             ),
             (
-                "SELECT data FROM lix_file WHERE path = $1",
-                "SELECT data FROM lix_file WHERE path = $1 AND true",
+                "SELECT content FROM lix_file WHERE path = $1",
+                "SELECT content FROM lix_file WHERE path = $1 AND true",
                 "/shared-point.bin",
             ),
             (
@@ -105,8 +105,8 @@ simulation_test!(
                 "73686172-6564-8d70-8f69-6e742d666900",
             ),
             (
-                "SELECT data FROM lix_file WHERE id = $1",
-                "SELECT data FROM lix_file WHERE id = $1 AND true",
+                "SELECT content FROM lix_file WHERE id = $1",
+                "SELECT content FROM lix_file WHERE id = $1 AND true",
                 "6d697373-696e-872d-806f-696e742d6600",
             ),
         ] {
@@ -176,7 +176,7 @@ async fn sql_update_path_to_plugin_storage_rejects_archive_rename() {
 
     let error = session
         .execute(
-            "UPDATE lix_file SET path = $1, data = $2 WHERE path = $3",
+            "UPDATE lix_file SET path = $1, content = $2 WHERE path = $3",
             &[
                 Value::Text("/.lix/plugins/untrusted.lixplugin".to_string()),
                 Value::Blob(b"not-a-plugin".to_vec().into()),
@@ -358,8 +358,8 @@ where
 {
     session
         .execute_sql(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
             &[Value::Text(path.to_string()), Value::Blob(data.into())],
         )
         .await?;
@@ -372,7 +372,7 @@ where
 {
     let result = session
         .execute_sql(
-            "SELECT data FROM lix_file WHERE path = $1",
+            "SELECT content FROM lix_file WHERE path = $1",
             &[Value::Text(path.to_string())],
         )
         .await?;

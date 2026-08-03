@@ -235,7 +235,7 @@ fn realistic_statements(file_count: usize) -> Vec<BenchStatement> {
 }
 
 async fn seed_files(session: &SessionContext<CountingStorage>, file_count: usize) {
-    let mut sql = String::from("INSERT INTO lix_file (id, path, data) VALUES ");
+    let mut sql = String::from("INSERT INTO lix_file (id, path, content) VALUES ");
     for index in 0..file_count {
         if index > 0 {
             sql.push(',');

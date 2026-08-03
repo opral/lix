@@ -617,11 +617,11 @@ fn bind_insert_input(
         }
         if columns
             .iter()
-            .any(|column| column.table == "lix_file" && column.name == "data")
+            .any(|column| column.table == "lix_file" && column.name == "content")
         {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                "lix_file.data expects binary data",
+                "lix_file.content expects binary content",
             )
             .with_hint("Use X'...' or a binary parameter for file contents."));
         }
@@ -1757,7 +1757,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_hidden_insert_columns() {
         let statement = parse_statement(
-            "INSERT INTO lix_file (id, path, directory_id, name, data, lixcol_schema_key) VALUES ('file1', '/a', null, 'a', null, 'schema')",
+            "INSERT INTO lix_file (id, path, directory_id, name, content, lixcol_schema_key) VALUES ('file1', '/a', null, 'a', null, 'schema')",
         );
         let error = bind_statement(&statement, &[], "branch1")
             .expect_err("hidden columns should not bind through statement binder");
@@ -1994,7 +1994,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_hex_literals_as_blobs() {
         let statement =
-            parse_statement("INSERT INTO lix_file (id, data) VALUES ('file1', X'4142')");
+            parse_statement("INSERT INTO lix_file (id, content) VALUES ('file1', X'4142')");
         let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
         let write = bound;
@@ -2046,7 +2046,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_public_values_functions() {
         let statement = parse_statement(
-            "INSERT INTO lix_file (id, path, data) VALUES (lix_uuid_v7(), lix_timestamp(), CAST('hello' AS BYTEA))",
+            "INSERT INTO lix_file (id, path, content) VALUES (lix_uuid_v7(), lix_timestamp(), CAST('hello' AS BYTEA))",
         );
         let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
@@ -2162,8 +2162,8 @@ mod tests {
     #[test]
     fn bind_statement_accepts_is_null_and_is_not_null_predicates() {
         for sql in [
-            "DELETE FROM lix_file WHERE data IS NULL",
-            "DELETE FROM lix_file WHERE data IS NOT NULL",
+            "DELETE FROM lix_file WHERE content IS NULL",
+            "DELETE FROM lix_file WHERE content IS NOT NULL",
         ] {
             bind_statement(&parse_statement(sql), &[], "branch1")
                 .unwrap_or_else(|error| panic!("{sql} should bind, got {error:?}"));
@@ -2290,7 +2290,7 @@ mod tests {
                 "path",
                 "directory_id",
                 "name",
-                "data",
+                "content",
                 "lixcol_global",
                 "lixcol_change_id",
                 "lixcol_untracked",

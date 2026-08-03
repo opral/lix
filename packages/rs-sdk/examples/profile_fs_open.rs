@@ -140,7 +140,7 @@ async fn run_read_benchmark(storage: &LocalFilesystem, workspace: &Path) -> Read
 
     let all_started = Instant::now();
     let all_files = lix
-        .execute("SELECT path, data FROM lix_file ORDER BY path", &[])
+        .execute("SELECT path, content FROM lix_file ORDER BY path", &[])
         .await
         .expect("profile read benchmark should read all files");
     let all_files_ms = duration_ms(all_started.elapsed());
@@ -151,7 +151,7 @@ async fn run_read_benchmark(storage: &LocalFilesystem, workspace: &Path) -> Read
             .get::<String>("path")
             .expect("profile read benchmark path should decode");
         let data = row
-            .get::<Vec<u8>>("data")
+            .get::<Vec<u8>>("content")
             .expect("profile read benchmark data should decode");
         all_files_count += 1;
         all_files_bytes += data.len() as u64;
@@ -188,7 +188,7 @@ async fn time_read_paths(lix: &lix_sdk::Lix<LocalFilesystem>, files: &[&BenchFil
     for file in files {
         let result = lix
             .execute(
-                "SELECT data FROM lix_file WHERE path = $1",
+                "SELECT content FROM lix_file WHERE path = $1",
                 &[Value::Text(file.lix_path.clone())],
             )
             .await
@@ -198,7 +198,7 @@ async fn time_read_paths(lix: &lix_sdk::Lix<LocalFilesystem>, files: &[&BenchFil
             .first()
             .unwrap_or_else(|| panic!("missing lix_file row for {}", file.lix_path));
         let data = row
-            .get::<Vec<u8>>("data")
+            .get::<Vec<u8>>("content")
             .expect("profile read benchmark data should decode");
         assert_eq!(
             data.len() as u64,

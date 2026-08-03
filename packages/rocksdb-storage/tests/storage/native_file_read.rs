@@ -26,34 +26,34 @@ where
 
     assert_eq!(
         session
-            .read_file_data("/native/missing.bin".to_string(), None)
+            .read_file_content("/native/missing.bin".to_string(), None)
             .await
             .expect("read missing file"),
         None
     );
 
     session
-        .upsert_file_data(
+        .upsert_file_content(
             "/native/deep/payload.bin".to_string(),
             b"payload".to_vec().into(),
         )
         .await
         .expect("create native file");
-    assert_file_data(&session, "/native/deep/payload.bin", Some(b"payload")).await;
+    assert_file_content(&session, "/native/deep/payload.bin", Some(b"payload")).await;
     let range = session
-        .read_file_data("/native/deep/payload.bin".to_string(), Some(1..5))
+        .read_file_content("/native/deep/payload.bin".to_string(), Some(1..5))
         .await
         .expect("read native file range")
         .expect("ranged native file should exist");
-    assert_eq!(range.data().as_ref(), b"aylo");
+    assert_eq!(range.content().as_ref(), b"aylo");
     assert_eq!(range.range(), 1..5);
     assert_eq!(range.total_size(), 7);
 
     session
-        .upsert_file_data("/native/empty.bin".to_string(), Vec::new().into())
+        .upsert_file_content("/native/empty.bin".to_string(), Vec::new().into())
         .await
         .expect("create empty native file");
-    assert_file_data(&session, "/native/empty.bin", Some(b"")).await;
+    assert_file_content(&session, "/native/empty.bin", Some(b"")).await;
 
     // Exact native reads must keep the established active-branch precedence
     // when a global file is overlaid by an active branch-local version.
@@ -64,7 +64,7 @@ where
     session
         .execute(
             "INSERT INTO lix_file_by_branch \
-             (id, path, data, lixcol_global, lixcol_branch_id) \
+             (id, path, content, lixcol_global, lixcol_branch_id) \
              VALUES ($1, $2, $3, true, 'ffffffff-ffff-7fff-bfff-ffffffffffff')",
             &[
                 Value::Text("630c8282-b934-7fd8-89df-6b093f08f3e3".to_string()),
@@ -77,7 +77,7 @@ where
     session
         .execute(
             "INSERT INTO lix_file_by_branch \
-             (id, path, data, lixcol_branch_id) \
+             (id, path, content, lixcol_branch_id) \
              VALUES ($1, $2, $3, $4)",
             &[
                 Value::Text("630c8282-b934-7fd8-89df-6b093f08f3e3".to_string()),
@@ -88,17 +88,17 @@ where
         )
         .await
         .expect("local overlap fixture should insert");
-    assert_file_data(&session, "/native/overlap.bin", Some(b"local")).await;
+    assert_file_content(&session, "/native/overlap.bin", Some(b"local")).await;
 }
 
-async fn assert_file_data<S>(session: &SessionContext<S>, path: &str, expected: Option<&[u8]>)
+async fn assert_file_content<S>(session: &SessionContext<S>, path: &str, expected: Option<&[u8]>)
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let actual = session
-        .read_file_data(path.to_string(), None)
+        .read_file_content(path.to_string(), None)
         .await
         .expect("read native file")
-        .map(|read| read.into_data().to_vec());
+        .map(|read| read.into_content().to_vec());
     assert_eq!(actual.as_deref(), expected);
 }

@@ -36,7 +36,7 @@ pub(crate) fn parse_file_with_literal_fast_path(
     file: &File,
     allow_literal_fast_path: bool,
 ) -> Result<ParsedMarkdown, PluginError> {
-    let (buf, encoding) = buffer_with_encoding(&file.data);
+    let (buf, encoding) = buffer_with_encoding(&file.content);
     let (decoded, _had_errors) = encoding.decode_without_bom_handling(buf);
     parse_markdown_source_with_literal_fast_path(&decoded, allow_literal_fast_path)
 }
@@ -134,7 +134,7 @@ fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginErro
         .find(|diagnostic| diagnostic.severity == markdown_syntax::DiagnosticSeverity::Error)
     {
         return Err(PluginError::InvalidInput(format!(
-            "file.data must be valid GitHub Flavored Markdown: {}",
+            "file.content must be valid GitHub Flavored Markdown: {}",
             diagnostic.message
         )));
     }

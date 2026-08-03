@@ -190,7 +190,7 @@ fn seeded_descriptor_unrelated_width_storage(
             .await
             .expect("benchmark session opens");
         session
-            .upsert_file_data(
+            .upsert_file_content(
                 "/descriptor-target.txt".into(),
                 Blob::from("target".as_bytes()),
             )

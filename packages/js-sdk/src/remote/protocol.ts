@@ -331,7 +331,7 @@ function applyObserveBlobDelta(
 	const baseValue = base.rows.rows[0]?.[0];
 	if (
 		base.rows.columns.length !== 1 ||
-		base.rows.columns[0] !== "data" ||
+		base.rows.columns[0] !== "content" ||
 		base.rows.rows.length !== 1 ||
 		base.rows.rows[0]?.length !== 1 ||
 		base.rows.rowsAffected !== 0 ||
@@ -361,7 +361,7 @@ function applyObserveBlobDelta(
 		prefixBytes + insert.byteLength,
 	);
 	return {
-		columns: ["data"],
+		columns: ["content"],
 		rows: [[{ kind: "blob", value: null, blob }]],
 		rowsAffected: 0,
 			notices: [],

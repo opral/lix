@@ -1662,7 +1662,7 @@ impl From<Vec<u8>> for FileContent {
 
 /// Incoming file content paired with transaction write rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TransactionFileData {
+pub(crate) struct TransactionFileContent {
     pub(crate) file_id: String,
     pub(crate) path: Option<String>,
     pub(crate) filename: Option<String>,
@@ -1710,7 +1710,7 @@ pub(crate) struct TransactionFileData {
     certified_entity_batches: Vec<WasmCertifiedEntityBatch>,
 }
 
-impl TransactionFileData {
+impl TransactionFileContent {
     pub(crate) fn new(
         file_id: String,
         path: Option<String>,
@@ -1815,7 +1815,7 @@ impl TransactionFileData {
     }
 
     #[cfg(test)]
-    pub(crate) fn data(&self) -> &[u8] {
+    pub(crate) fn content(&self) -> &[u8] {
         self.inline_data()
             .expect("test fixture expected inline file content")
     }
@@ -1931,10 +1931,10 @@ pub(crate) enum TransactionWrite {
         mode: TransactionWriteMode,
         rows: RawWriteBatch,
     },
-    RowsWithFileData {
+    RowsWithFileContent {
         mode: TransactionWriteMode,
         rows: RawWriteBatch,
-        file_data: Vec<TransactionFileData>,
+        file_content: Vec<TransactionFileContent>,
         count: u64,
     },
 }
@@ -1946,10 +1946,10 @@ pub(crate) enum PreparedTransactionWrite {
         mode: TransactionWriteMode,
         rows: PreparedStateBatch,
     },
-    RowsWithFileData {
+    RowsWithFileContent {
         mode: TransactionWriteMode,
         rows: PreparedStateBatch,
-        file_data: Vec<TransactionFileData>,
+        file_content: Vec<TransactionFileContent>,
         count: u64,
     },
 }
@@ -5452,7 +5452,7 @@ mod tests {
     fn verified_same_length_splice_requires_the_visible_blob_base() {
         let base = BlobId::from_content(b"before");
         let wrong_base = BlobId::from_content(b"other!");
-        let mut write = TransactionFileData::new(
+        let mut write = TransactionFileContent::new(
             "file".to_string(),
             None,
             None,
@@ -5481,7 +5481,7 @@ mod tests {
     fn verified_edit_splice_is_format_neutral_and_cleared_by_rematerialization() {
         let base = BlobId::from_content(b"before");
         let wrong_base = BlobId::from_content(b"other!");
-        let mut write = TransactionFileData::new(
+        let mut write = TransactionFileContent::new(
             "file".to_string(),
             None,
             None,

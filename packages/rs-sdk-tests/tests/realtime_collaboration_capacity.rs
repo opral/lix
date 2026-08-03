@@ -197,7 +197,7 @@ impl LocalCapacityBackend {
                 .expect("collaborator session should open");
             let mut events = peer
                 .observe(
-                    "SELECT data FROM lix_file WHERE path = $1",
+                    "SELECT content FROM lix_file WHERE path = $1",
                     &[Value::Text(path.clone())],
                 )
                 .expect("collaborator observation should open");
@@ -256,7 +256,7 @@ impl CollaborationCapacityBackend for LocalCapacityBackend {
                 .expect("wave transaction should open");
             transaction
                 .execute(
-                    "UPDATE lix_file SET data = $1 WHERE path = $2",
+                    "UPDATE lix_file SET content = $1 WHERE path = $2",
                     &[
                         Value::Blob(self.format.edit(base, edit.slot, &edit.token).into()),
                         Value::Text(self.path.clone()),
@@ -321,7 +321,7 @@ impl CollaborationCapacityBackend for LocalCapacityBackend {
                         .expect("receipt observation should evaluate")
                         .expect("receipt observation should stay open");
                     let data = event.rows.rows()[0]
-                        .get::<Vec<u8>>("data")
+                        .get::<Vec<u8>>("content")
                         .expect("receipt file data should be bytes");
                     if data.windows(marker.len()).any(|window| window == marker) {
                         break (event.mutation_sequence, wave_started.elapsed());
@@ -431,7 +431,7 @@ async fn abandoned_transactions_and_sessions_release_resources() {
             let edit = format!("{{\"value\":\"round-{round}-client-{client}\"}}\n");
             transaction
                 .execute(
-                    "UPDATE lix_file SET data = $1 WHERE path = $2",
+                    "UPDATE lix_file SET content = $1 WHERE path = $2",
                     &[
                         Value::Blob(edit.into_bytes().into()),
                         Value::Text(path.to_owned()),
@@ -542,7 +542,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
         &[
             Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
             Value::Blob(archive.to_vec().into()),
@@ -557,7 +557,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
         &[
             Value::Text(path.to_owned()),
             Value::Blob(bytes.to_vec().into()),
@@ -572,13 +572,13 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "SELECT data FROM lix_file WHERE path = $1",
+        "SELECT content FROM lix_file WHERE path = $1",
         &[Value::Text(path.to_owned())],
     )
     .await
     .expect("capacity document should read")
     .rows()[0]
-        .get::<Vec<u8>>("data")
+        .get::<Vec<u8>>("content")
         .expect("capacity document should contain bytes")
 }
 

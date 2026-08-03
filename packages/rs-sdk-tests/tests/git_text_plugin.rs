@@ -314,8 +314,8 @@ where
     StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         &[
             Value::Text(path.to_owned()),
             Value::Blob(data.to_vec().into()),
@@ -331,15 +331,15 @@ where
 {
     let result = lix
         .execute(
-            "SELECT data FROM lix_file WHERE path = $1",
+            "SELECT content FROM lix_file WHERE path = $1",
             &[Value::Text(path.to_owned())],
         )
         .await
         .expect("file read should succeed");
-    result
-        .rows()
-        .first()
-        .map(|row| row.get::<Vec<u8>>("data").expect("data should be a blob"))
+    result.rows().first().map(|row| {
+        row.get::<Vec<u8>>("content")
+            .expect("data should be a blob")
+    })
 }
 
 async fn file_id_at_path<StorageImpl>(lix: &lix_sdk::Lix<StorageImpl>, path: &str) -> String
@@ -381,7 +381,7 @@ async fn assert_history_file<StorageImpl>(
 {
     let result = lix
         .execute(
-            "SELECT data FROM lix_file_history($1) \
+            "SELECT content FROM lix_file_history($1) \
              WHERE id = $2 \
              ORDER BY lixcol_depth",
             &[
@@ -394,7 +394,7 @@ async fn assert_history_file<StorageImpl>(
     let rendered = result
         .rows()
         .iter()
-        .filter_map(|row| row.get::<Vec<u8>>("data").ok())
+        .filter_map(|row| row.get::<Vec<u8>>("content").ok())
         .collect::<Vec<_>>();
     assert!(
         rendered.iter().any(|bytes| bytes == expected),

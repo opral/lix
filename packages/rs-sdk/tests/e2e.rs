@@ -50,13 +50,13 @@ async fn rs_sdk_native_file_upsert_creates_updates_and_keeps_empty_file() {
     let lix = open_lix(OpenLixOptions::default()).await.expect("open Lix");
 
     assert_eq!(
-        lix.upsert_file_data("/native/file.bin", b"first".as_slice())
+        lix.upsert_file_content("/native/file.bin", b"first".as_slice())
             .await
             .expect("create native file"),
         1
     );
     assert_eq!(
-        lix.upsert_file_data("/native/file.bin", b"second".as_slice())
+        lix.upsert_file_content("/native/file.bin", b"second".as_slice())
             .await
             .expect("update native file"),
         1
@@ -69,7 +69,7 @@ async fn rs_sdk_native_file_upsert_creates_updates_and_keeps_empty_file() {
     );
 
     assert_eq!(
-        lix.upsert_file_data("/native/file.bin", Vec::<u8>::new())
+        lix.upsert_file_content("/native/file.bin", Vec::<u8>::new())
             .await
             .expect("write empty native file"),
         1
@@ -82,13 +82,13 @@ async fn rs_sdk_native_file_upsert_creates_updates_and_keeps_empty_file() {
     );
 
     let error = lix
-        .upsert_file_data("relative.bin", b"invalid".as_slice())
+        .upsert_file_content("relative.bin", b"invalid".as_slice())
         .await
         .expect_err("relative native file path should be rejected");
     assert_eq!(error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
 
     let error = lix
-        .upsert_file_data("/nul\0name.bin", b"invalid".as_slice())
+        .upsert_file_content("/nul\0name.bin", b"invalid".as_slice())
         .await
         .expect_err("NUL in a native file path should be rejected by the engine");
     assert_eq!(error.code, "LIX_ERROR_PATH_NUL");
@@ -98,12 +98,12 @@ async fn rs_sdk_native_file_upsert_creates_updates_and_keeps_empty_file() {
 async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays() {
     let lix = open_lix(OpenLixOptions::default()).await.expect("open Lix");
 
-    lix.upsert_file_data("/native/batch/one.bin", b"before".as_slice())
+    lix.upsert_file_content("/native/batch/one.bin", b"before".as_slice())
         .await
         .expect("seed native file batch update");
     let fast_batch_parent = active_branch_commit_id(&lix).await;
     assert_eq!(
-        lix.upsert_file_data_batch(native_file_writes(&[
+        lix.upsert_file_content_batch(native_file_writes(&[
             ("/native/batch/one.bin", b"one"),
             ("/native/batch/two.bin", b"two"),
             ("/native/batch/empty.bin", b""),
@@ -128,7 +128,7 @@ async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays()
 
     let fast_batch_update_parent = active_branch_commit_id(&lix).await;
     assert_eq!(
-        lix.upsert_file_data_batch(native_file_writes(&[
+        lix.upsert_file_content_batch(native_file_writes(&[
             ("/native/batch/one.bin", b"updated-one"),
             ("/native/batch/two.bin", b""),
             ("/native/batch/empty.bin", b"updated-empty"),
@@ -153,13 +153,13 @@ async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays()
 
     let head_before_prevalidation_errors = active_branch_commit_id(&lix).await;
     let empty_error = lix
-        .upsert_file_data_batch(Vec::new())
+        .upsert_file_content_batch(Vec::new())
         .await
         .expect_err("empty native file batch should be rejected");
     assert_eq!(empty_error.code, LixError::CODE_INVALID_PARAM);
 
     let duplicate_error = lix
-        .upsert_file_data_batch(native_file_writes(&[
+        .upsert_file_content_batch(native_file_writes(&[
             ("/native/batch/duplicate.bin", b"first"),
             ("/native/batch/duplicate.bin", b"second"),
         ]))
@@ -174,7 +174,7 @@ async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays()
     );
 
     let path_error = lix
-        .upsert_file_data_batch(native_file_writes(&[
+        .upsert_file_content_batch(native_file_writes(&[
             ("/native/batch/must-not-write.bin", b"first"),
             ("relative.bin", b"invalid"),
         ]))
@@ -196,7 +196,7 @@ async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays()
     let active_branch_id = lix.active_branch_id().await.expect("resolve active branch");
     lix.execute(
         "INSERT INTO lix_file_by_branch \
-         (id, path, data, lixcol_global, lixcol_branch_id) \
+         (id, path, content, lixcol_global, lixcol_branch_id) \
          VALUES ($1, $2, $3, true, $4)",
         &[
             Value::Text("01920000-0000-7000-8000-000000000301".to_string()),
@@ -209,7 +209,7 @@ async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays()
     .expect("insert global overlap fixture");
     lix.execute(
         "INSERT INTO lix_file_by_branch \
-         (id, path, data, lixcol_branch_id) \
+         (id, path, content, lixcol_branch_id) \
          VALUES ($1, $2, $3, $4)",
         &[
             Value::Text("01920000-0000-7000-8000-000000000301".to_string()),
@@ -223,7 +223,7 @@ async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays()
 
     let overlay_batch_parent = active_branch_commit_id(&lix).await;
     assert_eq!(
-        lix.upsert_file_data_batch(native_file_writes(&[
+        lix.upsert_file_content_batch(native_file_writes(&[
             ("/native/overlap.bin", b"updated"),
             ("/native/batch/overlay-companion.bin", b"companion"),
         ]))
@@ -265,26 +265,26 @@ async fn rs_sdk_native_file_read_distinguishes_missing_and_empty_files() {
     let lix = open_lix(OpenLixOptions::default()).await.expect("open Lix");
 
     assert_eq!(
-        lix.read_file_data("/native/missing.bin", None)
+        lix.read_file_content("/native/missing.bin", None)
             .await
             .expect("read missing native file")
-            .map(|read| read.into_data().to_vec()),
+            .map(|read| read.into_content().to_vec()),
         None
     );
 
-    lix.upsert_file_data("/native/empty.bin", Vec::<u8>::new())
+    lix.upsert_file_content("/native/empty.bin", Vec::<u8>::new())
         .await
         .expect("create empty native file");
     assert_eq!(
-        lix.read_file_data("/native/empty.bin", None)
+        lix.read_file_content("/native/empty.bin", None)
             .await
             .expect("read empty native file")
-            .map(|read| read.into_data().to_vec()),
+            .map(|read| read.into_content().to_vec()),
         Some(Vec::new())
     );
 
     let error = lix
-        .read_file_data("relative.bin", None)
+        .read_file_content("relative.bin", None)
         .await
         .expect_err("relative native file path should be rejected");
     assert_eq!(error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
@@ -667,14 +667,14 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
 }
 
 #[tokio::test]
-async fn transaction_lix_file_data_reads_staged_file_bytes() {
+async fn transaction_lix_file_content_reads_staged_file_bytes() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     let mut tx = lix.begin_transaction().await.unwrap();
     let path = "/tx-file-data.bin".to_string();
     let original = b"staged bytes before commit".to_vec();
 
     tx.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
         &[
             Value::Text(path.clone()),
             Value::Blob(original.clone().into()),
@@ -685,7 +685,7 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
 
     let selected = tx
         .execute(
-            "SELECT data FROM lix_file WHERE path = $1 AND data = $2",
+            "SELECT content FROM lix_file WHERE path = $1 AND content = $2",
             &[
                 Value::Text(path.clone()),
                 Value::Blob(original.clone().into()),
@@ -702,7 +702,7 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
     let updated = b"updated bytes before commit".to_vec();
     let update = tx
         .execute(
-            "UPDATE lix_file SET data = $1 WHERE path = $2 AND data = $3",
+            "UPDATE lix_file SET content = $1 WHERE path = $2 AND content = $3",
             &[
                 Value::Blob(updated.clone().into()),
                 Value::Text(path.clone()),
@@ -715,7 +715,7 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
 
     let after_update = tx
         .execute(
-            "SELECT data FROM lix_file WHERE path = $1 AND data = $2",
+            "SELECT content FROM lix_file WHERE path = $1 AND content = $2",
             &[
                 Value::Text(path.clone()),
                 Value::Blob(updated.clone().into()),
@@ -731,7 +731,7 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
 
     let delete = tx
         .execute(
-            "DELETE FROM lix_file WHERE path = $1 AND data = $2",
+            "DELETE FROM lix_file WHERE path = $1 AND content = $2",
             &[Value::Text(path.clone()), Value::Blob(updated.into())],
         )
         .await
@@ -740,7 +740,7 @@ async fn transaction_lix_file_data_reads_staged_file_bytes() {
 
     let after_delete = tx
         .execute(
-            "SELECT data FROM lix_file WHERE path = $1",
+            "SELECT content FROM lix_file WHERE path = $1",
             &[Value::Text(path)],
         )
         .await
@@ -1009,14 +1009,14 @@ where
 {
     let result = lix
         .execute(
-            "SELECT data FROM lix_file WHERE path = $1",
+            "SELECT content FROM lix_file WHERE path = $1",
             &[Value::Text(path.to_string())],
         )
         .await?;
     result
         .rows()
         .first()
-        .map(|row| row.get::<Vec<u8>>("data"))
+        .map(|row| row.get::<Vec<u8>>("content"))
         .transpose()
 }
 
@@ -1078,7 +1078,7 @@ where
 {
     let result = lix
         .execute(
-            "SELECT data FROM lix_file_by_branch WHERE id = $1 AND lixcol_branch_id = $2",
+            "SELECT content FROM lix_file_by_branch WHERE id = $1 AND lixcol_branch_id = $2",
             &[
                 Value::Text(id.to_string()),
                 Value::Text(branch_id.to_string()),
@@ -1088,7 +1088,7 @@ where
     result
         .rows()
         .first()
-        .map(|row| row.get::<Vec<u8>>("data"))
+        .map(|row| row.get::<Vec<u8>>("content"))
         .transpose()
 }
 
@@ -1101,8 +1101,8 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         &[Value::Text(path.to_string()), Value::Blob(data.into())],
     )
     .await?;
@@ -1302,7 +1302,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     assert!(tempdir.path().join("empty-sdk").is_dir());
 
     lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
         &[
             Value::Text("/sql.txt".to_string()),
             Value::Blob(b"sql".to_vec().into()),
@@ -1313,7 +1313,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     wait_for_disk_file(&tempdir.path().join("sql.txt"), Some(b"sql"));
 
     lix.execute(
-        "UPDATE lix_file SET data = $1 WHERE path = $2",
+        "UPDATE lix_file SET content = $1 WHERE path = $2",
         &[
             Value::Blob(b"updated".to_vec().into()),
             Value::Text("/sql.txt".to_string()),
@@ -1325,7 +1325,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
 
     let mut tx = lix.begin_transaction().await.unwrap();
     tx.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
         &[
             Value::Text("/tx.txt".to_string()),
             Value::Blob(b"tx".to_vec().into()),
@@ -1447,7 +1447,7 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     lix.execute(
-        "INSERT INTO lix_file (id, path, data, lixcol_untracked) VALUES ($1, $2, $3, true)",
+        "INSERT INTO lix_file (id, path, content, lixcol_untracked) VALUES ($1, $2, $3, true)",
         &[
             Value::Text("01920000-0000-7000-8000-000000000503".to_string()),
             Value::Text("/untracked.txt".to_string()),

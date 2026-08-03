@@ -250,15 +250,15 @@ pub(crate) fn scalar_is_binary_or_null(value: &ScalarValue) -> bool {
         )
 }
 
-pub(crate) fn lix_file_data_type_lix_error() -> LixError {
+pub(crate) fn lix_file_content_type_lix_error() -> LixError {
     LixError::new(
         LixError::CODE_TYPE_MISMATCH,
-        "lix_file.data expects binary data",
+        "lix_file.content expects binary content",
     )
     .with_hint("Use X'...' or a binary parameter for file contents.")
 }
 
-pub(crate) fn lix_file_data_type_error(
+pub(crate) fn lix_file_content_type_error(
     context: &str,
     column_name: &str,
     instruction: &str,
@@ -272,7 +272,7 @@ pub(crate) fn lix_file_data_type_error(
     )
 }
 
-pub(crate) fn lix_file_data_type_error_with_value(
+pub(crate) fn lix_file_content_type_error_with_value(
     context: &str,
     column_name: &str,
     value: &ScalarValue,

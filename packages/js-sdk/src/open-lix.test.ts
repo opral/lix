@@ -466,16 +466,16 @@ test("fs storage imports local files and materializes lix_file writes", async ()
 	).toBe(true);
 
 	const imported = await lix.execute(
-		"SELECT path, data FROM lix_file WHERE name = $1",
+		"SELECT path, content FROM lix_file WHERE name = $1",
 		["readme.md"],
 	);
 	expect(get(imported, "path")).toBe("/docs/readme.md");
-	expect(new TextDecoder().decode(get(imported, "data") as Uint8Array)).toBe(
+	expect(new TextDecoder().decode(get(imported, "content") as Uint8Array)).toBe(
 		"local",
 	);
 
 	await lix.execute(
-		"INSERT INTO lix_file (directory_id, name, data) VALUES ($1, $2, $3)",
+		"INSERT INTO lix_file (directory_id, name, content) VALUES ($1, $2, $3)",
 		[null, "generated.md", new TextEncoder().encode("generated")],
 	);
 	expect(readFileSync(join(dir, "generated.md"), "utf8")).toBe("generated");
@@ -485,10 +485,10 @@ test("fs storage imports local files and materializes lix_file writes", async ()
 		storage: new LocalFilesystem({ path: dir, syncAllFiles: true }),
 	});
 	const persisted = await reopened.execute(
-		"SELECT data FROM lix_file WHERE directory_id IS NULL AND name = $1",
+		"SELECT content FROM lix_file WHERE directory_id IS NULL AND name = $1",
 		["generated.md"],
 	);
-	expect(new TextDecoder().decode(get(persisted, "data") as Uint8Array)).toBe(
+	expect(new TextDecoder().decode(get(persisted, "content") as Uint8Array)).toBe(
 		"generated",
 	);
 	await reopened.close();
@@ -500,7 +500,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 	const metadata = { purpose: "metadata-only" };
 
 	await lix.execute(
-		"INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES ($1, $2, $3, $4)",
+		"INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES ($1, $2, $3, $4)",
 		[fileId, "/origin-key.md", new TextEncoder().encode("one\n"), metadata],
 		{ originKey: "test-origin" },
 	);
@@ -519,7 +519,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 		"test-origin",
 	);
 
-	await lix.execute("UPDATE lix_file SET data = $1 WHERE id = $2", [
+	await lix.execute("UPDATE lix_file SET content = $1 WHERE id = $2", [
 		new TextEncoder().encode("two\n"),
 		fileId,
 	]);
@@ -529,7 +529,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 
 	const transaction = await lix.beginTransaction();
 	await transaction.execute(
-		"UPDATE lix_file SET data = $1 WHERE id = $2",
+		"UPDATE lix_file SET content = $1 WHERE id = $2",
 		[new TextEncoder().encode("three\n"), fileId],
 		{ originKey: "tx-origin" },
 	);
@@ -560,7 +560,7 @@ test("executeBatch propagates originKey to every write", async () => {
 	const results = await lix.executeBatch(
 		[
 			{
-				sql: "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+				sql: "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
 				params: [
 					firstFileId,
 					"/batch-origin-one.md",
@@ -568,7 +568,7 @@ test("executeBatch propagates originKey to every write", async () => {
 				],
 			},
 			{
-				sql: "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+				sql: "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
 				params: [
 					secondFileId,
 					"/batch-origin-two.md",
@@ -607,26 +607,26 @@ test("fs storage with external lixDir imports the directory and writes normal fi
 	});
 
 	const files = await lix.execute(
-		"SELECT path, data FROM lix_file WHERE path IN ($1, $2) ORDER BY path",
+		"SELECT path, content FROM lix_file WHERE path IN ($1, $2) ORDER BY path",
 		["/note.md", "/sibling.md"],
 	);
 	expect(files.rows.map((row) => row.get("path"))).toEqual([
 		"/note.md",
 		"/sibling.md",
 	]);
-	expect(new TextDecoder().decode(get(files, "data") as Uint8Array)).toBe(
+	expect(new TextDecoder().decode(get(files, "content") as Uint8Array)).toBe(
 		"local",
 	);
 	expect(existsSync(join(dir, ".lix"))).toBe(false);
 
-	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
+	await lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2", [
 		new TextEncoder().encode("updated"),
 		"/note.md",
 	]);
 	expect(readFileSync(filePath, "utf8")).toBe("updated");
 	expect(readFileSync(siblingPath, "utf8")).toBe("sibling");
 
-	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+	await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 		"/generated.md",
 		new TextEncoder().encode("generated"),
 	]);
@@ -665,14 +665,14 @@ test("fs storage on-demand sync imports selected paths and lix-created files", a
 	);
 	expect(files.rows.map((row) => row.get("path"))).toEqual(["/docs/note.md"]);
 
-	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
+	await lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2", [
 		new TextEncoder().encode("updated"),
 		"/docs/note.md",
 	]);
 	expect(readFileSync(includedPath, "utf8")).toBe("updated");
 	expect(readFileSync(excludedPath, "utf8")).toBe("excluded");
 
-	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+	await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 		"/generated.md",
 		new TextEncoder().encode("generated"),
 	]);
@@ -969,7 +969,7 @@ test("fs storage with external lixDir materializes lix storage outside the works
 		storage: new LocalFilesystem({ path: dir, lixDir, syncAllFiles: true }),
 	});
 
-	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+	await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 		"/.lix/app_data/ephemeral.txt",
 		new TextEncoder().encode("external"),
 	]);
@@ -990,11 +990,11 @@ test("fs storage with external lixDir persists lix storage when reused", async (
 	const lix = await openLix({
 		storage: new LocalFilesystem({ path: dir, lixDir, syncAllFiles: true }),
 	});
-	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
+	await lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2", [
 		new TextEncoder().encode("second"),
 		"/note.md",
 	]);
-	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+	await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 		"/.lix/app_data/ephemeral.txt",
 		new TextEncoder().encode("ephemeral"),
 	]);
@@ -1026,11 +1026,11 @@ test("fs storage with a fresh external lixDir reimports disk state without old l
 			syncAllFiles: true,
 		}),
 	});
-	await lix.execute("UPDATE lix_file SET data = $1 WHERE path = $2", [
+	await lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2", [
 		new TextEncoder().encode("second"),
 		"/note.md",
 	]);
-	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+	await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 		"/.lix/app_data/ephemeral.txt",
 		new TextEncoder().encode("ephemeral"),
 	]);
@@ -1078,7 +1078,7 @@ test.skipIf(process.platform === "win32")(
 		expect(directories.rows.map((row) => row.get("path"))).toEqual(["/docs"]);
 
 		await expect(
-			lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+			lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 				"/link.txt",
 				new TextEncoder().encode("replacement"),
 			]),
@@ -1099,10 +1099,10 @@ test("SQL file upsert and read use paths", async () => {
 	const stored = await readFile(lix, "/docs/wrapper.txt");
 	expect(stored).toEqual(data);
 	const sqlRead = await lix.execute(
-		"SELECT data FROM lix_file WHERE path = $1",
+		"SELECT content FROM lix_file WHERE path = $1",
 		["/docs/wrapper.txt"],
 	);
-	expect(get(sqlRead, "data")).toEqual(data);
+	expect(get(sqlRead, "content")).toEqual(data);
 
 	const updated = new TextEncoder().encode("updated");
 	await writeFile(lix, "/docs/wrapper.txt", updated);
@@ -1131,10 +1131,10 @@ test("SQL plugin archive upsert installs bundled plugin archive schemas", async 
 	for (const plugin of plugins) {
 		await upsertPluginArchive(lix, plugin.key, plugin.archiveBytes);
 		const stored = await lix.execute(
-			"SELECT data FROM lix_file WHERE path = $1",
+			"SELECT content FROM lix_file WHERE path = $1",
 			[`/.lix/plugins/${plugin.key}.lixplugin`],
 		);
-		expectBytesEqual(get(stored, "data"), plugin.archiveBytes);
+		expectBytesEqual(get(stored, "content"), plugin.archiveBytes);
 	}
 
 	const schemas = await lix.execute(
@@ -1164,11 +1164,11 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 
 	await upsertPluginArchive(lix, csvPlugin.key, csvPlugin.archiveBytes);
 	const stored = await lix.execute(
-		"SELECT name, data FROM lix_file WHERE path = $1",
+		"SELECT name, content FROM lix_file WHERE path = $1",
 		[`/.lix/plugins/${csvPlugin.key}.lixplugin`],
 	);
 	expect(get(stored, "name")).toBe(`${csvPlugin.key}.lixplugin`);
-	expectBytesEqual(get(stored, "data"), csvPlugin.archiveBytes);
+	expectBytesEqual(get(stored, "content"), csvPlugin.archiveBytes);
 
 	const schemas = await lix.execute(
 		"SELECT table_name \
@@ -1854,7 +1854,7 @@ test("information_schema.columns SELECT * exposes the Lix column contract", asyn
 	expect(result.columns).toContain("lix_value_kind");
 	expect(result.columns).toContain("lix_insert_policy");
 	expect(
-		result.rows.find((row) => row.get("column_name") === "data")?.get(
+		result.rows.find((row) => row.get("column_name") === "content")?.get(
 			"character_octet_length",
 		),
 	).toBeNull();
@@ -1939,7 +1939,7 @@ test("lix_directory_history snapshot_content preserves JSON null after binary fi
 		["01920000-0000-7000-8000-000000000431", null, "history"],
 	);
 	await lix.execute(
-		"INSERT INTO lix_file (id, directory_id, name, data) VALUES ($1, $2, $3, $4)",
+		"INSERT INTO lix_file (id, directory_id, name, content) VALUES ($1, $2, $3, $4)",
 		[
 			"01920000-0000-7000-8000-000000000432",
 			"01920000-0000-7000-8000-000000000431",
@@ -2028,8 +2028,8 @@ async function writeFile(
 	data: Uint8Array,
 ): Promise<void> {
 	await lix.execute(
-		"INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-		 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+		"INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+		 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
 		[path, data],
 	);
 }
@@ -2039,13 +2039,13 @@ async function readFile(
 	path: string,
 ): Promise<Uint8Array | undefined> {
 	const result = await lix.execute(
-		"SELECT data FROM lix_file WHERE path = $1",
+		"SELECT content FROM lix_file WHERE path = $1",
 		[path],
 	);
 	if (result.rows.length === 0) {
 		return undefined;
 	}
-	return result.rows[0]?.value("data").asBytes() ?? new Uint8Array();
+	return result.rows[0]?.value("content").asBytes() ?? new Uint8Array();
 }
 
 async function currentFileChange(

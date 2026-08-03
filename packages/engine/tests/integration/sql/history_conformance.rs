@@ -419,7 +419,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('68697374-6f72-892d-836f-6e666f726d00', '/docs/conformance.txt', X'6F6E65')",
                 &[],
             )
@@ -427,7 +427,7 @@ simulation_test!(
             .expect("file insert should succeed");
         session
             .execute(
-                "UPDATE lix_file SET data = X'74776F' WHERE id = '68697374-6f72-892d-836f-6e666f726d00'",
+                "UPDATE lix_file SET content = X'74776F' WHERE id = '68697374-6f72-892d-836f-6e666f726d00'",
                 &[],
             )
             .await
@@ -442,7 +442,7 @@ simulation_test!(
 
         let file_rows = select_rows(
             &session,
-            "SELECT id, path, name, data, lixcol_entity_pk, lixcol_is_deleted, lixcol_depth \
+            "SELECT id, path, name, content, lixcol_entity_pk, lixcol_is_deleted, lixcol_depth \
              FROM lix_file_history() \
                WHERE id = '68697374-6f72-892d-836f-6e666f726d00' \
                AND lixcol_depth = 0",

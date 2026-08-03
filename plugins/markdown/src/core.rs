@@ -29,7 +29,7 @@ pub enum PluginError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct File {
     pub filename: Option<String>,
-    pub data: Vec<u8>,
+    pub content: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,7 +180,7 @@ impl MarkdownPlugin {
         };
         let before_view = ProjectionView::from_projection(&before);
         let mut after = parse_file(&file)?;
-        retain_noncanonical_source(&mut after, &file.data)?;
+        retain_noncanonical_source(&mut after, &file.content)?;
         let (changes, _) =
             detect_changes_for_markdown(&before_view, before_root.as_ref(), after, namespace, 0)?;
         Ok(changes)
@@ -230,7 +230,7 @@ fn render_tree_with_lexical_fallback(root: &NodeTree) -> Result<Vec<u8>, PluginE
     };
     let Ok(parsed_raw) = parse_file(&File {
         filename: None,
-        data: raw.clone(),
+        content: raw.clone(),
     }) else {
         return Ok(canonical);
     };
@@ -2031,10 +2031,10 @@ impl Document {
     ) -> Result<(Self, Vec<EntityChange>), PluginError> {
         let file = File {
             filename: path.map(ToOwned::to_owned),
-            data: bytes.clone(),
+            content: bytes.clone(),
         };
         let mut parsed = parse_file_with_literal_fast_path(&file, allow_literal_fast_path)?;
-        retain_noncanonical_source(&mut parsed, &file.data)?;
+        retain_noncanonical_source(&mut parsed, &file.content)?;
         let top_level_ranges = parsed.top_level_ranges.clone();
         let (detected, root) =
             detect_changes_for_markdown(&ProjectionView::default(), None, parsed, namespace, 0)?;
@@ -2268,12 +2268,12 @@ impl Document {
             let bytes = successor_bytes.materialize();
             let file = File {
                 filename: None,
-                data: bytes,
+                content: bytes,
             };
             let current_root = self.tree.materialize();
             let before = ProjectionView::from_tree(&current_root);
             let mut parsed = parse_file(&file)?;
-            retain_noncanonical_source(&mut parsed, &file.data)?;
+            retain_noncanonical_source(&mut parsed, &file.content)?;
             let top_level_ranges = Arc::new(parsed.top_level_ranges.clone());
             let (detected, root) =
                 detect_changes_for_markdown(&before, Some(&current_root), parsed, namespace, 0)?;
@@ -2490,7 +2490,7 @@ impl Document {
         let fragment_bytes = bytes.range(range.clone())?;
         let fragment = std::str::from_utf8(&fragment_bytes).map_err(|error| {
             PluginError::InvalidInput(format!(
-                "file.data must be valid UTF-8 for an incremental Markdown edit: {error}"
+                "file.content must be valid UTF-8 for an incremental Markdown edit: {error}"
             ))
         })?;
         let mut replacement = parse_markdown_source(fragment)?;
@@ -2599,7 +2599,7 @@ impl Document {
         let fragment_bytes = bytes.range(range.start..successor_end)?;
         let fragment = std::str::from_utf8(&fragment_bytes).map_err(|error| {
             PluginError::InvalidInput(format!(
-                "file.data must be valid UTF-8 for an incremental Markdown edit: {error}"
+                "file.content must be valid UTF-8 for an incremental Markdown edit: {error}"
             ))
         })?;
         let mut replacement = parse_markdown_source(fragment)?;

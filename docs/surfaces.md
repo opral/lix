@@ -21,8 +21,8 @@ shared workspace metadata, and `lix_change` provides workspace-wide activity.
 There is no generic `lix_state*` SQL family.
 
 `lix_file` represents regular file contents only. Its public shape remains
-`id`, `path`, and `data` (plus the standard `lixcol_*` bookkeeping columns):
-`path` is an absolute, literal UTF-8 path and `data` is the file's bytes. Path
+`id`, `path`, and `content` (plus the standard `lixcol_*` bookkeeping columns):
+`path` is an absolute, literal UTF-8 path and `content` is the file's bytes. Path
 characters such as spaces, `%`, `#`, `?`, and `@` are not URL-encoded. Symbolic
 links, device nodes, sockets, and other non-regular filesystem entries are not
 represented as `lix_file` rows. Executable and other permission bits are not
@@ -176,7 +176,7 @@ public for shared workspace settings and interoperability metadata.
 | `lix_file_by_branch` | Files with explicit branch scope. |
 | `lix_file_history` | File revisions reachable from a commit. |
 
-User columns are `id`, `path`, `directory_id`, `name`, and `data`.
+User columns are `id`, `path`, `directory_id`, `name`, and `content`.
 
 File history records changes to the composed file projection, not only changes
 to a file descriptor or its bytes. Renaming, moving, deleting, or restoring an
@@ -190,14 +190,14 @@ has no singular `lixcol_change_id`, `lixcol_schema_key`, or
 `lixcol_origin_key`.
 
 ```sql
-INSERT INTO lix_file (path, data)
+INSERT INTO lix_file (path, content)
 VALUES ('/orders.xlsx', CAST($1 AS BYTEA));
 
-SELECT data
+SELECT content
 FROM lix_file
 WHERE path = '/orders.xlsx';
 
-SELECT lixcol_depth, lixcol_observed_commit_id, data, lixcol_source_changes
+SELECT lixcol_depth, lixcol_observed_commit_id, content, lixcol_source_changes
 FROM lix_file_history()
 WHERE path = '/orders.xlsx'
 ORDER BY lixcol_depth;
@@ -208,7 +208,7 @@ revisions whose path was `/orders.xlsx`. Filter by immutable `id` when you
 want the complete lineage across renames and moves.
 
 In JavaScript, pass a `Uint8Array` or `ArrayBuffer` for a byte parameter and
-read `data` with `row.value("data").asBytes()`.
+read `content` with `row.value("content").asBytes()`.
 
 ## Directories
 

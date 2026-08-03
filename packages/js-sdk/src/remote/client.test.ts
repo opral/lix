@@ -178,7 +178,7 @@ test("remote mode compresses only large compressible JSON requests", async () =>
 	});
 
 	const compressible = new Uint8Array(100 * 1024).fill(0x41);
-	await lix.execute("UPDATE lix_file SET data = $1 WHERE id = $2", [
+	await lix.execute("UPDATE lix_file SET content = $1 WHERE id = $2", [
 		compressible,
 		"file-1",
 	]);
@@ -198,7 +198,7 @@ test("remote mode compresses only large compressible JSON requests", async () =>
 		random ^= random << 5;
 		return random & 0xff;
 	});
-	await lix.execute("UPDATE lix_file SET data = $1 WHERE id = $2", [
+	await lix.execute("UPDATE lix_file SET content = $1 WHERE id = $2", [
 		incompressible,
 		"file-1",
 	]);
@@ -315,9 +315,9 @@ test("remote execute sends successful large blob updates as exact splices", asyn
 	});
 	let deltaEncodedLengths: number[];
 	try {
-		await lix.execute("UPDATE lix_file SET data = $1", [first]);
+		await lix.execute("UPDATE lix_file SET content = $1", [first]);
 		encodedLengths.length = 0;
-		await lix.execute("UPDATE lix_file SET data = $1", [second]);
+		await lix.execute("UPDATE lix_file SET content = $1", [second]);
 		deltaEncodedLengths = [...encodedLengths];
 	} finally {
 		if (originalToBase64 === undefined) delete prototype.toBase64;
@@ -374,7 +374,7 @@ test(
 		const editOffset = Math.floor(byteLength / 2);
 		second[editOffset] = 98;
 		const sql =
-			"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data";
+			"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content";
 
 		await lix.execute(sql, ["/large.csv", first]);
 		await lix.execute(sql, ["/large.csv", second]);
@@ -435,8 +435,8 @@ test("remote execute retries a missing blob base once with full bytes", async ()
 	const second = new Uint8Array(first);
 	second[0] = 98;
 
-	await lix.execute("UPDATE lix_file SET data = $1", [first]);
-	await lix.execute("UPDATE lix_file SET data = $1", [second]);
+	await lix.execute("UPDATE lix_file SET content = $1", [first]);
+	await lix.execute("UPDATE lix_file SET content = $1", [second]);
 	await lix.close();
 
 	expect(bodies).toHaveLength(3);
@@ -504,9 +504,9 @@ test("remote execute keeps small and low-saving blob updates full", async () => 
 	const first = new Uint8Array(32 * 1024).fill(97);
 	const unrelated = new Uint8Array(32 * 1024).fill(98);
 
-	await lix.execute("UPDATE lix_file SET data = $1", [first]);
-	await lix.execute("UPDATE lix_file SET data = $1", [unrelated]);
-	await lix.execute("UPDATE lix_file SET data = $1", [new Uint8Array(1024)]);
+	await lix.execute("UPDATE lix_file SET content = $1", [first]);
+	await lix.execute("UPDATE lix_file SET content = $1", [unrelated]);
+	await lix.execute("UPDATE lix_file SET content = $1", [new Uint8Array(1024)]);
 	await lix.close();
 
 	expect((bodies[1]?.params as Array<Record<string, unknown>>)[0]?.kind).toBe(
@@ -547,8 +547,8 @@ test("remote protocol v1 uses blob splices without capability negotiation", asyn
 	const second = new Uint8Array(first);
 	second[0] = 98;
 
-	await lix.execute("UPDATE lix_file SET data = $1", [first]);
-	await lix.execute("UPDATE lix_file SET data = $1", [second]);
+	await lix.execute("UPDATE lix_file SET content = $1", [first]);
+	await lix.execute("UPDATE lix_file SET content = $1", [second]);
 	await lix.close();
 
 	expect(bodies).toHaveLength(2);
@@ -584,7 +584,7 @@ test("remote executeBatch uses blob splices for stable statement slots", async (
 	const second = new Uint8Array(first);
 	second[second.byteLength - 1] = 98;
 	const statement = (blob: Uint8Array) => [
-		{ sql: "UPDATE lix_file SET data = $1", params: [blob] },
+		{ sql: "UPDATE lix_file SET content = $1", params: [blob] },
 	];
 
 	await lix.executeBatch(statement(first));
@@ -1250,7 +1250,7 @@ test("an expired session mutation is propagated without a new handshake or retry
 	});
 
 	await expect(
-		lix.execute("UPDATE lix_file SET data = $1"),
+		lix.execute("UPDATE lix_file SET content = $1"),
 	).rejects.toMatchObject({
 		code: "LIX_REMOTE_SESSION_EXPIRED",
 		status: 410,
@@ -1297,7 +1297,7 @@ test("close waits for queued operations before deleting the remote session", asy
 		},
 	});
 
-	const executing = lix.execute("UPDATE lix_file SET data = $1");
+	const executing = lix.execute("UPDATE lix_file SET content = $1");
 	await executeStarted.promise;
 	const closing = lix.close();
 	await Promise.resolve();

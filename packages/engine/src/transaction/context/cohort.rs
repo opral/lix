@@ -273,7 +273,7 @@ where
         file_ids.extend(
             member
                 .prepared_writes
-                .file_data_writes
+                .file_content_writes
                 .iter()
                 .map(|write| write.file_id.to_string()),
         );
@@ -298,7 +298,7 @@ where
         files.extend(
             member
                 .prepared_writes
-                .file_data_writes
+                .file_content_writes
                 .iter()
                 .map(|write| write.file_id.to_string()),
         );
@@ -505,13 +505,13 @@ where
     // private renderer document as an ordinary single-writer successor.
     transaction.release_pending_plugin_actor_leases().await;
     let mut replacement = transaction.staged_writes.drain()?;
-    let mut latest_file_data = BTreeMap::new();
-    for write in replacement.file_data_writes.drain(..) {
-        latest_file_data.insert((write.branch_id.clone(), write.file_id.clone()), write);
+    let mut latest_file_content = BTreeMap::new();
+    for write in replacement.file_content_writes.drain(..) {
+        latest_file_content.insert((write.branch_id.clone(), write.file_id.clone()), write);
     }
     replacement
-        .file_data_writes
-        .extend(latest_file_data.into_values());
+        .file_content_writes
+        .extend(latest_file_content.into_values());
     replacement.state_rows.set_commit_id_all(cohort_commit_id);
     Ok(replacement)
 }

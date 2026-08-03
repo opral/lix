@@ -43,7 +43,7 @@ async fn crdt_benchmarks_b2_1_markdown_concurrent_prefix_inserts() {
         ] {
             transaction
                 .execute(
-                    "UPDATE lix_file SET data = $1 WHERE path = $2",
+                    "UPDATE lix_file SET content = $1 WHERE path = $2",
                     &[
                         Value::Blob(bytes.to_vec().into()),
                         Value::Text(path.to_owned()),
@@ -357,7 +357,7 @@ async fn invalid_aggregate_member_does_not_poison_valid_transaction() {
     ] {
         transaction
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/unique-path.json', $1)",
+                "INSERT INTO lix_file (path, content) VALUES ('/unique-path.json', $1)",
                 &[Value::Blob(bytes.to_vec().into())],
             )
             .await
@@ -401,7 +401,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
         &[
             Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
             Value::Blob(archive.to_vec().into()),
@@ -416,8 +416,8 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         &[
             Value::Text(path.to_owned()),
             Value::Blob(bytes.to_vec().into()),
@@ -432,13 +432,13 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "SELECT data FROM lix_file WHERE path = $1",
+        "SELECT content FROM lix_file WHERE path = $1",
         &[Value::Text(path.to_owned())],
     )
     .await
     .expect("benchmark file should read")
     .rows()[0]
-        .get::<Vec<u8>>("data")
+        .get::<Vec<u8>>("content")
         .expect("benchmark file data should be bytes")
 }
 
