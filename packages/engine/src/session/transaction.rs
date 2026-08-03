@@ -37,6 +37,7 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     /// Reusable storage only for SQL literals containing doubled quote
     /// escapes. Ordinary warm literals continue to borrow the SQL text.
     pub(super) prepared_literal_escape_scratch: SmallVec<[String; 4]>,
+    pub(super) prepared_literal_shape: crate::sql2::CachedUpdateLiteralShape,
 }
 
 impl<StorageImpl> SessionContext<StorageImpl>
@@ -97,6 +98,7 @@ where
             telemetry: self.telemetry.clone(),
             has_started_statement: false,
             prepared_literal_escape_scratch: SmallVec::new(),
+            prepared_literal_shape: crate::sql2::CachedUpdateLiteralShape::default(),
         })
     }
 }

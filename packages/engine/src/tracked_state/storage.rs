@@ -1302,6 +1302,7 @@ pub(crate) struct CommitDeltaLiveMembershipCursor {
     manifest: Option<Arc<CommitDeltaManifest>>,
     segment_index: Option<usize>,
     segment: Option<Arc<DecodedCommitDeltaSegment>>,
+    next_entry_index: usize,
 }
 
 #[derive(Default)]
@@ -1322,6 +1323,7 @@ impl CommitDeltaPointReadCache {
             manifest: None,
             segment_index: None,
             segment: None,
+            next_entry_index: 0,
         }
     }
 }
@@ -1405,15 +1407,50 @@ impl CommitDeltaLiveMembershipCursor {
                 self.segment = Some(decoded);
             }
             self.segment_index = Some(segment_index);
+            self.next_entry_index = 0;
         }
         let segment = self
             .segment
             .as_ref()
             .expect("membership cursor loaded its current immutable part");
-        Ok(Some(
-            find_commit_delta_value(&segment.leaf, encoded_key, self.commit_id)?
-                .is_some_and(|value| !value.deleted),
-        ))
+        let mut linear_probes = 0_usize;
+        while self.next_entry_index < segment.leaf.len() {
+            let entry = segment.leaf.entry(self.next_entry_index)?.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state packed commit_delta leaf has a missing entry",
+                )
+            })?;
+            match entry.key.cmp(encoded_key) {
+                std::cmp::Ordering::Less => {
+                    self.next_entry_index += 1;
+                    linear_probes += 1;
+                    if linear_probes == 8 {
+                        self.next_entry_index = commit_delta_entry_lower_bound_from(
+                            &segment.leaf,
+                            encoded_key,
+                            self.next_entry_index,
+                        )?;
+                    }
+                }
+                std::cmp::Ordering::Greater => return Ok(Some(false)),
+                std::cmp::Ordering::Equal => {
+                    self.next_entry_index += 1;
+                    let value = decode_value(entry.value)?;
+                    if value.commit_id != self.commit_id {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "tracked_state packed commit_delta for commit '{}' contains an entry for commit '{}'",
+                                self.commit_id, value.commit_id
+                            ),
+                        ));
+                    }
+                    return Ok(Some(!value.deleted));
+                }
+            }
+        }
+        Ok(Some(false))
     }
 }
 
@@ -9125,7 +9162,21 @@ fn find_commit_delta_entry_index(
     leaf: &DecodedLeafNodeRef,
     target_key: &[u8],
 ) -> Result<Option<usize>, LixError> {
-    let mut lower = 0usize;
+    let lower = commit_delta_entry_lower_bound_from(leaf, target_key, 0)?;
+    let Some(entry) = leaf.entry(lower)? else {
+        return Ok(None);
+    };
+    if entry.key != target_key {
+        return Ok(None);
+    }
+    Ok(Some(lower))
+}
+
+fn commit_delta_entry_lower_bound_from(
+    leaf: &DecodedLeafNodeRef,
+    target_key: &[u8],
+    mut lower: usize,
+) -> Result<usize, LixError> {
     let mut upper = leaf.len();
     while lower < upper {
         let middle = lower + (upper - lower) / 2;
@@ -9141,13 +9192,7 @@ fn find_commit_delta_entry_index(
             upper = middle;
         }
     }
-    let Some(entry) = leaf.entry(lower)? else {
-        return Ok(None);
-    };
-    if entry.key != target_key {
-        return Ok(None);
-    }
-    Ok(Some(lower))
+    Ok(lower)
 }
 
 pub(crate) async fn read_chunk(
