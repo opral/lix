@@ -5,6 +5,8 @@ use crate::entity_pk::EntityPk;
 use bytes::Bytes;
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
+pub(crate) const COMMIT_STATE_MAX_REPLAY_DEPTH: u16 = 32;
+pub(crate) const COMMIT_STATE_MAX_REPLAY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Content-addressed root id for one tracked-state commit-root tree.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, musli::Encode, musli::Decode)]
@@ -144,6 +146,147 @@ pub(crate) struct TrackedStateCommitRoot {
 pub(crate) struct TrackedStateCommitRootParent {
     pub(crate) commit_id: CommitId,
     pub(crate) root_id: TrackedStateRootId,
+}
+
+/// Bounded first-parent replay work carried by a commit's canonical mutation
+/// interval.
+///
+/// Zero debt means the snapshot root is the canonical serving layout. Nonzero
+/// debt means readers can reconstruct the state from the bounded interval;
+/// [`CommitStateManifest::snapshot_root`] may still contain an equivalent,
+/// rebuildable snapshot accelerator without changing that policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CommitStateReplayDebt {
+    pub(crate) depth: u16,
+    pub(crate) rows: u64,
+    pub(crate) bytes: u64,
+}
+
+/// Key bounds for one existing commit-addressed mutation segment.
+///
+/// Segment slot order is durable because directly addressable `ChangeId`s
+/// encode that slot and the row ordinal. Snapshot compaction may replace the
+/// optional root, but must never reorder these entries.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CommitStateMutationPart {
+    #[musli(bytes)]
+    pub(crate) first_key: Vec<u8>,
+    #[musli(bytes)]
+    pub(crate) last_key: Vec<u8>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) replacement_part: Option<StoredReplacementPart>,
+}
+
+/// One collection partition replaced by a certified immutable generation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CommitDeltaReplacementScope {
+    pub(crate) schema_key: String,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) file_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CommitDeltaLifecycleSummary {
+    pub(crate) scope: CommitDeltaReplacementScope,
+    pub(crate) ordered_identity_digest: [u8; 32],
+    pub(crate) uniform_created_at: LixTimestamp,
+}
+
+/// Durable certificate binding a replacement generation to its owner and
+/// immutable replacement-part directory.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct StoredCommitDeltaReplacementGeneration {
+    pub(crate) owner_commit_id: [u8; 16],
+    pub(crate) scope: CommitDeltaReplacementScope,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) fallback_commit_id: Option<[u8; 16]>,
+    pub(crate) integrity_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct StoredReplacementPartsAuthority {
+    pub(crate) directory_digest: [u8; 32],
+    pub(crate) uniform_updated_at: LixTimestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct StoredReplacementPart {
+    pub(crate) content_digest: [u8; 32],
+    pub(crate) owner_commit_id: [u8; 16],
+    pub(crate) first_address: u32,
+    pub(crate) uniform_created_at: LixTimestamp,
+    pub(crate) uniform_updated_at: LixTimestamp,
+}
+
+/// Point-addressable immutable mutation inventory owned by one commit.
+///
+/// The fields intentionally mirror the existing commit-delta directory. This
+/// lets the hard-cut manifest become authoritative without changing the
+/// bounded LXCD14 segment and payload-sidecar codec in the same step.
+#[derive(Debug, Clone, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CommitStateMutationInventory {
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) selected_source_commit_id: Option<[u8; 16]>,
+    pub(crate) member_count: u32,
+    pub(crate) selection_fingerprint: [u8; 32],
+    /// Exact row counts for every directly addressable part. Empty means the
+    /// generic locator-indexed layout.
+    pub(crate) direct_part_row_counts: Vec<u16>,
+    /// Authoritative collection-replacement scope. A miss within this scope
+    /// cannot fall through to an older first-parent generation.
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) single_partition: Option<CommitDeltaReplacementScope>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) lifecycle_summary: Option<CommitDeltaLifecycleSummary>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) replacement_generation: Option<StoredCommitDeltaReplacementGeneration>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) replacement_parts: Option<StoredReplacementPartsAuthority>,
+    /// Tiny commits retain their only part inline so an exact history lookup
+    /// remains one backend point read.
+    #[musli(bytes)]
+    pub(crate) inline_part: Vec<u8>,
+    pub(crate) parts: Vec<CommitStateMutationPart>,
+}
+
+impl CommitStateMutationInventory {
+    pub(crate) fn selected_source_commit_id(&self) -> Option<CommitId> {
+        self.selected_source_commit_id
+            .map(|bytes| CommitId::new(uuid::Uuid::from_bytes(bytes)))
+    }
+
+    pub(crate) fn part_count(&self) -> usize {
+        usize::from(!self.inline_part.is_empty()) + self.parts.len()
+    }
+}
+
+/// Single semantic authority for one tracked commit.
+///
+/// Compact topology projections, point locators, current-state HOT rows, and
+/// snapshot tree chunks remain rebuildable serving indexes. None may carry
+/// commit semantics absent from this manifest.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CommitStateManifest {
+    pub(crate) commit_id: CommitId,
+    pub(crate) generation: u64,
+    pub(crate) parent_commit_ids: Vec<CommitId>,
+    pub(crate) commit_change_id: ChangeId,
+    #[musli(with = crate::storage_codec::id_string_seq)]
+    pub(crate) author_account_ids: Vec<String>,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) replay_debt: CommitStateReplayDebt,
+    pub(crate) mutations: CommitStateMutationInventory,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) snapshot_root: Option<TrackedStateCommitRoot>,
 }
 
 /// Materialized tracked-state commit-root row.

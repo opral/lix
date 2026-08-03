@@ -10,6 +10,39 @@ use crate::storage_adapter::{
 };
 use crate::{ReadOptions, WriteOptions};
 
+fn stage_bench_commit_deltas(
+    writes: &mut StorageWriteSet,
+    deltas: &[crate::tracked_state::TrackedStateCommitDeltaRef<'_>],
+) -> Result<Vec<crate::tracked_state::CommitDeltaChangeLocator>, crate::LixError> {
+    let staged = crate::tracked_state::stage_commit_deltas_for_commit_state(writes, deltas)?;
+    let commit_id = deltas
+        .first()
+        .map(|delta| delta.delta.commit_id)
+        .unwrap_or_default();
+    let mutations = staged.mutation_inventory().clone();
+    crate::tracked_state::stage_commit_state_manifest(
+        writes,
+        &crate::tracked_state::CommitStateManifest {
+            commit_id,
+            generation: 0,
+            parent_commit_ids: Vec::new(),
+            commit_change_id: crate::changelog::ChangeId::for_test_label(&format!(
+                "{commit_id}:bench-commit"
+            )),
+            author_account_ids: Vec::new(),
+            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+            replay_debt: crate::tracked_state::CommitStateReplayDebt {
+                depth: 1,
+                rows: u64::from(mutations.member_count),
+                bytes: u64::from(mutations.member_count),
+            },
+            mutations,
+            snapshot_root: None,
+        },
+    )?;
+    Ok(staged.locators)
+}
+
 static TRANSACTION_ROWS_STAGED: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
@@ -296,7 +329,7 @@ where
             "{{\"index\":{index},\"payload\":\"{}\"}}",
             "x".repeat(192)
         ));
-        crate::tracked_state::stage_commit_deltas(
+        stage_bench_commit_deltas(
             &mut writes,
             &[crate::tracked_state::TrackedStateCommitDeltaRef {
                 delta: crate::tracked_state::TrackedStateDeltaRef {
@@ -642,7 +675,7 @@ where
     let mut physical_bytes_by_commit =
         std::collections::BTreeMap::<crate::changelog::CommitId, (u64, u64)>::new();
     for space in [
-        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
     ] {
         for entry in scan_layout_entries(read, space).await {
@@ -1372,8 +1405,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::json_store::store::JSON_SPACE,
         crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
         crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_ROOT_SPACE,
-        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
         crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
@@ -1629,11 +1661,12 @@ mod tests {
             .expect("repeat repository gc plan");
 
         assert_eq!(first.swept_commits, 10);
-        // Each unreachable commit removes its changelog record, exact-ID
-        // locator, and derived tracked-root record.
-        assert_eq!(first.staged_deletes, 30);
-        assert_eq!(first.key_shared_buffers, 3);
-        assert_eq!(first.key_shared_bytes, 30 * 16);
+        // Each unreachable commit removes its changelog projection and the
+        // unified commit-state authority. The hard cut retired the separate
+        // tracked-root record.
+        assert_eq!(first.staged_deletes, 20);
+        assert_eq!(first.key_shared_buffers, 2);
+        assert_eq!(first.key_shared_bytes, 20 * 16);
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.staged_deletes, first.staged_deletes);
     }

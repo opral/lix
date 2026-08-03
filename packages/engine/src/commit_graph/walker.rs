@@ -248,6 +248,10 @@ mod tests {
     use crate::commit_graph::CommitGraphContext;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageKey, StorageReadOptions, StorageWriteOptions};
+    use crate::tracked_state::{
+        CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
+        stage_commit_state_manifest,
+    };
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
@@ -394,24 +398,27 @@ mod tests {
         let mut writes = storage.new_write_set();
         for (label, parent) in [("commit-a", "commit-b"), ("commit-b", "commit-a")] {
             let commit_id = commit_id(label);
+            let record = CommitRecord {
+                format_version: 1,
+                commit_id,
+                generation: 1,
+                parent_commit_ids: commit_ids([parent]),
+                tracked_state_rootless: true,
+                tracked_state_rootless_depth: 1,
+                tracked_state_rootless_rows: 0,
+                tracked_state_rootless_bytes: 0,
+                change_id: ChangeId::for_test_label(&format!("{label}-change")),
+                author_account_ids: Vec::new(),
+                created_at: ts("2026-01-01T00:00:00Z"),
+            };
             writes.put(
                 crate::changelog::COMMIT_SPACE,
                 StorageKey(Bytes::copy_from_slice(commit_id.as_uuid().as_bytes())),
-                crate::changelog::encode_commit_record(&CommitRecord {
-                    format_version: 1,
-                    commit_id,
-                    generation: 1,
-                    parent_commit_ids: commit_ids([parent]),
-                    tracked_state_rootless: false,
-                    tracked_state_rootless_depth: 0,
-                    tracked_state_rootless_rows: 0,
-                    tracked_state_rootless_bytes: 0,
-                    change_id: ChangeId::for_test_label(&format!("{label}-change")),
-                    author_account_ids: Vec::new(),
-                    created_at: ts("2026-01-01T00:00:00Z"),
-                })
-                .expect("cycle commit should encode"),
+                crate::changelog::encode_commit_record(&record)
+                    .expect("cycle commit should encode"),
             );
+            stage_test_commit_manifest(&mut writes, &record)
+                .expect("cycle commit authority should stage");
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -685,24 +692,26 @@ mod tests {
         .await;
         let child = commit_id("commit-child");
         let mut writes = storage.new_write_set();
+        let record = CommitRecord {
+            format_version: 1,
+            commit_id: child,
+            generation: 0,
+            parent_commit_ids: commit_ids(["commit-root"]),
+            tracked_state_rootless: true,
+            tracked_state_rootless_depth: 2,
+            tracked_state_rootless_rows: 0,
+            tracked_state_rootless_bytes: 0,
+            change_id: ChangeId::for_test_label("commit-child-change"),
+            author_account_ids: Vec::new(),
+            created_at: ts("2026-01-01T00:00:00Z"),
+        };
         writes.put(
             crate::changelog::COMMIT_SPACE,
             StorageKey(Bytes::copy_from_slice(child.as_uuid().as_bytes())),
-            crate::changelog::encode_commit_record(&CommitRecord {
-                format_version: 1,
-                commit_id: child,
-                generation: 0,
-                parent_commit_ids: commit_ids(["commit-root"]),
-                tracked_state_rootless: false,
-                tracked_state_rootless_depth: 0,
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
-                change_id: ChangeId::for_test_label("commit-child-change"),
-                author_account_ids: Vec::new(),
-                created_at: ts("2026-01-01T00:00:00Z"),
-            })
-            .expect("corrupt commit should encode"),
+            crate::changelog::encode_commit_record(&record).expect("corrupt commit should encode"),
         );
+        stage_test_commit_manifest(&mut writes, &record)
+            .expect("matching corrupt authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -1017,8 +1026,9 @@ mod tests {
                 commit_id: typed_commit_id,
                 generation,
                 parent_commit_ids,
-                tracked_state_rootless: false,
-                tracked_state_rootless_depth: 0,
+                tracked_state_rootless: true,
+                tracked_state_rootless_depth: u16::try_from(generation + 1)
+                    .expect("test generation should fit replay depth"),
                 tracked_state_rootless_rows: 0,
                 tracked_state_rootless_bytes: 0,
                 change_id: change.change.id,
@@ -1027,15 +1037,43 @@ mod tests {
             });
             generations.insert(typed_commit_id, generation);
         }
+        let commit_records = append.commits.clone();
         ChangelogContext::new()
             .writer(&mut read, &mut writes)
             .stage_append(append)
             .await?;
+        for record in &commit_records {
+            stage_test_commit_manifest(&mut writes, record)?;
+        }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("commit should succeed");
         Ok(())
+    }
+
+    fn stage_test_commit_manifest(
+        writes: &mut crate::storage_adapter::StorageWriteSet,
+        record: &CommitRecord,
+    ) -> Result<(), LixError> {
+        stage_commit_state_manifest(
+            writes,
+            &CommitStateManifest {
+                commit_id: record.commit_id,
+                generation: record.generation,
+                parent_commit_ids: record.parent_commit_ids.clone(),
+                commit_change_id: record.change_id,
+                author_account_ids: record.author_account_ids.clone(),
+                created_at: record.created_at,
+                replay_debt: CommitStateReplayDebt {
+                    depth: record.tracked_state_rootless_depth,
+                    rows: record.tracked_state_rootless_rows,
+                    bytes: record.tracked_state_rootless_bytes,
+                },
+                mutations: CommitStateMutationInventory::default(),
+                snapshot_root: None,
+            },
+        )
     }
 
     fn commit_change(

@@ -28,7 +28,10 @@ use crate::storage_adapter::{
     StorageAdapter, StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace,
     StorageSpaceId, StorageWriteSet,
 };
-use crate::tracked_state::{TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef};
+use crate::tracked_state::{
+    CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
+    TrackedStateDeltaRef, stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
+};
 use bytes::Bytes;
 use serde_json::json;
 
@@ -48,7 +51,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"lxcd9-generation-indexed-commits.v46";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"commit-state-manifest.v47";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -365,12 +368,36 @@ where
                 authored: true,
             })
             .collect::<Vec<_>>();
-        let locators = crate::tracked_state::stage_commit_deltas(&mut writes, &commit_deltas)?;
-        crate::tracked_state::stage_change_locators(&mut writes, &locators);
-        tracked_state
-            .writer(&read, &mut writes)
+        let staged_delta = stage_commit_deltas_for_commit_state(&mut writes, &commit_deltas)?;
+        crate::tracked_state::stage_change_locators(&mut writes, &staged_delta.locators);
+        let mut tracked_writer = tracked_state.writer(&read, &mut writes);
+        tracked_writer
             .stage_commit_root(&receipt.initial_commit_id, None, root_deltas)
             .await?;
+        let snapshot_root = tracked_writer
+            .staged_commit_roots()
+            .find(|root| root.commit_id == plan.commit.id)
+            .cloned()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "repository initialization did not stage its snapshot root",
+                )
+            })?;
+        stage_commit_state_manifest(
+            &mut writes,
+            &CommitStateManifest {
+                commit_id: plan.commit.id,
+                generation: 0,
+                parent_commit_ids: plan.commit.parent_ids.clone(),
+                commit_change_id: plan.commit.change_id,
+                author_account_ids: plan.commit.author_account_ids.clone(),
+                created_at: plan.commit.created_at,
+                replay_debt: CommitStateReplayDebt::default(),
+                mutations: staged_delta.mutation_inventory().clone(),
+                snapshot_root: Some(snapshot_root),
+            },
+        )?;
 
         // Seed both visible branches with a complete hot current-state generation.
         // The initial commit is shared, but the branch-scoped marker and

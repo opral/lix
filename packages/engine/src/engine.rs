@@ -303,6 +303,23 @@ where
         let storage = self.storage();
         let read =
             SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+        let typed_head_commit_id = crate::changelog::CommitId::parse_lix(
+            &head_commit_id,
+            "tracked-state branch rebuild authority",
+        )?;
+        crate::tracked_state::load_commit_state_manifest(
+            &read,
+            typed_head_commit_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot rebuild tracked_state root for commit '{head_commit_id}' without its commit-state manifest"
+                ),
+            )
+        })?;
         let mut writes = StorageWriteSet::new();
         let rebuild_result = self
             .tracked_state

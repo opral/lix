@@ -31,11 +31,13 @@ use crate::live_state::{
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
-    CommitDeltaReplacementGeneration, CommitDeltaReplacementScope, MaterializedTrackedStateRow,
-    TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter,
-    TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
-    TrackedStateScanRequest, encode_key_ref, load_commit_delta_change_records,
-    load_commit_delta_replay_metadata, stage_addressable_commit_deltas, stage_change_locators,
+    CommitDeltaReplacementGeneration, CommitDeltaReplacementScope, CommitStateManifest,
+    CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
+    TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateContext, TrackedStateDeltaRef,
+    TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
+    TrackedStateRootMutationRef, TrackedStateScanRequest, encode_key_ref,
+    load_commit_delta_change_records, load_commit_delta_replay_metadata,
+    stage_addressable_commit_deltas, stage_change_locators, stage_commit_state_manifest,
     stage_ordered_addressable_commit_deltas,
 };
 use crate::transaction::staging::{PreparedInsertSelection, PreparedWriteSet};
@@ -57,17 +59,11 @@ type RowIndex = usize;
 // amplification dominates the cost of retaining one immutable manifest.
 const PACKED_CURRENT_BASE_MIN_ROWS: usize = 1_024;
 
-// Large certified commits already retain one ordered, payload-bearing delta
-// run and publish a packed current head. Rebuilding the same identities into
-// an immutable tree in the synchronous commit window duplicates the dominant
-// write work. Complete replacements persist an authoritative partition scope;
-// that scope begins a new base generation and therefore resets its replay
-// accounting without a foreground tree fence. Sparse intervals remain bounded
-// until the remaining tracked-state shapes move to partition manifests too.
-const ROOTLESS_ORDERED_COMMIT_MIN_ROWS: usize = 32 * 1_024;
-const ROOTLESS_MAX_FIRST_PARENT_DEPTH: u16 = 32;
-const ROOTLESS_MAX_REPLAY_ROWS: u64 = 1_048_576;
-const ROOTLESS_MAX_REPLAY_BYTES: u64 = 256 * 1024 * 1024;
+// Complete replacements retain an authoritative partition generation.
+// Ordinary non-empty ordered commits start bounded rootless intervals
+// regardless of workload size; replacement generations reset replay
+// accounting because exact misses in their scope are authoritative.
+const ROOTLESS_MAX_REPLAY_BYTES: u64 = crate::tracked_state::COMMIT_STATE_MAX_REPLAY_BYTES;
 
 fn compare_certified_predecessors(
     left: &crate::live_state::CertifiedCurrentStatePredecessorRef<'_>,
@@ -509,7 +505,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     )
     .await?;
 
-    let ordered_addressable_commits = stage_tracked_commit_delta_index(
+    let staged_delta_index = stage_tracked_commit_delta_index(
         read,
         &mut writes,
         &mut state_rows,
@@ -529,7 +525,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &state_rows,
         &row_index.tracked_row_indices_by_commit,
         &tracked_roots,
-        &ordered_addressable_commits,
+        &staged_delta_index.ordered_addressable_commits,
         &certified_packet_root_rows,
     );
     let replacement_generation_commits = replacement_generations
@@ -554,6 +550,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
         &certified_packet_root_rows,
+        &staged_delta_index.inventories,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -587,7 +584,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     )
     .await?;
 
-    stage_tracked_roots(
+    let staged_snapshot_roots = stage_tracked_roots(
         tracked_state,
         read,
         &mut writes,
@@ -607,6 +604,14 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         "lix.perf.materialization.tracked_roots"
     ))
     .await?;
+    stage_commit_state_manifests(
+        &mut writes,
+        &commit_rows,
+        &staged_delta_index.inventories,
+        &rootless_ordered_commits,
+        &staged_commits,
+        &staged_snapshot_roots,
+    )?;
     // HOT publication has adapter-specific checkpoint, packed-base, and
     // point-row futures. Keep their combined async state out of the parent
     // commit future so an inactive bulk branch cannot inflate every ordinary
@@ -628,7 +633,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &explicit_branch_targets,
         &branch_control_observations,
         &checkpoint_epochs,
-        &ordered_addressable_commits,
+        &staged_delta_index.ordered_addressable_commits,
     ))
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -911,8 +916,14 @@ fn index_prepared_rows(rows: &PreparedStateBatch) -> Result<PreparedRowIndex, Li
 
 #[derive(Clone, Debug)]
 struct StagedChangelogCommit {
+    record: CommitRecord,
     change_count: usize,
     selected_change_batches: Vec<StagedCommitChangeBatch>,
+}
+
+struct StagedCommitDeltaIndex {
+    ordered_addressable_commits: BTreeSet<CommitId>,
+    inventories: BTreeMap<CommitId, CommitStateMutationInventory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1010,6 +1021,7 @@ async fn stage_changelog_commits(
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     commit_rows: &[FinalizedCommitRow],
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
     let staged_commit_ids = commit_rows
@@ -1046,10 +1058,39 @@ async fn stage_changelog_commits(
                 format!("commit '{commit_id}' has a missing parent"),
             )
         })?;
-        generations.insert(*commit_id, record.generation);
-        rootless_depths.insert(*commit_id, record.tracked_state_rootless_depth);
-        rootless_rows.insert(*commit_id, record.tracked_state_rootless_rows);
-        rootless_bytes.insert(*commit_id, record.tracked_state_rootless_bytes);
+        let manifest = crate::tracked_state::load_commit_state_manifest(read, *commit_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' has no commit-state authority"),
+                )
+            })?;
+        // Replay debt is the durable layout authority. A rootless commit may
+        // later gain an immutable snapshot accelerator without changing its
+        // changelog topology projection.
+        let manifest_rootless = manifest.replay_debt.depth > 0;
+        if manifest.generation != record.generation
+            || manifest.parent_commit_ids != record.parent_commit_ids
+            || manifest.commit_change_id != record.change_id
+            || manifest.author_account_ids != record.author_account_ids
+            || manifest.created_at != record.created_at
+            || manifest_rootless != record.tracked_state_rootless
+            || manifest.replay_debt.depth != record.tracked_state_rootless_depth
+            || manifest.replay_debt.rows != record.tracked_state_rootless_rows
+            || manifest.replay_debt.bytes != record.tracked_state_rootless_bytes
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "commit '{commit_id}' topology projection disagrees with commit-state authority"
+                ),
+            ));
+        }
+        generations.insert(*commit_id, manifest.generation);
+        rootless_depths.insert(*commit_id, manifest.replay_debt.depth);
+        rootless_rows.insert(*commit_id, manifest.replay_debt.rows);
+        rootless_bytes.insert(*commit_id, manifest.replay_debt.bytes);
     }
     let mut staged_parent_count = BTreeMap::<CommitId, usize>::new();
     let mut children = BTreeMap::<CommitId, Vec<CommitId>>::new();
@@ -1119,7 +1160,11 @@ async fn stage_changelog_commits(
         let has_unbounded_payload_sources = certified_packet_root_rows
             .get(&commit_id)
             .is_some_and(|rows| !rows.is_empty())
-            || selected_change_count(&commit.selected_change_batches) > 0;
+            || selected_change_count(&commit.selected_change_batches) > 0
+            || mutation_inventories
+                .get(&commit_id)
+                .and_then(CommitStateMutationInventory::selected_source_commit_id)
+                .is_some();
         let first_parent = commit.parent_commit_ids.first().copied();
         let parent_rootless_depth = first_parent
             .and_then(|parent| rootless_depths.get(&parent).copied())
@@ -1139,7 +1184,6 @@ async fn stage_changelog_commits(
         let (rootless_depth, cumulative_rootless_rows, cumulative_rootless_bytes) =
             if selected_as_new_rootless
                 && replacement_generation_commit_ids.contains(&commit_id)
-                && commit_delta_rows <= ROOTLESS_MAX_REPLAY_ROWS
                 && commit_delta_bytes <= ROOTLESS_MAX_REPLAY_BYTES
                 && !has_unbounded_payload_sources
             {
@@ -1155,9 +1199,8 @@ async fn stage_changelog_commits(
                 let next_depth = parent_rootless_depth
                     .checked_add(1)
                     .ok_or_else(|| LixError::unknown("tracked-state rootless depth exceeds u16"))?;
-                if next_depth <= ROOTLESS_MAX_FIRST_PARENT_DEPTH
-                    && next_rootless_rows <= ROOTLESS_MAX_REPLAY_ROWS
-                    && next_rootless_bytes <= ROOTLESS_MAX_REPLAY_BYTES
+                if next_depth <= crate::tracked_state::COMMIT_STATE_MAX_REPLAY_DEPTH
+                    && next_rootless_bytes <= crate::tracked_state::COMMIT_STATE_MAX_REPLAY_BYTES
                     && !has_unbounded_payload_sources
                 {
                     rootless_commit_ids.insert(commit_id);
@@ -1171,6 +1214,10 @@ async fn stage_changelog_commits(
                     loop {
                         if let Some(staged_parent) = commit_rows_by_id.get(&cursor) {
                             staged_root_rebuild_commits.insert(cursor);
+                            rootless_commit_ids.remove(&cursor);
+                            rootless_depths.insert(cursor, 0);
+                            rootless_rows.insert(cursor, 0);
+                            rootless_bytes.insert(cursor, 0);
                             let Some(parent) = staged_parent.parent_commit_ids.first().copied()
                             else {
                                 break;
@@ -1186,8 +1233,7 @@ async fn stage_changelog_commits(
                     (0, 0, 0)
                 }
             } else if selected_as_new_rootless
-                && commit_delta_rows <= ROOTLESS_MAX_REPLAY_ROWS
-                && commit_delta_bytes <= ROOTLESS_MAX_REPLAY_BYTES
+                && commit_delta_bytes <= crate::tracked_state::COMMIT_STATE_MAX_REPLAY_BYTES
                 && !has_unbounded_payload_sources
             {
                 (1, commit_delta_rows, commit_delta_bytes)
@@ -1256,7 +1302,7 @@ async fn stage_changelog_commits(
                 )
             })?;
         }
-        commits.push(CommitRecord {
+        let record = CommitRecord {
             format_version: 1,
             commit_id: commit_row.commit_id,
             generation,
@@ -1268,7 +1314,8 @@ async fn stage_changelog_commits(
             change_id: commit_row.change_id,
             author_account_ids: Vec::new(),
             created_at: commit_row.created_at,
-        });
+        };
+        commits.push(record.clone());
         let change_count = state_row_indices.len()
             + certified_packet_root_rows
                 .get(&commit_row.commit_id)
@@ -1277,6 +1324,7 @@ async fn stage_changelog_commits(
         staged.insert(
             commit_row.commit_id,
             StagedChangelogCommit {
+                record,
                 change_count,
                 selected_change_batches: commit_row.selected_change_batches.clone(),
             },
@@ -1848,8 +1896,9 @@ async fn stage_tracked_commit_delta_index(
     certified_packet_json_refs: &BTreeMap<CommitId, Vec<CertifiedRootJsonRefs>>,
     insert_selection: &PreparedInsertSelection,
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
-) -> Result<BTreeSet<CommitId>, LixError> {
+) -> Result<StagedCommitDeltaIndex, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
+    let mut inventories = BTreeMap::new();
     let commit_rows = commit_rows
         .iter()
         .map(|commit| (commit.commit_id, commit))
@@ -1970,6 +2019,7 @@ async fn stage_tracked_commit_delta_index(
                 }
             };
             if let Some(ordered_stage) = ordered_stage {
+                inventories.insert(root.commit_id, ordered_stage.mutation_inventory().clone());
                 state_rows.set_ordered_addressable_change_ids(state_row_indices, ordered_stage)?;
                 ordered_addressable_commits.insert(root.commit_id);
                 continue;
@@ -2125,7 +2175,14 @@ async fn stage_tracked_commit_delta_index(
         } else {
             stage_addressable_commit_deltas(writes, &deltas, &addressable)?
         };
+        inventories.insert(root.commit_id, staged.mutation_inventory().clone());
         drop(deltas);
+        let assigned_change_ids = staged
+            .assigned_change_ids
+            .iter()
+            .copied()
+            .filter(|change_id| *change_id != ChangeId::default())
+            .collect::<std::collections::HashSet<_>>();
         for (source_index, &row_index) in state_row_indices.iter().enumerate() {
             if !state_rows.row(row_index).addressable_change_id {
                 continue;
@@ -2142,11 +2199,17 @@ async fn stage_tracked_commit_delta_index(
         let authored_locators = staged
             .locators
             .into_iter()
-            .filter(|locator| authored_change_ids.contains(&locator.change_id))
+            .filter(|locator| {
+                authored_change_ids.contains(&locator.change_id)
+                    || assigned_change_ids.contains(&locator.change_id)
+            })
             .collect::<Vec<_>>();
         stage_change_locators(writes, &authored_locators);
     }
-    Ok(ordered_addressable_commits)
+    Ok(StagedCommitDeltaIndex {
+        ordered_addressable_commits,
+        inventories,
+    })
 }
 
 async fn certify_complete_replacement_generations(
@@ -2264,30 +2327,6 @@ async fn certify_complete_replacement_generations(
             lifecycle_summary = Some(summary.clone());
             current = record.parent_commit_ids.first().copied();
         };
-        // A fallback that is itself rootless means the interval contained an
-        // uncertified partition shape. Decline the hard cut and let the normal
-        // root fence preserve bounded replay.
-        if let Some(fallback_commit_id) = fallback_commit_id {
-            let commit_ids = [fallback_commit_id];
-            let fallback = ChangelogContext::new()
-                .reader(read)
-                .load_commits(ChangelogCommitLoadRequest {
-                    commit_ids: &commit_ids,
-                })
-                .await?
-                .into_iter()
-                .next()
-                .and_then(|(_, record)| record)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("replacement fallback '{fallback_commit_id}' is missing"),
-                    )
-                })?;
-            if fallback.tracked_state_rootless {
-                continue;
-            }
-        }
         let Some(lifecycle_summary) = lifecycle_summary else {
             continue;
         };
@@ -2310,7 +2349,6 @@ fn certified_complete_replacement_scope(
 ) -> Option<CommitDeltaReplacementScope> {
     if !state_rows.certified_complete_collection_replacement()
         || row_indices.is_empty()
-        || row_indices.len() < ROOTLESS_ORDERED_COMMIT_MIN_ROWS
         || row_indices.len() != state_rows.len()
     {
         return None;
@@ -2385,15 +2423,15 @@ fn select_new_rootless_ordered_commits(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let starts_large_ordered_interval = can_start_rootless_interval
+        let starts_ordered_interval = can_start_rootless_interval
             && root.publish_head
-            && row_indices.len() >= ROOTLESS_ORDERED_COMMIT_MIN_ROWS
+            && !row_indices.is_empty()
             && ordered_addressable_commits.contains(&root.commit_id)
             && certified_packet_root_rows
                 .get(&root.commit_id)
                 .is_none_or(Vec::is_empty)
             && row_indices.len() == state_rows.len();
-        if starts_large_ordered_interval {
+        if starts_ordered_interval {
             rootless.insert(root.commit_id);
         }
     }
@@ -4544,10 +4582,10 @@ async fn stage_tracked_roots(
     insert_selection: &PreparedInsertSelection,
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
     certified_replacement_markers_by_commit: &BTreeMap<CommitId, BTreeSet<TrackedStateKey>>,
-) -> Result<(), LixError> {
+) -> Result<BTreeMap<CommitId, TrackedStateCommitRoot>, LixError> {
     let root_fence_ids = tracked_root_fence_ids(tracked_roots);
     if root_fence_ids.is_empty() {
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
     let mut tracked_writer = tracked_state.writer(read, writes);
     let mut staged_rebuild_plan_ids = BTreeSet::new();
@@ -4706,6 +4744,68 @@ async fn stage_tracked_roots(
                 certified_replacement_markers,
             )
             .await?;
+    }
+    Ok(tracked_writer
+        .staged_commit_roots()
+        .map(|root| (root.commit_id, root.clone()))
+        .collect())
+}
+
+fn stage_commit_state_manifests(
+    writes: &mut StorageWriteSet,
+    commit_rows: &[FinalizedCommitRow],
+    mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
+    rootless_commit_ids: &BTreeSet<CommitId>,
+    staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+    snapshot_roots: &BTreeMap<CommitId, TrackedStateCommitRoot>,
+) -> Result<(), LixError> {
+    for commit in commit_rows {
+        let staged = staged_commits.get(&commit.commit_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "commit '{}' has no staged topology projection for commit-state publication",
+                    commit.commit_id
+                ),
+            )
+        })?;
+        let record = &staged.record;
+        let rootless = rootless_commit_ids.contains(&commit.commit_id);
+        let snapshot_root = snapshot_roots.get(&commit.commit_id).cloned();
+        if rootless == snapshot_root.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "commit '{}' has inconsistent mutation-journal and snapshot-root publication",
+                    commit.commit_id
+                ),
+            ));
+        }
+        stage_commit_state_manifest(
+            writes,
+            &CommitStateManifest {
+                commit_id: record.commit_id,
+                generation: record.generation,
+                parent_commit_ids: record.parent_commit_ids.clone(),
+                commit_change_id: record.change_id,
+                author_account_ids: record.author_account_ids.clone(),
+                created_at: record.created_at,
+                replay_debt: if rootless {
+                    CommitStateReplayDebt {
+                        depth: record.tracked_state_rootless_depth,
+                        rows: record.tracked_state_rootless_rows,
+                        bytes: record.tracked_state_rootless_bytes,
+                    }
+                } else {
+                    CommitStateReplayDebt::default()
+                },
+                mutations: mutation_inventories
+                    .get(&commit.commit_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                snapshot_root,
+            },
+        )?;
     }
     Ok(())
 }
@@ -5341,14 +5441,14 @@ mod tests {
     // `tracked_state::storage` intentionally keeps this internal; this test
     // observes the durable space rather than reaching through that module.
     const TRACKED_STATE_TREE_CHUNK_SPACE_ID: SpaceId = SpaceId(0x0004_0001);
-    const TRACKED_STATE_COMMIT_ROOT_SPACE_ID: SpaceId = SpaceId(0x0004_0004);
+    const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID: SpaceId = SpaceId(0x0004_002b);
     const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
         TRACKED_STATE_TREE_CHUNK_SPACE_ID,
         "tracked_state.tree_chunk",
     );
-    const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::mutable(
-        TRACKED_STATE_COMMIT_ROOT_SPACE_ID,
-        "tracked_state.commit_root",
+    const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
+        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID,
+        "tracked_state.commit_state_manifest.v1",
     );
     // V11 has no tracked-head marker space. Keep the retired v10 ID here only
     // as a negative test sentinel: normal serving and staging must never read
@@ -5529,7 +5629,7 @@ mod tests {
                         .tree_chunk_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                if space.id == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
+                if space.id == TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID {
                     self.counts
                         .commit_root_get_many_calls
                         .fetch_add(1, Ordering::Relaxed);
@@ -5552,7 +5652,7 @@ mod tests {
                     .tree_chunk_scan_calls
                     .fetch_add(1, Ordering::Relaxed);
             }
-            if space.id == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
+            if space.id == TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID {
                 self.counts
                     .commit_root_scan_calls
                     .fetch_add(1, Ordering::Relaxed);
@@ -5681,7 +5781,7 @@ mod tests {
         let large_snapshot_ref = certified_json_refs[&commit_id][0]
             .snapshot
             .expect("large certified snapshot should use a JSON ref");
-        stage_tracked_commit_delta_index(
+        let staged_index = stage_tracked_commit_delta_index(
             &read,
             &mut writes,
             &mut state_rows,
@@ -5697,6 +5797,29 @@ mod tests {
         )
         .await
         .expect("mixed certified delta should stage");
+        stage_commit_state_manifest(
+            &mut writes,
+            &CommitStateManifest {
+                commit_id,
+                generation: 0,
+                parent_commit_ids: Vec::new(),
+                commit_change_id: change_id("mixed-certified-commit"),
+                author_account_ids: Vec::new(),
+                created_at: timestamp,
+                replay_debt: CommitStateReplayDebt {
+                    depth: 1,
+                    rows: 2,
+                    bytes: 2,
+                },
+                mutations: staged_index
+                    .inventories
+                    .get(&commit_id)
+                    .cloned()
+                    .expect("mixed certified inventory should stage"),
+                snapshot_root: None,
+            },
+        )
+        .expect("mixed certified authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -5746,7 +5869,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_tracked_commit_appends_changelog_and_root() {
+    async fn ordinary_unaddressed_tracked_commit_appends_changelog_and_root() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -5779,11 +5902,11 @@ mod tests {
         .expect("commit should flush staged rows");
         assert!(
             writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE),
-            "an ordinary tracked commit must write immutable tree chunks"
+            "an unaddressed tracked commit still requires immutable tree chunks"
         );
         assert!(
-            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "an ordinary tracked commit must write commit-root metadata"
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE),
+            "an unaddressed tracked commit still requires commit-state authority"
         );
         assert!(
             writes.has_mutations_in_space(HOT_ROW_SPACE),
@@ -6490,7 +6613,7 @@ mod tests {
         .expect("first rooted commit should stage");
         assert!(
             writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE),
             "first ordinary commit must publish its immutable root"
         );
         storage
@@ -6543,7 +6666,7 @@ mod tests {
         .expect("second rooted commit should stage");
         assert!(
             writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE),
             "serial ordinary commit must publish its immutable root"
         );
         storage
@@ -6596,7 +6719,7 @@ mod tests {
         .expect("third rooted commit should stage");
         assert!(
             writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE),
             "serial ordinary commit must publish its immutable root"
         );
         storage
@@ -6641,7 +6764,7 @@ mod tests {
         .expect("rooted delete commit should stage");
         assert!(
             writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE),
             "serial delete commit must publish its immutable root"
         );
         storage
@@ -6802,7 +6925,7 @@ mod tests {
         .await
         .expect("normal rooted commit should stage");
         assert!(
-            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE),
             "ordinary parent must publish a root"
         );
         storage
@@ -6847,8 +6970,8 @@ mod tests {
         .await
         .expect("selected-reference commit should stage");
         assert!(
-            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "selected-reference commits must publish root metadata"
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE),
+            "selected-reference commits must publish commit-state authority"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -6911,8 +7034,8 @@ mod tests {
             "an ordinary tracked commit must write immutable tree chunks"
         );
         assert!(
-            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "an ordinary tracked commit must write commit-root metadata"
+            writes.has_mutations_in_space(TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE),
+            "an ordinary tracked commit must write commit-state authority"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -6968,12 +7091,12 @@ mod tests {
         assert_eq!(
             counts.commit_root_get_many_calls.load(Ordering::Relaxed),
             0,
-            "a current head projection must not first look up root metadata"
+            "a current head projection must not first look up commit-state authority"
         );
         assert_eq!(
             counts.commit_root_scan_calls.load(Ordering::Relaxed),
             0,
-            "a current head projection must not scan root metadata"
+            "a current head projection must not scan commit-state authority"
         );
 
         let loaded = live_state_context()
@@ -7033,12 +7156,12 @@ mod tests {
         assert_eq!(
             counts.commit_root_get_many_calls.load(Ordering::Relaxed),
             0,
-            "neither serving read may look up root metadata"
+            "neither serving read may look up commit-state authority"
         );
         assert_eq!(
             counts.commit_root_scan_calls.load(Ordering::Relaxed),
             0,
-            "neither serving read may scan root metadata"
+            "neither serving read may scan commit-state authority"
         );
     }
 
@@ -7528,12 +7651,12 @@ mod tests {
         assert_eq!(
             counts.commit_root_get_many_calls.load(Ordering::Relaxed),
             0,
-            "current global and branch projections must not look up root metadata"
+            "current global and branch projections must not look up commit-state authority"
         );
         assert_eq!(
             counts.commit_root_scan_calls.load(Ordering::Relaxed),
             0,
-            "current global and branch projections must not scan root metadata"
+            "current global and branch projections must not scan commit-state authority"
         );
     }
 
@@ -7586,6 +7709,7 @@ mod tests {
             ]),
             &commits,
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .await
         .expect("child-before-parent input should still stage parent first");
@@ -7636,6 +7760,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
+    }
+
+    #[tokio::test]
+    async fn staged_chain_closes_the_complete_rootless_interval_at_the_depth_fence() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = StorageWriteSet::new();
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let commit_count = usize::from(crate::tracked_state::COMMIT_STATE_MAX_REPLAY_DEPTH) + 1;
+        let commit_ids = (0..commit_count)
+            .map(|index| CommitId::for_test_label(&format!("staged-fence-commit-{index}")))
+            .collect::<Vec<_>>();
+        let state_rows = PreparedStateBatch::from_test_rows(
+            commit_ids
+                .iter()
+                .enumerate()
+                .map(|(index, commit_id)| {
+                    let mut row = tracked_global_row(&format!("staged-fence-change-{index}"));
+                    row.commit_id = Some(*commit_id);
+                    row
+                })
+                .collect(),
+        );
+        let commit_rows = commit_ids
+            .iter()
+            .enumerate()
+            .map(|(index, commit_id)| FinalizedCommitRow {
+                commit_id: *commit_id,
+                parent_commit_ids: index
+                    .checked_sub(1)
+                    .map(|parent| vec![commit_ids[parent]])
+                    .unwrap_or_default(),
+                created_at: ts("2026-01-01T00:00:00Z"),
+                change_id: ChangeId::for_test_label(&format!("staged-fence-record-{index}")),
+                selected_change_batches: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let row_indices = commit_ids
+            .iter()
+            .enumerate()
+            .map(|(index, commit_id)| (*commit_id, vec![index]))
+            .collect::<BTreeMap<_, _>>();
+        let mut rootless_commit_ids = BTreeSet::from([commit_ids[0]]);
+        let mut durable_root_rebuild_parents = BTreeSet::new();
+        let mut staged_root_rebuild_commits = BTreeSet::new();
+
+        let staged = stage_changelog_commits(
+            &mut read,
+            &mut writes,
+            &state_rows,
+            &[],
+            &[],
+            &[],
+            &mut rootless_commit_ids,
+            &BTreeSet::new(),
+            &mut durable_root_rebuild_parents,
+            &mut staged_root_rebuild_commits,
+            &row_indices,
+            &commit_rows,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("depth fence should close a fully staged interval");
+
+        assert!(rootless_commit_ids.is_empty());
+        assert!(durable_root_rebuild_parents.is_empty());
+        assert_eq!(staged_root_rebuild_commits.len(), commit_count - 1);
+        assert!(staged.values().all(|commit| {
+            !commit.record.tracked_state_rootless
+                && commit.record.tracked_state_rootless_depth == 0
+                && commit.record.tracked_state_rootless_rows == 0
+                && commit.record.tracked_state_rootless_bytes == 0
+        }));
     }
 
     #[tokio::test]

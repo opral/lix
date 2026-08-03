@@ -1634,8 +1634,9 @@ mod tests {
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
     use crate::tracked_state::{
-        MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateDeltaRef,
-        TrackedStateScanRequest, stage_commit_deltas,
+        CommitStateManifest, CommitStateReplayDebt, MaterializedTrackedStateRow,
+        TrackedStateCommitDeltaRef, TrackedStateDeltaRef, TrackedStateScanRequest,
+        stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
     };
     use serde_json::json;
 
@@ -2781,10 +2782,11 @@ mod tests {
     ) {
         let mut writes = storage.new_write_set();
         let mut append = ChangelogAppend::default();
+        let mut records = std::collections::BTreeMap::new();
         for commit_id in commit_ids {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
             let commit_change_id = format!("{commit_id_text}:commit");
-            append.commits.push(crate::changelog::CommitRecord {
+            let record = crate::changelog::CommitRecord {
                 format_version: 1,
                 commit_id: CommitId::for_test_label(&commit_id_text),
                 generation: 0,
@@ -2796,7 +2798,9 @@ mod tests {
                 change_id: ChangeId::for_test_label(&commit_change_id),
                 author_account_ids: Vec::new(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
-            });
+            };
+            records.insert(record.commit_id, record.clone());
+            append.commits.push(record);
         }
         let mut changelog_read = read;
         let mut writer = ChangelogContext::new().writer(&mut changelog_read, &mut writes);
@@ -2806,11 +2810,37 @@ mod tests {
         drop(writer);
         for commit_id in commit_ids {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
-            TrackedStateContext::new()
-                .writer(read, &mut writes)
+            let typed_commit_id = CommitId::for_test_label(commit_id);
+            let tracked_state = TrackedStateContext::new();
+            let mut root_writer = tracked_state.writer(read, &mut writes);
+            root_writer
                 .stage_commit_root(&commit_id_text, None, [])
                 .await
                 .expect("empty tracked roots should stage");
+            let snapshot_root = root_writer
+                .staged_commit_roots()
+                .find(|root| root.commit_id == typed_commit_id)
+                .cloned()
+                .expect("empty tracked snapshot should stage");
+            drop(root_writer);
+            let record = records
+                .get(&typed_commit_id)
+                .expect("empty commit record should exist");
+            stage_commit_state_manifest(
+                &mut writes,
+                &CommitStateManifest {
+                    commit_id: record.commit_id,
+                    generation: record.generation,
+                    parent_commit_ids: record.parent_commit_ids.clone(),
+                    commit_change_id: record.change_id,
+                    author_account_ids: record.author_account_ids.clone(),
+                    created_at: record.created_at,
+                    replay_debt: CommitStateReplayDebt::default(),
+                    mutations: Default::default(),
+                    snapshot_root: Some(snapshot_root),
+                },
+            )
+            .expect("empty commit-state authority should stage");
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -3000,8 +3030,9 @@ mod tests {
                 commit_id,
                 generation,
                 parent_commit_ids: parents,
-                tracked_state_rootless: false,
-                tracked_state_rootless_depth: 0,
+                tracked_state_rootless: true,
+                tracked_state_rootless_depth: u16::try_from(generation + 1)
+                    .expect("fixture generation should fit replay depth"),
                 tracked_state_rootless_rows: 0,
                 tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label(&format!("{commit_id}:change")),
@@ -3009,12 +3040,34 @@ mod tests {
                 created_at: ts("1970-01-01T00:00:00.000Z"),
             });
         }
+        let commit_records = append.commits.clone();
         let mut changelog_read = &read;
         let mut writer = ChangelogContext::new().writer(&mut changelog_read, &mut writes);
         crate::changelog::ChangelogWriter::stage_append(&mut writer, append)
             .await
             .expect("mixed derived commits should stage");
         drop(writer);
+        for record in commit_records {
+            stage_commit_state_manifest(
+                &mut writes,
+                &CommitStateManifest {
+                    commit_id: record.commit_id,
+                    generation: record.generation,
+                    parent_commit_ids: record.parent_commit_ids,
+                    commit_change_id: record.change_id,
+                    author_account_ids: record.author_account_ids,
+                    created_at: record.created_at,
+                    replay_debt: CommitStateReplayDebt {
+                        depth: record.tracked_state_rootless_depth,
+                        rows: record.tracked_state_rootless_rows,
+                        bytes: record.tracked_state_rootless_bytes,
+                    },
+                    mutations: Default::default(),
+                    snapshot_root: None,
+                },
+            )
+            .expect("mixed derived commit authority should stage");
+        }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -3152,15 +3205,15 @@ mod tests {
             } else {
                 0
             };
-            let mut append = ChangelogAppend::default();
-            append.commits.push(crate::changelog::CommitRecord {
+            let typed_parent_ids = parent_ids
+                .iter()
+                .map(|id| CommitId::for_test_label(id))
+                .collect::<Vec<_>>();
+            let record = crate::changelog::CommitRecord {
                 format_version: 1,
                 commit_id: CommitId::for_test_label(&commit_id),
                 generation,
-                parent_commit_ids: parent_ids
-                    .iter()
-                    .map(|id| CommitId::for_test_label(id))
-                    .collect(),
+                parent_commit_ids: typed_parent_ids,
                 tracked_state_rootless: false,
                 tracked_state_rootless_depth: 0,
                 tracked_state_rootless_rows: 0,
@@ -3168,7 +3221,9 @@ mod tests {
                 change_id: ChangeId::for_test_label(&commit_change_id),
                 author_account_ids: Vec::new(),
                 created_at: commit_created_at,
-            });
+            };
+            let mut append = ChangelogAppend::default();
+            append.commits.push(record.clone());
             let mut changelog_read = store;
             let mut writer = ChangelogContext::new().writer(&mut changelog_read, writes);
             crate::changelog::ChangelogWriter::stage_append(&mut writer, append).await?;
@@ -3200,11 +3255,33 @@ mod tests {
                     authored: true,
                 })
                 .collect::<Vec<_>>();
-            stage_commit_deltas(writes, &commit_deltas)?;
-            TrackedStateContext::new()
-                .writer(&*store, writes)
+            let staged_delta = stage_commit_deltas_for_commit_state(writes, &commit_deltas)?;
+            let mutation_inventory = staged_delta.mutation_inventory().clone();
+            let tracked_state = TrackedStateContext::new();
+            let mut root_writer = tracked_state.writer(&*store, writes);
+            root_writer
                 .stage_commit_root(&commit_id, parent_commit_id.as_deref(), root_deltas)
                 .await?;
+            let snapshot_root = root_writer
+                .staged_commit_roots()
+                .find(|root| root.commit_id == typed_commit_id)
+                .cloned()
+                .ok_or_else(|| LixError::unknown("test materialization did not stage a root"))?;
+            drop(root_writer);
+            stage_commit_state_manifest(
+                writes,
+                &CommitStateManifest {
+                    commit_id: record.commit_id,
+                    generation: record.generation,
+                    parent_commit_ids: record.parent_commit_ids,
+                    commit_change_id: record.change_id,
+                    author_account_ids: record.author_account_ids,
+                    created_at: record.created_at,
+                    replay_debt: CommitStateReplayDebt::default(),
+                    mutations: mutation_inventory,
+                    snapshot_root: Some(snapshot_root),
+                },
+            )?;
         }
 
         Ok(())
