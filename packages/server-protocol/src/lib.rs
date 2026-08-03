@@ -41,7 +41,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock, mpsc, watch},
+    sync::{Mutex as AsyncMutex, Notify, mpsc, watch},
     task::JoinHandle,
 };
 use tower_http::{
@@ -290,7 +290,7 @@ struct SessionRecord<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lix: Arc<AsyncRwLock<Arc<Lix<S>>>>,
+    lix: Arc<Lix<S>>,
     transactions: AsyncMutex<RemoteTransactionRegistry<S>>,
     last_used: Mutex<Instant>,
     activity: Arc<SessionActivity>,
@@ -573,7 +573,7 @@ where
         request_blob_budget: Arc<RequestBlobCacheBudget>,
     ) -> Self {
         Self {
-            lix: Arc::new(AsyncRwLock::new(Arc::new(lix))),
+            lix: Arc::new(lix),
             transactions: AsyncMutex::new(RemoteTransactionRegistry::default()),
             last_used: Mutex::new(now),
             activity: Arc::new(SessionActivity::default()),
@@ -708,11 +708,7 @@ where
     {
         let lix = Arc::clone(&self.record.lix);
         self.run_detached(
-            async move {
-                let lix = lix.read_owned().await;
-                let current = Arc::clone(&lix);
-                operation(current).await
-            },
+            async move { operation(lix).await },
             "join Lix server operation",
         )
         .await
@@ -726,11 +722,7 @@ where
         F: FnOnce(Arc<Lix<S>>) -> Fut,
         Fut: Future<Output = Result<T, LixError>>,
     {
-        let result = {
-            let lix = Arc::clone(&self.record.lix).read_owned().await;
-            let current = Arc::clone(&lix);
-            operation(current).await
-        };
+        let result = operation(Arc::clone(&self.record.lix)).await;
         if let (Some(notifier), Err(error)) = (&self.durable_terminal_storage_notifier, &result) {
             notifier.signal_if_terminal(error);
         }
@@ -745,10 +737,7 @@ where
         metadata: ExecuteStatementMetadata,
         idempotency: Option<ExecuteIdempotency>,
     ) -> Result<ExecuteResult, LixError> {
-        let disposition = {
-            let lix = self.record.lix.read().await;
-            lix.execution_disposition(&sql)?
-        };
+        let disposition = self.record.lix.execution_disposition(&sql)?;
         match disposition {
             ExecutionDisposition::CancellableRead => {
                 self.run_cancellable_read(move |lix| async move {
@@ -788,10 +777,7 @@ where
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        let disposition = {
-            let lix = self.record.lix.read().await;
-            lix.execute_batch_disposition(&statements)?
-        };
+        let disposition = self.record.lix.execute_batch_disposition(&statements)?;
         match disposition {
             ExecutionDisposition::CancellableRead => {
                 self.run_cancellable_read(move |lix| async move {
@@ -829,7 +815,7 @@ where
                 "Lix session already has an active transaction",
             ));
         }
-        let lix = Arc::clone(&*self.record.lix.read().await);
+        let lix = Arc::clone(&self.record.lix);
         let id = generate_capability_id()?;
         let pin = RemoteTransactionPin::acquire(Arc::clone(&self.record.activity))?;
         transactions.active = Some(ActiveRemoteTransaction {
@@ -959,12 +945,7 @@ where
     ) -> Result<lix_sdk::SwitchBranchReceipt, LixError> {
         let lix = Arc::clone(&self.record.lix);
         self.run_detached(
-            async move {
-                let mut lix = lix.write().await;
-                let (switched, receipt) = lix.switch_branch_session(options).await?;
-                *lix = Arc::new(switched);
-                Ok(receipt)
-            },
+            async move { lix.switch_branch(options).await },
             "join Lix server branch switch",
         )
         .await
@@ -976,9 +957,8 @@ where
         params: &[Value],
         terminal_sender: TerminalStorageStreamSender,
     ) -> Result<ServerObserve<S>, LixError> {
-        let lix = self.record.lix.read().await;
         Ok(ServerObserve {
-            events: AsyncMutex::new(lix.observe(sql, params)?),
+            events: AsyncMutex::new(self.record.lix.observe(sql, params)?),
             terminal_sender,
         })
     }
@@ -1459,8 +1439,7 @@ where
         Some(active) => active.transaction.rollback().await,
         None => Ok(()),
     };
-    let lix = record.lix.write().await;
-    let close_result = lix.close().await;
+    let close_result = record.lix.close().await;
     rollback_result.and(close_result)
 }
 
@@ -9092,7 +9071,7 @@ mod tests {
         // Keep eviction cleanup blocked after the replacement is registered.
         // Shutdown must continue to track the whole create operation, not only
         // the child open and registry mutation.
-        let first_session_read = first_record.lix.read().await;
+        let first_transactions = first_record.transactions.lock().await;
         let branch_id = app
             .server
             .inner
@@ -9131,7 +9110,7 @@ mod tests {
             "close completed before pending eviction cleanup"
         );
 
-        drop(first_session_read);
+        drop(first_transactions);
         let replacement = replacement
             .await
             .expect("join replacement open")
@@ -9916,16 +9895,13 @@ mod tests {
         let (session_id, _) = new_session(&app.router).await;
         let child = {
             let registry = app.server.inner.registry.lock().await;
-            let current = Arc::clone(
+            Arc::clone(
                 &registry
                     .sessions
                     .get(&session_id)
                     .expect("registered child")
                     .lix,
-            );
-            drop(registry);
-            let current = current.read().await;
-            Arc::clone(&*current)
+            )
         };
         let root = Arc::clone(&app.server.inner.root);
 

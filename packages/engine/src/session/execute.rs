@@ -762,37 +762,41 @@ where
         crate::common::LixPath::try_from_file_path(&path)?;
         let write_access = self.begin_session_write_access().await?;
         let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
-        self.with_write_transaction_reserved_lending(write_access, async move |transaction| {
-            // `Blob` is reference-counted. Retaining a copy lets the rare
-            // general-write fallback reuse the same payload without a
-            // second allocation or a second transaction.
-            let fast_path = sql2::execute_fast_lix_file_path_writes(
-                transaction,
-                vec![(path.clone(), data.clone(), None, None)],
-                sql2::FastLixFilePathWriteConflict::UpdateData,
-                None,
-            )
-            .await?;
-            if let Some(count) = fast_path {
-                return Ok(count);
-            }
+        self.with_write_transaction_reserved_lending(
+            write_access,
+            async move |transaction| {
+                // `Blob` is reference-counted. Retaining a copy lets the rare
+                // general-write fallback reuse the same payload without a
+                // second allocation or a second transaction.
+                let fast_path = sql2::execute_fast_lix_file_path_writes(
+                    transaction,
+                    vec![(path.clone(), data.clone(), None, None)],
+                    sql2::FastLixFilePathWriteConflict::UpdateData,
+                    None,
+                )
+                .await?;
+                if let Some(count) = fast_path {
+                    return Ok(count);
+                }
 
-            // The fast helper declines pre-existing cross-scope path
-            // collisions before staging anything. The general provider
-            // handles those valid legacy layouts, so keep this request in
-            // the same transaction and use its public upsert semantics.
-            let statement = sql_planning_cache.parse_statement(NATIVE_FILE_UPSERT_SQL)?;
-            let plan =
-                transaction.prepare_sql_write_logical_plan(NATIVE_FILE_UPSERT_SQL, &statement)?;
-            sql2::execute_write_logical_plan_result_with_metadata(
-                transaction,
-                plan,
-                &[Value::Text(path), Value::Blob(data)],
-                &ExecuteStatementMetadata::default(),
-            )
-            .await
-            .map(|result| result.rows_affected)
-        })
+                // The fast helper declines pre-existing cross-scope path
+                // collisions before staging anything. The general provider
+                // handles those valid legacy layouts, so keep this request in
+                // the same transaction and use its public upsert semantics.
+                let statement = sql_planning_cache.parse_statement(NATIVE_FILE_UPSERT_SQL)?;
+                let plan = transaction
+                    .prepare_sql_write_logical_plan(NATIVE_FILE_UPSERT_SQL, &statement)?;
+                sql2::execute_write_logical_plan_result_with_metadata(
+                    transaction,
+                    plan,
+                    &[Value::Text(path), Value::Blob(data)],
+                    &ExecuteStatementMetadata::default(),
+                )
+                .await
+                .map(|result| result.rows_affected)
+            },
+            |_| Ok(()),
+        )
         .await
     }
 
@@ -830,7 +834,7 @@ where
                         "expected": "a filesystem layout that the direct path index can route unambiguously",
                     }))
                 })
-        })
+        }, |_| Ok(()))
         .await
     }
 
@@ -991,24 +995,29 @@ where
             let sql_for_planning = sql_for_error.clone();
             let params = params.to_vec();
             return self
-                .with_write_transaction_reserved_lending(write_access, async move |transaction| {
-                    let previous_origin_key = transaction.replace_origin_key(options.origin_key);
-                    let result = async {
-                        let tx_plan = transaction
-                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
-                        let result = execute_prepared_transaction_write(
-                            transaction,
-                            tx_plan,
-                            &params,
-                            &metadata,
-                        )
-                        .await?;
-                        Ok(ExecuteResult::from_sql_write_result(result))
-                    }
-                    .await;
-                    transaction.replace_origin_key(previous_origin_key);
-                    result
-                })
+                .with_write_transaction_reserved_lending(
+                    write_access,
+                    async move |transaction| {
+                        let previous_origin_key =
+                            transaction.replace_origin_key(options.origin_key);
+                        let result = async {
+                            let tx_plan = transaction
+                                .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
+                            let result = execute_prepared_transaction_write(
+                                transaction,
+                                tx_plan,
+                                &params,
+                                &metadata,
+                            )
+                            .await?;
+                            Ok(ExecuteResult::from_sql_write_result(result))
+                        }
+                        .await;
+                        transaction.replace_origin_key(previous_origin_key);
+                        result
+                    },
+                    |_| Ok(()),
+                )
                 .await
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
@@ -1118,29 +1127,33 @@ where
         // this call's immediate stack frame while the write lease is held.
         let idempotency_for_commit = idempotency.clone();
         let result = self
-            .with_write_transaction_reserved_lending(write_access, async move |transaction| {
-                let previous_origin_key = transaction.replace_origin_key(options.origin_key);
-                let result = async {
-                    let tx_plan = transaction
-                        .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
-                    let result = execute_prepared_transaction_write(
-                        transaction,
-                        tx_plan,
-                        &params,
-                        &metadata,
-                    )
-                    .await?;
-                    let result = ExecuteResult::from_sql_write_result(result);
-                    let receipt =
-                        ExecuteIdempotencyReceipt::single(&idempotency_for_commit, &result)?;
-                    transaction
-                        .stage_execute_idempotency_receipt(&idempotency_for_commit, &receipt)?;
-                    Ok(result)
-                }
-                .await;
-                transaction.replace_origin_key(previous_origin_key);
-                result
-            })
+            .with_write_transaction_reserved_lending(
+                write_access,
+                async move |transaction| {
+                    let previous_origin_key = transaction.replace_origin_key(options.origin_key);
+                    let result = async {
+                        let tx_plan = transaction
+                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
+                        let result = execute_prepared_transaction_write(
+                            transaction,
+                            tx_plan,
+                            &params,
+                            &metadata,
+                        )
+                        .await?;
+                        let result = ExecuteResult::from_sql_write_result(result);
+                        let receipt =
+                            ExecuteIdempotencyReceipt::single(&idempotency_for_commit, &result)?;
+                        transaction
+                            .stage_execute_idempotency_receipt(&idempotency_for_commit, &receipt)?;
+                        Ok(result)
+                    }
+                    .await;
+                    transaction.replace_origin_key(previous_origin_key);
+                    result
+                },
+                |_| Ok(()),
+            )
             .await
             .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
 
@@ -1938,18 +1951,22 @@ where
             let sql_for_planning = sql_for_error.clone();
             let params = params.to_vec();
             return self
-                .with_write_transaction_reserved_lending(write_access, async move |transaction| {
-                    let tx_plan = transaction
-                        .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
-                    let result = sql2::execute_write_logical_plan_with_mode_result(
-                        transaction,
-                        tx_plan,
-                        &params,
-                        mode,
-                    )
-                    .await?;
-                    Ok(ExecuteResult::from_sql_write_result(result))
-                })
+                .with_write_transaction_reserved_lending(
+                    write_access,
+                    async move |transaction| {
+                        let tx_plan = transaction
+                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
+                        let result = sql2::execute_write_logical_plan_with_mode_result(
+                            transaction,
+                            tx_plan,
+                            &params,
+                            mode,
+                        )
+                        .await?;
+                        Ok(ExecuteResult::from_sql_write_result(result))
+                    },
+                    |_| Ok(()),
+                )
                 .await
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
@@ -5156,33 +5173,34 @@ mod tests {
             })
             .await
             .expect("a branch should start from a rootless history commit");
-        let (draft_session, _) = session
+        session
             .switch_branch(crate::SwitchBranchOptions {
                 branch_id: draft.id.clone(),
             })
             .await
             .expect("rootless draft should open");
-        draft_session
+        session
             .execute(
                 "UPDATE rootless_ordered_insert_probe SET value = 'draft' WHERE id = '00001'",
                 &[],
             )
             .await
             .expect("rootless draft should remain writable");
-        let (main_session, _) = draft_session
+        session
             .switch_branch(crate::SwitchBranchOptions {
                 branch_id: branch_id.clone(),
             })
             .await
             .expect("workspace should switch back to the rootless main branch");
-        main_session
+        let main_session = &session;
+        session
             .execute(
                 "UPDATE rootless_ordered_insert_probe SET value = 'main' WHERE id = '32767'",
                 &[],
             )
             .await
             .expect("rootless main branch should remain writable");
-        let merge = main_session
+        let merge = session
             .merge_branch(crate::MergeBranchOptions {
                 source_branch_id: draft.id,
             })
@@ -7248,13 +7266,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let (historical_session, _) = session
+        session
             .switch_branch(crate::SwitchBranchOptions {
                 branch_id: historical_branch.id,
             })
             .await
             .unwrap();
-        let historical_points = historical_session
+        let historical_points = session
             .execute(
                 "SELECT path, value FROM packed_replacement_probe \
                  WHERE path IN ('/00000', '/32767') ORDER BY path",
@@ -7274,7 +7292,7 @@ mod tests {
                 .unwrap(),
             serde_json::json!({"updated": ROW_COUNT - 1})
         );
-        let (session, _) = historical_session
+        session
             .switch_branch(crate::SwitchBranchOptions {
                 branch_id: main_branch_id.clone(),
             })
@@ -7327,20 +7345,20 @@ mod tests {
             })
             .await
             .unwrap();
-        let (merge_source, _) = session
+        session
             .switch_branch(crate::SwitchBranchOptions {
                 branch_id: merge_base_branch.id.clone(),
             })
             .await
             .unwrap();
-        merge_source
+        session
             .execute(
                 "UPDATE packed_replacement_probe SET value = lix_json('{\"branch\":true}') WHERE path = '/00000'",
                 &[],
             )
             .await
             .unwrap();
-        let (session, _) = merge_source
+        session
             .switch_branch(crate::SwitchBranchOptions {
                 branch_id: main_branch_id.clone(),
             })

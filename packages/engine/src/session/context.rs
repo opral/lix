@@ -117,7 +117,7 @@ pub(crate) async fn load_workspace_branch_id_from_index(
 
 #[derive(Clone)]
 pub(crate) enum SessionMode {
-    Pinned { branch_id: String },
+    Pinned { branch_id: Arc<RwLock<String>> },
     Workspace { branch_id: Arc<RwLock<String>> },
 }
 
@@ -216,7 +216,7 @@ where
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             SessionMode::Pinned {
-                branch_id: active_branch_id,
+                branch_id: Arc::new(RwLock::new(active_branch_id)),
             },
             storage,
             live_state,
@@ -478,14 +478,13 @@ where
     {
         self.ensure_open()?;
         match &self.mode {
-            SessionMode::Pinned { branch_id } => Ok(branch_id.clone()),
-            SessionMode::Workspace { branch_id } => branch_id
+            SessionMode::Pinned { branch_id } | SessionMode::Workspace { branch_id } => branch_id
                 .read()
                 .map(|branch_id| branch_id.clone())
                 .map_err(|_| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "workspace branch selector cache is poisoned",
+                        "session branch selector is poisoned",
                     )
                 }),
         }
@@ -503,17 +502,19 @@ where
     {
         self.ensure_open()?;
         let write_access = self.begin_session_write_access().await?;
-        self.with_write_transaction_reserved_lending(write_access, f)
+        self.with_write_transaction_reserved_lending(write_access, f, |_| Ok(()))
             .await
     }
 
-    pub(super) async fn with_write_transaction_reserved_lending<T, F>(
+    pub(super) async fn with_write_transaction_reserved_lending<T, F, A>(
         &self,
         write_access: SessionWriteAccess,
         f: F,
+        after_commit: A,
     ) -> Result<T, LixError>
     where
         F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
+        A: FnOnce(&T) -> Result<(), LixError>,
     {
         let planner_validation_is_serialized = write_access.serializes_collaboration_writes();
         // Automatic writes already hold the collaboration gate, so taking the
@@ -560,9 +561,11 @@ where
                 let outcome = Box::pin(transaction.commit(&runtime_functions)).await?;
                 #[cfg(feature = "storage-benches")]
                 crate::storage_bench::record_crud_physical_writes(outcome.storage_stats);
+                let after_commit_result = after_commit(&value);
                 drop(write_access);
                 self.observe_invalidation
                     .bump_if_storage_changed(&outcome.storage_stats);
+                after_commit_result?;
                 Ok(value)
             }
             Err(error) => Err(error),

@@ -300,7 +300,6 @@ simulation_test!(
             )
             .await
             .expect("draft write should succeed");
-
         assert_key_value(
             &draft,
             "64726166-742d-8166-8465-722d62726100",
@@ -311,37 +310,42 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    switch_branch_returns_session_for_target_branch,
-    |sim| async move {
-        let (engine, main, draft) = create_draft_from_main(&sim).await;
-        draft
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('switch-draft-only', 'draft')",
-                &[],
-            )
-            .await
-            .expect("draft write should succeed");
+simulation_test!(switch_branch_updates_session_in_place, |sim| async move {
+    let (engine, main, draft) = create_draft_from_main(&sim).await;
+    draft
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('switch-draft-only', 'draft')",
+            &[],
+        )
+        .await
+        .expect("draft write should succeed");
+    let main_clone = main.clone();
 
-        let (switched, receipt) = main
-            .switch_branch(SwitchBranchOptions {
-                branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
-            })
-            .await
-            .expect("switch should succeed");
+    let receipt = main
+        .switch_branch(SwitchBranchOptions {
+            branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+        })
+        .await
+        .expect("switch should succeed");
 
-        assert_eq!(receipt.branch_id, "01930000-0000-7000-8000-000000000001");
-        assert_key_value(&switched, "switch-draft-only", Some("\"draft\"")).await;
-        assert_key_value(&main, "switch-draft-only", None).await;
+    assert_eq!(receipt.branch_id, "01930000-0000-7000-8000-000000000001");
+    assert_key_value(&main, "switch-draft-only", Some("\"draft\"")).await;
+    assert_key_value(&main_clone, "switch-draft-only", Some("\"draft\"")).await;
 
-        drop(engine);
-    }
-);
+    drop(engine);
+});
 
 simulation_test!(
     cached_write_templates_are_isolated_across_branch_switches,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
+        let main_snapshot = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id().to_string())
+                .await
+                .expect("open independent main session"),
+            &engine,
+        );
         let insert_sql = "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)";
 
         main.execute(
@@ -354,27 +358,25 @@ simulation_test!(
         .await
         .expect("main write should warm the exact SQL template");
 
-        let (switched, _) = main
-            .switch_branch(SwitchBranchOptions {
-                branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
-            })
-            .await
-            .expect("switch should succeed");
-        switched
-            .execute(
-                insert_sql,
-                &[
-                    Value::Text("template-draft-only".to_string()),
-                    Value::Text("draft".to_string()),
-                ],
-            )
-            .await
-            .expect("the same SQL should bind to the switched branch");
+        main.switch_branch(SwitchBranchOptions {
+            branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+        })
+        .await
+        .expect("switch should succeed");
+        main.execute(
+            insert_sql,
+            &[
+                Value::Text("template-draft-only".to_string()),
+                Value::Text("draft".to_string()),
+            ],
+        )
+        .await
+        .expect("the same SQL should bind to the switched branch");
 
-        assert_key_value(&switched, "template-draft-only", Some("\"draft\"")).await;
-        assert_key_value(&main, "template-draft-only", None).await;
-        assert_key_value(&main, "template-main-only", Some("\"main\"")).await;
-        assert_key_value(&switched, "template-main-only", None).await;
+        assert_key_value(&main, "template-draft-only", Some("\"draft\"")).await;
+        assert_key_value(&main_snapshot, "template-draft-only", None).await;
+        assert_key_value(&main_snapshot, "template-main-only", Some("\"main\"")).await;
+        assert_key_value(&main, "template-main-only", None).await;
 
         drop(engine);
     }
@@ -408,12 +410,11 @@ simulation_test!(
             "pinned session setup should not have moved the workspace selector"
         );
 
-        let (_switched, _receipt) = main
-            .switch_branch(SwitchBranchOptions {
-                branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
-            })
-            .await
-            .expect("switch should succeed");
+        main.switch_branch(SwitchBranchOptions {
+            branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
+        })
+        .await
+        .expect("switch should succeed");
 
         assert_eq!(
             engine
@@ -491,7 +492,7 @@ simulation_test!(
             sim.main_branch_id()
         );
 
-        let (workspace_switched, receipt) = workspace_a
+        let receipt = workspace_a
             .switch_branch(SwitchBranchOptions {
                 branch_id: "01930000-0000-7000-8000-000000000001".to_string(),
             })
@@ -500,7 +501,7 @@ simulation_test!(
 
         assert_eq!(receipt.branch_id, "01930000-0000-7000-8000-000000000001");
         assert_eq!(
-            workspace_switched
+            workspace_a
                 .active_branch_id()
                 .await
                 .expect("switched workspace selector should resolve"),
