@@ -58,6 +58,10 @@ impl RowGroupSetId {
         Self(bytes)
     }
 
+    pub(crate) const fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+
     fn manifest_key(self) -> StorageKey {
         StorageKey(Bytes::copy_from_slice(&self.0))
     }

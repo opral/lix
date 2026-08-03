@@ -1218,8 +1218,8 @@ mod tests {
     use super::*;
     use crate::NullableKeyFilter;
     use crate::entity_pk::EntityPk;
-    use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
+    use crate::storage_adapter::{StorageAdapter, StorageAdapterRead, StorageWriteSet};
     use crate::tracked_state::types::{
         TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateMutation,
         TrackedStateRootId,
@@ -1232,6 +1232,30 @@ mod tests {
 
     fn change_id(label: &str) -> String {
         ChangeId::for_test_label(label).to_string()
+    }
+
+    async fn stage_snapshot_authority_for_test(
+        read: &(impl StorageAdapterRead + ?Sized),
+        writes: &mut StorageWriteSet,
+        snapshot_root: &TrackedStateCommitRoot,
+    ) -> Result<(), LixError> {
+        let mut manifest =
+            crate::tracked_state::storage::load_unchecked_commit_state_manifest_for_test(
+                read,
+                snapshot_root.commit_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "corrupt-root fixture has no commit-state manifest",
+                )
+            })?;
+        manifest.snapshot_root = Some(snapshot_root.clone());
+        manifest.replay_debt = Default::default();
+        crate::tracked_state::storage::stage_unchecked_commit_state_manifest_for_test(
+            writes, &manifest,
+        )
     }
 
     #[test]
@@ -1942,6 +1966,25 @@ mod tests {
             file_id: None,
             entity_pk: EntityPk::single("entity-a"),
         };
+        {
+            let mut read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("corrupt commit read should open");
+            let mut writes = storage.new_write_set();
+            crate::test_support::stage_empty_changelog_commit(
+                &mut read,
+                &mut writes,
+                "right-corrupt",
+                None,
+            )
+            .await
+            .expect("corrupt commit authority should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("corrupt commit authority should commit");
+        }
         let result = {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
@@ -1963,7 +2006,8 @@ mod tests {
                 )
                 .await
                 .expect("corrupt root should write");
-            crate::tracked_state::storage::stage_commit_root(
+            stage_snapshot_authority_for_test(
+                &read,
                 &mut writes,
                 &TrackedStateCommitRoot {
                     commit_id: CommitId::for_test_label("right-corrupt"),
@@ -1976,6 +2020,7 @@ mod tests {
                     primary_chunk_bytes: result.chunk_bytes as u64,
                 },
             )
+            .await
             .expect("metadata should encode");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
@@ -1999,7 +2044,8 @@ mod tests {
             error
                 .message
                 .contains("does not match changelog change identity")
-                || error.message.contains("changelog commit"),
+                || error.message.contains("changelog commit")
+                || error.message.contains("has no authoritative payload"),
             "unexpected error: {error}"
         );
 
@@ -2125,7 +2171,7 @@ mod tests {
             .expect("unrelated row should appear in valid diff");
         let (source_key, source_value) = source_row.into_index_entry();
 
-        let result = {
+        {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
                 .await
@@ -2139,6 +2185,17 @@ mod tests {
             )
             .await
             .expect("empty right changelog should write");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("empty right changelog should commit");
+        };
+        let result = {
+            let mut read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open");
+            let mut writes = storage.new_write_set();
             let result = crate::tracked_state::tree::TrackedStateTree::new()
                 .apply_mutations(
                     &mut read,
@@ -2154,7 +2211,8 @@ mod tests {
                 )
                 .await
                 .expect("corrupt root should write");
-            crate::tracked_state::storage::stage_commit_root(
+            stage_snapshot_authority_for_test(
+                &read,
                 &mut writes,
                 &TrackedStateCommitRoot {
                     commit_id: CommitId::for_test_label("right-corrupt"),
@@ -2167,6 +2225,7 @@ mod tests {
                     primary_chunk_bytes: result.chunk_bytes as u64,
                 },
             )
+            .await
             .expect("metadata should encode");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
@@ -2626,7 +2685,7 @@ mod tests {
         )
         .await
         .expect("source add root should write");
-        let source_update = row_with_times(
+        let mut source_update = row_with_times(
             "entity-a",
             None,
             "source-update-a",
@@ -2634,6 +2693,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             "2026-01-02T00:00:00Z",
         );
+        source_update.commit_id = CommitId::for_test_label("source-update");
         write_root_committed_for_test(
             &storage,
             &tracked_state,
@@ -3043,7 +3103,7 @@ mod tests {
             .await
             .expect_err("extra commit-root parents must be rejected");
         assert!(
-            error.message.contains("more than one first-parent root"),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
@@ -3275,8 +3335,8 @@ mod tests {
     }
 
     async fn write_root_for_test(
-        read: &mut (impl crate::storage_adapter::StorageAdapterRead + ?Sized),
-        writes: &mut crate::storage_adapter::StorageWriteSet,
+        read: &mut (impl StorageAdapterRead + ?Sized),
+        writes: &mut StorageWriteSet,
         tracked_state: &TrackedStateContext,
         commit_id: &str,
         parent_commit_id: Option<&str>,
@@ -3338,7 +3398,8 @@ mod tests {
             )
             .await
             .expect("corrupt root should write");
-        crate::tracked_state::storage::stage_commit_root(
+        stage_snapshot_authority_for_test(
+            &read,
             &mut writes,
             &TrackedStateCommitRoot {
                 commit_id: CommitId::for_test_label(commit_id),
@@ -3351,6 +3412,7 @@ mod tests {
                 primary_chunk_bytes: result.chunk_bytes as u64,
             },
         )
+        .await
         .expect("metadata should encode");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -3377,6 +3439,7 @@ mod tests {
     fn is_commit_root_validation_error(error: &LixError) -> bool {
         error.message.contains("not the first-parent winner")
             || error.message.contains("does not match parent root")
+            || error.message.contains("snapshot ancestry disagrees")
             || error
                 .message
                 .contains("does not match changelog first-parent winners")

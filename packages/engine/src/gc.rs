@@ -412,20 +412,12 @@ where
     let phase_started = Instant::now();
     let changelog_plan = plan_and_stage_authority_gc(&store, writes, &roots).await?;
     let changelog_us = elapsed_micros(phase_started);
-    // Changelog reachability is the logical correctness boundary. A
-    // tracked root has the same commit id, so dead root metadata can be
-    // deleted directly without inventorying every retained root.
-    let sweep_tracked_commit_roots = changelog_plan.sweep.commits.clone();
-
-    // Removing a dead changelog commit invalidates its derived root metadata
-    // and its commit-addressed delta index. Immutable tree/CAS payloads remain
-    // content-addressed maintenance work, but delta rows have no shared
-    // ownership and must be reclaimed in the same logical GC pass.
+    let swept_snapshot_authorities = changelog_plan.sweep.commits.clone();
+    // Removing a dead changelog commit invalidates its commit-addressed delta
+    // inventory. Immutable tree/CAS payloads remain content-addressed
+    // maintenance work, but delta rows have no shared ownership and must be
+    // reclaimed in the same logical GC pass.
     let phase_started = Instant::now();
-    crate::tracked_state::stage_delete_commit_roots(
-        writes,
-        sweep_tracked_commit_roots.iter().copied(),
-    );
     // Old serving generations are derived data. Removing them in the same
     // atomic sweep as their untracked payload-root withdrawal prevents stale
     // branch generations from accumulating indefinitely.
@@ -495,7 +487,7 @@ where
     Ok(RepositoryGcPlan {
         changelog: changelog_plan,
         sweep: RepositoryGcSweep {
-            tracked_commit_roots: sweep_tracked_commit_roots,
+            tracked_commit_roots: swept_snapshot_authorities,
         },
         profile: RepositoryGcProfile {
             root_discovery_us,
@@ -518,18 +510,6 @@ where
     let standalone_changes = scan_all_gc_standalone_changes(store.clone()).await?;
     let packed = crate::tracked_state::scan_commit_delta_inventory(store).await?;
 
-    if let Some(commit_id) = packed
-        .commits
-        .keys()
-        .find(|commit_id| !commits.contains(commit_id))
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "garbage collection found packed commit-delta authority for missing commit '{commit_id}'"
-            ),
-        ));
-    }
     if let Some(change_id) = standalone_changes.keys().find(|change_id| {
         packed.commits.values().any(|entry| {
             entry
@@ -567,51 +547,112 @@ where
         pending.extend(commits.parent_commit_ids(commit).iter().copied());
     }
 
-    // A selected cascade tombstone intentionally carries no payload and
-    // cannot be promoted into canonical change authority. If it is the only
-    // surviving reference to a change, retain the authored owner's commit
-    // ancestry as an authority root. Ordinary selected rows carry matching
-    // identity and are promoted below, so they do not retain dead history.
-    let referenced_change_ids = live_commits
-        .iter()
-        .filter_map(|commit_id| packed.commits.get(commit_id))
-        .flat_map(|entry| entry.members.iter().map(|member| member.value.change_id))
-        .collect::<BTreeSet<_>>();
-    let promotable_change_ids = live_commits
-        .iter()
-        .filter_map(|commit_id| packed.commits.get(commit_id))
-        .flat_map(|entry| entry.members.iter())
-        .filter(|member| member.authored || member.is_selected_payload_ref())
-        .map(|member| member.value.change_id)
-        .collect::<BTreeSet<_>>();
-    let mut authority_roots = packed
-        .commits
-        .iter()
-        .filter(|(commit_id, _)| !live_commits.contains(commit_id))
-        .filter_map(|(commit_id, entry)| {
-            entry
-                .members
-                .iter()
-                .any(|member| {
-                    member.authored
-                        && referenced_change_ids.contains(&member.value.change_id)
-                        && !promotable_change_ids.contains(&member.value.change_id)
-                })
-                .then_some(*commit_id)
-        })
-        .collect::<Vec<_>>();
-    while let Some(commit_id) = authority_roots.pop() {
-        if !live_commits.insert(commit_id) {
-            continue;
-        }
-        let commit = commits.get(commit_id).ok_or_else(|| {
+    // GC is destructive, so the hard-cut commit-state manifest must be
+    // present and agree with every live changelog topology projection before
+    // payload reachability or sweep mutations are derived. Missing authority
+    // must not silently turn a live commit into an empty mutation owner.
+    for commit_id in &live_commits {
+        let commit = commits
+            .get(*commit_id)
+            .expect("live commit existence was checked during graph walk");
+        let authority = packed.commits.get(commit_id).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("canonical authority references missing commit '{commit_id}'"),
+                format!("live commit '{commit_id}' has no commit-state authority"),
             )
         })?;
-        authority_roots.extend(commits.parent_commit_ids(commit).iter().copied());
+        let topology = &authority.authority;
+        let manifest_rootless = topology.replay_debt.depth > 0;
+        if topology.generation != commit.generation
+            || topology.parent_commit_ids != commits.parent_commit_ids(commit)
+            || topology.commit_change_id != commit.change_id
+            || topology.author_account_ids != commit.author_account_ids
+            || topology.created_at != commit.created_at
+            || manifest_rootless != commit.tracked_state_rootless
+            || topology.replay_debt.depth != commit.tracked_state_rootless_depth
+            || topology.replay_debt.rows != commit.tracked_state_rootless_rows
+            || topology.replay_debt.bytes != commit.tracked_state_rootless_bytes
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("live commit '{commit_id}' disagrees with its commit-state authority"),
+            ));
+        }
     }
+
+    // Mutation parts are immutable: direct ChangeIds encode their physical
+    // part slot and ordinal. Retain selected-source and authored-owner parts
+    // instead of rewriting them into a surviving commit. Logical commit
+    // reachability remains independent, so an authority owner may disappear
+    // from `lix_commit` while its immutable mutation part remains addressable.
+    let referenced_change_ids = live_commits
+        .iter()
+        .map(|commit_id| {
+            packed
+                .commits
+                .get(commit_id)
+                .expect("live commit-state authorities were validated")
+        })
+        .flat_map(|entry| entry.members.iter().map(|member| member.value.change_id))
+        .collect::<BTreeSet<_>>();
+    let mut retained_authority_commits = live_commits.clone();
+    let mut authority_roots = live_commits
+        .iter()
+        .map(|commit_id| {
+            packed
+                .commits
+                .get(commit_id)
+                .expect("live commit-state authorities were validated")
+        })
+        .filter_map(|entry| entry.selected_source_commit_id)
+        .collect::<Vec<_>>();
+    authority_roots.extend(
+        packed
+            .commits
+            .iter()
+            .filter(|(commit_id, _)| !live_commits.contains(commit_id))
+            .filter_map(|(commit_id, entry)| {
+                entry
+                    .members
+                    .iter()
+                    .any(|member| {
+                        member.authored && referenced_change_ids.contains(&member.value.change_id)
+                    })
+                    .then_some(*commit_id)
+            }),
+    );
+    while let Some(commit_id) = authority_roots.pop() {
+        if !retained_authority_commits.insert(commit_id) {
+            continue;
+        }
+        if !packed.commits.contains_key(&commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("canonical mutation authority '{commit_id}' is missing"),
+            ));
+        }
+    }
+    if let Some((commit_id, source_commit_id)) = live_commits.iter().find_map(|commit_id| {
+        packed
+            .commits
+            .get(commit_id)
+            .and_then(|entry| entry.selected_source_commit_id)
+            .filter(|source_commit_id| !packed.commits.contains_key(source_commit_id))
+            .map(|source_commit_id| (*commit_id, source_commit_id))
+    }) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "live commit '{commit_id}' references missing mutation authority '{source_commit_id}'"
+            ),
+        ));
+    }
+    let sweep_authority_commits = packed
+        .commits
+        .keys()
+        .filter(|commit_id| !retained_authority_commits.contains(commit_id))
+        .copied()
+        .collect::<Vec<_>>();
 
     let standalone_root_ids = roots
         .iter()
@@ -646,12 +687,14 @@ where
             &mut live_payload_hashes,
         );
     }
-    for commit_id in &live_commits {
-        if let Some(entry) = packed.commits.get(commit_id) {
-            for member in &entry.members {
-                live_change_ids.insert(member.value.change_id);
-                collect_change_payload_hashes(&member.change, &mut live_payload_hashes);
-            }
+    for commit_id in &retained_authority_commits {
+        let entry = packed
+            .commits
+            .get(commit_id)
+            .expect("retained mutation authorities were validated");
+        for member in &entry.members {
+            live_change_ids.insert(member.value.change_id);
+            collect_change_payload_hashes(&member.change, &mut live_payload_hashes);
         }
     }
 
@@ -667,7 +710,7 @@ where
         .collect::<Vec<_>>();
 
     let mut dead_payload_hashes = BTreeSet::new();
-    for commit_id in &sweep_commits {
+    for commit_id in &sweep_authority_commits {
         if let Some(entry) = packed.commits.get(commit_id) {
             for member in &entry.members {
                 collect_change_payload_hashes(&member.change, &mut dead_payload_hashes);
@@ -688,7 +731,7 @@ where
         .map(JsonRef::from_hash_bytes)
         .collect::<Vec<_>>();
 
-    let dead_packed_change_ids = sweep_commits
+    let dead_packed_change_ids = sweep_authority_commits
         .iter()
         .filter_map(|commit_id| packed.commits.get(commit_id))
         .flat_map(|entry| entry.members.iter().map(|member| member.value.change_id))
@@ -697,56 +740,7 @@ where
         writes,
         dead_packed_change_ids.difference(&live_change_ids).copied(),
     );
-    // Selected commit rows persist only a canonical-reference tag. When GC
-    // removes the original authored owner, promote a surviving full selected
-    // row in-place before relocating the locator. This keeps immutable
-    // history self-contained without retaining an otherwise dead commit.
-    let mut promoted_locators = Vec::new();
-    for commit_id in &live_commits {
-        let Some(entry) = packed.commits.get(commit_id) else {
-            continue;
-        };
-        let borrowed_source_is_swept = entry
-            .selected_source_commit_id
-            .is_some_and(|source_commit_id| sweep_commits.contains(&source_commit_id));
-        if !borrowed_source_is_swept
-            && !entry.members.iter().any(|member| {
-                dead_packed_change_ids.contains(&member.value.change_id)
-                    && member.is_selected_payload_ref()
-            })
-        {
-            continue;
-        }
-        let deltas = entry
-            .members
-            .iter()
-            .map(|member| crate::tracked_state::TrackedStateCommitDeltaRef {
-                delta: crate::tracked_state::TrackedStateDeltaRef {
-                    schema_key: &member.key.schema_key,
-                    file_id: member.key.file_id.as_deref(),
-                    entity_pk: &member.key.entity_pk,
-                    change_id: member.value.change_id,
-                    commit_id: *commit_id,
-                    deleted: member.value.deleted,
-                    created_at: member.value.created_at,
-                    updated_at: member.value.updated_at,
-                },
-                snapshot: member.change.snapshot.as_ref_slot(),
-                metadata: member.change.metadata.as_ref_slot(),
-                origin_key: member.change.origin_key.as_deref(),
-                base_coordinate: member.base_coordinate,
-                authored: member.authored
-                    || (borrowed_source_is_swept && !member.is_selected_tombstone())
-                    || (dead_packed_change_ids.contains(&member.value.change_id)
-                        && member.is_selected_payload_ref()),
-            })
-            .collect::<Vec<_>>();
-        promoted_locators.extend(authoritative_promoted_locators(
-            &deltas,
-            crate::tracked_state::stage_commit_deltas(writes, &deltas)?,
-        )?);
-    }
-    let relocated_locators = live_commits
+    let relocated_locators = retained_authority_commits
         .iter()
         .filter_map(|commit_id| {
             packed
@@ -776,22 +770,13 @@ where
         })
         .into_values()
         .collect::<Vec<_>>();
-    let relocated_locators = promoted_locators
-        .into_iter()
-        .chain(relocated_locators)
-        .fold(BTreeMap::new(), |mut locators, locator| {
-            locators.entry(locator.change_id).or_insert(locator);
-            locators
-        })
-        .into_values()
-        .collect::<Vec<_>>();
     crate::tracked_state::stage_change_locators(writes, &relocated_locators);
 
     writes.delete_batch(
         COMMIT_SPACE,
         sweep_commits.iter().map(|commit_id| commit_key(*commit_id)),
     );
-    for commit_id in &sweep_commits {
+    for commit_id in &sweep_authority_commits {
         if let Some(entry) = packed.commits.get(commit_id) {
             let schema_keys = entry
                 .members
@@ -846,40 +831,17 @@ where
     })
 }
 
-fn authoritative_promoted_locators(
-    deltas: &[crate::tracked_state::TrackedStateCommitDeltaRef<'_>],
-    staged_locators: Vec<crate::tracked_state::CommitDeltaChangeLocator>,
-) -> Result<Vec<crate::tracked_state::CommitDeltaChangeLocator>, LixError> {
-    if staged_locators.len() != deltas.len() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "promoted commit-delta locator count does not match its members",
-        ));
-    }
-    // The caller supplies decoded members and staged locators in the same
-    // physical-key order. Only rows that are authoritative after promotion
-    // may become canonical locator targets; selected cascade tombstones
-    // intentionally remain payload-free even when another row causes this
-    // commit to be packed again.
-    let mut promoted = Vec::new();
-    for (delta, locator) in deltas.iter().zip(staged_locators) {
-        if delta.delta.change_id != locator.change_id {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "promoted commit-delta locator order does not match its members",
-            ));
-        }
-        if delta.authored {
-            promoted.push(locator);
-        }
-    }
-    Ok(promoted)
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GcCommitInventoryEntry {
     commit_id: CommitId,
+    generation: u64,
+    tracked_state_rootless: bool,
+    tracked_state_rootless_depth: u16,
+    tracked_state_rootless_rows: u64,
+    tracked_state_rootless_bytes: u64,
     change_id: ChangeId,
+    author_account_ids: Vec<String>,
+    created_at: crate::common::LixTimestamp,
     parent_start: usize,
     parent_len: usize,
 }
@@ -891,10 +853,6 @@ struct GcCommitInventory {
 }
 
 impl GcCommitInventory {
-    fn contains(&self, commit_id: &CommitId) -> bool {
-        self.get(*commit_id).is_some()
-    }
-
     fn get(&self, commit_id: CommitId) -> Option<&GcCommitInventoryEntry> {
         self.entries
             .binary_search_by_key(&commit_id, |entry| entry.commit_id)
@@ -946,7 +904,14 @@ where
                 .extend(commit.parent_commit_ids.into_iter());
             commits.entries.push(GcCommitInventoryEntry {
                 commit_id: commit.commit_id,
+                generation: commit.generation,
+                tracked_state_rootless: commit.tracked_state_rootless,
+                tracked_state_rootless_depth: commit.tracked_state_rootless_depth,
+                tracked_state_rootless_rows: commit.tracked_state_rootless_rows,
+                tracked_state_rootless_bytes: commit.tracked_state_rootless_bytes,
                 change_id: commit.change_id,
+                author_account_ids: commit.author_account_ids,
+                created_at: commit.created_at,
                 parent_start,
                 parent_len,
             });
@@ -1008,7 +973,7 @@ fn elapsed_micros(started: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
@@ -1028,10 +993,11 @@ mod tests {
         StorageKey, StorageReadOptions, StorageSpace, StorageWriteOptions,
     };
     use crate::tracked_state::{
+        CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
         TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef,
         load_change_record_by_id, scan_change_records_from_commit_deltas,
         scan_commit_delta_inventory, stage_addressable_commit_deltas_with_selected_source,
-        stage_change_locators, stage_commit_deltas,
+        stage_change_locators, stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
     };
     use crate::{Engine, GLOBAL_BRANCH_ID, Value};
     use bytes::Bytes;
@@ -1353,7 +1319,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authority_gc_materializes_tombstone_only_checkpoint_alias_before_source_sweep() {
+    async fn authority_gc_rejects_missing_live_commit_state_before_staging_deletes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live = gc_authority_record("gc-missing-live-authority");
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("missing-authority fixture read should open");
+        let mut writes = storage.new_write_set();
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(ChangelogAppend {
+                commits: vec![live.clone()],
+                changes: Vec::new(),
+            })
+            .await
+            .expect("missing-authority commit should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("missing-authority fixture should commit");
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("missing-authority GC read should open"),
+        );
+        let mut gc_writes = storage.new_write_set();
+        let error = super::plan_and_stage_authority_gc(
+            &read,
+            &mut gc_writes,
+            &[GcRoot::BranchHead(live.commit_id)],
+        )
+        .await
+        .expect_err("GC must reject a live commit without hard-cut authority");
+        assert!(error.message.contains("has no commit-state authority"));
+        assert!(
+            gc_writes.is_empty(),
+            "authority validation must precede every destructive GC mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_gc_rejects_live_topology_drift_before_staging_deletes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live = gc_authority_record("gc-live-authority-drift");
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("authority-drift fixture read should open");
+        let mut writes = storage.new_write_set();
+        ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_append(ChangelogAppend {
+                commits: vec![live.clone()],
+                changes: Vec::new(),
+            })
+            .await
+            .expect("authority-drift commit should stage");
+        let mut drifted = CommitStateManifest {
+            commit_id: live.commit_id,
+            generation: live.generation,
+            parent_commit_ids: live.parent_commit_ids.clone(),
+            commit_change_id: live.change_id,
+            author_account_ids: live.author_account_ids.clone(),
+            created_at: live.created_at,
+            replay_debt: CommitStateReplayDebt {
+                depth: live.tracked_state_rootless_depth,
+                rows: live.tracked_state_rootless_rows,
+                bytes: live.tracked_state_rootless_bytes,
+            },
+            mutations: CommitStateMutationInventory::default(),
+            snapshot_root: None,
+        };
+        drifted.generation += 1;
+        stage_commit_state_manifest(&mut writes, &drifted)
+            .expect("internally valid but projection-drifted authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("authority-drift fixture should commit");
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("authority-drift GC read should open"),
+        );
+        let mut gc_writes = storage.new_write_set();
+        let error = super::plan_and_stage_authority_gc(
+            &read,
+            &mut gc_writes,
+            &[GcRoot::BranchHead(live.commit_id)],
+        )
+        .await
+        .expect_err("GC must reject topology projection drift");
+        assert!(
+            error
+                .message
+                .contains("disagrees with its commit-state authority")
+        );
+        assert!(
+            gc_writes.is_empty(),
+            "authority validation must precede every destructive GC mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_gc_retains_tombstone_only_checkpoint_alias_source() {
         let storage = Memory::new();
         let storage_adapter = StorageAdapter::new(storage);
         let source_commit = CommitId::for_test_label("gc-tombstone-alias-source");
@@ -1448,21 +1522,39 @@ mod tests {
         let mut source_deltas =
             commit_delta_refs(source_commit, std::slice::from_ref(&source_change));
         source_deltas[0].base_coordinate = Some(base_coordinate);
-        let source_locators = stage_commit_deltas(&mut writes, &source_deltas)
+        let source_stage = stage_commit_deltas_for_commit_state(&mut writes, &source_deltas)
             .expect("source tombstone should stage");
-        stage_change_locators(&mut writes, &source_locators);
+        stage_change_locators(&mut writes, &source_stage.locators);
         let authority_deltas =
             commit_delta_refs(authority_commit, std::slice::from_ref(&source_change));
-        stage_commit_deltas(&mut writes, &authority_deltas)
+        let authority_stage = stage_commit_deltas_for_commit_state(&mut writes, &authority_deltas)
             .expect("surviving tombstone authority should stage");
         let alias_local = commit_delta_refs(alias_commit, std::slice::from_ref(&marker_change));
-        stage_addressable_commit_deltas_with_selected_source(
+        let alias_stage = stage_addressable_commit_deltas_with_selected_source(
             &mut writes,
             &alias_local,
             &[false],
             source_commit,
         )
         .expect("tombstone-only alias should stage");
+        let inventories = BTreeMap::from([
+            (source_commit, source_stage.mutation_inventory().clone()),
+            (
+                authority_commit,
+                authority_stage.mutation_inventory().clone(),
+            ),
+            (alias_commit, alias_stage.mutation_inventory().clone()),
+        ]);
+        for record in &commits {
+            stage_test_commit_state_manifest(
+                &mut writes,
+                record,
+                inventories
+                    .get(&record.commit_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -1495,12 +1587,12 @@ mod tests {
         let inventory = scan_commit_delta_inventory(&read)
             .await
             .expect("materialized tombstone alias inventory should load");
-        assert!(!inventory.commits.contains_key(&source_commit));
+        assert!(inventory.commits.contains_key(&source_commit));
         let alias = inventory
             .commits
             .get(&alias_commit)
-            .expect("live alias should remain materialized");
-        assert_eq!(alias.selected_source_commit_id, None);
+            .expect("live alias should remain readable");
+        assert_eq!(alias.selected_source_commit_id, Some(source_commit));
         assert_eq!(alias.members.len(), 2);
         assert!(alias.members.iter().all(|member| member.value.deleted));
         assert_eq!(
@@ -1510,7 +1602,7 @@ mod tests {
                 .find(|member| member.value.change_id == source_change.change_id)
                 .and_then(|member| member.base_coordinate),
             Some(base_coordinate),
-            "GC promotion must preserve the immutable columnar-base address"
+            "retained immutable authority must preserve the columnar-base address"
         );
         assert_eq!(
             alias
@@ -1523,11 +1615,11 @@ mod tests {
         );
         scan_change_records_from_commit_deltas(&read)
             .await
-            .expect("materialized cascade tombstone must preserve canonical history");
+            .expect("retained cascade tombstone authority must preserve canonical history");
     }
 
     #[tokio::test]
-    async fn authority_gc_sweeps_dead_packed_and_standalone_facts_but_keeps_shared_payloads() {
+    async fn authority_gc_retains_immutable_packed_owner_and_sweeps_dead_standalone_fact() {
         let storage = Memory::new();
         let storage_adapter = StorageAdapter::new(storage.clone());
         let shared_ref = stage_bare_json(&storage, r#"{"payload":"shared"}"#).await;
@@ -1611,7 +1703,7 @@ mod tests {
         let mut writer = ChangelogContext::new().writer(&mut read, &mut writes);
         writer
             .stage_append(ChangelogAppend {
-                commits,
+                commits: commits.clone(),
                 changes: vec![live_standalone.clone(), dead_standalone.clone()],
             })
             .await
@@ -1621,11 +1713,27 @@ mod tests {
         // The surviving copy is a merge/checkpoint selection. Once the
         // original owner dies, GC promotes it through locator relocation.
         live_deltas[0].authored = false;
-        stage_commit_deltas(&mut writes, &live_deltas).expect("live packed member should stage");
+        let live_stage = stage_commit_deltas_for_commit_state(&mut writes, &live_deltas)
+            .expect("live packed member should stage");
         let dead_members = vec![dead_shared_member.clone(), dead_only_member.clone()];
         let dead_deltas = commit_delta_refs(dead_commit, &dead_members);
-        let dead_locators = stage_commit_deltas(&mut writes, &dead_deltas)
+        let dead_stage = stage_commit_deltas_for_commit_state(&mut writes, &dead_deltas)
             .expect("dead packed members should stage");
+        let dead_locators = dead_stage.locators.clone();
+        let inventories = BTreeMap::from([
+            (live_parent, live_stage.mutation_inventory().clone()),
+            (dead_commit, dead_stage.mutation_inventory().clone()),
+        ]);
+        for record in &commits {
+            stage_test_commit_state_manifest(
+                &mut writes,
+                record,
+                inventories
+                    .get(&record.commit_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
         let sidecar_schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Utf8,
@@ -1682,8 +1790,8 @@ mod tests {
             "a payload shared with live packed history must stay live"
         );
         assert!(
-            plan.sweep.json_payloads.contains(&dead_only_ref),
-            "a payload referenced only by dead packed and standalone facts must sweep"
+            !plan.sweep.json_payloads.contains(&dead_only_ref),
+            "co-resident immutable part members and their payloads remain reachable"
         );
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -1726,14 +1834,14 @@ mod tests {
         assert!(
             load_change_record_by_id(&read, live_member.change_id)
                 .await
-                .expect("relocated live locator should load")
+                .expect("retained live authority should load")
                 .is_some()
         );
         assert!(
             load_change_record_by_id(&read, dead_only_member.change_id)
                 .await
-                .expect("dead locator lookup should succeed")
-                .is_none()
+                .expect("co-resident authority lookup should succeed")
+                .is_some()
         );
         let canonical_changes = scan_change_records_from_commit_deltas(&read)
             .await
@@ -1746,13 +1854,13 @@ mod tests {
         assert!(
             canonical_changes
                 .iter()
-                .all(|change| change.change_id != dead_only_member.change_id)
+                .any(|change| change.change_id == dead_only_member.change_id)
         );
         let inventory = scan_commit_delta_inventory(&read)
             .await
             .expect("post-GC packed inventory should scan");
         assert!(inventory.commits.contains_key(&live_parent));
-        assert!(!inventory.commits.contains_key(&dead_commit));
+        assert!(inventory.commits.contains_key(&dead_commit));
         assert!(
             crate::columnar_row_group::load_row_group_manifest(
                 &read,
@@ -1769,14 +1877,14 @@ mod tests {
                 crate::live_state::entity_row_group_set_id(dead_commit, "authority_gc"),
             )
             .await
-            .expect("load swept sidecar")
-            .is_none(),
-            "swept commit sidecars must be removed"
+            .expect("load retained authority sidecar")
+            .is_some(),
+            "sidecars co-owned by retained immutable authority must survive"
         );
         drop(read);
         assert!(json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await);
         assert!(
-            !json_ref_exists(
+            json_ref_exists(
                 &storage,
                 crate::json_store::store::JSON_SPACE,
                 dead_only_ref,
@@ -1790,59 +1898,6 @@ mod tests {
                 live_standalone_ref,
             )
             .await
-        );
-    }
-
-    #[test]
-    fn promoted_locator_filter_excludes_selected_tombstones() {
-        let commit_id = CommitId::for_test_label("mixed-promotion-commit");
-        let change_id = ChangeId::for_test_label("shared-promotion-change");
-        let mut tombstone =
-            packed_change("selected-tombstone", "a-selected-tombstone", JsonSlot::None);
-        tombstone.change_id = change_id;
-        let mut promoted = packed_change("promoted-owner", "z-promoted-owner", JsonSlot::None);
-        promoted.change_id = change_id;
-        let unrelated_change_id = ChangeId::for_test_label("unrelated-authored-change");
-        let mut unrelated = packed_change(
-            "unrelated-authority",
-            "zz-unrelated-authority",
-            JsonSlot::None,
-        );
-        unrelated.change_id = unrelated_change_id;
-        let changes = [tombstone, promoted, unrelated];
-        let mut deltas = commit_delta_refs(commit_id, &changes);
-        deltas[0].authored = false;
-        let locators = vec![
-            crate::tracked_state::CommitDeltaChangeLocator {
-                change_id,
-                commit_id,
-                segment_index: 0,
-                ordinal: 0,
-            },
-            crate::tracked_state::CommitDeltaChangeLocator {
-                change_id,
-                commit_id,
-                segment_index: 0,
-                ordinal: 1,
-            },
-            crate::tracked_state::CommitDeltaChangeLocator {
-                change_id: unrelated_change_id,
-                commit_id,
-                segment_index: 1,
-                ordinal: 0,
-            },
-        ];
-
-        let filtered = super::authoritative_promoted_locators(&deltas, locators)
-            .expect("mixed promotion locators should filter");
-
-        assert_eq!(filtered.len(), 2);
-        assert_eq!(
-            filtered
-                .iter()
-                .map(|locator| locator.change_id)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([change_id, unrelated_change_id]),
         );
     }
 
@@ -2023,6 +2078,25 @@ mod tests {
         }
     }
 
+    fn gc_authority_record(label: &str) -> CommitRecord {
+        CommitRecord {
+            format_version: 1,
+            commit_id: CommitId::for_test_label(label),
+            generation: 0,
+            parent_commit_ids: Vec::new(),
+            tracked_state_rootless: true,
+            tracked_state_rootless_depth: 1,
+            tracked_state_rootless_rows: 0,
+            tracked_state_rootless_bytes: 0,
+            change_id: ChangeId::for_test_label(&format!("{label}-header")),
+            author_account_ids: Vec::new(),
+            created_at: LixTimestamp::expect_parse(
+                "authority GC record timestamp",
+                "2026-01-01T00:00:00.000Z",
+            ),
+        }
+    }
+
     fn commit_delta_refs<'a>(
         commit_id: CommitId,
         changes: &'a [ChangeRecord],
@@ -2047,6 +2121,32 @@ mod tests {
                 authored: true,
             })
             .collect()
+    }
+
+    fn stage_test_commit_state_manifest(
+        writes: &mut crate::storage_adapter::StorageWriteSet,
+        record: &CommitRecord,
+        mutations: CommitStateMutationInventory,
+    ) {
+        stage_commit_state_manifest(
+            writes,
+            &CommitStateManifest {
+                commit_id: record.commit_id,
+                generation: record.generation,
+                parent_commit_ids: record.parent_commit_ids.clone(),
+                commit_change_id: record.change_id,
+                author_account_ids: record.author_account_ids.clone(),
+                created_at: record.created_at,
+                replay_debt: CommitStateReplayDebt {
+                    depth: record.tracked_state_rootless_depth,
+                    rows: record.tracked_state_rootless_rows,
+                    bytes: record.tracked_state_rootless_bytes,
+                },
+                mutations,
+                snapshot_root: None,
+            },
+        )
+        .expect("GC fixture commit-state manifest should stage");
     }
 
     async fn json_ref_exists(storage: &Memory, space: StorageSpace, json_ref: JsonRef) -> bool {

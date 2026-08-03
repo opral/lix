@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::LixError;
-use crate::changelog::{ChangeId, CommitId, CommitRecord};
+use crate::changelog::{ChangeId, CommitId};
 use crate::common::{ExactValue, LixTimestamp};
 use crate::entity_pk::EntityPk;
 
@@ -19,7 +19,7 @@ pub(crate) struct CommitGraphChange {
 
 /// One topology-first commit fact.
 ///
-/// Nodes contain exactly the changelog fields needed by graph algorithms and
+/// Nodes contain exactly the manifest fields needed by graph algorithms and
 /// derived commit surfaces. Entity/change payloads are loaded separately only
 /// by history APIs that explicitly request them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,18 +34,6 @@ pub(crate) struct CommitGraphNode {
 impl ExactValue<CommitId> for CommitGraphNode {
     fn matches_exact_key(&self, key: &CommitId) -> bool {
         self.commit_id == *key
-    }
-}
-
-impl From<CommitRecord> for CommitGraphNode {
-    fn from(record: CommitRecord) -> Self {
-        Self {
-            commit_id: record.commit_id,
-            change_id: record.change_id,
-            generation: record.generation,
-            parent_commit_ids: record.parent_commit_ids,
-            created_at: record.created_at,
-        }
     }
 }
 

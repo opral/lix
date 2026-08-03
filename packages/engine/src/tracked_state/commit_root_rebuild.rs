@@ -41,6 +41,17 @@ pub(crate) async fn rebuild_commit_root_at<S>(
 where
     S: StorageAdapterRead + ?Sized,
 {
+    let typed_commit_id = CommitId::parse_lix(commit_id, "commit-root rebuild authority")?;
+    storage::load_commit_state_manifest(rebuilder.store, typed_commit_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot rebuild tracked_state root for commit '{commit_id}' without its commit-state manifest"
+                ),
+            )
+        })?;
     let plans =
         load_rebuild_plans_to_nearest_available_root(rebuilder.store, commit_id, true).await?;
     let mut report = None;
@@ -60,6 +71,26 @@ where
     writer
         .validate_staged_commit_root_against_changelog(commit_id)
         .await?;
+    let staged_roots = writer.staged_commit_roots().cloned().collect::<Vec<_>>();
+    drop(writer);
+    for snapshot_root in staged_roots {
+        let mut manifest = storage::load_commit_state_manifest(rebuilder.store, snapshot_root.commit_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot publish rebuilt tracked_state root for commit '{}' without its commit-state manifest",
+                        snapshot_root.commit_id
+                    ),
+                )
+            })?;
+        // The rebuilt tree is an optional immutable accelerator. Preserve
+        // replay debt: it remains the physical-policy authority projected by
+        // the changelog, while readers may serve through this equivalent root.
+        manifest.snapshot_root = Some(snapshot_root);
+        storage::stage_commit_state_manifest(rebuilder.writes, &manifest)?;
+    }
     Ok(report)
 }
 
@@ -115,7 +146,8 @@ where
         if !seen.insert(commit_id.to_string()) {
             return Ok(None);
         }
-        let Some(metadata) = storage::load_commit_root(store, commit_id).await? else {
+        let Some(metadata) = storage::load_authoritative_commit_root(store, commit_id).await?
+        else {
             seen.remove(commit_id);
             return Ok(None);
         };

@@ -6,12 +6,44 @@ use crate::json_store::{
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageReadOptions, StorageWriteOptions,
-    StorageWriteSetStats,
+    StorageWriteSet, StorageWriteSetStats,
 };
 use crate::tracked_state::{
-    TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter,
-    TrackedStateKey, TrackedStateReadColumns, TrackedStateScanRequest,
+    CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
+    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey, TrackedStateReadColumns,
+    TrackedStateScanRequest,
 };
+
+fn stage_bench_commit_deltas(
+    writes: &mut StorageWriteSet,
+    deltas: &[TrackedStateCommitDeltaRef<'_>],
+) -> Result<Vec<super::storage::CommitDeltaChangeLocator>, crate::LixError> {
+    let staged = super::storage::stage_commit_deltas_for_commit_state(writes, deltas)?;
+    let commit_id = deltas
+        .first()
+        .map(|delta| delta.delta.commit_id)
+        .unwrap_or_default();
+    let mutations = staged.mutation_inventory().clone();
+    super::storage::stage_commit_state_manifest(
+        writes,
+        &CommitStateManifest {
+            commit_id,
+            generation: 0,
+            parent_commit_ids: Vec::new(),
+            commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:bench-commit")),
+            author_account_ids: Vec::new(),
+            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+            replay_debt: CommitStateReplayDebt {
+                depth: 1,
+                rows: u64::from(mutations.member_count),
+                bytes: u64::from(mutations.member_count),
+            },
+            mutations,
+            snapshot_root: None,
+        },
+    )?;
+    Ok(staged.locators)
+}
 
 #[derive(Clone, Debug)]
 pub struct BenchTrackedRow {
@@ -194,7 +226,7 @@ where
                 .iter()
                 .map(PackedHistoryDelta::as_commit_ref)
                 .collect::<Vec<_>>();
-            let locators = super::storage::stage_commit_deltas(&mut writes, &deltas)
+            let locators = stage_bench_commit_deltas(&mut writes, &deltas)
                 .expect("stage packed-history commit delta");
             super::storage::stage_change_locators(&mut writes, &locators);
         }
@@ -805,7 +837,7 @@ impl OwnedDelta {
         commit_id: &str,
         index: usize,
         deleted: bool,
-        _writes: &mut crate::storage_adapter::StorageWriteSet,
+        _writes: &mut StorageWriteSet,
     ) -> Self {
         let change_id = format!("tracked-crud-change-{commit_id}-{index}");
         Self {

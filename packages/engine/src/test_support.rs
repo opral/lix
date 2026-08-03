@@ -9,8 +9,9 @@ use crate::storage_adapter::StorageAdapter;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::StorageWriteSet;
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateContext,
-    TrackedStateDeltaRef, TrackedStateKey,
+    CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
+    MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
+    TrackedStateContext, TrackedStateDeltaRef, TrackedStateKey,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -285,9 +286,9 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
             }
         })
         .collect::<Vec<_>>();
-    stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
-    tracked_state
-        .writer(read, writes)
+    let mut inventories = stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
+    let mut root_writer = tracked_state.writer(read, writes);
+    root_writer
         .stage_commit_root_with_absence_guards(
             &commit_id_text,
             parent_commit_id_text.as_deref(),
@@ -296,6 +297,15 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_certified_replacem
             certified_replacement_markers,
         )
         .await?;
+    let snapshot_root = root_writer
+        .staged_commit_roots()
+        .find(|root| root.commit_id == commit_id)
+        .cloned()
+        .ok_or_else(|| crate::LixError::unknown("test rooted commit did not stage a root"))?;
+    drop(root_writer);
+    let mutations = inventories.remove(&commit_id).unwrap_or_default();
+    reject_unconsumed_test_inventories(&inventories, commit_id)?;
+    stage_test_commit_state_manifest(writes, &staged, mutations, Some(snapshot_root))?;
     Ok(())
 }
 
@@ -366,7 +376,10 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
             }
         })
         .collect::<Vec<_>>();
-    stage_test_commit_deltas_by_owner(writes, &commit_deltas)
+    let mut inventories = stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
+    let mutations = inventories.remove(&commit_id).unwrap_or_default();
+    reject_unconsumed_test_inventories(&inventories, commit_id)?;
+    stage_test_commit_state_manifest(writes, &staged, mutations, None)
 }
 
 #[cfg(test)]
@@ -441,31 +454,57 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
             }
         })
         .collect::<Vec<_>>();
-    stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
-    tracked_state
-        .writer(read, writes)
+    let typed_commit_id = test_commit_id(&commit_id_text);
+    let mut inventories = stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
+    let mutations = inventories.remove(&typed_commit_id).unwrap_or_default();
+    for (owner_commit_id, owner_mutations) in inventories {
+        let mut owner_manifest = crate::tracked_state::load_commit_state_manifest(
+            &*read,
+            owner_commit_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            crate::LixError::unknown(format!(
+                "test fixture staged mutations for owner commit '{owner_commit_id}' without an existing commit-state authority"
+            ))
+        })?;
+        owner_manifest.mutations = owner_mutations;
+        crate::tracked_state::stage_commit_state_manifest(writes, &owner_manifest)?;
+    }
+    let mut root_writer = tracked_state.writer(read, writes);
+    root_writer
         .stage_commit_root(
             &commit_id_text,
             commit_root_parent_commit_id_text.as_deref(),
             root_deltas,
         )
         .await?;
+    let snapshot_root = root_writer
+        .staged_commit_roots()
+        .find(|root| root.commit_id == typed_commit_id)
+        .cloned()
+        .ok_or_else(|| crate::LixError::unknown("test rooted commit did not stage a root"))?;
+    drop(root_writer);
+    stage_test_commit_state_manifest(writes, &staged, mutations, Some(snapshot_root))?;
     Ok(())
 }
 
 fn stage_test_commit_deltas_by_owner(
     writes: &mut StorageWriteSet,
     deltas: &[TrackedStateCommitDeltaRef<'_>],
-) -> Result<(), crate::LixError> {
+) -> Result<BTreeMap<CommitId, CommitStateMutationInventory>, crate::LixError> {
     let mut by_owner = BTreeMap::<CommitId, Vec<TrackedStateCommitDeltaRef<'_>>>::new();
     for delta in deltas {
         let owner = delta.delta.commit_id;
         by_owner.entry(owner).or_default().push(*delta);
     }
     let mut canonical_locators = BTreeMap::new();
-    for owner_deltas in by_owner.values() {
-        let locators = crate::tracked_state::stage_commit_deltas(writes, owner_deltas)?;
-        for locator in locators {
+    let mut inventories = BTreeMap::new();
+    for (owner, owner_deltas) in &by_owner {
+        let staged =
+            crate::tracked_state::stage_commit_deltas_for_commit_state(writes, owner_deltas)?;
+        inventories.insert(*owner, staged.mutation_inventory().clone());
+        for locator in staged.locators {
             canonical_locators
                 .entry(locator.change_id)
                 .or_insert(locator);
@@ -475,7 +514,52 @@ fn stage_test_commit_deltas_by_owner(
         writes,
         &canonical_locators.into_values().collect::<Vec<_>>(),
     );
-    Ok(())
+    Ok(inventories)
+}
+
+fn reject_unconsumed_test_inventories(
+    inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
+    expected_owner: CommitId,
+) -> Result<(), crate::LixError> {
+    if inventories.is_empty() {
+        return Ok(());
+    }
+    Err(crate::LixError::unknown(format!(
+        "test fixture for commit '{expected_owner}' staged mutation inventories for unexpected owners: {:?}",
+        inventories.keys().collect::<Vec<_>>()
+    )))
+}
+
+fn stage_test_commit_state_manifest(
+    writes: &mut StorageWriteSet,
+    staged: &TestStagedChangelogCommit,
+    mutations: CommitStateMutationInventory,
+    snapshot_root: Option<TrackedStateCommitRoot>,
+) -> Result<(), crate::LixError> {
+    let record = &staged.record;
+    let replay_debt = if snapshot_root.is_some() {
+        CommitStateReplayDebt::default()
+    } else {
+        CommitStateReplayDebt {
+            depth: record.tracked_state_rootless_depth,
+            rows: record.tracked_state_rootless_rows,
+            bytes: record.tracked_state_rootless_bytes,
+        }
+    };
+    crate::tracked_state::stage_commit_state_manifest(
+        writes,
+        &CommitStateManifest {
+            commit_id: record.commit_id,
+            generation: record.generation,
+            parent_commit_ids: record.parent_commit_ids.clone(),
+            commit_change_id: record.change_id,
+            author_account_ids: record.author_account_ids.clone(),
+            created_at: record.created_at,
+            replay_debt,
+            mutations,
+            snapshot_root,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -492,7 +576,7 @@ pub(crate) async fn stage_empty_changelog_commit(
         .map(|parent| vec![parent.clone()])
         .unwrap_or_default();
     let commit_change_id = format!("{commit_id_text}:commit");
-    stage_test_changelog_commit(
+    let staged = stage_test_changelog_commit(
         read,
         writes,
         &commit_id_text,
@@ -502,7 +586,23 @@ pub(crate) async fn stage_empty_changelog_commit(
         false,
     )
     .await?;
-    Ok(())
+    let tracked_state = TrackedStateContext::new();
+    let mut root_writer = tracked_state.writer(&*read, writes);
+    root_writer
+        .stage_commit_root(&commit_id_text, parent_commit_id_text.as_deref(), [])
+        .await?;
+    let snapshot_root = root_writer
+        .staged_commit_roots()
+        .find(|root| root.commit_id == staged.record.commit_id)
+        .cloned()
+        .ok_or_else(|| crate::LixError::unknown("empty test commit did not stage a root"))?;
+    drop(root_writer);
+    stage_test_commit_state_manifest(
+        writes,
+        &staged,
+        CommitStateMutationInventory::default(),
+        Some(snapshot_root),
+    )
 }
 
 #[cfg(test)]
@@ -518,7 +618,7 @@ pub(crate) async fn stage_empty_changelog_commit_with_parents(
         .map(|parent| test_commit_id(parent).to_string())
         .collect::<Vec<_>>();
     let commit_change_id = format!("{commit_id_text}:commit");
-    stage_test_changelog_commit(
+    let staged = stage_test_changelog_commit(
         read,
         writes,
         &commit_id_text,
@@ -528,7 +628,24 @@ pub(crate) async fn stage_empty_changelog_commit_with_parents(
         false,
     )
     .await?;
-    Ok(())
+    let first_parent = parent_id_texts.first().map(String::as_str);
+    let tracked_state = TrackedStateContext::new();
+    let mut root_writer = tracked_state.writer(&*read, writes);
+    root_writer
+        .stage_commit_root(&commit_id_text, first_parent, [])
+        .await?;
+    let snapshot_root = root_writer
+        .staged_commit_roots()
+        .find(|root| root.commit_id == staged.record.commit_id)
+        .cloned()
+        .ok_or_else(|| crate::LixError::unknown("empty test commit did not stage a root"))?;
+    drop(root_writer);
+    stage_test_commit_state_manifest(
+        writes,
+        &staged,
+        CommitStateMutationInventory::default(),
+        Some(snapshot_root),
+    )
 }
 
 async fn stage_test_changelog_commit(
@@ -608,7 +725,7 @@ async fn stage_test_changelog_commit(
         .first()
         .map(|row| crate::common::LixTimestamp::expect_parse("created_at", &row.created_at))
         .unwrap_or_else(test_timestamp);
-    append.commits.push(CommitRecord {
+    let record = CommitRecord {
         format_version: 1,
         commit_id: typed_commit_id,
         generation,
@@ -620,14 +737,19 @@ async fn stage_test_changelog_commit(
         change_id: typed_commit_change_id,
         author_account_ids: Vec::new(),
         created_at,
-    });
+    };
+    append.commits.push(record.clone());
     let mut writer = ChangelogContext::new().writer(&mut read, writes);
     writer.stage_append(append).await?;
     change_commit_ids.sort_by_key(|(row_index, _)| *row_index);
-    Ok(TestStagedChangelogCommit { change_commit_ids })
+    Ok(TestStagedChangelogCommit {
+        record,
+        change_commit_ids,
+    })
 }
 
 struct TestStagedChangelogCommit {
+    record: CommitRecord,
     change_commit_ids: Vec<(usize, CommitId)>,
 }
 

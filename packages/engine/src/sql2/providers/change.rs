@@ -9,7 +9,7 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use crate::LixError;
 use crate::changelog::{
     COMMIT_CHANGE_ID_SPACE, ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest,
-    ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest, CommitScanRequest,
+    ChangelogContext, ChangelogReader, CommitId,
 };
 use crate::serialize_row_metadata;
 
@@ -167,7 +167,7 @@ where
     }
     let packed_changes =
         crate::tracked_state::scan_change_records_from_commit_deltas(&store).await?;
-    let mut reader = ChangelogContext::new().reader(store);
+    let mut reader = ChangelogContext::new().reader(store.clone());
     let mut changes = packed_changes
         .into_iter()
         .map(LixChangeRow::Direct)
@@ -186,23 +186,11 @@ where
         };
         start_after = Some(next.to_string());
     }
-    let mut start_after = None::<String>;
-    loop {
-        let scan = reader
-            .scan_commits(CommitScanRequest {
-                start_after: start_after.as_deref(),
-                limit: Some(1024),
-            })
-            .await?;
-        for commit in scan.entries {
-            changes.push(LixChangeRow::DerivedCommit(
-                crate::commit_graph::canonical_commit_change(&commit.into()),
-            ));
-        }
-        let Some(next) = scan.next_start_after else {
-            break;
-        };
-        start_after = Some(next.to_string());
+    let mut graph_reader = crate::commit_graph::CommitGraphContext::new().reader(store);
+    for commit in graph_reader.all_nodes().await? {
+        changes.push(LixChangeRow::DerivedCommit(
+            crate::commit_graph::canonical_commit_change(&commit),
+        ));
     }
     changes.sort_by_key(LixChangeRow::change_id);
     if let Some(limit) = limit {
@@ -304,14 +292,10 @@ where
             format!("changelog commit change-id index has invalid commit id: {error}"),
         )
     })?);
-    let commit = reader
-        .load_commits(CommitLoadRequest {
-            commit_ids: std::slice::from_ref(&commit_id),
-        })
+    let commit = crate::commit_graph::CommitGraphContext::new()
+        .reader(store)
+        .load_node(&commit_id)
         .await?
-        .into_iter()
-        .next()
-        .and_then(|(_, value)| value)
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -319,7 +303,7 @@ where
             )
         })?;
     Ok(Some(LixChangeRow::DerivedCommit(
-        crate::commit_graph::canonical_commit_change(&commit.into()),
+        crate::commit_graph::canonical_commit_change(&commit),
     )))
 }
 

@@ -24,11 +24,12 @@ use crate::entity_pk::EntityPk;
 use crate::storage_adapter::StorageAdapterRead;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-/// Read model for resolving changelog commits into entity state at a head.
+/// Read model for resolving authoritative commit manifests into entity state
+/// at a head.
 ///
-/// This module does not own durable storage. It reads immutable changelog
-/// facts through a caller-provided KV store and applies commit graph rules on
-/// top.
+/// The changelog commit plane is a compact serving projection. Every graph
+/// read validates it against the commit-state manifest before exposing
+/// topology.
 #[derive(Clone)]
 pub(crate) struct CommitGraphContext;
 
@@ -105,9 +106,12 @@ where
                     commit_ids: &uncached_ids,
                 })
                 .await?;
-            for (commit_id, entry) in batch {
-                self.node_cache
-                    .insert(*commit_id, entry.map(commit_graph_node_from_commit_record));
+            let manifests =
+                crate::tracked_state::load_commit_state_manifests(&self.store, &uncached_ids)
+                    .await?;
+            for ((commit_id, record), manifest) in batch.into_iter().zip(manifests) {
+                let node = commit_graph_node_from_authority(*commit_id, record, manifest)?;
+                self.node_cache.insert(*commit_id, node);
             }
         }
         let nodes = commit_ids
@@ -117,7 +121,7 @@ where
         ExactBatch::try_new("commit graph", commit_ids, nodes)
     }
 
-    /// Loads every direct commit fact from the changelog.
+    /// Loads every direct commit fact from the commit-state authority.
     ///
     /// This is used by global commit surfaces where the caller wants the durable
     /// graph facts themselves, not reachability from a particular branch head.
@@ -132,8 +136,17 @@ where
                     limit: Some(1024),
                 })
                 .await?;
-            for record in scan.entries {
-                let node = commit_graph_node_from_commit_record(record);
+            let commit_ids = scan
+                .entries
+                .iter()
+                .map(|record| record.commit_id)
+                .collect::<Vec<_>>();
+            let manifests =
+                crate::tracked_state::load_commit_state_manifests(&self.store, &commit_ids).await?;
+            for (record, manifest) in scan.entries.into_iter().zip(manifests) {
+                let commit_id = record.commit_id;
+                let node = commit_graph_node_from_authority(commit_id, Some(record), manifest)?
+                    .expect("scanned commit projection produces a graph node");
                 self.node_cache.insert(node.commit_id, Some(node.clone()));
                 commits.push(node);
             }
@@ -142,7 +155,6 @@ where
             };
             start_after = Some(next.to_string());
         }
-        commits.sort_by_key(|left| left.commit_id);
         Ok(commits)
     }
 
@@ -368,8 +380,51 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
     }
 }
 
-fn commit_graph_node_from_commit_record(record: CommitRecord) -> CommitGraphNode {
-    record.into()
+fn commit_graph_node_from_authority(
+    commit_id: CommitId,
+    record: Option<CommitRecord>,
+    manifest: Option<crate::tracked_state::CommitStateManifest>,
+) -> Result<Option<CommitGraphNode>, LixError> {
+    // Public graph membership belongs to the compact changelog projection.
+    // GC may retain an immutable manifest after removing that projection so
+    // selected payloads remain addressable for recovery.
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let Some(manifest) = manifest else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "commit_graph projection for commit '{commit_id}' has no commit-state authority"
+            ),
+        ));
+    };
+    let manifest_rootless = manifest.replay_debt.depth > 0;
+    if record.commit_id != manifest.commit_id
+        || record.generation != manifest.generation
+        || record.parent_commit_ids != manifest.parent_commit_ids
+        || record.change_id != manifest.commit_change_id
+        || record.author_account_ids != manifest.author_account_ids
+        || record.created_at != manifest.created_at
+        || record.tracked_state_rootless != manifest_rootless
+        || record.tracked_state_rootless_depth != manifest.replay_debt.depth
+        || record.tracked_state_rootless_rows != manifest.replay_debt.rows
+        || record.tracked_state_rootless_bytes != manifest.replay_debt.bytes
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "commit_graph projection disagrees with commit-state authority for commit '{commit_id}'"
+            ),
+        ));
+    }
+    Ok(Some(CommitGraphNode {
+        commit_id: manifest.commit_id,
+        change_id: manifest.commit_change_id,
+        generation: manifest.generation,
+        parent_commit_ids: manifest.parent_commit_ids,
+        created_at: manifest.created_at,
+    }))
 }
 
 fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
@@ -470,18 +525,20 @@ mod tests {
         GetManyResult, KeyRange, ScanChunk, ScanOptions, StorageError, StorageRead,
     };
     use crate::storage_adapter::{
-        Memory, MemoryRead, Storage, StorageAdapter, StorageAdapterReadScope, StorageReadOptions,
-        StorageWriteOptions,
+        Memory, MemoryRead, Storage, StorageAdapter, StorageAdapterReadScope, StorageKey,
+        StorageReadOptions, StorageWriteOptions,
     };
     use crate::tracked_state::{
-        TrackedStateCommitDeltaRef, TrackedStateDeltaRef, stage_commit_deltas,
+        CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
+        TrackedStateCommitDeltaRef, TrackedStateDeltaRef, stage_commit_deltas_for_commit_state,
+        stage_commit_state_manifest,
     };
 
     #[derive(Clone)]
     struct CountingMemoryRead {
         inner: MemoryRead,
         change_get_many_calls: Arc<AtomicUsize>,
-        delta_get_many_calls: Arc<AtomicUsize>,
+        member_segment_get_many_calls: Arc<AtomicUsize>,
     }
 
     impl StorageRead for CountingMemoryRead {
@@ -496,13 +553,10 @@ mod tests {
                 self.change_get_many_calls.fetch_add(1, Ordering::Relaxed);
             }
             if requests.iter().any(|request| {
-                matches!(
-                    request.space,
-                    crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE
-                        | crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE
-                )
+                request.space == crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE
             }) {
-                self.delta_get_many_calls.fetch_add(1, Ordering::Relaxed);
+                self.member_segment_get_many_calls
+                    .fetch_add(1, Ordering::Relaxed);
             }
             self.inner.get_many(requests).await
         }
@@ -592,6 +646,138 @@ mod tests {
             .expect("commit load should succeed");
 
         assert_eq!(commit, None);
+    }
+
+    #[tokio::test]
+    async fn retained_manifest_without_projection_is_not_a_public_graph_node() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = commit_id("retained-payload-authority");
+        let mut writes = storage.new_write_set();
+        stage_commit_state_manifest(
+            &mut writes,
+            &CommitStateManifest {
+                commit_id,
+                generation: 0,
+                parent_commit_ids: Vec::new(),
+                commit_change_id: change_id("retained-payload-authority-change"),
+                author_account_ids: Vec::new(),
+                created_at: ts("2026-01-01T00:00:00Z"),
+                replay_debt: CommitStateReplayDebt {
+                    depth: 1,
+                    rows: 0,
+                    bytes: 0,
+                },
+                mutations: CommitStateMutationInventory::default(),
+                snapshot_root: None,
+            },
+        )
+        .expect("retained payload authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("retained payload authority should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut reader = CommitGraphContext::new().reader(read);
+        assert!(
+            reader
+                .load_node(&commit_id)
+                .await
+                .expect("retained authority lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            reader
+                .all_nodes()
+                .await
+                .expect("retained authority scan should succeed")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn load_node_rejects_projection_without_commit_state_authority() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[commit_change(
+                "missing-authority-change",
+                "missing-authority",
+                &[],
+                &[],
+            )],
+        )
+        .await;
+        let commit_id = commit_id("missing-authority");
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            StorageKey(bytes::Bytes::copy_from_slice(
+                commit_id.as_uuid().as_bytes(),
+            )),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("manifest deletion should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let error = CommitGraphContext::new()
+            .reader(read)
+            .load_node(&commit_id)
+            .await
+            .expect_err("a changelog projection cannot replace missing authority");
+        assert!(error.message.contains("has no commit-state authority"));
+    }
+
+    #[tokio::test]
+    async fn load_node_rejects_changelog_projection_drift() {
+        let storage = StorageAdapter::new(Memory::new());
+        append_changes(
+            &storage,
+            &[commit_change(
+                "drift-authority-change",
+                "drift-authority",
+                &[],
+                &[],
+            )],
+        )
+        .await;
+        let commit_id = commit_id("drift-authority");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("authority read should open");
+        let mut manifest = crate::tracked_state::load_commit_state_manifest(&read, commit_id)
+            .await
+            .expect("authority should load")
+            .expect("authority should exist");
+        drop(read);
+        manifest.commit_change_id = change_id("different-authority-change");
+        let mut writes = storage.new_write_set();
+        stage_commit_state_manifest(&mut writes, &manifest)
+            .expect("drifted but structurally valid authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("drifted authority should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let error = CommitGraphContext::new()
+            .reader(read)
+            .load_node(&commit_id)
+            .await
+            .expect_err("projection drift must fail closed");
+        assert!(error.message.contains("projection disagrees"));
     }
 
     #[tokio::test]
@@ -740,7 +926,7 @@ mod tests {
         .await;
 
         let change_get_many_calls = Arc::new(AtomicUsize::new(0));
-        let delta_get_many_calls = Arc::new(AtomicUsize::new(0));
+        let member_segment_get_many_calls = Arc::new(AtomicUsize::new(0));
         let read = memory
             .begin_read(StorageReadOptions::default())
             .await
@@ -749,7 +935,7 @@ mod tests {
         let mut reader = graph.reader(StorageAdapterReadScope::new(CountingMemoryRead {
             inner: read,
             change_get_many_calls: Arc::clone(&change_get_many_calls),
-            delta_get_many_calls,
+            member_segment_get_many_calls,
         }));
         let request = CommitGraphChangeHistoryRequest {
             schema_keys: vec!["test_schema".to_string()],
@@ -804,9 +990,9 @@ mod tests {
                     commit_id,
                     generation: 0,
                     parent_commit_ids: Vec::new(),
-                    tracked_state_rootless: false,
-                    tracked_state_rootless_depth: 0,
-                    tracked_state_rootless_rows: 0,
+                    tracked_state_rootless: true,
+                    tracked_state_rootless_depth: 1,
+                    tracked_state_rootless_rows: 3,
                     tracked_state_rootless_bytes: 0,
                     change_id: change_id("selected-tombstone-commit-change"),
                     author_account_ids: Vec::new(),
@@ -868,7 +1054,27 @@ mod tests {
                 authored: false,
             },
         ];
-        stage_commit_deltas(&mut writes, &deltas).expect("selected tombstones should stage");
+        let staged = stage_commit_deltas_for_commit_state(&mut writes, &deltas)
+            .expect("selected tombstones should stage");
+        stage_commit_state_manifest(
+            &mut writes,
+            &CommitStateManifest {
+                commit_id,
+                generation: 0,
+                parent_commit_ids: Vec::new(),
+                commit_change_id: change_id("selected-tombstone-commit-change"),
+                author_account_ids: Vec::new(),
+                created_at,
+                replay_debt: CommitStateReplayDebt {
+                    depth: 1,
+                    rows: 3,
+                    bytes: 0,
+                },
+                mutations: staged.mutation_inventory().clone(),
+                snapshot_root: None,
+            },
+        )
+        .expect("selected tombstone commit-state manifest should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -960,7 +1166,7 @@ mod tests {
         )
         .await;
 
-        let delta_get_many_calls = Arc::new(AtomicUsize::new(0));
+        let member_segment_get_many_calls = Arc::new(AtomicUsize::new(0));
         let read = memory
             .begin_read(StorageReadOptions::default())
             .await
@@ -969,7 +1175,7 @@ mod tests {
             CommitGraphContext::new().reader(StorageAdapterReadScope::new(CountingMemoryRead {
                 inner: read,
                 change_get_many_calls: Arc::new(AtomicUsize::new(0)),
-                delta_get_many_calls: Arc::clone(&delta_get_many_calls),
+                member_segment_get_many_calls: Arc::clone(&member_segment_get_many_calls),
             }));
         let head = commit_id("commit-head");
         let root = commit_id("commit-root");
@@ -988,7 +1194,7 @@ mod tests {
             .expect("ancestor walk should succeed");
         reader.all_nodes().await.expect("node scan should succeed");
         assert_eq!(
-            delta_get_many_calls.load(Ordering::Relaxed),
+            member_segment_get_many_calls.load(Ordering::Relaxed),
             0,
             "topology APIs must never touch commit member storage",
         );
@@ -1006,7 +1212,7 @@ mod tests {
             .expect("commit-only history should derive node changes");
         assert_eq!(commit_history.entries.len(), 2);
         assert_eq!(
-            delta_get_many_calls.load(Ordering::Relaxed),
+            member_segment_get_many_calls.load(Ordering::Relaxed),
             0,
             "commit-only history must not hydrate unrelated member payloads",
         );
@@ -1023,9 +1229,10 @@ mod tests {
             .await
             .expect("history should hydrate requested payloads");
         assert_eq!(history.entries.len(), 2);
-        assert!(
-            delta_get_many_calls.load(Ordering::Relaxed) > 0,
-            "history payload hydration must remain explicit and observable",
+        assert_eq!(
+            member_segment_get_many_calls.load(Ordering::Relaxed),
+            0,
+            "these tiny commit inventories are inline in their authority manifests",
         );
     }
 
@@ -1286,9 +1493,11 @@ mod tests {
                 commit_id,
                 generation,
                 parent_commit_ids: change.parent_commit_ids.clone(),
-                tracked_state_rootless: false,
-                tracked_state_rootless_depth: 0,
-                tracked_state_rootless_rows: 0,
+                tracked_state_rootless: true,
+                tracked_state_rootless_depth: u16::try_from(generation + 1)
+                    .expect("test commit generation should fit replay depth"),
+                tracked_state_rootless_rows: u64::try_from(members.len())
+                    .expect("test member count should fit u64"),
                 tracked_state_rootless_bytes: 0,
                 change_id: change.change.id,
                 author_account_ids: Vec::new(),
@@ -1298,11 +1507,13 @@ mod tests {
             staged_commit_ids.insert(commit_id);
             generations.insert(commit_id, generation);
         }
+        let commit_records = append.commits.clone();
         writer
             .stage_append(append)
             .await
             .expect("changelog append should stage");
         drop(writer);
+        let mut inventories = BTreeMap::new();
         for (commit_id, members) in &commit_members {
             let deltas = members
                 .iter()
@@ -1324,12 +1535,47 @@ mod tests {
                     authored: true,
                 })
                 .collect::<Vec<_>>();
-            stage_commit_deltas(&mut writes, &deltas).expect("packed commit members should stage");
+            let staged = stage_commit_deltas_for_commit_state(&mut writes, &deltas)
+                .expect("packed commit members should stage");
+            inventories.insert(*commit_id, staged.mutation_inventory().clone());
+        }
+        for record in &commit_records {
+            stage_test_commit_manifest(
+                &mut writes,
+                record,
+                inventories.remove(&record.commit_id).unwrap_or_default(),
+            );
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("commit should succeed");
+    }
+
+    fn stage_test_commit_manifest(
+        writes: &mut crate::storage_adapter::StorageWriteSet,
+        record: &CommitRecord,
+        mutations: CommitStateMutationInventory,
+    ) {
+        stage_commit_state_manifest(
+            writes,
+            &CommitStateManifest {
+                commit_id: record.commit_id,
+                generation: record.generation,
+                parent_commit_ids: record.parent_commit_ids.clone(),
+                commit_change_id: record.change_id,
+                author_account_ids: record.author_account_ids.clone(),
+                created_at: record.created_at,
+                replay_debt: CommitStateReplayDebt {
+                    depth: record.tracked_state_rootless_depth,
+                    rows: record.tracked_state_rootless_rows,
+                    bytes: record.tracked_state_rootless_bytes,
+                },
+                mutations,
+                snapshot_root: None,
+            },
+        )
+        .expect("test commit-state manifest should stage");
     }
 
     fn append_empty_commit(append: &mut ChangelogAppend, commit_id: CommitId) {
@@ -1339,8 +1585,8 @@ mod tests {
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
-            tracked_state_rootless: false,
-            tracked_state_rootless_depth: 0,
+            tracked_state_rootless: true,
+            tracked_state_rootless_depth: 1,
             tracked_state_rootless_rows: 0,
             tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label(&change_id),

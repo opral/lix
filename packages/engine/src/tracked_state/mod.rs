@@ -40,32 +40,34 @@ pub(crate) use storage::{
     load_change_record_by_id, load_commit_delta_change_records,
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
     load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
-    load_owned_commit_delta_entries, load_owned_commit_delta_entries_one_ordered_ref,
-    scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_values,
-    selected_change_selection_fingerprint, stage_addressable_commit_deltas,
-    stage_addressable_commit_deltas_with_selected_source, stage_change_locators,
-    stage_commit_deltas, stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
-    stage_delete_commit_roots, stage_ordered_addressable_commit_deltas,
-    stage_ordered_addressable_replacement_parts,
+    load_commit_state_manifest, load_commit_state_manifests, load_owned_commit_delta_entries,
+    load_owned_commit_delta_entries_one_ordered_ref, scan_change_records_from_commit_deltas,
+    scan_commit_delta_inventory, scan_commit_delta_values, selected_change_selection_fingerprint,
+    stage_addressable_commit_deltas, stage_addressable_commit_deltas_with_selected_source,
+    stage_change_locators, stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
+    stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
+    stage_ordered_addressable_commit_deltas, stage_ordered_addressable_replacement_parts,
 };
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{
-    TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
-    TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_SPACE,
-    TRACKED_STATE_TREE_CHUNK_SPACE, decode_change_locator,
+    TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+    TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE,
+    decode_change_locator,
 };
 #[cfg(all(test, not(feature = "storage-benches")))]
 pub(crate) use storage::{
-    TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+    TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
 };
 #[cfg(test)]
 pub(crate) use storage::{
-    load_commit_delta_change_ids, load_commit_root, scan_commit_delta_members,
+    load_authoritative_commit_root, load_commit_delta_change_ids, scan_commit_delta_members,
 };
+pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
+    CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
     MaterializedTrackedStateRow, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
-    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue, TrackedStateReadColumns,
-    TrackedStateRootMutationRef, TrackedStateScanRequest,
+    TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue,
+    TrackedStateReadColumns, TrackedStateRootMutationRef, TrackedStateScanRequest,
 };
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 #[cfg(feature = "storage-benches")]

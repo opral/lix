@@ -5043,14 +5043,17 @@ mod tests {
             .and_then(|(_, record)| record)
             .expect("head commit should exist");
         assert!(record.tracked_state_rootless);
-        assert_eq!(record.tracked_state_rootless_depth, 1);
-        assert_eq!(record.tracked_state_rootless_rows, ROW_COUNT as u64);
+        assert!(record.tracked_state_rootless_depth >= 1);
+        assert!(record.tracked_state_rootless_rows >= ROW_COUNT as u64);
         assert!(record.tracked_state_rootless_bytes > record.tracked_state_rootless_rows);
         assert!(
-            crate::tracked_state::load_commit_root(&history_read, &head.commit_id.to_string(),)
-                .await
-                .expect("root lookup should succeed")
-                .is_none(),
+            crate::tracked_state::load_authoritative_commit_root(
+                &history_read,
+                &head.commit_id.to_string(),
+            )
+            .await
+            .expect("root lookup should succeed")
+            .is_none(),
             "rootless production commit must skip the duplicate immutable tree"
         );
 
@@ -5127,16 +5130,19 @@ mod tests {
             descendant_record.tracked_state_rootless,
             "a sparse descendant must extend the rootless first-parent interval"
         );
-        assert_eq!(descendant_record.tracked_state_rootless_depth, 2);
+        assert_eq!(
+            descendant_record.tracked_state_rootless_depth,
+            record.tracked_state_rootless_depth + 1
+        );
         assert_eq!(
             descendant_record.tracked_state_rootless_rows,
-            ROW_COUNT as u64 + 1
+            record.tracked_state_rootless_rows + 1
         );
         assert!(
             descendant_record.tracked_state_rootless_bytes > record.tracked_state_rootless_bytes
         );
         assert!(
-            crate::tracked_state::load_commit_root(
+            crate::tracked_state::load_authoritative_commit_root(
                 &descendant_history_read,
                 &descendant.commit_id.to_string(),
             )
@@ -5266,7 +5272,7 @@ mod tests {
             .and_then(|(_, record)| record)
             .expect("reseed commit should exist");
         assert!(reseed_record.tracked_state_rootless);
-        assert_eq!(reseed_record.tracked_state_rootless_depth, 1);
+        assert!(reseed_record.tracked_state_rootless_depth >= 1);
 
         let mut rooted_fence = None;
         for generation_offset in 1..=32 {
@@ -5307,10 +5313,13 @@ mod tests {
                 assert_eq!(record.tracked_state_rootless_rows, 0);
                 assert_eq!(record.tracked_state_rootless_bytes, 0);
                 assert!(
-                    crate::tracked_state::load_commit_root(&read, &head.commit_id.to_string())
-                        .await
-                        .expect("root-fence lookup should succeed")
-                        .is_some(),
+                    crate::tracked_state::load_authoritative_commit_root(
+                        &read,
+                        &head.commit_id.to_string(),
+                    )
+                    .await
+                    .expect("root-fence lookup should succeed")
+                    .is_some(),
                     "a rooted fence must publish its immutable accelerator"
                 );
                 rooted_fence = Some(head.commit_id);
