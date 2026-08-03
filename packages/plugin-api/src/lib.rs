@@ -19,8 +19,10 @@ use lix::plugin::host::{
     ConflictSide as WitConflictSide, ConflictSource, EntityPage as WitEntityPage, EntitySource,
     HostError, ResolutionSink, Snapshot as WitSnapshot, Transition as WitTransition,
 };
-use lix_plugin_wire::{Operation, Page as WirePage, Representation, encode_single_section};
 use std::marker::PhantomData;
+use wire::{Operation, Page as WirePage, Representation, encode_single_section};
+
+mod wire;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {

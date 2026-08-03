@@ -17,6 +17,5 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-lix_plugin_wire = { workspace = true }
 uuid = { version = "1", features = ["std"] }
 wit-bindgen = "0.57"
