@@ -1378,6 +1378,10 @@ struct HeadValueView<'a> {
 }
 
 impl CertifiedCurrentStatePredecessor {
+    pub(crate) fn created_at(&self) -> Result<LixTimestamp, LixError> {
+        Ok(self.view()?.created_at)
+    }
+
     fn view(&self) -> Result<HeadValueView<'_>, LixError> {
         match self {
             Self::Encoded(bytes) => decode_head_value(bytes),

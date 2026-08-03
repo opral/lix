@@ -913,6 +913,7 @@ impl TrackedStateContext {
             point_value_cache: HashMap::new(),
             commit_delta_value_cache: HashMap::new(),
             point_replay_commits: HashMap::new(),
+            commit_delta_point_cache: storage::CommitDeltaPointReadCache::default(),
         }
     }
 
@@ -968,6 +969,9 @@ pub(crate) struct TrackedStateStoreReader<S> {
     /// in one snapshot, so resolving neighbouring observed revisions never
     /// reloads the same changelog records.
     point_replay_commits: HashMap<CommitId, PointReplayCommit>,
+    /// Shares decoded immutable manifests between rootless topology discovery
+    /// and the later delta scan in this storage snapshot.
+    commit_delta_point_cache: storage::CommitDeltaPointReadCache,
 }
 
 struct DiffCommitRootValidationCache {
@@ -983,6 +987,7 @@ struct PointReplayCommit {
     parent_commit_id: Option<CommitId>,
     root_id: Option<TrackedStateRootId>,
     rootless: bool,
+    replacement_generation: Option<storage::CommitDeltaReplacementGeneration>,
 }
 
 /// One immutable first-parent interval shared by every cached suffix view.
@@ -1437,10 +1442,11 @@ where
                     entity_pk: row.entity_pk(),
                 });
             }
-            let loaded = storage::load_commit_delta_values_encoded(
+            let loaded = storage::load_commit_delta_values_encoded_with_cache(
                 &self.store,
                 commit_id,
                 &encoded_keys.finish(),
+                Some(&self.commit_delta_point_cache),
             )
             .await?;
             let mut fallback_rows = Vec::new();
@@ -1460,10 +1466,11 @@ where
                     fallback_rows.push(index);
                 }
             }
-            let fallback_values = storage::load_commit_delta_values_encoded(
+            let fallback_values = storage::load_commit_delta_values_encoded_with_cache(
                 &self.store,
                 commit_id,
                 &fallback_keys.finish(),
+                Some(&self.commit_delta_point_cache),
             )
             .await?;
             let mut fallbacks = vec![None; commit_rows.len()];
@@ -2968,10 +2975,11 @@ where
                 break;
             }
 
-            let deltas = storage::load_commit_delta_values_encoded(
+            let deltas = storage::load_commit_delta_values_encoded_with_cache(
                 &self.store,
                 current_commit_id,
                 &unresolved_keys,
+                Some(&self.commit_delta_point_cache),
             )
             .await?;
 
@@ -2988,10 +2996,11 @@ where
                 descriptor_ordinals.push(ordinal);
                 descriptor_query.push(descriptor_keys[ordinal as usize].clone());
             }
-            let descriptor_deltas = storage::load_commit_delta_values_encoded(
+            let descriptor_deltas = storage::load_commit_delta_values_encoded_with_cache(
                 &self.store,
                 current_commit_id,
                 &descriptor_query,
+                Some(&self.commit_delta_point_cache),
             )
             .await?;
             for (&file_id_ordinal, value) in descriptor_ordinals.iter().zip(descriptor_deltas) {
@@ -3008,6 +3017,13 @@ where
                         _ => Some(delta),
                     };
                 } else {
+                    if let Some(generation) = replay_commit.replacement_generation.as_ref() {
+                        let decoded_key = decode_key_shared(keys[index].clone())?;
+                        if replacement_scope_covers_key(&generation.scope, decoded_key.as_ref()) {
+                            values[index] = None;
+                            continue;
+                        }
+                    }
                     if pending_cascades[index].is_none()
                         && key_file_id_ordinals[index] != u32::MAX
                         && let Some(cascade) = &cascades[key_file_id_ordinals[index] as usize]
@@ -3025,7 +3041,11 @@ where
                 break;
             }
             std::mem::swap(&mut unresolved, &mut next_unresolved);
-            let Some(parent_commit_id) = replay_commit.parent_commit_id else {
+            let replay_parent_commit_id = match replay_commit.replacement_generation.as_ref() {
+                Some(generation) => generation.fallback_commit_id,
+                None => replay_commit.parent_commit_id,
+            };
+            let Some(parent_commit_id) = replay_parent_commit_id else {
                 break;
             };
             current_commit_id = parent_commit_id;
@@ -3110,6 +3130,21 @@ where
                         Some(cascade) if !delta.deleted => Some(cascade_tombstone(cascade, &delta)),
                         _ => Some(delta),
                     };
+                } else if replay_commit
+                    .replacement_generation
+                    .as_ref()
+                    .is_some_and(|generation| {
+                        replacement_scope_covers_key(
+                            &generation.scope,
+                            TrackedStateKeyRef {
+                                schema_key: &keys[index].schema_key,
+                                file_id: keys[index].file_id.as_deref(),
+                                entity_pk: &keys[index].entity_pk,
+                            },
+                        )
+                    })
+                {
+                    values[index] = None;
                 } else {
                     if pending_cascades[index].is_none()
                         && let Some(cascade) = keys[index]
@@ -3126,7 +3161,11 @@ where
                 break;
             }
             unresolved = next_unresolved;
-            let Some(parent_commit_id) = replay_commit.parent_commit_id else {
+            let replay_parent_commit_id = match replay_commit.replacement_generation.as_ref() {
+                Some(generation) => generation.fallback_commit_id,
+                None => replay_commit.parent_commit_id,
+            };
+            let Some(parent_commit_id) = replay_parent_commit_id else {
                 break;
             };
             current_commit_id = parent_commit_id;
@@ -3171,10 +3210,22 @@ where
                     .ok_or_else(|| missing_commit_root_error(&commit_id.to_string()))?,
             )
         };
+        let replacement_generation = if record.tracked_state_rootless {
+            storage::load_commit_delta_replay_metadata_with_cache(
+                &self.store,
+                commit_id,
+                Some(&self.commit_delta_point_cache),
+            )
+            .await?
+            .and_then(|metadata| metadata.replacement_generation)
+        } else {
+            None
+        };
         let replay_commit = PointReplayCommit {
             parent_commit_id: record.parent_commit_ids.first().copied(),
             root_id,
             rootless: record.tracked_state_rootless,
+            replacement_generation,
         };
         self.point_replay_commits
             .insert(commit_id, replay_commit.clone());
@@ -3213,10 +3264,11 @@ where
                 entity_pk: &key.entity_pk,
             });
         }
-        let values = storage::load_commit_delta_values_encoded(
+        let values = storage::load_commit_delta_values_encoded_with_cache(
             &self.store,
             commit_id,
             &encoded_keys.finish(),
+            Some(&self.commit_delta_point_cache),
         )
         .await?;
         for ((index, key), value) in missing.into_iter().zip(values) {
@@ -3237,7 +3289,13 @@ where
         commit_id: CommitId,
         schema_keys: &[String],
     ) -> Result<storage::DecodedCommitDeltaBatch, LixError> {
-        storage::scan_commit_delta_values(&self.store, commit_id, schema_keys).await
+        storage::scan_commit_delta_values_with_cache(
+            &self.store,
+            commit_id,
+            schema_keys,
+            Some(&self.commit_delta_point_cache),
+        )
+        .await
     }
 
     async fn point_replay_interval(
@@ -3269,7 +3327,11 @@ where
                 break Some(root_id);
             }
             commits.push(current_commit_id);
-            let Some(parent_commit_id) = replay_commit.parent_commit_id else {
+            let replay_parent_commit_id = match replay_commit.replacement_generation.as_ref() {
+                Some(generation) => generation.fallback_commit_id,
+                None => replay_commit.parent_commit_id,
+            };
+            let Some(parent_commit_id) = replay_parent_commit_id else {
                 break None;
             };
             if let Some(tail) = self.point_replay_intervals.get(&parent_commit_id) {
@@ -4108,6 +4170,13 @@ fn compare_tracked_state_key_refs(
         .cmp(right.schema_key)
         .then_with(|| left.file_id.cmp(&right.file_id))
         .then_with(|| left.entity_pk.cmp(right.entity_pk))
+}
+
+fn replacement_scope_covers_key(
+    scope: &storage::CommitDeltaReplacementScope,
+    key: TrackedStateKeyRef<'_>,
+) -> bool {
+    scope.schema_key == key.schema_key && scope.file_id.as_deref() == key.file_id
 }
 
 fn schema_keys_with_file_descriptors(schema_keys: &[String]) -> Vec<String> {

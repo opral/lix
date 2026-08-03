@@ -159,7 +159,7 @@ enum FixtureShape {
     Olap,
 }
 
-enum LiteralUpdateWorkload {
+enum UpdateWorkload {
     Transaction(Vec<String>),
     ExecuteBatch(Vec<ExecuteBatchStatement>),
 }
@@ -192,7 +192,7 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage + 'static> {
     select_many_by_pk_sql: String,
     select_one_by_pk_sql: String,
     update_one_by_pk_sql: String,
-    update_all_workload: LiteralUpdateWorkload,
+    update_all_workload: UpdateWorkload,
     bound_update_all_batch: SharedParameterBatch,
     delete_all_sql: String,
     delete_one_by_pk_sql: String,
@@ -938,10 +938,10 @@ where
     #[expect(clippy::cast_possible_truncation)]
     async fn update_all(&self) -> usize {
         let affected = match &self.update_all_workload {
-            LiteralUpdateWorkload::Transaction(statements) => {
+            UpdateWorkload::Transaction(statements) => {
                 Box::pin(execute_many_in_transaction(&self.session, statements)).await
             }
-            LiteralUpdateWorkload::ExecuteBatch(statements) => self
+            UpdateWorkload::ExecuteBatch(statements) => self
                 .session
                 .execute_batch(statements)
                 .await
@@ -1111,7 +1111,7 @@ where
         ),
         select_one_by_pk_sql: select_by_pk_sql(&tracked_rows[mid..][..1]),
         update_one_by_pk_sql: update_row_sql(&tracked_rows[mid]),
-        update_all_workload: literal_update_workload(shape, tracked_rows),
+        update_all_workload: update_workload(shape, tracked_rows),
         bound_update_all_batch: if matches!(shape, FixtureShape::FullCrud) {
             tracked_rows
                 .iter()
@@ -1483,24 +1483,41 @@ fn assert_close(actual: f64, expected: f64) {
     );
 }
 
-fn literal_update_workload(shape: FixtureShape, rows: &[WorkloadRow]) -> LiteralUpdateWorkload {
+fn update_workload(shape: FixtureShape, rows: &[WorkloadRow]) -> UpdateWorkload {
     if !matches!(shape, FixtureShape::FullCrud) {
-        return LiteralUpdateWorkload::Transaction(Vec::new());
+        return UpdateWorkload::Transaction(Vec::new());
     }
     match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_UPDATE_API").as_deref() {
-        Ok("execute_batch") => LiteralUpdateWorkload::ExecuteBatch(
-            rows.iter()
-                .map(|row| ExecuteBatchStatement {
-                    sql: update_row_sql(row),
-                    params: Vec::new(),
-                })
-                .collect(),
-        ),
+        Ok("execute_batch") => UpdateWorkload::ExecuteBatch(literal_update_batch(rows)),
+        Ok("execute_batch_parameterized") => {
+            UpdateWorkload::ExecuteBatch(parameterized_update_batch(rows))
+        }
         Ok(other) => panic!(
-            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_UPDATE_API '{other}'; expected execute_batch"
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_UPDATE_API '{other}'; expected execute_batch or execute_batch_parameterized"
         ),
-        Err(_) => LiteralUpdateWorkload::Transaction(rows.iter().map(update_row_sql).collect()),
+        Err(_) => UpdateWorkload::Transaction(rows.iter().map(update_row_sql).collect()),
     }
+}
+
+fn parameterized_update_batch(rows: &[WorkloadRow]) -> Vec<ExecuteBatchStatement> {
+    rows.iter()
+        .map(|row| ExecuteBatchStatement {
+            sql: BOUND_UPDATE_ALL_SQL.to_string(),
+            params: vec![
+                Value::Text(row.updated_value_json.clone()),
+                Value::Text(row.path.clone()),
+            ],
+        })
+        .collect()
+}
+
+fn literal_update_batch(rows: &[WorkloadRow]) -> Vec<ExecuteBatchStatement> {
+    rows.iter()
+        .map(|row| ExecuteBatchStatement {
+            sql: update_row_sql(row),
+            params: Vec::new(),
+        })
+        .collect()
 }
 
 /// Profile-only unified-current-state fixture switch. `one_unrelated` keeps
