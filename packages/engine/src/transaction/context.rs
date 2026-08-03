@@ -120,6 +120,7 @@ use crate::transaction::types::{
     StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
     TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
+    TypedMutationJournalBatch,
     canonicalize_transaction_json_batch, stage_json_from_value,
 };
 
@@ -8799,6 +8800,123 @@ where
                     })
             },
         )
+    }
+
+    async fn stage_typed_mutation_journal_replace(
+        &mut self,
+        rows: TypedMutationJournalBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        let row_count = rows.len();
+        if row_count == 0 {
+            return Ok(TransactionWriteOutcome { count: 0 });
+        }
+        self.ensure_plugin_generation_read_guard().await;
+        let domain = Domain::schema_catalog(rows.branch_id.to_string(), false);
+        if self.origin_key.is_some()
+            || self
+                .staged_writes
+                .has_staged_schema_catalog_change(&domain)?
+        {
+            return Err(LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "typed mutation journals require a stable schema and direct transaction origin",
+            ));
+        }
+        if opening_parent_complete_lifecycle_created_at(
+            &self.opening_read(),
+            self.opening_active_branch_head,
+            rows.schema_key.as_str(),
+            u64::try_from(row_count).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "typed mutation journal row count exceeds u64",
+                )
+            })?,
+            rows.expected_ordered_identity_digest,
+        )
+        .await?
+        .is_none()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "typed mutation journal lacks complete parent lifecycle authority",
+            ));
+        }
+
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_transaction_rows_staged(row_count);
+            crate::storage_bench::record_transaction_untracked_rows(0);
+        }
+        let expected_ordered_identity_digest = rows.expected_ordered_identity_digest;
+        let schema_key = rows.schema_key.clone();
+        let branch_id = rows.branch_id.clone();
+        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+            rows.schema_plan_id,
+            rows.schema_key,
+            rows.branch_id,
+            None,
+            rows.identity_arena,
+            rows.identity_offsets,
+            rows.snapshot_arena,
+            rows.snapshot_offsets,
+            None,
+            self.functions.call_timestamp(),
+        )?;
+        match self.staged_writes.stage_immutable_mutation_chunk(chunk)? {
+            ImmutableMutationChunkStage::Staged => {
+                if !self.staged_writes.certify_complete_collection_replacement(
+                    schema_key.as_str(),
+                    branch_id.as_str(),
+                    u64::try_from(row_count).map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "typed mutation journal row count exceeds u64",
+                        )
+                    })?,
+                    expected_ordered_identity_digest,
+                )? {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "typed mutation journal lost its complete replacement scope",
+                    ));
+                }
+            }
+            ImmutableMutationChunkStage::RequiresGeneric(_) => {
+                return Err(LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    "typed mutation journal overlaps an existing transaction mutation lane",
+                ));
+            }
+        }
+        Ok(TransactionWriteOutcome {
+            count: u64::try_from(row_count).expect("typed mutation journal row count fits u64"),
+        })
+    }
+
+    async fn can_stage_typed_mutation_journal_replace(
+        &mut self,
+        schema_key: &str,
+        live_count: u64,
+        ordered_identity_digest: [u8; 32],
+    ) -> Result<bool, LixError> {
+        let domain = Domain::schema_catalog(self.active_branch_id.clone(), false);
+        if self.origin_key.is_some()
+            || self
+                .staged_writes
+                .has_staged_schema_catalog_change(&domain)?
+        {
+            return Ok(false);
+        }
+        opening_parent_complete_lifecycle_created_at(
+            &self.opening_read(),
+            self.opening_active_branch_head,
+            schema_key,
+            live_count,
+            ordered_identity_digest,
+        )
+        .await
+        .map(|created_at| created_at.is_some())
     }
 
     async fn execute_diff_command(

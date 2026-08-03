@@ -93,8 +93,9 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-static DIRECT_JOURNAL_REPLACEMENT_PUBLICATIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static DIRECT_JOURNAL_REPLACEMENT_PUBLICATIONS: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<String, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
 
 #[cfg(test)]
 pub(crate) fn take_ordered_packed_current_base_publications() -> usize {
@@ -118,8 +119,12 @@ pub(crate) fn take_rootless_replacement_generation_publications() -> usize {
 }
 
 #[cfg(test)]
-pub(crate) fn take_direct_journal_replacement_publications() -> usize {
-    DIRECT_JOURNAL_REPLACEMENT_PUBLICATIONS.swap(0, std::sync::atomic::Ordering::Relaxed)
+pub(crate) fn take_direct_journal_replacement_publications(schema_key: &str) -> usize {
+    DIRECT_JOURNAL_REPLACEMENT_PUBLICATIONS
+        .lock()
+        .expect("direct journal publication counters")
+        .remove(schema_key)
+        .unwrap_or_default()
 }
 
 /// Commits prepared transaction rows into tracked history and unified current
@@ -1982,8 +1987,13 @@ async fn stage_tracked_commit_delta_index(
     for root in tracked_roots {
         if let Some(journal) = ordered_replacements.get(&root.commit_id) {
             #[cfg(test)]
-            DIRECT_JOURNAL_REPLACEMENT_PUBLICATIONS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            {
+                let mut counts = DIRECT_JOURNAL_REPLACEMENT_PUBLICATIONS
+                    .lock()
+                    .expect("direct journal publication counters");
+                let count = counts.entry(journal.schema_key().to_owned()).or_default();
+                *count = count.saturating_add(1);
+            }
             if !state_rows.is_empty()
                 || certified_packet_root_rows
                     .get(&root.commit_id)
@@ -3401,6 +3411,10 @@ async fn stage_tracked_head(
                     "immutable replacement journal entered an incompatible HOT publication lane",
                 ));
             }
+            #[cfg(test)]
+            COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| {
+                publications.set(publications.get().saturating_add(1));
+            });
             let (generation, _retired_predecessor_bases) = tracked_head
                 .writer(read, writes)
                 .stage_complete_collection_replacement_current_base(
@@ -3418,6 +3432,12 @@ async fn stage_tracked_head(
                     "lix.perf.materialization.tracked_head.stage_direct_replacement_parts"
                 ))
                 .await?;
+            #[cfg(test)]
+            if _retired_predecessor_bases {
+                COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_RETIREMENTS.with(|retirements| {
+                    retirements.set(retirements.get().saturating_add(1));
+                });
+            }
             if let Some(epoch) = working_diff_epoch {
                 let next_epoch = TrackedWorkingDiffEpoch {
                     checkpoint_commit_id: epoch.checkpoint_commit_id,

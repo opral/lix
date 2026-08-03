@@ -2834,6 +2834,25 @@ mod tests {
             Ok(TransactionWriteOutcome { count })
         }
 
+        async fn stage_typed_mutation_journal_replace(
+            &mut self,
+            _rows: crate::transaction::types::TypedMutationJournalBatch,
+        ) -> Result<TransactionWriteOutcome, LixError> {
+            Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "DataFusion test context does not stage transaction journals",
+            ))
+        }
+
+        async fn can_stage_typed_mutation_journal_replace(
+            &mut self,
+            _schema_key: &str,
+            _live_count: u64,
+            _ordered_identity_digest: [u8; 32],
+        ) -> Result<bool, LixError> {
+            Ok(false)
+        }
+
         async fn execute_diff_command(
             &mut self,
             _command: crate::sql2::DiffCommand,
@@ -2902,6 +2921,28 @@ mod tests {
             write: TransactionWrite,
         ) -> Result<TransactionWriteOutcome, LixError> {
             self.inner.stage_write(write).await
+        }
+
+        async fn stage_typed_mutation_journal_replace(
+            &mut self,
+            rows: crate::transaction::types::TypedMutationJournalBatch,
+        ) -> Result<TransactionWriteOutcome, LixError> {
+            self.inner.stage_typed_mutation_journal_replace(rows).await
+        }
+
+        async fn can_stage_typed_mutation_journal_replace(
+            &mut self,
+            schema_key: &str,
+            live_count: u64,
+            ordered_identity_digest: [u8; 32],
+        ) -> Result<bool, LixError> {
+            self.inner
+                .can_stage_typed_mutation_journal_replace(
+                    schema_key,
+                    live_count,
+                    ordered_identity_digest,
+                )
+                .await
         }
     }
 

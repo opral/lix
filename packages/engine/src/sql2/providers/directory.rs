@@ -2676,6 +2676,25 @@ mod tests {
             self.writes.push(write);
             Ok(TransactionWriteOutcome { count: 0 })
         }
+
+        async fn stage_typed_mutation_journal_replace(
+            &mut self,
+            _rows: crate::transaction::types::TypedMutationJournalBatch,
+        ) -> Result<TransactionWriteOutcome, LixError> {
+            Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "directory provider test context does not stage transaction journals",
+            ))
+        }
+
+        async fn can_stage_typed_mutation_journal_replace(
+            &mut self,
+            _schema_key: &str,
+            _live_count: u64,
+            _ordered_identity_digest: [u8; 32],
+        ) -> Result<bool, LixError> {
+            Ok(false)
+        }
     }
 
     fn live_row(

@@ -3155,6 +3155,22 @@ mod tests {
         ) -> Result<crate::transaction::types::TransactionWriteOutcome, LixError> {
             panic!("raw DataFusion entity INSERT must never stage writes");
         }
+
+        async fn stage_typed_mutation_journal_replace(
+            &mut self,
+            _rows: crate::transaction::types::TypedMutationJournalBatch,
+        ) -> Result<crate::transaction::types::TransactionWriteOutcome, LixError> {
+            panic!("raw DataFusion entity INSERT must never stage transaction journals");
+        }
+
+        async fn can_stage_typed_mutation_journal_replace(
+            &mut self,
+            _schema_key: &str,
+            _live_count: u64,
+            _ordered_identity_digest: [u8; 32],
+        ) -> Result<bool, LixError> {
+            Ok(false)
+        }
     }
 
     // Guards the plan-time phase of the entity INSERT rejection: validate-only

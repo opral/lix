@@ -496,6 +496,59 @@ pub(crate) struct CompleteCollectionReplacementProof {
     pub(crate) replay_bytes: u64,
 }
 
+/// Frontend-neutral columns for one certified ordered replacement journal.
+///
+/// SQL, plugins, and programmatic APIs can produce this carrier without
+/// allocating row-owned transaction DTOs. The transaction assigns lifecycle
+/// and commit identity while retaining these arenas as its immutable journal.
+/// Mixed mutation lanes are rejected instead of lowering this representation
+/// into generic prepared rows.
+pub(crate) struct TypedMutationJournalBatch {
+    pub(crate) schema_plan_id: SchemaPlanId,
+    pub(crate) schema_key: SharedStr,
+    pub(crate) branch_id: SharedStr,
+    pub(crate) identity_arena: Vec<u8>,
+    pub(crate) identity_offsets: Vec<(usize, usize)>,
+    pub(crate) snapshot_arena: Vec<u8>,
+    pub(crate) snapshot_offsets: Vec<(usize, usize)>,
+    pub(crate) expected_ordered_identity_digest: [u8; 32],
+}
+
+impl TypedMutationJournalBatch {
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        schema_plan_id: SchemaPlanId,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        identity_arena: Vec<u8>,
+        identity_offsets: Vec<(usize, usize)>,
+        snapshot_arena: Vec<u8>,
+        snapshot_offsets: Vec<(usize, usize)>,
+        expected_ordered_identity_digest: [u8; 32],
+    ) -> Result<Self, LixError> {
+        if identity_offsets.is_empty() || identity_offsets.len() != snapshot_offsets.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "typed mutation journal columns are empty or misaligned",
+            ));
+        }
+        Ok(Self {
+            schema_plan_id,
+            schema_key,
+            branch_id,
+            identity_arena,
+            identity_offsets,
+            snapshot_arena,
+            snapshot_offsets,
+            expected_ordered_identity_digest,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.identity_offsets.len()
+    }
+}
+
 /// Dense, typed columns produced by certified SQL parameter-batch paths.
 ///
 /// Keeping this transport separate from [`RawWriteBatch`] avoids allocating
