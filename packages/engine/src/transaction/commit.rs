@@ -35,8 +35,8 @@ use crate::tracked_state::{
     CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
     TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateContext, TrackedStateDeltaRef,
     TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
-    TrackedStateRootMutationRef, TrackedStateScanRequest, encode_key_ref,
-    load_commit_delta_change_records, load_commit_delta_replay_metadata,
+    TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
+    encode_key_ref, load_commit_delta_change_records, load_commit_delta_replay_metadata,
     stage_addressable_commit_deltas, stage_change_locators, stage_commit_state_manifest,
     stage_ordered_addressable_commit_deltas,
 };
@@ -1995,24 +1995,15 @@ async fn stage_tracked_commit_delta_index(
             let stage = crate::tracked_state::stage_ordered_addressable_replacement_parts(
                 writes,
                 journal.iter().map(|row| {
-                    Ok(TrackedStateCommitDeltaRef {
-                        delta: TrackedStateDeltaRef {
-                            schema_key: journal.schema_key(),
-                            file_id: None,
-                            entity_pk: row.entity_pk(),
-                            // Direct-address encoders derive the final id from
-                            // part/row coordinates and ignore this sentinel.
-                            change_id: ChangeId::default(),
-                            commit_id: root.commit_id,
-                            deleted: false,
-                            created_at,
-                            updated_at: journal.timestamp(),
-                        },
+                    Ok(TrackedStateSingleStringReplacementRef {
+                        schema_key: journal.schema_key(),
+                        file_id: None,
+                        entity_pk: row.identity(),
+                        commit_id: root.commit_id,
+                        created_at,
+                        updated_at: journal.timestamp(),
                         snapshot: row.snapshot_slot(),
                         metadata: crate::json_store::JsonSlotRef::None,
-                        origin_key: None,
-                        base_coordinate: None,
-                        authored: true,
                     })
                 }),
                 generation,

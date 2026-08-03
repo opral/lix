@@ -91,7 +91,8 @@ pub(crate) struct ImmutableMutationJournalChunk {
     schema_key: SharedStr,
     branch_id: SharedStr,
     origin_key: Option<SharedStr>,
-    entity_pks: Arc<[EntityPk]>,
+    identity_arena: Bytes,
+    identity_offsets: Arc<[(u32, u32)]>,
     snapshot_arena: Bytes,
     snapshot_offsets: Arc<[(u32, u32)]>,
     large_snapshot_refs: Arc<[(u16, crate::json_store::JsonRef)]>,
@@ -105,7 +106,8 @@ impl PartialEq for ImmutableMutationJournalChunk {
             && self.schema_key == other.schema_key
             && self.branch_id == other.branch_id
             && self.origin_key == other.origin_key
-            && self.entity_pks == other.entity_pks
+            && self.identity_arena == other.identity_arena
+            && self.identity_offsets == other.identity_offsets
             && self.snapshot_arena == other.snapshot_arena
             && self.snapshot_offsets == other.snapshot_offsets
             && self.large_snapshot_refs == other.large_snapshot_refs
@@ -130,18 +132,99 @@ impl Eq for ImmutableMutationJournalChunk {}
 
 impl ImmutableMutationJournalChunk {
     #[expect(clippy::too_many_arguments)]
-    pub(crate) fn try_new(
+    pub(crate) fn try_new_single_string_identities(
         schema_plan_id: SchemaPlanId,
         schema_key: SharedStr,
         branch_id: SharedStr,
         origin_key: Option<SharedStr>,
-        entity_pks: Vec<EntityPk>,
+        identity_arena: Vec<u8>,
+        identity_offsets: Vec<(usize, usize)>,
         snapshot_arena: Vec<u8>,
         snapshot_offsets: Vec<(usize, usize)>,
         durable_predecessors: Option<Vec<CertifiedCurrentStatePredecessor>>,
         timestamp: LixTimestamp,
     ) -> Result<Self, LixError> {
-        if entity_pks.is_empty() || entity_pks.len() != snapshot_offsets.len() {
+        if identity_offsets.len() != snapshot_offsets.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation identity arena is misaligned",
+            ));
+        }
+        let identity_bytes = Bytes::from(identity_arena);
+        let mut previous_end = 0usize;
+        let mut offsets = Vec::with_capacity(identity_offsets.len());
+        let mut previous_identity = None;
+        for (start, end) in identity_offsets {
+            if start != previous_end || end < start || end > identity_bytes.len() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation identity offsets are invalid",
+                ));
+            }
+            let value = std::str::from_utf8(&identity_bytes[start..end]).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation identity offset splits UTF-8",
+                )
+            })?;
+            if previous_identity.is_some_and(|previous| previous >= value) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation journal identities are not strictly ordered",
+                ));
+            }
+            offsets.push((
+                u32::try_from(start).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "immutable mutation identity arena exceeds u32",
+                    )
+                })?,
+                u32::try_from(end).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "immutable mutation identity arena exceeds u32",
+                    )
+                })?,
+            ));
+            previous_identity = Some(value);
+            previous_end = end;
+        }
+        if previous_end != identity_bytes.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation identity offsets do not cover the arena",
+            ));
+        }
+        Self::try_new_validated_single_string_identities(
+            schema_plan_id,
+            schema_key,
+            branch_id,
+            origin_key,
+            identity_bytes,
+            offsets.into(),
+            snapshot_arena,
+            snapshot_offsets,
+            durable_predecessors,
+            timestamp,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn try_new_validated_single_string_identities(
+        schema_plan_id: SchemaPlanId,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        origin_key: Option<SharedStr>,
+        identity_arena: Bytes,
+        identity_offsets: Arc<[(u32, u32)]>,
+        snapshot_arena: Vec<u8>,
+        snapshot_offsets: Vec<(usize, usize)>,
+        durable_predecessors: Option<Vec<CertifiedCurrentStatePredecessor>>,
+        timestamp: LixTimestamp,
+    ) -> Result<Self, LixError> {
+        let row_count = identity_offsets.len();
+        if row_count == 0 || row_count != snapshot_offsets.len() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "immutable mutation journal columns are empty or misaligned",
@@ -149,17 +232,11 @@ impl ImmutableMutationJournalChunk {
         }
         if durable_predecessors
             .as_ref()
-            .is_some_and(|predecessors| predecessors.len() != entity_pks.len())
+            .is_some_and(|predecessors| predecessors.len() != row_count)
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "immutable mutation predecessor column is misaligned",
-            ));
-        }
-        if !entity_pks.windows(2).all(|pair| pair[0] < pair[1]) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "immutable mutation journal identities are not strictly ordered",
             ));
         }
         let arena_len = snapshot_arena.len();
@@ -225,7 +302,8 @@ impl ImmutableMutationJournalChunk {
             schema_key,
             branch_id,
             origin_key,
-            entity_pks: entity_pks.into(),
+            identity_arena,
+            identity_offsets,
             snapshot_arena: Bytes::from(snapshot_arena),
             snapshot_offsets: offsets.into(),
             large_snapshot_refs: large_snapshot_refs.into(),
@@ -235,11 +313,21 @@ impl ImmutableMutationJournalChunk {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.entity_pks.len()
+        self.identity_offsets.len()
     }
 
-    pub(crate) fn entity_pks(&self) -> &Arc<[EntityPk]> {
-        &self.entity_pks
+    pub(crate) fn materialized_entity_pks(&self) -> Arc<[EntityPk]> {
+        self.identity_offsets
+            .iter()
+            .map(|&(start, end)| {
+                let value = std::str::from_utf8(&self.identity_arena[start as usize..end as usize])
+                    .expect("validated immutable mutation identity UTF-8");
+                let value = SharedStr::from_utf8_slice(self.identity_arena.clone(), value)
+                    .expect("validated immutable mutation identity remains in its arena");
+                EntityPk::from_validated_shared_string(value)
+            })
+            .collect::<Vec<_>>()
+            .into()
     }
 
     pub(crate) fn attach_durable_predecessors(
@@ -256,8 +344,10 @@ impl ImmutableMutationJournalChunk {
         Ok(())
     }
 
-    pub(crate) fn entity_pk(&self, index: usize) -> &EntityPk {
-        &self.entity_pks[index]
+    fn identity(&self, index: usize) -> &str {
+        let (start, end) = self.identity_offsets[index];
+        std::str::from_utf8(&self.identity_arena[start as usize..end as usize])
+            .expect("validated immutable mutation identity UTF-8")
     }
 
     pub(crate) fn snapshot(&self, index: usize) -> &str {
@@ -299,13 +389,14 @@ impl ImmutableMutationJournalChunk {
         self,
         allow_missing_predecessors: bool,
     ) -> Result<PreparedStateBatch, LixError> {
+        let entity_pks = self.materialized_entity_pks();
         let offsets = self
             .snapshot_offsets
             .iter()
             .map(|&(start, end)| (start as usize, end as usize))
             .collect();
         let mut rows = CertifiedParameterReplacementBatch::new(
-            self.entity_pks.iter().cloned().collect(),
+            entity_pks.iter().cloned().collect(),
             TransactionJson::from_certified_row_content_arena(
                 self.snapshot_arena.to_vec(),
                 offsets,
@@ -359,8 +450,8 @@ pub(crate) struct OrderedMutationJournalRowRef<'a> {
 }
 
 impl<'a> OrderedMutationJournalRowRef<'a> {
-    pub(crate) fn entity_pk(&self) -> &'a EntityPk {
-        self.chunk.entity_pk(self.row_index)
+    pub(crate) fn identity(&self) -> &'a str {
+        self.chunk.identity(self.row_index)
     }
 
     pub(crate) fn snapshot(&self) -> &'a str {
@@ -1201,7 +1292,7 @@ impl PreparedWriteSet {
                         entity_pk_chunks: journal
                             .chunks
                             .iter()
-                            .map(|chunk| Arc::clone(chunk.entity_pks()))
+                            .map(ImmutableMutationJournalChunk::materialized_entity_pks)
                             .collect(),
                     })
             })
@@ -1467,13 +1558,16 @@ impl TransactionWriteBuffer {
             {
                 return Ok(false);
             }
-            let actual_digest = crate::collection_generation::ordered_single_string_identity_digest(
-                journal
-                    .chunks
-                    .iter()
-                    .flat_map(|chunk| chunk.entity_pks.iter()),
-            );
-            if actual_digest != Some(expected_ordered_identity_digest) {
+            let mut identity_hasher = blake3::Hasher::new();
+            for identity in journal
+                .chunks
+                .iter()
+                .flat_map(|chunk| (0..chunk.len()).map(|index| chunk.identity(index)))
+            {
+                identity_hasher.update(&(identity.len() as u64).to_le_bytes());
+                identity_hasher.update(identity.as_bytes());
+            }
+            if *identity_hasher.finalize().as_bytes() != expected_ordered_identity_digest {
                 return Ok(false);
             }
             let replay_bytes = journal.chunks.iter().try_fold(0_u64, |bytes, chunk| {
@@ -1481,7 +1575,7 @@ impl TransactionWriteBuffer {
                     let row_bytes = chunk
                         .schema_key()
                         .len()
-                        .checked_add(chunk.entity_pk(index).estimated_heap_bytes())
+                        .checked_add(chunk.identity(index).len())
                         .and_then(|value| value.checked_add(128))
                         .and_then(|value| value.checked_add(chunk.snapshot(index).len()))
                         .and_then(|value| u64::try_from(value).ok())
@@ -1562,8 +1656,13 @@ impl TransactionWriteBuffer {
                 && existing
                     .chunks
                     .last()
-                    .and_then(|previous| previous.entity_pks.last())
-                    .zip(chunk.entity_pks.first())
+                    .and_then(|previous| {
+                        previous
+                            .len()
+                            .checked_sub(1)
+                            .map(|index| previous.identity(index))
+                    })
+                    .zip((chunk.len() > 0).then(|| chunk.identity(0)))
                     .is_some_and(|(previous, next)| previous < next);
             if !compatible {
                 return Ok(ImmutableMutationChunkStage::RequiresGeneric(chunk));
@@ -1684,7 +1783,7 @@ impl TransactionWriteBuffer {
                 entity_pk_chunks: journal
                     .chunks
                     .iter()
-                    .map(|chunk| Arc::clone(&chunk.entity_pks))
+                    .map(ImmutableMutationJournalChunk::materialized_entity_pks)
                     .collect(),
                 predecessors_complete: journal
                     .chunks
@@ -3554,16 +3653,18 @@ fn ordered_mutation_journal_row<'a>(
     if file_id.is_some() || journal.branch_id() != branch_id || journal.schema_key() != schema_key {
         return None;
     }
-    let chunk_index = journal.chunks.partition_point(|chunk| {
-        chunk
-            .entity_pks
-            .last()
-            .is_some_and(|last_entity_pk| last_entity_pk < entity_pk)
-    });
+    let entity_pk = entity_pk.as_single_string().ok()?;
+    let chunk_index = journal
+        .chunks
+        .partition_point(|chunk| chunk.len() > 0 && chunk.identity(chunk.len() - 1) < entity_pk);
     let chunk = journal.chunks.get(chunk_index)?;
     chunk
-        .entity_pks
-        .binary_search(entity_pk)
+        .identity_offsets
+        .binary_search_by(|&(start, end)| {
+            std::str::from_utf8(&chunk.identity_arena[start as usize..end as usize])
+                .expect("validated immutable mutation identity UTF-8")
+                .cmp(entity_pk)
+        })
         .ok()
         .map(|index| (chunk, index))
 }
@@ -3593,8 +3694,17 @@ fn push_ordered_mutation_materialized(
             .transpose()?
             .unwrap_or_else(|| chunk.timestamp())
     };
+    let identity = chunk.identity(row_index);
+    let identity =
+        SharedStr::from_utf8_slice(chunk.identity_arena.clone(), identity).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation identity escaped its shared arena",
+            )
+        })?;
+    let entity_pk = EntityPk::from_validated_shared_string(identity);
     let ordinal = output.push_materialized_ref(
-        chunk.entity_pk(row_index),
+        &entity_pk,
         chunk.schema_key(),
         None,
         Some(snapshot),
@@ -4216,6 +4326,36 @@ mod tests {
         ($($row:expr),* $(,)?) => {
             PreparedStateBatch::from_test_rows(vec![$($row),*])
         };
+    }
+
+    #[test]
+    fn immutable_journal_single_string_identities_share_one_arena() {
+        let first_snapshot = r#"{"path":"a","value":1}"#;
+        let second_snapshot = r#"{"path":"b","value":2}"#;
+        let snapshots = format!("{first_snapshot}{second_snapshot}");
+        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+            SchemaPlanId::for_test(0),
+            "schema".into(),
+            "branch".into(),
+            None,
+            b"ab".to_vec(),
+            vec![(0, 1), (1, 2)],
+            snapshots.into_bytes(),
+            vec![
+                (0, first_snapshot.len()),
+                (
+                    first_snapshot.len(),
+                    first_snapshot.len() + second_snapshot.len(),
+                ),
+            ],
+            None,
+            LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
+        )
+        .expect("shared identity chunk");
+
+        assert_eq!(chunk.identity(0), "a");
+        assert_eq!(chunk.identity(1), "b");
+        assert_eq!(chunk.identity_arena.len(), 2);
     }
 
     #[test]

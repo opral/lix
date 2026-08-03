@@ -24,7 +24,7 @@ use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkBatch,
     TrackedStateMutationBatchBuilder, decode_key, decode_key_shared, decode_node_ref, decode_value,
     encode_key_ref, encode_key_ref_into, encode_leaf_node_refs, encode_schema_key_prefix,
-    encode_value_ref,
+    encode_single_string_key_ref_into, encode_value_ref,
 };
 pub(crate) use crate::tracked_state::types::{
     CommitDeltaLifecycleSummary, CommitDeltaReplacementScope,
@@ -35,6 +35,7 @@ use crate::tracked_state::types::{
     StoredReplacementPartsAuthority, TRACKED_STATE_HASH_BYTES, TrackedStateBaseCoordinate,
     TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateIndexValue,
     TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateRootId,
+    TrackedStateSingleStringReplacementRef,
 };
 use crate::{LixError, storage_codec};
 use bytes::Bytes;
@@ -954,6 +955,17 @@ pub(crate) struct CommitDeltaPointReadCache {
     inner: Mutex<CommitDeltaPointReadCacheInner>,
 }
 
+/// Transaction-owned cursor for a monotonically scanned immutable generation.
+/// The manifest and current decoded segment stay outside the shared cache
+/// mutex; an ordered UPDATE therefore touches the LRU only when it crosses a
+/// physical part boundary instead of twice for every row.
+pub(crate) struct CommitDeltaLiveMembershipCursor {
+    commit_id: CommitId,
+    manifest: Option<Arc<CommitDeltaManifest>>,
+    segment_index: Option<usize>,
+    segment: Option<Arc<DecodedCommitDeltaSegment>>,
+}
+
 #[derive(Default)]
 struct CommitDeltaPointReadCacheInner {
     manifests: VecDeque<(CommitId, Arc<CommitDeltaManifest>)>,
@@ -963,26 +975,30 @@ struct CommitDeltaPointReadCacheInner {
 }
 
 impl CommitDeltaPointReadCache {
-    pub(crate) fn cached_live_member(
+    pub(crate) fn live_membership_cursor(
         &self,
         commit_id: CommitId,
+    ) -> CommitDeltaLiveMembershipCursor {
+        CommitDeltaLiveMembershipCursor {
+            commit_id,
+            manifest: None,
+            segment_index: None,
+            segment: None,
+        }
+    }
+}
+
+impl CommitDeltaLiveMembershipCursor {
+    pub(crate) fn cached_live_member(
+        &mut self,
+        cache: &CommitDeltaPointReadCache,
         encoded_key: &[u8],
     ) -> Result<Option<bool>, LixError> {
-        let manifest = {
-            let cache = self.inner.lock().map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "transaction commit-delta point cache lock is poisoned",
-                )
-            })?;
-            let Some((_, manifest)) = cache
-                .manifests
-                .iter()
-                .find(|(cached_commit_id, _)| *cached_commit_id == commit_id)
-            else {
-                return Ok(None);
-            };
-            Arc::clone(manifest)
+        if self.manifest.is_none() {
+            self.manifest = cache.manifest(self.commit_id)?;
+        }
+        let Some(manifest) = self.manifest.as_ref() else {
+            return Ok(None);
         };
         if manifest.selected_source_commit_id.is_some() || manifest.inline_segment().is_some() {
             return Ok(None);
@@ -990,20 +1006,25 @@ impl CommitDeltaPointReadCache {
         let Some(segment_index) = commit_delta_segment_for_key(&manifest, encoded_key) else {
             return Ok(Some(false));
         };
-        let Some(segment) = self.segment(
-            commit_id,
-            segment_index,
-            manifest.segments.get(segment_index),
-        )?
-        else {
+        if self.segment_index != Some(segment_index) || self.segment.is_none() {
+            self.segment = cache.segment(
+                self.commit_id,
+                segment_index,
+                manifest.segments.get(segment_index),
+            )?;
+            self.segment_index = Some(segment_index);
+        }
+        let Some(segment) = self.segment.as_ref() else {
             return Ok(None);
         };
         Ok(Some(
-            find_commit_delta_value(&segment.leaf, encoded_key, commit_id)?
+            find_commit_delta_value(&segment.leaf, encoded_key, self.commit_id)?
                 .is_some_and(|value| !value.deleted),
         ))
     }
+}
 
+impl CommitDeltaPointReadCache {
     fn should_admit_segment(
         &self,
         commit_id: CommitId,
@@ -1880,13 +1901,67 @@ where
 /// Publishes a complete replacement as compact immutable identity parts.
 /// Parts own identity routing and JSON authority: small values are inline and
 /// large values remain content-addressed references into the JSON store.
-pub(crate) fn stage_ordered_addressable_replacement_parts<'a, I>(
+pub(crate) struct ReplacementPartInput<'a> {
+    key: Vec<u8>,
+    commit_id: CommitId,
+    created_at: crate::common::LixTimestamp,
+    updated_at: crate::common::LixTimestamp,
+    snapshot: crate::json_store::JsonSlotRef<'a>,
+    metadata: crate::json_store::JsonSlotRef<'a>,
+}
+
+pub(crate) trait ReplacementPartInputRef<'a>: Copy {
+    fn into_replacement_part_input(self) -> Result<ReplacementPartInput<'a>, LixError>;
+}
+
+impl<'a> ReplacementPartInputRef<'a> for TrackedStateCommitDeltaRef<'a> {
+    fn into_replacement_part_input(self) -> Result<ReplacementPartInput<'a>, LixError> {
+        if self.delta.deleted || !self.authored || self.origin_key.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state replacement member violates immutable replacement invariants",
+            ));
+        }
+        Ok(ReplacementPartInput {
+            key: encode_key_ref(TrackedStateKeyRef {
+                schema_key: self.delta.schema_key,
+                file_id: self.delta.file_id,
+                entity_pk: self.delta.entity_pk,
+            }),
+            commit_id: self.delta.commit_id,
+            created_at: self.delta.created_at,
+            updated_at: self.delta.updated_at,
+            snapshot: self.snapshot,
+            metadata: self.metadata,
+        })
+    }
+}
+
+impl<'a> ReplacementPartInputRef<'a> for TrackedStateSingleStringReplacementRef<'a> {
+    fn into_replacement_part_input(self) -> Result<ReplacementPartInput<'a>, LixError> {
+        let mut key = Vec::with_capacity(
+            self.schema_key.len() + self.file_id.map_or(0, str::len) + self.entity_pk.len() + 8,
+        );
+        encode_single_string_key_ref_into(&mut key, self.schema_key, self.file_id, self.entity_pk);
+        Ok(ReplacementPartInput {
+            key,
+            commit_id: self.commit_id,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            snapshot: self.snapshot,
+            metadata: self.metadata,
+        })
+    }
+}
+
+pub(crate) fn stage_ordered_addressable_replacement_parts<'a, I, R>(
     writes: &mut StorageWriteSet,
     deltas: I,
     generation: &CommitDeltaReplacementGeneration,
 ) -> Result<OrderedAddressableCommitDeltaStage, LixError>
 where
-    I: ExactSizeIterator<Item = Result<TrackedStateCommitDeltaRef<'a>, LixError>>,
+    I: ExactSizeIterator<Item = Result<R, LixError>>,
+    R: ReplacementPartInputRef<'a>,
 {
     struct BorrowedRow<'a> {
         key: Vec<u8>,
@@ -1914,12 +1989,8 @@ where
     let mut parts = Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS));
     let mut compressor = None;
     for delta in deltas {
-        let delta = delta?;
-        if delta.delta.deleted
-            || !delta.authored
-            || delta.origin_key.is_some()
-            || delta.delta.created_at != generation.lifecycle_summary.uniform_created_at
-        {
+        let delta = delta?.into_replacement_part_input()?;
+        if delta.created_at != generation.lifecycle_summary.uniform_created_at {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state replacement member violates immutable replacement invariants",
@@ -1932,22 +2003,18 @@ where
             ));
         }
         if commit_id
-            .replace(delta.delta.commit_id)
-            .is_some_and(|owner| owner != delta.delta.commit_id)
+            .replace(delta.commit_id)
+            .is_some_and(|owner| owner != delta.commit_id)
             || uniform_updated_at
-                .replace(delta.delta.updated_at)
-                .is_some_and(|timestamp| timestamp != delta.delta.updated_at)
+                .replace(delta.updated_at)
+                .is_some_and(|timestamp| timestamp != delta.updated_at)
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state replacement members have nonuniform owner or timestamp",
             ));
         }
-        let key = encode_key_ref(TrackedStateKeyRef {
-            schema_key: delta.delta.schema_key,
-            file_id: delta.delta.file_id,
-            entity_pk: delta.delta.entity_pk,
-        });
+        let key = delta.key;
         if !previous_key.is_empty() && previous_key >= key {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -7971,6 +8038,44 @@ mod tests {
             &generation,
         )
         .expect("replacement parts should stage");
+        let mut borrowed_writes = storage.new_write_set();
+        let borrowed_staged = super::stage_ordered_addressable_replacement_parts(
+            &mut borrowed_writes,
+            fixtures.iter().map(|fixture| {
+                Ok(
+                    crate::tracked_state::TrackedStateSingleStringReplacementRef {
+                        schema_key: &fixture.schema_key,
+                        file_id: fixture.file_id.as_deref(),
+                        entity_pk: fixture
+                            .entity_pk
+                            .as_single_string()
+                            .expect("fixture identity is one string"),
+                        commit_id,
+                        created_at: fixture.created_at,
+                        updated_at: fixture.updated_at,
+                        snapshot: crate::json_store::JsonSlotRef::Inline("{}"),
+                        metadata: crate::json_store::JsonSlotRef::None,
+                    },
+                )
+            }),
+            &generation,
+        )
+        .expect("borrowed replacement parts should stage");
+        assert_eq!(borrowed_staged.commit_id, staged.commit_id);
+        assert_eq!(borrowed_staged.row_count(), staged.row_count());
+        assert_eq!(
+            borrowed_staged.mutation_inventory(),
+            staged.mutation_inventory()
+        );
+        assert_eq!(
+            borrowed_staged.assigned_change_ids().collect::<Vec<_>>(),
+            staged.assigned_change_ids().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            format!("{borrowed_writes:?}"),
+            format!("{writes:?}"),
+            "borrowed and generic replacement staging must be byte-identical"
+        );
         stage_fixture_manifest(&mut writes, staged.commit_id, staged.mutation_inventory())
             .expect("replacement commit-state authority should stage");
         storage
