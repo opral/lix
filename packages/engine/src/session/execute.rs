@@ -4816,6 +4816,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_insert_preserves_declared_integer_primary_key_type() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "integer_primary_key_insert_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        let inserted = session
+            .execute(
+                "INSERT INTO integer_primary_key_insert_probe (id, value) VALUES ($1, $2)",
+                &[Value::Integer(42), Value::Text("answer".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(inserted.rows_affected(), 1);
+
+        let result = session
+            .execute(
+                "SELECT id, value FROM integer_primary_key_insert_probe WHERE id = $1",
+                &[Value::Integer(42)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.rows()[0].get::<i64>("id").unwrap(), 42);
+        assert_eq!(result.rows()[0].get::<String>("value").unwrap(), "answer");
+    }
+
+    #[tokio::test]
     async fn execute_batch_lowers_distinct_bound_entity_inserts_once() {
         let session = open_session().await;
         let schema = serde_json::json!({

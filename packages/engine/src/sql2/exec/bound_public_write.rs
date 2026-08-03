@@ -5302,18 +5302,20 @@ fn append_entity_insert_row(
         .apply(&mut snapshot, ctx.functions(), &layout.schema_key)?;
     let snapshot = JsonValue::Object(snapshot);
     if !spec.primary_key_paths.is_empty() {
-        let derived_entity_pk =
-            EntityPk::from_primary_key_paths(&snapshot, &spec.primary_key_paths).map_err(
-                |error| {
-                    LixError::new(
-                        LixError::CODE_SCHEMA_VALIDATION,
-                        format!(
-                            "INSERT failed to derive entity primary key for schema '{}': {error}",
-                            layout.schema_key
-                        ),
-                    )
-                },
-            )?;
+        let derived_entity_pk = EntityPk::from_primary_key_plan(
+            &snapshot,
+            &spec.primary_key_paths,
+            &spec.primary_key_component_types,
+        )
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "INSERT failed to derive entity primary key for schema '{}': {error}",
+                    layout.schema_key
+                ),
+            )
+        })?;
         if entity_pk
             .as_ref()
             .is_some_and(|explicit_entity_pk| explicit_entity_pk != &derived_entity_pk)
