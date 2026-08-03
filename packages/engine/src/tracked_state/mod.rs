@@ -62,7 +62,8 @@ pub(crate) use storage::{
     stage_commit_state_manifest_with_handle, stage_current_state_catalog_from_published_parent,
     stage_current_state_catalog_from_staged_parent, stage_delete_change_locators,
     stage_delete_commit_delta_inventory_entry, stage_ordered_addressable_commit_deltas,
-    stage_ordered_addressable_replacement_parts, validate_current_state_catalog_parent_manifest,
+    stage_ordered_addressable_replacement_parts, stage_ordered_columnar_mutations,
+    validate_current_state_catalog_parent_manifest,
 };
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{
@@ -82,11 +83,11 @@ pub(crate) use storage::{
 };
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{
-    CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
-    MaterializedTrackedStateRow, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
-    TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue,
-    TrackedStateReadColumns, TrackedStateRootMutationRef, TrackedStateScanRequest,
-    TrackedStateSingleStringReplacementRef,
+    ColumnarMutationPartSet, CommitStateManifest, CommitStateMutationInventory,
+    CommitStateReplayDebt, MaterializedTrackedStateRow, TrackedStateBaseCoordinate,
+    TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateFilter,
+    TrackedStateIndexValue, TrackedStateReadColumns, TrackedStateRootMutationRef,
+    TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
 };
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 #[cfg(feature = "storage-benches")]

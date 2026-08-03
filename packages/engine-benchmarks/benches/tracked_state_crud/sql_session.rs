@@ -382,6 +382,33 @@ impl SqlFixture {
         }
     }
 
+    pub(crate) async fn active_commit_id(&self) -> String {
+        match self {
+            Self::SQLite(fixture) => fixture.active_commit_id().await,
+            Self::RocksDB(fixture) => fixture.active_commit_id().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.active_commit_id().await,
+        }
+    }
+
+    pub(crate) async fn columnar_history_count(&self, commit_id: &str) -> usize {
+        match self {
+            Self::SQLite(fixture) => fixture.columnar_history_count(commit_id).await,
+            Self::RocksDB(fixture) => fixture.columnar_history_count(commit_id).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.columnar_history_count(commit_id).await,
+        }
+    }
+
+    pub(crate) async fn columnar_diff_count(&self, before: &str, after: &str) -> usize {
+        match self {
+            Self::SQLite(fixture) => fixture.columnar_diff_count(before, after).await,
+            Self::RocksDB(fixture) => fixture.columnar_diff_count(before, after).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.columnar_diff_count(before, after).await,
+        }
+    }
+
     async fn seed_rows(&self) {
         match self {
             Self::SQLite(fixture) => fixture.seed_rows().await,
@@ -670,6 +697,50 @@ where
             "tracked-state CRUD insert benchmark must execute one certified parameter batch"
         );
         affected as usize
+    }
+
+    async fn active_commit_id(&self) -> String {
+        let result = execute(&self.session, "SELECT lix_active_branch_commit_id()").await;
+        match result.rows()[0].get_index(0) {
+            Some(Value::Text(commit_id)) => commit_id.clone(),
+            value => panic!("active commit id should be text, got {value:?}"),
+        }
+    }
+
+    async fn columnar_history_count(&self, commit_id: &str) -> usize {
+        let result = execute(
+            &self.session,
+            &format!(
+                "SELECT COUNT(*) AS entries FROM tracked_crud_insert_history('{commit_id}') \
+                 WHERE lixcol_is_deleted = false"
+            ),
+        )
+        .await;
+        assert_eq!(
+            result.rows()[0].get_index(0),
+            Some(&Value::Integer(
+                i64::try_from(self.row_count).expect("benchmark row count fits i64"),
+            ))
+        );
+        self.row_count
+    }
+
+    async fn columnar_diff_count(&self, before: &str, after: &str) -> usize {
+        let result = execute(
+            &self.session,
+            &format!(
+                "SELECT COUNT(*) AS entries FROM lix_diff('{before}', '{after}') \
+                 WHERE schema_key = 'tracked_crud_insert' AND diff_type = 'added'"
+            ),
+        )
+        .await;
+        assert_eq!(
+            result.rows()[0].get_index(0),
+            Some(&Value::Integer(
+                i64::try_from(self.row_count).expect("benchmark row count fits i64"),
+            ))
+        );
+        self.row_count
     }
 
     async fn seed_rows(&self) {

@@ -28,6 +28,8 @@ pub(crate) const ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
     "lix.entity_columnar.layout_fingerprint.v1";
 pub(crate) const ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
     "lix.entity_columnar.base_coordinates.v1";
+pub(crate) const ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY: &str =
+    "lix.entity_columnar.lossless_snapshot.v1";
 pub(crate) const ENTITY_COLUMNAR_ENTITY_PK_FIELD: &str = "lixcol_entity_pk";
 pub(crate) const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;
 const LOW_CARDINALITY_CLUSTER_MAX_BUCKETS: usize = 8;
@@ -48,8 +50,54 @@ pub(crate) struct EntityColumnarRowRef<'a> {
 #[derive(Clone, Debug)]
 pub(crate) struct EncodedEntityRowGroups {
     encoded: EncodedRowGroupSet,
-    pub(crate) input_locations: Vec<RowGroupRowLocation>,
+    pub(crate) input_locations: EntityRowGroupLocations,
 }
+
+/// Input-row to physical-row mapping for one sealed entity generation.
+///
+/// Identity-preserving batches use arithmetic coordinates and retain no
+/// row-cardinal location column. Clustered layouts keep the explicit
+/// permutation required to map their reordered rows back to statement order.
+#[derive(Clone, Debug)]
+pub(crate) enum EntityRowGroupLocations {
+    Dense { row_count: usize },
+    Explicit(Vec<RowGroupRowLocation>),
+}
+
+impl EntityRowGroupLocations {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Dense { row_count } => *row_count,
+            Self::Explicit(locations) => locations.len(),
+        }
+    }
+
+    pub(crate) fn location(&self, input_index: usize) -> Option<RowGroupRowLocation> {
+        match self {
+            Self::Dense { row_count } if input_index < *row_count => Some(RowGroupRowLocation {
+                group_index: u32::try_from(input_index / ROW_GROUP_MAX_ROWS).ok()?,
+                row_index: u32::try_from(input_index % ROW_GROUP_MAX_ROWS).ok()?,
+            }),
+            Self::Dense { .. } => None,
+            Self::Explicit(locations) => locations.get(input_index).copied(),
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = RowGroupRowLocation> + '_ {
+        (0..self.len()).map(|input_index| {
+            self.location(input_index)
+                .expect("entity row-group location covers every input row")
+        })
+    }
+}
+
+impl PartialEq for EntityRowGroupLocations {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for EntityRowGroupLocations {}
 
 impl Deref for EncodedEntityRowGroups {
     type Target = EncodedRowGroupSet;
@@ -60,7 +108,7 @@ impl Deref for EncodedEntityRowGroups {
 }
 
 impl EncodedEntityRowGroups {
-    pub(crate) fn into_parts(self) -> (EncodedRowGroupSet, Vec<RowGroupRowLocation>) {
+    pub(crate) fn into_parts(self) -> (EncodedRowGroupSet, EntityRowGroupLocations) {
         (self.encoded, self.input_locations)
     }
 }
@@ -139,27 +187,12 @@ pub(crate) fn encode_unclustered_registered_entity_row_groups(
         DataType::Utf8,
         false,
     ));
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_string(),
-        spec.columnar_layout_fingerprint(),
-    );
-    metadata.insert(
-        ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY.to_string(),
-        "true".to_owned(),
-    );
+    let metadata = entity_columnar_metadata(spec);
     let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
     columns.push(entity_pks);
     let mut batches = Vec::with_capacity(row_count.div_ceil(ROW_GROUP_MAX_ROWS));
-    let mut input_locations = Vec::with_capacity(row_count);
     for offset in (0..row_count).step_by(ROW_GROUP_MAX_ROWS) {
         let len = (row_count - offset).min(ROW_GROUP_MAX_ROWS);
-        let group_index = u32::try_from(batches.len())
-            .map_err(|_| entity_columnar_error("row-group index exceeds u32"))?;
-        input_locations.extend((0..len).map(|row_index| RowGroupRowLocation {
-            group_index,
-            row_index: u32::try_from(row_index).expect("row-group size fits u32"),
-        }));
         batches.push(
             RecordBatch::try_new(
                 Arc::clone(&schema),
@@ -174,7 +207,7 @@ pub(crate) fn encode_unclustered_registered_entity_row_groups(
     let encoded = encode_row_group_set_preserving_batches(&spec.schema_key, schema, &batches)?;
     Ok(Some(EncodedEntityRowGroups {
         encoded,
-        input_locations,
+        input_locations: EntityRowGroupLocations::Dense { row_count },
     }))
 }
 
@@ -191,15 +224,7 @@ where
         DataType::Utf8,
         false,
     ));
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_string(),
-        spec.columnar_layout_fingerprint(),
-    );
-    metadata.insert(
-        ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY.to_string(),
-        "true".to_owned(),
-    );
+    let metadata = entity_columnar_metadata(spec);
     let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
     let decoder =
         EntityProjectionDecoder::new(spec, spec.columns.iter().map(|column| column.name.as_str()))?;
@@ -324,10 +349,14 @@ where
     let encoded = encode_row_group_set_preserving_batches(&spec.schema_key, schema, &batches)?;
     Ok(EncodedEntityRowGroups {
         encoded,
-        input_locations: input_locations
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| entity_columnar_error("row-group permutation omitted an input row"))?,
+        input_locations: EntityRowGroupLocations::Explicit(
+            input_locations
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    entity_columnar_error("row-group permutation omitted an input row")
+                })?,
+        ),
     })
 }
 
@@ -335,6 +364,26 @@ fn optional_derived_row_group_set(
     encoded: Result<EncodedEntityRowGroups, LixError>,
 ) -> Option<EncodedEntityRowGroups> {
     encoded.ok()
+}
+
+fn entity_columnar_metadata(spec: &EntitySurfaceSpec) -> HashMap<String, String> {
+    let mut metadata = HashMap::from([
+        (
+            ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_string(),
+            spec.columnar_layout_fingerprint(),
+        ),
+        (
+            ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY.to_string(),
+            "true".to_owned(),
+        ),
+    ]);
+    if spec.columnar_snapshot_bijective {
+        metadata.insert(
+            ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY.to_string(),
+            "true".to_owned(),
+        );
+    }
+    metadata
 }
 
 fn entity_columnar_error(message: impl Into<String>) -> LixError {
@@ -496,6 +545,10 @@ mod tests {
         )
         .expect("direct encoding should succeed")
         .expect("high-cardinality values should not cluster");
+        assert!(matches!(
+            &direct_encoding.input_locations,
+            EntityRowGroupLocations::Dense { row_count: 128 }
+        ));
         assert_eq!(direct_encoding.manifest, canonical_encoding.manifest);
         assert_eq!(
             direct_encoding.input_locations,
@@ -628,8 +681,16 @@ mod tests {
 
         assert_eq!(encoded.input_locations.len(), identities.len());
         assert_ne!(
-            encoded.input_locations[0].group_index,
-            encoded.input_locations[1].group_index
+            encoded
+                .input_locations
+                .location(0)
+                .expect("first input coordinate")
+                .group_index,
+            encoded
+                .input_locations
+                .location(1)
+                .expect("second input coordinate")
+                .group_index
         );
         for (input_index, location) in encoded.input_locations.iter().enumerate() {
             let group = &encoded.manifest.groups[location.group_index as usize];

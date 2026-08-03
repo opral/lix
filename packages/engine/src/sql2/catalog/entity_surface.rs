@@ -55,6 +55,10 @@ pub(crate) struct EntitySurfaceSpec {
     /// This exact schema shape proves that replacing `value` while preserving
     /// the already-valid string `path` produces complete valid row content.
     pub(crate) certifies_path_value_replacement: bool,
+    /// Every accepted snapshot is exactly the declared, required top-level
+    /// columns, so typed Arrow values can reconstruct canonical JSON without
+    /// a second persisted snapshot payload.
+    pub(crate) columnar_snapshot_bijective: bool,
 }
 
 impl EntitySurfaceSpec {
@@ -205,6 +209,18 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
     columns.sort_by(|left, right| left.name.cmp(&right.name));
 
     let certifies_path_value_replacement = certifies_path_value_replacement(schema);
+    let columnar_snapshot_bijective = schema.get("additionalProperties")
+        == Some(&JsonValue::Bool(false))
+        && properties.len() == columns.len()
+        && columns.iter().all(|column| {
+            column.insert_required
+                && matches!(
+                    column.column_type,
+                    EntityColumnType::String
+                        | EntityColumnType::Integer
+                        | EntityColumnType::Boolean
+                )
+        });
     Ok(EntitySurfaceSpec {
         schema_key: schema_key.to_string(),
         primary_key_paths,
@@ -220,6 +236,7 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
             },
         ),
         certifies_path_value_replacement,
+        columnar_snapshot_bijective,
     })
 }
 
@@ -616,6 +633,28 @@ mod tests {
         .expect("schema should derive");
 
         assert!(spec.certifies_path_value_replacement);
+    }
+
+    #[test]
+    fn columnar_snapshot_certificate_requires_exact_reversible_columns() {
+        let strings = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
+            "type": "string"
+        })))
+        .expect("string schema should derive");
+        assert!(strings.columnar_snapshot_bijective);
+
+        let numbers = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
+            "type": "number"
+        })))
+        .expect("number schema should derive");
+        assert!(!numbers.columnar_snapshot_bijective);
+
+        let mut reserved = path_value_schema(json!({ "type": "string" }));
+        reserved["properties"]["lixcol_user_value"] = json!({ "type": "string" });
+        reserved["required"] = json!(["path", "value", "lixcol_user_value"]);
+        let reserved = derive_entity_surface_spec_from_schema(&reserved)
+            .expect("reserved-name schema should still derive");
+        assert!(!reserved.columnar_snapshot_bijective);
     }
 
     #[test]
