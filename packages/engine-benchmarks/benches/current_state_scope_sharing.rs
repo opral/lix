@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use lix_engine::storage_adapter::StorageAdapter;
 use lix_engine::tracked_state::bench::{
-    BenchCurrentStatePointFixture, BenchCurrentStatePointMode, BenchCurrentStatePointTarget,
-    BenchCurrentStateSparseShape, seed_current_state_point_fixture,
+    BenchCurrentStateDirectoryDiffMode, BenchCurrentStatePointFixture, BenchCurrentStatePointMode,
+    BenchCurrentStatePointTarget, BenchCurrentStateSparseShape, seed_current_state_point_fixture,
 };
 use lix_rocksdb_storage::RocksDB;
 use lix_slatedb_storage::SlateDB;
@@ -97,6 +97,45 @@ async fn run_backend<S>(
     .await;
     let setup = setup.elapsed();
     let mode = std::env::var("LIX_CURRENT_STATE_MODE").unwrap_or_default();
+    if let Some(diff_mode) = match mode.as_str() {
+        "directory-diff-merkle" => Some(BenchCurrentStateDirectoryDiffMode::Merkle),
+        "directory-diff-flatten" => Some(BenchCurrentStateDirectoryDiffMode::Flatten),
+        _ => None,
+    } {
+        let started = Instant::now();
+        let mut digest = [0; 32];
+        for _ in 0..samples {
+            digest = black_box(fixture.diff_current_state_directory(diff_mode).await);
+        }
+        println!(
+            "current_state_directory_diff_profile,backend={backend},authority=published,mode={diff_mode:?},shape={sparse_shape:?},rows={rows},sparse_commits={sparse_commits},samples={samples},elapsed_ms={:.3},digest={}",
+            millis(started.elapsed()),
+            hex_digest(digest),
+        );
+        return;
+    }
+    if mode == "directory-diff" {
+        assert_eq!(
+            fixture
+                .diff_current_state_directory(BenchCurrentStateDirectoryDiffMode::Merkle)
+                .await,
+            fixture
+                .diff_current_state_directory(BenchCurrentStateDirectoryDiffMode::Flatten)
+                .await,
+            "Merkle and flattened directory comparison must agree",
+        );
+        let (merkle, flatten) = measure_directory_diff_pair(&fixture, warmups, samples).await;
+        println!(
+            "current_state_directory_diff,backend={backend},authority=published,measurement=interleaved,shape={sparse_shape:?},rows={rows},sparse_commits={sparse_commits},merkle_p50_us={:.3},merkle_p95_us={:.3},flatten_p50_us={:.3},flatten_p95_us={:.3},p50_reduction_pct={:.2},p95_reduction_pct={:.2}",
+            micros(merkle.0),
+            micros(merkle.1),
+            micros(flatten.0),
+            micros(flatten.1),
+            reduction_percent(merkle.0, flatten.0),
+            reduction_percent(merkle.1, flatten.1),
+        );
+        return;
+    }
     if mode == "persistent" || mode == "replay" {
         let selected = if mode == "persistent" {
             BenchCurrentStatePointMode::PersistentCatalog
@@ -170,6 +209,64 @@ async fn run_backend<S>(
     );
 }
 
+async fn measure_directory_diff_pair<S>(
+    fixture: &BenchCurrentStatePointFixture<S>,
+    warmups: usize,
+    samples: usize,
+) -> ((Duration, Duration), (Duration, Duration))
+where
+    S: lix_engine::storage::Storage,
+{
+    let expected = fixture
+        .diff_current_state_directory(BenchCurrentStateDirectoryDiffMode::Flatten)
+        .await;
+    for warmup in 0..warmups {
+        for mode in alternating_directory_diff_modes(warmup) {
+            assert_eq!(
+                black_box(fixture.diff_current_state_directory(mode).await),
+                expected
+            );
+        }
+    }
+    let mut merkle = Vec::with_capacity(samples);
+    let mut flatten = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        for mode in alternating_directory_diff_modes(sample) {
+            let started = Instant::now();
+            assert_eq!(
+                black_box(fixture.diff_current_state_directory(mode).await),
+                expected
+            );
+            match mode {
+                BenchCurrentStateDirectoryDiffMode::Merkle => merkle.push(started.elapsed()),
+                BenchCurrentStateDirectoryDiffMode::Flatten => flatten.push(started.elapsed()),
+            }
+        }
+    }
+    (percentiles(merkle), percentiles(flatten))
+}
+
+fn alternating_directory_diff_modes(round: usize) -> [BenchCurrentStateDirectoryDiffMode; 2] {
+    if round.is_multiple_of(2) {
+        [
+            BenchCurrentStateDirectoryDiffMode::Merkle,
+            BenchCurrentStateDirectoryDiffMode::Flatten,
+        ]
+    } else {
+        [
+            BenchCurrentStateDirectoryDiffMode::Flatten,
+            BenchCurrentStateDirectoryDiffMode::Merkle,
+        ]
+    }
+}
+
+fn percentiles(mut timings: Vec<Duration>) -> (Duration, Duration) {
+    timings.sort_unstable();
+    let p50 = timings[timings.len() / 2];
+    let p95 = timings[timings.len().saturating_mul(95).div_ceil(100) - 1];
+    (p50, p95)
+}
+
 async fn measure<S>(
     fixture: &BenchCurrentStatePointFixture<S>,
     mode: BenchCurrentStatePointMode,
@@ -207,6 +304,16 @@ fn micros(duration: Duration) -> f64 {
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn hex_digest(digest: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(encoded, "{byte:02x}").expect("write to string");
+    }
+    encoded
 }
 
 fn reduction_percent(candidate: Duration, baseline: Duration) -> f64 {

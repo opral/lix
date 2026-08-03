@@ -769,6 +769,35 @@ fn fresh_replacement_current_state_part_set(
     Ok(Some(set))
 }
 
+/// Resolves one exact authenticated serving partition from an immutable
+/// published commit manifest. Absence means the scope is not completely
+/// covered; malformed catalog or coverage authority is an error.
+pub(crate) async fn load_complete_current_state_part_set_from_published_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &PublishedCommitStateManifest,
+    scope: &CommitDeltaReplacementScope,
+) -> Result<Option<crate::tracked_state::types::CurrentStatePartSet>, LixError> {
+    if let Some(fresh) = fresh_replacement_current_state_part_set(state)?
+        && fresh.scope == *scope
+    {
+        return Ok(Some(fresh));
+    }
+    let Some(root) = state.current_state_catalog.as_deref() else {
+        return Ok(None);
+    };
+    let Some(entry) =
+        super::current_state_part::load_current_state_catalog_entry(store, root, scope).await?
+    else {
+        return Ok(None);
+    };
+    let authority_id = CommitId::new(uuid::Uuid::from_bytes(entry.coverage_anchor_commit_id));
+    let authority = load_published_commit_state_manifest(store, authority_id)
+        .await?
+        .ok_or_else(|| replacement_payload_error("current-state coverage authority is missing"))?;
+    validate_current_state_catalog_entry_against_authority(&entry, &authority)?;
+    Ok(Some(entry))
+}
+
 /// Resolves a point batch from authoritative complete collection entries in
 /// the persistent catalog. `None` means at least one scope is uncovered and
 /// canonical first-parent replay remains responsible for the whole batch.
@@ -9840,6 +9869,20 @@ mod tests {
         .await
         .expect("replacement catalog should load")
         .expect("replacement should publish a current-state part set");
+        let published = super::load_published_commit_state_manifest(&read, commit_id)
+            .await
+            .expect("published replacement authority should load")
+            .expect("published replacement authority should exist");
+        assert_eq!(
+            super::load_complete_current_state_part_set_from_published_manifest(
+                &read,
+                &published,
+                &state_set.scope,
+            )
+            .await
+            .expect("published exact scope should authenticate"),
+            Some(state_set.clone()),
+        );
         let directory_root = state_set.directory.clone();
         assert_eq!(state_set.directory.part_count, 3);
         let route_key = fixtures[777].key();

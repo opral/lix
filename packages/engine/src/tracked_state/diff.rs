@@ -357,7 +357,7 @@ where
 {
     let scan_request = scan_request_for_diff(request);
     let tree_diff = reader
-        .diff_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
+        .diff_semantic_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
         .await?;
 
     // Validate only rows exposed by the hash-guided tree diff. Whole-root

@@ -2480,7 +2480,17 @@ where
         Ok(records)
     }
 
-    pub(crate) async fn diff_tree_entries_at_commits(
+    pub(crate) async fn diff_semantic_tree_entries_at_commits(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+        request: &TrackedStateTreeScanRequest,
+    ) -> Result<TrackedStateTreeDiffBatch, LixError> {
+        self.diff_semantic_tree_entries_at_commits_inner(left_commit_id, right_commit_id, request)
+            .await
+    }
+
+    async fn diff_semantic_tree_entries_at_commits_inner(
         &mut self,
         left_commit_id: &str,
         right_commit_id: &str,
@@ -2523,6 +2533,17 @@ where
         {
             entries.swap_sides();
             return Ok(entries);
+        }
+        if self
+            .exact_current_state_scope_has_equal_live_state(
+                left_commit_id,
+                right_commit_id,
+                request,
+            )
+            .await?
+            == Some(true)
+        {
+            return Ok(TrackedStateTreeDiffBatch::default());
         }
         if left_commit_id == right_commit_id {
             return Ok(TrackedStateTreeDiffBatch::default());
@@ -2588,6 +2609,65 @@ where
             }
         }
         entries.finish()
+    }
+
+    /// Proves equal live endpoint state from authenticated serving partitions.
+    ///
+    /// This proof belongs to semantic diff, which normalizes tombstones to
+    /// absence. Raw tree-entry diff must retain tombstone rows for merge and
+    /// history consumers and therefore never calls this helper.
+    pub(crate) async fn exact_current_state_scope_has_equal_live_state(
+        &self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+        request: &TrackedStateTreeScanRequest,
+    ) -> Result<Option<bool>, LixError> {
+        let Some(scope) = exact_current_state_scope(request) else {
+            return Ok(None);
+        };
+        let left_commit_id = CommitId::parse_lix(
+            left_commit_id,
+            "tracked-state current-state diff left commit_id",
+        )?;
+        let right_commit_id = CommitId::parse_lix(
+            right_commit_id,
+            "tracked-state current-state diff right commit_id",
+        )?;
+        let Some(left_state) =
+            storage::load_published_commit_state_manifest(&self.store, left_commit_id).await?
+        else {
+            return Ok(None);
+        };
+        let Some(right_state) =
+            storage::load_published_commit_state_manifest(&self.store, right_commit_id).await?
+        else {
+            return Ok(None);
+        };
+        let Some(left) = storage::load_complete_current_state_part_set_from_published_manifest(
+            &self.store,
+            &left_state,
+            &scope,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let Some(right) = storage::load_complete_current_state_part_set_from_published_manifest(
+            &self.store,
+            &right_state,
+            &scope,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let windows = super::current_state_part::diff_current_state_part_descriptors(
+            &self.store,
+            &left.directory,
+            &right.directory,
+        )
+        .await?;
+        Ok(Some(windows.is_empty()))
     }
 
     /// Returns the compact write-set union for an ancestor/descendant
@@ -3619,6 +3699,26 @@ where
         let payloads = self.load_change_payloads(&fallback_ids).await?;
         merge::plan_merge(&target_diff, &source_diff, &payloads)
     }
+}
+
+fn exact_current_state_scope(
+    request: &TrackedStateTreeScanRequest,
+) -> Option<storage::CommitDeltaReplacementScope> {
+    let [schema_key] = request.schema_keys.as_slice() else {
+        return None;
+    };
+    let [file_id] = request.file_ids.as_slice() else {
+        return None;
+    };
+    let file_id = match file_id {
+        NullableKeyFilter::Null => None,
+        NullableKeyFilter::Value(file_id) => Some(file_id.clone()),
+        NullableKeyFilter::Any => return None,
+    };
+    Some(storage::CommitDeltaReplacementScope {
+        schema_key: schema_key.clone(),
+        file_id,
+    })
 }
 
 /// Writer for changelog-backed tracked-state commit roots.
@@ -4731,6 +4831,56 @@ mod tests {
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::wasm::{WasmCertifiedEntityBatch, WasmCreateContext};
+
+    #[test]
+    fn exact_current_state_diff_scope_requires_one_schema_and_concrete_file_lane() {
+        let request = TrackedStateTreeScanRequest {
+            schema_keys: vec!["alpha".to_string()],
+            file_ids: vec![NullableKeyFilter::Null],
+            entity_pks: vec![EntityPk::single("optional-residual")],
+            ..TrackedStateTreeScanRequest::default()
+        };
+        assert_eq!(
+            exact_current_state_scope(&request),
+            Some(storage::CommitDeltaReplacementScope {
+                schema_key: "alpha".to_string(),
+                file_id: None,
+            })
+        );
+        assert_eq!(
+            exact_current_state_scope(&TrackedStateTreeScanRequest {
+                file_ids: vec![NullableKeyFilter::Value("file".to_string())],
+                ..request.clone()
+            }),
+            Some(storage::CommitDeltaReplacementScope {
+                schema_key: "alpha".to_string(),
+                file_id: Some("file".to_string()),
+            })
+        );
+        for file_ids in [
+            Vec::new(),
+            vec![NullableKeyFilter::Any],
+            vec![
+                NullableKeyFilter::Null,
+                NullableKeyFilter::Value("file".to_string()),
+            ],
+        ] {
+            assert!(
+                exact_current_state_scope(&TrackedStateTreeScanRequest {
+                    file_ids,
+                    ..request.clone()
+                })
+                .is_none()
+            );
+        }
+        assert!(
+            exact_current_state_scope(&TrackedStateTreeScanRequest {
+                schema_keys: Vec::new(),
+                ..request
+            })
+            .is_none()
+        );
+    }
 
     #[test]
     fn point_replay_interval_suffixes_share_one_backing_buffer() {

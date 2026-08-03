@@ -2242,6 +2242,386 @@ pub(crate) async fn load_current_state_part_descriptors(
     Ok(descriptors)
 }
 
+/// One ordered key-range whose immutable current-state descriptors differ.
+///
+/// This is intentionally a physical, source-agnostic result. Consumers decide
+/// whether and how to decode the referenced parts; the directory layer only
+/// proves which descriptor ranges cannot be skipped by Merkle identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentStatePartDescriptorDiffWindow {
+    pub(crate) first_key: Vec<u8>,
+    pub(crate) last_key: Vec<u8>,
+    pub(crate) left: Vec<CurrentStatePartDescriptor>,
+    pub(crate) right: Vec<CurrentStatePartDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryNodeRef {
+    first_key: Vec<u8>,
+    last_key: Vec<u8>,
+    node_id: [u8; 32],
+    row_count: u64,
+    part_count: u32,
+    level: u16,
+}
+
+impl From<DirectoryChild> for DirectoryNodeRef {
+    fn from(child: DirectoryChild) -> Self {
+        Self {
+            first_key: child.first_key,
+            last_key: child.last_key,
+            node_id: child.node_id,
+            row_count: child.row_count,
+            part_count: child.part_count,
+            level: child.level,
+        }
+    }
+}
+
+enum DirectoryDiffWork {
+    Compare(DirectoryNodeRef, DirectoryNodeRef),
+    CollectLeft(DirectoryNodeRef),
+    CollectRight(DirectoryNodeRef),
+}
+
+/// Compares two persistent part directories without interpreting their parts.
+///
+/// Equal node IDs prune complete subtrees. Unequal shapes are aligned by their
+/// certified key ranges, so leaf splits, contractions, and height changes do
+/// not turn into positional comparisons. The returned windows contain only
+/// descriptors that are not byte-identical on both sides.
+pub(crate) async fn diff_current_state_part_descriptors(
+    store: &(impl StorageAdapterRead + ?Sized),
+    left_root: &CurrentStatePartDirectoryRoot,
+    right_root: &CurrentStatePartDirectoryRoot,
+) -> Result<Vec<CurrentStatePartDescriptorDiffWindow>, LixError> {
+    let left_empty = left_root.part_count == 0;
+    let right_empty = right_root.part_count == 0;
+    if left_empty {
+        validate_empty_root(left_root)?;
+    }
+    if right_empty {
+        validate_empty_root(right_root)?;
+    }
+    if left_empty && right_empty {
+        return Ok(Vec::new());
+    }
+
+    let mut cache = std::collections::BTreeMap::<[u8; 32], DirectoryNode>::new();
+    let left = if left_empty {
+        None
+    } else {
+        Some(load_root_ref(store, left_root, &mut cache).await?)
+    };
+    let right = if right_empty {
+        None
+    } else {
+        Some(load_root_ref(store, right_root, &mut cache).await?)
+    };
+    let mut work = match (left, right) {
+        (Some(left), Some(right)) => vec![DirectoryDiffWork::Compare(left, right)],
+        (Some(left), None) => vec![DirectoryDiffWork::CollectLeft(left)],
+        (None, Some(right)) => vec![DirectoryDiffWork::CollectRight(right)],
+        (None, None) => unreachable!("both empty roots returned above"),
+    };
+    let mut left_candidates =
+        std::collections::BTreeMap::<Vec<u8>, CurrentStatePartDescriptor>::new();
+    let mut right_candidates =
+        std::collections::BTreeMap::<Vec<u8>, CurrentStatePartDescriptor>::new();
+
+    while let Some(next) = work.pop() {
+        match next {
+            DirectoryDiffWork::Compare(left, right) => {
+                if left.node_id == right.node_id {
+                    if left != right {
+                        return Err(directory_error(
+                            "equal node identity has conflicting range summaries",
+                        ));
+                    }
+                    continue;
+                }
+                if left.last_key < right.first_key || right.last_key < left.first_key {
+                    work.push(DirectoryDiffWork::CollectLeft(left));
+                    work.push(DirectoryDiffWork::CollectRight(right));
+                    continue;
+                }
+                let left_node = load_node_ref(store, &left, &mut cache).await?;
+                let right_node = load_node_ref(store, &right, &mut cache).await?;
+                match (left_node.kind, right_node.kind) {
+                    (0, 0) => {
+                        insert_descriptor_candidates(&mut left_candidates, left_node.parts)?;
+                        insert_descriptor_candidates(&mut right_candidates, right_node.parts)?;
+                    }
+                    (1, 1) => enqueue_aligned_directory_refs(
+                        left_node.children.into_iter().map(Into::into).collect(),
+                        right_node.children.into_iter().map(Into::into).collect(),
+                        &mut work,
+                    ),
+                    (1, 0) => enqueue_aligned_directory_refs(
+                        left_node.children.into_iter().map(Into::into).collect(),
+                        vec![right],
+                        &mut work,
+                    ),
+                    (0, 1) => enqueue_aligned_directory_refs(
+                        vec![left],
+                        right_node.children.into_iter().map(Into::into).collect(),
+                        &mut work,
+                    ),
+                    _ => unreachable!("validated directory node kind"),
+                }
+            }
+            DirectoryDiffWork::CollectLeft(reference) => {
+                collect_descriptor_candidates(
+                    store,
+                    reference,
+                    &mut cache,
+                    &mut left_candidates,
+                    true,
+                    &mut work,
+                )
+                .await?;
+            }
+            DirectoryDiffWork::CollectRight(reference) => {
+                collect_descriptor_candidates(
+                    store,
+                    reference,
+                    &mut cache,
+                    &mut right_candidates,
+                    false,
+                    &mut work,
+                )
+                .await?;
+            }
+        }
+    }
+
+    remove_shared_descriptors(&mut left_candidates, &mut right_candidates);
+    Ok(descriptor_diff_windows(left_candidates, right_candidates))
+}
+
+/// Pure flatten-and-compare oracle for benchmarks and callers that already
+/// own complete descriptor slices. Its result is identical to the Merkle
+/// walker's result; only descriptor discovery differs.
+pub(crate) fn diff_current_state_part_descriptor_slices(
+    left: &[CurrentStatePartDescriptor],
+    right: &[CurrentStatePartDescriptor],
+) -> Result<Vec<CurrentStatePartDescriptorDiffWindow>, LixError> {
+    if !left.is_empty() {
+        validate_descriptor_slice(left)?;
+    }
+    if !right.is_empty() {
+        validate_descriptor_slice(right)?;
+    }
+    let mut left_candidates = std::collections::BTreeMap::new();
+    let mut right_candidates = std::collections::BTreeMap::new();
+    insert_descriptor_candidates(&mut left_candidates, left.to_vec())?;
+    insert_descriptor_candidates(&mut right_candidates, right.to_vec())?;
+    remove_shared_descriptors(&mut left_candidates, &mut right_candidates);
+    Ok(descriptor_diff_windows(left_candidates, right_candidates))
+}
+
+async fn load_root_ref(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &CurrentStatePartDirectoryRoot,
+    cache: &mut std::collections::BTreeMap<[u8; 32], DirectoryNode>,
+) -> Result<DirectoryNodeRef, LixError> {
+    let node = load_cached_directory_node(store, root.root_id, cache).await?;
+    validate_root_summary(root, &node)?;
+    let (first_key, last_key, row_count, part_count) = node_summary(&node)?;
+    Ok(DirectoryNodeRef {
+        first_key,
+        last_key,
+        node_id: root.root_id,
+        row_count,
+        part_count,
+        level: node.level,
+    })
+}
+
+async fn load_node_ref(
+    store: &(impl StorageAdapterRead + ?Sized),
+    reference: &DirectoryNodeRef,
+    cache: &mut std::collections::BTreeMap<[u8; 32], DirectoryNode>,
+) -> Result<DirectoryNode, LixError> {
+    let node = load_cached_directory_node(store, reference.node_id, cache).await?;
+    let (first_key, last_key, row_count, part_count) = node_summary(&node)?;
+    if first_key != reference.first_key
+        || last_key != reference.last_key
+        || row_count != reference.row_count
+        || part_count != reference.part_count
+        || node.level != reference.level
+    {
+        return Err(directory_error("node disagrees with its range summary"));
+    }
+    Ok(node)
+}
+
+async fn load_cached_directory_node(
+    store: &(impl StorageAdapterRead + ?Sized),
+    node_id: [u8; 32],
+    cache: &mut std::collections::BTreeMap<[u8; 32], DirectoryNode>,
+) -> Result<DirectoryNode, LixError> {
+    if let Some(node) = cache.get(&node_id) {
+        return Ok(node.clone());
+    }
+    let node = load_node(store, node_id).await?;
+    cache.insert(node_id, node.clone());
+    Ok(node)
+}
+
+async fn collect_descriptor_candidates(
+    store: &(impl StorageAdapterRead + ?Sized),
+    reference: DirectoryNodeRef,
+    cache: &mut std::collections::BTreeMap<[u8; 32], DirectoryNode>,
+    candidates: &mut std::collections::BTreeMap<Vec<u8>, CurrentStatePartDescriptor>,
+    left: bool,
+    work: &mut Vec<DirectoryDiffWork>,
+) -> Result<(), LixError> {
+    let node = load_node_ref(store, &reference, cache).await?;
+    match node.kind {
+        0 => insert_descriptor_candidates(candidates, node.parts),
+        1 => {
+            for child in node.children.into_iter().rev().map(DirectoryNodeRef::from) {
+                work.push(if left {
+                    DirectoryDiffWork::CollectLeft(child)
+                } else {
+                    DirectoryDiffWork::CollectRight(child)
+                });
+            }
+            Ok(())
+        }
+        _ => unreachable!("validated directory node kind"),
+    }
+}
+
+fn insert_descriptor_candidates(
+    candidates: &mut std::collections::BTreeMap<Vec<u8>, CurrentStatePartDescriptor>,
+    descriptors: Vec<CurrentStatePartDescriptor>,
+) -> Result<(), LixError> {
+    for descriptor in descriptors {
+        match candidates.entry(descriptor.first_key.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(descriptor);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &descriptor => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(directory_error(
+                    "paired traversal found conflicting descriptors for one first key",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_shared_descriptors(
+    left: &mut std::collections::BTreeMap<Vec<u8>, CurrentStatePartDescriptor>,
+    right: &mut std::collections::BTreeMap<Vec<u8>, CurrentStatePartDescriptor>,
+) {
+    let shared = left
+        .iter()
+        .filter_map(|(first_key, left)| {
+            right
+                .get(first_key)
+                .is_some_and(|right| right == left)
+                .then(|| first_key.clone())
+        })
+        .collect::<Vec<_>>();
+    for first_key in shared {
+        left.remove(&first_key);
+        right.remove(&first_key);
+    }
+}
+
+fn enqueue_aligned_directory_refs(
+    left: Vec<DirectoryNodeRef>,
+    right: Vec<DirectoryNodeRef>,
+    work: &mut Vec<DirectoryDiffWork>,
+) {
+    let mut pending = Vec::new();
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+    while left_index < left.len() && right_index < right.len() {
+        let left_ref = &left[left_index];
+        let right_ref = &right[right_index];
+        if left_ref.last_key < right_ref.first_key {
+            pending.push(DirectoryDiffWork::CollectLeft(left_ref.clone()));
+            left_index += 1;
+            continue;
+        }
+        if right_ref.last_key < left_ref.first_key {
+            pending.push(DirectoryDiffWork::CollectRight(right_ref.clone()));
+            right_index += 1;
+            continue;
+        }
+        pending.push(DirectoryDiffWork::Compare(
+            left_ref.clone(),
+            right_ref.clone(),
+        ));
+        match left_ref.last_key.cmp(&right_ref.last_key) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Equal => {
+                left_index += 1;
+                right_index += 1;
+            }
+            std::cmp::Ordering::Greater => right_index += 1,
+        }
+    }
+    pending.extend(
+        left[left_index..]
+            .iter()
+            .cloned()
+            .map(DirectoryDiffWork::CollectLeft),
+    );
+    pending.extend(
+        right[right_index..]
+            .iter()
+            .cloned()
+            .map(DirectoryDiffWork::CollectRight),
+    );
+    work.extend(pending.into_iter().rev());
+}
+
+fn descriptor_diff_windows(
+    left: std::collections::BTreeMap<Vec<u8>, CurrentStatePartDescriptor>,
+    right: std::collections::BTreeMap<Vec<u8>, CurrentStatePartDescriptor>,
+) -> Vec<CurrentStatePartDescriptorDiffWindow> {
+    let mut descriptors = left
+        .into_values()
+        .map(|descriptor| (false, descriptor))
+        .chain(right.into_values().map(|descriptor| (true, descriptor)))
+        .collect::<Vec<_>>();
+    descriptors.sort_by(|(left_side, left), (right_side, right)| {
+        left.first_key
+            .cmp(&right.first_key)
+            .then_with(|| left_side.cmp(right_side))
+    });
+    let mut windows = Vec::<CurrentStatePartDescriptorDiffWindow>::new();
+    for (right_side, descriptor) in descriptors {
+        let append = windows
+            .last()
+            .is_some_and(|window| descriptor.first_key <= window.last_key);
+        if !append {
+            windows.push(CurrentStatePartDescriptorDiffWindow {
+                first_key: descriptor.first_key.clone(),
+                last_key: descriptor.last_key.clone(),
+                left: Vec::new(),
+                right: Vec::new(),
+            });
+        }
+        let window = windows.last_mut().expect("a descriptor created a window");
+        if descriptor.last_key > window.last_key {
+            window.last_key.clone_from(&descriptor.last_key);
+        }
+        if right_side {
+            window.right.push(descriptor);
+        } else {
+            window.left.push(descriptor);
+        }
+    }
+    windows
+}
+
 fn stage_node(writes: &mut StorageWriteSet, node: DirectoryNode) -> Result<StagedNode, LixError> {
     stage_node_reusing(writes, node, None)
 }
@@ -2743,6 +3123,299 @@ mod tests {
                 tree_height: 1,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn directory_merkle_diff_skips_an_identical_root_after_validation() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT * 2 + 7);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("directory should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("directory should commit");
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let read = CountingDirectoryRead {
+            inner: adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("diff read should open"),
+            directory_batch_sizes: Arc::clone(&batch_sizes),
+            catalog_batch_sizes: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let windows = diff_current_state_part_descriptors(&read, &root, &root)
+            .await
+            .expect("equal directory should diff");
+
+        assert!(windows.is_empty());
+        assert_eq!(
+            batch_sizes
+                .lock()
+                .expect("directory batch counts lock")
+                .as_slice(),
+            &[1],
+            "the root is validated once and every descendant is pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_merkle_diff_reads_only_the_changed_leaf_paths() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT * 2 + 7);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("directory should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("directory should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("splice read should open");
+        let mut splice_writes = adapter.new_write_set();
+        let key = Bytes::from_static(b"key-000001-m");
+        let plan = plan_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            &root,
+            std::slice::from_ref(&key),
+        )
+        .await
+        .expect("one-key splice should plan");
+        let mut replacement = plan.leaf_parts(0).to_vec();
+        replacement[1].content_digest = [7; 32];
+        let rewritten = stage_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            plan,
+            vec![replacement],
+        )
+        .await
+        .expect("one-leaf splice should stage");
+        drop(read);
+        adapter
+            .commit_write_set(splice_writes, StorageWriteOptions::default())
+            .await
+            .expect("splice should commit");
+
+        let mut expected_descriptors = descriptors.clone();
+        expected_descriptors[1].content_digest = [7; 32];
+        let expected =
+            diff_current_state_part_descriptor_slices(&descriptors, &expected_descriptors)
+                .expect("flat oracle should compare");
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let read = CountingDirectoryRead {
+            inner: adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("diff read should open"),
+            directory_batch_sizes: Arc::clone(&batch_sizes),
+            catalog_batch_sizes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let actual = diff_current_state_part_descriptors(&read, &root, &rewritten)
+            .await
+            .expect("rewritten directory should diff");
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].left, vec![descriptors[1].clone()]);
+        assert_eq!(actual[0].right, vec![expected_descriptors[1].clone()]);
+        assert_eq!(
+            batch_sizes
+                .lock()
+                .expect("directory batch counts lock")
+                .as_slice(),
+            &[1, 1, 1, 1],
+            "only two roots and the unequal leaf pair are read"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_merkle_diff_aligns_a_leaf_split_without_positional_pairing() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT * 2);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("directory should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("directory should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("splice read should open");
+        let mut splice_writes = adapter.new_write_set();
+        let key = Bytes::from_static(b"key-000000-0");
+        let plan = plan_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            &root,
+            std::slice::from_ref(&key),
+        )
+        .await
+        .expect("boundary insertion should plan");
+        let mut inserted = descriptors[0].clone();
+        inserted.first_key = b"key-000000-0a".to_vec();
+        inserted.last_key = b"key-000000-0z".to_vec();
+        inserted.content_digest = [8; 32];
+        let mut replacement = Vec::with_capacity(DIRECTORY_FANOUT + 1);
+        replacement.push(inserted.clone());
+        replacement.extend_from_slice(plan.leaf_parts(0));
+        let rewritten = stage_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            plan,
+            vec![replacement],
+        )
+        .await
+        .expect("overflowing leaf should split");
+        drop(read);
+        adapter
+            .commit_write_set(splice_writes, StorageWriteOptions::default())
+            .await
+            .expect("boundary insertion should commit");
+
+        let mut expected_descriptors = Vec::with_capacity(descriptors.len() + 1);
+        expected_descriptors.push(inserted.clone());
+        expected_descriptors.extend(descriptors.clone());
+        let expected =
+            diff_current_state_part_descriptor_slices(&descriptors, &expected_descriptors)
+                .expect("flat oracle should compare");
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let read = CountingDirectoryRead {
+            inner: adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("diff read should open"),
+            directory_batch_sizes: Arc::clone(&batch_sizes),
+            catalog_batch_sizes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let actual = diff_current_state_part_descriptors(&read, &root, &rewritten)
+            .await
+            .expect("split directory should diff");
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 1);
+        assert!(actual[0].left.is_empty());
+        assert_eq!(actual[0].right, vec![inserted]);
+        assert_eq!(
+            batch_sizes
+                .lock()
+                .expect("directory batch counts lock")
+                .as_slice(),
+            &[1, 1, 1, 1, 1],
+            "the unchanged sibling leaf is pruned across unequal shapes"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_merkle_diff_aligns_a_contracted_root_with_unequal_height() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT * 2);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("directory should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("directory should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("splice read should open");
+        let original_root = load_node(&read, root.root_id)
+            .await
+            .expect("root should load");
+        let removed_count = usize::try_from(original_root.children[0].part_count)
+            .expect("fixture part count fits usize");
+        let mut splice_writes = adapter.new_write_set();
+        let key = Bytes::from_static(b"key-000001-m");
+        let plan = plan_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            &root,
+            std::slice::from_ref(&key),
+        )
+        .await
+        .expect("leaf removal should plan");
+        let rewritten = stage_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            plan,
+            vec![Vec::new()],
+        )
+        .await
+        .expect("root should contract to its surviving leaf");
+        assert_eq!((root.tree_height, rewritten.tree_height), (2, 1));
+        drop(read);
+        adapter
+            .commit_write_set(splice_writes, StorageWriteOptions::default())
+            .await
+            .expect("contraction should commit");
+
+        let surviving = &descriptors[removed_count..];
+        let expected = diff_current_state_part_descriptor_slices(&descriptors, surviving)
+            .expect("flat oracle should compare");
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let read = CountingDirectoryRead {
+            inner: adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("diff read should open"),
+            directory_batch_sizes: Arc::clone(&batch_sizes),
+            catalog_batch_sizes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let actual = diff_current_state_part_descriptors(&read, &root, &rewritten)
+            .await
+            .expect("unequal-height directories should diff");
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.iter().map(|window| window.left.len()).sum::<usize>(),
+            removed_count
+        );
+        assert!(actual.iter().all(|window| window.right.is_empty()));
+        assert_eq!(
+            batch_sizes
+                .lock()
+                .expect("directory batch counts lock")
+                .as_slice(),
+            &[1, 1, 1],
+            "the surviving contracted leaf is identified by node ID and not reread"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_merkle_diff_rejects_a_cross_wired_root_summary() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(3);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("directory should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("directory should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("diff read should open");
+        let forged = CurrentStatePartDirectoryRoot {
+            row_count: root.row_count + 1,
+            ..root.clone()
+        };
+
+        assert!(
+            diff_current_state_part_descriptors(&read, &root, &forged)
+                .await
+                .is_err(),
+            "both endpoint root summaries must be validated before pruning"
+        );
     }
 
     #[tokio::test]
