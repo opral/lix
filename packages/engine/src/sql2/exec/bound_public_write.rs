@@ -32,8 +32,8 @@ use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::transaction::types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
-    CertifiedRawWriteBatchPreparation, PreparedRowFacts, RawWriteBatch, RawWriteRowRef,
-    TransactionJson, TransactionWrite, TransactionWriteMode,
+    CertifiedRawWriteBatchPreparation, CompleteCollectionReplacementProof, PreparedRowFacts,
+    RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
 use crate::wasm::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
@@ -969,7 +969,7 @@ async fn try_execute_direct_path_value_replacement_batch(
             }
         }
     }
-    let complete_collection_replacement = certified_generation_identity
+    let replaces_complete_collection = certified_generation_identity
         || (candidates.len() == unique_row_count
             && collection_generation
                 .is_some_and(|generation| generation.live_count == unique_row_count as u64));
@@ -1084,15 +1084,15 @@ async fn try_execute_direct_path_value_replacement_batch(
                     requires_transaction_validation: false,
                 },
                 tracked_keys_strictly_ordered: true,
-                complete_collection_replacement,
-                complete_collection_identity_digest: complete_collection_replacement
-                    .then_some(ordered_identity_digest)
-                    .flatten(),
-                complete_collection_replay_bytes: complete_collection_replacement
+                complete_collection_replacement: replaces_complete_collection
                     .then(|| {
-                        replacement_identity_replay_bytes
-                            .checked_add(normalized_len)
-                            .and_then(|bytes| u64::try_from(bytes).ok())
+                        Some(CompleteCollectionReplacementProof {
+                            ordered_identity_digest: ordered_identity_digest?,
+                            replay_bytes: u64::try_from(
+                                replacement_identity_replay_bytes.checked_add(normalized_len)?,
+                            )
+                            .ok()?,
+                        })
                     })
                     .flatten(),
             },
@@ -2849,9 +2849,7 @@ async fn try_execute_direct_path_value_replacement(
                 requires_transaction_validation: false,
             },
             tracked_keys_strictly_ordered: true,
-            complete_collection_replacement: false,
-            complete_collection_identity_digest: None,
-            complete_collection_replay_bytes: None,
+            complete_collection_replacement: None,
         },
     )?;
     ctx.stage_certified_parameter_batch_replace(rows).await?;
@@ -4419,9 +4417,7 @@ fn certified_direct_parameter_insert_batch(
             requires_transaction_validation: false,
         },
         tracked_keys_strictly_ordered,
-        complete_collection_replacement: false,
-        complete_collection_identity_digest: None,
-        complete_collection_replay_bytes: None,
+        complete_collection_replacement: None,
     };
     let rows = CertifiedParameterInsertBatch::new(
         entity_pks,
@@ -4566,9 +4562,7 @@ fn certified_direct_path_value_insert_batch(
                 requires_transaction_validation: false,
             },
             tracked_keys_strictly_ordered: true,
-            complete_collection_replacement: false,
-            complete_collection_identity_digest: None,
-            complete_collection_replay_bytes: None,
+            complete_collection_replacement: None,
         },
     )?))
 }

@@ -1141,19 +1141,16 @@ async fn stage_changelog_commits(
         let commit_row_indices = tracked_row_indices_by_commit
             .get(&commit_id)
             .map(Vec::as_slice);
-        let commit_delta_bytes = if state_rows.certified_complete_collection_replacement()
-            && commit_row_indices.is_some_and(|indices| indices.len() == state_rows.len())
+        let commit_delta_bytes = if let Some(proof) = state_rows
+            .complete_collection_replacement_proof()
+            .filter(|_| commit_row_indices.is_some_and(|indices| indices.len() == state_rows.len()))
         {
-            if let Some(certified_bytes) = state_rows.certified_complete_collection_replay_bytes() {
-                #[cfg(debug_assertions)]
-                debug_assert_eq!(
-                    certified_bytes,
-                    replay_bytes_for_rows(state_rows, commit_row_indices)?
-                );
-                certified_bytes
-            } else {
+            #[cfg(debug_assertions)]
+            debug_assert_eq!(
+                proof.replay_bytes,
                 replay_bytes_for_rows(state_rows, commit_row_indices)?
-            }
+            );
+            proof.replay_bytes
         } else {
             replay_bytes_for_rows(state_rows, commit_row_indices)?
         };
@@ -2229,27 +2226,19 @@ async fn certify_complete_replacement_generations(
         else {
             continue;
         };
-        let certified_identity_digest = state_rows.certified_complete_collection_identity_digest();
+        let Some(replacement_proof) = state_rows.complete_collection_replacement_proof() else {
+            continue;
+        };
         #[cfg(debug_assertions)]
-        if let Some(certified_identity_digest) = certified_identity_digest {
-            debug_assert_eq!(
-                Some(certified_identity_digest),
-                crate::collection_generation::ordered_single_string_identity_digest(
-                    row_indices
-                        .iter()
-                        .map(|&row_index| state_rows.row(row_index).entity_pk),
-                )
-            );
-        }
-        let Some(ordered_identity_digest) = certified_identity_digest.or_else(|| {
+        debug_assert_eq!(
+            Some(replacement_proof.ordered_identity_digest),
             crate::collection_generation::ordered_single_string_identity_digest(
                 row_indices
                     .iter()
-                    .map(|&row_index| state_rows.row(row_index).entity_pk),
+                    .map(|&row_index| state_rows.row(row_index).entity_pk)
             )
-        }) else {
-            continue;
-        };
+        );
+        let ordered_identity_digest = replacement_proof.ordered_identity_digest;
         let mut current = root.parent_commit_id;
         let mut seen = BTreeSet::new();
         let mut lifecycle_summary = None;
@@ -2347,7 +2336,7 @@ fn certified_complete_replacement_scope(
     row_indices: &[RowIndex],
     commit_id: CommitId,
 ) -> Option<CommitDeltaReplacementScope> {
-    if !state_rows.certified_complete_collection_replacement()
+    if state_rows.complete_collection_replacement_proof().is_none()
         || row_indices.is_empty()
         || row_indices.len() != state_rows.len()
     {
@@ -3015,41 +3004,42 @@ async fn stage_tracked_head(
                         .change_id
                         .is_some_and(|change_id| change_id != ChangeId::default())
             });
-        let complete_replacement_schema = (state_rows.certified_complete_collection_replacement()
-            && ordered_addressable_commits.contains(&root.commit_id)
-            && !is_checkpoint_publication
-            && state_row_indices.len() >= PACKED_CURRENT_BASE_MIN_ROWS
-            && certified_fresh_plugin_file_id.is_none()
-            && !host_certified_live_increments.contains_key(&root.branch_id)
-            && staged.selected_change_batches.is_empty()
-            && selected_materialization.is_none()
-            && untracked_deltas.is_empty()
-            && engine_rows.is_empty()
-            && explicit_branch_targets.is_empty()
-            && state_row_indices.len() == state_rows.len()
-            && insert_selection.is_empty())
-        .then(|| state_rows.first())
-        .flatten()
-        .filter(|first| {
-            state_row_indices.iter().all(|&row_index| {
-                let row = state_rows.row(row_index);
-                row.schema_key == first.schema_key
-                    && row.branch_id.as_str() == root.branch_id
-                    && !row.global
-                    && !row.untracked
-                    && row.snapshot.is_some()
-                    && row.metadata.is_none()
-                    && row.file_id.is_none()
-                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                    && row.schema_key
-                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-                    && row.commit_id == Some(root.commit_id)
-                    && row
-                        .change_id
-                        .is_some_and(|change_id| change_id != ChangeId::default())
+        let complete_replacement_schema =
+            (state_rows.complete_collection_replacement_proof().is_some()
+                && ordered_addressable_commits.contains(&root.commit_id)
+                && !is_checkpoint_publication
+                && state_row_indices.len() >= PACKED_CURRENT_BASE_MIN_ROWS
+                && certified_fresh_plugin_file_id.is_none()
+                && !host_certified_live_increments.contains_key(&root.branch_id)
+                && staged.selected_change_batches.is_empty()
+                && selected_materialization.is_none()
+                && untracked_deltas.is_empty()
+                && engine_rows.is_empty()
+                && explicit_branch_targets.is_empty()
+                && state_row_indices.len() == state_rows.len()
+                && insert_selection.is_empty())
+            .then(|| state_rows.first())
+            .flatten()
+            .filter(|first| {
+                state_row_indices.iter().all(|&row_index| {
+                    let row = state_rows.row(row_index);
+                    row.schema_key == first.schema_key
+                        && row.branch_id.as_str() == root.branch_id
+                        && !row.global
+                        && !row.untracked
+                        && row.snapshot.is_some()
+                        && row.metadata.is_none()
+                        && row.file_id.is_none()
+                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                        && row.schema_key
+                            != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                        && row.commit_id == Some(root.commit_id)
+                        && row
+                            .change_id
+                            .is_some_and(|change_id| change_id != ChangeId::default())
+                })
             })
-        })
-        .map(|row| row.schema_key.as_str());
+            .map(|row| row.schema_key.as_str());
         let absence_guards =
             if can_publish_ordered_packed_current_base || complete_replacement_schema.is_some() {
                 Vec::new()
