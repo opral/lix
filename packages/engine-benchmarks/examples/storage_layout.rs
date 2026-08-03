@@ -266,7 +266,7 @@ async fn print_commit_delta_inventory(read: &impl lix_engine::storage_adapter::S
         .expect("decode commit-delta inventory")
     {
         println!(
-            "COMMIT_DELTA\tcommit={}\tphysical_key_bytes={}\tphysical_value_bytes={}\tsegments={}\tmembers={}\tauthored={}\tselected={}\tselected_tombstones={}\tcertified={}\tselected_certified={}\tselected_direct_addresses={}\tselected_source_commits={}\tdominant_selected_source_members={}",
+            "COMMIT_DELTA\tcommit={}\tphysical_key_bytes={}\tphysical_value_bytes={}\tsegments={}\tmembers={}\tauthored={}\tselected={}\tselected_tombstones={}\tselected_direct_addresses={}\tselected_source_commits={}\tdominant_selected_source_members={}",
             entry.commit_id,
             entry.physical_key_bytes,
             entry.physical_value_bytes,
@@ -275,8 +275,6 @@ async fn print_commit_delta_inventory(read: &impl lix_engine::storage_adapter::S
             entry.authored_members,
             entry.selected_members,
             entry.selected_tombstones,
-            entry.certified_members,
-            entry.selected_certified_members,
             entry.selected_direct_addresses,
             entry.selected_source_commits,
             entry.dominant_selected_source_members,
