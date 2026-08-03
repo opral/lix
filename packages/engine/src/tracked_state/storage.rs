@@ -989,22 +989,36 @@ impl CommitDeltaPointReadCache {
 }
 
 impl CommitDeltaLiveMembershipCursor {
-    pub(crate) fn cached_live_member(
+    /// Resolves one key through a monotonically consumed immutable generation.
+    ///
+    /// The shared point cache is only an opportunistic source. An ordered
+    /// transaction must not fall back to the generic live-state point reader
+    /// merely because the next physical part has not been observed twice yet:
+    /// load that one bounded part directly and retain it until the cursor
+    /// crosses the next range boundary.
+    pub(crate) async fn live_member(
         &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
         cache: &CommitDeltaPointReadCache,
         encoded_key: &[u8],
     ) -> Result<Option<bool>, LixError> {
         if self.manifest.is_none() {
-            self.manifest = cache.manifest(self.commit_id)?;
+            self.manifest =
+                load_commit_delta_manifest_cached(store, self.commit_id, Some(cache)).await?;
         }
         let Some(manifest) = self.manifest.as_ref() else {
             return Ok(None);
         };
-        if manifest.selected_source_commit_id.is_some() || manifest.inline_segment().is_some() {
+        if manifest.selected_source_commit_id.is_some() {
             return Ok(None);
         }
-        let Some(segment_index) = commit_delta_segment_for_key(&manifest, encoded_key) else {
-            return Ok(Some(false));
+        let segment_index = if manifest.inline_segment().is_some() {
+            0
+        } else {
+            let Some(segment_index) = commit_delta_segment_for_key(manifest, encoded_key) else {
+                return Ok(Some(false));
+            };
+            segment_index
         };
         if self.segment_index != Some(segment_index) || self.segment.is_none() {
             self.segment = cache.segment(
@@ -1012,11 +1026,52 @@ impl CommitDeltaLiveMembershipCursor {
                 segment_index,
                 manifest.segments.get(segment_index),
             )?;
+            if self.segment.is_none() {
+                let decoded = if let Some(inline_segment) = manifest.inline_segment() {
+                    decode_owned_commit_delta_segment(inline_segment, None)?
+                } else {
+                    let bounds = manifest.segments.get(segment_index).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "tracked_state commit_delta manifest for commit '{}' has no segment {segment_index}",
+                                self.commit_id
+                            ),
+                        )
+                    })?;
+                    let storage_key =
+                        commit_delta_segment_key_for_bounds(self.commit_id, segment_index, bounds)?;
+                    let loaded = PointReadPlan::new(
+                        TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+                        &[StorageKey(Bytes::from(storage_key))],
+                    )
+                    .materialize(store, StorageGetOptions::default())
+                    .await?;
+                    let bytes = loaded
+                        .value
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .and_then(full_value_bytes)
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "tracked_state commit_delta manifest for commit '{}' references missing segment {segment_index}",
+                                    self.commit_id
+                                ),
+                            )
+                        })?;
+                    decode_owned_commit_delta_segment(&bytes, Some(bounds))?
+                };
+                self.segment = Some(decoded);
+            }
             self.segment_index = Some(segment_index);
         }
-        let Some(segment) = self.segment.as_ref() else {
-            return Ok(None);
-        };
+        let segment = self
+            .segment
+            .as_ref()
+            .expect("membership cursor loaded its current immutable part");
         Ok(Some(
             find_commit_delta_value(&segment.leaf, encoded_key, self.commit_id)?
                 .is_some_and(|value| !value.deleted),
@@ -8130,6 +8185,28 @@ mod tests {
             .await
             .expect("replacement point replay should load");
         assert!(values.iter().all(Option::is_some));
+        let point_cache = super::CommitDeltaPointReadCache::default();
+        let mut membership = point_cache.live_membership_cursor(commit_id);
+        let mut encoded_key = Vec::new();
+        for fixture_index in [0, 777, 1_024] {
+            encoded_key.clear();
+            crate::tracked_state::encode_single_string_key_ref_into(
+                &mut encoded_key,
+                "alpha",
+                None,
+                fixtures[fixture_index]
+                    .entity_pk
+                    .as_single_string()
+                    .expect("fixture identity is one string"),
+            );
+            assert_eq!(
+                membership
+                    .live_member(&read, &point_cache, &encoded_key)
+                    .await
+                    .expect("cold monotonic membership should load its bounded part"),
+                Some(true)
+            );
+        }
         let change_id = staged
             .change_id_at(777)
             .expect("replacement row has a direct address");

@@ -1994,8 +1994,9 @@ pub(crate) struct PackedIdentityMembership {
 }
 
 impl PackedIdentityMembership {
-    pub(crate) fn contains_single_string(
+    pub(crate) async fn contains_single_string(
         &mut self,
+        store: &(impl StorageAdapterRead + ?Sized),
         entity_pk: &str,
     ) -> Result<Option<bool>, LixError> {
         self.encoded_key.clear();
@@ -2006,7 +2007,12 @@ impl PackedIdentityMembership {
             entity_pk,
         );
         self.cursor
-            .cached_live_member(&self.cache.commit_delta_points, &self.encoded_key[encoded])
+            .live_member(
+                store,
+                &self.cache.commit_delta_points,
+                &self.encoded_key[encoded],
+            )
+            .await
     }
 
     pub(crate) fn complete_generation(&self) -> (u64, [u8; 32]) {

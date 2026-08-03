@@ -6434,9 +6434,12 @@ where
             }
             self.prepared_mutation_overlay_empty = !self.staged_writes.has_staged_state_rows()?;
         }
+        let opening_read = self.opening_read();
         let cached_membership = match &mut self.prepared_mutation_membership {
             PreparedMutationMembership::Packed(membership) => {
-                membership.contains_single_string(primary_key)?
+                membership
+                    .contains_single_string(&opening_read, primary_key)
+                    .await?
             }
             PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
                 None
@@ -6569,11 +6572,15 @@ where
             }
             self.prepared_mutation_overlay_empty = !self.staged_writes.has_staged_state_rows()?;
         }
+        let opening_read = self.opening_read();
         let PreparedMutationMembership::Packed(membership) = &mut self.prepared_mutation_membership
         else {
             unreachable!("packed literal mutation membership was checked above")
         };
-        match membership.contains_single_string(primary_key)? {
+        match membership
+            .contains_single_string(&opening_read, primary_key)
+            .await?
+        {
             Some(false) => return Ok(Some(crate::sql2::SqlWriteResult::affected(0))),
             Some(true) => {}
             None => return Ok(None),
