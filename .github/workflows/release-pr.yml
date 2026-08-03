@@ -10,6 +10,10 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: release-pr
+  cancel-in-progress: true
+
 jobs:
   release-pr:
     name: Open release PR
@@ -36,6 +40,7 @@ jobs:
 
       - name: Create or update release PR
         if: steps.prepare.outputs.has_release == 'true'
+        id: release_pr
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -48,3 +53,25 @@ jobs:
 
             Merging this PR updates `CHANGELOG.md`, bumps lockstep package versions,
             and enables the release workflow to create `v${{ steps.prepare.outputs.version }}` and publish packages.
+
+      - name: Close superseded release PRs
+        if: steps.prepare.outputs.has_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_PR: ${{ steps.release_pr.outputs.pull-request-number }}
+          TARGET_BRANCH: release/v${{ steps.prepare.outputs.version }}
+        run: |
+          gh pr list \
+            --state open \
+            --base main \
+            --limit 100 \
+            --json number,headRefName,isCrossRepository \
+            --jq '.[] | select(.isCrossRepository == false and (.headRefName | test("^release/v[0-9]+\\.[0-9]+\\.[0-9]+$"))) | [.number, .headRefName] | @tsv' |
+          while IFS=$'\t' read -r number branch; do
+            if [ "$branch" = "$TARGET_BRANCH" ]; then
+              continue
+            fi
+
+            gh pr close "$number" \
+              --comment "Superseded by #${CURRENT_PR}, which contains the current release changes."
+          done
