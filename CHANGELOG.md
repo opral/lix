@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.10.0 - 2026-08-03
+
+### Minor
+
+- Added repository-native accounts and single-account change attribution across local and remote sessions.
+
+  Every change now has one required account, anonymous work uses the built-in anonymous account, and applications can select an active account through the Rust, JavaScript, SQL, and server-protocol APIs.
+- Added persistent undo and redo for tracked branch history across the Rust SDK, JavaScript SDK, remote protocol, and CLI.
+
+  Undo and redo append inverse and replay commits without rewinding branch history. Atomic batches and transactions remain one undo unit, while untracked state remains unchanged; checkpoints and merge commits form undo boundaries.
+- Renamed the `lix_file`, `lix_file_by_branch`, and `lix_file_history` binary payload column from `data` to `content`. Native file read and write APIs now use `content` names as well; the former `data` surface is not supported.
+- Git replay can now seed the complete parent tree for a bounded commit window.
+
+  Use `--parent-tree full` when untouched parent files must remain available in current and historical snapshots; the default window-scoped mode remains unchanged.
+- Introduced Plugin API v1 and migrated the bundled CSV, JSON, Markdown, Excalidraw, and Git text plugins.
+
+  Plugin API v1 replaces the previous Wasm plugin contract with a fused, host-owned API.
+- SQL writes now support `RETURNING` across registered entities and writable filesystem and branch surfaces. INSERT and UPDATE return final post-write values (including generated defaults), while DELETE continues to return the removed row values.
+
+### Patch
+
+- Filesystem sync now reports symlinks and other unsupported entries that block a regular Lix file instead of silently leaving Lix and disk out of sync.
+
+  Git replay now also rejects unsupported paths and entries explicitly instead of representing them as regular files.
+- Improved reliability and reporting for large semantic merges.
+
+  Large conflict sets no longer hit small-transition limits, and merge previews and receipts now include plugin-resolved changes in their statistics.
+- Improved reliability for large and frequently edited Markdown files.
+
+  Large structured Markdown files no longer exhaust the default plugin memory limit, and sequential localized edits now apply to the latest document state.
+- Improved performance and reduced memory and disk use for large repositories.
+
+  History queries, checkpoints, working changes, binary and media storage, remote observations, and large inserts now do less redundant work. Million-row inserts complete more than 20% faster on both RocksDB and SlateDB.
+
 ## 0.9.0 - 2026-07-29
 
 ### Minor
