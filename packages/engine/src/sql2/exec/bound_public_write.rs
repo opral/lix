@@ -2937,6 +2937,26 @@ pub(crate) fn prepare_path_value_replacement_row_known_live(
     params: &[Value],
 ) -> Result<PreparedPathValueReplacementRow, LixError> {
     let primary_key = program.primary_key(params)?;
+    let entity_pk = EntityPk::single(primary_key.to_owned());
+    let mut normalized = Vec::with_capacity(primary_key.len().saturating_add(32));
+    let (start, end) =
+        append_path_value_replacement_snapshot(program, primary_key, params, &mut normalized)?;
+    let snapshot =
+        TransactionJson::from_certified_row_content_arena(normalized, vec![(start, end)])?
+            .pop()
+            .expect("one certified replacement snapshot");
+    Ok(PreparedPathValueReplacementRow {
+        entity_pk,
+        snapshot,
+    })
+}
+
+pub(crate) fn append_path_value_replacement_snapshot(
+    program: &PreparedPathValueReplacementProgram,
+    primary_key: &str,
+    params: &[Value],
+    normalized: &mut Vec<u8>,
+) -> Result<(usize, usize), LixError> {
     let replacement_value = match params.get(program.value_param_index) {
         Some(Value::Text(value)) => Some(value.as_str()),
         Some(Value::Null) => None,
@@ -2947,32 +2967,29 @@ pub(crate) fn prepare_path_value_replacement_row_known_live(
             ));
         }
     };
-    let entity_pk = EntityPk::single(primary_key.to_owned());
-
-    let mut normalized = Vec::with_capacity(primary_key.len().saturating_add(32));
+    let start = normalized.len();
     normalized.extend_from_slice(b"{\"path\":");
-    append_canonical_json_string(&mut normalized, primary_key)?;
+    if let Err(error) = append_canonical_json_string(normalized, primary_key) {
+        normalized.truncate(start);
+        return Err(error);
+    }
     normalized.extend_from_slice(b",\"value\":");
-    match replacement_value {
+    let result = match replacement_value {
         None => normalized.extend_from_slice(b"null"),
         Some(raw) => {
-            append_canonical_json_parameter(&mut normalized, raw)?;
+            if let Err(error) = append_canonical_json_parameter(normalized, raw) {
+                normalized.truncate(start);
+                return Err(error);
+            }
         }
-    }
+    };
+    let () = result;
     normalized.push(b'}');
-    let normalized_len = normalized.len();
-    let snapshot =
-        TransactionJson::from_certified_row_content_arena(normalized, vec![(0, normalized_len)])?
-            .pop()
-            .expect("one certified replacement snapshot");
     #[cfg(test)]
     CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| {
         executions.set(executions.get().saturating_add(1));
     });
-    Ok(PreparedPathValueReplacementRow {
-        entity_pk,
-        snapshot,
-    })
+    Ok((start, normalized.len()))
 }
 
 /// Stage entity INSERT/UPDATE rows and, when requested, retain their final

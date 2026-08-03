@@ -113,11 +113,18 @@ pub(crate) async fn prepare_path_value_replacement_row(
     bound_public_write::prepare_path_value_replacement_row(ctx, program, params).await
 }
 
-pub(crate) fn prepare_path_value_replacement_row_known_live(
+pub(crate) fn append_path_value_replacement_snapshot(
     program: &bound_public_write::PreparedPathValueReplacementProgram,
+    primary_key: &str,
     params: &[crate::Value],
-) -> Result<bound_public_write::PreparedPathValueReplacementRow, crate::LixError> {
-    bound_public_write::prepare_path_value_replacement_row_known_live(program, params)
+    normalized: &mut Vec<u8>,
+) -> Result<(usize, usize), crate::LixError> {
+    bound_public_write::append_path_value_replacement_snapshot(
+        program,
+        primary_key,
+        params,
+        normalized,
+    )
 }
 
 #[cfg(test)]

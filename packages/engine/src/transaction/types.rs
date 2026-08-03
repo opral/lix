@@ -570,23 +570,6 @@ impl CertifiedParameterBatch {
         self.into_dense_prepared_timestamps(origin_key, DenseParameterTimestamps::Scalar(timestamp))
     }
 
-    pub(crate) fn into_dense_prepared_with_timestamps(
-        self,
-        origin_key: Option<&SharedStr>,
-        timestamps: Vec<LixTimestamp>,
-    ) -> Result<PreparedStateBatch, LixError> {
-        if timestamps.len() != self.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "certified replacement timestamp column is not aligned",
-            ));
-        }
-        self.into_dense_prepared_timestamps(
-            origin_key,
-            DenseParameterTimestamps::PerRow(timestamps),
-        )
-    }
-
     fn into_dense_prepared_timestamps(
         self,
         origin_key: Option<&SharedStr>,
@@ -2705,13 +2688,12 @@ impl PreparedStateBatch {
 
     pub(crate) fn certify_complete_collection_replacement(
         &mut self,
+        expected_schema_key: &str,
+        expected_branch_id: &str,
         expected_live_count: u64,
         expected_ordered_identity_digest: [u8; 32],
     ) -> bool {
-        if self.len() as u64 != expected_live_count
-            || self.is_empty()
-            || !self.certified_tracked_keys_strictly_ordered
-        {
+        if u64::try_from(self.len()).ok() != Some(expected_live_count) || self.is_empty() {
             return false;
         }
         let Some(actual_digest) =
@@ -2725,7 +2707,15 @@ impl PreparedStateBatch {
             return false;
         }
         let Some(replay_bytes) = self.iter().try_fold(0_u64, |bytes, row| {
-            if row.snapshot.is_none() || row.file_id.is_some() || row.untracked || row.global {
+            if row.schema_key.as_str() != expected_schema_key
+                || row.branch_id.as_str() != expected_branch_id
+                || row.snapshot.is_none()
+                || row.file_id.is_some()
+                || row.origin.is_some()
+                || row.origin_key.is_some()
+                || row.untracked
+                || row.global
+            {
                 return None;
             }
             let row_bytes = row
@@ -2738,10 +2728,23 @@ impl PreparedStateBatch {
         }) else {
             return false;
         };
+        // A complete replacement is one immutable post-image generation, not
+        // a sequence of row statements. Canonicalize its lifecycle boundary
+        // exactly where the complete-set proof becomes authoritative so the
+        // durable part encoder never inherits legacy per-call timestamps.
+        let replacement_timestamp = self.row(0).updated_at;
+        if let Some(dense) = &mut self.dense_certified_parameter {
+            dense.timestamps = DenseParameterTimestamps::Scalar(replacement_timestamp);
+        } else {
+            for slot in &mut self.slots {
+                slot.updated_at = replacement_timestamp;
+            }
+        }
         self.complete_collection_replacement = Some(CompleteCollectionReplacementProof {
             ordered_identity_digest: expected_ordered_identity_digest,
             replay_bytes,
         });
+        self.certified_tracked_keys_strictly_ordered = true;
         true
     }
 
@@ -4214,6 +4217,19 @@ mod tests {
         assert_eq!(prepared.row(0).commit_id, Some(commit_id));
         assert_eq!(prepared.row(1).commit_id, Some(commit_id));
         assert!(prepared.certified_tracked_keys_strictly_ordered());
+        let ordered_identity_digest =
+            crate::collection_generation::ordered_single_string_identity_digest(
+                prepared.iter().map(|row| row.entity_pk),
+            )
+            .expect("single-string identities should hash");
+        assert!(prepared.certify_complete_collection_replacement(
+            "dense_replacement",
+            "main",
+            2,
+            ordered_identity_digest,
+        ));
+        assert_eq!(prepared.row(0).updated_at, first_timestamp);
+        assert_eq!(prepared.row(1).updated_at, first_timestamp);
         let (columnar_commit_id, schema_key, snapshots) = prepared
             .dense_entity_columnar_input()
             .expect("coalesced replacement retains contiguous columnar input");
@@ -4225,6 +4241,54 @@ mod tests {
         assert!(!prepared.is_dense_certified_parameter());
         assert!(!prepared.certified_tracked_keys_strictly_ordered());
         assert_eq!(prepared.len(), 3);
+    }
+
+    #[test]
+    fn complete_replacement_certificate_rejects_rows_outside_collection_scope() {
+        let certificate = CertifiedRawWriteBatchPreparation {
+            schema_plan_id: SchemaPlanId::for_test(10),
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+            tracked_keys_strictly_ordered: true,
+            complete_collection_replacement: None,
+        };
+        let prepare = |schema_key: &str, key: &str, timestamp| {
+            CertifiedParameterReplacementBatch::new(
+                vec![EntityPk::single(key)],
+                vec![
+                    TransactionJson::from_certified_shared_normalized_row_content(
+                        format!(r#"{{"id":"{key}"}}"#).into(),
+                    ),
+                ],
+                schema_key.into(),
+                "main".into(),
+                certificate,
+            )
+            .expect("certified replacement should construct")
+            .into_dense_prepared(None, timestamp)
+            .expect("certified replacement should prepare")
+        };
+        let first_timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z");
+        let second_timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:01.000Z");
+        let mut prepared = prepare("other_schema", "a", first_timestamp);
+        prepared.append(prepare("target_schema", "b", second_timestamp));
+        let ordered_identity_digest =
+            crate::collection_generation::ordered_single_string_identity_digest(
+                prepared.iter().map(|row| row.entity_pk),
+            )
+            .expect("single-string identities should hash");
+
+        assert!(!prepared.certify_complete_collection_replacement(
+            "target_schema",
+            "main",
+            2,
+            ordered_identity_digest,
+        ));
+        assert_eq!(prepared.row(0).updated_at, first_timestamp);
+        assert_eq!(prepared.row(1).updated_at, second_timestamp);
+        assert!(prepared.complete_collection_replacement_proof().is_none());
     }
 
     #[test]

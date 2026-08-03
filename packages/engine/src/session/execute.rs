@@ -2584,6 +2584,29 @@ where
                 };
             let params = auto_params.as_deref().unwrap_or(params);
             let transaction = self.transaction_mut()?;
+            if transaction.prepared_mutation_matches(&planning_sql) {
+                transaction
+                    .flush_prepared_mutation_barrier(
+                        &planning_sql,
+                        options.origin_key.as_deref(),
+                        params,
+                    )
+                    .await?;
+                let previous_origin_key =
+                    transaction.replace_origin_key(options.origin_key.clone());
+                let result = transaction
+                    .try_execute_prepared_mutation(&planning_sql, params)
+                    .await;
+                transaction.replace_origin_key(previous_origin_key);
+                return match result {
+                    Ok(Some(result)) => Ok(ExecuteResult::from_sql_write_result(result)),
+                    Ok(None) => Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "prepared transaction mutation disappeared during warm execution",
+                    )),
+                    Err(error) => Err(normalize_sql_surface_error(error, sql)),
+                };
+            }
             let is_read = matches!(
                 sql2::bind_statement_route(&statement)?,
                 sql2::BoundStatementRoute::Read
@@ -2908,6 +2931,14 @@ where
         }
         let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
         transaction.remember_prepared_mutation(sql, &tx_plan)?;
+        // The first statement is the producer of the typed program. Feed it
+        // through that program immediately so a homogeneous transaction never
+        // creates one legacy prepared row before entering the journal.
+        match transaction.try_execute_prepared_mutation(sql, params).await {
+            Ok(Some(result)) => return Ok(ExecuteResult::from_sql_write_result(result)),
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
         let checkpoint = (checkpoint_post_stage_returning
             && sql2::write_plan_requires_post_stage_returning_checkpoint(&tx_plan))
         .then(|| transaction.begin_sql_statement_checkpoint())

@@ -932,6 +932,8 @@ impl TransactionWriteBuffer {
 
     pub(crate) fn certify_complete_collection_replacement(
         &self,
+        expected_schema_key: &str,
+        expected_branch_id: &str,
         expected_live_count: u64,
         expected_ordered_identity_digest: [u8; 32],
     ) -> Result<bool, LixError> {
@@ -946,6 +948,8 @@ impl TransactionWriteBuffer {
             | StagedPreparedRows::Indexed { rows, .. } => rows,
         };
         Ok(batch.certify_complete_collection_replacement(
+            expected_schema_key,
+            expected_branch_id,
             expected_live_count,
             expected_ordered_identity_digest,
         ))
