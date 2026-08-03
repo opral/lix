@@ -5,8 +5,8 @@ use crate::json_store::{
 };
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, StorageAdapter, StorageReadOptions, StorageWriteOptions,
-    StorageWriteSet, StorageWriteSetStats,
+    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageReadOptions,
+    StorageWriteOptions, StorageWriteSet, StorageWriteSetStats,
 };
 use crate::tracked_state::{
     CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
@@ -68,7 +68,20 @@ pub struct BenchTrackedFixture<StorageImpl: Storage> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchCurrentStatePointMode {
     PersistentCatalog,
+    CatalogThenReplay,
     FirstParentReplay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchCurrentStateSparseShape {
+    UnrelatedScopes,
+    TouchedScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchCurrentStatePointTarget {
+    ColdUntouched,
+    HotMutated,
 }
 
 #[expect(missing_debug_implementations)]
@@ -81,6 +94,12 @@ pub struct BenchCurrentStatePointFixture<StorageImpl: Storage> {
     catalog_manifest_bytes: u64,
     replay_manifest_bytes: u64,
     catalog_staged_encoded_bytes: u64,
+    directory_staged_encoded_bytes: u64,
+    sparse_staged_puts: u64,
+    sparse_written_bytes: u64,
+    first_sparse_elapsed_nanos: u64,
+    first_sparse_staged_puts: u64,
+    first_sparse_written_bytes: u64,
 }
 
 pub async fn seed_current_state_point_fixture<StorageImpl>(
@@ -88,6 +107,8 @@ pub async fn seed_current_state_point_fixture<StorageImpl>(
     replacement_rows: usize,
     unrelated_sparse_commits: usize,
     catalog_entry_count: usize,
+    sparse_shape: BenchCurrentStateSparseShape,
+    point_target: BenchCurrentStatePointTarget,
 ) -> BenchCurrentStatePointFixture<StorageImpl>
 where
     StorageImpl: Storage,
@@ -95,6 +116,7 @@ where
     assert!(replacement_rows > 0);
     assert!(catalog_entry_count > 0);
     let _ = crate::storage_bench::take_crud_current_state_catalog_bytes();
+    let _ = crate::storage_bench::take_crud_current_state_directory_bytes();
     let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(11);
     let updated_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(22);
     let parent_id = bench_addressable_commit_id("persistent-catalog-parent");
@@ -342,11 +364,20 @@ where
     let mut commits = vec![replay_base_id];
     let mut catalog_manifest_bytes = 0u64;
     let mut replay_manifest_bytes = 0u64;
+    let mut sparse_staged_puts = 0u64;
+    let mut sparse_written_bytes = 0u64;
+    let mut first_sparse_elapsed_nanos = 0u64;
+    let mut first_sparse_staged_puts = 0u64;
+    let mut first_sparse_written_bytes = 0u64;
     let beta_pk = EntityPk::single("unrelated");
     for index in 0..unrelated_sparse_commits {
+        let sparse_started = Instant::now();
         let commit_id = bench_addressable_commit_id(&format!("catalog-child-{index}"));
-        let present_scope = catalog_entry_count > 1 && index % 4 == 0;
-        let schema_key = if present_scope {
+        let touches_alpha = sparse_shape == BenchCurrentStateSparseShape::TouchedScope;
+        let present_scope = !touches_alpha && catalog_entry_count > 1 && index % 4 == 0;
+        let schema_key = if touches_alpha {
+            "bench_current_state_alpha".to_string()
+        } else if present_scope {
             format!("bench_scope_{:08}", 1 + index % (catalog_entry_count - 1))
         } else {
             "bench_current_state_beta".to_string()
@@ -357,11 +388,16 @@ where
                 (1 + index % (catalog_entry_count - 1)) % 10_000
             )
         });
+        let sparse_pk = if touches_alpha {
+            &entity_pks[replacement_rows / 4]
+        } else {
+            &beta_pk
+        };
         let row = TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key: &schema_key,
                 file_id: file_id.as_deref(),
-                entity_pk: &beta_pk,
+                entity_pk: sparse_pk,
                 change_id: ChangeId::for_test_label(&format!("catalog-child-change-{index}")),
                 commit_id,
                 deleted: false,
@@ -426,14 +462,29 @@ where
             &publication,
         )
         .expect("stage benchmark sparse manifest");
-        storage
+        let (_, stats) = storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("commit benchmark sparse child");
+        sparse_staged_puts += stats.staged_puts;
+        sparse_written_bytes += stats.written_bytes;
+        if index == 0 {
+            first_sparse_elapsed_nanos =
+                u64::try_from(sparse_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            first_sparse_staged_puts = stats.staged_puts;
+            first_sparse_written_bytes = stats.written_bytes;
+        }
         commits.push(commit_id);
     }
 
-    let target = &entity_pks[replacement_rows / 2];
+    let target_index = if sparse_shape == BenchCurrentStateSparseShape::TouchedScope
+        && point_target == BenchCurrentStatePointTarget::HotMutated
+    {
+        replacement_rows / 4
+    } else {
+        replacement_rows / 2
+    };
+    let target = &entity_pks[target_index];
     let encoded_key = bytes::Bytes::from(super::codec::encode_key_ref(
         super::types::TrackedStateKeyRef {
             schema_key: "bench_current_state_alpha",
@@ -450,6 +501,13 @@ where
         catalog_manifest_bytes,
         replay_manifest_bytes,
         catalog_staged_encoded_bytes: crate::storage_bench::take_crud_current_state_catalog_bytes(),
+        directory_staged_encoded_bytes:
+            crate::storage_bench::take_crud_current_state_directory_bytes(),
+        sparse_staged_puts,
+        sparse_written_bytes,
+        first_sparse_elapsed_nanos,
+        first_sparse_staged_puts,
+        first_sparse_written_bytes,
     }
 }
 
@@ -473,6 +531,30 @@ where
         self.catalog_staged_encoded_bytes
     }
 
+    pub fn directory_staged_encoded_bytes(&self) -> u64 {
+        self.directory_staged_encoded_bytes
+    }
+
+    pub fn sparse_staged_puts(&self) -> u64 {
+        self.sparse_staged_puts
+    }
+
+    pub fn sparse_written_bytes(&self) -> u64 {
+        self.sparse_written_bytes
+    }
+
+    pub fn first_sparse_elapsed_nanos(&self) -> u64 {
+        self.first_sparse_elapsed_nanos
+    }
+
+    pub fn first_sparse_staged_puts(&self) -> u64 {
+        self.first_sparse_staged_puts
+    }
+
+    pub fn first_sparse_written_bytes(&self) -> u64 {
+        self.first_sparse_written_bytes
+    }
+
     pub async fn read_point(&self, mode: BenchCurrentStatePointMode) -> usize {
         let read = self
             .storage
@@ -480,7 +562,22 @@ where
             .await
             .expect("begin benchmark current-state point read");
         match mode {
-            BenchCurrentStatePointMode::PersistentCatalog => {
+            BenchCurrentStatePointMode::PersistentCatalog
+            | BenchCurrentStatePointMode::CatalogThenReplay => {
+                if mode == BenchCurrentStatePointMode::CatalogThenReplay {
+                    let head = *self.commits.last().expect("benchmark has a head commit");
+                    let values = super::storage::load_commit_delta_values_encoded_with_cache(
+                        &read,
+                        head,
+                        std::slice::from_ref(&self.encoded_key),
+                        None,
+                    )
+                    .await
+                    .expect("probe benchmark head delta");
+                    if values[0].is_some() {
+                        return 1;
+                    }
+                }
                 let state = super::storage::load_published_commit_state_manifest(
                     &read,
                     self.current_manifest.commit_id,
@@ -488,34 +585,49 @@ where
                 .await
                 .expect("load benchmark current-state manifest")
                 .expect("benchmark current-state manifest exists");
-                let values =
+                let values = if mode == BenchCurrentStatePointMode::PersistentCatalog {
                     super::storage::load_complete_current_state_values_from_published_manifest(
                         &read,
                         &state,
                         std::slice::from_ref(&self.encoded_key),
                     )
                     .await
-                    .expect("read benchmark current-state catalog")
-                    .expect("benchmark point is covered");
-                usize::from(values[0].is_some())
-            }
-            BenchCurrentStatePointMode::FirstParentReplay => {
-                for commit_id in self.commits.iter().rev() {
-                    let values = super::storage::load_commit_delta_values_encoded_with_cache(
+                } else {
+                    super::storage::load_complete_current_state_values_from_replay_manifest(
                         &read,
-                        *commit_id,
+                        &state,
                         std::slice::from_ref(&self.encoded_key),
-                        None,
                     )
                     .await
-                    .expect("replay benchmark commit point");
-                    if values[0].is_some() {
-                        return 1;
-                    }
                 }
-                0
+                .expect("read benchmark current-state catalog");
+                if let Some(values) = values {
+                    return usize::from(values[0].is_some());
+                }
+                if mode == BenchCurrentStatePointMode::PersistentCatalog {
+                    panic!("benchmark point is not covered");
+                }
+                self.read_point_by_replay(&read).await
+            }
+            BenchCurrentStatePointMode::FirstParentReplay => self.read_point_by_replay(&read).await,
+        }
+    }
+
+    async fn read_point_by_replay(&self, read: &(impl StorageAdapterRead + ?Sized)) -> usize {
+        for commit_id in self.commits.iter().rev() {
+            let values = super::storage::load_commit_delta_values_encoded_with_cache(
+                read,
+                *commit_id,
+                std::slice::from_ref(&self.encoded_key),
+                None,
+            )
+            .await
+            .expect("replay benchmark commit point");
+            if values[0].is_some() {
+                return 1;
             }
         }
+        0
     }
 }
 
@@ -1373,3 +1485,4 @@ fn row_key(row: &BenchTrackedRow) -> TrackedStateKey {
         file_id: row.file_id.clone(),
     }
 }
+use std::time::Instant;

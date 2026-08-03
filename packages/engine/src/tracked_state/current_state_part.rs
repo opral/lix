@@ -42,6 +42,7 @@ const CURRENT_STATE_LINEAGE_CONTEXT: &str = "lix current-state lineage v1";
 const CATALOG_TRANSITION_CONTEXT: &str = "lix current-state catalog transition v1";
 const CATALOG_LEAF_MAX_ENTRIES: usize = 128;
 const CATALOG_MAX_KEY_BYTES: usize = 64 * 1024;
+const CURRENT_STATE_DESCRIPTOR_DIGEST_CONTEXT: &str = "lix current-state descriptor set v1";
 
 /// Publishes the serving directory for a certified complete replacement.
 /// Ordinary mutation inventories are not state partitions and return `None`.
@@ -63,7 +64,6 @@ pub(crate) fn stage_complete_replacement_current_state_part_set(
             "replacement generation has no complete directly-addressable part set",
         ));
     }
-    let mut first_ordinal = 0u32;
     let descriptors = inventory
         .parts
         .iter()
@@ -77,29 +77,32 @@ pub(crate) fn stage_complete_replacement_current_state_part_set(
                 first_key: bounds.first_key.clone(),
                 last_key: bounds.last_key.clone(),
                 content_digest: part.content_digest,
+                payload_refs_digest: [0; 32],
+                source_kind: 0,
                 owner_commit_id: part.owner_commit_id,
                 part_index: u32::try_from(part_index)
                     .map_err(|_| directory_error("part index overflows u32"))?,
-                first_ordinal,
+                source_row_offset: 0,
                 row_count,
                 uniform_created_at: part.uniform_created_at,
                 uniform_updated_at: part.uniform_updated_at,
             };
-            first_ordinal = first_ordinal
-                .checked_add(u32::from(row_count))
-                .ok_or_else(|| directory_error("row ordinal overflows u32"))?;
             Ok(descriptor)
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    let directory = stage_current_state_part_directory(writes, &descriptors)?;
+    let mut directory = stage_current_state_part_directory(writes, &descriptors)?;
     if directory.row_count != u64::from(inventory.member_count)
-        || directory.descriptor_digest != authority_digest
+        || replacement_directory_digest(&descriptors)? != authority_digest
         || initial_generation.owner_commit_id != *commit_id.as_uuid().as_bytes()
     {
         return Err(directory_error(
             "replacement state set disagrees with its commit authority",
         ));
     }
+    // The first complete generation retains the historical replacement
+    // certificate digest. Sparse descendants use the generic descriptor-set
+    // digest because they may mix replacement and native sources.
+    directory.descriptor_digest = authority_digest;
     let generation = initial_generation.clone();
     let state_lineage_digest =
         fresh_current_state_lineage_digest(commit_id, generation.integrity_digest, &directory);
@@ -286,8 +289,27 @@ pub(super) async fn stage_current_state_catalog(
         {
             continue;
         }
-        root =
-            update_catalog_entry(store, writes, &mut staged, root.as_ref(), &scope, None).await?;
+        let rewritten = if let Some(parent_root) = parent_root {
+            match load_current_state_catalog_entry_for_write(store, writes, parent_root, &scope)
+                .await?
+            {
+                Some(parent_entry) => {
+                    crate::tracked_state::storage::stage_sparse_current_state_part_set(
+                        store,
+                        writes,
+                        &parent_entry,
+                        commit_id,
+                        inventory,
+                    )
+                    .await?
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        root = update_catalog_entry(store, writes, &mut staged, root.as_ref(), &scope, rewritten)
+            .await?;
     }
     let anchor = replacement.as_ref().map(coverage_anchor_from_entry);
     if let Some(entry) = replacement {
@@ -322,11 +344,29 @@ pub(super) async fn stage_current_state_catalog(
 pub(crate) async fn validate_current_state_catalog_transition_root(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &CommitStateManifest,
-    parent: Option<&CurrentStateCatalogRoot>,
+    parent: Option<&CommitStateManifest>,
 ) -> Result<(), LixError> {
     if state.current_state_catalog.is_none() {
         return Ok(());
     }
+    if state.current_state_coverage_anchor.is_none() {
+        let mut writes = StorageWriteSet::new();
+        let expected = stage_current_state_catalog(
+            store,
+            &mut writes,
+            parent,
+            state.commit_id,
+            &state.mutations,
+        )
+        .await?;
+        if expected.root.as_ref() != state.current_state_catalog.as_deref() {
+            return Err(directory_error(
+                "sparse catalog result is not the canonical parent mutation transition",
+            ));
+        }
+        return Ok(());
+    }
+    let parent = parent.and_then(|parent| parent.current_state_catalog.as_deref());
     let replacement =
         state
             .current_state_coverage_anchor
@@ -1017,6 +1057,62 @@ pub(crate) async fn load_current_state_catalog_entry(
     }
 }
 
+async fn load_current_state_catalog_entry_for_write(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    root: &CurrentStateCatalogRoot,
+    scope: &crate::tracked_state::types::CommitDeltaReplacementScope,
+) -> Result<Option<CurrentStatePartSet>, LixError> {
+    let route_key = catalog_scope_key(scope)?;
+    let mut expected_count = root.entry_count;
+    let mut minimum_depth = 0u32;
+    let mut expected_route: Option<(usize, Vec<u8>)> = None;
+    let mut node_id = root.root_id;
+    loop {
+        let staged = writes.staged_value(CURRENT_STATE_CATALOG_SPACE, &node_id);
+        let node = load_catalog_node_with_staged(store, None, staged, node_id).await?;
+        if node.entry_count()? != expected_count
+            || node.depth < minimum_depth
+            || (minimum_depth == 0 && node.depth != 0)
+        {
+            return Err(directory_error("catalog node summary mismatch"));
+        }
+        if let Some((parent_depth, route)) = expected_route.take() {
+            let child_depth = usize::try_from(node.depth).expect("u32 fits usize");
+            if child_depth > node.sample_key.len()
+                || node.sample_key.get(parent_depth..child_depth) != Some(route.as_slice())
+            {
+                return Err(directory_error("catalog child route mismatch"));
+            }
+        }
+        if node.children.is_empty() {
+            return Ok(node
+                .entries
+                .binary_search_by(|entry| entry.scope.cmp(scope))
+                .ok()
+                .map(|index| node.entries[index].clone()));
+        }
+        let depth = usize::try_from(node.depth).expect("u32 fits usize");
+        let selector = *route_key
+            .get(depth)
+            .ok_or_else(|| directory_error("catalog exceeds its hash depth"))?;
+        let Ok(index) = node
+            .children
+            .binary_search_by_key(&selector, |child| child.route[0])
+        else {
+            return Ok(None);
+        };
+        let child = &node.children[index];
+        if route_key.get(depth..depth + child.route.len()) != Some(child.route.as_slice()) {
+            return Ok(None);
+        }
+        node_id = child.node_id;
+        expected_count = child.entry_count;
+        minimum_depth = node.depth.saturating_add(1);
+        expected_route = Some((depth, child.route.clone()));
+    }
+}
+
 /// Resolves catalog scopes in caller order while reading each shared trie node
 /// at most once. Each frontier is issued as one storage point-read batch.
 pub(crate) async fn load_current_state_catalog_entries_for_scopes(
@@ -1391,6 +1487,66 @@ pub(crate) async fn load_current_state_part_directory_reachability(
     Ok((nodes, descriptor_sets.pop().unwrap_or_default()))
 }
 
+pub(crate) async fn load_current_state_part_directory_reachability_for_write(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    root: &CurrentStatePartDirectoryRoot,
+) -> Result<
+    (
+        std::collections::BTreeSet<[u8; 32]>,
+        Vec<CurrentStatePartDescriptor>,
+    ),
+    LixError,
+> {
+    if root.part_count == 0 {
+        validate_empty_root(root)?;
+        return Ok((std::collections::BTreeSet::new(), Vec::new()));
+    }
+    let mut pending = vec![(root.root_id, None)];
+    let mut node_ids = std::collections::BTreeSet::new();
+    let mut descriptors = Vec::with_capacity(root.part_count as usize);
+    while let Some((node_id, expected_child)) = pending.pop() {
+        if !node_ids.insert(node_id) {
+            return Err(directory_error(
+                "part directory contains a cycle or duplicate child",
+            ));
+        }
+        let staged = writes.staged_value(CURRENT_STATE_PART_DIRECTORY_SPACE, &node_id);
+        let node = if let Some(bytes) = staged {
+            if node_digest(&bytes) != node_id {
+                return Err(directory_error("node content digest mismatch"));
+            }
+            decode_node(&bytes)?
+        } else {
+            load_node(store, node_id).await?
+        };
+        if expected_child.is_none() {
+            validate_root_summary(root, &node)?;
+        }
+        if let Some(expected) = expected_child.as_ref() {
+            validate_child_summary(expected, &node)?;
+        }
+        if node.kind == 0 {
+            descriptors.extend(node.parts);
+        } else {
+            pending.extend(
+                node.children
+                    .into_iter()
+                    .rev()
+                    .map(|child| (child.node_id, Some(child))),
+            );
+        }
+    }
+    descriptors.sort_by(|left, right| left.first_key.cmp(&right.first_key));
+    validate_descriptors(&descriptors)?;
+    if descriptors.len() != root.part_count as usize
+        || !descriptor_digest_matches(root, &descriptors)?
+    {
+        return Err(directory_error("part directory reachability mismatch"));
+    }
+    Ok((node_ids, descriptors))
+}
+
 pub(crate) async fn load_current_state_part_directory_reachability_many(
     store: &(impl StorageAdapterRead + ?Sized),
     roots: &[CurrentStatePartDirectoryRoot],
@@ -1404,6 +1560,10 @@ pub(crate) async fn load_current_state_part_directory_reachability_many(
     let mut frontier =
         std::collections::BTreeMap::<[u8; 32], Vec<(usize, Option<DirectoryChild>)>>::new();
     for (root_index, root) in roots.iter().enumerate() {
+        if root.part_count == 0 {
+            validate_empty_root(root)?;
+            continue;
+        }
         frontier
             .entry(root.root_id)
             .or_default()
@@ -1458,12 +1618,16 @@ pub(crate) async fn load_current_state_part_directory_reachability_many(
         frontier = next;
     }
     for (root, descriptors) in roots.iter().zip(&mut descriptor_sets) {
+        if root.part_count == 0 {
+            validate_empty_root(root)?;
+            continue;
+        }
         // Frontier batching is content-ID ordered, so normalize the
         // caller-visible descriptor sequence before semantic validation.
         descriptors.sort_by(|left, right| left.first_key.cmp(&right.first_key));
         validate_descriptors(descriptors)?;
         if descriptors.len() != root.part_count as usize
-            || replacement_directory_digest(descriptors)? != root.descriptor_digest
+            || !descriptor_digest_matches(root, descriptors)?
         {
             return Err(directory_error("part directory reachability mismatch"));
         }
@@ -1473,6 +1637,7 @@ pub(crate) async fn load_current_state_part_directory_reachability_many(
 
 fn validate_catalog_node(node: &CatalogNode) -> Result<(), LixError> {
     let depth = usize::try_from(node.depth).expect("u32 fits usize");
+    let empty_descriptor_digest = current_state_descriptor_digest(&[])?;
     if depth > CATALOG_MAX_KEY_BYTES
         || node.sample_key.len() > CATALOG_MAX_KEY_BYTES
         || node.sample_key.len() < depth
@@ -1484,15 +1649,21 @@ fn validate_catalog_node(node: &CatalogNode) -> Result<(), LixError> {
             .windows(2)
             .any(|pair| pair[0].scope >= pair[1].scope)
         || node.entries.iter().any(|entry| {
+            let valid_empty_directory = entry.directory.root_id == [0; 32]
+                && entry.directory.descriptor_digest == empty_descriptor_digest
+                && entry.directory.row_count == 0
+                && entry.directory.part_count == 0
+                && entry.directory.tree_height == 0;
+            let valid_nonempty_directory = entry.directory.root_id != [0; 32]
+                && entry.directory.descriptor_digest != [0; 32]
+                && entry.directory.row_count > 0
+                && entry.directory.part_count > 0
+                && entry.directory.tree_height > 0;
             entry.scope.schema_key.is_empty()
                 || entry.coverage_anchor_commit_id == [0; 16]
                 || entry.generation_integrity_digest == [0; 32]
                 || entry.state_lineage_digest == [0; 32]
-                || entry.directory.root_id == [0; 32]
-                || entry.directory.descriptor_digest == [0; 32]
-                || entry.directory.row_count == 0
-                || entry.directory.part_count == 0
-                || entry.directory.tree_height == 0
+                || !(valid_empty_directory || valid_nonempty_directory)
         })
         || node
             .children
@@ -1609,22 +1780,52 @@ pub(crate) fn stage_current_state_part_directory(
     writes: &mut StorageWriteSet,
     descriptors: &[CurrentStatePartDescriptor],
 ) -> Result<CurrentStatePartDirectoryRoot, LixError> {
+    stage_current_state_part_directory_reusing(
+        writes,
+        descriptors,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+/// Rebuilds the logical directory while retaining all content-identical nodes
+/// already reachable from the parent root. When descriptor cardinality stays
+/// stable, leaf chunking stages only changed leaves and their ancestors. A
+/// fully key-addressed range splice is deliberately left to the next cut.
+pub(crate) fn stage_current_state_part_directory_reusing(
+    writes: &mut StorageWriteSet,
+    descriptors: &[CurrentStatePartDescriptor],
+    reusable_node_ids: &std::collections::BTreeSet<[u8; 32]>,
+) -> Result<CurrentStatePartDirectoryRoot, LixError> {
+    if descriptors.is_empty() {
+        return Ok(CurrentStatePartDirectoryRoot {
+            root_id: [0; 32],
+            descriptor_digest: current_state_descriptor_digest(descriptors)?,
+            row_count: 0,
+            part_count: 0,
+            tree_height: 0,
+        });
+    }
     validate_descriptors(descriptors)?;
-    // Reuse the historical replacement-directory certificate rather than
-    // inventing a second digest vocabulary for the same immutable part set.
-    let descriptor_digest = replacement_directory_digest(descriptors)?;
+    let descriptor_digest = current_state_descriptor_digest(descriptors)?;
     let mut level = descriptors
         .chunks(DIRECTORY_FANOUT)
-        .map(|chunk| stage_node(writes, DirectoryNode::leaf(chunk.to_vec())))
+        .map(|chunk| {
+            stage_node_reusing(
+                writes,
+                DirectoryNode::leaf(chunk.to_vec()),
+                reusable_node_ids,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut tree_height = 1u16;
     while level.len() > 1 {
         level = level
             .chunks(DIRECTORY_FANOUT)
             .map(|chunk| {
-                stage_node(
+                stage_node_reusing(
                     writes,
                     DirectoryNode::internal(chunk.iter().map(|node| node.child.clone()).collect()),
+                    reusable_node_ids,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1651,6 +1852,10 @@ pub(crate) async fn route_current_state_part(
     root: &CurrentStatePartDirectoryRoot,
     encoded_key: &[u8],
 ) -> Result<Option<CurrentStatePartDescriptor>, LixError> {
+    if root.part_count == 0 {
+        validate_empty_root(root)?;
+        return Ok(None);
+    }
     let mut node_id = root.root_id;
     let mut expected_child = None;
     loop {
@@ -1710,6 +1915,10 @@ pub(crate) async fn route_current_state_part_sets(
         .collect::<Vec<_>>();
     let mut frontier = std::collections::BTreeMap::<[u8; 32], Vec<PendingDirectoryRoute>>::new();
     for (request_index, (root, keys)) in requests.iter().enumerate() {
+        if root.part_count == 0 {
+            validate_empty_root(root)?;
+            continue;
+        }
         frontier.entry(root.root_id).or_default().push((
             request_index,
             None,
@@ -1797,6 +2006,10 @@ pub(crate) async fn load_current_state_part_descriptors(
     store: &(impl StorageAdapterRead + ?Sized),
     root: &CurrentStatePartDirectoryRoot,
 ) -> Result<Vec<CurrentStatePartDescriptor>, LixError> {
+    if root.part_count == 0 {
+        validate_empty_root(root)?;
+        return Ok(Vec::new());
+    }
     let mut pending = vec![(root.root_id, None)];
     let mut descriptors = Vec::with_capacity(root.part_count as usize);
     while let Some((node_id, expected_child)) = pending.pop() {
@@ -1827,7 +2040,7 @@ pub(crate) async fn load_current_state_part_descriptors(
             .map(|part| u64::from(part.row_count))
             .sum::<u64>()
             != root.row_count
-        || replacement_directory_digest(&descriptors)? != root.descriptor_digest
+        || !descriptor_digest_matches(root, &descriptors)?
     {
         return Err(directory_error(
             "root summary does not match its descriptor set",
@@ -1836,19 +2049,25 @@ pub(crate) async fn load_current_state_part_descriptors(
     Ok(descriptors)
 }
 
-fn stage_node(writes: &mut StorageWriteSet, node: DirectoryNode) -> Result<StagedNode, LixError> {
+fn stage_node_reusing(
+    writes: &mut StorageWriteSet,
+    node: DirectoryNode,
+    reusable_node_ids: &std::collections::BTreeSet<[u8; 32]>,
+) -> Result<StagedNode, LixError> {
     let (first_key, last_key, row_count, part_count) = node_summary(&node)?;
     let bytes = encode_node(&node)?;
-    #[cfg(feature = "storage-benches")]
-    crate::storage_bench::record_crud_current_state_directory_bytes(bytes.len());
     let node_id = node_digest(&bytes);
-    writes.put(
-        CURRENT_STATE_PART_DIRECTORY_SPACE,
-        StorageKey(Bytes::copy_from_slice(&node_id)),
-        StorageValue {
-            bytes: bytes.clone(),
-        },
-    );
+    if !reusable_node_ids.contains(&node_id) {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_crud_current_state_directory_bytes(bytes.len());
+        writes.put(
+            CURRENT_STATE_PART_DIRECTORY_SPACE,
+            StorageKey(Bytes::copy_from_slice(&node_id)),
+            StorageValue {
+                bytes: bytes.clone(),
+            },
+        );
+    }
     Ok(StagedNode {
         child: DirectoryChild {
             first_key,
@@ -1984,16 +2203,21 @@ fn node_digest(bytes: &[u8]) -> [u8; 32] {
 fn replacement_directory_digest(
     descriptors: &[CurrentStatePartDescriptor],
 ) -> Result<[u8; 32], LixError> {
+    let mut first_ordinal = 0u32;
     let entries = descriptors
         .iter()
         .map(|descriptor| {
-            crate::tracked_state::replacement_part::ReplacementPartDirectoryEntry::new(
+            let entry = crate::tracked_state::replacement_part::ReplacementPartDirectoryEntry::new(
                 descriptor.content_digest,
                 &descriptor.first_key,
                 &descriptor.last_key,
-                descriptor.first_ordinal,
+                first_ordinal,
                 descriptor.row_count,
-            )
+            );
+            first_ordinal = first_ordinal
+                .checked_add(u32::from(descriptor.row_count))
+                .expect("validated replacement row count fits u32");
+            entry
         })
         .collect();
     crate::tracked_state::replacement_part::ReplacementPartDirectory::try_new(
@@ -2009,6 +2233,34 @@ fn replacement_directory_digest(
     .digest()
 }
 
+fn current_state_descriptor_digest(
+    descriptors: &[CurrentStatePartDescriptor],
+) -> Result<[u8; 32], LixError> {
+    let encoded = storage_codec::encode("current-state descriptor set", &descriptors)?;
+    Ok(
+        *blake3::Hasher::new_derive_key(CURRENT_STATE_DESCRIPTOR_DIGEST_CONTEXT)
+            .update(&encoded)
+            .finalize()
+            .as_bytes(),
+    )
+}
+
+fn descriptor_digest_matches(
+    root: &CurrentStatePartDirectoryRoot,
+    descriptors: &[CurrentStatePartDescriptor],
+) -> Result<bool, LixError> {
+    if current_state_descriptor_digest(descriptors)? == root.descriptor_digest {
+        return Ok(true);
+    }
+    if descriptors
+        .iter()
+        .all(|part| part.source_kind == 0 && part.source_row_offset == 0)
+    {
+        return Ok(replacement_directory_digest(descriptors)? == root.descriptor_digest);
+    }
+    Ok(false)
+}
+
 fn validate_root_summary(
     root: &CurrentStatePartDirectoryRoot,
     node: &DirectoryNode,
@@ -2016,6 +2268,18 @@ fn validate_root_summary(
     let (_, _, row_count, part_count) = node_summary(node)?;
     if row_count != root.row_count || part_count != root.part_count {
         return Err(directory_error("root summary disagrees with its node"));
+    }
+    Ok(())
+}
+
+fn validate_empty_root(root: &CurrentStatePartDirectoryRoot) -> Result<(), LixError> {
+    if root.root_id != [0; 32]
+        || root.descriptor_digest != current_state_descriptor_digest(&[])?
+        || root.row_count != 0
+        || root.part_count != 0
+        || root.tree_height != 0
+    {
+        return Err(directory_error("empty root summary is invalid"));
     }
     Ok(())
 }
@@ -2068,7 +2332,7 @@ fn validate_node(node: &DirectoryNode) -> Result<(), LixError> {
             if !node.children.is_empty() || node.parts.len() > DIRECTORY_FANOUT {
                 return Err(directory_error("leaf exceeds bounded fanout"));
             }
-            validate_descriptor_slice(&node.parts, false)
+            validate_descriptor_slice(&node.parts)
         }
         1 => {
             if !node.parts.is_empty()
@@ -2097,29 +2361,34 @@ fn validate_node(node: &DirectoryNode) -> Result<(), LixError> {
 }
 
 fn validate_descriptors(parts: &[CurrentStatePartDescriptor]) -> Result<(), LixError> {
-    validate_descriptor_slice(parts, true)
+    validate_descriptor_slice(parts)
 }
 
-fn validate_descriptor_slice(
-    parts: &[CurrentStatePartDescriptor],
-    require_zero_origin: bool,
-) -> Result<(), LixError> {
+fn validate_descriptor_slice(parts: &[CurrentStatePartDescriptor]) -> Result<(), LixError> {
     let first = parts.first();
     if first.is_none()
-        || (require_zero_origin && first.is_some_and(|part| part.first_ordinal != 0))
         || parts.iter().any(|part| {
             part.first_key.is_empty()
-                || part.last_key.is_empty()
-                || part.first_key > part.last_key
-                || part.row_count == 0
-                || part.content_digest == [0; 32]
+            || part.last_key.is_empty()
+            || part.first_key > part.last_key
+            || part.row_count == 0
+            || u32::from(part.source_row_offset) + u32::from(part.row_count)
+                > crate::tracked_state::current_state_data_part::CURRENT_STATE_DATA_PART_MAX_ROWS
+                    as u32
+            || part.content_digest == [0; 32]
+            || part.source_kind > 1
+            || (part.source_kind == 0
+                && (part.owner_commit_id == [0; 16] || part.payload_refs_digest != [0; 32]))
+            || (part.source_kind == 1
+                && (part.owner_commit_id != [0; 16]
+                    || part.part_index != 0
+                    || part.payload_refs_digest == [0; 32]
+                    || part.uniform_created_at.packed() != 0
+                    || part.uniform_updated_at.packed() != 0))
         })
         || parts
             .windows(2)
             .any(|pair| pair[0].last_key >= pair[1].first_key)
-        || parts.windows(2).any(|pair| {
-            pair[1].first_ordinal != pair[0].first_ordinal + u32::from(pair[0].row_count)
-        })
     {
         return Err(directory_error(
             "descriptor set is empty, unordered, or overlapping",
@@ -2200,9 +2469,11 @@ mod tests {
                 first_key: format!("key-{index:06}-a").into_bytes(),
                 last_key: format!("key-{index:06}-z").into_bytes(),
                 content_digest: *blake3::hash(&index.to_be_bytes()).as_bytes(),
+                payload_refs_digest: [0; 32],
+                source_kind: 0,
                 owner_commit_id: [9; 16],
                 part_index: u32::try_from(index).expect("fixture index fits u32"),
-                first_ordinal: u32::try_from(index * 10).expect("fixture ordinal fits u32"),
+                source_row_offset: 0,
                 row_count: 10,
                 uniform_created_at: timestamp,
                 uniform_updated_at: timestamp,
@@ -2693,7 +2964,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_rejects_overlap_and_ordinal_drift_but_allows_mixed_owners() {
+    fn directory_rejects_overlap_and_unknown_sources_but_allows_mixed_owners() {
         let adapter = StorageAdapter::new(Memory::new());
         let mut overlapping = descriptors(2);
         overlapping[1].first_key = overlapping[0].last_key.clone();
@@ -2705,10 +2976,10 @@ mod tests {
         assert!(
             stage_current_state_part_directory(&mut adapter.new_write_set(), &owner_drift).is_ok()
         );
-        let mut ordinal_drift = descriptors(2);
-        ordinal_drift[1].first_ordinal += 1;
+        let mut invalid_source = descriptors(2);
+        invalid_source[1].source_kind = 2;
         assert!(
-            stage_current_state_part_directory(&mut adapter.new_write_set(), &ordinal_drift)
+            stage_current_state_part_directory(&mut adapter.new_write_set(), &invalid_source)
                 .is_err()
         );
 

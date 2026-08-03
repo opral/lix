@@ -248,6 +248,13 @@ pub(crate) mod json_slot_storage {
 
     use super::{JsonRef, JsonSlot};
 
+    pub(crate) fn encode<E>(value: &JsonSlot, encoder: E) -> Result<(), E::Error>
+    where
+        E: musli::Encoder,
+    {
+        super::json_slot_storage_ref::encode(&value.as_ref_slot(), encoder)
+    }
+
     pub(crate) fn decode<'de, D>(decoder: D) -> Result<JsonSlot, D::Error>
     where
         D: musli::Decoder<'de>,

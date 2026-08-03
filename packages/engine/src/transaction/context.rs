@@ -120,8 +120,7 @@ use crate::transaction::types::{
     StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileContent,
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
     TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow,
-    TypedMutationJournalBatch,
-    canonicalize_transaction_json_batch, stage_json_from_value,
+    TypedMutationJournalBatch, canonicalize_transaction_json_batch, stage_json_from_value,
 };
 
 pub(crate) struct CertifiedHistoryStoreReader<S> {

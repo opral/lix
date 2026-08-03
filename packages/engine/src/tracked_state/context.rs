@@ -3193,15 +3193,78 @@ where
                 entity_pk: &key.entity_pk,
             });
         }
-        #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_crud_current_state_catalog_attempt();
-        match storage::load_complete_current_state_values_from_replay_manifest(
-            &self.store,
-            &head.state_manifest,
-            &encoded.finish(),
-        )
-        .await
-        {
+        let encoded = encoded.finish();
+        // The newest delta is the cheapest and most likely OLTP hit. Probe it
+        // once before the persistent post-image so hot keys never pay a
+        // catalog traversal, and retain the result for canonical replay.
+        let head_values = self
+            .load_replayed_commit_delta_values(requested_commit_id, keys)
+            .await?;
+        let cold_indices = head_values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.is_none().then_some(index))
+            .collect::<Vec<_>>();
+        if !cold_indices.is_empty() && cold_indices.len() != keys.len() {
+            let cold_encoded = cold_indices
+                .iter()
+                .map(|&index| encoded[index].clone())
+                .collect::<Vec<_>>();
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_crud_current_state_catalog_attempt();
+            let cold_catalog = storage::load_complete_current_state_values_from_replay_manifest(
+                &self.store,
+                &head.state_manifest,
+                &cold_encoded,
+            )
+            .await;
+            #[cfg(feature = "storage-benches")]
+            let cold_catalog_error = cold_catalog.is_err();
+            if let Ok(Some(cold_values)) = cold_catalog {
+                let hot_indices = head_values
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, value)| value.is_some().then_some(index))
+                    .collect::<Vec<_>>();
+                let hot_keys = hot_indices
+                    .iter()
+                    .map(|&index| keys[index].clone())
+                    .collect::<Vec<_>>();
+                // Box the hot-only recursion so this async function keeps a
+                // finite future type. The recursive call cannot re-enter this
+                // mixed branch because every hot key matched the head delta.
+                let hot_values =
+                    Box::pin(self.resolve_rootless_index_values_at_commit(commit_id, &hot_keys))
+                        .await?;
+                let mut values = vec![None; keys.len()];
+                for (index, value) in cold_indices.into_iter().zip(cold_values) {
+                    values[index] = value;
+                }
+                for (index, value) in hot_indices.into_iter().zip(hot_values) {
+                    values[index] = value;
+                }
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_crud_current_state_catalog_hit();
+                return Ok(values);
+            }
+            #[cfg(feature = "storage-benches")]
+            if cold_catalog_error {
+                crate::storage_bench::record_crud_current_state_catalog_error();
+            }
+        }
+        let catalog = if head_values.iter().all(Option::is_none) {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_crud_current_state_catalog_attempt();
+            storage::load_complete_current_state_values_from_replay_manifest(
+                &self.store,
+                &head.state_manifest,
+                &encoded,
+            )
+            .await
+        } else {
+            Ok(None)
+        };
+        match catalog {
             Ok(Some(values)) => {
                 #[cfg(feature = "storage-benches")]
                 crate::storage_bench::record_crud_current_state_catalog_hit();
@@ -3238,9 +3301,12 @@ where
         // generations instead carry their lifecycle timestamp explicitly.
         for &current_commit_id in interval.commits().iter().rev() {
             let replay_commit = self.load_point_replay_commit(current_commit_id).await?;
-            let deltas = self
-                .load_replayed_commit_delta_values(current_commit_id, keys)
-                .await?;
+            let deltas = if current_commit_id == requested_commit_id {
+                head_values.clone()
+            } else {
+                self.load_replayed_commit_delta_values(current_commit_id, keys)
+                    .await?
+            };
             let descriptor_deltas = self
                 .load_replayed_commit_delta_values(current_commit_id, &descriptor_keys)
                 .await?;

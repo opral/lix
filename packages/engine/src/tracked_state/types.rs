@@ -255,9 +255,17 @@ pub(crate) struct CurrentStatePartDescriptor {
     #[musli(bytes)]
     pub(crate) last_key: Vec<u8>,
     pub(crate) content_digest: [u8; 32],
+    /// Digest of the native part's compact JSON-reference summary. Zero for
+    /// complete-replacement sources whose history authority owns reachability.
+    pub(crate) payload_refs_digest: [u8; 32],
+    /// 0 references an immutable complete-replacement mutation part; 1
+    /// references a native content-addressed current-state data part.
+    pub(crate) source_kind: u8,
     pub(crate) owner_commit_id: [u8; 16],
     pub(crate) part_index: u32,
-    pub(crate) first_ordinal: u32,
+    /// First physical row selected from the source part. Descriptor slicing
+    /// allows sparse deletes and updates to retain untouched source bytes.
+    pub(crate) source_row_offset: u16,
     pub(crate) row_count: u16,
     pub(crate) uniform_created_at: LixTimestamp,
     pub(crate) uniform_updated_at: LixTimestamp,
@@ -335,6 +343,9 @@ pub(crate) struct CurrentStateCoverageAnchor {
 #[derive(Debug, Clone, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateMutationInventory {
+    /// Certified whole-source alias authority. This is never used for a
+    /// finite exact selection: when present, the selected source supplies the
+    /// complete inherited state and authored members overlay it during replay.
     #[musli(with = crate::storage_codec::option)]
     pub(crate) selected_source_commit_id: Option<[u8; 16]>,
     pub(crate) member_count: u32,

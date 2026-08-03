@@ -3,6 +3,7 @@ mod bench_support;
 mod codec;
 mod commit_root_rebuild;
 mod context;
+mod current_state_data_part;
 mod current_state_part;
 mod diff;
 mod diff_id;
@@ -19,6 +20,10 @@ pub(crate) use commit_root_rebuild::{
 };
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
+};
+pub(crate) use current_state_data_part::{
+    CURRENT_STATE_DATA_PART_REFS_SPACE, CURRENT_STATE_DATA_PART_SPACE,
+    decode_current_state_data_part_refs,
 };
 pub(crate) use current_state_part::{
     CURRENT_STATE_CATALOG_SPACE, CURRENT_STATE_PART_DIRECTORY_SPACE,
