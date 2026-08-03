@@ -734,13 +734,16 @@ impl NativeLixTransactionInner {
     ) -> std::result::Result<RsExecuteResult, LixError> {
         match self {
             Self::Memory(transaction) => {
-                Box::pin(transaction.execute_with_options(sql, params, options)).await
+                Box::pin(transaction.execute_with_options(sql.to_owned(), params.to_vec(), options))
+                    .await
             }
             Self::SQLite(transaction) => {
-                Box::pin(transaction.execute_with_options(sql, params, options)).await
+                Box::pin(transaction.execute_with_options(sql.to_owned(), params.to_vec(), options))
+                    .await
             }
             Self::LocalFilesystem(transaction) => {
-                Box::pin(transaction.execute_with_options(sql, params, options)).await
+                Box::pin(transaction.execute_with_options(sql.to_owned(), params.to_vec(), options))
+                    .await
             }
         }
     }

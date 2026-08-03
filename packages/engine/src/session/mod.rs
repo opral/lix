@@ -10,6 +10,10 @@
 //! the storage commit point-of-no-return. After that point, close waits for
 //! commit completion. Crash persistence is provider-defined.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 mod checkpoint;
 mod context;
 mod create_branch;
@@ -48,3 +52,31 @@ pub use observe::{ObserveEvent, ObserveEvents};
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;
 pub use undo_redo::{RedoReceipt, UndoReceipt};
+
+/// Zero-cost adapter for futures that rustc cannot prove `Send` because an
+/// opaque async call contains higher-ranked references. Construction is unsafe:
+/// callers must verify that every value retained across suspension is `Send`.
+#[repr(transparent)]
+pub(super) struct AssumeSendFuture<F>(F);
+
+impl<F> AssumeSendFuture<F> {
+    pub(super) unsafe fn new(future: F) -> Self {
+        Self(future)
+    }
+}
+
+// SAFETY: `AssumeSendFuture::new` is private and unsafe; each call site must
+// establish the wrapped future's complete suspension state is movable.
+unsafe impl<F> Send for AssumeSendFuture<F> {}
+
+impl<F> Future for AssumeSendFuture<F>
+where
+    F: Future,
+{
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: projecting through the transparent wrapper does not move F.
+        unsafe { self.map_unchecked_mut(|wrapped| &mut wrapped.0) }.poll(context)
+    }
+}

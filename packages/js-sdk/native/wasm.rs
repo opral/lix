@@ -328,7 +328,7 @@ impl WasmLixTransaction {
         let options = execute_options_from_js(options)?;
         let inner = self.inner.as_mut().ok_or_else(transaction_closed_error)?;
         let result = inner
-            .execute_with_options(&sql, &params, options)
+            .execute_with_options(sql, params, options)
             .await
             .map_err(lix_error_to_js)?;
         execute_result_to_js(result)

@@ -247,7 +247,7 @@ impl ActiveTelemetrySpan {
         }
     }
 
-    pub(crate) async fn instrument<F>(&self, future: F) -> F::Output
+    pub(crate) fn instrument<F>(&self, future: F) -> TelemetryInstrumentedFuture<'_, F>
     where
         F: Future,
     {
@@ -255,7 +255,6 @@ impl ActiveTelemetrySpan {
             future: Box::pin(future),
             handle: self.handle.as_ref(),
         }
-        .await
     }
 
     pub(crate) fn finish(self, status: TelemetrySpanStatus, attributes: Vec<TelemetryAttribute>) {
@@ -268,7 +267,7 @@ impl ActiveTelemetrySpan {
     }
 }
 
-struct TelemetryInstrumentedFuture<'a, F> {
+pub(crate) struct TelemetryInstrumentedFuture<'a, F> {
     future: Pin<Box<F>>,
     handle: &'a dyn TelemetrySpanHandle,
 }
