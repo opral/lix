@@ -1805,6 +1805,13 @@ async fn stage_tracked_commit_delta_index(
             && state_row_indices
                 .iter()
                 .all(|&row_index| state_rows.row(row_index).addressable_change_id);
+        if replacement_generations.contains_key(&root.commit_id) && !can_stream_ordered_addressable
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "complete replacement generation cannot use generic commit-delta staging",
+            ));
+        }
         if can_stream_ordered_addressable {
             let replacement_generation = replacement_generations.get(&root.commit_id);
             let lifecycle_created_at = replacement_generation
@@ -1825,7 +1832,7 @@ async fn stage_tracked_commit_delta_index(
                 )
                 .entered();
                 let state_rows = &*state_rows;
-                let deltas = state_row_indices.iter().map(|&row_index| {
+                let make_delta = |row_index| {
                     let row = state_rows.row(row_index);
                     let mut delta = tracked_commit_delta_from_state_row(row)?;
                     if let Some(created_at) = lifecycle_created_at {
@@ -1840,28 +1847,53 @@ async fn stage_tracked_commit_delta_index(
                                 row_index: location.row_index,
                             },
                         );
-                    delta.certified = root.publish_head
-                        && host_certified_batch_owns_live_row(
-                            row,
-                            &root.branch_id,
-                            root.commit_id,
-                            host_certified_file_schemas,
-                        );
+                    if replacement_generation.is_none() {
+                        delta.certified = root.publish_head
+                            && host_certified_batch_owns_live_row(
+                                row,
+                                &root.branch_id,
+                                root.commit_id,
+                                host_certified_file_schemas,
+                            );
+                    }
                     Ok(delta)
-                });
+                };
                 let order_certified = state_rows.certified_tracked_keys_strictly_ordered()
                     && state_row_indices.len() == state_rows.len()
                     && state_row_indices
                         .iter()
                         .enumerate()
                         .all(|(index, &row_index)| index == row_index);
-                stage_ordered_addressable_commit_deltas(
-                    writes,
-                    deltas,
-                    order_certified,
-                    publish_lifecycle_summary,
-                    replacement_generation,
-                )?
+                let replacement_stage = if let Some(generation) = replacement_generation {
+                    if !order_certified {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "complete replacement generation is not in canonical identity order",
+                        ));
+                    }
+                    Some(
+                        crate::tracked_state::stage_ordered_addressable_replacement_parts(
+                            writes,
+                            state_row_indices
+                                .iter()
+                                .map(|&row_index| make_delta(row_index)),
+                            generation,
+                        )?,
+                    )
+                } else {
+                    None
+                };
+                match replacement_stage {
+                    Some(stage) => Some(stage),
+                    None => stage_ordered_addressable_commit_deltas(
+                        writes,
+                        state_row_indices
+                            .iter()
+                            .map(|&row_index| make_delta(row_index)),
+                        order_certified,
+                        publish_lifecycle_summary,
+                    )?,
+                }
             };
             if let Some(ordered_stage) = ordered_stage {
                 state_rows.set_ordered_addressable_change_ids(state_row_indices, ordered_stage)?;
@@ -4313,14 +4345,10 @@ fn prepare_entity_columnar_write_sets(
     }
     let publishes_ordered_insert =
         insert_selection.len() == state_rows.len() && insert_selection.covers_all(state_rows.len());
-    let publishes_complete_replacement =
-        state_rows.certified_complete_collection_replacement() && insert_selection.is_empty();
-    if !publishes_ordered_insert && !publishes_complete_replacement {
+    if !publishes_ordered_insert {
         return Ok(crate::live_state::EntityColumnarWriteSets::new());
     }
-    if (publishes_ordered_insert || publishes_complete_replacement)
-        && let Some((commit_id, schema_key, snapshots)) = state_rows.dense_entity_columnar_input()
-    {
+    if let Some((commit_id, schema_key, snapshots)) = state_rows.dense_entity_columnar_input() {
         let Some(schema) = entity_schema_catalog.and_then(|catalog| catalog.schema(schema_key))
         else {
             return Ok(crate::live_state::EntityColumnarWriteSets::new());
@@ -4348,7 +4376,7 @@ fn prepare_entity_columnar_write_sets(
     }
     let mut indices = BTreeMap::<(CommitId, String), Vec<usize>>::new();
     for (index, row) in state_rows.iter().enumerate() {
-        if !publishes_complete_replacement && !insert_selection.contains(index) {
+        if !insert_selection.contains(index) {
             return Ok(crate::live_state::EntityColumnarWriteSets::new());
         }
         let (Some(commit_id), Some(_snapshot)) = (row.commit_id, row.snapshot) else {

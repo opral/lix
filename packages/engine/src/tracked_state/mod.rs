@@ -6,6 +6,7 @@ mod context;
 mod diff;
 mod diff_id;
 mod merge;
+pub(crate) mod replacement_part;
 mod row_materialization;
 mod storage;
 mod tree;
@@ -45,6 +46,7 @@ pub(crate) use storage::{
     stage_addressable_commit_deltas_with_selected_source, stage_change_locators,
     stage_commit_deltas, stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
     stage_delete_commit_roots, stage_ordered_addressable_commit_deltas,
+    stage_ordered_addressable_replacement_parts,
 };
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{

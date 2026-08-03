@@ -4028,7 +4028,7 @@ mod tests {
         assert_eq!(overlay_rows, expected_overlay_rows);
     }
 
-    async fn assert_current_head_has_columnar_manifest(
+    async fn assert_current_head_uses_packed_delta_without_columnar_sidecar(
         session: &SessionContext<Memory>,
         schema_key: &str,
         expected_rows: u64,
@@ -4049,17 +4049,25 @@ mod tests {
             .await
             .expect("branch head should load")
             .expect("active branch should have a head");
-        let sidecar_read = session
+        let state_read = session
             .storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("sidecar read should open");
+            .expect("replacement read should open");
+        let replay =
+            crate::tracked_state::load_commit_delta_replay_metadata(&state_read, head.commit_id)
+                .await
+                .expect("replacement metadata should load")
+                .expect("current head must publish replacement metadata");
+        assert_eq!(u64::from(replay.member_count), expected_rows);
         let id = crate::live_state::entity_row_group_set_id(head.commit_id, schema_key);
-        let manifest = crate::columnar_row_group::load_row_group_manifest(&sidecar_read, id)
+        let manifest = crate::columnar_row_group::load_row_group_manifest(&state_read, id)
             .await
-            .expect("sidecar manifest should load")
-            .expect("current packed base must publish its typed sidecar atomically");
-        assert_eq!(manifest.row_count(), expected_rows);
+            .expect("columnar manifest lookup should succeed");
+        assert!(
+            manifest.is_none(),
+            "UPDATE replacement parts supersede the synchronous typed sidecar"
+        );
     }
 
     async fn open_session_with_telemetry(
@@ -5671,7 +5679,7 @@ mod tests {
                 1,
                 "each complete certified replacement should swap one packed base reference"
             );
-            assert_current_head_has_columnar_manifest(
+            assert_current_head_uses_packed_delta_without_columnar_sidecar(
                 &session,
                 "ordered_packed_update_probe",
                 ROW_COUNT as u64,

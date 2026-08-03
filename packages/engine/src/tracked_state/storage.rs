@@ -38,9 +38,9 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 pub(crate) const TRACKED_STATE_TREE_CHUNK_NAMESPACE: &str = "tracked_state.tree_chunk";
 pub(crate) const TRACKED_STATE_COMMIT_ROOT_NAMESPACE: &str = "tracked_state.commit_root";
 pub(crate) const TRACKED_STATE_COMMIT_DELTA_MANIFEST_NAMESPACE: &str =
-    "tracked_state.commit_delta_manifest.v5";
+    "tracked_state.commit_delta_manifest.v6";
 pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE: &str =
-    "tracked_state.commit_delta_segment.v5";
+    "tracked_state.commit_delta_segment.v6";
 pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE: &str = "tracked_state.change_locator.v2";
 pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0001),
@@ -59,7 +59,7 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE: StorageSpace = Stora
     StorageSpaceId(0x0004_0019),
     TRACKED_STATE_COMMIT_DELTA_MANIFEST_NAMESPACE,
 );
-pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace = StorageSpace::mutable(
+pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_001a),
     TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE,
 );
@@ -76,10 +76,10 @@ const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
 const GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const GENERIC_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
 const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
-// Version 12 authenticates authoritative collection-replacement metadata and
-// binds it to its owning commit. Reject version 11 as a whole: accepting an
-// unauthenticated fallback could inherit unrelated state from another commit.
-const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD12";
+// Version 13 hard-cuts certified complete replacements to bounded identity
+// parts backed by one immutable columnar generation. Older manifests cannot
+// express that authority and are intentionally rejected.
+const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD13";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -232,6 +232,13 @@ enum CommitDeltaPayloadLayout {
 
 type CommitDeltaPayloadIndexRef<'a> = CommitDeltaPayloadIndex<Cow<'a, [u8]>>;
 type OwnedCommitDeltaPayloadIndex = CommitDeltaPayloadIndex<Bytes>;
+
+fn replacement_payload_error(message: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("tracked_state replacement {message}"),
+    )
+}
 
 impl<S> CommitDeltaPayloadIndex<S>
 where
@@ -527,6 +534,7 @@ impl CommitDeltaMember {
 pub(crate) struct CommitDeltaInventoryEntry {
     pub(crate) members: Vec<CommitDeltaMember>,
     pub(crate) segment_count: usize,
+    physical_segment_keys: Vec<Vec<u8>>,
     pub(crate) selected_source_commit_id: Option<CommitId>,
 }
 
@@ -538,6 +546,7 @@ pub(crate) struct CommitDeltaInventory {
 struct CommitDeltaPlane {
     manifests: BTreeMap<CommitId, CommitDeltaManifest>,
     segments: BTreeMap<CommitId, BTreeMap<usize, Bytes>>,
+    segment_keys: BTreeMap<CommitId, BTreeMap<usize, Bytes>>,
 }
 
 // Version the root metadata independently of storage backends. Version 3 is a
@@ -568,6 +577,8 @@ struct CommitDeltaManifest {
     lifecycle_summary: Option<CommitDeltaLifecycleSummary>,
     #[musli(with = storage_codec::option)]
     replacement_generation: Option<StoredCommitDeltaReplacementGeneration>,
+    #[musli(with = storage_codec::option)]
+    replacement_parts: Option<StoredReplacementPartsAuthority>,
     /// A complete leaf payload for a commit that fits in one segment. Keeping
     /// it in the directory preserves the one-record shape of tiny commits;
     /// larger commits use the indexed segment list below.
@@ -602,6 +613,13 @@ struct StoredCommitDeltaReplacementGeneration {
     integrity_digest: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredReplacementPartsAuthority {
+    directory_digest: [u8; 32],
+    uniform_updated_at: crate::common::LixTimestamp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitDeltaReplacementGeneration {
     pub(crate) scope: CommitDeltaReplacementScope,
@@ -632,6 +650,18 @@ struct CommitDeltaSegmentBounds {
     first_key: Vec<u8>,
     #[musli(bytes)]
     last_key: Vec<u8>,
+    #[musli(with = storage_codec::option)]
+    replacement_part: Option<StoredReplacementPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredReplacementPart {
+    content_digest: [u8; 32],
+    owner_commit_id: [u8; 16],
+    first_address: u32,
+    uniform_created_at: crate::common::LixTimestamp,
+    uniform_updated_at: crate::common::LixTimestamp,
 }
 
 #[derive(Debug)]
@@ -1219,6 +1249,18 @@ fn commit_delta_segment_key(
     Ok(encoded)
 }
 
+fn commit_delta_segment_key_for_bounds(
+    commit_id: CommitId,
+    segment_index: usize,
+    bounds: &CommitDeltaSegmentBounds,
+) -> Result<Vec<u8>, LixError> {
+    let mut encoded = commit_delta_segment_key(commit_id, segment_index)?;
+    if let Some(part) = bounds.replacement_part.as_ref() {
+        encoded.extend_from_slice(&part.content_digest);
+    }
+    Ok(encoded)
+}
+
 pub(crate) async fn load_commit_root(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: &str,
@@ -1327,7 +1369,6 @@ pub(crate) fn stage_ordered_addressable_commit_deltas<'a, I>(
     deltas: I,
     order_certified: bool,
     publish_lifecycle_summary: bool,
-    replacement_generation: Option<&CommitDeltaReplacementGeneration>,
 ) -> Result<Option<OrderedAddressableCommitDeltaStage>, LixError>
 where
     I: ExactSizeIterator<Item = Result<TrackedStateCommitDeltaRef<'a>, LixError>> + Clone,
@@ -1368,9 +1409,7 @@ where
         }
     }
 
-    let lifecycle_summary = if let Some(generation) = replacement_generation {
-        Some(generation.lifecycle_summary.clone())
-    } else if publish_lifecycle_summary {
+    let lifecycle_summary = if publish_lifecycle_summary {
         lifecycle_summary_for_ordered_deltas(deltas.clone())?
     } else {
         None
@@ -1393,8 +1432,8 @@ where
         ),
         single_partition: None,
         lifecycle_summary,
-        replacement_generation: replacement_generation
-            .map(|generation| stored_replacement_generation(commit_id, generation)),
+        replacement_generation: None,
+        replacement_parts: None,
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS)),
     };
@@ -1529,6 +1568,249 @@ where
     }))
 }
 
+/// Publishes a complete replacement as compact immutable identity parts.
+/// Parts own identity routing and JSON authority: small values are inline and
+/// large values remain content-addressed references into the JSON store.
+pub(crate) fn stage_ordered_addressable_replacement_parts<'a, I>(
+    writes: &mut StorageWriteSet,
+    deltas: I,
+    generation: &CommitDeltaReplacementGeneration,
+) -> Result<OrderedAddressableCommitDeltaStage, LixError>
+where
+    I: ExactSizeIterator<Item = Result<TrackedStateCommitDeltaRef<'a>, LixError>>,
+{
+    struct OwnedRow {
+        key: Vec<u8>,
+        snapshot: crate::json_store::JsonSlot,
+        metadata: crate::json_store::JsonSlot,
+    }
+
+    let row_count = deltas.len();
+    if row_count == 0 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state replacement generation cannot be empty",
+        ));
+    }
+    let _span = tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.materialization.commit_delta.replacement_parts",
+        row_count
+    )
+    .entered();
+    let mut commit_id = None;
+    let mut uniform_updated_at = None;
+    let mut previous_key = Vec::new();
+    let mut pending = Vec::with_capacity(COMMIT_DELTA_SEGMENT_MAX_ROWS);
+    let mut parts = Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS));
+    let mut compressor = None;
+    for delta in deltas {
+        let delta = delta?;
+        if delta.delta.deleted
+            || !delta.authored
+            || delta.origin_key.is_some()
+            || delta.delta.created_at != generation.lifecycle_summary.uniform_created_at
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state replacement member violates immutable replacement invariants",
+            ));
+        }
+        let own_slot = |slot| match slot {
+            crate::json_store::JsonSlotRef::None => crate::json_store::JsonSlot::None,
+            crate::json_store::JsonSlotRef::Ref(json_ref) => {
+                crate::json_store::JsonSlot::Ref(*json_ref)
+            }
+            crate::json_store::JsonSlotRef::Inline(json) => {
+                crate::json_store::JsonSlot::Inline(json.into())
+            }
+        };
+        let snapshot = own_slot(delta.snapshot);
+        if snapshot.is_none() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state replacement member has no canonical snapshot",
+            ));
+        }
+        let metadata = own_slot(delta.metadata);
+        if commit_id
+            .replace(delta.delta.commit_id)
+            .is_some_and(|owner| owner != delta.delta.commit_id)
+            || uniform_updated_at
+                .replace(delta.delta.updated_at)
+                .is_some_and(|timestamp| timestamp != delta.delta.updated_at)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state replacement members have nonuniform owner or timestamp",
+            ));
+        }
+        let key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: delta.delta.schema_key,
+            file_id: delta.delta.file_id,
+            entity_pk: delta.delta.entity_pk,
+        });
+        if !previous_key.is_empty() && previous_key >= key {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state replacement members are not in canonical identity order",
+            ));
+        }
+        previous_key.clear();
+        previous_key.extend_from_slice(&key);
+        pending.push(OwnedRow {
+            key,
+            snapshot: snapshot.to_owned(),
+            metadata,
+        });
+        if pending.len() == COMMIT_DELTA_SEGMENT_MAX_ROWS {
+            encode_replacement_part_prefix(&mut pending, &mut parts, &mut compressor)?;
+        }
+    }
+    let commit_id = commit_id.expect("non-empty replacement has an owner");
+    addressable_change_id(commit_id, 0, 0)?;
+    let uniform_updated_at = uniform_updated_at.expect("non-empty replacement has a timestamp");
+
+    while !pending.is_empty() {
+        encode_replacement_part_prefix(&mut pending, &mut parts, &mut compressor)?;
+    }
+
+    fn encode_replacement_part_prefix(
+        pending: &mut Vec<OwnedRow>,
+        parts: &mut Vec<crate::tracked_state::replacement_part::EncodedReplacementPart>,
+        compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
+    ) -> Result<(), LixError> {
+        let mut candidate_len = pending.len().min(COMMIT_DELTA_SEGMENT_MAX_ROWS);
+        let encoded = loop {
+            let refs = pending[..candidate_len]
+                .iter()
+                .map(
+                    |row| crate::tracked_state::replacement_part::ReplacementPartRowRef {
+                        encoded_key: &row.key,
+                        snapshot: row.snapshot.as_ref_slot(),
+                        metadata: row.metadata.as_ref_slot(),
+                    },
+                )
+                .collect::<Vec<_>>();
+            match crate::tracked_state::replacement_part::encode_replacement_part_with_compressor(
+                &refs, compressor,
+            ) {
+                Ok(encoded)
+                    if encoded.bytes().len()
+                        <= crate::tracked_state::replacement_part::REPLACEMENT_PART_TARGET_BYTES
+                        || candidate_len == 1 =>
+                {
+                    break encoded;
+                }
+                Ok(_) => candidate_len = candidate_len.div_ceil(2),
+                Err(_) if candidate_len > 1 => candidate_len = candidate_len.div_ceil(2),
+                Err(error) => return Err(error),
+            }
+        };
+        parts.push(encoded);
+        pending.drain(..candidate_len);
+        Ok(())
+    }
+
+    let mut first_ordinal = 0u32;
+    let directory_entries = parts
+        .iter()
+        .map(|part| {
+            let entry = part.directory_entry(first_ordinal);
+            first_ordinal = first_ordinal
+                .checked_add(u32::from(part.row_count()))
+                .expect("replacement row count fits u32");
+            entry
+        })
+        .collect::<Vec<_>>();
+    let directory = crate::tracked_state::replacement_part::ReplacementPartDirectory::try_new(
+        directory_entries,
+        u32::try_from(row_count).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state replacement row count exceeds u32",
+            )
+        })?,
+    )?;
+    let authority = StoredReplacementPartsAuthority {
+        directory_digest: directory.digest()?,
+        uniform_updated_at,
+    };
+    let mut manifest = CommitDeltaManifest {
+        selected_source_commit_id: None,
+        member_count: u32::try_from(row_count).expect("replacement row count was bounded"),
+        selection_fingerprint: [0; 32],
+        direct_segment_row_counts: Vec::with_capacity(parts.len()),
+        single_partition: Some(generation.scope.clone()),
+        lifecycle_summary: Some(generation.lifecycle_summary.clone()),
+        replacement_generation: Some(stored_replacement_generation(
+            commit_id, generation, &authority,
+        )),
+        replacement_parts: Some(authority),
+        inline_segment: Vec::new(),
+        segments: Vec::with_capacity(parts.len()),
+    };
+    writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, 1, 0);
+    writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, parts.len(), 0);
+    let mut first_address = 0u32;
+    for (segment_index, part) in parts.into_iter().enumerate() {
+        manifest.direct_segment_row_counts.push(part.row_count());
+        let bounds = CommitDeltaSegmentBounds {
+            first_key: part.first_key().to_vec(),
+            last_key: part.last_key().to_vec(),
+            replacement_part: Some(StoredReplacementPart {
+                content_digest: *part.digest(),
+                owner_commit_id: *commit_id.as_uuid().as_bytes(),
+                first_address,
+                uniform_created_at: generation.lifecycle_summary.uniform_created_at,
+                uniform_updated_at,
+            }),
+        };
+        let physical_key = commit_delta_segment_key_for_bounds(commit_id, segment_index, &bounds)?;
+        manifest.segments.push(bounds);
+        writes.put(
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+            key(physical_key),
+            value(part.bytes().to_vec()),
+        );
+        first_address = u32::try_from(segment_index + 1)
+            .expect("replacement segment count fits u32")
+            .checked_mul(u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("row limit fits u32"))
+            .expect("replacement direct address fits u32");
+    }
+    writes.put(
+        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        key(commit_delta_manifest_key(commit_id)),
+        value(encode_commit_delta_manifest(&manifest)?),
+    );
+
+    let dense = manifest
+        .direct_segment_row_counts
+        .iter()
+        .take(manifest.direct_segment_row_counts.len().saturating_sub(1))
+        .all(|&count| usize::from(count) == COMMIT_DELTA_SEGMENT_MAX_ROWS);
+    let change_addresses = if dense {
+        OrderedChangeAddresses::Dense
+    } else {
+        let mut packed = Vec::with_capacity(row_count);
+        for (segment_index, &rows) in manifest.direct_segment_row_counts.iter().enumerate() {
+            let base = u32::try_from(segment_index)
+                .expect("replacement segment index fits u32")
+                .checked_mul(
+                    u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("row limit fits u32"),
+                )
+                .expect("replacement direct address fits u32");
+            packed.extend((0..rows).map(|ordinal| base + u32::from(ordinal) + 1));
+        }
+        OrderedChangeAddresses::Packed(packed)
+    };
+    Ok(OrderedAddressableCommitDeltaStage {
+        commit_id,
+        change_addresses,
+        row_count,
+    })
+}
+
 fn lifecycle_summary_for_ordered_deltas<'a, I>(
     deltas: I,
 ) -> Result<Option<CommitDeltaLifecycleSummary>, LixError>
@@ -1575,6 +1857,7 @@ where
 fn stored_replacement_generation(
     owner_commit_id: CommitId,
     generation: &CommitDeltaReplacementGeneration,
+    replacement_parts: &StoredReplacementPartsAuthority,
 ) -> StoredCommitDeltaReplacementGeneration {
     let mut stored = StoredCommitDeltaReplacementGeneration {
         owner_commit_id: *owner_commit_id.as_uuid().as_bytes(),
@@ -1584,14 +1867,18 @@ fn stored_replacement_generation(
             .map(|commit_id| *commit_id.as_uuid().as_bytes()),
         integrity_digest: [0; 32],
     };
-    stored.integrity_digest =
-        replacement_generation_integrity_digest(&stored, &generation.lifecycle_summary);
+    stored.integrity_digest = replacement_generation_integrity_digest(
+        &stored,
+        &generation.lifecycle_summary,
+        replacement_parts,
+    );
     stored
 }
 
 fn replacement_generation_integrity_digest(
     generation: &StoredCommitDeltaReplacementGeneration,
     lifecycle_summary: &CommitDeltaLifecycleSummary,
+    replacement_parts: &StoredReplacementPartsAuthority,
 ) -> [u8; 32] {
     let mut digest =
         blake3::Hasher::new_derive_key("lix tracked-state replacement generation certificate v1");
@@ -1619,6 +1906,8 @@ fn replacement_generation_integrity_digest(
     }
     digest.update(&lifecycle_summary.ordered_identity_digest);
     digest.update(&lifecycle_summary.uniform_created_at.packed().to_be_bytes());
+    digest.update(&replacement_parts.directory_digest);
+    digest.update(&replacement_parts.uniform_updated_at.packed().to_be_bytes());
     *digest.finalize().as_bytes()
 }
 
@@ -1705,6 +1994,7 @@ fn encode_ordered_addressable_commit_delta_segment<'a>(
                 .expect("ordered commit-delta segment is nonempty")
                 .key
                 .to_vec(),
+            replacement_part: None,
         };
         let encoded =
             try_encode_commit_delta_segment_with_payload_refs(entries, &payloads, compressor)?;
@@ -1891,6 +2181,7 @@ fn stage_commit_deltas_inner(
                 single_partition: single_partition_for_entries(&entries)?,
                 lifecycle_summary: None,
                 replacement_generation: None,
+                replacement_parts: None,
                 inline_segment,
                 segments: Vec::new(),
             })?),
@@ -1915,6 +2206,7 @@ fn stage_commit_deltas_inner(
         single_partition: single_partition_for_entries(&entries)?,
         lifecycle_summary: None,
         replacement_generation: None,
+        replacement_parts: None,
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(segment_count),
     };
@@ -1935,6 +2227,7 @@ fn stage_commit_deltas_inner(
         manifest.segments.push(CommitDeltaSegmentBounds {
             first_key,
             last_key,
+            replacement_part: None,
         });
         writes.put(
             TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
@@ -2278,8 +2571,12 @@ async fn load_change_records_at_locators(
     let segment_keys = routes
         .iter()
         .map(|&(commit_id, segment_index)| {
-            commit_delta_segment_key(commit_id, segment_index)
-                .map(|key| StorageKey(Bytes::from(key)))
+            commit_delta_segment_key_for_bounds(
+                commit_id,
+                segment_index,
+                &manifests[&commit_id].segments[segment_index],
+            )
+            .map(|key| StorageKey(Bytes::from(key)))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let segment_values =
@@ -2504,9 +2801,10 @@ async fn try_load_change_record_at_locator_in_manifest(
                 ),
             )
         })?;
-        let segment_key = StorageKey(Bytes::from(commit_delta_segment_key(
+        let segment_key = StorageKey(Bytes::from(commit_delta_segment_key_for_bounds(
             locator.commit_id,
             segment_index,
+            bounds,
         )?));
         let segment = PointReadPlan::new(
             TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
@@ -2775,8 +3073,12 @@ async fn load_local_commit_delta_values_encoded(
     let storage_keys = segment_ranges
         .iter()
         .map(|&(segment_index, _, _)| {
-            commit_delta_segment_key(commit_id, segment_index)
-                .map(|key| StorageKey(Bytes::from(key)))
+            commit_delta_segment_key_for_bounds(
+                commit_id,
+                segment_index,
+                &manifest.segments[segment_index],
+            )
+            .map(|key| StorageKey(Bytes::from(key)))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let result = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
@@ -2956,8 +3258,12 @@ async fn load_commit_delta_members_from_manifest(
         let segment_keys = segment_indices
             .iter()
             .map(|&segment_index| {
-                commit_delta_segment_key(commit_id, segment_index)
-                    .map(|key| StorageKey(Bytes::from(key)))
+                commit_delta_segment_key_for_bounds(
+                    commit_id,
+                    segment_index,
+                    &manifest.segments[segment_index],
+                )
+                .map(|key| StorageKey(Bytes::from(key)))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let segments = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &segment_keys)
@@ -3375,8 +3681,12 @@ async fn load_local_owned_commit_delta_entries(
     let segment_keys = segment_routes
         .iter()
         .map(|&(commit_id, segment_index)| {
-            commit_delta_segment_key(commit_id, segment_index)
-                .map(|key| StorageKey(Bytes::from(key)))
+            commit_delta_segment_key_for_bounds(
+                commit_id,
+                segment_index,
+                &segmented_manifests[&commit_id].segments[segment_index],
+            )
+            .map(|key| StorageKey(Bytes::from(key)))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let segment_values =
@@ -3583,10 +3893,9 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                 None => {
                     decoded_segments.push(None);
                     missing_indices.push(segment_index);
-                    missing_keys.push(StorageKey(Bytes::from(commit_delta_segment_key(
-                        commit_id,
-                        segment_index,
-                    )?)));
+                    missing_keys.push(StorageKey(Bytes::from(
+                        commit_delta_segment_key_for_bounds(commit_id, segment_index, bounds)?,
+                    )));
                 }
             }
         }
@@ -3666,8 +3975,12 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
     let segment_keys = segment_indices
         .iter()
         .map(|&segment_index| {
-            commit_delta_segment_key(commit_id, segment_index)
-                .map(|key| StorageKey(Bytes::from(key)))
+            commit_delta_segment_key_for_bounds(
+                commit_id,
+                segment_index,
+                &manifest.segments[segment_index],
+            )
+            .map(|key| StorageKey(Bytes::from(key)))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let segment_values =
@@ -3943,8 +4256,12 @@ async fn scan_local_commit_delta_values(
     let storage_keys = segment_indices
         .iter()
         .map(|&segment_index| {
-            commit_delta_segment_key(commit_id, segment_index)
-                .map(|key| StorageKey(Bytes::from(key)))
+            commit_delta_segment_key_for_bounds(
+                commit_id,
+                segment_index,
+                &manifest.segments[segment_index],
+            )
+            .map(|key| StorageKey(Bytes::from(key)))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let segments = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
@@ -4241,10 +4558,10 @@ async fn validate_no_orphan_commit_delta_segments(
         }
         let mut commit_ids = Vec::new();
         for entry in &page.value.entries {
-            if entry.key.0.len() != 20 {
+            if entry.key.0.len() != 20 && entry.key.0.len() != 52 {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_delta segment key is not commit-id plus u32 suffix",
+                    "tracked_state commit_delta segment key is not a physical segment address",
                 ));
             }
             let commit_id = commit_id_from_delta_key(&entry.key)?;
@@ -4295,6 +4612,19 @@ async fn validate_no_orphan_commit_delta_segments(
                     ),
                 ));
             }
+            if entry.key.0.as_ref()
+                != commit_delta_segment_key_for_bounds(
+                    commit_id,
+                    segment_index,
+                    &manifest.segments[segment_index],
+                )?
+                .as_slice()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_delta physical segment key does not match its manifest",
+                ));
+            }
         }
         if !page.value.has_more {
             break;
@@ -4314,10 +4644,12 @@ pub(crate) async fn scan_commit_delta_inventory(
     let CommitDeltaPlane {
         manifests,
         mut segments,
+        mut segment_keys,
     } = scan_commit_delta_plane(store).await?;
     let mut inventory = CommitDeltaInventory::default();
     for (&commit_id, manifest) in &manifests {
         let physical_segments = segments.remove(&commit_id).unwrap_or_default();
+        let physical_segment_keys = segment_keys.remove(&commit_id).unwrap_or_default();
         let segment_count = manifest.segments.len();
         let mut members = Vec::new();
         if let Some(inline_segment) = manifest.inline_segment() {
@@ -4331,7 +4663,12 @@ pub(crate) async fn scan_commit_delta_inventory(
             }
             collect_strict_commit_delta_members(inline_segment, None, commit_id, 0, &mut members)?;
         } else {
-            validate_physical_commit_delta_segments(commit_id, &manifest, &physical_segments)?;
+            validate_physical_commit_delta_segments(
+                commit_id,
+                &manifest,
+                &physical_segments,
+                &physical_segment_keys,
+            )?;
             for (segment_index, bounds) in manifest.segments.iter().enumerate() {
                 collect_strict_commit_delta_members(
                     &physical_segments[&segment_index],
@@ -4349,6 +4686,14 @@ pub(crate) async fn scan_commit_delta_inventory(
             CommitDeltaInventoryEntry {
                 members,
                 segment_count,
+                physical_segment_keys: manifest
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .map(|(segment_index, bounds)| {
+                        commit_delta_segment_key_for_bounds(commit_id, segment_index, bounds)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
                 selected_source_commit_id: manifest.selected_source_commit_id(),
             },
         );
@@ -4421,6 +4766,7 @@ pub(crate) async fn scan_commit_delta_inventory(
         }
     }
     debug_assert!(segments.is_empty());
+    debug_assert!(segment_keys.is_empty());
     Ok(inventory)
 }
 
@@ -4451,11 +4797,12 @@ async fn scan_commit_delta_plane(
     }
 
     let mut segments = BTreeMap::<CommitId, BTreeMap<usize, Bytes>>::new();
+    let mut segment_keys = BTreeMap::<CommitId, BTreeMap<usize, Bytes>>::new();
     for (key, bytes) in segment_rows {
-        if key.0.len() != 20 {
+        if key.0.len() != 20 && key.0.len() != 52 {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "tracked_state commit_delta segment key is not commit-id plus u32 suffix",
+                "tracked_state commit_delta segment key is not a physical segment address",
             ));
         }
         let commit_id = commit_id_from_delta_key(&key)?;
@@ -4465,6 +4812,10 @@ async fn scan_commit_delta_plane(
                 .expect("commit-delta segment suffix length checked"),
         ))
         .expect("u32 fits usize");
+        segment_keys
+            .entry(commit_id)
+            .or_default()
+            .insert(segment_index, key.0.clone());
         if segments
             .entry(commit_id)
             .or_default()
@@ -4495,6 +4846,7 @@ async fn scan_commit_delta_plane(
     Ok(CommitDeltaPlane {
         manifests,
         segments,
+        segment_keys,
     })
 }
 
@@ -4502,6 +4854,7 @@ fn validate_physical_commit_delta_segments(
     commit_id: CommitId,
     manifest: &CommitDeltaManifest,
     physical_segments: &BTreeMap<usize, Bytes>,
+    physical_segment_keys: &BTreeMap<usize, Bytes>,
 ) -> Result<(), LixError> {
     if physical_segments.len() != manifest.segments.len() {
         return Err(LixError::new(
@@ -4523,6 +4876,19 @@ fn validate_physical_commit_delta_segments(
             ),
         ));
     }
+    for (segment_index, bounds) in manifest.segments.iter().enumerate() {
+        if physical_segment_keys.get(&segment_index).is_none_or(|key| {
+            match commit_delta_segment_key_for_bounds(commit_id, segment_index, bounds) {
+                Ok(expected) => key.as_ref() != expected.as_slice(),
+                Err(_) => true,
+            }
+        }) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta physical segment key does not match its manifest",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -4535,10 +4901,10 @@ pub(crate) fn stage_delete_commit_delta_inventory_entry(
         TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
         key(commit_delta_manifest_key(commit_id)),
     );
-    for segment_index in 0..entry.segment_count {
+    for segment_key in &entry.physical_segment_keys {
         writes.delete(
             TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-            key(commit_delta_segment_key(commit_id, segment_index)?),
+            key(segment_key.clone()),
         );
     }
     Ok(())
@@ -4944,15 +5310,87 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
             || manifest.selected_source_commit_id.is_some()
             || manifest.direct_segment_row_counts.is_empty()
             || !manifest.inline_segment.is_empty()
+            || manifest.replacement_parts.is_none()
             || manifest.lifecycle_summary.as_ref().is_none_or(|summary| {
                 generation.integrity_digest
-                    != replacement_generation_integrity_digest(generation, summary)
+                    != replacement_generation_integrity_digest(
+                        generation,
+                        summary,
+                        manifest
+                            .replacement_parts
+                            .as_ref()
+                            .expect("replacement generation requires immutable parts"),
+                    )
             }))
     {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "tracked_state commit_delta manifest has an invalid replacement generation",
         ));
+    }
+    match manifest.replacement_parts.as_ref() {
+        Some(authority) => {
+            if manifest.replacement_generation.is_none()
+                || manifest.inline_segment().is_some()
+                || manifest.segments.is_empty()
+                || manifest
+                    .segments
+                    .iter()
+                    .any(|bounds| bounds.replacement_part.is_none())
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state replacement-part authority has an invalid manifest shape",
+                ));
+            }
+            let directory = replacement_directory_from_manifest(manifest)?;
+            if directory.digest()? != authority.directory_digest {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state replacement-part directory digest mismatch",
+                ));
+            }
+            let generation = manifest
+                .replacement_generation
+                .as_ref()
+                .expect("replacement-part authority requires a generation");
+            if manifest.segments.iter().enumerate().any(|(index, bounds)| {
+                bounds.replacement_part.as_ref().is_none_or(|part| {
+                    part.owner_commit_id != generation.owner_commit_id
+                        || part.uniform_created_at
+                            != manifest
+                                .lifecycle_summary
+                                .as_ref()
+                                .expect("replacement generation has lifecycle summary")
+                                .uniform_created_at
+                        || part.first_address
+                            != u32::try_from(index)
+                                .expect("replacement part index fits u32")
+                                .saturating_mul(
+                                    u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                                        .expect("replacement row bound fits u32"),
+                                )
+                        || part.uniform_updated_at != authority.uniform_updated_at
+                })
+            }) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state replacement-part authority does not match its owner generation",
+                ));
+            }
+        }
+        None => {
+            if manifest
+                .segments
+                .iter()
+                .any(|bounds| bounds.replacement_part.is_some())
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_delta has unauthorised replacement parts",
+                ));
+            }
+        }
     }
     if !manifest.direct_segment_row_counts.is_empty() {
         if manifest.selected_source_commit_id.is_some()
@@ -5052,6 +5490,45 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+fn replacement_directory_from_manifest(
+    manifest: &CommitDeltaManifest,
+) -> Result<crate::tracked_state::replacement_part::ReplacementPartDirectory, LixError> {
+    let mut first_ordinal = 0u32;
+    let entries = manifest
+        .segments
+        .iter()
+        .zip(&manifest.direct_segment_row_counts)
+        .map(|(bounds, &row_count)| {
+            let replacement = bounds.replacement_part.as_ref().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state replacement directory contains a generic segment",
+                )
+            })?;
+            let entry = crate::tracked_state::replacement_part::ReplacementPartDirectoryEntry::new(
+                replacement.content_digest,
+                &bounds.first_key,
+                &bounds.last_key,
+                first_ordinal,
+                row_count,
+            );
+            first_ordinal = first_ordinal
+                .checked_add(u32::from(row_count))
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state replacement directory ordinal overflows",
+                    )
+                })?;
+            Ok(entry)
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    crate::tracked_state::replacement_part::ReplacementPartDirectory::try_new(
+        entries,
+        manifest.member_count,
+    )
 }
 
 impl CommitDeltaManifest {
@@ -5464,6 +5941,11 @@ fn decode_commit_delta_leaf(
     bytes: &[u8],
     expected_bounds: Option<&CommitDeltaSegmentBounds>,
 ) -> Result<DecodedLeafNodeRef, LixError> {
+    if let Some(bounds) = expected_bounds
+        && bounds.replacement_part.is_some()
+    {
+        return decode_replacement_part_as_commit_delta(bytes, bounds).map(|(leaf, _)| leaf);
+    }
     let (leaf_bytes, _) = split_commit_delta_segment(bytes)?;
     let leaf = match decode_node_ref(leaf_bytes)? {
         DecodedNodeRef::Leaf(leaf) => leaf,
@@ -5522,6 +6004,26 @@ fn decode_commit_delta_with_payloads<'a>(
     bytes: &'a [u8],
     expected_bounds: Option<&CommitDeltaSegmentBounds>,
 ) -> Result<(DecodedLeafNodeRef, CommitDeltaPayloadIndexRef<'a>), LixError> {
+    if let Some(bounds) = expected_bounds
+        && bounds.replacement_part.is_some()
+    {
+        let (leaf, payloads) = decode_replacement_part_as_commit_delta(bytes, bounds)?;
+        let entry_count = leaf.len();
+        let directory_len = entry_count
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(4))
+            .expect("bounded replacement payload directory fits usize");
+        return Ok((
+            leaf,
+            CommitDeltaPayloadIndexRef {
+                sidecar: Cow::Owned(payloads),
+                offsets: 0..directory_len,
+                payload_start: directory_len,
+                entry_count,
+                layout: CommitDeltaPayloadLayout::Indexed,
+            },
+        ));
+    }
     let (_, encoded_sidecar) = split_commit_delta_segment(bytes)?;
     let leaf = decode_commit_delta_leaf(bytes, expected_bounds)?;
     let (&encoding, encoded_sidecar) = encoded_sidecar.split_first().ok_or_else(|| {
@@ -5681,6 +6183,101 @@ fn decode_commit_delta_with_payloads<'a>(
         ));
     }
     Ok((leaf, index))
+}
+
+fn decode_replacement_part_as_commit_delta(
+    bytes: &[u8],
+    bounds: &CommitDeltaSegmentBounds,
+) -> Result<(DecodedLeafNodeRef, Vec<u8>), LixError> {
+    let replacement = bounds.replacement_part.as_ref().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state replacement segment is missing its physical metadata",
+        )
+    })?;
+    let decoded = crate::tracked_state::replacement_part::decode_replacement_part(
+        &replacement.content_digest,
+        bytes,
+    )?;
+    if decoded.first_key() != Some(bounds.first_key.as_slice())
+        || decoded.last_key() != Some(bounds.last_key.as_slice())
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state replacement part does not match its manifest bounds",
+        ));
+    }
+    let owner_commit_id = CommitId::new(uuid::Uuid::from_bytes(replacement.owner_commit_id));
+    let mut values = Vec::with_capacity(decoded.len());
+    let mut payload_offsets = Vec::with_capacity(decoded.len() + 1);
+    let mut payload_bytes = Vec::new();
+    for ordinal in 0..decoded.len() {
+        let packed = replacement
+            .first_address
+            .checked_add(u32::try_from(ordinal).expect("replacement part ordinal fits u32"))
+            .and_then(|address| address.checked_add(1))
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state replacement change address overflows",
+                )
+            })?;
+        values.push(encode_value_ref(TrackedStateIndexValueRef {
+            change_id: change_id_from_packed_address(owner_commit_id, packed),
+            commit_id: owner_commit_id,
+            deleted: false,
+            created_at: replacement.uniform_created_at,
+            updated_at: replacement.uniform_updated_at,
+        }));
+        payload_offsets.push(
+            u32::try_from(payload_bytes.len())
+                .map_err(|_| replacement_payload_error("payload directory exceeds u32"))?,
+        );
+        let snapshot = decoded
+            .snapshot(ordinal)?
+            .ok_or_else(|| replacement_payload_error("part omitted a snapshot"))?;
+        let metadata = decoded
+            .metadata(ordinal)?
+            .ok_or_else(|| replacement_payload_error("part omitted metadata authority"))?;
+        payload_bytes.push(COMMIT_DELTA_PAYLOAD_AUTHORED);
+        storage_codec::append(
+            "tracked_state replacement authored payload",
+            &mut payload_bytes,
+            &CommitDeltaAuthoredPayloadRef {
+                snapshot,
+                metadata,
+                origin_key: None,
+                base_coordinate: None,
+            },
+        )?;
+    }
+    let entries = (0..decoded.len())
+        .map(|ordinal| {
+            Ok(EncodedLeafEntryRef {
+                key: decoded.key(ordinal)?.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state replacement part omitted a key",
+                    )
+                })?,
+                value: &values[ordinal],
+            })
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let encoded_leaf = encode_leaf_node_refs(&entries);
+    let DecodedNodeRef::Leaf(leaf) = decode_node_ref(&encoded_leaf)? else {
+        unreachable!("replacement leaf encoder returns a leaf")
+    };
+    payload_offsets.push(
+        u32::try_from(payload_bytes.len())
+            .map_err(|_| replacement_payload_error("payload directory exceeds u32"))?,
+    );
+    let mut sidecar = Vec::with_capacity(payload_offsets.len() * 4 + payload_bytes.len());
+    for offset in payload_offsets {
+        sidecar.extend_from_slice(&offset.to_be_bytes());
+    }
+    sidecar.extend_from_slice(&payload_bytes);
+    Ok((leaf, sidecar))
 }
 
 fn validate_decoded_commit_delta_bounds(
@@ -6548,7 +7145,6 @@ mod tests {
             deltas.iter().copied().map(Ok::<_, LixError>),
             false,
             false,
-            None,
         )
         .expect("ordered addressable deltas should stage")
         .expect("sorted deltas should use the streaming route");
@@ -6677,34 +7273,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut writes = storage.new_write_set();
-        let replacement_generation = super::CommitDeltaReplacementGeneration {
-            scope: super::CommitDeltaReplacementScope {
-                schema_key: "irregular".to_string(),
-                file_id: None,
-            },
-            fallback_commit_id: Some(CommitId::for_test_label("irregular-fallback")),
-            lifecycle_summary: super::CommitDeltaLifecycleSummary {
-                scope: super::CommitDeltaReplacementScope {
-                    schema_key: "irregular".to_string(),
-                    file_id: None,
-                },
-                ordered_identity_digest:
-                    crate::collection_generation::ordered_single_string_identity_digest(
-                        fixtures.iter().map(|fixture| &fixture.entity_pk),
-                    )
-                    .expect("irregular identities are single strings"),
-                uniform_created_at: fixtures[0].created_at,
-            },
-        };
         let staged = super::stage_ordered_addressable_commit_deltas(
             &mut writes,
             deltas.iter().copied().map(Ok::<_, LixError>),
             true,
             false,
-            Some(&replacement_generation),
         )
         .expect("irregular ordered deltas should stage")
-        .expect("certified ordered deltas should use the streaming route");
+        .expect("ordered deltas should use the streaming route");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -6718,13 +7294,13 @@ mod tests {
             .await
             .expect("irregular selection certificate should load")
             .expect("irregular ordered commit should have a certificate");
-        assert_eq!(
+        assert!(
             super::load_commit_delta_replay_metadata(&read, commit_id)
                 .await
-                .expect("replacement replay metadata should load")
+                .expect("replay metadata should load")
                 .expect("ordered commit has replay metadata")
-                .replacement_generation,
-            Some(replacement_generation)
+                .replacement_generation
+                .is_none()
         );
         assert!(
             certificate
@@ -6760,95 +7336,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_generation_certificate_rejects_corruption_and_owner_substitution() {
-        let owner_commit_id = CommitId::for_test_label("replacement-certificate-owner");
-        let substituted_commit_id = CommitId::for_test_label("replacement-certificate-substitute");
-        let scope = super::CommitDeltaReplacementScope {
-            schema_key: "replacement_certificate".to_string(),
-            file_id: None,
-        };
-        let lifecycle_summary = super::CommitDeltaLifecycleSummary {
-            scope: scope.clone(),
-            ordered_identity_digest: [7; 32],
-            uniform_created_at: LixTimestamp::from_unix_millis_utc_lossy(42),
-        };
-        let generation = super::CommitDeltaReplacementGeneration {
-            scope: scope.clone(),
-            fallback_commit_id: Some(CommitId::for_test_label("replacement-certificate-fallback")),
-            lifecycle_summary: lifecycle_summary.clone(),
-        };
-        let encoded_key = encode_key_ref(TrackedStateKeyRef {
-            schema_key: &scope.schema_key,
-            file_id: None,
-            entity_pk: &EntityPk::single("member"),
-        });
-        let manifest = CommitDeltaManifest {
-            selected_source_commit_id: None,
-            member_count: 1,
-            selection_fingerprint: [0; 32],
-            direct_segment_row_counts: vec![1],
-            single_partition: Some(scope),
-            lifecycle_summary: Some(lifecycle_summary),
-            replacement_generation: Some(super::stored_replacement_generation(
-                owner_commit_id,
-                &generation,
-            )),
-            inline_segment: Vec::new(),
-            segments: vec![super::CommitDeltaSegmentBounds {
-                first_key: encoded_key.clone(),
-                last_key: encoded_key,
-            }],
-        };
-        let encoded = encode_commit_delta_manifest(&manifest)
-            .expect("valid replacement certificate should encode");
-        super::decode_commit_delta_manifest_for_commit(&encoded, owner_commit_id)
-            .expect("valid replacement certificate should decode for its owner");
-
-        let mut corrupted_fallback = manifest.clone();
-        corrupted_fallback
-            .replacement_generation
-            .as_mut()
-            .expect("fixture has a replacement generation")
-            .fallback_commit_id = Some(*substituted_commit_id.as_uuid().as_bytes());
-        let error = decode_commit_delta_manifest(
-            &encode_commit_delta_manifest(&corrupted_fallback)
-                .expect("structurally encodable fallback corruption"),
-        )
-        .expect_err("fallback corruption must fail its integrity certificate");
-        assert!(error.message.contains("invalid replacement generation"));
-
-        let mut corrupted_lifecycle = manifest.clone();
-        corrupted_lifecycle
-            .lifecycle_summary
-            .as_mut()
-            .expect("fixture has lifecycle metadata")
-            .uniform_created_at = LixTimestamp::from_unix_millis_utc_lossy(43);
-        let error = decode_commit_delta_manifest(
-            &encode_commit_delta_manifest(&corrupted_lifecycle)
-                .expect("structurally encodable lifecycle corruption"),
-        )
-        .expect_err("lifecycle corruption must fail its integrity certificate");
-        assert!(error.message.contains("invalid replacement generation"));
-
+    async fn complete_replacement_parts_are_bounded_content_addressed_and_replay_exactly() {
         let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_0000_0000_7000_8000_0000_0000_0000,
+        ));
+        let created_at = LixTimestamp::from_unix_millis_utc_lossy(11);
+        let updated_at = LixTimestamp::from_unix_millis_utc_lossy(22);
+        let fixtures = (0..1_025)
+            .map(|index| CommitDeltaFixture {
+                schema_key: "alpha".to_string(),
+                file_id: None,
+                entity_pk: EntityPk::single(format!("entity-{index:05}")),
+                change_id: ChangeId::for_test_label(&format!("ignored-{index}")),
+                deleted: false,
+                created_at,
+                updated_at,
+            })
+            .collect::<Vec<_>>();
+        let mut deltas = commit_delta_refs(commit_id, &fixtures);
+        for (index, delta) in deltas.iter_mut().enumerate() {
+            delta.snapshot = crate::json_store::JsonSlotRef::Inline("{}");
+            delta.base_coordinate = Some(TrackedStateBaseCoordinate {
+                base_commit_id: commit_id,
+                group_index: u32::try_from(index / 257).expect("fixture group fits u32"),
+                row_index: u32::try_from(index % 257).expect("fixture row fits u32"),
+            });
+        }
+        let generation = super::CommitDeltaReplacementGeneration {
+            scope: super::CommitDeltaReplacementScope {
+                schema_key: "alpha".to_string(),
+                file_id: None,
+            },
+            fallback_commit_id: None,
+            lifecycle_summary: super::CommitDeltaLifecycleSummary {
+                scope: super::CommitDeltaReplacementScope {
+                    schema_key: "alpha".to_string(),
+                    file_id: None,
+                },
+                ordered_identity_digest: [3; 32],
+                uniform_created_at: created_at,
+            },
+        };
         let mut writes = storage.new_write_set();
-        writes.put(
-            TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
-            key(commit_delta_manifest_key(substituted_commit_id)),
-            value(encoded),
-        );
+        let staged = super::stage_ordered_addressable_replacement_parts(
+            &mut writes,
+            deltas.iter().copied().map(Ok),
+            &generation,
+        )
+        .expect("replacement parts should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("substituted manifest fixture should commit");
+            .expect("replacement parts should commit atomically");
+
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("substituted manifest read should open");
-        let error = super::load_commit_delta_replay_metadata(&read, substituted_commit_id)
+            .expect("read should open");
+        let physical = super::scan_full_space(&read, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE)
             .await
-            .expect_err("a valid certificate stored under another commit must fail closed");
-        assert!(error.message.contains("does not belong to commit"));
+            .expect("replacement parts should scan");
+        assert_eq!(physical.len(), 3);
+        assert!(physical.iter().all(|(key, bytes)| {
+            key.0.len() == 52
+                && (bytes.starts_with(b"LXRPI003") || bytes.starts_with(b"LXRPZ003"))
+                && bytes.len() <= 64 * 1024
+        }));
+
+        let keys = [
+            fixtures[0].key(),
+            fixtures[777].key(),
+            fixtures[1_024].key(),
+        ];
+        let values = load_commit_delta_values_for_test(&read, commit_id, &keys)
+            .await
+            .expect("replacement point replay should load");
+        assert!(values.iter().all(Option::is_some));
+        let change_id = staged
+            .change_id_at(777)
+            .expect("replacement row has a direct address");
+        let change_ids = load_commit_delta_change_ids(&read, commit_id)
+            .await
+            .expect("replacement addresses should scan without hydrating payloads");
+        assert_eq!(change_ids[777], change_id);
     }
 
     #[tokio::test]
@@ -7937,6 +8508,7 @@ mod tests {
                     }),
                     lifecycle_summary: None,
                     replacement_generation: None,
+                    replacement_parts: None,
                     inline_segment: segment,
                     segments: Vec::new(),
                 })
@@ -8270,7 +8842,9 @@ mod tests {
                 if coordinate == coordinates[1]
         ));
         assert!(matches!(
-            decoded.decode(2).expect("certified coordinate should decode"),
+            decoded
+                .decode(2)
+                .expect("replacement coordinate should decode"),
             super::CommitDeltaPayload::CertifiedRef {
                 origin_key: None,
                 base_coordinate: Some(coordinate),
@@ -8874,6 +9448,7 @@ mod tests {
                     single_partition: None,
                     lifecycle_summary: None,
                     replacement_generation: None,
+                    replacement_parts: None,
                     inline_segment: encode_commit_delta_segment(&entries),
                     segments: Vec::new(),
                 })
