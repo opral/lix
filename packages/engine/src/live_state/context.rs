@@ -2857,6 +2857,7 @@ mod tests {
                     created_at: record.created_at,
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: Default::default(),
+                    current_state_part_sets: Vec::new(),
                     snapshot_root: Some(snapshot_root),
                 },
             )
@@ -3083,6 +3084,7 @@ mod tests {
                         bytes: record.tracked_state_rootless_bytes,
                     },
                     mutations: Default::default(),
+                    current_state_part_sets: Vec::new(),
                     snapshot_root: None,
                 },
             )
@@ -3299,6 +3301,7 @@ mod tests {
                     created_at: record.created_at,
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: mutation_inventory,
+                    current_state_part_sets: Vec::new(),
                     snapshot_root: Some(snapshot_root),
                 },
             )?;

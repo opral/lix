@@ -39,6 +39,7 @@ fn stage_bench_commit_deltas(
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
+            current_state_part_sets: Vec::new(),
             snapshot_root: None,
         },
     )?;

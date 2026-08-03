@@ -3,6 +3,7 @@ mod bench_support;
 mod codec;
 mod commit_root_rebuild;
 mod context;
+mod current_state_part;
 mod diff;
 mod diff_id;
 mod merge;
@@ -18,6 +19,9 @@ pub(crate) use commit_root_rebuild::{
 };
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
+};
+pub(crate) use current_state_part::{
+    stage_complete_replacement_current_state_part_set, stage_delete_current_state_part_directory,
 };
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
