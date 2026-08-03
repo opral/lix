@@ -89,6 +89,62 @@ simulation_test!(observe_next_returns_initial_snapshot, |sim| async move {
     assert_key_value_row(&initial, "observe-initial", "v0");
 });
 
+simulation_test!(observe_follows_in_place_branch_switch, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let (raw_session, session) = open_workspace_session(&sim, &engine).await;
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('observe-switch', 'main')",
+            &[],
+        )
+        .await
+        .expect("seed main value");
+    let main_branch_id = session
+        .active_branch_id()
+        .await
+        .expect("active main branch");
+    let draft = session
+        .create_branch(lix_engine::CreateBranchOptions {
+            id: None,
+            name: "observe-switch-draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("create draft branch");
+    session
+        .switch_branch(lix_engine::SwitchBranchOptions {
+            branch_id: draft.id.clone(),
+        })
+        .await
+        .expect("switch to draft");
+    session
+        .execute(
+            "UPDATE lix_key_value SET value = 'draft' WHERE key = 'observe-switch'",
+            &[],
+        )
+        .await
+        .expect("update draft value");
+    session
+        .switch_branch(lix_engine::SwitchBranchOptions {
+            branch_id: main_branch_id,
+        })
+        .await
+        .expect("switch back to main");
+
+    let mut events = observe_key(&raw_session, "observe-switch");
+    let initial = next_event(&mut events, "main branch snapshot").await;
+    assert_key_value_row(&initial, "observe-switch", "main");
+
+    session
+        .switch_branch(lix_engine::SwitchBranchOptions {
+            branch_id: draft.id,
+        })
+        .await
+        .expect("switch observed session to draft");
+    let switched = next_event(&mut events, "draft branch snapshot").await;
+    assert_key_value_row(&switched, "observe-switch", "draft");
+});
+
 #[tokio::test]
 async fn observe_initial_next_waits_without_rejecting_same_session_write() {
     let storage = BlockingBeginReadStorage::new();

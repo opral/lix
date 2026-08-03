@@ -272,27 +272,27 @@ async fn register_poison_task_schema(session: &lix_engine::SessionContext) {
 }
 
 simulation_test!(
-    session_close_state_is_shared_with_switched_session,
+    session_close_state_is_shared_with_cloned_session,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = engine
             .open_workspace_session()
             .await
             .expect("storage should open a session");
-        let (switched_session, _) = session
+        let cloned_session = session.clone();
+        session
             .switch_branch(SwitchBranchOptions {
                 branch_id: sim.main_branch_id().to_string(),
             })
             .await
             .expect("switch_branch should succeed before close");
-
         session.close().await.expect("close should succeed");
 
         assert_closed(
-            switched_session
+            cloned_session
                 .active_branch_id()
                 .await
-                .expect_err("derived session should observe closed state"),
+                .expect_err("cloned session should observe closed state"),
         );
     }
 );

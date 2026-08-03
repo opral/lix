@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use serde_json::json;
 
 use crate::GLOBAL_BRANCH_ID;
@@ -30,19 +28,27 @@ where
 {
     /// Switches the session's active branch selector.
     ///
-    /// Pinned sessions switch in memory and return a new pinned session.
-    /// Workspace sessions update the shared workspace selector and return a
-    /// new session pinned to that selection. Existing sessions retain the
-    /// branch snapshot they opened with, like ordinary database connections.
+    /// Pinned sessions update their in-memory selector. Workspace sessions
+    /// additionally persist the workspace selector. Clones of this session
+    /// observe the switch in place; independently opened sessions retain the
+    /// branch snapshot they opened with.
     pub async fn switch_branch(
         &self,
         options: SwitchBranchOptions,
-    ) -> Result<(Self, SwitchBranchReceipt), LixError> {
+    ) -> Result<SwitchBranchReceipt, LixError> {
         let branch_id = options.branch_id;
         let receipt_branch_id = branch_id.clone();
         let current_mode = self.mode.clone();
-        let next_mode = self
-            .with_write_transaction_lending(async move |transaction| {
+        let selector = match &self.mode {
+            SessionMode::Pinned { branch_id } | SessionMode::Workspace { branch_id } => {
+                branch_id.clone()
+            }
+        };
+        let observe_invalidation = self.observe_invalidation.clone();
+        let write_access = self.begin_session_write_access().await?;
+        self.with_write_transaction_reserved_lending(
+            write_access,
+            async move |transaction| {
                 {
                     let reader = transaction.branch_ref_reader().await;
                     BranchLifecycle::new(&reader)
@@ -54,58 +60,32 @@ where
                         .await?
                 };
 
-                match current_mode {
-                    SessionMode::Pinned { .. } => Ok(SessionMode::Pinned {
-                        branch_id: branch_id.clone(),
-                    }),
-                    SessionMode::Workspace {
-                        branch_id: selector,
-                    } => {
+                match &current_mode {
+                    SessionMode::Pinned { .. } => Ok(()),
+                    SessionMode::Workspace { .. } => {
                         let mut rows = RawWriteBatch::with_capacity(1);
                         rows.push(workspace_branch_stage_row(&branch_id)?);
                         transaction.stage_rows(rows).await?;
-                        Ok(SessionMode::Workspace {
-                            branch_id: selector,
-                        })
+                        Ok(())
                     }
                 }
-            })
-            .await?;
-
-        if let SessionMode::Workspace { branch_id } = &next_mode {
-            *branch_id.write().map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "workspace branch selector cache is poisoned",
-                )
-            })? = receipt_branch_id.clone();
-        }
-
-        let session = Self::new_with_transaction_manager(
-            next_mode,
-            self.storage.clone(),
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.tracked_state),
-            Arc::clone(&self.binary_cas),
-            Arc::clone(&self.branch_ctx),
-            Arc::clone(&self.catalog_context),
-            Arc::clone(&self.sql_planning_cache),
-            Arc::clone(&self.deterministic_runtime_gate),
-            Arc::clone(&self.collaboration_write_gate),
-            Arc::clone(&self.commit_coordinator),
-            Arc::clone(&self.observe_coordinator),
-            Arc::clone(&self.observe_invalidation),
-            self.plugin_host.clone(),
-            self.telemetry.clone(),
-            self.transaction_manager(),
-            self.file_views.clone(),
-        );
-        Ok((
-            session,
-            SwitchBranchReceipt {
-                branch_id: receipt_branch_id,
             },
-        ))
+            |()| {
+                *selector.write().map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "session branch selector is poisoned",
+                    )
+                })? = receipt_branch_id.clone();
+                observe_invalidation.bump();
+                Ok(())
+            },
+        )
+        .await?;
+
+        Ok(SwitchBranchReceipt {
+            branch_id: receipt_branch_id,
+        })
     }
 }
 

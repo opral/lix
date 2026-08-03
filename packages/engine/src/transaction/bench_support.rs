@@ -293,7 +293,7 @@ where
         let logical_rows = rows.len();
         let opened = super::open_transaction(
             &SessionMode::Pinned {
-                branch_id: BENCH_BRANCH_ID.to_string(),
+                branch_id: Arc::new(std::sync::RwLock::new(BENCH_BRANCH_ID.to_string())),
             },
             self.storage.clone(),
             Arc::clone(&self.live_state),

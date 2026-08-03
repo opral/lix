@@ -174,8 +174,8 @@ where
     ///
     /// Unlike a workspace session, a pinned session never reads or writes the
     /// shared workspace branch selector. The requested branch is validated
-    /// before the child handle is returned. To switch it, use
-    /// [`Self::switch_branch_session`] and retain the returned replacement.
+    /// before the child handle is returned. Branch switches update this
+    /// handle and its clones in place.
     pub async fn open_session(
         &self,
         active_branch_id: impl Into<String>,
@@ -432,35 +432,7 @@ where
         &self,
         options: SwitchBranchOptions,
     ) -> Result<SwitchBranchReceipt, LixError> {
-        if self.session.is_pinned() {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_SESSION_STATE,
-                "switch_branch() cannot replace a borrowed pinned Lix handle",
-            )
-            .with_hint("use switch_branch_session() and retain the returned Lix handle"));
-        }
-        let (_lix, receipt) = self.switch_branch_session(options).await?;
-        Ok(receipt)
-    }
-
-    /// Switches branches and returns the replacement handle produced by the
-    /// engine session transition.
-    ///
-    /// Callers that own pinned sessions must retain the returned handle. The
-    /// compatibility [`Self::switch_branch`] method intentionally preserves
-    /// its existing receipt-only API for workspace sessions.
-    pub async fn switch_branch_session(
-        &self,
-        options: SwitchBranchOptions,
-    ) -> Result<(Self, SwitchBranchReceipt), LixError> {
-        let (session, receipt) = self.session.switch_branch(options).await?;
-        Ok((
-            Self {
-                engine: self.engine.clone(),
-                session: Arc::new(session),
-            },
-            receipt,
-        ))
+        self.session.switch_branch(options).await
     }
 
     pub async fn merge_branch(
@@ -643,24 +615,21 @@ mod tests {
             .open_session(main_branch_id.clone())
             .await
             .expect("open pinned main session");
-        let error = pinned
+        let pinned_clone = pinned.clone();
+        let receipt = pinned
             .switch_branch(SwitchBranchOptions {
-                branch_id: draft.id.clone(),
-            })
-            .await
-            .expect_err("receipt-only switching must reject pinned sessions");
-        assert_eq!(error.code, LixError::CODE_INVALID_SESSION_STATE);
-        let (switched, receipt) = pinned
-            .switch_branch_session(SwitchBranchOptions {
                 branch_id: draft.id.clone(),
             })
             .await
             .expect("switch pinned session");
 
         assert_eq!(receipt.branch_id, draft.id);
-        assert_eq!(pinned.active_branch_id().await.unwrap(), main_branch_id);
         assert_eq!(
-            switched.active_branch_id().await.unwrap(),
+            pinned.active_branch_id().await.unwrap(),
+            "01920000-0000-7000-8000-000000000501"
+        );
+        assert_eq!(
+            pinned_clone.active_branch_id().await.unwrap(),
             "01920000-0000-7000-8000-000000000501"
         );
         assert_eq!(root.active_branch_id().await.unwrap(), main_branch_id);

@@ -15,6 +15,7 @@ use super::{SessionContext, SessionMode};
 
 #[derive(Debug, Clone)]
 struct ObserveQuery {
+    scope: ObserveSessionScope,
     sql: String,
     params: Vec<Value>,
     shared_state: Option<Arc<ObserveQueryState>>,
@@ -22,11 +23,13 @@ struct ObserveQuery {
 
 impl ObserveQuery {
     fn new(
+        scope: ObserveSessionScope,
         sql: impl Into<String>,
         params: Vec<Value>,
         shared_state: Option<Arc<ObserveQueryState>>,
     ) -> Self {
         Self {
+            scope,
             sql: sql.into(),
             params,
             shared_state,
@@ -197,7 +200,17 @@ where
         }
     }
 
-    async fn execute_or_share(&self, generation: u64) -> Result<ObserveQueryEvaluation, LixError> {
+    async fn execute_or_share(
+        &mut self,
+        generation: u64,
+    ) -> Result<ObserveQueryEvaluation, LixError> {
+        let scope = self.session.observe_scope();
+        if self.query.scope != scope {
+            let key = ObserveQueryKey::new(scope.clone(), &self.query.sql, &self.query.params)?;
+            self.query.scope = scope;
+            self.query.shared_state = Some(self.session.observe_coordinator.state_for(&key));
+            self.last_shared_content = None;
+        }
         let Some(shared_state) = &self.query.shared_state else {
             return Box::pin(
                 self.session
@@ -259,12 +272,13 @@ where
                 "observe does not support durable runtime functions",
             ));
         }
-        let key = ObserveQueryKey::new(self.observe_scope(), sql, params)?;
+        let scope = self.observe_scope();
+        let key = ObserveQueryKey::new(scope.clone(), sql, params)?;
         let shared_state = Some(self.observe_coordinator.state_for(&key));
 
         Ok(ObserveEvents {
             session: self.clone(),
-            query: ObserveQuery::new(sql, params.to_vec(), shared_state),
+            query: ObserveQuery::new(scope, sql, params.to_vec(), shared_state),
             receiver: Some(self.observe_invalidation.subscribe()),
             sequence: 0,
             last_rows: None,
@@ -281,7 +295,12 @@ where
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone(),
             ),
-            SessionMode::Pinned { branch_id } => ObserveSessionScope::Branch(branch_id.clone()),
+            SessionMode::Pinned { branch_id } => ObserveSessionScope::Branch(
+                branch_id
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
         }
     }
 }

@@ -11294,7 +11294,15 @@ async fn resolve_active_branch_id(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
     match mode {
-        SessionMode::Pinned { branch_id } => Ok(branch_id.clone()),
+        SessionMode::Pinned { branch_id } => branch_id
+            .read()
+            .map(|branch_id| branch_id.clone())
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "session branch selector is poisoned",
+                )
+            }),
         SessionMode::Workspace { branch_id } => {
             let branch_id = branch_id
                 .read()
@@ -12424,7 +12432,7 @@ mod tests {
         let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
             &SessionMode::Pinned {
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                branch_id: Arc::new(std::sync::RwLock::new(GLOBAL_BRANCH_ID.to_string())),
             },
             storage.clone(),
             Arc::clone(&live_state),
@@ -12739,7 +12747,7 @@ mod tests {
         let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
             &SessionMode::Pinned {
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                branch_id: Arc::new(std::sync::RwLock::new(GLOBAL_BRANCH_ID.to_string())),
             },
             storage.clone(),
             Arc::clone(&live_state),
@@ -13191,7 +13199,7 @@ mod tests {
         let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
             &SessionMode::Pinned {
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                branch_id: Arc::new(std::sync::RwLock::new(GLOBAL_BRANCH_ID.to_string())),
             },
             storage,
             Arc::clone(&live_state),

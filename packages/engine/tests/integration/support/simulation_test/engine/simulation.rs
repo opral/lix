@@ -104,6 +104,7 @@ impl Simulation {
 }
 
 /// Session wrapper that injects simulation behavior around normal execution.
+#[derive(Clone)]
 #[allow(
     dead_code,
     reason = "shared integration-test harness is compiled once per test target"
@@ -208,17 +209,8 @@ impl SimSession {
     pub async fn switch_branch(
         &self,
         options: SwitchBranchOptions,
-    ) -> Result<(Self, SwitchBranchReceipt), LixError> {
-        let (session, receipt) = self.session.switch_branch(options).await?;
-        Ok((
-            Self {
-                sim: self.sim.clone(),
-                engine: self.engine.clone(),
-                fs: SimFs::new(self.sim.clone(), self.engine.clone(), session.clone()),
-                session,
-            },
-            receipt,
-        ))
+    ) -> Result<SwitchBranchReceipt, LixError> {
+        self.session.switch_branch(options).await
     }
 }
 
