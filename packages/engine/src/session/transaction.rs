@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use crate::Value;
+use smallvec::SmallVec;
+
 use crate::catalog::CatalogFingerprint;
 use crate::functions::{DeterministicRuntimeGuard, FunctionContext};
 use crate::observe_invalidation::ObserveInvalidation;
@@ -33,7 +34,9 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) has_started_statement: bool,
-    pub(super) prepared_literal_params: Vec<Value>,
+    /// Reusable storage only for SQL literals containing doubled quote
+    /// escapes. Ordinary warm literals continue to borrow the SQL text.
+    pub(super) prepared_literal_escape_scratch: SmallVec<[String; 4]>,
 }
 
 impl<StorageImpl> SessionContext<StorageImpl>
@@ -92,7 +95,7 @@ where
             commit_coordinator: Arc::clone(&self.commit_coordinator),
             telemetry: self.telemetry.clone(),
             has_started_statement: false,
-            prepared_literal_params: Vec::new(),
+            prepared_literal_escape_scratch: SmallVec::new(),
         })
     }
 }
@@ -160,6 +163,7 @@ where
         self.transaction_manager.ensure_open()
     }
 
+    #[cfg(test)]
     pub(super) fn begin_session_operation(&self) -> Result<SessionOperationGuard, LixError> {
         self.transaction_manager.begin_transaction_operation()
     }
@@ -328,6 +332,7 @@ impl SessionTransactionManager {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn begin_transaction_operation(&self) -> Result<SessionOperationGuard, LixError> {
         self.begin_operation(SessionOperationScope::Transaction)
     }
@@ -556,6 +561,7 @@ impl SessionTransactionState {
                 owner,
             } => match scope {
                 SessionOperationScope::Session => Err(active_transaction_error()),
+                #[cfg(test)]
                 SessionOperationScope::Transaction => {
                     *active_operations += 1;
                     Ok(())
@@ -655,6 +661,7 @@ impl SessionTransactionState {
 #[derive(Clone, Copy)]
 enum SessionOperationScope {
     Session,
+    #[cfg(test)]
     Transaction,
     TransactionCommit,
 }

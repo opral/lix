@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 
 use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
@@ -78,7 +78,9 @@ impl LiteralParameterBuilder {
 /// so observation fanout does not copy large blob values per subscriber.
 #[derive(Debug, Clone)]
 pub struct ExecuteResult {
-    backing: Arc<ExecuteResultBacking>,
+    /// Mutation results without RETURNING carry no row backing. Keeping the
+    /// empty case inline avoids one Arc clone/drop pair for every scalar write.
+    backing: Option<Arc<ExecuteResultBacking>>,
     rows_affected: u64,
 }
 
@@ -96,10 +98,12 @@ struct ExecuteResultBacking {
 impl PartialEq for ExecuteResult {
     fn eq(&self, other: &Self) -> bool {
         self.rows_affected == other.rows_affected
-            && (Arc::ptr_eq(&self.backing, &other.backing)
-                || (self.backing.columns == other.backing.columns
-                    && self.backing.rows == other.backing.rows
-                    && self.backing.notices == other.backing.notices))
+            && (matches!(
+                (&self.backing, &other.backing),
+                (Some(left), Some(right)) if Arc::ptr_eq(left, right)
+            ) || (self.columns() == other.columns()
+                && self.rows() == other.rows()
+                && self.notices() == other.notices()))
     }
 }
 
@@ -177,7 +181,7 @@ impl ExecuteResult {
 
     pub fn from_rows_affected(rows_affected: u64) -> Self {
         Self {
-            backing: empty_execute_result_backing(),
+            backing: None,
             rows_affected,
         }
     }
@@ -210,53 +214,68 @@ impl ExecuteResult {
             })
             .collect();
         Self {
-            backing: Arc::new(ExecuteResultBacking {
+            backing: Some(Arc::new(ExecuteResultBacking {
                 columns,
                 rows,
                 notices,
                 file_view_mutations: Vec::new(),
-            }),
+            })),
             rows_affected,
         }
     }
 
     fn with_file_view_mutations(mut self, mutations: Vec<sql2::SessionFileViewMutation>) -> Self {
-        Arc::get_mut(&mut self.backing)
+        let backing = self.backing.get_or_insert_with(|| {
+            Arc::new(ExecuteResultBacking {
+                columns: Vec::new().into(),
+                rows: Vec::new(),
+                notices: Vec::new(),
+                file_view_mutations: Vec::new(),
+            })
+        });
+        Arc::get_mut(backing)
             .expect("fresh execute result backing must be uniquely owned")
             .file_view_mutations = mutations;
         self
     }
 
     pub(crate) fn file_view_mutations(&self) -> &[sql2::SessionFileViewMutation] {
-        &self.backing.file_view_mutations
+        self.backing
+            .as_deref()
+            .map_or(&[], |backing| backing.file_view_mutations.as_slice())
     }
 
     /// Returns the result-set column names in row value order.
     pub fn columns(&self) -> &[String] {
-        self.backing.columns.as_ref()
+        self.backing
+            .as_deref()
+            .map_or(&[], |backing| backing.columns.as_ref())
     }
 
     /// Returns the owned rows. Use `iter()` for name-based access.
     pub fn rows(&self) -> &[Row] {
-        &self.backing.rows
+        self.backing
+            .as_deref()
+            .map_or(&[], |backing| backing.rows.as_slice())
     }
 
     /// Iterates rows with borrowed access to the shared column metadata.
     pub fn iter(&self) -> impl Iterator<Item = RowRef<'_>> {
-        self.backing.rows.iter().map(|row| RowRef {
-            columns: self.backing.columns.as_ref(),
+        let columns = self.columns();
+        self.rows().iter().map(move |row| RowRef {
+            columns,
             values: row.values.as_slice(),
         })
     }
 
     /// Returns the number of rows in this result set.
     pub fn len(&self) -> usize {
-        self.backing.rows.len()
+        self.rows().len()
     }
 
     /// Returns true when this result set has no rows.
     pub fn is_empty(&self) -> bool {
-        self.backing.rows.is_empty()
+        self.rows().is_empty()
     }
 
     /// Returns the number of rows affected by a mutation statement.
@@ -266,7 +285,9 @@ impl ExecuteResult {
 
     /// Returns non-fatal diagnostics produced while executing the statement.
     pub fn notices(&self) -> &[LixNotice] {
-        &self.backing.notices
+        self.backing
+            .as_deref()
+            .map_or(&[], |backing| backing.notices.as_slice())
     }
 
     /// Looks up the value for `column_name` on an owned row from this set.
@@ -277,23 +298,10 @@ impl ExecuteResult {
 
     /// Returns the index for a column name.
     pub fn column_index(&self, column_name: &str) -> Option<usize> {
-        self.backing
-            .columns
+        self.columns()
             .iter()
             .position(|column| column == column_name)
     }
-}
-
-fn empty_execute_result_backing() -> Arc<ExecuteResultBacking> {
-    static EMPTY: OnceLock<Arc<ExecuteResultBacking>> = OnceLock::new();
-    Arc::clone(EMPTY.get_or_init(|| {
-        Arc::new(ExecuteResultBacking {
-            columns: Vec::new().into(),
-            rows: Vec::new(),
-            notices: Vec::new(),
-            file_view_mutations: Vec::new(),
-        })
-    }))
 }
 
 /// One owned row returned by a query.
@@ -2563,43 +2571,41 @@ where
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, "transaction", None);
         let may_reuse_literal_shape = self.has_started_statement;
         self.has_started_statement = true;
+        // The explicit write lease already keeps one transaction operation
+        // active for this handle's lifetime, and `&mut self` excludes an
+        // overlapping execute or commit. A second manager guard per statement
+        // only repeated mutex/Notify traffic without adding a state boundary.
         let operation = async {
-            let _operation_guard = self.begin_session_operation()?;
             if may_reuse_literal_shape
                 && params.is_empty()
-                && let Some(parameter_count) = self.transaction.as_ref().and_then(|transaction| {
-                    transaction.prepared_literal_mutation_parameter_count(sql)
-                })
+                && let Some((normalized_shape, parameter_count)) = self
+                    .transaction
+                    .as_ref()
+                    .and_then(|transaction| transaction.prepared_literal_mutation_shape())
             {
-                if self.prepared_literal_params.len() != parameter_count {
-                    self.prepared_literal_params.clear();
-                    self.prepared_literal_params
-                        .resize_with(parameter_count, || Value::Text(String::new()));
-                }
-                if self
-                    .sql_planning_cache
-                    .decode_certified_update_literals_into_values(
+                if let Some(decoded_values) =
+                    self.sql_planning_cache.decode_update_literals_for_shape(
                         sql,
-                        &mut self.prepared_literal_params,
+                        normalized_shape,
+                        parameter_count,
+                        &mut self.prepared_literal_escape_scratch,
                     )
                 {
-                    let (transaction_slot, prepared_params) =
-                        (&mut self.transaction, &self.prepared_literal_params);
-                    let transaction = transaction_slot
+                    let transaction = self
+                        .transaction
                         .as_mut()
                         .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
-                    transaction
-                        .flush_cached_prepared_mutation_barrier(
-                            options.origin_key.as_deref(),
-                            prepared_params,
-                        )
-                        .await?;
-                    let previous_origin_key =
-                        transaction.replace_origin_key(options.origin_key.clone());
                     let result = transaction
-                        .try_execute_cached_prepared_mutation(prepared_params)
+                        .try_execute_cached_literal_prepared_mutation(
+                            options.origin_key.as_deref(),
+                            &decoded_values,
+                        )
                         .await;
-                    transaction.replace_origin_key(previous_origin_key);
+                    for (index, value) in decoded_values.into_iter().enumerate() {
+                        if let std::borrow::Cow::Owned(value) = value {
+                            self.prepared_literal_escape_scratch[index] = value;
+                        }
+                    }
                     match result {
                         Ok(Some(result)) => {
                             return Ok(ExecuteResult::from_sql_write_result(result));
@@ -8349,8 +8355,19 @@ mod tests {
         );
         let cloned = result.clone();
 
-        assert!(Arc::ptr_eq(&result.backing, &cloned.backing));
+        assert!(Arc::ptr_eq(
+            result.backing.as_ref().unwrap(),
+            cloned.backing.as_ref().unwrap()
+        ));
         assert_eq!(result, cloned);
+    }
+
+    #[test]
+    fn mutation_result_equality_is_independent_of_empty_backing_representation() {
+        let inline = ExecuteResult::from_rows_affected(7);
+        let materialized = ExecuteResult::from_query_parts(Vec::new(), Vec::new(), 7, Vec::new());
+
+        assert_eq!(inline, materialized);
     }
 
     #[test]

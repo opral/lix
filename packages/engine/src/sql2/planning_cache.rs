@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -7,6 +8,7 @@ use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, Value};
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use lru::LruCache;
+use smallvec::SmallVec;
 
 const PARSED_STATEMENT_CAPACITY: usize = 256;
 const PUBLIC_CATALOG_CAPACITY: usize = 16;
@@ -130,31 +132,25 @@ where
         decode_update_string_literals_into(sql, params)
     }
 
-    /// Decodes a shape-certified scalar UPDATE directly into reusable public
-    /// parameter slots. This is the scalar journal counterpart of the shared
-    /// batch decoder: no normalized SQL, AST clone, parameter vector, or
-    /// per-value string allocation is constructed for a warm statement.
-    pub(crate) fn decode_certified_update_literals_into_values(
+    /// Returns borrowed decoded string literals when a warm UPDATE still
+    /// matches its normalized shape. Ordinary literals borrow the caller's
+    /// SQL directly; SQL quote escapes allocate only the affected slot.
+    pub(crate) fn decode_update_literals_for_shape<'a>(
         &self,
-        sql: &str,
-        params: &mut [Value],
-    ) -> bool {
-        params.iter_mut().all(|param| match param {
-            Value::Text(value) => {
-                value.clear();
-                true
-            }
-            _ => false,
-        }) && decode_update_string_literals_with(sql, params.len(), |index, segment, escaped| {
-            let Some(Value::Text(value)) = params.get_mut(index) else {
-                return false;
-            };
-            value.push_str(segment);
-            if escaped {
-                value.push('\'');
-            }
-            true
-        })
+        sql: &'a str,
+        normalized_shape: &str,
+        parameter_count: usize,
+        escape_scratch: &mut SmallVec<[String; 4]>,
+    ) -> Option<SmallVec<[Cow<'a, str>; 4]>> {
+        if escape_scratch.len() < parameter_count {
+            escape_scratch.resize_with(parameter_count, String::new);
+        }
+        decode_update_string_literals_for_shape(
+            sql,
+            normalized_shape,
+            parameter_count,
+            escape_scratch,
+        )
     }
 
     /// Returns stable public-surface metadata for one catalog generation.
@@ -415,6 +411,142 @@ fn update_string_literals_match_shape(sql: &str, normalized_shape: &str) -> bool
     !quoted_identifier && param_count > 0 && shape.get(shape_cursor..) == Some(&bytes[copied..])
 }
 
+enum DecodedUpdateLiteral<'a> {
+    Borrowed(&'a str),
+    Escaped(usize),
+}
+
+fn decode_update_string_literals_for_shape<'a>(
+    sql: &'a str,
+    normalized_shape: &str,
+    parameter_count: usize,
+    escape_scratch: &mut [String],
+) -> Option<SmallVec<[Cow<'a, str>; 4]>> {
+    let trimmed = sql.trim_start();
+    let update = trimmed.get(.."UPDATE".len())?;
+    if !update.eq_ignore_ascii_case("UPDATE")
+        || !trimmed
+            .as_bytes()
+            .get("UPDATE".len())
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        return None;
+    }
+
+    let bytes = sql.as_bytes();
+    let shape = normalized_shape.as_bytes();
+    let mut cursor = 0;
+    let mut copied = 0;
+    let mut shape_cursor = 0;
+    let mut quoted_identifier = false;
+    let mut decoded = SmallVec::<[DecodedUpdateLiteral<'a>; 4]>::new();
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'"' => {
+                if quoted_identifier && bytes.get(cursor + 1) == Some(&b'"') {
+                    cursor += 2;
+                    continue;
+                }
+                quoted_identifier = !quoted_identifier;
+                cursor += 1;
+            }
+            b'-' if !quoted_identifier && bytes.get(cursor + 1) == Some(&b'-') => return None,
+            b'/' if !quoted_identifier && bytes.get(cursor + 1) == Some(&b'*') => return None,
+            b'?' | b'$' if !quoted_identifier => return None,
+            b'\'' if !quoted_identifier => {
+                if decoded.len() >= parameter_count
+                    || bytes[..cursor]
+                        .iter()
+                        .rposition(|byte| !byte.is_ascii_whitespace())
+                        .is_some_and(|index| {
+                            matches!(
+                                bytes[index],
+                                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'
+                            )
+                        })
+                {
+                    return None;
+                }
+                let outside = &bytes[copied..cursor];
+                if !shape
+                    .get(shape_cursor..)
+                    .is_some_and(|remaining| remaining.starts_with(outside))
+                {
+                    return None;
+                }
+                shape_cursor += outside.len();
+                if shape.get(shape_cursor) != Some(&b'$') {
+                    return None;
+                }
+                shape_cursor += 1;
+                let digit_start = shape_cursor;
+                let mut parameter_number = 0_usize;
+                while let Some(digit @ b'0'..=b'9') = shape.get(shape_cursor) {
+                    parameter_number = parameter_number
+                        .saturating_mul(10)
+                        .saturating_add(usize::from(*digit - b'0'));
+                    shape_cursor += 1;
+                }
+                if shape_cursor == digit_start || parameter_number != decoded.len() + 1 {
+                    return None;
+                }
+
+                cursor += 1;
+                let value_start = cursor;
+                let mut segment_start = cursor;
+                let mut escaped = false;
+                loop {
+                    let quote = bytes[cursor..]
+                        .iter()
+                        .position(|byte| *byte == b'\'')
+                        .map(|offset| cursor + offset)?;
+                    if bytes.get(quote + 1) == Some(&b'\'') {
+                        let value = &mut escape_scratch[decoded.len()];
+                        if !escaped {
+                            value.clear();
+                            value.reserve(quote.saturating_sub(value_start).saturating_add(1));
+                            escaped = true;
+                        }
+                        value.push_str(&sql[segment_start..quote]);
+                        value.push('\'');
+                        cursor = quote + 2;
+                        segment_start = cursor;
+                        continue;
+                    }
+                    let value = if escaped {
+                        escape_scratch[decoded.len()].push_str(&sql[segment_start..quote]);
+                        DecodedUpdateLiteral::Escaped(decoded.len())
+                    } else {
+                        DecodedUpdateLiteral::Borrowed(&sql[value_start..quote])
+                    };
+                    decoded.push(value);
+                    cursor = quote + 1;
+                    copied = cursor;
+                    break;
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+    if quoted_identifier
+        || decoded.len() != parameter_count
+        || shape.get(shape_cursor..) != Some(&bytes[copied..])
+    {
+        return None;
+    }
+    Some(
+        decoded
+            .into_iter()
+            .map(|value| match value {
+                DecodedUpdateLiteral::Borrowed(value) => Cow::Borrowed(value),
+                DecodedUpdateLiteral::Escaped(index) => {
+                    Cow::Owned(std::mem::take(&mut escape_scratch[index]))
+                }
+            })
+            .collect(),
+    )
+}
+
 fn decode_update_string_literals_into(sql: &str, params: &mut [String]) -> bool {
     params.iter_mut().for_each(String::clear);
     decode_update_string_literals_with(sql, params.len(), |index, segment, escaped| {
@@ -429,10 +561,10 @@ fn decode_update_string_literals_into(sql: &str, params: &mut [String]) -> bool 
     })
 }
 
-fn decode_update_string_literals_with(
-    sql: &str,
+fn decode_update_string_literals_with<'a>(
+    sql: &'a str,
     parameter_count: usize,
-    mut append: impl FnMut(usize, &str, bool) -> bool,
+    mut append: impl FnMut(usize, &'a str, bool) -> bool,
 ) -> bool {
     let bytes = sql.as_bytes();
     let mut cursor = 0_usize;
@@ -609,42 +741,57 @@ mod tests {
     }
 
     #[test]
-    fn certified_literal_value_decoder_reuses_text_storage() {
+    fn warm_literal_decoder_borrows_unescaped_slots_in_one_shape_pass() {
         let cache = test_cache(8);
-        let mut params = vec![
-            Value::Text(String::with_capacity(64)),
-            Value::Text(String::with_capacity(32)),
-        ];
-        let capacities = params
-            .iter()
-            .map(|value| match value {
-                Value::Text(value) => value.capacity(),
-                _ => unreachable!("test slots are text"),
-            })
-            .collect::<Vec<_>>();
+        let template = cache
+            .auto_parameterized_update(
+                "UPDATE notes SET value = lix_json('{\"text\":\"first\"}') WHERE id = 'a'",
+            )
+            .unwrap();
+        let mut escape_scratch = SmallVec::new();
+        let borrowed = cache
+            .decode_update_literals_for_shape(
+                "UPDATE notes SET value = lix_json('{\"text\":\"second\"}') WHERE id = 'b'",
+                &template.sql,
+                2,
+                &mut escape_scratch,
+            )
+            .unwrap();
+        assert!(matches!(borrowed[0], Cow::Borrowed(_)));
+        assert!(matches!(borrowed[1], Cow::Borrowed(_)));
+        assert_eq!(borrowed[0], "{\"text\":\"second\"}");
+        assert_eq!(borrowed[1], "b");
 
-        assert!(cache.decode_certified_update_literals_into_values(
-            "UPDATE notes SET value = lix_json('{\"text\":\"it''s warm\"}') WHERE id = 'row-1'",
-            &mut params,
-        ));
-        assert_eq!(
-            params,
-            [
-                Value::Text("{\"text\":\"it's warm\"}".to_string()),
-                Value::Text("row-1".to_string()),
-            ]
-        );
-        assert_eq!(
-            params
-                .iter()
-                .map(|value| match value {
-                    Value::Text(value) => value.capacity(),
-                    _ => unreachable!("test slots stay text"),
-                })
-                .collect::<Vec<_>>(),
-            capacities,
-            "warm decoding must retain the session-owned string buffers"
-        );
+        let escaped = cache
+            .decode_update_literals_for_shape(
+                "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'c'",
+                &template.sql,
+                2,
+                &mut escape_scratch,
+            )
+            .unwrap();
+        assert!(matches!(escaped[0], Cow::Owned(_)));
+        assert!(matches!(escaped[1], Cow::Borrowed(_)));
+        assert_eq!(escaped[0], "{\"text\":\"it's fine\"}");
+
+        let recycled = match escaped.into_iter().next().unwrap() {
+            Cow::Owned(value) => value,
+            Cow::Borrowed(_) => panic!("escaped literal must own the scratch buffer"),
+        };
+        escape_scratch[0] = recycled;
+        let allocation = escape_scratch[0].as_ptr();
+        let escaped_again = cache
+            .decode_update_literals_for_shape(
+                "UPDATE notes SET value = lix_json('{\"text\":\"it''s fine\"}') WHERE id = 'd'",
+                &template.sql,
+                2,
+                &mut escape_scratch,
+            )
+            .unwrap();
+        let Cow::Owned(reused) = &escaped_again[0] else {
+            panic!("escaped literal must reuse owned scratch storage");
+        };
+        assert_eq!(reused.as_ptr(), allocation);
     }
 
     #[test]
