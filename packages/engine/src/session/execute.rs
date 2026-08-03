@@ -4145,10 +4145,10 @@ mod tests {
 
     async fn assert_columnar_lifecycle_current(
         session: &SessionContext<Memory>,
+        row_count: usize,
         first: &str,
-        last: &str,
+        sample: &str,
     ) {
-        const ROW_COUNT: usize = 1_024;
         let rows = session
             .execute(
                 "SELECT id, value FROM columnar_lifecycle_probe ORDER BY id",
@@ -4156,17 +4156,11 @@ mod tests {
             )
             .await
             .expect("typed lifecycle scan should succeed");
-        assert_eq!(rows.len(), ROW_COUNT);
-        assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "0000");
+        assert_eq!(rows.len(), row_count);
+        assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "00000");
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), first);
-        assert_eq!(
-            rows.rows()[ROW_COUNT - 1].get::<String>("id").unwrap(),
-            "1023"
-        );
-        assert_eq!(
-            rows.rows()[ROW_COUNT - 1].get::<String>("value").unwrap(),
-            last
-        );
+        assert_eq!(rows.rows()[1_023].get::<String>("id").unwrap(), "01023");
+        assert_eq!(rows.rows()[1_023].get::<String>("value").unwrap(), sample);
     }
 
     async fn assert_columnar_layout_selected(
@@ -5550,17 +5544,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successive_columnar_inserts_preserve_the_existing_schema_base() {
+        const BATCH_ROWS: usize = 1_024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "successive_columnar_insert_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("successive insert schema should register");
+
+        let sql = "INSERT INTO successive_columnar_insert_probe (id, value) VALUES ($1, $2)";
+        for generation in 0..2 {
+            let first = generation * BATCH_ROWS;
+            let inserts = (first..first + BATCH_ROWS)
+                .map(|row_index| ExecuteBatchStatement {
+                    sql: sql.to_owned(),
+                    params: vec![
+                        Value::Text(format!("{row_index:04}")),
+                        Value::Text(format!("generation-{generation}")),
+                    ],
+                })
+                .collect::<Vec<_>>();
+            let inserted = session
+                .execute_batch(&inserts)
+                .await
+                .expect("each ordered insert generation should commit")
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .sum::<u64>();
+            assert_eq!(inserted, BATCH_ROWS as u64);
+        }
+
+        let rows = session
+            .execute(
+                "SELECT id, value FROM successive_columnar_insert_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("the second generation must retain the first columnar base");
+        assert_eq!(rows.len(), BATCH_ROWS * 2);
+        assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "0000");
+        assert_eq!(
+            rows.rows()[0].get::<String>("value").unwrap(),
+            "generation-0"
+        );
+        assert_eq!(rows.rows()[BATCH_ROWS].get::<String>("id").unwrap(), "1024");
+        assert_eq!(
+            rows.rows()[BATCH_ROWS].get::<String>("value").unwrap(),
+            "generation-1"
+        );
+    }
+
+    #[tokio::test]
     async fn typed_columnar_base_preserves_current_diff_and_history_across_lifecycle_changes() {
-        const ROW_COUNT: usize = 1_024;
+        const ROW_COUNT: usize = 65_537;
         let storage = Memory::default();
         Engine::initialize(storage.clone())
             .await
             .expect("storage should initialize");
-        let engine = Engine::new(storage)
+        let engine = Engine::new(storage.clone())
             .await
             .expect("initialized storage should create engine");
         let main = engine
-            .open_workspace_session()
+            .open_workspace_session_with_account(crate::SYSTEM_ACCOUNT_ID)
             .await
             .expect("workspace session should open");
         let main_branch_id = main
@@ -5597,7 +5657,7 @@ mod tests {
             .map(|row_index| ExecuteBatchStatement {
                 sql: insert_sql.to_owned(),
                 params: vec![
-                    Value::Text(format!("{row_index:04}")),
+                    Value::Text(format!("{row_index:05}")),
                     Value::Text(format!("base-{row_index:04}")),
                 ],
             })
@@ -5620,8 +5680,8 @@ mod tests {
             .await
             .expect("insert head should load")
             .expect("insert head should exist");
-        let storage = engine.storage();
-        let read = storage
+        let adapter = engine.storage();
+        let read = adapter
             .begin_read(StorageReadOptions::default())
             .await
             .expect("sidecar read scope should open");
@@ -5635,8 +5695,38 @@ mod tests {
             .expect("typed lifecycle sidecar manifest should load")
             .expect("fixture must publish a typed columnar sidecar");
         assert_eq!(manifest.row_count(), ROW_COUNT as u64);
+        assert_eq!(
+            manifest
+                .groups
+                .iter()
+                .map(|group| group.row_count)
+                .collect::<Vec<_>>(),
+            vec![65_536, 1],
+            "fixture must cross both column-page and logical-group boundaries"
+        );
+        let commit_state = crate::tracked_state::load_commit_state_manifest(
+            &read,
+            crate::changelog::CommitId::parse_lix(
+                &inserted_head,
+                "typed lifecycle mutation authority",
+            )
+            .expect("insert head should be canonical"),
+        )
+        .await
+        .expect("typed mutation authority should load")
+        .expect("typed mutation authority should exist");
+        let columnar_parts = commit_state
+            .mutations
+            .columnar_parts
+            .as_ref()
+            .expect("fixture must publish column pages as sole mutation authority");
+        assert_eq!(commit_state.account_id, crate::SYSTEM_ACCOUNT_ID);
+        assert!(commit_state.mutations.inline_part.is_empty());
+        assert!(commit_state.mutations.parts.is_empty());
+        assert_eq!(columnar_parts.page_first_keys.len(), 33);
+        drop(read);
 
-        assert_columnar_lifecycle_current(&main, "base-0000", "base-1023").await;
+        assert_columnar_lifecycle_current(&main, ROW_COUNT, "base-0000", "base-1023").await;
 
         let inserted_diff = main
             .execute(
@@ -5668,9 +5758,34 @@ mod tests {
             inserted_history.rows()[0].get::<i64>("entries").unwrap(),
             ROW_COUNT as i64
         );
+        let attributed_changes = main
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_change \
+                 WHERE schema_key = 'columnar_lifecycle_probe' AND account_id = $1",
+                &[Value::Text(crate::SYSTEM_ACCOUNT_ID.to_owned())],
+            )
+            .await
+            .expect("columnar mutation history must retain commit account attribution");
+        assert_eq!(
+            attributed_changes.rows()[0].get::<i64>("entries").unwrap(),
+            ROW_COUNT as i64
+        );
+        let boundary_history = main
+            .execute(
+                &format!(
+                    "SELECT COUNT(DISTINCT id) AS entries \
+                     FROM columnar_lifecycle_probe_history('{inserted_head}') \
+                     WHERE id IN ('02047', '02048', '65535', '65536') \
+                       AND lixcol_is_deleted = false"
+                ),
+                &[],
+            )
+            .await
+            .expect("history must address rows on both sides of page and group boundaries");
+        assert_eq!(boundary_history.rows()[0].get::<i64>("entries").unwrap(), 4);
 
         main.execute(
-            "UPDATE columnar_lifecycle_probe SET value = 'sparse-0512' WHERE id = '0512'",
+            "UPDATE columnar_lifecycle_probe SET value = 'sparse-0512' WHERE id = '00512'",
             &[],
         )
         .await
@@ -5685,8 +5800,8 @@ mod tests {
             .await
             .expect("DataFusion LIMIT should remain above the columnar scan");
         assert_eq!(limited.len(), 3);
-        assert_eq!(limited.rows()[0].get::<String>("id").unwrap(), "0000");
-        assert_eq!(limited.rows()[2].get::<String>("id").unwrap(), "0002");
+        assert_eq!(limited.rows()[0].get::<String>("id").unwrap(), "00000");
+        assert_eq!(limited.rows()[2].get::<String>("id").unwrap(), "00002");
         let zero = main
             .execute(
                 "SELECT id FROM columnar_lifecycle_probe ORDER BY id LIMIT 0",
@@ -5707,7 +5822,10 @@ mod tests {
             .await
             .expect("pruned columnar scan should retain matching overlay winner");
         assert_eq!(overlay_match.len(), 1);
-        assert_eq!(overlay_match.rows()[0].get::<String>("id").unwrap(), "0512");
+        assert_eq!(
+            overlay_match.rows()[0].get::<String>("id").unwrap(),
+            "00512"
+        );
         let no_match = main
             .execute(
                 "SELECT id FROM columnar_lifecycle_probe \
@@ -5719,7 +5837,7 @@ mod tests {
         assert!(no_match.is_empty());
 
         main.execute(
-            "UPDATE columnar_lifecycle_probe SET value = 'base-0512' WHERE id = '0512'",
+            "UPDATE columnar_lifecycle_probe SET value = 'base-0512' WHERE id = '00512'",
             &[],
         )
         .await
@@ -5743,7 +5861,7 @@ mod tests {
             .expect("draft session should open");
         draft_session
             .execute(
-                "UPDATE columnar_lifecycle_probe SET value = 'draft-0000' WHERE id = '0000'",
+                "UPDATE columnar_lifecycle_probe SET value = 'draft-0000' WHERE id = '00000'",
                 &[],
             )
             .await
@@ -5752,14 +5870,15 @@ mod tests {
             .undo()
             .await
             .expect("draft update should undo");
-        assert_columnar_lifecycle_current(&draft_session, "base-0000", "base-1023").await;
+        assert_columnar_lifecycle_current(&draft_session, ROW_COUNT, "base-0000", "base-1023")
+            .await;
         draft_session
             .redo()
             .await
             .expect("draft update should redo");
 
         main.execute(
-            "UPDATE columnar_lifecycle_probe SET value = 'main-1023' WHERE id = '1023'",
+            "UPDATE columnar_lifecycle_probe SET value = 'main-1023' WHERE id = '01023'",
             &[],
         )
         .await
@@ -5771,7 +5890,7 @@ mod tests {
             .await
             .expect("disjoint typed updates should merge");
         assert_eq!(merge.outcome, crate::MergeBranchOutcome::MergeCommitted);
-        assert_columnar_lifecycle_current(&main, "draft-0000", "main-1023").await;
+        assert_columnar_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
 
         let merged_head = engine
             .load_branch_head_commit_id(&main_branch_id)
@@ -5795,7 +5914,7 @@ mod tests {
                 &format!(
                     "SELECT value, lixcol_depth \
                      FROM columnar_lifecycle_probe_history('{merged_head}') \
-                     WHERE id = '0000' ORDER BY lixcol_depth"
+                     WHERE id = '00000' ORDER BY lixcol_depth"
                 ),
                 &[],
             )
@@ -5813,7 +5932,7 @@ mod tests {
         );
 
         main.execute(
-            "UPDATE columnar_lifecycle_probe SET value = 'temporary' WHERE id = '0512'",
+            "UPDATE columnar_lifecycle_probe SET value = 'temporary' WHERE id = '00512'",
             &[],
         )
         .await
@@ -5821,7 +5940,7 @@ mod tests {
         main.undo().await.expect("post-merge update should undo");
         let restored = main
             .execute(
-                "SELECT value FROM columnar_lifecycle_probe WHERE id = '0512'",
+                "SELECT value FROM columnar_lifecycle_probe WHERE id = '00512'",
                 &[],
             )
             .await
@@ -5830,7 +5949,40 @@ mod tests {
             restored.rows()[0].get::<String>("value").unwrap(),
             "base-0512"
         );
-        assert_columnar_lifecycle_current(&main, "draft-0000", "main-1023").await;
+        assert_columnar_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
+
+        let mut corrupt = engine.storage().new_write_set();
+        corrupt.delete(
+            crate::columnar_row_group::ROW_GROUP_MANIFEST_SPACE,
+            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
+                &row_group_id.as_bytes(),
+            )),
+        );
+        engine
+            .storage()
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .expect("test corruption should commit");
+        let reopened = Engine::new(storage)
+            .await
+            .expect("corrupt storage should still open structurally");
+        let reopened_session = reopened
+            .open_workspace_session()
+            .await
+            .expect("corrupt storage session should open");
+        assert!(
+            reopened_session
+                .execute(
+                    &format!(
+                        "SELECT value FROM columnar_lifecycle_probe_history('{inserted_head}') \
+                         WHERE id = '65536'"
+                    ),
+                    &[],
+                )
+                .await
+                .is_err(),
+            "missing authoritative columnar manifests must fail closed"
+        );
     }
 
     #[tokio::test]

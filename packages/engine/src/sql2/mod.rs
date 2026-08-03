@@ -50,9 +50,10 @@ pub(crate) use context::{
 pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader};
 pub(crate) use entity_columnar_layout::{
     ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ENTITY_COLUMNAR_ENTITY_PK_FIELD,
-    ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY, EncodedEntityRowGroups, EntityColumnarRowRef,
-    LOW_CARDINALITY_CLUSTER_MAX_VALUES, encode_registered_entity_row_groups,
-    encode_unclustered_registered_entity_row_groups,
+    ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY,
+    ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, EncodedEntityRowGroups, EntityColumnarRowRef,
+    EntityRowGroupLocations, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
+    encode_registered_entity_row_groups, encode_unclustered_registered_entity_row_groups,
 };
 pub(crate) use entity_projection::EntityProjectionDecoder;
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;

@@ -480,6 +480,7 @@ mod tests {
                 metadata: std::collections::HashMap::new(),
                 fields: Vec::new(),
                 groups: Vec::new(),
+                encoded_digest: [0; 32],
             }),
             manifest_digest: [42; 32],
             overlay: Arc::new(Vec::new()),

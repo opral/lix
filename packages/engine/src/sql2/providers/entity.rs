@@ -4927,7 +4927,10 @@ mod tests {
         .expect("encode")
         .expect("registered sidecar");
         let base_commit_id = CommitId::for_test_label("coordinate-base");
-        let location = encoded.input_locations[0];
+        let location = encoded
+            .input_locations
+            .location(0)
+            .expect("encoded entity row has an input coordinate");
         let layout = crate::sql2::entity_batch::EntityColumnarScanLayout {
             id: crate::live_state::entity_row_group_set_id(base_commit_id, &spec.schema_key),
             manifest: Arc::new(encoded.manifest.clone()),
@@ -4985,6 +4988,7 @@ mod tests {
                 metadata: HashMap::new(),
                 fields: Vec::new(),
                 groups: Vec::new(),
+                encoded_digest: [0; 32],
             }),
             manifest_digest: [24; 32],
             overlay: Arc::new(Vec::new()),

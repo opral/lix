@@ -241,6 +241,18 @@ fn profile_bound_update_spread() -> bool {
 /// `read_many`, `LIX_TRACKED_STATE_CRUD_PROFILE_READ_MANY_PK_COUNT` selects
 /// the setup-excluded multi-point query shape.
 fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
+    if let Ok(operation @ ("columnar_history" | "columnar_diff")) =
+        std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_OP").as_deref()
+    {
+        profile_columnar_semantic_operation(
+            runtime,
+            rows,
+            operation,
+            profile_sample_count(),
+            profile_sql_session_storage(),
+        );
+        return;
+    }
     let operation = match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_OP").as_deref() {
         Ok("insert_all") => TransactionBenchOp::InsertAll,
         Ok("read_one") => TransactionBenchOp::ReadOneByPk,
@@ -407,6 +419,44 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
             "unknown LIX_TRACKED_STATE_CRUD_PROFILE_LAYER '{other}'; expected transaction, sql_session, sql_session_bound, kv_layout, raw_sqlite, or raw_sqlite_literal"
         ),
     }
+}
+
+fn profile_columnar_semantic_operation(
+    runtime: &tokio::runtime::Runtime,
+    rows: &[WorkloadRow],
+    operation: &str,
+    sample_count: usize,
+    profile: StorageProfile,
+) {
+    let mut samples = Vec::with_capacity(sample_count);
+    for _ in 0..sample_count {
+        let fixture = runtime.block_on(sql_session::empty_fixture_with_read_many_pk_count(
+            profile,
+            rows,
+            READ_MANY_PK_COUNT.min(rows.len()),
+        ));
+        let baseline = runtime.block_on(fixture.active_commit_id());
+        runtime.block_on(fixture.insert_all());
+        let head = runtime.block_on(fixture.active_commit_id());
+        let start = Instant::now();
+        let result = match operation {
+            "columnar_history" => runtime.block_on(fixture.columnar_history_count(&head)),
+            "columnar_diff" => runtime.block_on(fixture.columnar_diff_count(&baseline, &head)),
+            _ => unreachable!("columnar semantic operation was validated"),
+        };
+        samples.push(start.elapsed());
+        black_box(result);
+    }
+    let mut sorted = samples.clone();
+    sorted.sort_unstable();
+    println!(
+        "tracked_state_crud profile: sql_session/{}/{operation}/{} samples: median={:?} min={:?} max={:?}",
+        profile.name(),
+        sample_count,
+        sorted[sorted.len() / 2],
+        sorted[0],
+        sorted[sorted.len() - 1],
+    );
 }
 
 fn profile_read_many_pk_count(operation: TransactionBenchOp, row_count: usize) -> usize {
@@ -945,12 +995,31 @@ fn profile_sql_session_operation(
         maybe_print_profile_rss_phase("after_seed");
         reset_allocation_accounting();
         let _ = lix_engine::storage_bench::take_crud_current_state_catalog_accounting();
+        if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
+            let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
+            let _ = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
+            let _ = lix_engine::storage_bench::take_crud_current_state_directory_bytes();
+        }
         let start = Instant::now();
         let result = runtime.block_on(run_sql_session_operation(operation, &fixture));
         samples.push(start.elapsed());
         black_box(result);
         maybe_print_profile_rss_phase("after_operation");
         print_allocation_accounting("operation");
+        if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
+            let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
+            let manifest_bytes = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
+            let directory_bytes =
+                lix_engine::storage_bench::take_crud_current_state_directory_bytes();
+            println!(
+                "tracked_state_crud write accounting: staged_puts={} staged_deletes={} staged_value_bytes={} commit_state_manifest_value_bytes={} current_state_directory_value_bytes={}",
+                physical.puts,
+                physical.deletes,
+                physical.written_bytes,
+                manifest_bytes,
+                directory_bytes,
+            );
+        }
     }
     let profile_layer = if matches!(operation, TransactionBenchOp::ReadAll) {
         format!(

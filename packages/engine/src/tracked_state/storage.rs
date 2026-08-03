@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::changelog::CommitId;
 use crate::common::SharedStr;
+use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{
     BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, ScanPlan, StorageAdapterRead,
     StorageCoreProjection, StorageError, StorageGetManyRequest, StorageGetManyResult,
@@ -89,7 +90,10 @@ const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
 // payload-less certified-reference encoding is intentionally rejected.
 const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD14";
 const COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC: &[u8] = b"LXSA1";
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS3";
+// Version 4 makes lossless columnar mutation parts a first-class, exclusive
+// commit payload. LXCS3 repositories are intentionally rejected: there is no
+// compatibility decoder beneath the new authority.
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS4";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -544,6 +548,8 @@ struct CommitDeltaManifest {
     replacement_generation: Option<StoredCommitDeltaReplacementGeneration>,
     #[musli(with = storage_codec::option)]
     replacement_parts: Option<StoredReplacementPartsAuthority>,
+    #[musli(with = storage_codec::option)]
+    columnar_parts: Option<crate::tracked_state::types::ColumnarMutationPartSet>,
     /// A complete leaf payload for a commit that fits in one segment. Keeping
     /// it in the directory preserves the one-record shape of tiny commits;
     /// larger commits use the indexed segment list below.
@@ -607,6 +613,7 @@ fn commit_state_inventory_from_delta_manifest(
         lifecycle_summary: manifest.lifecycle_summary.clone(),
         replacement_generation: manifest.replacement_generation.clone(),
         replacement_parts: manifest.replacement_parts.clone(),
+        columnar_parts: manifest.columnar_parts.clone(),
         inline_part: manifest.inline_segment.clone(),
         parts: manifest
             .segments
@@ -638,6 +645,11 @@ pub(crate) fn commit_state_inventory_exact_touched_scopes(
     }
     if inventory.member_count == 0 {
         return Ok(Some(Vec::new()));
+    }
+    if inventory.columnar_parts.is_some() {
+        // The catalog rewrite path does not yet consume typed column pages.
+        // Discard inherited serving state rather than publishing stale misses.
+        return Ok(None);
     }
     if !inventory.replacement_part_digests.is_empty() {
         return Ok(inventory.single_partition.clone().map(|scope| vec![scope]));
@@ -1062,6 +1074,11 @@ fn current_inventory_may_contain_any_key(
     encoded_keys: &[Bytes],
 ) -> Result<bool, LixError> {
     let manifest = commit_delta_manifest_from_inventory(&state.mutations);
+    if let Some(parts) = manifest.columnar_parts.as_ref() {
+        return Ok(encoded_keys.iter().any(|key| {
+            parts.first_key.as_slice() <= key.as_ref() && key.as_ref() <= parts.last_key.as_slice()
+        }));
+    }
     if let Some(inline) = manifest.inline_segment() {
         let leaf = decode_commit_delta_segment(inline, None, state.commit_id)?;
         for encoded_key in encoded_keys {
@@ -1244,6 +1261,7 @@ fn commit_delta_manifest_from_inventory(
         lifecycle_summary: inventory.lifecycle_summary.clone(),
         replacement_generation: inventory.replacement_generation.clone(),
         replacement_parts: inventory.replacement_parts.clone(),
+        columnar_parts: inventory.columnar_parts.clone(),
         inline_segment: inventory.inline_part.clone(),
         segments: inventory
             .parts
@@ -1706,6 +1724,7 @@ const COMMIT_DELTA_SMALL_STRING_DICTIONARY_LIMIT: usize = 32;
 #[derive(Debug, Default)]
 pub(crate) struct DecodedCommitDeltaBatch {
     arenas: Vec<DecodedLeafNodeRef>,
+    columnar_keys: Bytes,
     schema_keys: Vec<SharedStr>,
     file_ids: Vec<SharedStr>,
     rows: Vec<DecodedCommitDeltaRow>,
@@ -1716,10 +1735,11 @@ pub(crate) struct DecodedCommitDeltaBatch {
 struct DecodedCommitDeltaRow {
     arena_ordinal: u32,
     entry_ordinal: u16,
+    columnar_key: Option<BufferRange>,
     schema_key_ordinal: u32,
     /// `u32::MAX` is the null file-id sentinel.
     file_id_ordinal: u32,
-    entity_pk: crate::entity_pk::EntityPk,
+    entity_pk: EntityPk,
 }
 
 #[derive(Clone, Copy)]
@@ -1780,6 +1800,12 @@ impl<'a> DecodedCommitDeltaRowRef<'a> {
     #[cfg(test)]
     pub(crate) fn encoded_key(&self) -> Bytes {
         let row = &self.batch.rows[self.ordinal];
+        if let Some(range) = row.columnar_key {
+            return self
+                .batch
+                .columnar_keys
+                .slice(range.offset()..range.offset() + range.len());
+        }
         self.batch.arenas[row.arena_ordinal as usize]
             .entry_owned(row.entry_ordinal as usize)
             .expect("decoded commit-delta row references an existing leaf entry")
@@ -1792,6 +1818,9 @@ impl<'a> DecodedCommitDeltaRowRef<'a> {
     /// so it does not need a `Bytes` clone for every discovered mutation.
     pub(crate) fn encoded_key_ref(&self) -> &[u8] {
         let row = &self.batch.rows[self.ordinal];
+        if let Some(range) = row.columnar_key {
+            return &self.batch.columnar_keys[range.offset()..range.offset() + range.len()];
+        }
         self.batch.arenas[row.arena_ordinal as usize]
             .key(row.entry_ordinal as usize)
             .expect("decoded commit-delta key lookup cannot fail")
@@ -1848,6 +1877,7 @@ impl CommitDeltaStringInterner {
 
 struct DecodedCommitDeltaBatchBuilder {
     arenas: Vec<DecodedLeafNodeRef>,
+    columnar_keys: Vec<u8>,
     schema_keys: CommitDeltaStringInterner,
     file_ids: CommitDeltaStringInterner,
     rows: Vec<DecodedCommitDeltaRow>,
@@ -1858,6 +1888,7 @@ impl DecodedCommitDeltaBatchBuilder {
     fn with_capacity(row_capacity: usize, arena_capacity: usize) -> Self {
         Self {
             arenas: Vec::with_capacity(arena_capacity),
+            columnar_keys: Vec::new(),
             schema_keys: CommitDeltaStringInterner::new(row_capacity),
             file_ids: CommitDeltaStringInterner::new(row_capacity),
             rows: Vec::with_capacity(row_capacity),
@@ -1901,6 +1932,7 @@ impl DecodedCommitDeltaBatchBuilder {
             self.rows.push(DecodedCommitDeltaRow {
                 arena_ordinal,
                 entry_ordinal,
+                columnar_key: None,
                 schema_key_ordinal,
                 file_id_ordinal,
                 entity_pk: key.entity_pk,
@@ -1914,9 +1946,39 @@ impl DecodedCommitDeltaBatchBuilder {
         Ok(())
     }
 
+    fn push_columnar_row(
+        &mut self,
+        schema_key: &str,
+        entity_pk: EntityPk,
+        value: TrackedStateIndexValue,
+    ) -> Result<(), LixError> {
+        let schema_key_ordinal = self.schema_keys.intern(SharedStr::from(schema_key))?;
+        let start = self.columnar_keys.len();
+        encode_key_ref_into(
+            &mut self.columnar_keys,
+            TrackedStateKeyRef {
+                schema_key,
+                file_id: None,
+                entity_pk: &entity_pk,
+            },
+        );
+        let columnar_key = BufferRange::new(start, self.columnar_keys.len() - start);
+        self.rows.push(DecodedCommitDeltaRow {
+            arena_ordinal: u32::MAX,
+            entry_ordinal: 0,
+            columnar_key: Some(columnar_key),
+            schema_key_ordinal,
+            file_id_ordinal: u32::MAX,
+            entity_pk,
+        });
+        self.values.push(value);
+        Ok(())
+    }
+
     fn finish(self) -> DecodedCommitDeltaBatch {
         DecodedCommitDeltaBatch {
             arenas: self.arenas,
+            columnar_keys: Bytes::from(self.columnar_keys),
             schema_keys: self.schema_keys.values,
             file_ids: self.file_ids.values,
             rows: self.rows,
@@ -3084,6 +3146,7 @@ where
         lifecycle_summary,
         replacement_generation: None,
         replacement_parts: None,
+        columnar_parts: None,
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS)),
     };
@@ -3210,6 +3273,70 @@ where
         row_count,
         mutation_inventory: commit_state_inventory_from_delta_manifest(&manifest),
     }))
+}
+
+/// Publishes a lossless identity-ordered entity generation as the commit's
+/// authored mutation payload without encoding a second LXCD JSON sidecar.
+/// The row-group set is staged by the current-state publisher in the same
+/// atomic write set; this function seals only its historical authority.
+pub(crate) fn stage_ordered_columnar_mutations(
+    commit_id: CommitId,
+    parts: crate::tracked_state::types::ColumnarMutationPartSet,
+    ordered_identity_digest: [u8; 32],
+) -> Result<OrderedAddressableCommitDeltaStage, LixError> {
+    let row_count = usize::try_from(parts.row_count).expect("u32 row count fits usize");
+    if row_count == 0
+        || parts.group_row_counts.is_empty()
+        || parts
+            .group_row_counts
+            .iter()
+            .map(|&count| u64::from(count))
+            .sum::<u64>()
+            != u64::from(parts.row_count)
+        || (row_count == 1 && parts.first_key != parts.last_key)
+        || (row_count > 1 && parts.first_key >= parts.last_key)
+        || parts.page_first_keys.len()
+            != row_count.div_ceil(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS)
+        || parts.page_first_keys.len() != parts.page_last_keys.len()
+    {
+        return Err(replacement_payload_error(
+            "columnar mutation inventory has invalid row topology",
+        ));
+    }
+    let direct_part_row_counts = (0..row_count)
+        .step_by(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+        .map(|offset| {
+            u16::try_from((row_count - offset).min(COMMIT_DELTA_SEGMENT_MAX_ROWS))
+                .expect("direct mutation segment row count fits u16")
+        })
+        .collect::<Vec<_>>();
+    let lifecycle_summary = CommitDeltaLifecycleSummary {
+        scope: CommitDeltaReplacementScope {
+            schema_key: parts.schema_key.clone(),
+            file_id: None,
+        },
+        ordered_identity_digest,
+        uniform_created_at: parts.uniform_created_at,
+    };
+    Ok(OrderedAddressableCommitDeltaStage {
+        commit_id,
+        change_addresses: OrderedChangeAddresses::Dense,
+        row_count,
+        mutation_inventory: CommitStateMutationInventory {
+            selected_source_commit_id: None,
+            member_count: parts.row_count,
+            selection_fingerprint: [0; 32],
+            direct_part_row_counts,
+            replacement_part_digests: Vec::new(),
+            single_partition: Some(lifecycle_summary.scope.clone()),
+            lifecycle_summary: Some(lifecycle_summary),
+            replacement_generation: None,
+            replacement_parts: None,
+            columnar_parts: Some(parts),
+            inline_part: Vec::new(),
+            parts: Vec::new(),
+        },
+    })
 }
 
 /// Publishes a complete replacement as compact immutable identity parts.
@@ -3427,6 +3554,7 @@ where
             commit_id, generation, &authority,
         )),
         replacement_parts: Some(authority),
+        columnar_parts: None,
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(parts.len()),
     };
@@ -3868,6 +3996,7 @@ fn stage_commit_deltas_inner(
             lifecycle_summary: None,
             replacement_generation: None,
             replacement_parts: None,
+            columnar_parts: None,
             inline_segment,
             segments: Vec::new(),
         };
@@ -3894,6 +4023,7 @@ fn stage_commit_deltas_inner(
         lifecycle_summary: None,
         replacement_generation: None,
         replacement_parts: None,
+        columnar_parts: None,
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(segment_count),
     };
@@ -4166,7 +4296,9 @@ async fn load_change_records_by_ids(
         // per selected change. Address-shaped explicit IDs are rare and keep
         // the established locator fallback below if candidate validation
         // rejects the direct route.
-        if let Ok(records) = load_change_records_at_locators(store, &direct_locators).await {
+        if let Ok(records) =
+            Box::pin(load_change_records_at_locators(store, &direct_locators)).await
+        {
             return Ok(records);
         }
     }
@@ -4215,7 +4347,7 @@ async fn load_change_records_by_ids(
             decode_change_locator(change_id, &bytes)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    load_change_records_at_locators(store, &locators).await
+    Box::pin(load_change_records_at_locators(store, &locators)).await
 }
 
 fn load_change_record_by_id_boxed<'a, S>(
@@ -4257,11 +4389,87 @@ async fn load_change_records_at_locators(
         })
         .collect::<Result<BTreeMap<_, _>, LixError>>()?;
 
+    let mut loaded = (0..locators.len()).map(|_| None).collect::<Vec<_>>();
+    let mut columnar_by_commit = BTreeMap::<CommitId, Vec<usize>>::new();
+    for (locator_index, locator) in locators.iter().enumerate() {
+        if manifests[&locator.commit_id].columnar_parts.is_some() {
+            columnar_by_commit
+                .entry(locator.commit_id)
+                .or_default()
+                .push(locator_index);
+        }
+    }
+    for (commit_id, locator_indices) in columnar_by_commit {
+        let parts = manifests[&commit_id]
+            .columnar_parts
+            .as_ref()
+            .expect("columnar locator group was selected from this manifest");
+        let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
+        let row_group_manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
+            .await?
+            .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
+        validate_columnar_mutation_manifest(&row_group_manifest, parts)?;
+        let projection = (0..row_group_manifest.fields.len()).collect::<Vec<_>>();
+        let mut page_groups = BTreeMap::<(usize, usize), Vec<(usize, usize)>>::new();
+        for locator_index in locator_indices {
+            let locator = locators[locator_index];
+            let logical_ordinal = usize::try_from(locator.segment_index)
+                .expect("u32 segment fits usize")
+                .checked_mul(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                .and_then(|base| base.checked_add(usize::from(locator.ordinal)))
+                .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
+            if logical_ordinal >= parts.row_count as usize {
+                return Err(replacement_payload_error(
+                    "columnar mutation locator is outside its inventory",
+                ));
+            }
+            let packed = u32::try_from(logical_ordinal)
+                .map_err(|_| replacement_payload_error("columnar mutation address exceeds u32"))?
+                .checked_add(1)
+                .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
+            if locator.change_id != change_id_from_packed_address(commit_id, packed) {
+                return Err(replacement_payload_error(
+                    "columnar mutation locator change id disagrees with its ordinal",
+                ));
+            }
+            let group_index = logical_ordinal / crate::columnar_row_group::ROW_GROUP_MAX_ROWS;
+            let row_in_group = logical_ordinal % crate::columnar_row_group::ROW_GROUP_MAX_ROWS;
+            let page_index = row_in_group / crate::columnar_row_group::ROW_GROUP_PAGE_ROWS;
+            let row_in_page = row_in_group % crate::columnar_row_group::ROW_GROUP_PAGE_ROWS;
+            page_groups
+                .entry((group_index, page_index))
+                .or_default()
+                .push((locator_index, row_in_page));
+        }
+        for ((group_index, page_index), page_locators) in page_groups {
+            let batch = crate::columnar_row_group::load_row_group_page(
+                store,
+                id,
+                &row_group_manifest,
+                group_index,
+                page_index,
+                &projection,
+            )
+            .await?;
+            for (locator_index, row_in_page) in page_locators {
+                let locator = locators[locator_index];
+                loaded[locator_index] = Some(decode_columnar_change_record(
+                    &row_group_manifest,
+                    &batch,
+                    row_in_page,
+                    parts,
+                    locator.change_id,
+                    &manifests[&commit_id].account_id,
+                )?);
+            }
+        }
+    }
+
     let routes = locators
         .iter()
         .filter_map(|locator| {
             let manifest = &manifests[&locator.commit_id];
-            manifest.inline_segment().is_none().then_some((
+            (manifest.columnar_parts.is_none() && manifest.inline_segment().is_none()).then_some((
                 locator.commit_id,
                 usize::try_from(locator.segment_index).expect("u32 fits usize"),
             ))
@@ -4313,6 +4521,9 @@ async fn load_change_records_at_locators(
 
     let mut locator_groups = BTreeMap::<(CommitId, usize), Vec<usize>>::new();
     for (locator_index, locator) in locators.iter().enumerate() {
+        if manifests[&locator.commit_id].columnar_parts.is_some() {
+            continue;
+        }
         locator_groups
             .entry((
                 locator.commit_id,
@@ -4321,7 +4532,6 @@ async fn load_change_records_at_locators(
             .or_default()
             .push(locator_index);
     }
-    let mut loaded = (0..locators.len()).map(|_| None).collect::<Vec<_>>();
     for ((commit_id, segment_index), locator_indices) in locator_groups {
         let manifest = &manifests[&commit_id];
         let (bytes, bounds) = if let Some(inline) = manifest.inline_segment() {
@@ -4344,18 +4554,21 @@ async fn load_change_records_at_locators(
         let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, bounds)?;
         for locator_index in locator_indices {
             let locator = locators[locator_index];
-            loaded[locator_index] = Some(decode_change_at_locator_from_decoded(
-                &leaf,
-                &payloads,
-                locator,
-                &manifest.account_id,
-            )?);
+            loaded[locator_index] = Some(
+                decode_change_at_locator_from_decoded(
+                    &leaf,
+                    &payloads,
+                    locator,
+                    &manifest.account_id,
+                )?
+                .change_record,
+            );
         }
     }
     loaded
         .into_iter()
         .map(|entry| {
-            entry.map(|entry| entry.change_record).ok_or_else(|| {
+            entry.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "tracked_state authoritative change unexpectedly disappeared",
@@ -4477,6 +4690,11 @@ async fn try_load_change_record_at_locator_in_manifest(
     locator: CommitDeltaChangeLocator,
     manifest: &CommitDeltaManifest,
 ) -> Result<Option<crate::changelog::ChangeRecord>, LixError> {
+    if let Some(parts) = manifest.columnar_parts.as_ref() {
+        return load_columnar_change_record_at_locator(store, locator, parts, &manifest.account_id)
+            .await
+            .map(Some);
+    }
     let change_id = locator.change_id;
     let (segment, bounds) = if let Some(inline) = manifest.inline_segment() {
         if locator.segment_index != 0 {
@@ -4530,6 +4748,199 @@ async fn try_load_change_record_at_locator_in_manifest(
     Ok(Some(
         decode_change_at_locator(&segment, bounds, locator, &manifest.account_id)?.change_record,
     ))
+}
+
+async fn load_columnar_change_record_at_locator(
+    store: &(impl StorageAdapterRead + ?Sized),
+    locator: CommitDeltaChangeLocator,
+    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    account_id: &str,
+) -> Result<crate::changelog::ChangeRecord, LixError> {
+    let logical_ordinal = usize::try_from(locator.segment_index)
+        .expect("u32 segment fits usize")
+        .checked_mul(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+        .and_then(|base| base.checked_add(usize::from(locator.ordinal)))
+        .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
+    if logical_ordinal >= parts.row_count as usize {
+        return Err(replacement_payload_error(
+            "columnar mutation address is outside its inventory",
+        ));
+    }
+    let expected_change_id = change_id_from_packed_address(
+        locator.commit_id,
+        u32::try_from(logical_ordinal)
+            .map_err(|_| replacement_payload_error("columnar mutation address exceeds u32"))?
+            .checked_add(1)
+            .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?,
+    );
+    if locator.change_id != expected_change_id {
+        return Err(replacement_payload_error(
+            "columnar mutation locator change id disagrees with its ordinal",
+        ));
+    }
+    let mut group_base = 0usize;
+    let (group_index, row_index) = parts
+        .group_row_counts
+        .iter()
+        .enumerate()
+        .find_map(|(group_index, &row_count)| {
+            let group_end = group_base + row_count as usize;
+            let result = (logical_ordinal < group_end)
+                .then_some((group_index, logical_ordinal - group_base));
+            group_base = group_end;
+            result
+        })
+        .ok_or_else(|| replacement_payload_error("columnar mutation group is missing"))?;
+    let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
+    let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
+        .await?
+        .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
+    validate_columnar_mutation_manifest(&manifest, parts)?;
+    let projection = (0..manifest.fields.len()).collect::<Vec<_>>();
+    let page_index = row_index / crate::columnar_row_group::ROW_GROUP_PAGE_ROWS;
+    let page_row_index = row_index % crate::columnar_row_group::ROW_GROUP_PAGE_ROWS;
+    let batch = crate::columnar_row_group::load_row_group_page(
+        store,
+        id,
+        &manifest,
+        group_index,
+        page_index,
+        &projection,
+    )
+    .await?;
+    decode_columnar_change_record(
+        &manifest,
+        &batch,
+        page_row_index,
+        parts,
+        locator.change_id,
+        account_id,
+    )
+}
+
+fn validate_columnar_mutation_manifest(
+    manifest: &crate::columnar_row_group::RowGroupManifest,
+    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+) -> Result<(), LixError> {
+    let owner = CommitId::new(uuid::Uuid::from_bytes(parts.owner_commit_id));
+    if crate::live_state::entity_row_group_set_id(owner, &parts.schema_key).as_bytes()
+        != parts.row_group_set_id
+        || manifest.content_digest()? != parts.manifest_digest
+        || manifest.namespace != parts.schema_key
+        || manifest
+            .metadata
+            .get(crate::sql2::ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY)
+            .map(String::as_str)
+            != Some("true")
+        || manifest
+            .groups
+            .iter()
+            .map(|group| group.row_count)
+            .collect::<Vec<_>>()
+            != parts.group_row_counts
+        || manifest.fields.last().map(|field| field.name.as_str())
+            != Some(crate::sql2::ENTITY_COLUMNAR_ENTITY_PK_FIELD)
+    {
+        return Err(replacement_payload_error(
+            "columnar mutation manifest disagrees with commit authority",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_columnar_change_record(
+    manifest: &crate::columnar_row_group::RowGroupManifest,
+    batch: &datafusion::arrow::record_batch::RecordBatch,
+    row_index: usize,
+    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    change_id: crate::changelog::ChangeId,
+    account_id: &str,
+) -> Result<crate::changelog::ChangeRecord, LixError> {
+    use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
+
+    let identity_column = batch
+        .column(batch.num_columns() - 1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| replacement_payload_error("columnar mutation identity is not UTF-8"))?;
+    if identity_column.is_null(row_index) {
+        return Err(replacement_payload_error(
+            "columnar mutation identity is null",
+        ));
+    }
+    let entity_pk = EntityPk::from_json_array_text(identity_column.value(row_index))
+        .map_err(|error| replacement_payload_error(&error.to_string()))?;
+    let mut snapshot = serde_json::Map::new();
+    for (column_index, field) in manifest
+        .fields
+        .iter()
+        .take(manifest.fields.len() - 1)
+        .enumerate()
+    {
+        let column = batch.column(column_index);
+        let value = if column.is_null(row_index) {
+            serde_json::Value::Null
+        } else {
+            match field.data_type {
+                crate::columnar_row_group::RowGroupDataType::String => {
+                    let value = column
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| replacement_payload_error("columnar string type drift"))?
+                        .value(row_index);
+                    if field.metadata.get("lix.value_type").map(String::as_str) == Some("json") {
+                        serde_json::from_str(value).map_err(|error| {
+                            replacement_payload_error(&format!(
+                                "columnar JSON value is invalid: {error}"
+                            ))
+                        })?
+                    } else {
+                        serde_json::Value::String(value.to_owned())
+                    }
+                }
+                crate::columnar_row_group::RowGroupDataType::Int64 => serde_json::Value::Number(
+                    column
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| replacement_payload_error("columnar integer type drift"))?
+                        .value(row_index)
+                        .into(),
+                ),
+                crate::columnar_row_group::RowGroupDataType::Float64 => {
+                    let value = column
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or_else(|| replacement_payload_error("columnar number type drift"))?
+                        .value(row_index);
+                    serde_json::Number::from_f64(value)
+                        .map(serde_json::Value::Number)
+                        .ok_or_else(|| replacement_payload_error("columnar number is non-finite"))?
+                }
+                crate::columnar_row_group::RowGroupDataType::Boolean => serde_json::Value::Bool(
+                    column
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| replacement_payload_error("columnar boolean type drift"))?
+                        .value(row_index),
+                ),
+            }
+        };
+        snapshot.insert(field.name.clone(), value);
+    }
+    let snapshot = serde_json::to_string(&snapshot)
+        .map_err(|error| replacement_payload_error(&error.to_string()))?;
+    Ok(crate::changelog::ChangeRecord {
+        account_id: account_id.to_string(),
+        format_version: 2,
+        change_id,
+        schema_key: parts.schema_key.clone(),
+        entity_pk,
+        file_id: None,
+        snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
+        metadata: crate::json_store::JsonSlot::None,
+        created_at: parts.uniform_updated_at,
+        origin_key: parts.origin_key.clone(),
+    })
 }
 
 pub(crate) fn decode_change_locator(
@@ -4922,6 +5333,15 @@ async fn load_local_commit_delta_values_encoded(
     if encoded_keys.is_empty() {
         return Ok(Vec::new());
     }
+    if let Some(parts) = manifest.columnar_parts.as_ref() {
+        return Box::pin(load_columnar_mutation_values_encoded(
+            store,
+            commit_id,
+            encoded_keys,
+            parts,
+        ))
+        .await;
+    }
     let mut values = vec![None; encoded_keys.len()];
     if let Some(inline_segment) = manifest.inline_segment() {
         let leaf = decode_commit_delta_segment(inline_segment, None, commit_id)?;
@@ -4994,6 +5414,223 @@ async fn load_local_commit_delta_values_encoded(
         }
     }
     Ok(values)
+}
+
+async fn load_columnar_mutation_values_encoded(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    encoded_keys: &[Bytes],
+    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+    use datafusion::arrow::array::{Array, StringArray};
+
+    let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
+    let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
+        .await?
+        .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
+    validate_columnar_mutation_manifest(&manifest, parts)?;
+    let identity_column_index = manifest.fields.len() - 1;
+    let identities = encoded_keys
+        .iter()
+        .map(|encoded| {
+            let key = decode_key(encoded)?;
+            if key.schema_key != parts.schema_key || key.file_id.is_some() {
+                return Ok(None);
+            }
+            key.entity_pk.as_json_array_text().map(Some)
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let mut grouped = BTreeMap::<(usize, usize), Vec<(usize, &str)>>::new();
+    for (output_index, identity) in identities.iter().enumerate() {
+        let Some(identity) = identity.as_deref() else {
+            continue;
+        };
+        if let Some((group_index, page_index, _global_page)) =
+            columnar_mutation_page_for_key(parts, &encoded_keys[output_index])
+        {
+            grouped
+                .entry((group_index, page_index))
+                .or_default()
+                .push((output_index, identity));
+        }
+    }
+    let mut output = vec![None; encoded_keys.len()];
+    for ((group_index, page_index), requests) in grouped {
+        let batch = crate::columnar_row_group::load_row_group_page(
+            store,
+            id,
+            &manifest,
+            group_index,
+            page_index,
+            &[identity_column_index],
+        )
+        .await?;
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| replacement_payload_error("columnar mutation identity type drift"))?;
+        if column.null_count() != 0 {
+            return Err(replacement_payload_error(
+                "columnar mutation identity contains nulls",
+            ));
+        }
+        let row_by_identity = (requests.len() > 8).then(|| {
+            (0..column.len())
+                .map(|row_index| (column.value(row_index), row_index))
+                .collect::<HashMap<_, _>>()
+        });
+        for (output_index, identity) in requests {
+            let row_index = match &row_by_identity {
+                Some(rows) => rows.get(identity).copied(),
+                None => (0..column.len()).find(|&row_index| column.value(row_index) == identity),
+            };
+            let Some(row_index) = row_index else {
+                continue;
+            };
+            let global_ordinal = group_index
+                .saturating_mul(crate::columnar_row_group::ROW_GROUP_MAX_ROWS)
+                .saturating_add(
+                    page_index.saturating_mul(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS),
+                )
+                .saturating_add(row_index);
+            let packed = u32::try_from(global_ordinal)
+                .map_err(|_| replacement_payload_error("columnar mutation address exceeds u32"))?
+                + 1;
+            output[output_index] = Some(TrackedStateIndexValue {
+                change_id: change_id_from_packed_address(commit_id, packed),
+                commit_id,
+                deleted: false,
+                created_at: parts.uniform_created_at,
+                updated_at: parts.uniform_updated_at,
+            });
+        }
+    }
+    Ok(output)
+}
+
+fn columnar_mutation_page_for_key(
+    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    encoded_key: &[u8],
+) -> Option<(usize, usize, usize)> {
+    let global_page = parts
+        .page_first_keys
+        .partition_point(|first| first.as_slice() <= encoded_key)
+        .checked_sub(1)?;
+    if encoded_key > parts.page_last_keys[global_page].as_slice() {
+        return None;
+    }
+    let pages_per_group = crate::columnar_row_group::ROW_GROUP_MAX_ROWS
+        / crate::columnar_row_group::ROW_GROUP_PAGE_ROWS;
+    Some((
+        global_page / pages_per_group,
+        global_page % pages_per_group,
+        global_page,
+    ))
+}
+
+async fn load_columnar_owned_entries(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    keys: &[TrackedStateKeyRef<'_>],
+    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    account_id: &str,
+) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
+    use datafusion::arrow::array::{Array, StringArray};
+
+    let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
+    let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
+        .await?
+        .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
+    validate_columnar_mutation_manifest(&manifest, parts)?;
+    let identity_column_index = manifest.fields.len() - 1;
+    let mut grouped = BTreeMap::<(usize, usize), Vec<(usize, String)>>::new();
+    for (output_index, key) in keys.iter().enumerate() {
+        if key.schema_key != parts.schema_key || key.file_id.is_some() {
+            continue;
+        }
+        let identity = key.entity_pk.as_json_array_text()?;
+        let encoded_key = encode_key_ref(*key);
+        if let Some((group_index, page_index, _global_page)) =
+            columnar_mutation_page_for_key(parts, &encoded_key)
+        {
+            grouped
+                .entry((group_index, page_index))
+                .or_default()
+                .push((output_index, identity));
+        }
+    }
+    let projection = (0..manifest.fields.len()).collect::<Vec<_>>();
+    let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+    for ((group_index, page_index), requests) in grouped {
+        let batch = crate::columnar_row_group::load_row_group_page(
+            store,
+            id,
+            &manifest,
+            group_index,
+            page_index,
+            &projection,
+        )
+        .await?;
+        let identities = batch
+            .column(identity_column_index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| replacement_payload_error("columnar mutation identity type drift"))?;
+        if identities.null_count() != 0 {
+            return Err(replacement_payload_error(
+                "columnar mutation identity contains nulls",
+            ));
+        }
+        let row_by_identity = (requests.len() > 8).then(|| {
+            (0..identities.len())
+                .map(|row_index| (identities.value(row_index), row_index))
+                .collect::<HashMap<_, _>>()
+        });
+        for (output_index, identity) in requests {
+            let row_index = match &row_by_identity {
+                Some(rows) => rows.get(identity.as_str()).copied(),
+                None => {
+                    (0..identities.len()).find(|&row_index| identities.value(row_index) == identity)
+                }
+            };
+            let Some(row_index) = row_index else {
+                continue;
+            };
+            let row_index_in_group = page_index
+                .saturating_mul(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS)
+                .saturating_add(row_index);
+            let global_ordinal = group_index
+                .saturating_mul(crate::columnar_row_group::ROW_GROUP_MAX_ROWS)
+                .saturating_add(row_index_in_group);
+            let packed = u32::try_from(global_ordinal)
+                .map_err(|_| replacement_payload_error("columnar mutation address exceeds u32"))?
+                .checked_add(1)
+                .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
+            let change_id = change_id_from_packed_address(commit_id, packed);
+            output[output_index] = Some(LoadedCommitDeltaEntry {
+                value: TrackedStateIndexValue {
+                    change_id,
+                    commit_id,
+                    deleted: false,
+                    created_at: parts.uniform_created_at,
+                    updated_at: parts.uniform_updated_at,
+                },
+                change_record: decode_columnar_change_record(
+                    &manifest, &batch, row_index, parts, change_id, account_id,
+                )?,
+                base_coordinate: Some(TrackedStateBaseCoordinate {
+                    base_commit_id: commit_id,
+                    group_index: u32::try_from(group_index)
+                        .expect("columnar mutation group fits u32"),
+                    row_index: u32::try_from(row_index_in_group)
+                        .expect("columnar mutation row fits u32"),
+                }),
+                selected_ref: false,
+            });
+        }
+    }
+    Ok(output)
 }
 
 /// Loads authoritative change records for exact identities in one physical
@@ -5133,6 +5770,13 @@ async fn load_commit_delta_members_from_manifest(
     manifest: &CommitDeltaManifest,
     schema_keys: &[String],
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
+    if let Some(parts) = manifest.columnar_parts.as_ref() {
+        if !schema_keys.is_empty() && !schema_keys.iter().any(|schema| schema == &parts.schema_key)
+        {
+            return Ok(Vec::new());
+        }
+        return load_columnar_mutation_members(store, commit_id, parts, &manifest.account_id).await;
+    }
     let requested_schemas = schema_keys
         .iter()
         .map(String::as_str)
@@ -5186,6 +5830,77 @@ async fn load_commit_delta_members_from_manifest(
         members.retain(|member| requested_schemas.contains(member.key.schema_key.as_str()));
     }
     hydrate_selected_members(store, &mut members).await?;
+    validate_commit_delta_member_order_and_ids(commit_id, &members)?;
+    Ok(members)
+}
+
+async fn load_columnar_mutation_members(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    account_id: &str,
+) -> Result<Vec<CommitDeltaMember>, LixError> {
+    let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
+    let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
+        .await?
+        .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
+    validate_columnar_mutation_manifest(&manifest, parts)?;
+    let projection = (0..manifest.fields.len()).collect::<Vec<_>>();
+    let mut members = Vec::with_capacity(parts.row_count as usize);
+    for group_index in 0..manifest.groups.len() {
+        let batch = crate::columnar_row_group::load_row_group_batch(
+            store,
+            id,
+            &manifest,
+            group_index,
+            &projection,
+        )
+        .await?;
+        for row_index in 0..batch.num_rows() {
+            let global_ordinal = members.len();
+            let packed = u32::try_from(global_ordinal)
+                .map_err(|_| replacement_payload_error("columnar mutation address exceeds u32"))?
+                .checked_add(1)
+                .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
+            let change_id = change_id_from_packed_address(commit_id, packed);
+            let change = decode_columnar_change_record(
+                &manifest, &batch, row_index, parts, change_id, account_id,
+            )?;
+            let key = TrackedStateKey {
+                schema_key: parts.schema_key.clone(),
+                file_id: None,
+                entity_pk: change.entity_pk.clone(),
+            };
+            members.push(CommitDeltaMember {
+                key,
+                value: TrackedStateIndexValue {
+                    change_id,
+                    commit_id,
+                    deleted: false,
+                    created_at: parts.uniform_created_at,
+                    updated_at: parts.uniform_updated_at,
+                },
+                change,
+                segment_index: u32::try_from(global_ordinal / COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                    .expect("columnar mutation segment fits u32"),
+                ordinal: u32::try_from(global_ordinal % COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                    .expect("columnar mutation ordinal fits u32"),
+                authored: true,
+                base_coordinate: Some(TrackedStateBaseCoordinate {
+                    base_commit_id: commit_id,
+                    group_index: u32::try_from(group_index)
+                        .expect("columnar mutation group fits u32"),
+                    row_index: u32::try_from(row_index).expect("columnar mutation row fits u32"),
+                }),
+                selected_tombstone: false,
+            });
+        }
+    }
+    if members.len() != parts.row_count as usize {
+        return Err(replacement_payload_error(
+            "columnar mutation rows disagree with commit authority",
+        ));
+    }
     validate_commit_delta_member_order_and_ids(commit_id, &members)?;
     Ok(members)
 }
@@ -5425,6 +6140,32 @@ async fn load_local_owned_commit_delta_entries(
         let request_indices = request_indices_by_commit
             .get(&commit_id)
             .expect("manifest commit came from the requested commit set");
+        if let Some(parts) = manifest.columnar_parts.as_ref() {
+            let keys = request_indices
+                .iter()
+                .map(|&request_index| {
+                    let key = &requests[request_index].1;
+                    TrackedStateKeyRef {
+                        schema_key: &key.schema_key,
+                        file_id: key.file_id.as_deref(),
+                        entity_pk: &key.entity_pk,
+                    }
+                })
+                .collect::<Vec<_>>();
+            for (&request_index, entry) in request_indices.iter().zip(
+                Box::pin(load_columnar_owned_entries(
+                    store,
+                    commit_id,
+                    &keys,
+                    parts,
+                    &manifest.account_id,
+                ))
+                .await?,
+            ) {
+                output[request_index] = entry;
+            }
+            continue;
+        }
         if let Some(inline_segment) = manifest.inline_segment() {
             let (leaf, payloads) = decode_commit_delta_with_payloads(inline_segment, None)?;
             for &request_index in request_indices {
@@ -5782,6 +6523,16 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
             }
         }
     };
+    if let Some(parts) = manifest.columnar_parts.as_ref() {
+        return Box::pin(load_columnar_owned_entries(
+            store,
+            commit_id,
+            keys,
+            parts,
+            &manifest.account_id,
+        ))
+        .await;
+    }
     let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
     if let Some(inline_segment) = manifest.inline_segment() {
         if keys.len() <= DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS
@@ -6207,6 +6958,12 @@ async fn scan_local_commit_delta_values(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
+    if let Some(parts) = manifest.columnar_parts.as_ref() {
+        if !requested_schemas.is_empty() && !requested_schemas.contains(parts.schema_key.as_str()) {
+            return Ok(DecodedCommitDeltaBatch::default());
+        }
+        return scan_columnar_mutation_values(store, commit_id, parts).await;
+    }
     if let Some(inline_segment) = manifest.inline_segment() {
         let leaf = decode_commit_delta_leaf(inline_segment, None)?;
         let mut batch = DecodedCommitDeltaBatchBuilder::with_capacity(leaf.len(), 1);
@@ -6254,6 +7011,67 @@ async fn scan_local_commit_delta_values(
     Ok(batch.finish())
 }
 
+async fn scan_columnar_mutation_values(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+) -> Result<DecodedCommitDeltaBatch, LixError> {
+    use datafusion::arrow::array::{Array, StringArray};
+
+    let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
+    let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
+        .await?
+        .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
+    validate_columnar_mutation_manifest(&manifest, parts)?;
+    let identity_column_index = manifest.fields.len() - 1;
+    let mut builder = DecodedCommitDeltaBatchBuilder::with_capacity(
+        parts.row_count as usize,
+        (parts.row_count as usize).div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS),
+    );
+    let mut global_ordinal = 0usize;
+    for group_index in 0..manifest.groups.len() {
+        let batch = crate::columnar_row_group::load_row_group_batch(
+            store,
+            id,
+            &manifest,
+            group_index,
+            &[identity_column_index],
+        )
+        .await?;
+        let identities = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| replacement_payload_error("columnar mutation identity type drift"))?;
+        for row_index in 0..identities.len() {
+            let entity_pk = EntityPk::from_json_array_text(identities.value(row_index))
+                .map_err(|error| replacement_payload_error(&error.to_string()))?;
+            let packed = u32::try_from(global_ordinal)
+                .map_err(|_| replacement_payload_error("columnar mutation address exceeds u32"))?
+                .checked_add(1)
+                .ok_or_else(|| replacement_payload_error("columnar mutation address overflows"))?;
+            builder.push_columnar_row(
+                &parts.schema_key,
+                entity_pk,
+                TrackedStateIndexValue {
+                    change_id: change_id_from_packed_address(commit_id, packed),
+                    commit_id,
+                    deleted: false,
+                    created_at: parts.uniform_created_at,
+                    updated_at: parts.uniform_updated_at,
+                },
+            )?;
+            global_ordinal += 1;
+        }
+    }
+    if global_ordinal != parts.row_count as usize {
+        return Err(replacement_payload_error(
+            "columnar mutation rows disagree with commit authority",
+        ));
+    }
+    Ok(builder.finish())
+}
+
 fn merge_selected_source_batches(
     mut source: DecodedCommitDeltaBatch,
     mut local: DecodedCommitDeltaBatch,
@@ -6277,36 +7095,39 @@ fn merge_selected_source_batches(
             "selected-source commit delta has too many file ids",
         )
     })?;
+    let columnar_key_offset = source.columnar_keys.len();
     let mut entries = BTreeMap::<Vec<u8>, (DecodedCommitDeltaRow, TrackedStateIndexValue)>::new();
-    for (row, mut value) in source.rows.drain(..).zip(source.values.drain(..)) {
-        let key = source.arenas[row.arena_ordinal as usize]
-            .key(row.entry_ordinal as usize)?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "selected-source commit delta references a missing source key",
-                )
-            })?
-            .to_vec();
+    let source_rows = std::mem::take(&mut source.rows);
+    let source_values = std::mem::take(&mut source.values);
+    for (row, mut value) in source_rows.into_iter().zip(source_values) {
+        let key = decoded_commit_delta_row_key(&source, &row)?.to_vec();
         value.commit_id = commit_id;
         entries.insert(key, (row, value));
     }
-    for (mut row, value) in local.rows.drain(..).zip(local.values.drain(..)) {
-        let key = local.arenas[row.arena_ordinal as usize]
-            .key(row.entry_ordinal as usize)?
-            .ok_or_else(|| {
+    let local_rows = std::mem::take(&mut local.rows);
+    let local_values = std::mem::take(&mut local.values);
+    for (mut row, value) in local_rows.into_iter().zip(local_values) {
+        let key = decoded_commit_delta_row_key(&local, &row)?.to_vec();
+        if let Some(range) = row.columnar_key {
+            let shifted_offset =
+                range
+                    .offset()
+                    .checked_add(columnar_key_offset)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "commit delta columnar key offset overflow",
+                        )
+                    })?;
+            row.columnar_key = Some(BufferRange::new(shifted_offset, range.len()));
+        } else {
+            row.arena_ordinal = row.arena_ordinal.checked_add(arena_offset).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "selected-source commit delta references a missing local key",
+                    "commit delta arena ordinal overflow",
                 )
-            })?
-            .to_vec();
-        row.arena_ordinal = row.arena_ordinal.checked_add(arena_offset).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "commit delta arena ordinal overflow",
-            )
-        })?;
+            })?;
+        }
         row.schema_key_ordinal = row
             .schema_key_ordinal
             .checked_add(schema_offset)
@@ -6329,6 +7150,15 @@ fn merge_selected_source_batches(
         }
         entries.insert(key, (row, value));
     }
+    let mut columnar_keys = Vec::with_capacity(
+        source
+            .columnar_keys
+            .len()
+            .saturating_add(local.columnar_keys.len()),
+    );
+    columnar_keys.extend_from_slice(&source.columnar_keys);
+    columnar_keys.extend_from_slice(&local.columnar_keys);
+    source.columnar_keys = Bytes::from(columnar_keys);
     source.arenas.append(&mut local.arenas);
     source.schema_keys.append(&mut local.schema_keys);
     source.file_ids.append(&mut local.file_ids);
@@ -6337,6 +7167,34 @@ fn merge_selected_source_batches(
         source.values.push(value);
     }
     Ok(source)
+}
+
+fn decoded_commit_delta_row_key<'a>(
+    batch: &'a DecodedCommitDeltaBatch,
+    row: &DecodedCommitDeltaRow,
+) -> Result<&'a [u8], LixError> {
+    if let Some(range) = row.columnar_key {
+        return batch
+            .columnar_keys
+            .get(range.offset()..range.offset().saturating_add(range.len()))
+            .ok_or_else(|| replacement_payload_error("columnar mutation key range is invalid"));
+    }
+    batch
+        .arenas
+        .get(row.arena_ordinal as usize)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "selected-source commit delta references a missing arena",
+            )
+        })?
+        .key(row.entry_ordinal as usize)?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "selected-source commit delta references a missing key",
+            )
+        })
 }
 
 /// Answers schema membership from the packed commit directory.
@@ -6368,6 +7226,9 @@ async fn local_commit_delta_contains_schema(
     let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
         return Ok(false);
     };
+    if let Some(parts) = manifest.columnar_parts.as_ref() {
+        return Ok(parts.schema_key == schema_key);
+    }
     if let Some(inline_segment) = manifest.inline_segment() {
         let leaf = decode_commit_delta_leaf(inline_segment, None)?;
         let mut found = false;
@@ -6471,6 +7332,19 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
             })?;
             validate_commit_state_semantic_seal(&state, &seal)?;
             let manifest = expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
+            if let Some(parts) = manifest.columnar_parts.as_ref() {
+                emitted = emitted.saturating_add(
+                    visit_columnar_mutation_change_records(
+                        store,
+                        commit_id,
+                        parts,
+                        &manifest.account_id,
+                        &mut visit,
+                    )
+                    .await?,
+                );
+                continue;
+            }
             let members =
                 load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[]).await?;
             for member in members {
@@ -6518,6 +7392,58 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
     }
     validate_no_orphan_commit_delta_segments(store).await?;
     Ok(emitted)
+}
+
+async fn visit_columnar_mutation_change_records(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    parts: &crate::tracked_state::types::ColumnarMutationPartSet,
+    account_id: &str,
+    visit: &mut impl FnMut(crate::changelog::ChangeRecord) -> Result<(), LixError>,
+) -> Result<usize, LixError> {
+    let id = crate::columnar_row_group::RowGroupSetId::new(parts.row_group_set_id);
+    let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
+        .await?
+        .ok_or_else(|| replacement_payload_error("columnar mutation manifest is missing"))?;
+    validate_columnar_mutation_manifest(&manifest, parts)?;
+    let projection = (0..manifest.fields.len()).collect::<Vec<_>>();
+    let mut global_ordinal = 0usize;
+    for (group_index, group) in manifest.groups.iter().enumerate() {
+        let page_count =
+            (group.row_count as usize).div_ceil(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS);
+        for page_index in 0..page_count {
+            let batch = crate::columnar_row_group::load_row_group_page(
+                store,
+                id,
+                &manifest,
+                group_index,
+                page_index,
+                &projection,
+            )
+            .await?;
+            for row_index in 0..batch.num_rows() {
+                let packed = u32::try_from(global_ordinal)
+                    .map_err(|_| {
+                        replacement_payload_error("columnar mutation address exceeds u32")
+                    })?
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        replacement_payload_error("columnar mutation address overflows")
+                    })?;
+                let change_id = change_id_from_packed_address(commit_id, packed);
+                visit(decode_columnar_change_record(
+                    &manifest, &batch, row_index, parts, change_id, account_id,
+                )?)?;
+                global_ordinal += 1;
+            }
+        }
+    }
+    if global_ordinal != parts.row_count as usize {
+        return Err(replacement_payload_error(
+            "columnar mutation rows disagree with commit authority",
+        ));
+    }
+    Ok(global_ordinal)
 }
 
 async fn validate_no_orphan_commit_delta_segments(
@@ -6626,9 +7552,17 @@ pub(crate) async fn scan_commit_delta_inventory(
     for (&commit_id, manifest) in &manifests {
         let physical_segments = segments.remove(&commit_id).unwrap_or_default();
         let physical_segment_keys = segment_keys.remove(&commit_id).unwrap_or_default();
-        let segment_count = manifest.segments.len();
         let mut members = Vec::new();
-        if let Some(inline_segment) = manifest.inline_segment() {
+        let segment_count = if let Some(parts) = manifest.columnar_parts.as_ref() {
+            if !physical_segments.is_empty() {
+                return Err(replacement_payload_error(
+                    "columnar mutation inventory has legacy external segments",
+                ));
+            }
+            members = load_columnar_mutation_members(store, commit_id, parts, &manifest.account_id)
+                .await?;
+            parts.group_row_counts.len()
+        } else if let Some(inline_segment) = manifest.inline_segment() {
             if !physical_segments.is_empty() {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -6645,6 +7579,7 @@ pub(crate) async fn scan_commit_delta_inventory(
                 &manifest.account_id,
                 &mut members,
             )?;
+            1
         } else {
             validate_physical_commit_delta_segments(
                 commit_id,
@@ -6662,7 +7597,8 @@ pub(crate) async fn scan_commit_delta_inventory(
                     &mut members,
                 )?;
             }
-        }
+            manifest.segments.len()
+        };
         hydrate_selected_members(store, &mut members).await?;
         validate_commit_delta_member_order_and_ids(commit_id, &members)?;
         inventory.commits.insert(
@@ -7443,7 +8379,9 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
                 "tracked_state commit_delta manifest has an invalid dense address inventory",
             ));
         }
-        let expected_segment_count = if manifest.inline_segment.is_empty() {
+        let expected_segment_count = if manifest.columnar_parts.is_some() {
+            manifest.direct_segment_row_counts.len()
+        } else if manifest.inline_segment.is_empty() {
             manifest.segments.len()
         } else {
             1
@@ -7454,6 +8392,16 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
                 "tracked_state commit_delta dense address inventory does not match its segments",
             ));
         }
+    }
+    if let Some(parts) = manifest.columnar_parts.as_ref() {
+        let actual_single_partition =
+            single_partition_from_bounds(&parts.first_key, &parts.last_key)?;
+        if manifest.single_partition != actual_single_partition {
+            return Err(replacement_payload_error(
+                "columnar mutation partition certificate does not match its bounds",
+            ));
+        }
+        return Ok(());
     }
     if !manifest.inline_segment.is_empty() {
         if !manifest.segments.is_empty() {
@@ -8894,6 +9842,64 @@ fn validate_commit_state_mutation_inventory(
             "tracked_state commit_state_manifest selects itself as a mutation source",
         ));
     }
+    if let Some(columnar) = inventory.columnar_parts.as_ref() {
+        if inventory.selected_source_commit_id.is_some()
+            || !inventory.inline_part.is_empty()
+            || !inventory.parts.is_empty()
+            || !inventory.replacement_part_digests.is_empty()
+            || inventory.replacement_generation.is_some()
+            || inventory.replacement_parts.is_some()
+            || inventory.single_partition.as_ref().is_none_or(|scope| {
+                scope.schema_key != columnar.schema_key || scope.file_id.is_some()
+            })
+            || columnar.owner_commit_id != *commit_id.as_uuid().as_bytes()
+            || columnar.row_group_set_id
+                != crate::live_state::entity_row_group_set_id(commit_id, &columnar.schema_key)
+                    .as_bytes()
+            || columnar.manifest_digest == [0; 32]
+            || columnar.schema_key.is_empty()
+            || columnar.row_count != inventory.member_count
+            || columnar.group_row_counts.is_empty()
+            || columnar.group_row_counts.iter().any(|&rows| {
+                rows == 0 || rows as usize > crate::columnar_row_group::ROW_GROUP_MAX_ROWS
+            })
+            || columnar
+                .group_row_counts
+                .iter()
+                .map(|&rows| u64::from(rows))
+                .sum::<u64>()
+                != u64::from(columnar.row_count)
+            || columnar.first_key.is_empty()
+            || columnar.last_key.is_empty()
+            || columnar.first_key > columnar.last_key
+            || columnar.page_first_keys.len()
+                != (columnar.row_count as usize)
+                    .div_ceil(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS)
+            || columnar.page_first_keys.len() != columnar.page_last_keys.len()
+            || columnar
+                .page_first_keys
+                .iter()
+                .zip(&columnar.page_last_keys)
+                .any(|(first, last)| first.is_empty() || first > last)
+            || columnar
+                .page_last_keys
+                .iter()
+                .zip(columnar.page_first_keys.iter().skip(1))
+                .any(|(last, first)| last >= first)
+            || columnar.page_first_keys.first() != Some(&columnar.first_key)
+            || columnar.page_last_keys.last() != Some(&columnar.last_key)
+            || inventory.lifecycle_summary.as_ref().is_none_or(|summary| {
+                summary.scope.schema_key != columnar.schema_key
+                    || summary.scope.file_id.is_some()
+                    || summary.uniform_created_at != columnar.uniform_created_at
+            })
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_state_manifest has an invalid columnar mutation inventory",
+            ));
+        }
+    }
     if !inventory.inline_part.is_empty()
         && (!inventory.parts.is_empty() || !inventory.replacement_part_digests.is_empty())
     {
@@ -8939,7 +9945,7 @@ fn validate_commit_state_mutation_inventory(
     }
     if !inventory.direct_part_row_counts.is_empty() {
         let direct_rows = &inventory.direct_part_row_counts;
-        if direct_rows.len() != inventory.part_count()
+        if (inventory.columnar_parts.is_none() && direct_rows.len() != inventory.part_count())
             || direct_rows
                 .iter()
                 .any(|&rows| rows == 0 || usize::from(rows) > COMMIT_DELTA_SEGMENT_MAX_ROWS)
@@ -8959,11 +9965,12 @@ fn validate_commit_state_mutation_inventory(
         && inventory.lifecycle_summary.is_none()
         && inventory.replacement_generation.is_none()
         && inventory.replacement_parts.is_none()
+        && inventory.columnar_parts.is_none()
         && inventory.replacement_part_digests.is_empty()
         && inventory.inline_part.is_empty()
         && inventory.parts.is_empty();
     if !is_empty {
-        if inventory.replacement_part_digests.is_empty() {
+        if inventory.replacement_part_digests.is_empty() && inventory.columnar_parts.is_none() {
             validate_commit_delta_manifest(&commit_delta_manifest_from_inventory(inventory))?;
         }
         if inventory
@@ -11359,6 +12366,65 @@ mod tests {
         assert_eq!(canonical.len(), 3);
     }
 
+    #[test]
+    fn selected_source_merge_preserves_columnar_key_arenas() {
+        let source_commit = CommitId::for_test_label("columnar-selected-source");
+        let alias_commit = CommitId::for_test_label("columnar-selected-alias");
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(7);
+        let mut source = super::DecodedCommitDeltaBatchBuilder::with_capacity(2, 0);
+        for identity in ["a", "c"] {
+            source
+                .push_columnar_row(
+                    "columnar-selected-schema",
+                    EntityPk::single(identity),
+                    TrackedStateIndexValue {
+                        change_id: ChangeId::for_test_label(&format!("source-{identity}")),
+                        commit_id: source_commit,
+                        deleted: false,
+                        created_at: timestamp,
+                        updated_at: timestamp,
+                    },
+                )
+                .expect("source columnar row should append");
+        }
+        let mut local = super::DecodedCommitDeltaBatchBuilder::with_capacity(2, 0);
+        for identity in ["b", "c"] {
+            local
+                .push_columnar_row(
+                    "columnar-selected-schema",
+                    EntityPk::single(identity),
+                    TrackedStateIndexValue {
+                        change_id: ChangeId::for_test_label(&format!("local-{identity}")),
+                        commit_id: alias_commit,
+                        deleted: false,
+                        created_at: timestamp,
+                        updated_at: timestamp,
+                    },
+                )
+                .expect("local columnar row should append");
+        }
+
+        let merged =
+            super::merge_selected_source_batches(source.finish(), local.finish(), alias_commit)
+                .expect("selected-source merge should preserve both columnar key arenas");
+        let rows = decoded_commit_delta_rows(&merged);
+        assert_eq!(
+            rows.iter()
+                .map(|(key, _)| key.entity_pk.as_single_string().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert!(
+            rows.iter()
+                .all(|(_, value)| value.commit_id == alias_commit)
+        );
+        assert_eq!(
+            rows[2].1.change_id,
+            ChangeId::for_test_label("local-c"),
+            "local mutations must override selected-source identities"
+        );
+    }
+
     fn decoded_commit_delta_rows(
         batch: &DecodedCommitDeltaBatch,
     ) -> Vec<(TrackedStateKey, TrackedStateIndexValue)> {
@@ -11714,6 +12780,7 @@ mod tests {
             lifecycle_summary: None,
             replacement_generation: None,
             replacement_parts: None,
+            columnar_parts: None,
             inline_segment: segment,
             segments: Vec::new(),
         };
@@ -12612,6 +13679,7 @@ mod tests {
             lifecycle_summary: None,
             replacement_generation: None,
             replacement_parts: None,
+            columnar_parts: None,
             inline_segment: encode_commit_delta_segment(&entries),
             segments: Vec::new(),
         };
@@ -12928,6 +13996,7 @@ mod tests {
                 lifecycle_summary: None,
                 replacement_generation: None,
                 replacement_parts: None,
+                columnar_parts: None,
                 inline_part: encode_commit_delta_segment(&[entry]),
                 parts: Vec::new(),
             },

@@ -196,6 +196,33 @@ pub(crate) struct CommitStateMutationPart {
     pub(crate) replacement_part: Option<StoredReplacementPart>,
 }
 
+/// One lossless entity-columnar generation used directly as authored history.
+///
+/// The row-group manifest binds every column digest. Uniform lifecycle and
+/// origin metadata remain in the commit authority instead of being repeated
+/// in every row. Direct change addresses retain their established 512-row
+/// logical slots and translate to these larger physical groups by ordinal.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct ColumnarMutationPartSet {
+    pub(crate) owner_commit_id: [u8; 16],
+    pub(crate) row_group_set_id: [u8; 16],
+    pub(crate) manifest_digest: [u8; 32],
+    pub(crate) schema_key: String,
+    pub(crate) row_count: u32,
+    pub(crate) group_row_counts: Vec<u32>,
+    #[musli(bytes)]
+    pub(crate) first_key: Vec<u8>,
+    #[musli(bytes)]
+    pub(crate) last_key: Vec<u8>,
+    pub(crate) page_first_keys: Vec<Vec<u8>>,
+    pub(crate) page_last_keys: Vec<Vec<u8>>,
+    pub(crate) uniform_created_at: LixTimestamp,
+    pub(crate) uniform_updated_at: LixTimestamp,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) origin_key: Option<String>,
+}
+
 /// One collection partition replaced by a certified immutable generation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
 #[musli(packed)]
@@ -365,6 +392,11 @@ pub(crate) struct CommitStateMutationInventory {
     pub(crate) replacement_generation: Option<StoredCommitDeltaReplacementGeneration>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) replacement_parts: Option<StoredReplacementPartsAuthority>,
+    /// Lossless typed post-images that are both the authored mutation payload
+    /// and the serving columnar source. When present, legacy LXCD parts are
+    /// forbidden rather than retained as a compatibility copy.
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) columnar_parts: Option<ColumnarMutationPartSet>,
     /// Tiny commits retain their only part inline so an exact history lookup
     /// remains one backend point read.
     #[musli(bytes)]
@@ -379,7 +411,10 @@ impl CommitStateMutationInventory {
     }
 
     pub(crate) fn part_count(&self) -> usize {
-        usize::from(!self.inline_part.is_empty())
+        self.columnar_parts
+            .as_ref()
+            .map_or(0, |parts| parts.group_row_counts.len())
+            + usize::from(!self.inline_part.is_empty())
             + if self.replacement_part_digests.is_empty() {
                 self.parts.len()
             } else {
