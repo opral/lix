@@ -276,7 +276,7 @@ pub(crate) struct CurrentStatePartDescriptor {
 #[musli(packed)]
 pub(crate) struct CurrentStatePartDirectoryRoot {
     pub(crate) root_id: [u8; 32],
-    pub(crate) descriptor_digest: [u8; 32],
+    pub(crate) directory_digest: [u8; 32],
     pub(crate) row_count: u64,
     pub(crate) part_count: u32,
     pub(crate) tree_height: u16,
@@ -284,9 +284,10 @@ pub(crate) struct CurrentStatePartDirectoryRoot {
 
 /// One authoritative current-state collection generation.
 ///
-/// The mutation-directory digest binds this rebuildable serving projection to
-/// the commit's historical replacement certificate without making the serving
-/// directory part of commit semantics.
+/// The generation digest binds this rebuildable serving projection to the
+/// historical replacement certificate. Sparse lineage then binds each later
+/// post-image directory root without making that serving directory historical
+/// commit authority.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CurrentStatePartSet {

@@ -51,7 +51,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"sparse-current-state-parts.v50";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"persistent-current-state-range-splice.v51";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
