@@ -485,6 +485,8 @@ pub(crate) struct CertifiedRawWriteBatchPreparation {
     pub(crate) facts: PreparedRowFacts,
     pub(crate) tracked_keys_strictly_ordered: bool,
     pub(crate) complete_collection_replacement: bool,
+    pub(crate) complete_collection_identity_digest: Option<[u8; 32]>,
+    pub(crate) complete_collection_replay_bytes: Option<u64>,
 }
 
 /// Dense, typed columns produced by certified SQL parameter-batch paths.
@@ -624,6 +626,10 @@ impl CertifiedParameterBatch {
             origin_column_index: HashMap::new(),
             certified_tracked_keys_strictly_ordered: certificate.tracked_keys_strictly_ordered,
             certified_complete_collection_replacement: certificate.complete_collection_replacement,
+            certified_complete_collection_identity_digest: certificate
+                .complete_collection_identity_digest,
+            certified_complete_collection_replay_bytes: certificate
+                .complete_collection_replay_bytes,
         })
     }
 }
@@ -1057,6 +1063,10 @@ impl RawWriteBatch {
             origin_column_index: HashMap::new(),
             certified_tracked_keys_strictly_ordered: certificate.tracked_keys_strictly_ordered,
             certified_complete_collection_replacement: certificate.complete_collection_replacement,
+            certified_complete_collection_identity_digest: certificate
+                .complete_collection_identity_digest,
+            certified_complete_collection_replay_bytes: certificate
+                .complete_collection_replay_bytes,
         })
     }
 
@@ -2488,6 +2498,8 @@ pub(crate) struct PreparedStateBatch {
     /// A typed producer proved this batch replaces every live row in one
     /// tracked, unfiled collection under the transaction's branch snapshot.
     certified_complete_collection_replacement: bool,
+    certified_complete_collection_identity_digest: Option<[u8; 32]>,
+    certified_complete_collection_replay_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2646,6 +2658,8 @@ impl PreparedStateBatch {
             origin_column_index: HashMap::new(),
             certified_tracked_keys_strictly_ordered: false,
             certified_complete_collection_replacement: false,
+            certified_complete_collection_identity_digest: None,
+            certified_complete_collection_replay_bytes: None,
         }
     }
 
@@ -2665,6 +2679,14 @@ impl PreparedStateBatch {
 
     pub(crate) fn certified_complete_collection_replacement(&self) -> bool {
         self.certified_complete_collection_replacement
+    }
+
+    pub(crate) fn certified_complete_collection_identity_digest(&self) -> Option<[u8; 32]> {
+        self.certified_complete_collection_identity_digest
+    }
+
+    pub(crate) fn certified_complete_collection_replay_bytes(&self) -> Option<u64> {
+        self.certified_complete_collection_replay_bytes
     }
 
     pub(crate) fn iter(&self) -> PreparedStateRows<'_> {
@@ -2990,6 +3012,8 @@ impl PreparedStateBatch {
         self.entity_pks.append(&mut other.entity_pks);
         self.json.append(&mut other.json);
         self.certified_complete_collection_replacement = false;
+        self.certified_complete_collection_identity_digest = None;
+        self.certified_complete_collection_replay_bytes = None;
         true
     }
 
@@ -3009,6 +3033,8 @@ impl PreparedStateBatch {
         other.expand_dense_certified_parameter();
         self.certified_tracked_keys_strictly_ordered = false;
         self.certified_complete_collection_replacement = false;
+        self.certified_complete_collection_identity_digest = None;
+        self.certified_complete_collection_replay_bytes = None;
         let entity_base =
             u32::try_from(self.entity_pks.len()).expect("prepared entity column must fit u32");
         let json_base = u32::try_from(self.json.len()).expect("prepared JSON column must fit u32");
@@ -3077,6 +3103,8 @@ impl PreparedStateBatch {
         self.expand_dense_certified_parameter();
         self.certified_tracked_keys_strictly_ordered = false;
         self.certified_complete_collection_replacement = false;
+        self.certified_complete_collection_identity_digest = None;
+        self.certified_complete_collection_replay_bytes = None;
         self.slots.swap(left, right);
     }
 
@@ -3097,6 +3125,8 @@ impl PreparedStateBatch {
         self.expand_dense_certified_parameter();
         self.certified_tracked_keys_strictly_ordered = false;
         self.certified_complete_collection_replacement = false;
+        self.certified_complete_collection_identity_digest = None;
+        self.certified_complete_collection_replay_bytes = None;
         debug_assert!(
             source_by_destination
                 .iter()
@@ -3145,6 +3175,8 @@ impl PreparedStateBatch {
         if retained_len != self.slots.len() {
             self.certified_tracked_keys_strictly_ordered = false;
             self.certified_complete_collection_replacement = false;
+            self.certified_complete_collection_identity_digest = None;
+            self.certified_complete_collection_replay_bytes = None;
         }
         self.slots.truncate(retained_len);
         if !self.should_compact_owner_columns(retained_len) {
@@ -3981,6 +4013,8 @@ mod tests {
             },
             tracked_keys_strictly_ordered: true,
             complete_collection_replacement: false,
+            complete_collection_identity_digest: None,
+            complete_collection_replay_bytes: None,
         };
         let timestamp = LixTimestamp::expect_parse("timestamp", "2026-08-02T00:00:00.000Z");
         let mut prepared = CertifiedParameterInsertBatch::new(
@@ -4060,6 +4094,8 @@ mod tests {
                 },
                 tracked_keys_strictly_ordered: true,
                 complete_collection_replacement: true,
+                complete_collection_identity_digest: Some([7; 32]),
+                complete_collection_replay_bytes: Some(321),
             },
         )
         .expect("certified replacement should construct")
@@ -4071,14 +4107,31 @@ mod tests {
 
         assert!(prepared.is_dense_certified_parameter());
         assert!(prepared.certified_complete_collection_replacement());
+        assert_eq!(
+            prepared.certified_complete_collection_identity_digest(),
+            Some([7; 32])
+        );
+        assert_eq!(
+            prepared.certified_complete_collection_replay_bytes(),
+            Some(321)
+        );
         assert!(prepared.certified_tracked_keys_strictly_ordered());
         prepared.truncate_rows(2);
         assert!(prepared.is_dense_certified_parameter());
         assert!(prepared.certified_complete_collection_replacement());
+        assert_eq!(
+            prepared.certified_complete_collection_identity_digest(),
+            Some([7; 32])
+        );
 
         prepared.truncate_rows(1);
         assert!(!prepared.is_dense_certified_parameter());
         assert!(!prepared.certified_complete_collection_replacement());
+        assert_eq!(
+            prepared.certified_complete_collection_identity_digest(),
+            None
+        );
+        assert_eq!(prepared.certified_complete_collection_replay_bytes(), None);
         assert!(!prepared.certified_tracked_keys_strictly_ordered());
         assert_eq!(prepared.row(0).entity_pk, &EntityPk::single("a"));
     }
@@ -4093,6 +4146,8 @@ mod tests {
             },
             tracked_keys_strictly_ordered: true,
             complete_collection_replacement: false,
+            complete_collection_identity_digest: None,
+            complete_collection_replay_bytes: None,
         };
         let prepare = |key: &str, timestamp| {
             CertifiedParameterReplacementBatch::new(

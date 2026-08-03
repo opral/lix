@@ -1035,17 +1035,25 @@ async fn stage_changelog_commits(
             })
             .and_then(|rows| u64::try_from(rows).ok())
             .ok_or_else(|| LixError::unknown("tracked-state rootless row count exceeds u64"))?;
-        let commit_delta_bytes = tracked_row_indices_by_commit
+        let commit_row_indices = tracked_row_indices_by_commit
             .get(&commit_id)
-            .into_iter()
-            .flatten()
-            .try_fold(0_u64, |bytes, &row_index| {
-                bytes
-                    .checked_add(prepared_state_row_replay_bytes(state_rows.row(row_index))?)
-                    .ok_or_else(|| {
-                        LixError::unknown("tracked-state rootless byte count exceeds u64")
-                    })
-            })?;
+            .map(Vec::as_slice);
+        let commit_delta_bytes = if state_rows.certified_complete_collection_replacement()
+            && commit_row_indices.is_some_and(|indices| indices.len() == state_rows.len())
+        {
+            if let Some(certified_bytes) = state_rows.certified_complete_collection_replay_bytes() {
+                #[cfg(debug_assertions)]
+                debug_assert_eq!(
+                    certified_bytes,
+                    replay_bytes_for_rows(state_rows, commit_row_indices)?
+                );
+                certified_bytes
+            } else {
+                replay_bytes_for_rows(state_rows, commit_row_indices)?
+            }
+        } else {
+            replay_bytes_for_rows(state_rows, commit_row_indices)?
+        };
         let has_unbounded_payload_sources = certified_packet_root_rows
             .get(&commit_id)
             .is_some_and(|rows| !rows.is_empty())
@@ -2076,13 +2084,25 @@ async fn certify_complete_replacement_generations(
         else {
             continue;
         };
-        let Some(ordered_identity_digest) =
+        let certified_identity_digest = state_rows.certified_complete_collection_identity_digest();
+        #[cfg(debug_assertions)]
+        if let Some(certified_identity_digest) = certified_identity_digest {
+            debug_assert_eq!(
+                Some(certified_identity_digest),
+                crate::collection_generation::ordered_single_string_identity_digest(
+                    row_indices
+                        .iter()
+                        .map(|&row_index| state_rows.row(row_index).entity_pk),
+                )
+            );
+        }
+        let Some(ordered_identity_digest) = certified_identity_digest.or_else(|| {
             crate::collection_generation::ordered_single_string_identity_digest(
                 row_indices
                     .iter()
                     .map(|&row_index| state_rows.row(row_index).entity_pk),
             )
-        else {
+        }) else {
             continue;
         };
         let mut current = root.parent_commit_id;
@@ -2253,6 +2273,20 @@ fn prepared_state_row_replay_bytes(row: PreparedStateRowRef<'_>) -> Result<u64, 
         .and_then(|bytes| bytes.checked_add(metadata_bytes))
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or_else(|| LixError::unknown("tracked-state replay row bytes exceed u64"))
+}
+
+fn replay_bytes_for_rows(
+    state_rows: &PreparedStateBatch,
+    row_indices: Option<&[RowIndex]>,
+) -> Result<u64, LixError> {
+    row_indices
+        .into_iter()
+        .flatten()
+        .try_fold(0_u64, |bytes, &row_index| {
+            bytes
+                .checked_add(prepared_state_row_replay_bytes(state_rows.row(row_index))?)
+                .ok_or_else(|| LixError::unknown("tracked-state rootless byte count exceeds u64"))
+        })
 }
 
 fn select_new_rootless_ordered_commits(

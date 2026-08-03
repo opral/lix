@@ -87,9 +87,6 @@ const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 1024 * 1024;
 const COMMIT_DELTA_SIDECAR_RAW: u8 = 0;
 const COMMIT_DELTA_SIDECAR_ZSTD: u8 = 1;
-/// Every entry is an authored, certified reference with one shared optional
-/// origin key. The leaf already carries the entry count, so only that shared
-/// origin needs a body.
 /// Every entry is an authored inline snapshot with empty metadata and origin
 /// columns. The indexed body stores raw JSON ranges without per-row Musli
 /// envelopes.
@@ -1516,10 +1513,10 @@ pub(crate) fn stage_ordered_addressable_replacement_parts<'a, I>(
 where
     I: ExactSizeIterator<Item = Result<TrackedStateCommitDeltaRef<'a>, LixError>>,
 {
-    struct OwnedRow {
+    struct BorrowedRow<'a> {
         key: Vec<u8>,
-        snapshot: crate::json_store::JsonSlot,
-        metadata: crate::json_store::JsonSlot,
+        snapshot: crate::json_store::JsonSlotRef<'a>,
+        metadata: crate::json_store::JsonSlotRef<'a>,
     }
 
     let row_count = deltas.len();
@@ -1553,23 +1550,12 @@ where
                 "tracked_state replacement member violates immutable replacement invariants",
             ));
         }
-        let own_slot = |slot| match slot {
-            crate::json_store::JsonSlotRef::None => crate::json_store::JsonSlot::None,
-            crate::json_store::JsonSlotRef::Ref(json_ref) => {
-                crate::json_store::JsonSlot::Ref(*json_ref)
-            }
-            crate::json_store::JsonSlotRef::Inline(json) => {
-                crate::json_store::JsonSlot::Inline(json.into())
-            }
-        };
-        let snapshot = own_slot(delta.snapshot);
-        if snapshot.is_none() {
+        if matches!(delta.snapshot, crate::json_store::JsonSlotRef::None) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state replacement member has no canonical snapshot",
             ));
         }
-        let metadata = own_slot(delta.metadata);
         if commit_id
             .replace(delta.delta.commit_id)
             .is_some_and(|owner| owner != delta.delta.commit_id)
@@ -1595,10 +1581,10 @@ where
         }
         previous_key.clear();
         previous_key.extend_from_slice(&key);
-        pending.push(OwnedRow {
+        pending.push(BorrowedRow {
             key,
-            snapshot: snapshot.to_owned(),
-            metadata,
+            snapshot: delta.snapshot,
+            metadata: delta.metadata,
         });
         if pending.len() == COMMIT_DELTA_SEGMENT_MAX_ROWS {
             encode_replacement_part_prefix(&mut pending, &mut parts, &mut compressor)?;
@@ -1613,7 +1599,7 @@ where
     }
 
     fn encode_replacement_part_prefix(
-        pending: &mut Vec<OwnedRow>,
+        pending: &mut Vec<BorrowedRow<'_>>,
         parts: &mut Vec<crate::tracked_state::replacement_part::EncodedReplacementPart>,
         compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
     ) -> Result<(), LixError> {
@@ -1624,8 +1610,8 @@ where
                 .map(
                     |row| crate::tracked_state::replacement_part::ReplacementPartRowRef {
                         encoded_key: &row.key,
-                        snapshot: row.snapshot.as_ref_slot(),
-                        metadata: row.metadata.as_ref_slot(),
+                        snapshot: row.snapshot,
+                        metadata: row.metadata,
                     },
                 )
                 .collect::<Vec<_>>();
