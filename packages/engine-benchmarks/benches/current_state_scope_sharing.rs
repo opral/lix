@@ -105,13 +105,19 @@ async fn run_backend<S>(
         };
         let measured = measure(&fixture, selected, warmups, samples).await;
         println!(
-            "current_state_scope_sharing,backend={backend},mode={mode},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},setup_ms={:.3},catalog_staged_encoded_bytes={},directory_staged_encoded_bytes={},sparse_staged_puts={},sparse_written_bytes={},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},catalog_manifest_bytes={},replay_manifest_bytes={},p50_us={:.3},p95_us={:.3}",
+            "current_state_scope_sharing,backend={backend},mode={mode},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},setup_ms={:.3},catalog_staged_encoded_bytes={},directory_staged_encoded_bytes={},sparse_directory_staged_encoded_bytes={},sparse_staged_puts={},sparse_written_bytes={},sparse_directory_nodes_loaded={},sparse_directory_descriptors_visited={},sparse_directory_nodes_encoded={},sparse_publication_p50_us={:.3},sparse_publication_p95_us={:.3},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},catalog_manifest_bytes={},replay_manifest_bytes={},p50_us={:.3},p95_us={:.3}",
             fixture.catalog_entry_count(),
             millis(setup),
             fixture.catalog_staged_encoded_bytes(),
             fixture.directory_staged_encoded_bytes(),
+            fixture.sparse_directory_staged_encoded_bytes(),
             fixture.sparse_staged_puts(),
             fixture.sparse_written_bytes(),
+            fixture.sparse_directory_nodes_loaded(),
+            fixture.sparse_directory_descriptors_visited(),
+            fixture.sparse_directory_nodes_encoded(),
+            fixture.sparse_publication_p50_nanos() as f64 / 1_000.0,
+            fixture.sparse_publication_p95_nanos() as f64 / 1_000.0,
             fixture.first_sparse_elapsed_nanos() as f64 / 1_000_000.0,
             fixture.first_sparse_staged_puts(),
             fixture.first_sparse_written_bytes(),
@@ -137,13 +143,19 @@ async fn run_backend<S>(
     )
     .await;
     println!(
-        "current_state_scope_sharing,backend={backend},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},setup_ms={:.3},catalog_staged_encoded_bytes={},directory_staged_encoded_bytes={},sparse_staged_puts={},sparse_written_bytes={},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},catalog_manifest_bytes={},replay_manifest_bytes={},serving_p50_us={:.3},serving_p95_us={:.3},replay_p50_us={:.3},replay_p95_us={:.3},p50_reduction_pct={:.2},p95_reduction_pct={:.2}",
+        "current_state_scope_sharing,backend={backend},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},setup_ms={:.3},catalog_staged_encoded_bytes={},directory_staged_encoded_bytes={},sparse_directory_staged_encoded_bytes={},sparse_staged_puts={},sparse_written_bytes={},sparse_directory_nodes_loaded={},sparse_directory_descriptors_visited={},sparse_directory_nodes_encoded={},sparse_publication_p50_us={:.3},sparse_publication_p95_us={:.3},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},catalog_manifest_bytes={},replay_manifest_bytes={},serving_p50_us={:.3},serving_p95_us={:.3},replay_p50_us={:.3},replay_p95_us={:.3},p50_reduction_pct={:.2},p95_reduction_pct={:.2}",
         fixture.catalog_entry_count(),
         millis(setup),
         fixture.catalog_staged_encoded_bytes(),
         fixture.directory_staged_encoded_bytes(),
+        fixture.sparse_directory_staged_encoded_bytes(),
         fixture.sparse_staged_puts(),
         fixture.sparse_written_bytes(),
+        fixture.sparse_directory_nodes_loaded(),
+        fixture.sparse_directory_descriptors_visited(),
+        fixture.sparse_directory_nodes_encoded(),
+        fixture.sparse_publication_p50_nanos() as f64 / 1_000.0,
+        fixture.sparse_publication_p95_nanos() as f64 / 1_000.0,
         fixture.first_sparse_elapsed_nanos() as f64 / 1_000_000.0,
         fixture.first_sparse_staged_puts(),
         fixture.first_sparse_written_bytes(),
@@ -178,7 +190,7 @@ where
     }
     timings.sort_unstable();
     let p50 = timings[timings.len() / 2];
-    let p95 = timings[(timings.len() - 1) * 95 / 100];
+    let p95 = timings[timings.len().saturating_mul(95).div_ceil(100) - 1];
     (p50, p95)
 }
 

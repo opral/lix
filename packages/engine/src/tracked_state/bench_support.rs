@@ -95,8 +95,14 @@ pub struct BenchCurrentStatePointFixture<StorageImpl: Storage> {
     replay_manifest_bytes: u64,
     catalog_staged_encoded_bytes: u64,
     directory_staged_encoded_bytes: u64,
+    sparse_directory_staged_encoded_bytes: u64,
     sparse_staged_puts: u64,
     sparse_written_bytes: u64,
+    sparse_directory_nodes_loaded: u64,
+    sparse_directory_descriptors_visited: u64,
+    sparse_directory_nodes_encoded: u64,
+    sparse_publication_p50_nanos: u64,
+    sparse_publication_p95_nanos: u64,
     first_sparse_elapsed_nanos: u64,
     first_sparse_staged_puts: u64,
     first_sparse_written_bytes: u64,
@@ -366,9 +372,16 @@ where
     let mut replay_manifest_bytes = 0u64;
     let mut sparse_staged_puts = 0u64;
     let mut sparse_written_bytes = 0u64;
+    let mut sparse_directory_nodes_loaded = 0u64;
+    let mut sparse_directory_descriptors_visited = 0u64;
+    let mut sparse_directory_nodes_encoded = 0u64;
+    let mut sparse_publication_nanos = Vec::with_capacity(unrelated_sparse_commits);
     let mut first_sparse_elapsed_nanos = 0u64;
     let mut first_sparse_staged_puts = 0u64;
     let mut first_sparse_written_bytes = 0u64;
+    let _ = crate::storage_bench::take_crud_current_state_directory_accounting();
+    let base_directory_staged_encoded_bytes =
+        crate::storage_bench::take_crud_current_state_directory_bytes();
     let beta_pk = EntityPk::single("unrelated");
     for index in 0..unrelated_sparse_commits {
         let sparse_started = Instant::now();
@@ -429,6 +442,7 @@ where
                 .await
                 .expect("load benchmark sparse parent authority")
                 .expect("benchmark sparse parent authority exists");
+        let publication_started = Instant::now();
         let publication = super::storage::stage_current_state_catalog_from_published_parent(
             &read,
             &mut writes,
@@ -438,6 +452,8 @@ where
         )
         .await
         .expect("reuse benchmark persistent catalog");
+        sparse_publication_nanos
+            .push(u64::try_from(publication_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         let (catalog, anchor) = publication.parts();
         drop(read);
         current_manifest = bench_current_state_manifest(
@@ -468,6 +484,11 @@ where
             .expect("commit benchmark sparse child");
         sparse_staged_puts += stats.staged_puts;
         sparse_written_bytes += stats.written_bytes;
+        let directory_accounting =
+            crate::storage_bench::take_crud_current_state_directory_accounting();
+        sparse_directory_nodes_loaded += directory_accounting.nodes_loaded;
+        sparse_directory_descriptors_visited += directory_accounting.descriptors_visited;
+        sparse_directory_nodes_encoded += directory_accounting.nodes_encoded;
         if index == 0 {
             first_sparse_elapsed_nanos =
                 u64::try_from(sparse_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -476,6 +497,23 @@ where
         }
         commits.push(commit_id);
     }
+    sparse_publication_nanos.sort_unstable();
+    let sparse_publication_p50_nanos = sparse_publication_nanos
+        .get(sparse_publication_nanos.len() / 2)
+        .copied()
+        .unwrap_or_default();
+    let sparse_publication_p95_nanos = sparse_publication_nanos
+        .get(
+            sparse_publication_nanos
+                .len()
+                .saturating_mul(95)
+                .div_ceil(100)
+                .saturating_sub(1),
+        )
+        .copied()
+        .unwrap_or_default();
+    let sparse_directory_staged_encoded_bytes =
+        crate::storage_bench::take_crud_current_state_directory_bytes();
 
     let target_index = if sparse_shape == BenchCurrentStateSparseShape::TouchedScope
         && point_target == BenchCurrentStatePointTarget::HotMutated
@@ -501,10 +539,16 @@ where
         catalog_manifest_bytes,
         replay_manifest_bytes,
         catalog_staged_encoded_bytes: crate::storage_bench::take_crud_current_state_catalog_bytes(),
-        directory_staged_encoded_bytes:
-            crate::storage_bench::take_crud_current_state_directory_bytes(),
+        directory_staged_encoded_bytes: base_directory_staged_encoded_bytes
+            .saturating_add(sparse_directory_staged_encoded_bytes),
+        sparse_directory_staged_encoded_bytes,
         sparse_staged_puts,
         sparse_written_bytes,
+        sparse_directory_nodes_loaded,
+        sparse_directory_descriptors_visited,
+        sparse_directory_nodes_encoded,
+        sparse_publication_p50_nanos,
+        sparse_publication_p95_nanos,
         first_sparse_elapsed_nanos,
         first_sparse_staged_puts,
         first_sparse_written_bytes,
@@ -535,12 +579,36 @@ where
         self.directory_staged_encoded_bytes
     }
 
+    pub fn sparse_directory_staged_encoded_bytes(&self) -> u64 {
+        self.sparse_directory_staged_encoded_bytes
+    }
+
     pub fn sparse_staged_puts(&self) -> u64 {
         self.sparse_staged_puts
     }
 
     pub fn sparse_written_bytes(&self) -> u64 {
         self.sparse_written_bytes
+    }
+
+    pub fn sparse_directory_nodes_loaded(&self) -> u64 {
+        self.sparse_directory_nodes_loaded
+    }
+
+    pub fn sparse_directory_descriptors_visited(&self) -> u64 {
+        self.sparse_directory_descriptors_visited
+    }
+
+    pub fn sparse_directory_nodes_encoded(&self) -> u64 {
+        self.sparse_directory_nodes_encoded
+    }
+
+    pub fn sparse_publication_p50_nanos(&self) -> u64 {
+        self.sparse_publication_p50_nanos
+    }
+
+    pub fn sparse_publication_p95_nanos(&self) -> u64 {
+        self.sparse_publication_p95_nanos
     }
 
     pub fn first_sparse_elapsed_nanos(&self) -> u64 {

@@ -62,6 +62,9 @@ static CRUD_PHYSICAL_DELETES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
 static CRUD_COMMIT_STATE_MANIFEST_BYTES: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_DIRECTORY_BYTES: AtomicU64 = AtomicU64::new(0);
+static CRUD_CURRENT_STATE_DIRECTORY_NODES_LOADED: AtomicU64 = AtomicU64::new(0);
+static CRUD_CURRENT_STATE_DIRECTORY_DESCRIPTORS_VISITED: AtomicU64 = AtomicU64::new(0);
+static CRUD_CURRENT_STATE_DIRECTORY_NODES_ENCODED: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_CATALOG_BYTES: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_DIRECTORY_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 static CRUD_CURRENT_STATE_CATALOG_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
@@ -204,6 +207,34 @@ pub(crate) fn record_crud_current_state_directory_bytes(bytes: usize) {
 
 pub fn take_crud_current_state_directory_bytes() -> u64 {
     CRUD_CURRENT_STATE_DIRECTORY_BYTES.swap(0, Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrudCurrentStateDirectoryAccounting {
+    pub nodes_loaded: u64,
+    pub descriptors_visited: u64,
+    pub nodes_encoded: u64,
+}
+
+pub(crate) fn record_crud_current_state_directory_node_loaded() {
+    CRUD_CURRENT_STATE_DIRECTORY_NODES_LOADED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_crud_current_state_directory_descriptors_visited(count: usize) {
+    CRUD_CURRENT_STATE_DIRECTORY_DESCRIPTORS_VISITED.fetch_add(count as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_crud_current_state_directory_node_encoded() {
+    CRUD_CURRENT_STATE_DIRECTORY_NODES_ENCODED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn take_crud_current_state_directory_accounting() -> CrudCurrentStateDirectoryAccounting {
+    CrudCurrentStateDirectoryAccounting {
+        nodes_loaded: CRUD_CURRENT_STATE_DIRECTORY_NODES_LOADED.swap(0, Ordering::Relaxed),
+        descriptors_visited: CRUD_CURRENT_STATE_DIRECTORY_DESCRIPTORS_VISITED
+            .swap(0, Ordering::Relaxed),
+        nodes_encoded: CRUD_CURRENT_STATE_DIRECTORY_NODES_ENCODED.swap(0, Ordering::Relaxed),
+    }
 }
 
 pub(crate) fn record_crud_current_state_catalog_bytes(bytes: usize) {

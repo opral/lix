@@ -24,25 +24,24 @@ use crate::{LixError, storage_codec};
 
 pub(crate) const CURRENT_STATE_PART_DIRECTORY_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_002c),
-    "tracked_state.current_state_part_directory.v1",
+    "tracked_state.current_state_part_directory.v2",
 );
 pub(crate) const CURRENT_STATE_CATALOG_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_002d),
     "tracked_state.current_state_catalog.v1",
 );
 
-const DIRECTORY_NODE_RAW_MAGIC: &[u8; 6] = b"LXCSDR";
-const DIRECTORY_NODE_ZSTD_MAGIC: &[u8; 6] = b"LXCSDZ";
+const DIRECTORY_NODE_RAW_MAGIC: &[u8; 6] = b"LXC2DR";
+const DIRECTORY_NODE_ZSTD_MAGIC: &[u8; 6] = b"LXC2DZ";
 const DIRECTORY_NODE_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const DIRECTORY_FANOUT: usize = 128;
-const DIRECTORY_HASH_CONTEXT: &str = "lix current-state part directory node v1";
+const DIRECTORY_HASH_CONTEXT: &str = "lix current-state part directory node v2";
 const CATALOG_NODE_MAGIC: &[u8; 6] = b"LXCSCR";
 const CATALOG_HASH_CONTEXT: &str = "lix current-state catalog node v1";
-const CURRENT_STATE_LINEAGE_CONTEXT: &str = "lix current-state lineage v1";
+const CURRENT_STATE_LINEAGE_CONTEXT: &str = "lix current-state lineage v2";
 const CATALOG_TRANSITION_CONTEXT: &str = "lix current-state catalog transition v1";
 const CATALOG_LEAF_MAX_ENTRIES: usize = 128;
 const CATALOG_MAX_KEY_BYTES: usize = 64 * 1024;
-const CURRENT_STATE_DESCRIPTOR_DIGEST_CONTEXT: &str = "lix current-state descriptor set v1";
 
 /// Publishes the serving directory for a certified complete replacement.
 /// Ordinary mutation inventories are not state partitions and return `None`.
@@ -90,7 +89,7 @@ pub(crate) fn stage_complete_replacement_current_state_part_set(
             Ok(descriptor)
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    let mut directory = stage_current_state_part_directory(writes, &descriptors)?;
+    let directory = stage_current_state_part_directory(writes, &descriptors)?;
     if directory.row_count != u64::from(inventory.member_count)
         || replacement_directory_digest(&descriptors)? != authority_digest
         || initial_generation.owner_commit_id != *commit_id.as_uuid().as_bytes()
@@ -99,10 +98,6 @@ pub(crate) fn stage_complete_replacement_current_state_part_set(
             "replacement state set disagrees with its commit authority",
         ));
     }
-    // The first complete generation retains the historical replacement
-    // certificate digest. Sparse descendants use the generic descriptor-set
-    // digest because they may mix replacement and native sources.
-    directory.descriptor_digest = authority_digest;
     let generation = initial_generation.clone();
     let state_lineage_digest =
         fresh_current_state_lineage_digest(commit_id, generation.integrity_digest, &directory);
@@ -174,7 +169,7 @@ pub(crate) fn fresh_current_state_lineage_digest(
         .update(commit_id.as_uuid().as_bytes())
         .update(&generation_integrity_digest)
         .update(&directory.root_id)
-        .update(&directory.descriptor_digest)
+        .update(&directory.directory_digest)
         .finalize()
         .as_bytes()
 }
@@ -1487,66 +1482,6 @@ pub(crate) async fn load_current_state_part_directory_reachability(
     Ok((nodes, descriptor_sets.pop().unwrap_or_default()))
 }
 
-pub(crate) async fn load_current_state_part_directory_reachability_for_write(
-    store: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    root: &CurrentStatePartDirectoryRoot,
-) -> Result<
-    (
-        std::collections::BTreeSet<[u8; 32]>,
-        Vec<CurrentStatePartDescriptor>,
-    ),
-    LixError,
-> {
-    if root.part_count == 0 {
-        validate_empty_root(root)?;
-        return Ok((std::collections::BTreeSet::new(), Vec::new()));
-    }
-    let mut pending = vec![(root.root_id, None)];
-    let mut node_ids = std::collections::BTreeSet::new();
-    let mut descriptors = Vec::with_capacity(root.part_count as usize);
-    while let Some((node_id, expected_child)) = pending.pop() {
-        if !node_ids.insert(node_id) {
-            return Err(directory_error(
-                "part directory contains a cycle or duplicate child",
-            ));
-        }
-        let staged = writes.staged_value(CURRENT_STATE_PART_DIRECTORY_SPACE, &node_id);
-        let node = if let Some(bytes) = staged {
-            if node_digest(&bytes) != node_id {
-                return Err(directory_error("node content digest mismatch"));
-            }
-            decode_node(&bytes)?
-        } else {
-            load_node(store, node_id).await?
-        };
-        if expected_child.is_none() {
-            validate_root_summary(root, &node)?;
-        }
-        if let Some(expected) = expected_child.as_ref() {
-            validate_child_summary(expected, &node)?;
-        }
-        if node.kind == 0 {
-            descriptors.extend(node.parts);
-        } else {
-            pending.extend(
-                node.children
-                    .into_iter()
-                    .rev()
-                    .map(|child| (child.node_id, Some(child))),
-            );
-        }
-    }
-    descriptors.sort_by(|left, right| left.first_key.cmp(&right.first_key));
-    validate_descriptors(&descriptors)?;
-    if descriptors.len() != root.part_count as usize
-        || !descriptor_digest_matches(root, &descriptors)?
-    {
-        return Err(directory_error("part directory reachability mismatch"));
-    }
-    Ok((node_ids, descriptors))
-}
-
 pub(crate) async fn load_current_state_part_directory_reachability_many(
     store: &(impl StorageAdapterRead + ?Sized),
     roots: &[CurrentStatePartDirectoryRoot],
@@ -1626,9 +1561,7 @@ pub(crate) async fn load_current_state_part_directory_reachability_many(
         // caller-visible descriptor sequence before semantic validation.
         descriptors.sort_by(|left, right| left.first_key.cmp(&right.first_key));
         validate_descriptors(descriptors)?;
-        if descriptors.len() != root.part_count as usize
-            || !descriptor_digest_matches(root, descriptors)?
-        {
+        if descriptors.len() != root.part_count as usize || !directory_digest_matches(root) {
             return Err(directory_error("part directory reachability mismatch"));
         }
     }
@@ -1637,7 +1570,7 @@ pub(crate) async fn load_current_state_part_directory_reachability_many(
 
 fn validate_catalog_node(node: &CatalogNode) -> Result<(), LixError> {
     let depth = usize::try_from(node.depth).expect("u32 fits usize");
-    let empty_descriptor_digest = current_state_descriptor_digest(&[])?;
+    let empty_directory_digest = empty_current_state_directory_digest();
     if depth > CATALOG_MAX_KEY_BYTES
         || node.sample_key.len() > CATALOG_MAX_KEY_BYTES
         || node.sample_key.len() < depth
@@ -1650,12 +1583,12 @@ fn validate_catalog_node(node: &CatalogNode) -> Result<(), LixError> {
             .any(|pair| pair[0].scope >= pair[1].scope)
         || node.entries.iter().any(|entry| {
             let valid_empty_directory = entry.directory.root_id == [0; 32]
-                && entry.directory.descriptor_digest == empty_descriptor_digest
+                && entry.directory.directory_digest == empty_directory_digest
                 && entry.directory.row_count == 0
                 && entry.directory.part_count == 0
                 && entry.directory.tree_height == 0;
             let valid_nonempty_directory = entry.directory.root_id != [0; 32]
-                && entry.directory.descriptor_digest != [0; 32]
+                && entry.directory.directory_digest != [0; 32]
                 && entry.directory.row_count > 0
                 && entry.directory.part_count > 0
                 && entry.directory.tree_height > 0;
@@ -1741,12 +1674,14 @@ struct DirectoryChild {
     node_id: [u8; 32],
     row_count: u64,
     part_count: u32,
+    level: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 struct DirectoryNode {
     kind: u8,
+    level: u16,
     parts: Vec<CurrentStatePartDescriptor>,
     children: Vec<DirectoryChild>,
 }
@@ -1755,14 +1690,20 @@ impl DirectoryNode {
     fn leaf(parts: Vec<CurrentStatePartDescriptor>) -> Self {
         Self {
             kind: 0,
+            level: 0,
             parts,
             children: Vec::new(),
         }
     }
 
     fn internal(children: Vec<DirectoryChild>) -> Self {
+        let level = children
+            .first()
+            .map(|child| child.level.saturating_add(1))
+            .unwrap_or(1);
         Self {
             kind: 1,
+            level,
             parts: Vec::new(),
             children,
         }
@@ -1774,58 +1715,80 @@ struct StagedNode {
     child: DirectoryChild,
 }
 
+fn balanced_directory_chunks<T>(values: &[T]) -> Vec<&[T]> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let group_count = values.len().div_ceil(DIRECTORY_FANOUT);
+    let base = values.len() / group_count;
+    let remainder = values.len() % group_count;
+    let mut chunks = Vec::with_capacity(group_count);
+    let mut start = 0usize;
+    for group_index in 0..group_count {
+        let length = base + usize::from(group_index < remainder);
+        chunks.push(&values[start..start + length]);
+        start += length;
+    }
+    chunks
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CurrentStateDirectorySplicePlan {
+    write_set_id: u64,
+    root: CurrentStatePartDirectoryRoot,
+    leaves: Vec<DirectorySpliceLeaf>,
+    internal_by_depth: Vec<std::collections::BTreeMap<[u8; 32], DirectoryNode>>,
+}
+
+#[derive(Debug, Clone)]
+struct DirectorySpliceLeaf {
+    node_id: [u8; 32],
+    parts: Vec<CurrentStatePartDescriptor>,
+    key_indices: Vec<usize>,
+}
+
+impl CurrentStateDirectorySplicePlan {
+    pub(crate) fn leaf_count(&self) -> usize {
+        self.leaves.len()
+    }
+
+    pub(crate) fn leaf_parts(&self, index: usize) -> &[CurrentStatePartDescriptor] {
+        &self.leaves[index].parts
+    }
+
+    pub(crate) fn leaf_key_indices(&self, index: usize) -> &[usize] {
+        &self.leaves[index].key_indices
+    }
+}
+
 /// Stages one complete ordered post-image part set as a bounded persistent
 /// range directory. Equal nodes naturally share storage across generations.
 pub(crate) fn stage_current_state_part_directory(
     writes: &mut StorageWriteSet,
     descriptors: &[CurrentStatePartDescriptor],
 ) -> Result<CurrentStatePartDirectoryRoot, LixError> {
-    stage_current_state_part_directory_reusing(
-        writes,
-        descriptors,
-        &std::collections::BTreeSet::new(),
-    )
-}
-
-/// Rebuilds the logical directory while retaining all content-identical nodes
-/// already reachable from the parent root. When descriptor cardinality stays
-/// stable, leaf chunking stages only changed leaves and their ancestors. A
-/// fully key-addressed range splice is deliberately left to the next cut.
-pub(crate) fn stage_current_state_part_directory_reusing(
-    writes: &mut StorageWriteSet,
-    descriptors: &[CurrentStatePartDescriptor],
-    reusable_node_ids: &std::collections::BTreeSet<[u8; 32]>,
-) -> Result<CurrentStatePartDirectoryRoot, LixError> {
     if descriptors.is_empty() {
         return Ok(CurrentStatePartDirectoryRoot {
             root_id: [0; 32],
-            descriptor_digest: current_state_descriptor_digest(descriptors)?,
+            directory_digest: empty_current_state_directory_digest(),
             row_count: 0,
             part_count: 0,
             tree_height: 0,
         });
     }
     validate_descriptors(descriptors)?;
-    let descriptor_digest = current_state_descriptor_digest(descriptors)?;
-    let mut level = descriptors
-        .chunks(DIRECTORY_FANOUT)
-        .map(|chunk| {
-            stage_node_reusing(
-                writes,
-                DirectoryNode::leaf(chunk.to_vec()),
-                reusable_node_ids,
-            )
-        })
+    let mut level = balanced_directory_chunks(descriptors)
+        .into_iter()
+        .map(|chunk| stage_node(writes, DirectoryNode::leaf(chunk.to_vec())))
         .collect::<Result<Vec<_>, _>>()?;
     let mut tree_height = 1u16;
     while level.len() > 1 {
-        level = level
-            .chunks(DIRECTORY_FANOUT)
+        level = balanced_directory_chunks(&level)
+            .into_iter()
             .map(|chunk| {
-                stage_node_reusing(
+                stage_node(
                     writes,
                     DirectoryNode::internal(chunk.iter().map(|node| node.child.clone()).collect()),
-                    reusable_node_ids,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1839,7 +1802,237 @@ pub(crate) fn stage_current_state_part_directory_reusing(
         .ok_or_else(|| directory_error("cannot stage an empty part set"))?;
     Ok(CurrentStatePartDirectoryRoot {
         root_id: root.child.node_id,
-        descriptor_digest,
+        directory_digest: current_state_directory_digest(
+            root.child.node_id,
+            root.child.row_count,
+            root.child.part_count,
+            tree_height,
+        ),
+        row_count: root.child.row_count,
+        part_count: root.child.part_count,
+        tree_height,
+    })
+}
+
+/// Loads only the immutable search paths and boundary leaves needed to apply
+/// an ordered key batch. Keys in gaps are assigned to the preceding leaf (or
+/// the first leaf before the directory's minimum), so inserts and exact
+/// misses never require flattening the complete descriptor set.
+pub(crate) async fn plan_current_state_part_directory_splice(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    root: &CurrentStatePartDirectoryRoot,
+    encoded_keys: &[Bytes],
+) -> Result<CurrentStateDirectorySplicePlan, LixError> {
+    if root.part_count == 0 {
+        validate_empty_root(root)?;
+        return Ok(CurrentStateDirectorySplicePlan {
+            write_set_id: writes.identity(),
+            root: root.clone(),
+            leaves: Vec::new(),
+            internal_by_depth: Vec::new(),
+        });
+    }
+    if encoded_keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(directory_error(
+            "splice keys are empty, duplicate, or unordered",
+        ));
+    }
+    if encoded_keys.is_empty() {
+        return Err(directory_error("splice key batch is empty"));
+    }
+    let mut cache = std::collections::BTreeMap::<[u8; 32], DirectoryNode>::new();
+    let mut internal_by_depth = (0..root.tree_height.saturating_sub(1))
+        .map(|_| std::collections::BTreeMap::new())
+        .collect::<Vec<_>>();
+    let mut leaves = std::collections::BTreeMap::<[u8; 32], DirectorySpliceLeaf>::new();
+    for (key_index, encoded_key) in encoded_keys.iter().enumerate() {
+        let mut node_id = root.root_id;
+        let mut expected_child = None;
+        let mut depth = 0usize;
+        loop {
+            let node = if let Some(node) = cache.get(&node_id) {
+                node.clone()
+            } else {
+                let node = load_node_for_write(store, writes, node_id).await?;
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_crud_current_state_directory_node_loaded();
+                cache.insert(node_id, node.clone());
+                node
+            };
+            if depth == 0 {
+                validate_root_summary(root, &node)?;
+            }
+            if let Some(expected) = expected_child.as_ref() {
+                validate_child_summary(expected, &node)?;
+            }
+            match node.kind {
+                0 => {
+                    #[cfg(feature = "storage-benches")]
+                    if !leaves.contains_key(&node_id) {
+                        crate::storage_bench::record_crud_current_state_directory_descriptors_visited(
+                            node.parts.len(),
+                        );
+                    }
+                    leaves
+                        .entry(node_id)
+                        .or_insert_with(|| DirectorySpliceLeaf {
+                            node_id,
+                            parts: node.parts,
+                            key_indices: Vec::new(),
+                        })
+                        .key_indices
+                        .push(key_index);
+                    break;
+                }
+                1 => {
+                    let upper = node.children.partition_point(|child| {
+                        child.first_key.as_slice() <= encoded_key.as_ref()
+                    });
+                    let child_index = upper.saturating_sub(1);
+                    let child = node.children.get(child_index).cloned().ok_or_else(|| {
+                        directory_error("splice path reached an empty internal node")
+                    })?;
+                    internal_by_depth
+                        .get_mut(depth)
+                        .ok_or_else(|| directory_error("splice path exceeds root height"))?
+                        .insert(node_id, node);
+                    node_id = child.node_id;
+                    expected_child = Some(child);
+                    depth += 1;
+                }
+                _ => unreachable!("validated directory node kind"),
+            }
+        }
+    }
+    let leaves = leaves.into_values().collect::<Vec<_>>();
+    Ok(CurrentStateDirectorySplicePlan {
+        write_set_id: writes.identity(),
+        root: root.clone(),
+        leaves,
+        internal_by_depth,
+    })
+}
+
+/// Applies leaf replacements to a previously planned immutable search-path
+/// frontier. Only changed leaves and their ancestor closure are staged.
+pub(crate) async fn stage_current_state_part_directory_splice(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    plan: CurrentStateDirectorySplicePlan,
+    replacements: Vec<Vec<CurrentStatePartDescriptor>>,
+) -> Result<CurrentStatePartDirectoryRoot, LixError> {
+    if plan.write_set_id != writes.identity() {
+        return Err(directory_error(
+            "splice plan belongs to a different storage write set",
+        ));
+    }
+    if replacements.len() != plan.leaves.len() {
+        return Err(directory_error("splice replacement cardinality mismatch"));
+    }
+    if plan.root.part_count == 0 {
+        if replacements.is_empty() {
+            return Ok(plan.root);
+        }
+        return Err(directory_error("empty directory splice cannot name leaves"));
+    }
+    let mut changes = std::collections::BTreeMap::<[u8; 32], Vec<StagedNode>>::new();
+    for (leaf, parts) in plan.leaves.into_iter().zip(replacements) {
+        if !parts.is_empty() {
+            validate_descriptor_slice(&parts)?;
+        }
+        let chunks = balanced_directory_chunks(&parts);
+        let reuse = (chunks.len() == 1).then_some(leaf.node_id);
+        let staged = chunks
+            .into_iter()
+            .map(|chunk| stage_node_reusing(writes, DirectoryNode::leaf(chunk.to_vec()), reuse))
+            .collect::<Result<Vec<_>, _>>()?;
+        changes.insert(leaf.node_id, staged);
+    }
+    for level in plan.internal_by_depth.into_iter().rev() {
+        for (node_id, node) in level {
+            let mut children = Vec::with_capacity(node.children.len() + DIRECTORY_FANOUT);
+            for child in node.children {
+                if let Some(replacement) = changes.remove(&child.node_id) {
+                    children.extend(replacement.into_iter().map(|node| node.child));
+                } else {
+                    children.push(child);
+                }
+            }
+            if node_id == plan.root.root_id && children.len() == 1 {
+                changes.insert(
+                    node_id,
+                    vec![StagedNode {
+                        child: children.pop().expect("one-child root has one child"),
+                    }],
+                );
+                continue;
+            }
+            let chunks = balanced_directory_chunks(&children);
+            let reuse = (chunks.len() == 1).then_some(node_id);
+            let staged = chunks
+                .into_iter()
+                .map(|chunk| {
+                    stage_node_reusing(writes, DirectoryNode::internal(chunk.to_vec()), reuse)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            changes.insert(node_id, staged);
+        }
+    }
+    let mut roots = changes.remove(&plan.root.root_id).ok_or_else(|| {
+        directory_error("splice plan did not rewrite the root search-path closure")
+    })?;
+    if !changes.is_empty() {
+        return Err(directory_error(
+            "splice plan retained disconnected node changes",
+        ));
+    }
+    if roots.is_empty() {
+        return Ok(CurrentStatePartDirectoryRoot {
+            root_id: [0; 32],
+            directory_digest: empty_current_state_directory_digest(),
+            row_count: 0,
+            part_count: 0,
+            tree_height: 0,
+        });
+    }
+    while roots.len() > 1 {
+        roots = balanced_directory_chunks(&roots)
+            .into_iter()
+            .map(|chunk| {
+                stage_node(
+                    writes,
+                    DirectoryNode::internal(chunk.iter().map(|node| node.child.clone()).collect()),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    let mut root = roots.pop().expect("non-empty roots have one final node");
+    while root.child.level > 0 {
+        let node = load_node_for_write(store, writes, root.child.node_id).await?;
+        validate_child_summary(&root.child, &node)?;
+        if node.children.len() != 1 {
+            break;
+        }
+        root.child = node
+            .children
+            .into_iter()
+            .next()
+            .expect("validated one-child internal node has one child");
+    }
+    let tree_height = root
+        .child
+        .level
+        .checked_add(1)
+        .ok_or_else(|| directory_error("tree height overflows"))?;
+    Ok(CurrentStatePartDirectoryRoot {
+        root_id: root.child.node_id,
+        directory_digest: current_state_directory_digest(
+            root.child.node_id,
+            root.child.row_count,
+            root.child.part_count,
+            tree_height,
+        ),
         row_count: root.child.row_count,
         part_count: root.child.part_count,
         tree_height,
@@ -2040,7 +2233,7 @@ pub(crate) async fn load_current_state_part_descriptors(
             .map(|part| u64::from(part.row_count))
             .sum::<u64>()
             != root.row_count
-        || !descriptor_digest_matches(root, &descriptors)?
+        || !directory_digest_matches(root)
     {
         return Err(directory_error(
             "root summary does not match its descriptor set",
@@ -2049,15 +2242,27 @@ pub(crate) async fn load_current_state_part_descriptors(
     Ok(descriptors)
 }
 
+fn stage_node(writes: &mut StorageWriteSet, node: DirectoryNode) -> Result<StagedNode, LixError> {
+    stage_node_reusing(writes, node, None)
+}
+
 fn stage_node_reusing(
     writes: &mut StorageWriteSet,
     node: DirectoryNode,
-    reusable_node_ids: &std::collections::BTreeSet<[u8; 32]>,
+    reusable_node_id: Option<[u8; 32]>,
 ) -> Result<StagedNode, LixError> {
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_crud_current_state_directory_node_encoded();
     let (first_key, last_key, row_count, part_count) = node_summary(&node)?;
     let bytes = encode_node(&node)?;
     let node_id = node_digest(&bytes);
-    if !reusable_node_ids.contains(&node_id) {
+    if let Some(staged) = writes.staged_value(CURRENT_STATE_PART_DIRECTORY_SPACE, &node_id) {
+        if staged != bytes {
+            return Err(directory_error(
+                "content-addressed node identity has conflicting staged bytes",
+            ));
+        }
+    } else if reusable_node_id != Some(node_id) {
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_crud_current_state_directory_bytes(bytes.len());
         writes.put(
@@ -2075,8 +2280,24 @@ fn stage_node_reusing(
             node_id,
             row_count,
             part_count,
+            level: node.level,
         },
     })
+}
+
+async fn load_node_for_write(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    node_id: [u8; 32],
+) -> Result<DirectoryNode, LixError> {
+    if let Some(bytes) = writes.staged_value(CURRENT_STATE_PART_DIRECTORY_SPACE, &node_id) {
+        if node_digest(&bytes) != node_id {
+            return Err(directory_error("node content digest mismatch"));
+        }
+        decode_node(&bytes)
+    } else {
+        load_node(store, node_id).await
+    }
 }
 
 async fn load_node(
@@ -2233,32 +2454,33 @@ fn replacement_directory_digest(
     .digest()
 }
 
-fn current_state_descriptor_digest(
-    descriptors: &[CurrentStatePartDescriptor],
-) -> Result<[u8; 32], LixError> {
-    let encoded = storage_codec::encode("current-state descriptor set", &descriptors)?;
-    Ok(
-        *blake3::Hasher::new_derive_key(CURRENT_STATE_DESCRIPTOR_DIGEST_CONTEXT)
-            .update(&encoded)
-            .finalize()
-            .as_bytes(),
-    )
+fn current_state_directory_digest(
+    root_id: [u8; 32],
+    row_count: u64,
+    part_count: u32,
+    tree_height: u16,
+) -> [u8; 32] {
+    *blake3::Hasher::new_derive_key("lix current-state merkle directory v2")
+        .update(&root_id)
+        .update(&row_count.to_be_bytes())
+        .update(&part_count.to_be_bytes())
+        .update(&tree_height.to_be_bytes())
+        .finalize()
+        .as_bytes()
 }
 
-fn descriptor_digest_matches(
-    root: &CurrentStatePartDirectoryRoot,
-    descriptors: &[CurrentStatePartDescriptor],
-) -> Result<bool, LixError> {
-    if current_state_descriptor_digest(descriptors)? == root.descriptor_digest {
-        return Ok(true);
-    }
-    if descriptors
-        .iter()
-        .all(|part| part.source_kind == 0 && part.source_row_offset == 0)
-    {
-        return Ok(replacement_directory_digest(descriptors)? == root.descriptor_digest);
-    }
-    Ok(false)
+fn empty_current_state_directory_digest() -> [u8; 32] {
+    current_state_directory_digest([0; 32], 0, 0, 0)
+}
+
+fn directory_digest_matches(root: &CurrentStatePartDirectoryRoot) -> bool {
+    root.directory_digest
+        == current_state_directory_digest(
+            root.root_id,
+            root.row_count,
+            root.part_count,
+            root.tree_height,
+        )
 }
 
 fn validate_root_summary(
@@ -2266,7 +2488,17 @@ fn validate_root_summary(
     node: &DirectoryNode,
 ) -> Result<(), LixError> {
     let (_, _, row_count, part_count) = node_summary(node)?;
-    if row_count != root.row_count || part_count != root.part_count {
+    if row_count != root.row_count
+        || part_count != root.part_count
+        || node.level.checked_add(1) != Some(root.tree_height)
+        || root.directory_digest
+            != current_state_directory_digest(
+                root.root_id,
+                root.row_count,
+                root.part_count,
+                root.tree_height,
+            )
+    {
         return Err(directory_error("root summary disagrees with its node"));
     }
     Ok(())
@@ -2274,7 +2506,7 @@ fn validate_root_summary(
 
 fn validate_empty_root(root: &CurrentStatePartDirectoryRoot) -> Result<(), LixError> {
     if root.root_id != [0; 32]
-        || root.descriptor_digest != current_state_descriptor_digest(&[])?
+        || root.directory_digest != empty_current_state_directory_digest()
         || root.row_count != 0
         || root.part_count != 0
         || root.tree_height != 0
@@ -2290,6 +2522,7 @@ fn validate_child_summary(expected: &DirectoryChild, node: &DirectoryNode) -> Re
         || last_key != expected.last_key
         || row_count != expected.row_count
         || part_count != expected.part_count
+        || node.level != expected.level
     {
         return Err(directory_error("child summary disagrees with its node"));
     }
@@ -2312,16 +2545,26 @@ fn node_summary(node: &DirectoryNode) -> Result<(Vec<u8>, Vec<u8>, u64, u32), Li
                 .sum(),
             u32::try_from(node.parts.len()).map_err(|_| directory_error("part count overflows"))?,
         )),
-        1 => Ok((
-            node.children[0].first_key.clone(),
-            node.children
-                .last()
-                .expect("validated internal node is non-empty")
-                .last_key
-                .clone(),
-            node.children.iter().map(|child| child.row_count).sum(),
-            node.children.iter().map(|child| child.part_count).sum(),
-        )),
+        1 => {
+            let row_count = node.children.iter().try_fold(0u64, |sum, child| {
+                sum.checked_add(child.row_count)
+                    .ok_or_else(|| directory_error("directory row count overflows"))
+            })?;
+            let part_count = node.children.iter().try_fold(0u32, |sum, child| {
+                sum.checked_add(child.part_count)
+                    .ok_or_else(|| directory_error("directory part count overflows"))
+            })?;
+            Ok((
+                node.children[0].first_key.clone(),
+                node.children
+                    .last()
+                    .expect("validated internal node is non-empty")
+                    .last_key
+                    .clone(),
+                row_count,
+                part_count,
+            ))
+        }
         _ => unreachable!("validated directory node kind"),
     }
 }
@@ -2329,7 +2572,7 @@ fn node_summary(node: &DirectoryNode) -> Result<(Vec<u8>, Vec<u8>, u64, u32), Li
 fn validate_node(node: &DirectoryNode) -> Result<(), LixError> {
     match node.kind {
         0 => {
-            if !node.children.is_empty() || node.parts.len() > DIRECTORY_FANOUT {
+            if node.level != 0 || !node.children.is_empty() || node.parts.len() > DIRECTORY_FANOUT {
                 return Err(directory_error("leaf exceeds bounded fanout"));
             }
             validate_descriptor_slice(&node.parts)
@@ -2344,6 +2587,7 @@ fn validate_node(node: &DirectoryNode) -> Result<(), LixError> {
                         || child.first_key > child.last_key
                         || child.row_count == 0
                         || child.part_count == 0
+                        || child.level.checked_add(1) != Some(node.level)
                 })
                 || node
                     .children
@@ -2492,7 +2736,7 @@ mod tests {
             state_lineage_digest: [3; 32],
             directory: CurrentStatePartDirectoryRoot {
                 root_id: *blake3::hash(format!("root-{index}").as_bytes()).as_bytes(),
-                descriptor_digest: *blake3::hash(format!("descriptors-{index}").as_bytes())
+                directory_digest: *blake3::hash(format!("descriptors-{index}").as_bytes())
                     .as_bytes(),
                 row_count: 1,
                 part_count: 1,
@@ -2869,11 +3113,494 @@ mod tests {
             root_id: foreign_root.root_id,
             ..root.clone()
         };
-        let routed = route_current_state_part(&read, &forged_root, b"key-000000-m")
+        assert!(
+            route_current_state_part(&read, &forged_root, b"key-000000-m")
+                .await
+                .is_err(),
+            "the Merkle directory digest must reject a cross-wired foreign root"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_splice_reads_and_rewrites_only_one_search_path() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT * 2 + 7);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("directory should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("content-addressed foreign root remains structurally readable")
-            .expect("foreign range should route");
-        assert_ne!(routed.content_digest, descriptors[0].content_digest);
+            .expect("directory should commit");
+
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let read = CountingDirectoryRead {
+            inner: adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("splice read should open"),
+            directory_batch_sizes: Arc::clone(&batch_sizes),
+            catalog_batch_sizes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let key = Bytes::from_static(b"key-000001-m");
+        let mut splice_writes = adapter.new_write_set();
+        let plan = plan_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            &root,
+            std::slice::from_ref(&key),
+        )
+        .await
+        .expect("one-key splice should plan");
+        assert_eq!(plan.leaf_count(), 1);
+        let first_leaf_len = descriptors.len().div_ceil(3);
+        assert_eq!(plan.leaf_parts(0), &descriptors[..first_leaf_len]);
+        let mut replacement = plan.leaf_parts(0).to_vec();
+        replacement[1].content_digest = [7; 32];
+        let mut foreign_writes = adapter.new_write_set();
+        assert!(
+            stage_current_state_part_directory_splice(
+                &read,
+                &mut foreign_writes,
+                plan.clone(),
+                vec![replacement.clone()],
+            )
+            .await
+            .is_err(),
+            "a splice plan cannot move staged-only authority into another write set"
+        );
+        let rewritten = stage_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            plan,
+            vec![replacement],
+        )
+        .await
+        .expect("one-leaf splice should stage");
+        assert_eq!(
+            batch_sizes
+                .lock()
+                .expect("directory batch counts lock")
+                .as_slice(),
+            &[1, 1],
+            "a two-level directory splice must read only root and one leaf"
+        );
+        assert_eq!(
+            splice_writes.stats().staged_puts,
+            2,
+            "one update must stage one leaf and its root"
+        );
+        adapter
+            .commit_write_set(splice_writes, StorageWriteOptions::default())
+            .await
+            .expect("splice should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rewritten read should open");
+        let mut expected = descriptors;
+        expected[1].content_digest = [7; 32];
+        assert_eq!(
+            load_current_state_part_descriptors(&read, &rewritten)
+                .await
+                .expect("rewritten directory should flatten"),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_splice_splits_boundary_leaf_and_preserves_distant_subtrees() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT * 2);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("directory should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("directory should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("splice read should open");
+        let original_root = load_node(&read, root.root_id)
+            .await
+            .expect("root should load");
+        let untouched_middle = original_root.children[1].clone();
+
+        let key = Bytes::from_static(b"key-000000-0");
+        let mut splice_writes = adapter.new_write_set();
+        let plan = plan_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            &root,
+            std::slice::from_ref(&key),
+        )
+        .await
+        .expect("boundary insertion should plan");
+        let mut inserted = descriptors[0].clone();
+        inserted.first_key = b"key-000000-0a".to_vec();
+        inserted.last_key = b"key-000000-0z".to_vec();
+        inserted.content_digest = [8; 32];
+        let mut replacement = Vec::with_capacity(DIRECTORY_FANOUT + 1);
+        replacement.push(inserted.clone());
+        replacement.extend_from_slice(plan.leaf_parts(0));
+        let rewritten = stage_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            plan,
+            vec![replacement],
+        )
+        .await
+        .expect("overflowing leaf should split");
+        assert_eq!(
+            splice_writes.stats().staged_puts,
+            3,
+            "one overflowing leaf stages two leaves and one root"
+        );
+        adapter
+            .commit_write_set(splice_writes, StorageWriteOptions::default())
+            .await
+            .expect("boundary insertion should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rewritten read should open");
+        let rewritten_root = load_node(&read, rewritten.root_id)
+            .await
+            .expect("rewritten root should load");
+        assert_eq!(rewritten_root.children[0].part_count, 65);
+        assert_eq!(rewritten_root.children[1].part_count, 64);
+        assert!(
+            rewritten_root
+                .children
+                .iter()
+                .any(|child| child == &untouched_middle),
+            "the distant middle subtree must remain byte-identical"
+        );
+        let mut expected = Vec::with_capacity(descriptors.len() + 1);
+        expected.push(inserted);
+        expected.extend(descriptors);
+        assert_eq!(
+            load_current_state_part_descriptors(&read, &rewritten)
+                .await
+                .expect("split directory should flatten"),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_splice_removes_empty_leaf_without_rewriting_siblings() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT * 2);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("directory should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("directory should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("splice read should open");
+        let original_root = load_node(&read, root.root_id)
+            .await
+            .expect("root should load");
+        let removed_count = usize::try_from(original_root.children[0].part_count).unwrap();
+        let surviving_child = original_root.children[1].clone();
+        let key = Bytes::from_static(b"key-000001-m");
+        let mut splice_writes = adapter.new_write_set();
+        let plan = plan_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            &root,
+            std::slice::from_ref(&key),
+        )
+        .await
+        .expect("leaf removal should plan");
+        let rewritten = stage_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            plan,
+            vec![Vec::new()],
+        )
+        .await
+        .expect("empty leaf should be removed");
+        assert_eq!(
+            splice_writes.stats().staged_puts,
+            0,
+            "contracting to an immutable sibling stages no directory node"
+        );
+        assert_eq!(rewritten.root_id, surviving_child.node_id);
+        assert_eq!(rewritten.tree_height, 1);
+        adapter
+            .commit_write_set(splice_writes, StorageWriteOptions::default())
+            .await
+            .expect("leaf removal should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rewritten read should open");
+        assert_eq!(
+            load_current_state_part_descriptors(&read, &rewritten)
+                .await
+                .expect("rewritten directory should flatten"),
+            descriptors[removed_count..]
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_splice_recursively_contracts_a_height_three_root() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT * DIRECTORY_FANOUT + 1);
+        let survivor = descriptors
+            .last()
+            .expect("descriptors are non-empty")
+            .clone();
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("height-three directory should stage");
+        assert_eq!(root.tree_height, 3);
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("height-three directory should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("splice read should open");
+        let deleted_keys = descriptors[..descriptors.len() - 1]
+            .iter()
+            .map(|descriptor| Bytes::copy_from_slice(&descriptor.first_key))
+            .collect::<Vec<_>>();
+        let mut splice_writes = adapter.new_write_set();
+        let plan = plan_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            &root,
+            &deleted_keys,
+        )
+        .await
+        .expect("mass-delete splice should plan");
+        let replacements = (0..plan.leaf_count())
+            .map(|leaf_index| {
+                plan.leaf_parts(leaf_index)
+                    .iter()
+                    .filter(|part| part.first_key == survivor.first_key)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let rewritten = stage_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            plan,
+            replacements,
+        )
+        .await
+        .expect("mass delete should recursively contract");
+        assert_eq!(rewritten.tree_height, 1);
+        assert_eq!(rewritten.part_count, 1);
+        adapter
+            .commit_write_set(splice_writes, StorageWriteOptions::default())
+            .await
+            .expect("contracted directory should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("contracted read should open");
+        assert_eq!(
+            load_current_state_part_descriptors(&read, &rewritten)
+                .await
+                .expect("contracted directory should flatten"),
+            vec![survivor]
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_splice_coalesces_staged_parent_noop() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT + 1);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("staged parent should build");
+        let puts_before = writes.stats().staged_puts;
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("empty backing read should open");
+        let key = Bytes::from_static(b"key-000001-m");
+        let plan = plan_current_state_part_directory_splice(
+            &read,
+            &mut writes,
+            &root,
+            std::slice::from_ref(&key),
+        )
+        .await
+        .expect("staged parent should be readable");
+        let unchanged = plan.leaf_parts(0).to_vec();
+        let rewritten =
+            stage_current_state_part_directory_splice(&read, &mut writes, plan, vec![unchanged])
+                .await
+                .expect("identical staged nodes should coalesce");
+        assert_eq!(rewritten, root);
+        assert_eq!(
+            writes.stats().staged_puts,
+            puts_before,
+            "no-op path copying must not stage duplicate immutable puts"
+        );
+        writes
+            .validate()
+            .expect("coalesced staged-parent write set must validate");
+    }
+
+    #[tokio::test]
+    async fn directory_splice_coalesces_two_distant_multilevel_paths() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT * DIRECTORY_FANOUT + 1);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("multilevel directory should stage");
+        assert_eq!(root.tree_height, 3);
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("multilevel directory should commit");
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let read = CountingDirectoryRead {
+            inner: adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("splice read should open"),
+            directory_batch_sizes: Arc::clone(&batch_sizes),
+            catalog_batch_sizes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let keys = [
+            Bytes::from_static(b"key-000001-m"),
+            Bytes::from(format!("key-{:06}-m", descriptors.len() - 1)),
+        ];
+        let mut splice_writes = adapter.new_write_set();
+        let plan =
+            plan_current_state_part_directory_splice(&read, &mut splice_writes, &root, &keys)
+                .await
+                .expect("distant splice should plan");
+        assert_eq!(plan.leaf_count(), 2);
+        let mut changed_keys = Vec::new();
+        let replacements = (0..plan.leaf_count())
+            .map(|leaf_index| {
+                let mut parts = plan.leaf_parts(leaf_index).to_vec();
+                changed_keys.push(parts[0].first_key.clone());
+                parts[0].content_digest = [u8::try_from(10 + leaf_index).unwrap(); 32];
+                parts
+            })
+            .collect::<Vec<_>>();
+        let rewritten = stage_current_state_part_directory_splice(
+            &read,
+            &mut splice_writes,
+            plan,
+            replacements,
+        )
+        .await
+        .expect("distant paths should splice");
+        assert_eq!(
+            batch_sizes
+                .lock()
+                .expect("directory batch counts lock")
+                .len(),
+            5,
+            "two height-three paths share the root and read five nodes"
+        );
+        assert_eq!(
+            splice_writes.stats().staged_puts,
+            5,
+            "two distant leaves stage their two parents and shared root"
+        );
+        adapter
+            .commit_write_set(splice_writes, StorageWriteOptions::default())
+            .await
+            .expect("distant splice should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rewritten read should open");
+        let loaded = load_current_state_part_descriptors(&read, &rewritten)
+            .await
+            .expect("rewritten directory should flatten");
+        for key in changed_keys {
+            assert_ne!(
+                loaded
+                    .iter()
+                    .find(|part| part.first_key == key)
+                    .expect("changed descriptor remains present")
+                    .content_digest,
+                descriptors
+                    .iter()
+                    .find(|part| part.first_key == key)
+                    .expect("original descriptor exists")
+                    .content_digest
+            );
+        }
+    }
+
+    #[test]
+    fn directory_nodes_reject_mixed_or_forged_levels() {
+        let leaf = DirectoryNode::leaf(descriptors(1));
+        let child = StagedNode {
+            child: DirectoryChild {
+                first_key: b"a".to_vec(),
+                last_key: b"z".to_vec(),
+                node_id: [1; 32],
+                row_count: 1,
+                part_count: 1,
+                level: 0,
+            },
+        };
+        let mut internal = DirectoryNode::internal(vec![child.child]);
+        assert!(validate_node(&leaf).is_ok());
+        assert!(validate_node(&internal).is_ok());
+        internal.level = 2;
+        assert!(validate_node(&internal).is_err());
+
+        let overflowing_rows = DirectoryNode::internal(vec![
+            DirectoryChild {
+                first_key: b"a".to_vec(),
+                last_key: b"b".to_vec(),
+                node_id: [2; 32],
+                row_count: u64::MAX,
+                part_count: 1,
+                level: 0,
+            },
+            DirectoryChild {
+                first_key: b"c".to_vec(),
+                last_key: b"d".to_vec(),
+                node_id: [3; 32],
+                row_count: 1,
+                part_count: 1,
+                level: 0,
+            },
+        ]);
+        assert!(node_summary(&overflowing_rows).is_err());
+
+        let overflowing_parts = DirectoryNode::internal(vec![
+            DirectoryChild {
+                first_key: b"a".to_vec(),
+                last_key: b"b".to_vec(),
+                node_id: [4; 32],
+                row_count: 1,
+                part_count: u32::MAX,
+                level: 0,
+            },
+            DirectoryChild {
+                first_key: b"c".to_vec(),
+                last_key: b"d".to_vec(),
+                node_id: [5; 32],
+                row_count: 1,
+                part_count: 1,
+                level: 0,
+            },
+        ]);
+        assert!(node_summary(&overflowing_parts).is_err());
     }
 
     #[tokio::test]

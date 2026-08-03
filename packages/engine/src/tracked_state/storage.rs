@@ -736,7 +736,7 @@ async fn expanded_commit_delta_manifest_from_commit_state(
 fn fresh_replacement_current_state_part_set(
     manifest: &CommitStateManifest,
 ) -> Result<Option<crate::tracked_state::types::CurrentStatePartSet>, LixError> {
-    let (Some(_root), Some(generation), Some(authority), Some(anchor)) = (
+    let (Some(_root), Some(generation), Some(_authority), Some(anchor)) = (
         manifest.current_state_catalog.as_ref(),
         manifest.mutations.replacement_generation.as_ref(),
         manifest.mutations.replacement_parts.as_ref(),
@@ -757,7 +757,6 @@ fn fresh_replacement_current_state_part_set(
         || set.generation_integrity_digest != anchor.generation_integrity_digest
         || set.state_lineage_digest != anchor.state_lineage_digest
         || set.directory != anchor.directory
-        || set.directory.descriptor_digest != authority.directory_digest
         || set.directory.row_count != u64::from(manifest.mutations.member_count)
         || set.directory.part_count as usize != manifest.mutations.part_count()
         || set.directory.root_id == [0; 32]
@@ -2179,83 +2178,127 @@ pub(crate) async fn stage_sparse_current_state_part_set(
         return Ok(Some(parent.clone()));
     }
 
-    let (reusable_directory_nodes, parent_descriptors) =
-        super::current_state_part::load_current_state_part_directory_reachability_for_write(
+    let mut mutation_rows = mutations.into_iter().map(Some).collect::<Vec<_>>();
+    let directory = if parent.directory.part_count == 0 {
+        let rows = mutation_rows
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, row)| row)
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+        stage_native_current_state_rows(writes, &rows, &mut output)?;
+        super::current_state_part::stage_current_state_part_directory(writes, &output)?
+    } else {
+        let encoded_keys = mutation_rows
+            .iter()
+            .map(|entry| {
+                Bytes::copy_from_slice(
+                    &entry
+                        .as_ref()
+                        .expect("sparse mutation has not been assigned")
+                        .0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let splice = super::current_state_part::plan_current_state_part_directory_splice(
             store,
             writes,
             &parent.directory,
+            &encoded_keys,
         )
         .await?;
-    let mut output = Vec::with_capacity(parent_descriptors.len() + mutations.len());
-    let mut pending = mutations.into_iter().peekable();
-    for descriptor in parent_descriptors {
-        let mut gap = Vec::new();
-        while pending
-            .peek()
-            .is_some_and(|(key, _)| key.as_slice() < descriptor.first_key.as_slice())
-        {
-            let (_, row) = pending.next().expect("peeked sparse mutation");
-            if let Some(row) = row {
-                gap.push(row);
-            }
-        }
-        stage_native_current_state_rows(writes, &gap, &mut output)?;
-
-        let touches_descriptor = pending
-            .peek()
-            .is_some_and(|(key, _)| key.as_slice() <= descriptor.last_key.as_slice());
-        if !touches_descriptor {
-            output.push(descriptor);
-            continue;
-        }
-        let mut rows = load_current_state_descriptor_rows(store, writes, &descriptor)
-            .await?
-            .into_iter()
-            .map(|row| (row.encoded_key.clone(), row))
-            .collect::<BTreeMap<_, _>>();
-        while pending
-            .peek()
-            .is_some_and(|(key, _)| key.as_slice() <= descriptor.last_key.as_slice())
-        {
-            let (key, row) = pending.next().expect("peeked sparse mutation");
-            match row {
-                Some(mut row) => {
-                    if let Some(previous) = rows.get(&key) {
-                        row.value.created_at = previous.value.created_at;
+        let mut replacements = Vec::with_capacity(splice.leaf_count());
+        for leaf_index in 0..splice.leaf_count() {
+            let leaf_key_indices = splice.leaf_key_indices(leaf_index).to_vec();
+            let leaf_parts = splice.leaf_parts(leaf_index).to_vec();
+            let mut pending = leaf_key_indices
+                .iter()
+                .map(|&key_index| {
+                    mutation_rows[key_index]
+                        .take()
+                        .expect("each sparse mutation is assigned to one leaf")
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .peekable();
+            let mut output = Vec::with_capacity(leaf_parts.len() + leaf_key_indices.len());
+            for descriptor in &leaf_parts {
+                let mut gap = Vec::new();
+                while pending
+                    .peek()
+                    .is_some_and(|(key, _)| key.as_slice() < descriptor.first_key.as_slice())
+                {
+                    let (_, row) = pending.next().expect("peeked sparse mutation");
+                    if let Some(row) = row {
+                        gap.push(row);
                     }
-                    rows.insert(key, row);
                 }
-                None => {
-                    rows.remove(&key);
-                }
-            }
-        }
-        stage_native_current_state_rows(
-            writes,
-            &rows.into_values().collect::<Vec<_>>(),
-            &mut output,
-        )?;
-    }
-    let tail = pending
-        .filter_map(|(_, row)| row)
-        .collect::<Vec<CurrentStateDataRow>>();
-    stage_native_current_state_rows(writes, &tail, &mut output)?;
+                stage_native_current_state_rows(writes, &gap, &mut output)?;
 
-    let directory = super::current_state_part::stage_current_state_part_directory_reusing(
-        writes,
-        &output,
-        &reusable_directory_nodes,
-    )?;
+                let touches_descriptor = pending
+                    .peek()
+                    .is_some_and(|(key, _)| key.as_slice() <= descriptor.last_key.as_slice());
+                if !touches_descriptor {
+                    output.push(descriptor.clone());
+                    continue;
+                }
+                let mut rows = load_current_state_descriptor_rows(store, writes, descriptor)
+                    .await?
+                    .into_iter()
+                    .map(|row| (row.encoded_key.clone(), row))
+                    .collect::<BTreeMap<_, _>>();
+                while pending
+                    .peek()
+                    .is_some_and(|(key, _)| key.as_slice() <= descriptor.last_key.as_slice())
+                {
+                    let (key, row) = pending.next().expect("peeked sparse mutation");
+                    match row {
+                        Some(mut row) => {
+                            if let Some(previous) = rows.get(&key) {
+                                row.value.created_at = previous.value.created_at;
+                            }
+                            rows.insert(key, row);
+                        }
+                        None => {
+                            rows.remove(&key);
+                        }
+                    }
+                }
+                stage_native_current_state_rows(
+                    writes,
+                    &rows.into_values().collect::<Vec<_>>(),
+                    &mut output,
+                )?;
+            }
+            let tail = pending
+                .filter_map(|(_, row)| row)
+                .collect::<Vec<CurrentStateDataRow>>();
+            stage_native_current_state_rows(writes, &tail, &mut output)?;
+            replacements.push(output);
+        }
+        if mutation_rows.iter().any(Option::is_some) {
+            return Err(replacement_payload_error(
+                "sparse current-state splice did not assign every mutation",
+            ));
+        }
+        super::current_state_part::stage_current_state_part_directory_splice(
+            store,
+            writes,
+            splice,
+            replacements,
+        )
+        .await?
+    };
     let inventory_bytes =
         storage_codec::encode("sparse current-state lineage inventory", inventory)?;
     let state_lineage_digest =
-        *blake3::Hasher::new_derive_key("lix sparse current-state lineage v1")
+        *blake3::Hasher::new_derive_key("lix sparse current-state lineage v2")
             .update(&parent.state_lineage_digest)
             .update(commit_id.as_uuid().as_bytes())
             .update(&(inventory_bytes.len() as u64).to_be_bytes())
             .update(&inventory_bytes)
             .update(&directory.root_id)
-            .update(&directory.descriptor_digest)
+            .update(&directory.directory_digest)
             .finalize()
             .as_bytes();
     let rewritten = crate::tracked_state::types::CurrentStatePartSet {
@@ -2276,16 +2319,18 @@ pub(crate) async fn stage_sparse_current_state_part_set(
         }
         let timestamp = crate::common::LixTimestamp::from_unix_millis_utc_lossy(0);
         for part in encode_bounded_current_state_data_parts(rows)? {
-            writes.put(
+            stage_content_addressed_current_state_bytes(
+                writes,
                 CURRENT_STATE_DATA_PART_SPACE,
-                key(part.digest.to_vec()),
-                value(part.bytes.to_vec()),
-            );
-            writes.put(
+                part.digest,
+                &part.bytes,
+            )?;
+            stage_content_addressed_current_state_bytes(
+                writes,
                 CURRENT_STATE_DATA_PART_REFS_SPACE,
-                key(part.digest.to_vec()),
-                value(part.refs_bytes.to_vec()),
-            );
+                part.digest,
+                &part.refs_bytes,
+            )?;
             output.push(CurrentStatePartDescriptor {
                 first_key: part.first_key,
                 last_key: part.last_key,
@@ -2300,6 +2345,24 @@ pub(crate) async fn stage_sparse_current_state_part_set(
                 uniform_updated_at: timestamp,
             });
         }
+        Ok(())
+    }
+
+    fn stage_content_addressed_current_state_bytes(
+        writes: &mut StorageWriteSet,
+        space: StorageSpace,
+        digest: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<(), LixError> {
+        if let Some(staged) = writes.staged_value(space, &digest) {
+            if staged.as_ref() != bytes {
+                return Err(replacement_payload_error(
+                    "current-state content digest has conflicting staged bytes",
+                ));
+            }
+            return Ok(());
+        }
+        writes.put(space, key(digest.to_vec()), value(bytes.to_vec()));
         Ok(())
     }
 
@@ -8709,7 +8772,7 @@ fn validate_current_state_catalog(
         ));
     }
     if let Some(anchor) = manifest.current_state_coverage_anchor.as_ref() {
-        let (Some(generation), Some(authority)) = (
+        let (Some(generation), Some(_authority)) = (
             manifest.mutations.replacement_generation.as_ref(),
             manifest.mutations.replacement_parts.as_ref(),
         ) else {
@@ -8720,7 +8783,6 @@ fn validate_current_state_catalog(
         };
         if anchor.scope != generation.scope
             || anchor.generation_integrity_digest != generation.integrity_digest
-            || anchor.directory.descriptor_digest != authority.directory_digest
             || anchor.directory.row_count != u64::from(manifest.mutations.member_count)
             || anchor.directory.part_count as usize != manifest.mutations.part_count()
             || anchor.directory.root_id == [0; 32]
@@ -10155,12 +10217,59 @@ mod tests {
         staged_child.parent_commit_ids = vec![touching_id];
         staged_child.replay_debt.depth = super::MIN_CURRENT_STATE_CATALOG_POINT_READS;
         staged_child.current_state_catalog = staged_child_catalog;
-        super::stage_certified_commit_state_manifest(
+        let staged_staged_child = super::stage_certified_commit_state_manifest_with_handle(
             &mut touching_writes,
             &staged_child,
             &staged_child_publication,
         )
         .expect("staged child manifest should stage in the same write set");
+        let absent_delete_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_2000_0000_7000_8000_0002_2000_0000,
+        ));
+        let absent_delete = CommitDeltaFixture {
+            schema_key: "alpha".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::single("absent-staged-child-key"),
+            change_id: ChangeId::for_test_label("catalog-staged-child-absent-delete"),
+            deleted: true,
+            created_at,
+            updated_at,
+        };
+        let absent_delete_deltas =
+            commit_delta_refs(absent_delete_id, std::slice::from_ref(&absent_delete));
+        let absent_delete_stage = super::stage_ordered_addressable_commit_deltas(
+            &mut touching_writes,
+            absent_delete_deltas.iter().copied().map(Ok),
+            true,
+            false,
+        )
+        .expect("absent delete should stage")
+        .expect("absent delete should be addressable");
+        let absent_delete_inventory = absent_delete_stage.mutation_inventory().clone();
+        let absent_delete_publication = super::stage_current_state_catalog_from_staged_parent(
+            &read,
+            &mut touching_writes,
+            &staged_staged_child,
+            absent_delete_id,
+            &absent_delete_inventory,
+        )
+        .await
+        .expect("absent delete should reuse identical staged current-state parts");
+        let (absent_delete_catalog, _) = absent_delete_publication.parts();
+        let mut absent_delete_manifest =
+            fixture_commit_state_manifest(absent_delete_id, absent_delete_inventory);
+        absent_delete_manifest.parent_commit_ids = vec![staged_child_id];
+        absent_delete_manifest.replay_debt.depth = super::MIN_CURRENT_STATE_CATALOG_POINT_READS;
+        absent_delete_manifest.current_state_catalog = absent_delete_catalog;
+        super::stage_certified_commit_state_manifest(
+            &mut touching_writes,
+            &absent_delete_manifest,
+            &absent_delete_publication,
+        )
+        .expect("absent-delete child manifest should coalesce in the same write set");
+        touching_writes
+            .validate()
+            .expect("two staged children must retain one immutable data-part put per digest");
         drop(read);
         storage
             .commit_write_set(touching_writes, StorageWriteOptions::default())
