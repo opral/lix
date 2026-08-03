@@ -776,8 +776,8 @@ impl UploadBenchFixture {
         let result = self
             .session
             .execute(
-                "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, $3) \
-                 ON CONFLICT (path) DO UPDATE SET data = excluded.data, \
+                "INSERT INTO lix_file (path, content, lixcol_metadata) VALUES ($1, $2, $3) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content, \
                  lixcol_metadata = excluded.lixcol_metadata",
                 &[
                     Value::Text(self.upload_path.clone()),
@@ -795,8 +795,8 @@ impl UploadBenchFixture {
         let result = self
             .session
             .execute(
-                "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, $3) \
-                 ON CONFLICT (path) DO UPDATE SET data = excluded.data, \
+                "INSERT INTO lix_file (path, content, lixcol_metadata) VALUES ($1, $2, $3) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content, \
                  lixcol_metadata = excluded.lixcol_metadata",
                 &[
                     Value::Text(self.upload_path.clone()),
@@ -819,7 +819,7 @@ impl UploadBenchFixture {
         let result = self
             .session
             .execute(
-                "UPDATE lix_file SET data = $1 WHERE id = $2 AND data = $3",
+                "UPDATE lix_file SET content = $1 WHERE id = $2 AND content = $3",
                 &[
                     Value::Blob(upload_file_bytes(version).into()),
                     Value::Text(self.file_id.clone()),
@@ -841,7 +841,7 @@ impl UploadBenchFixture {
         let result = self
             .session
             .execute(
-                "UPDATE lix_file SET data = $1 WHERE id = $2",
+                "UPDATE lix_file SET content = $1 WHERE id = $2",
                 &[
                     Value::Blob(upload_file_bytes(version).into()),
                     Value::Text(self.file_id.clone()),
@@ -889,10 +889,10 @@ impl UploadBenchFixture {
 
     async fn native_upsert_ten_sequential(&self, entries: Vec<(String, Blob)>) -> u64 {
         let mut rows_affected = 0;
-        for (path, data) in entries {
+        for (path, content) in entries {
             rows_affected += self
                 .session
-                .upsert_file_data(path, data)
+                .upsert_file_content(path, content)
                 .await
                 .expect("native sequential file upsert");
         }
@@ -903,7 +903,7 @@ impl UploadBenchFixture {
     async fn native_upsert_one_batch(&self, entries: Vec<(String, Blob)>) -> u64 {
         let rows_affected = self
             .session
-            .upsert_file_data_batch(entries)
+            .upsert_file_content_batch(entries)
             .await
             .expect("native batch file upsert");
         assert_eq!(rows_affected, LIXRAY_UPLOAD_BATCH_FILES as u64);
@@ -916,8 +916,8 @@ impl UploadBenchFixture {
         let result = self
             .session
             .execute(
-                "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES ($1, $2, $3) \
-                 ON CONFLICT (path) DO UPDATE SET data = excluded.data, \
+                "INSERT INTO lix_file (path, content, lixcol_metadata) VALUES ($1, $2, $3) \
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content, \
                  lixcol_metadata = excluded.lixcol_metadata",
                 &[
                     Value::Text(path),
@@ -943,8 +943,8 @@ fn upload_batch_sql(row_count: usize) -> String {
         })
         .collect::<Vec<_>>();
     format!(
-        "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES {} \
-         ON CONFLICT (path) DO UPDATE SET data = excluded.data, \
+        "INSERT INTO lix_file (path, content, lixcol_metadata) VALUES {} \
+         ON CONFLICT (path) DO UPDATE SET content = excluded.content, \
          lixcol_metadata = excluded.lixcol_metadata",
         placeholders.join(", ")
     )
@@ -1193,7 +1193,7 @@ impl FreshEngineSelectBenchFixture {
 async fn download_file(session: &SessionContext<SlateDB>, file_id: &str) -> usize {
     let result = session
         .execute(
-            "SELECT data FROM lix_file WHERE id = $1",
+            "SELECT content FROM lix_file WHERE id = $1",
             &[Value::Text(file_id.to_string())],
         )
         .await
@@ -1427,8 +1427,8 @@ async fn seed_files(session: &SessionContext<SlateDB>) {
         }
 
         let sql = format!(
-            "INSERT INTO lix_file (path, data, lixcol_metadata) VALUES {} \
-             ON CONFLICT (path) DO UPDATE SET data = excluded.data, \
+            "INSERT INTO lix_file (path, content, lixcol_metadata) VALUES {} \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content, \
              lixcol_metadata = excluded.lixcol_metadata",
             placeholders.join(", ")
         );

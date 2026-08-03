@@ -98,7 +98,7 @@ where
     ] {
         inserted += transaction
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                 &[
                     Value::Text(file_id),
                     Value::Text(path.to_string()),
@@ -111,7 +111,7 @@ where
     }
     for first_index in (2..file_count).step_by(CORPUS_INSERT_CHUNK_SIZE) {
         let last_index = (first_index + CORPUS_INSERT_CHUNK_SIZE).min(file_count);
-        let mut sql = String::from("INSERT INTO lix_file (id, path, data) VALUES ");
+        let mut sql = String::from("INSERT INTO lix_file (id, path, content) VALUES ");
         for index in first_index..last_index {
             if index != first_index {
                 sql.push(',');
@@ -148,12 +148,12 @@ where
         ),
         (
             "data_by_id_4k",
-            "SELECT data FROM lix_file WHERE id = $1",
+            "SELECT content FROM lix_file WHERE id = $1",
             benchmark_file_id(0),
         ),
         (
             "data_by_path_4k",
-            "SELECT data FROM lix_file WHERE path = $1",
+            "SELECT content FROM lix_file WHERE path = $1",
             "/exact-read-4k.bin".to_string(),
         ),
         (
@@ -163,12 +163,12 @@ where
         ),
         (
             "data_by_id_1m",
-            "SELECT data FROM lix_file WHERE id = $1",
+            "SELECT content FROM lix_file WHERE id = $1",
             benchmark_file_id(1),
         ),
         (
             "data_by_path_1m",
-            "SELECT data FROM lix_file WHERE path = $1",
+            "SELECT content FROM lix_file WHERE path = $1",
             "/exact-read-1m.bin".to_string(),
         ),
     ];
@@ -181,7 +181,7 @@ where
         ));
         shapes.push((
             "data_by_id_corpus_tail",
-            "SELECT data FROM lix_file WHERE id = $1",
+            "SELECT content FROM lix_file WHERE id = $1",
             benchmark_file_id(target),
         ));
         shapes.push((

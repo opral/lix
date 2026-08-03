@@ -468,7 +468,7 @@ fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
             Field::new("path", DataType::Utf8, false),
             Field::new("directory_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, false),
-            Field::new("data", DataType::LargeBinary, false),
+            Field::new("content", DataType::LargeBinary, false),
         ]
     } else {
         vec![
@@ -503,7 +503,7 @@ fn history_filesystem_schema(include_data: bool) -> SchemaRef {
             Field::new("path", DataType::Utf8, true),
             Field::new("directory_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, true),
-            Field::new("data", DataType::LargeBinary, true),
+            Field::new("content", DataType::LargeBinary, true),
         ]
     } else {
         vec![
@@ -588,7 +588,7 @@ fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
         PublicColumn::public("path", false).conditional_on_insert(),
         PublicColumn::public("directory_id", true).conditional_on_insert(),
         PublicColumn::public("name", false).conditional_on_insert(),
-        PublicColumn::public("data", false).with_default("X''"),
+        PublicColumn::public("content", false).with_default("X''"),
     ];
     columns.extend(filesystem_hidden_columns(by_branch));
     columns
@@ -689,7 +689,7 @@ fn file_history_columns() -> Vec<PublicColumn> {
         ("path", true),
         ("directory_id", true),
         ("name", true),
-        ("data", true),
+        ("content", true),
         (HISTORY_COL_ENTITY_PK, false),
         (HISTORY_COL_SOURCE_CHANGES, false),
         (HISTORY_COL_OBSERVED_COMMIT_ID, false),

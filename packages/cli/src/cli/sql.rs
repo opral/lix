@@ -11,8 +11,8 @@ pub enum SqlSubcommand {
     /// Execute SQL text. Use '-' to read SQL from stdin.
     #[command(after_long_help = "\
 Examples:
-  lix sql execute \"INSERT INTO lix_file (path, data) VALUES ('/hello.md', CAST('# Hello' AS BYTEA))\"
-  lix sql execute \"SELECT path, CAST(data AS TEXT) FROM lix_file\"
+  lix sql execute \"INSERT INTO lix_file (path, content) VALUES ('/hello.md', CAST('# Hello' AS BYTEA))\"
+  lix sql execute \"SELECT path, CAST(content AS TEXT) FROM lix_file\"
   lix sql execute \"SELECT path, lixcol_depth FROM lix_file_history()\"")]
     Execute(SqlExecuteArgs),
 }

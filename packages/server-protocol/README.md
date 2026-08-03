@@ -143,7 +143,7 @@ Content-Type: application/octet-stream
 ```
 
 The body is the raw file bytes, including an empty body for a present empty
-file. The endpoint creates a missing file or replaces an existing file's data,
+file. The endpoint creates a missing file or replaces an existing file's content,
 uses the normal transactional filesystem write path, and returns the standard
 `ExecuteResponse` envelope with `rowsAffected: 1`. It has the same configured
 request-body ceiling as JSON protocol requests.
@@ -180,13 +180,13 @@ The body is a deterministic big-endian frame:
 u32 entry_count
 repeat entry_count times:
   u32 UTF-8 path byte length
-  u32 raw data byte length
+  u32 raw content byte length
   path bytes
-  data bytes
+  content bytes
 ```
 
 `entry_count` must be between 1 and 1,024; paths must be unique, valid UTF-8,
-and consume the complete frame. Empty file data is valid. The server keeps data
+and consume the complete frame. Empty file content is valid. The server keeps content
 as slices of the request body rather than making a second payload copy. A valid
 request stages all entries in one transaction and returns the standard
 `ExecuteResponse` with `rowsAffected` equal to the entry count; any validation
@@ -210,7 +210,7 @@ The successful response has `Content-Type: application/octet-stream`,
 `Lix-File-Found: true` for a present file (including a present empty file) or
 `Lix-File-Found: false` for a missing file, whose body is empty. This route has
 the same active-branch, plugin rendering, and per-session acknowledgement
-semantics as `SELECT data FROM lix_file WHERE path = $1`; it is not a generic
+semantics as `SELECT content FROM lix_file WHERE path = $1`; it is not a generic
 SQL read endpoint.
 
 The route accepts one forward byte range and returns `206 Partial Content`,

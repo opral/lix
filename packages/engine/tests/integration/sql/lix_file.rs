@@ -21,7 +21,7 @@ simulation_test!(
         session
             .execute(
                 &format!(
-                    "INSERT INTO lix_file (id, path, data) \
+                    "INSERT INTO lix_file (id, path, content) \
                      VALUES ('{file_id}', '/timestamps.txt', X'6F6E65')"
                 ),
                 &[],
@@ -51,7 +51,7 @@ simulation_test!(
 
         session
             .execute(
-                &format!("UPDATE lix_file SET data = X'74776F' WHERE id = '{file_id}'"),
+                &format!("UPDATE lix_file SET content = X'74776F' WHERE id = '{file_id}'"),
                 &[],
             )
             .await
@@ -83,7 +83,7 @@ simulation_test!(
         session
             .execute(
                 &format!(
-                    "INSERT INTO lix_file (id, path, data) \
+                    "INSERT INTO lix_file (id, path, content) \
                      VALUES ('{renamed_file_id}', '/before-rename.txt', X'6F6E65')"
                 ),
                 &[],
@@ -174,7 +174,7 @@ simulation_test!(
         session
             .execute(
                 &format!(
-                    "INSERT INTO lix_file (id, path, data) \
+                    "INSERT INTO lix_file (id, path, content) \
                      VALUES ('{file_id}', '/readme.md', X'68656C6C6F')"
                 ),
                 &[],
@@ -322,7 +322,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('67756172-6465-842d-8669-6c6500000000', '/guarded.txt', X'6265666F7265')",
+                "INSERT INTO lix_file (id, path, content) VALUES ('67756172-6465-842d-8669-6c6500000000', '/guarded.txt', X'6265666F7265')",
                 &[],
             )
             .await
@@ -344,7 +344,7 @@ simulation_test!(
 
         let applied = session
             .execute(
-                "UPDATE lix_file SET data = X'6166746572' WHERE path = '/guarded.txt' AND lixcol_change_id = $1",
+                "UPDATE lix_file SET content = X'6166746572' WHERE path = '/guarded.txt' AND lixcol_change_id = $1",
                 &[Value::Text(change_id)],
             )
             .await
@@ -353,7 +353,7 @@ simulation_test!(
 
         let stale = session
             .execute(
-                "UPDATE lix_file SET data = X'7374616C65' WHERE path = '/guarded.txt' AND lixcol_change_id = 'stale'",
+                "UPDATE lix_file SET content = X'7374616C65' WHERE path = '/guarded.txt' AND lixcol_change_id = 'stale'",
                 &[],
             )
             .await
@@ -362,7 +362,7 @@ simulation_test!(
 
         let content = session
             .execute(
-                "SELECT data FROM lix_file WHERE id = '67756172-6465-842d-8669-6c6500000000'",
+                "SELECT content FROM lix_file WHERE id = '67756172-6465-842d-8669-6c6500000000'",
                 &[],
             )
             .await
@@ -409,7 +409,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_exact_data_batch_rejects_a_missing_pinned_branch,
+    lix_file_exact_content_batch_rejects_a_missing_pinned_branch,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let missing = sim.wrap_session(
@@ -422,7 +422,7 @@ simulation_test!(
 
         let error = missing
             .execute(
-                "SELECT data FROM lix_file WHERE path IN ('/missing-a.txt', '/missing-b.txt')",
+                "SELECT content FROM lix_file WHERE path IN ('/missing-a.txt', '/missing-b.txt')",
                 &[],
             )
             .await
@@ -453,6 +453,27 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_legacy_payload_column_is_not_supported,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute("SELECT data FROM lix_file", &[])
+            .await
+            .expect_err("the retired data column must not remain available");
+
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
+    }
+);
+
+simulation_test!(
     lix_file_lower_path_like_keeps_the_blob_revision_for_guarded_updates,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -466,21 +487,21 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('67756172-6465-842d-8365-617263682d00', '/Docs/Guarded-Readme.md', X'6265666F7265')",
+                "INSERT INTO lix_file (id, path, content) VALUES ('67756172-6465-842d-8365-617263682d00', '/Docs/Guarded-Readme.md', X'6265666F7265')",
                 &[],
             )
             .await
             .expect("search fixture insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('6f746865-722d-8365-8172-63682d666900', '/Docs/other.md', X'6F74686572')",
+                "INSERT INTO lix_file (id, path, content) VALUES ('6f746865-722d-8365-8172-63682d666900', '/Docs/other.md', X'6F74686572')",
                 &[],
             )
             .await
             .expect("non-matching search fixture insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('756e6963-6f64-852d-8365-617263682d00', '/Ä/Readme.md', X'756E69636F6465')",
+                "INSERT INTO lix_file (id, path, content) VALUES ('756e6963-6f64-852d-8365-617263682d00', '/Ä/Readme.md', X'756E69636F6465')",
                 &[],
             )
             .await
@@ -527,7 +548,7 @@ simulation_test!(
 
         let updated = session
             .execute(
-                "UPDATE lix_file SET data = X'6166746572' WHERE path = '/Docs/Guarded-Readme.md' AND lixcol_change_id = $1",
+                "UPDATE lix_file SET content = X'6166746572' WHERE path = '/Docs/Guarded-Readme.md' AND lixcol_change_id = $1",
                 &[Value::Text(change_id)],
             )
             .await
@@ -536,7 +557,7 @@ simulation_test!(
 
         let content = session
             .execute(
-                "SELECT data FROM lix_file WHERE id = '67756172-6465-842d-8365-617263682d00'",
+                "SELECT content FROM lix_file WHERE id = '67756172-6465-842d-8365-617263682d00'",
                 &[],
             )
             .await
@@ -651,7 +672,7 @@ simulation_test!(
 
         let insert_error = session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('plugin-poison', '/.lix/plugins/nested/plugin_sentinel.lixplugin', X'626164')",
                 &[],
             )
@@ -666,7 +687,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('73616665-2d66-896c-8500-000000000000', '/safe.bin', X'6F6B')",
                 &[],
             )
@@ -984,7 +1005,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_reads_path_data_and_parent_dirs,
+    lix_file_insert_reads_path_content_and_parent_dirs,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -997,7 +1018,7 @@ simulation_test!(
 
         let file_result = session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
              VALUES ('66696c65-2d72-8561-846d-650000000000', '/docs/guides/readme.md', X'68656C6C6F')",
                 &[],
             )
@@ -1007,7 +1028,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, data, lixcol_schema_key \
+                "SELECT id, path, content, lixcol_schema_key \
              FROM lix_file \
              WHERE id = '66696c65-2d72-8561-846d-650000000000'",
                 &[],
@@ -1119,7 +1140,7 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
 });
 
 simulation_test!(
-    lix_file_path_insert_applies_defaulted_id_and_empty_data,
+    lix_file_path_insert_applies_defaulted_id_and_empty_content,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1141,7 +1162,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, name, data \
+                "SELECT id, path, name, content \
              FROM lix_file \
              WHERE path = '/docs/readme.md'",
                 &[],
@@ -1167,7 +1188,7 @@ simulation_test!(
 
         let null_result = session
             .execute(
-                "SELECT id FROM lix_file WHERE path = '/docs/readme.md' AND data IS NULL",
+                "SELECT id FROM lix_file WHERE path = '/docs/readme.md' AND content IS NULL",
                 &[],
             )
             .await
@@ -1177,7 +1198,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_path_data_insert_applies_defaulted_id,
+    lix_file_path_content_insert_applies_defaulted_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1190,7 +1211,7 @@ simulation_test!(
 
         let insert_result = session
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/docs/readme.md', X'68656C6C6F')",
+                "INSERT INTO lix_file (path, content) VALUES ('/docs/readme.md', X'68656C6C6F')",
                 &[],
             )
             .await
@@ -1199,7 +1220,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, data \
+                "SELECT id, path, content \
              FROM lix_file \
              WHERE path = '/docs/readme.md'",
                 &[],
@@ -1218,7 +1239,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_file_data_is_not_nullable, |sim| async move {
+simulation_test!(lix_file_content_is_not_nullable, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -1233,7 +1254,7 @@ simulation_test!(lix_file_data_is_not_nullable, |sim| async move {
             "SELECT is_nullable \
              FROM information_schema.columns \
              WHERE table_name = 'lix_file' \
-               AND column_name = 'data'",
+               AND column_name = 'content'",
             &[],
         )
         .await
@@ -1243,7 +1264,7 @@ simulation_test!(lix_file_data_is_not_nullable, |sim| async move {
     assert_eq!(result.rows()[0].values(), &[Value::Text("NO".to_string())]);
 });
 
-simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
+simulation_test!(lix_file_insert_rejects_null_content, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -1255,7 +1276,7 @@ simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
 
     let error = session
         .execute(
-            "INSERT INTO lix_file (id, path, data) \
+            "INSERT INTO lix_file (id, path, content) \
              VALUES ('6e756c6c-2d64-8174-812d-66696c650000', '/null.bin', NULL)",
             &[],
         )
@@ -1266,7 +1287,7 @@ simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
 
     let parameter_error = session
         .execute(
-            "INSERT INTO lix_file (id, path, data) \
+            "INSERT INTO lix_file (id, path, content) \
              VALUES ('6e756c6c-2d70-8172-816d-2d6461746100', '/null-param.bin', $1)",
             &[Value::Null],
         )
@@ -1287,7 +1308,7 @@ simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
 });
 
 simulation_test!(
-    lix_file_insert_rejects_non_binary_data_literals,
+    lix_file_insert_rejects_non_binary_content_literals,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1301,27 +1322,27 @@ simulation_test!(
         for (id, sql) in [
             (
                 "74657874-2d64-8174-812d-66696c650000",
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('74657874-2d64-8174-812d-66696c650000', '/text.bin', 'hello')",
             ),
             (
                 "696e742d-6461-8461-8d66-696c65000000",
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('696e742d-6461-8461-8d66-696c65000000', '/int.bin', 12345)",
             ),
             (
                 "666c6f61-742d-8461-8461-2d66696c6500",
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('666c6f61-742d-8461-8461-2d66696c6500', '/float.bin', 1.5)",
             ),
             (
                 "626f6f6c-2d64-8174-812d-66696c650000",
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('626f6f6c-2d64-8174-812d-66696c650000', '/bool.bin', true)",
             ),
             (
                 "74657874-2d66-856e-8374-696f6e2d6400",
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES (\
                    '74657874-2d66-856e-8374-696f6e2d6400',\
                    '/text-function.bin',\
@@ -1356,7 +1377,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_rejects_non_binary_data_from_select,
+    lix_file_insert_rejects_non_binary_content_from_select,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1369,12 +1390,12 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  SELECT '73656c65-6374-8d74-8578-742d64617400', '/select-text.bin', 'hello'",
                 &[],
             )
             .await
-            .expect_err("non-binary data from SELECT should be rejected");
+            .expect_err("non-binary content from SELECT should be rejected");
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
 
         let result = session
@@ -1389,7 +1410,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_rejects_non_binary_data_parameters,
+    lix_file_insert_rejects_non_binary_content_parameters,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1413,7 +1434,7 @@ simulation_test!(
             let error = session
                 .execute(
                     &format!(
-                        "INSERT INTO lix_file (id, path, data) \
+                        "INSERT INTO lix_file (id, path, content) \
                          VALUES ('{id}', '/{id}.bin', $1)"
                     ),
                     &[value],
@@ -1439,7 +1460,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('63617374-2d62-896e-8172-792d66696c00', $1, CAST($2 AS BYTEA))",
                 &[
                     Value::Text("/cast-binary.txt".to_string()),
@@ -1451,7 +1472,7 @@ simulation_test!(
 
         session
             .execute(
-                "UPDATE lix_file SET data = CAST($1 AS BYTEA) \
+                "UPDATE lix_file SET content = CAST($1 AS BYTEA) \
                  WHERE id = '63617374-2d62-896e-8172-792d66696c00'",
                 &[Value::Text("updated".to_string())],
             )
@@ -1460,7 +1481,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT data FROM lix_file WHERE id = '63617374-2d62-896e-8172-792d66696c00'",
+                "SELECT content FROM lix_file WHERE id = '63617374-2d62-896e-8172-792d66696c00'",
                 &[],
             )
             .await
@@ -1470,7 +1491,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_accepts_anonymous_path_and_data_parameters,
+    lix_file_insert_accepts_anonymous_path_and_content_parameters,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1483,7 +1504,7 @@ simulation_test!(
 
         let insert_result = session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
+                "INSERT INTO lix_file (id, path, content) VALUES (?, ?, ?)",
                 &[
                     Value::Text("616e6f6e-796d-8f75-832d-706172616d00".to_string()),
                     Value::Text("/anonymous-param.bin".to_string()),
@@ -1496,7 +1517,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT path, data FROM lix_file WHERE id = ?",
+                "SELECT path, content FROM lix_file WHERE id = ?",
                 &[Value::Text(
                     "616e6f6e-796d-8f75-832d-706172616d00".to_string(),
                 )],
@@ -1514,7 +1535,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_anonymous_data_parameter_keeps_strict_blob_validation,
+    lix_file_anonymous_content_parameter_keeps_strict_blob_validation,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1527,7 +1548,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
+                "INSERT INTO lix_file (id, path, content) VALUES (?, ?, ?)",
                 &[
                     Value::Text("616e6f6e-796d-8f75-832d-746578742d00".to_string()),
                     Value::Text("/anonymous-text-data.bin".to_string()),
@@ -1540,48 +1561,51 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_file_insert_accepts_empty_blob_data, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(
-        engine
-            .open_workspace_session()
-            .await
-            .expect("main session should open"),
-        &engine,
-    );
+simulation_test!(
+    lix_file_insert_accepts_empty_blob_content,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
-    let insert_result = session
-        .execute(
-            "INSERT INTO lix_file (id, path, data) \
+        let insert_result = session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
              VALUES ('656d7074-792d-8461-8461-2d66696c6500', '/empty.bin', X'')",
-            &[],
-        )
-        .await
-        .expect("empty blob data should be accepted");
-    assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
+                &[],
+            )
+            .await
+            .expect("empty blob data should be accepted");
+        assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
-    let result = session
-        .execute(
-            "SELECT data FROM lix_file WHERE id = '656d7074-792d-8461-8461-2d66696c6500'",
-            &[],
-        )
-        .await
-        .expect("file read should succeed");
-    assert_eq!(result.len(), 1);
-    assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new().into())]);
+        let result = session
+            .execute(
+                "SELECT content FROM lix_file WHERE id = '656d7074-792d-8461-8461-2d66696c6500'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new().into())]);
 
-    let blob_ref_changes = session
-        .execute(
-            "SELECT id \
+        let blob_ref_changes = session
+            .execute(
+                "SELECT id \
              FROM lix_change \
              WHERE schema_key = 'lix_binary_blob_ref' \
                AND entity_pk = lix_json('[\"656d7074-792d-8461-8461-2d66696c6500\"]')",
-            &[],
-        )
-        .await
-        .expect("blob ref changes should read");
-    assert_eq!(blob_ref_changes.len(), 0);
-});
+                &[],
+            )
+            .await
+            .expect("blob ref changes should read");
+        assert_eq!(blob_ref_changes.len(), 0);
+    }
+);
 
 simulation_test!(
     lix_file_path_insert_rejects_duplicate_root_path,
@@ -1597,7 +1621,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/x.bin', $1)",
+                "INSERT INTO lix_file (path, content) VALUES ('/x.bin', $1)",
                 &[Value::Blob(vec![1].into())],
             )
             .await
@@ -1605,7 +1629,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/x.bin', $1)",
+                "INSERT INTO lix_file (path, content) VALUES ('/x.bin', $1)",
                 &[Value::Blob(vec![2].into())],
             )
             .await
@@ -1616,7 +1640,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_duplicate_id_with_data_reports_lix_file,
+    lix_file_insert_duplicate_id_with_content_reports_lix_file,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1629,7 +1653,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('73616d65-2d66-896c-8500-000000000000', '/a.bin', X'01')",
                 &[],
             )
@@ -1638,7 +1662,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('73616d65-2d66-896c-8500-000000000000', '/b.bin', X'02')",
                 &[],
             )
@@ -1658,7 +1682,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_duplicate_id_without_data_reports_lix_file,
+    lix_file_insert_duplicate_id_without_content_reports_lix_file,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1711,7 +1735,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES \
+                "INSERT INTO lix_file (id, path, content) VALUES \
                  ('73616d65-2d66-896c-8500-000000000000', '/a.bin', X'01'), \
                  ('73616d65-2d66-896c-8500-000000000000', '/b.bin', X'02')",
                 &[],
@@ -1748,7 +1772,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
-                     (id, path, data, lixcol_branch_id) \
+                     (id, path, content, lixcol_branch_id) \
                      VALUES ('73616d65-2d66-896c-8500-000000000000', '/a.bin', X'01', '{branch_id}')"
                 ),
                 &[],
@@ -1760,7 +1784,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
-                     (id, path, data, lixcol_branch_id) \
+                     (id, path, content, lixcol_branch_id) \
                      VALUES ('73616d65-2d66-896c-8500-000000000000', '/b.bin', X'02', '{branch_id}')"
                 ),
                 &[],
@@ -2036,7 +2060,7 @@ simulation_test!(
         for path in ["/a/../b/c.txt", "/a/./b/c.txt"] {
             let error = session
                 .execute(
-                    "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                    "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
                     &[
                         Value::Text(path.to_string()),
                         Value::Blob(Vec::new().into()),
@@ -2058,7 +2082,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_data_insert_applies_defaulted_id,
+    lix_file_content_insert_applies_defaulted_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -2080,7 +2104,7 @@ simulation_test!(
 
         let insert_result = session
             .execute(
-                "INSERT INTO lix_file (directory_id, name, data) \
+                "INSERT INTO lix_file (directory_id, name, content) \
              VALUES ('6469722d-646f-8373-8000-000000000000', 'readme.md', X'68656C6C6F')",
                 &[],
             )
@@ -2090,7 +2114,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, data \
+                "SELECT id, path, content \
              FROM lix_file \
              WHERE path = '/docs/readme.md'",
                 &[],
@@ -2109,7 +2133,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
+simulation_test!(lix_file_path_update_preserves_content, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -2121,7 +2145,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
 
     let insert_result = session
         .execute(
-            "INSERT INTO lix_file (id, path, data) \
+            "INSERT INTO lix_file (id, path, content) \
              VALUES ('66696c65-2d72-8561-846d-650000000000', '/docs/guides/readme.md', X'68656C6C6F')",
             &[],
         )
@@ -2142,7 +2166,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
 
     let file_result = session
         .execute(
-            "SELECT id, path, data \
+            "SELECT id, path, content \
              FROM lix_file \
              WHERE id = '66696c65-2d72-8561-846d-650000000000'",
             &[],
@@ -2192,7 +2216,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES \
+                "INSERT INTO lix_file (id, path, content) VALUES \
              ('66696c65-2d74-8172-8765-740000000000', '/docs/target.md', X'746172676574'), \
              ('66696c65-2d6f-8468-8572-000000000000', '/docs/other.md', X'6F74686572')",
                 &[],
@@ -2237,7 +2261,7 @@ simulation_test!(
 
         let renamed = session
             .execute(
-                "SELECT id, path, data FROM lix_file WHERE path = '/archive/renamed.md'",
+                "SELECT id, path, content FROM lix_file WHERE path = '/archive/renamed.md'",
                 &[],
             )
             .await
@@ -2253,7 +2277,7 @@ simulation_test!(
 
         let unrelated = session
             .execute(
-                "SELECT path, data FROM lix_file WHERE id = '66696c65-2d6f-8468-8572-000000000000'",
+                "SELECT path, content FROM lix_file WHERE id = '66696c65-2d6f-8468-8572-000000000000'",
                 &[],
             )
             .await
@@ -2282,7 +2306,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('6272616e-6368-8d68-8561-642d66696c00', '/branch-head.txt', X'68656164')",
                 &[],
             )
@@ -2384,7 +2408,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES \
+                "INSERT INTO lix_file (id, path, content) VALUES \
              ('01950000-0000-7000-8000-000000000008', '/.lix/app_data/atelier/extensions/demo/a.js', X'61'), \
              ('01950000-0000-7000-8000-000000000009', '/.lix/app_data/atelier/extensions/demo/b.js', X'62'), \
              ('01950000-0000-7000-8000-00000000000a', '/.lix/app_data/atelier/extensions0/out.js', X'78'), \
@@ -2396,7 +2420,7 @@ simulation_test!(
 
         let range = session
             .execute(
-                "SELECT path, data FROM lix_file \
+                "SELECT path, content FROM lix_file \
              WHERE path >= '/.lix/app_data/atelier/extensions/' \
                AND path < '/.lix/app_data/atelier/extensions0' \
              ORDER BY path",
@@ -2474,7 +2498,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_update_rejects_null_data_and_preserves_existing_data,
+    lix_file_update_rejects_null_content_and_preserves_existing_content,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -2487,7 +2511,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('75706461-7465-8d6e-856c-6c2d66696c00', '/update-null.bin', X'68656C6C6F')",
                 &[],
             )
@@ -2496,7 +2520,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "UPDATE lix_file SET data = NULL WHERE id = '75706461-7465-8d6e-856c-6c2d66696c00'",
+                "UPDATE lix_file SET content = NULL WHERE id = '75706461-7465-8d6e-856c-6c2d66696c00'",
                 &[],
             )
             .await
@@ -2506,7 +2530,7 @@ simulation_test!(
 
         let parameter_error = session
             .execute(
-                "UPDATE lix_file SET data = $1 WHERE id = '75706461-7465-8d6e-856c-6c2d66696c00'",
+                "UPDATE lix_file SET content = $1 WHERE id = '75706461-7465-8d6e-856c-6c2d66696c00'",
                 &[Value::Null],
             )
             .await
@@ -2516,7 +2540,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT data FROM lix_file WHERE id = '75706461-7465-8d6e-856c-6c2d66696c00'",
+                "SELECT content FROM lix_file WHERE id = '75706461-7465-8d6e-856c-6c2d66696c00'",
                 &[],
             )
             .await
@@ -2530,7 +2554,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_update_rejects_non_binary_data_literals_and_preserves_existing_data,
+    lix_file_update_rejects_non_binary_content_literals_and_preserves_existing_content,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -2554,7 +2578,7 @@ simulation_test!(
             session
                 .execute(
                     &format!(
-                        "INSERT INTO lix_file (id, path, data) \
+                        "INSERT INTO lix_file (id, path, content) \
                          VALUES ('{id}', '/{id}.bin', X'68656C6C6F')"
                     ),
                     &[],
@@ -2564,7 +2588,7 @@ simulation_test!(
 
             let error = session
                 .execute(
-                    &format!("UPDATE lix_file SET data = {assignment} WHERE id = '{id}'"),
+                    &format!("UPDATE lix_file SET content = {assignment} WHERE id = '{id}'"),
                     &[],
                 )
                 .await
@@ -2575,7 +2599,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, data FROM lix_file \
+                "SELECT id, content FROM lix_file \
                  WHERE id IN (\
                    '75706461-7465-8d74-8578-742d66696c00',\
                    '75706461-7465-8d74-8578-742d66756e00',\
@@ -2618,7 +2642,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_update_rejects_non_binary_data_parameters_and_preserves_existing_data,
+    lix_file_update_rejects_non_binary_content_parameters_and_preserves_existing_content,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -2642,7 +2666,7 @@ simulation_test!(
             session
                 .execute(
                     &format!(
-                        "INSERT INTO lix_file (id, path, data) \
+                        "INSERT INTO lix_file (id, path, content) \
                          VALUES ('{id}', '/{id}.bin', X'68656C6C6F')"
                     ),
                     &[],
@@ -2652,7 +2676,7 @@ simulation_test!(
 
             let error = session
                 .execute(
-                    &format!("UPDATE lix_file SET data = $1 WHERE id = '{id}'"),
+                    &format!("UPDATE lix_file SET content = $1 WHERE id = '{id}'"),
                     &[value],
                 )
                 .await
@@ -2662,7 +2686,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, data FROM lix_file \
+                "SELECT id, content FROM lix_file \
                  WHERE id IN ('75706461-7465-8d74-8578-742d70617200', '75706461-7465-8d69-8e74-2d7061726100') \
                  ORDER BY id",
                 &[],
@@ -2685,44 +2709,47 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_file_update_accepts_empty_blob_data, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(
-        engine
-            .open_workspace_session()
-            .await
-            .expect("main session should open"),
-        &engine,
-    );
+simulation_test!(
+    lix_file_update_accepts_empty_blob_content,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
-    session
-        .execute(
-            "INSERT INTO lix_file (id, path, data) \
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) \
              VALUES ('656d7074-792d-8570-8461-74652d666900', '/empty-update.bin', X'68656C6C6F')",
-            &[],
-        )
-        .await
-        .expect("file insert should succeed");
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
 
-    let update_result = session
+        let update_result = session
         .execute(
-            "UPDATE lix_file SET data = X'' WHERE id = '656d7074-792d-8570-8461-74652d666900'",
+            "UPDATE lix_file SET content = X'' WHERE id = '656d7074-792d-8570-8461-74652d666900'",
             &[],
         )
         .await
         .expect("empty blob data update should be accepted");
-    assert_eq!(update_result, ExecuteResult::from_rows_affected(1));
+        assert_eq!(update_result, ExecuteResult::from_rows_affected(1));
 
-    let result = session
-        .execute(
-            "SELECT data FROM lix_file WHERE id = '656d7074-792d-8570-8461-74652d666900'",
-            &[],
-        )
-        .await
-        .expect("file read should succeed");
-    assert_eq!(result.len(), 1);
-    assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new().into())]);
-});
+        let result = session
+            .execute(
+                "SELECT content FROM lix_file WHERE id = '656d7074-792d-8570-8461-74652d666900'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new().into())]);
+    }
+);
 
 simulation_test!(
     lix_file_equal_normalized_metadata_skips_descriptor_history,
@@ -2736,10 +2763,10 @@ simulation_test!(
             &engine,
         );
 
-        let upsert = "INSERT INTO lix_file (path, data, lixcol_metadata) \
+        let upsert = "INSERT INTO lix_file (path, content, lixcol_metadata) \
                       VALUES ($1, $2, $3) \
                       ON CONFLICT (path) DO UPDATE SET \
-                        data = excluded.data, \
+                        content = excluded.content, \
                         lixcol_metadata = excluded.lixcol_metadata";
         let metadata = json!({"a": 1, "z": 2});
         session
@@ -2782,7 +2809,7 @@ simulation_test!(
             .expect("branch head should exist");
         let current = session
             .execute(
-                "SELECT data, lixcol_metadata \
+                "SELECT content, lixcol_metadata \
                  FROM lix_file WHERE path = '/equal-metadata.bin'",
                 &[],
             )
@@ -2810,10 +2837,10 @@ simulation_test!(
                 .expect("main session should open"),
             &engine,
         );
-        let upsert = "INSERT INTO lix_file (path, data, lixcol_metadata) \
+        let upsert = "INSERT INTO lix_file (path, content, lixcol_metadata) \
                       VALUES ($1, $2, $3) \
                       ON CONFLICT (path) DO UPDATE SET \
-                        data = excluded.data, \
+                        content = excluded.content, \
                         lixcol_metadata = excluded.lixcol_metadata";
         session
             .execute(
@@ -2901,7 +2928,7 @@ simulation_test!(
         );
         let current = session
             .execute(
-                "SELECT data, lixcol_metadata \
+                "SELECT content, lixcol_metadata \
                  FROM lix_file WHERE path = '/changed-metadata.bin'",
                 &[],
             )
@@ -2951,7 +2978,7 @@ async fn file_descriptor_event_count(
 }
 
 simulation_test!(
-    lix_file_update_empty_data_on_empty_file_does_not_stage_blob_ref_tombstone,
+    lix_file_update_empty_content_on_empty_file_does_not_stage_blob_ref_tombstone,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -2973,7 +3000,7 @@ simulation_test!(
 
         session
             .execute(
-                "UPDATE lix_file SET data = X'' WHERE id = '616c7265-6164-892d-856d-7074792d6600'",
+                "UPDATE lix_file SET content = X'' WHERE id = '616c7265-6164-892d-856d-7074792d6600'",
                 &[],
             )
             .await
@@ -3004,7 +3031,7 @@ simulation_test!(lix_file_by_branch_expands_global_rows, |sim| async move {
 
     session
         .execute(
-            "INSERT INTO lix_file (id, path, data, lixcol_global, lixcol_untracked) \
+            "INSERT INTO lix_file (id, path, content, lixcol_global, lixcol_untracked) \
              VALUES ('66696c65-2d67-8c6f-8261-6c2d6f766500', '/global.txt', X'67', true, false)",
             &[],
         )
@@ -3065,7 +3092,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data, lixcol_global) \
+                "INSERT INTO lix_file (id, path, content, lixcol_global) \
                  VALUES ('676c6f62-616c-8d73-8861-7265642d6600', '/shared/a.txt', CAST('a' AS BYTEA), true)",
                 &[],
             )
@@ -3106,7 +3133,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('66696c65-2d72-8561-846d-650000000000', '/scratch/readme.md', CAST('hello' AS BYTEA))",
                 &[],
             )
@@ -3134,7 +3161,7 @@ simulation_test!(
 
         let files = session
             .execute(
-                "SELECT id, path, directory_id, data \
+                "SELECT id, path, directory_id, content \
                  FROM lix_file \
                  WHERE id = '66696c65-2d72-8561-846d-650000000000'",
                 &[],
@@ -3166,7 +3193,7 @@ simulation_test!(
             .expect("tracked parent insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data, lixcol_untracked) \
+                "INSERT INTO lix_file (id, path, content, lixcol_untracked) \
                  VALUES ('66696c65-2d64-8261-8674-000000000000', '/docs/draft.md', CAST('draft' AS BYTEA), true)",
                 &[],
             )
@@ -3213,7 +3240,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_on_conflict_do_update_replaces_data,
+    lix_file_insert_on_conflict_do_update_replaces_content,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -3226,7 +3253,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('66696c65-2d75-8073-8572-740000000000', '/docs/upsert.md', X'6F6C64')",
                 &[],
             )
@@ -3235,9 +3262,9 @@ simulation_test!(
 
         let result = session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('66696c65-2d75-8073-8572-740000000000', '/docs/upsert.md', X'6E6577') \
-                 ON CONFLICT (id) DO UPDATE SET data = excluded.data",
+                 ON CONFLICT (id) DO UPDATE SET content = excluded.content",
                 &[],
             )
             .await
@@ -3246,7 +3273,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id, path, data FROM lix_file WHERE id = '66696c65-2d75-8073-8572-740000000000'",
+                "SELECT id, path, content FROM lix_file WHERE id = '66696c65-2d75-8073-8572-740000000000'",
                 &[],
             )
             .await
@@ -3276,7 +3303,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('66696c65-2d6e-8f74-8869-6e6700000000', '/docs/nothing.md', X'6B656570')",
                 &[],
             )
@@ -3285,7 +3312,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('66696c65-2d6e-8f74-8869-6e6700000000', '/docs/nothing.md', X'6967') \
                  ON CONFLICT (id) DO NOTHING",
                 &[],
@@ -3296,7 +3323,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id, path, data FROM lix_file WHERE id = '66696c65-2d6e-8f74-8869-6e6700000000'",
+                "SELECT id, path, content FROM lix_file WHERE id = '66696c65-2d6e-8f74-8869-6e6700000000'",
                 &[],
             )
             .await
@@ -3326,9 +3353,9 @@ simulation_test!(
 
         let result = session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('66696c65-2d66-8265-8368-000000000000', '/docs/fresh.md', X'6E6577') \
-                 ON CONFLICT (id) DO UPDATE SET data = excluded.data",
+                 ON CONFLICT (id) DO UPDATE SET content = excluded.content",
                 &[],
             )
             .await
@@ -3337,7 +3364,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id, path, data FROM lix_file WHERE id = '66696c65-2d66-8265-8368-000000000000'",
+                "SELECT id, path, content FROM lix_file WHERE id = '66696c65-2d66-8265-8368-000000000000'",
                 &[],
             )
             .await
@@ -3367,9 +3394,9 @@ simulation_test!(
 
         let result = session
             .execute(
-                "INSERT INTO lix_file (path, data) \
+                "INSERT INTO lix_file (path, content) \
                  VALUES ('/docs/path-fresh.md', X'6E6577') \
-                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[],
             )
             .await
@@ -3378,7 +3405,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT path, data FROM lix_file WHERE path = '/docs/path-fresh.md'",
+                "SELECT path, content FROM lix_file WHERE path = '/docs/path-fresh.md'",
                 &[],
             )
             .await
@@ -3394,7 +3421,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_insert_on_conflict_path_updates_existing_data_and_preserves_id,
+    lix_file_insert_on_conflict_path_updates_existing_content_and_preserves_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -3407,7 +3434,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('66696c65-2d70-8174-882d-757073657200', '/docs/path-upsert.md', X'6F6C64')",
                 &[],
             )
@@ -3416,9 +3443,9 @@ simulation_test!(
 
         let result = session
             .execute(
-                "INSERT INTO lix_file (path, data) \
+                "INSERT INTO lix_file (path, content) \
                  VALUES ('/docs/path-upsert.md', X'6E6577') \
-                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[],
             )
             .await
@@ -3427,7 +3454,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id, path, data FROM lix_file WHERE path = '/docs/path-upsert.md'",
+                "SELECT id, path, content FROM lix_file WHERE path = '/docs/path-upsert.md'",
                 &[],
             )
             .await
@@ -3469,7 +3496,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
-                     (id, path, data, lixcol_branch_id) \
+                     (id, path, content, lixcol_branch_id) \
                      VALUES ('66696c65-2d62-8261-8e63-682d70617400', '/docs/branch.md', X'6F6C64', '{branch_id}')"
                 ),
                 &[],
@@ -3481,9 +3508,9 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
-                     (path, data, lixcol_branch_id) \
+                     (path, content, lixcol_branch_id) \
                      VALUES ('/docs/branch.md', X'6E6577', '{branch_id}') \
-                     ON CONFLICT (path, lixcol_branch_id) DO UPDATE SET data = excluded.data"
+                     ON CONFLICT (path, lixcol_branch_id) DO UPDATE SET content = excluded.content"
                 ),
                 &[],
             )
@@ -3493,7 +3520,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id, data FROM lix_file WHERE path = '/docs/branch.md'",
+                "SELECT id, content FROM lix_file WHERE path = '/docs/branch.md'",
                 &[],
             )
             .await
@@ -3525,9 +3552,9 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
-                     (path, data, lixcol_branch_id) \
+                     (path, content, lixcol_branch_id) \
                      VALUES ('/docs/reject.md', X'00', '{branch_id}') \
-                     ON CONFLICT (path) DO UPDATE SET data = excluded.data"
+                     ON CONFLICT (path) DO UPDATE SET content = excluded.content"
                 ),
                 &[],
             )
@@ -3555,9 +3582,9 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (id, data) \
+                "INSERT INTO lix_file (id, content) \
                  VALUES ('66696c65-2d6d-8973-8369-6e672d706100', X'00') \
-                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[],
             )
             .await
@@ -3580,7 +3607,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('66696c65-2d74-8261-836b-65642d636f00', '/docs/collision.md', X'00')",
                 &[],
             )
@@ -3589,9 +3616,9 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (path, data, lixcol_untracked) \
+                "INSERT INTO lix_file (path, content, lixcol_untracked) \
                  VALUES ('/docs/collision.md', X'01', true) \
-                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[],
             )
             .await
@@ -3615,7 +3642,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data, lixcol_global) \
+                "INSERT INTO lix_file (id, path, content, lixcol_global) \
                  VALUES ('66696c65-2d67-8c6f-8261-6c2d70617400', '/docs/global.md', X'6F6C64', true)",
                 &[],
             )
@@ -3624,9 +3651,9 @@ simulation_test!(
 
         let result = session
             .execute(
-                "INSERT INTO lix_file (path, data) \
+                "INSERT INTO lix_file (path, content) \
                  VALUES ('/docs/global.md', X'6E6577') \
-                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[],
             )
             .await
@@ -3635,7 +3662,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id, data, lixcol_global, lixcol_branch_id \
+                "SELECT id, content, lixcol_global, lixcol_branch_id \
                  FROM lix_file_by_branch \
                  WHERE id = '66696c65-2d67-8c6f-8261-6c2d70617400' AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
                 &[],
@@ -3668,9 +3695,9 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (path, data) \
+                "INSERT INTO lix_file (path, content) \
                  VALUES ('/docs/duplicate-target.md', X'00') \
-                 ON CONFLICT (path, path) DO UPDATE SET data = excluded.data",
+                 ON CONFLICT (path, path) DO UPDATE SET content = excluded.content",
                 &[],
             )
             .await
@@ -3698,7 +3725,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('01950000-0000-7000-8000-000000000002', '/docs/target.md', X'6265666F7265')",
                 &[],
             )
@@ -3719,7 +3746,7 @@ simulation_test!(
             .expect("transaction should begin");
         transaction
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('01950000-0000-7000-8000-00000000000b', '/01950000-0000-7000-8000-00000000000b.md', X'01')",
                 &[],
             )
@@ -3728,7 +3755,7 @@ simulation_test!(
 
         let update = transaction
             .execute(
-                "UPDATE lix_file SET data = X'6166746572' \
+                "UPDATE lix_file SET content = X'6166746572' \
                  WHERE path = '/docs/target.md'",
                 &[],
             )
@@ -3738,7 +3765,7 @@ simulation_test!(
 
         let first_read = transaction
             .execute(
-                "SELECT id, data FROM lix_file WHERE path = '/docs/target.md'",
+                "SELECT id, content FROM lix_file WHERE path = '/docs/target.md'",
                 &[],
             )
             .await
@@ -3753,7 +3780,7 @@ simulation_test!(
 
         transaction
             .execute(
-                "UPDATE lix_file SET data = X'616761696E' \
+                "UPDATE lix_file SET content = X'616761696E' \
                  WHERE path = '/docs/target.md'",
                 &[],
             )
@@ -3761,7 +3788,7 @@ simulation_test!(
             .expect("repeated path-filtered transaction update should succeed");
         let repeated_read = transaction
             .execute(
-                "SELECT data FROM lix_file WHERE path = '/docs/target.md'",
+                "SELECT content FROM lix_file WHERE path = '/docs/target.md'",
                 &[],
             )
             .await
@@ -3782,7 +3809,7 @@ simulation_test!(
 
         let after_failure = transaction
             .execute(
-                "SELECT id, path, data FROM lix_file WHERE path = '/docs/target.md'",
+                "SELECT id, path, content FROM lix_file WHERE path = '/docs/target.md'",
                 &[],
             )
             .await
@@ -3803,7 +3830,7 @@ simulation_test!(
 
         let rolled_back = session
             .execute(
-                "SELECT id, data FROM lix_file WHERE path = '/docs/target.md'",
+                "SELECT id, content FROM lix_file WHERE path = '/docs/target.md'",
                 &[],
             )
             .await
@@ -3842,7 +3869,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file_by_branch \
-                 (id, path, data, lixcol_global, lixcol_branch_id) \
+                 (id, path, content, lixcol_global, lixcol_branch_id) \
                  VALUES ('6c616e65-2d66-896c-8500-000000000000', '/global.md', X'01', true, 'ffffffff-ffff-7fff-bfff-ffffffffffff')",
                 &[],
             )
@@ -3852,7 +3879,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
-                     (id, path, data, lixcol_branch_id) \
+                     (id, path, content, lixcol_branch_id) \
                      VALUES ('6c616e65-2d66-896c-8500-000000000000', '/branch.md', X'02', '{branch_id}')"
                 ),
                 &[],
@@ -3866,7 +3893,7 @@ simulation_test!(
             .expect("transaction should begin");
         transaction
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('01950000-0000-7000-8000-000000000003', '/01950000-0000-7000-8000-000000000003.md', X'03')",
                 &[],
             )
@@ -3962,7 +3989,7 @@ simulation_test!(
             .expect("transaction should begin");
         transaction
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('01950000-0000-7000-8000-000000000004', '/01950000-0000-7000-8000-000000000004.md', X'01')",
                 &[],
             )
@@ -3980,7 +4007,7 @@ simulation_test!(
 
         other_session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('6f746865-722d-8365-8373-696f6e2d6600', '/other-session.md', X'02')",
                 &[],
             )
@@ -4057,7 +4084,7 @@ simulation_test!(
         );
 
         main.execute(
-            "INSERT INTO lix_file (id, path, data) \
+            "INSERT INTO lix_file (id, path, content) \
              VALUES ('6d657267-652d-8d61-896e-2d66696c6500', '/main.md', X'01')",
             &[],
         )
@@ -4065,7 +4092,7 @@ simulation_test!(
         .expect("main divergence file should insert");
         draft
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('6d657267-652d-8472-8166-742d66696c00', '/merged.md', X'02')",
                 &[],
             )
@@ -4085,7 +4112,7 @@ simulation_test!(
             .expect("transaction should begin");
         transaction
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('01950000-0000-7000-8000-000000000005', '/01950000-0000-7000-8000-000000000005.md', X'03')",
                 &[],
             )

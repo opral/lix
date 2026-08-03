@@ -320,7 +320,7 @@ simulation_test!(
         session
             .execute(
                 &format!(
-                    "INSERT INTO lix_file (id, path, data) \
+                    "INSERT INTO lix_file (id, path, content) \
                      VALUES ('{file_id}', '/a.md', X'6F6C64')"
                 ),
                 &[],
@@ -347,7 +347,7 @@ simulation_test!(
         session
             .execute(
                 &format!(
-                    "INSERT INTO lix_file (id, path, data) \
+                    "INSERT INTO lix_file (id, path, content) \
                      VALUES ('{nested_file_id}', '/existing/b.md', X'6F6C64')"
                 ),
                 &[],
@@ -361,7 +361,9 @@ simulation_test!(
         for changed_file_id in [file_id, nested_file_id] {
             session
                 .execute(
-                    &format!("UPDATE lix_file SET data = X'6E6577' WHERE id = '{changed_file_id}'"),
+                    &format!(
+                        "UPDATE lix_file SET content = X'6E6577' WHERE id = '{changed_file_id}'"
+                    ),
                     &[],
                 )
                 .await
@@ -450,7 +452,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('01950000-0000-7000-8000-000000000001', '/docs/readme.md', X'68656C6C6F')",
                 &[],
             )

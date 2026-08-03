@@ -177,9 +177,9 @@ simulation_test!(
 
         let inserted_file = session
             .execute(
-                "INSERT INTO lix_file (path, data) \
+                "INSERT INTO lix_file (path, content) \
                  VALUES ('/returning-file.txt', X'6265666F7265') \
-                 RETURNING id, path, data",
+                 RETURNING id, path, content",
                 &[],
             )
             .await
@@ -197,8 +197,8 @@ simulation_test!(
 
         let updated_file = session
             .execute(
-                "UPDATE lix_file SET data = X'6166746572' WHERE id = $1 \
-                 RETURNING id, path, data",
+                "UPDATE lix_file SET content = X'6166746572' WHERE id = $1 \
+                 RETURNING id, path, content",
                 &[Value::Text(file_id.clone())],
             )
             .await
@@ -214,10 +214,10 @@ simulation_test!(
 
         let upserted_file = session
             .execute(
-                "INSERT INTO lix_file (path, data) \
+                "INSERT INTO lix_file (path, content) \
                  VALUES ('/returning-file.txt', X'66696E616C') \
-                 ON CONFLICT (path) DO UPDATE SET data = excluded.data \
-                 RETURNING id, data",
+                 ON CONFLICT (path) DO UPDATE SET content = excluded.content \
+                 RETURNING id, content",
                 &[],
             )
             .await
@@ -338,7 +338,7 @@ simulation_test!(
         let explicit_branch_id = sim.main_branch_id().to_string();
         let inserted_file_by_branch = session
             .execute(
-                "INSERT INTO lix_file_by_branch (path, data, lixcol_branch_id) \
+                "INSERT INTO lix_file_by_branch (path, content, lixcol_branch_id) \
                  VALUES ('/returning-by-branch-file.txt', X'01', $1) \
                  RETURNING id, path, lixcol_branch_id",
                 &[Value::Text(explicit_branch_id.clone())],
@@ -359,10 +359,10 @@ simulation_test!(
 
         let upserted_file_by_branch = session
             .execute(
-                "INSERT INTO lix_file_by_branch (path, data, lixcol_branch_id) \
+                "INSERT INTO lix_file_by_branch (path, content, lixcol_branch_id) \
                  VALUES ('/returning-by-branch-file.txt', X'02', $1) \
-                 ON CONFLICT (path, lixcol_branch_id) DO UPDATE SET data = excluded.data \
-                 RETURNING id, data, lixcol_branch_id",
+                 ON CONFLICT (path, lixcol_branch_id) DO UPDATE SET content = excluded.content \
+                 RETURNING id, content, lixcol_branch_id",
                 &[Value::Text(explicit_branch_id.clone())],
             )
             .await
@@ -380,7 +380,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file_by_branch \
-                 (id, path, data, lixcol_global, lixcol_branch_id) \
+                 (id, path, content, lixcol_global, lixcol_branch_id) \
                  VALUES ($1, '/returning-global-file.txt', X'01', true, \
                          'ffffffff-ffff-7fff-bfff-ffffffffffff')",
                 &[Value::Text(global_file_id.to_string())],
@@ -393,7 +393,7 @@ simulation_test!(
         // than re-validate the rendered row as a new global write.
         let updated_global_projection = session
             .execute(
-                "UPDATE lix_file_by_branch SET data = X'03' \
+                "UPDATE lix_file_by_branch SET content = X'03' \
                  WHERE id = $1 AND lixcol_branch_id = $2 \
                  RETURNING id, path, lixcol_branch_id, lixcol_global",
                 &[
@@ -487,7 +487,7 @@ simulation_test!(
             .expect("atomic-returning entity seed should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/42', X'01')",
+                "INSERT INTO lix_file (path, content) VALUES ('/42', X'01')",
                 &[],
             )
             .await
@@ -499,7 +499,7 @@ simulation_test!(
             .expect("transaction should begin");
         transaction
             .execute(
-                "INSERT INTO lix_file (path, data) \
+                "INSERT INTO lix_file (path, content) \
                  VALUES ('/successful-before-returning-error.txt', X'02')",
                 &[],
             )

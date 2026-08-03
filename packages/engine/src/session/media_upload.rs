@@ -67,17 +67,17 @@ where
     /// Up to four 16 MiB parts may complete out of order. Each request persists
     /// one manifest leaf plus its missing immutable payloads; publication folds
     /// the leaves into the root manifest atomically with ordinary file history.
-    pub async fn upsert_file_data_part(
+    pub async fn upsert_file_content_part(
         &self,
         upload_id: String,
         path: String,
         start: u64,
         total_size: u64,
-        data: Blob,
+        content: Blob,
     ) -> Result<FileUploadProgress, LixError> {
         self.ensure_open()?;
         crate::common::LixPath::try_from_file_path(&path)?;
-        validate_upload_request(&upload_id, start, total_size, data.len())?;
+        validate_upload_request(&upload_id, start, total_size, content.len())?;
         let operation_guard = self.begin_waitable_session_operation().await?;
         let state_key = upload_state_key(&upload_id)?;
         let part_number = u32::try_from(start / FILE_UPLOAD_PART_BYTES as u64)
@@ -114,14 +114,14 @@ where
             let mut writer = self
                 .binary_cas
                 .writer_skipping_existing_chunks(&read, &mut writes);
-            let chunks = if data.is_empty() {
+            let chunks = if content.is_empty() {
                 Vec::new()
             } else {
-                writer.stage_fixed_part(&data).await?
+                writer.stage_fixed_part(&content).await?
             };
             drop(writer);
             let leaf = UploadManifestLeaf {
-                part_size: data.len() as u64,
+                part_size: content.len() as u64,
                 chunks,
             };
             if let Some(UploadState::Complete(complete)) = &loaded_state {
@@ -778,7 +778,7 @@ mod tests {
         let total = (first.len() + tail.len()) as u64;
 
         let progress = first_session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "movie-proxy-1".into(),
                 "/media/proxy.mov".into(),
                 0,
@@ -791,7 +791,7 @@ mod tests {
         assert!(!progress.finalized);
         assert!(
             first_session
-                .read_file_data("/media/proxy.mov".into(), None)
+                .read_file_content("/media/proxy.mov".into(), None)
                 .await
                 .expect("read before publish")
                 .is_none()
@@ -802,7 +802,7 @@ mod tests {
             .await
             .expect("open resumed session");
         let progress = resumed_session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "movie-proxy-1".into(),
                 "/media/proxy.mov".into(),
                 FILE_UPLOAD_PART_BYTES as u64,
@@ -814,7 +814,7 @@ mod tests {
         assert!(progress.finalized);
 
         let boundary = resumed_session
-            .read_file_data(
+            .read_file_content(
                 "/media/proxy.mov".into(),
                 Some((FILE_UPLOAD_PART_BYTES as u64 - 4)..(FILE_UPLOAD_PART_BYTES as u64 + 4)),
             )
@@ -822,7 +822,7 @@ mod tests {
             .expect("range read")
             .expect("published file");
         assert_eq!(
-            boundary.data().as_ref(),
+            boundary.content().as_ref(),
             [vec![0x31; 4], vec![0x72; 4]].concat().as_slice()
         );
         let adapter = StorageAdapter::new(storage.clone());
@@ -856,7 +856,7 @@ mod tests {
             .expect("published commit id");
 
         let replay = resumed_session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "movie-proxy-1".into(),
                 "/media/proxy.mov".into(),
                 FILE_UPLOAD_PART_BYTES as u64,
@@ -879,7 +879,7 @@ mod tests {
             "a completed upload replay must not publish duplicate history",
         );
         let mismatched_replay = resumed_session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "movie-proxy-1".into(),
                 "/media/proxy.mov".into(),
                 FILE_UPLOAD_PART_BYTES as u64,
@@ -891,7 +891,7 @@ mod tests {
         assert_eq!(mismatched_replay.code, LixError::CODE_INVALID_PARAM);
 
         resumed_session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "movie-proxy-copy".into(),
                 "/media/proxy-copy.mov".into(),
                 0,
@@ -901,7 +901,7 @@ mod tests {
             .await
             .expect("stage identical first part");
         resumed_session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "movie-proxy-copy".into(),
                 "/media/proxy-copy.mov".into(),
                 FILE_UPLOAD_PART_BYTES as u64,
@@ -949,21 +949,21 @@ mod tests {
         let session = engine.open_workspace_session().await.expect("open session");
         let total_size = 4 * FILE_UPLOAD_PART_BYTES as u64;
 
-        let second = session.upsert_file_data_part(
+        let second = session.upsert_file_content_part(
             "windowed-proxy".into(),
             "/media/windowed.mov".into(),
             FILE_UPLOAD_PART_BYTES as u64,
             total_size,
             vec![0x22; FILE_UPLOAD_PART_BYTES].into(),
         );
-        let third = session.upsert_file_data_part(
+        let third = session.upsert_file_content_part(
             "windowed-proxy".into(),
             "/media/windowed.mov".into(),
             2 * FILE_UPLOAD_PART_BYTES as u64,
             total_size,
             vec![0x33; FILE_UPLOAD_PART_BYTES].into(),
         );
-        let fourth = session.upsert_file_data_part(
+        let fourth = session.upsert_file_content_part(
             "windowed-proxy".into(),
             "/media/windowed.mov".into(),
             3 * FILE_UPLOAD_PART_BYTES as u64,
@@ -1005,7 +1005,7 @@ mod tests {
         drop(read);
 
         let outside_window = session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "window-gap".into(),
                 "/media/window-gap.mov".into(),
                 4 * FILE_UPLOAD_PART_BYTES as u64,
@@ -1017,7 +1017,7 @@ mod tests {
         assert_eq!(outside_window.code, LixError::CODE_INVALID_PARAM);
 
         session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "sparse-chain".into(),
                 "/media/sparse-chain.mov".into(),
                 0,
@@ -1027,7 +1027,7 @@ mod tests {
             .await
             .expect("stage sparse-chain first part");
         session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "sparse-chain".into(),
                 "/media/sparse-chain.mov".into(),
                 4 * FILE_UPLOAD_PART_BYTES as u64,
@@ -1037,7 +1037,7 @@ mod tests {
             .await
             .expect("stage last part inside the first moving window");
         let sparse_escape = session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "sparse-chain".into(),
                 "/media/sparse-chain.mov".into(),
                 8 * FILE_UPLOAD_PART_BYTES as u64,
@@ -1049,7 +1049,7 @@ mod tests {
         assert_eq!(sparse_escape.code, LixError::CODE_INVALID_PARAM);
 
         let mismatched_active_replay = session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "windowed-proxy".into(),
                 "/media/windowed.mov".into(),
                 FILE_UPLOAD_PART_BYTES as u64,
@@ -1061,7 +1061,7 @@ mod tests {
         assert_eq!(mismatched_active_replay.code, LixError::CODE_INVALID_PARAM);
 
         let completed = session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 "windowed-proxy".into(),
                 "/media/windowed.mov".into(),
                 0,
@@ -1076,14 +1076,14 @@ mod tests {
         for (part, expected) in [0x11, 0x22, 0x33, 0x44].into_iter().enumerate() {
             let offset = part as u64 * FILE_UPLOAD_PART_BYTES as u64;
             let byte = session
-                .read_file_data(
+                .read_file_content(
                     "/media/windowed.mov".into(),
                     Some(offset..offset.saturating_add(1)),
                 )
                 .await
                 .expect("read completed part")
                 .expect("published file");
-            assert_eq!(byte.data().as_ref(), &[expected]);
+            assert_eq!(byte.content().as_ref(), &[expected]);
         }
     }
 }

@@ -829,7 +829,7 @@ where
         snapshot.directories.insert("/".to_string());
         let statements: [(&str, &[Value]); 2] = [
             ("SELECT path FROM lix_directory ORDER BY path", &[]),
-            ("SELECT path, data FROM lix_file ORDER BY path", &[]),
+            ("SELECT path, content FROM lix_file ORDER BY path", &[]),
         ];
         let batch = self
             .session
@@ -849,7 +849,7 @@ where
         }
         for row in files.rows() {
             let path = row.get::<String>("path")?;
-            let data = row.get::<Vec<u8>>("data")?;
+            let data = row.get::<Vec<u8>>("content")?;
             snapshot.files.insert(path, data);
         }
 
@@ -1883,14 +1883,14 @@ fn write_materialized_file(
 
 fn lix_file_upsert_sql(row_count: usize) -> String {
     debug_assert!(row_count > 0);
-    let mut sql = String::from("INSERT INTO lix_file (path, data) VALUES ");
+    let mut sql = String::from("INSERT INTO lix_file (path, content) VALUES ");
     for row in 0..row_count {
         if row > 0 {
             sql.push_str(", ");
         }
         let _ = write!(sql, "(${}, ${})", row * 2 + 1, row * 2 + 2);
     }
-    sql.push_str(" ON CONFLICT (path) DO UPDATE SET data = excluded.data");
+    sql.push_str(" ON CONFLICT (path) DO UPDATE SET content = excluded.content");
     sql
 }
 
@@ -2501,14 +2501,14 @@ mod tests {
     {
         let result = session
             .execute(
-                "SELECT data FROM lix_file WHERE path = $1",
+                "SELECT content FROM lix_file WHERE path = $1",
                 &[Value::Text(path.to_string())],
             )
             .await?;
         result
             .rows()
             .first()
-            .map(|row| row.get::<Vec<u8>>("data"))
+            .map(|row| row.get::<Vec<u8>>("content"))
             .transpose()
     }
 
@@ -2523,8 +2523,8 @@ mod tests {
     {
         session
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-             ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+             ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                 &[Value::Text(path.to_string()), Value::Blob(data.into())],
             )
             .await?;
@@ -2746,10 +2746,10 @@ mod tests {
     }
 
     #[test]
-    fn lix_file_upsert_sql_batches_path_data_rows() {
+    fn lix_file_upsert_sql_batches_path_content_rows() {
         assert_eq!(
             lix_file_upsert_sql(3),
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4), ($5, $6) ON CONFLICT (path) DO UPDATE SET data = excluded.data"
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2), ($3, $4), ($5, $6) ON CONFLICT (path) DO UPDATE SET content = excluded.content"
         );
     }
 
@@ -2844,7 +2844,7 @@ mod tests {
 
     #[cfg(feature = "local_filesystem")]
     #[tokio::test]
-    async fn disk_sync_does_not_skip_lix_side_file_data_change() {
+    async fn disk_sync_does_not_skip_lix_side_file_content_change() {
         let tempdir = tempfile::tempdir().unwrap();
         let layout = prepare_filesystem_layout(tempdir.path(), None).unwrap();
         let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
@@ -2948,7 +2948,7 @@ mod tests {
 
         let tracked = lix
             .execute(
-                "SELECT data FROM lix_file WHERE path = $1",
+                "SELECT content FROM lix_file WHERE path = $1",
                 &[Value::Text("/tracked.md".to_string())],
             )
             .await
@@ -2958,14 +2958,14 @@ mod tests {
                 .rows()
                 .first()
                 .unwrap()
-                .get::<Vec<u8>>("data")
+                .get::<Vec<u8>>("content")
                 .unwrap(),
             b"changed"
         );
 
         let ignored = lix
             .execute(
-                "SELECT data FROM lix_file WHERE path = $1",
+                "SELECT content FROM lix_file WHERE path = $1",
                 &[Value::Text("/ignored.md".to_string())],
             )
             .await
@@ -3000,7 +3000,7 @@ mod tests {
         let lix = crate::lix::open_lix_with_storage(storage).await.unwrap();
         let tracked = lix
             .execute(
-                "SELECT data FROM lix_file WHERE path = $1",
+                "SELECT content FROM lix_file WHERE path = $1",
                 &[Value::Text("/tracked.md".to_string())],
             )
             .await
@@ -3010,7 +3010,7 @@ mod tests {
                 .rows()
                 .first()
                 .unwrap()
-                .get::<Vec<u8>>("data")
+                .get::<Vec<u8>>("content")
                 .unwrap(),
             b"changed"
         );
@@ -3034,7 +3034,7 @@ mod tests {
         let lix = crate::lix::open_lix_with_storage(storage).await.unwrap();
 
         lix.execute(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
             &[
                 Value::Text("/.lix/app_data/test.bin".to_string()),
                 Value::Blob(b"plugin".to_vec().into()),

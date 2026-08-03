@@ -274,17 +274,17 @@ where
 {
     async fn native_batch(&self, writes: Vec<(String, Blob)>) -> u64 {
         self.session
-            .upsert_file_data_batch(writes)
+            .upsert_file_content_batch(writes)
             .await
             .expect("native component batch upsert")
     }
 
     async fn native_sequential(&self, writes: Vec<(String, Blob)>) -> u64 {
         let mut rows_affected = 0;
-        for (path, data) in writes {
+        for (path, content) in writes {
             rows_affected += self
                 .session
-                .upsert_file_data(path, data)
+                .upsert_file_content(path, content)
                 .await
                 .expect("native component sequential upsert");
         }
@@ -754,7 +754,7 @@ where
         // the later 5k-history component screen toward a pathological case.
         let file_index = commit_count % config.file_count;
         let rows_affected = session
-            .upsert_file_data(
+            .upsert_file_content(
                 corpus_path(file_index),
                 Blob::from(corpus_payload(file_index, commit_count as u64)),
             )
@@ -787,7 +787,7 @@ where
             })
             .collect::<Vec<_>>();
         let rows_affected = session
-            .upsert_file_data_batch(writes)
+            .upsert_file_content_batch(writes)
             .await
             .expect("seed direct native file batch");
         assert_eq!(rows_affected, (chunk_end - chunk_start) as u64);

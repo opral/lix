@@ -1516,7 +1516,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES \
                  ('66696c65-2d31-8000-8000-000000000000', '/66696c65-2d31-8000-8000-000000000000.txt', X'31'), \
                  ('66696c65-2d32-8000-8000-000000000000', '/66696c65-2d32-8000-8000-000000000000.txt', X'32')",

@@ -17,7 +17,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
+                "INSERT INTO lix_file (id, path, content) \
                  VALUES ('72657475-726e-896e-872d-66696c650000', '/returning-file.txt', X'6265666F7265')",
                 &[],
             )
@@ -25,7 +25,7 @@ simulation_test!(
             .expect("file fixture insert should succeed");
         let deleted_file = session
             .execute(
-                "DELETE FROM lix_file WHERE path LIKE '/returning-%' RETURNING id, data",
+                "DELETE FROM lix_file WHERE path LIKE '/returning-%' RETURNING id, content",
                 &[],
             )
             .await

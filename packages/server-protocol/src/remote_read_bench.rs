@@ -438,7 +438,7 @@ impl Seed {
                 vec![0x43; 1024 * 1024].into(),
             ),
         ]);
-        lix.upsert_file_data_batch(files)
+        lix.upsert_file_content_batch(files)
             .await
             .expect("seed benchmark files");
         seed_state_rows(&lix).await;
@@ -938,11 +938,11 @@ async fn run_direct(lix: &Lix<SlateDB>, operation: Operation) {
         }
         _ => {
             let data = lix
-                .read_file_data(operation.path(), None)
+                .read_file_content(operation.path(), None)
                 .await
                 .expect("direct file read")
                 .expect("seeded direct file")
-                .into_data();
+                .into_content();
             assert_eq!(
                 data.len(),
                 operation.payload_bytes().expect("payload operation")

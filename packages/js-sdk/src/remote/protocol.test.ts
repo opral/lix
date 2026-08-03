@@ -43,7 +43,7 @@ test("remote blobs use native typed-array base64 when available", () => {
 		expect(toBase64.mock.contexts[0]).toBe(bytes);
 
 		const decoded = decodeExecuteResult({
-			columns: ["data"],
+			columns: ["content"],
 			rows: [[{ kind: "blob", base64: "native-input" }]],
 			rowsAffected: 0,
 			notices: [],
@@ -60,7 +60,7 @@ test("remote blobs use native typed-array base64 when available", () => {
 		});
 		expect(() =>
 			decodeExecuteResult({
-				columns: ["data"],
+				columns: ["content"],
 				rows: [[{ kind: "blob", base64: "%%%" }]],
 				rowsAffected: 0,
 				notices: [],
@@ -104,7 +104,7 @@ test("remote blob base64 falls back on runtimes without native support", () => {
 			}),
 		).toEqual({ kind: "blob", base64: "AQID" });
 		const decoded = decodeExecuteResult({
-			columns: ["data"],
+			columns: ["content"],
 			rows: [[{ kind: "blob", base64: "BAUG" }]],
 			rowsAffected: 0,
 			notices: [],
@@ -136,7 +136,7 @@ test("observe blob deltas fail closed without an exact non-overlapping base", ()
 		sequence: 0,
 		mutationSequence: 0,
 		result: {
-			columns: ["data"],
+			columns: ["content"],
 			rows: [[{ kind: "blob", base64: "YWJjZGVm" }]],
 			rowsAffected: 0,
 			notices: [],

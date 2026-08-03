@@ -29,7 +29,7 @@ test("Workerd snapshots preserve exact Lix state across bindings", async () => {
 		});
 		await first.switchBranch({ branchId: SNAPSHOT_DRAFT_BRANCH_ID });
 		await first.execute(
-			"INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+			"INSERT INTO lix_file (path, content) VALUES ($1, $2)",
 			[
 				{ kind: "text", value: "/snapshot.txt" },
 				{ kind: "blob", value: null, blob: new TextEncoder().encode("saved") },
@@ -40,7 +40,7 @@ test("Workerd snapshots preserve exact Lix state across bindings", async () => {
 			[{ kind: "text", value: SNAPSHOT_DRAFT_BRANCH_ID }],
 		);
 		fileBefore = await first.execute(
-			"SELECT path, data, lixcol_change_id FROM lix_file WHERE path = '/snapshot.txt'",
+			"SELECT path, content, lixcol_change_id FROM lix_file WHERE path = '/snapshot.txt'",
 			noParams,
 		);
 		revisionBefore = await first.execute(
@@ -63,7 +63,7 @@ test("Workerd snapshots preserve exact Lix state across bindings", async () => {
 			),
 		).toEqual(branchBefore);
 		const result = await restored.execute(
-			"SELECT path, data, lixcol_change_id FROM lix_file WHERE path = '/snapshot.txt'",
+			"SELECT path, content, lixcol_change_id FROM lix_file WHERE path = '/snapshot.txt'",
 			noParams,
 		);
 		expect(result).toEqual(fileBefore);
@@ -94,7 +94,7 @@ test("Workerd executeBatch accepts nested statement parameters", async () => {
 	try {
 		const [inserted] = await lix.executeBatch([
 			{
-				sql: "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+				sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
 				params: [
 					{ kind: "text", value: "/batch.txt" },
 					{
@@ -115,7 +115,7 @@ test("Workerd executeBatch accepts nested statement parameters", async () => {
 		expect(revision).toMatchObject({ kind: "text" });
 		const [updated] = await lix.executeBatch([
 			{
-				sql: "UPDATE lix_file SET data = $1 WHERE path = $2 AND lixcol_change_id = $3",
+				sql: "UPDATE lix_file SET content = $1 WHERE path = $2 AND lixcol_change_id = $3",
 				params: [
 					{
 						kind: "blob",

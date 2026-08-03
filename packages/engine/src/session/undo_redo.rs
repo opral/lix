@@ -907,29 +907,29 @@ mod tests {
     async fn file_create_and_update_roundtrip_through_undo_redo() {
         let session = setup().await;
         session
-            .upsert_file_data("/note.txt".into(), Blob::from("one".as_bytes()))
+            .upsert_file_content("/note.txt".into(), Blob::from("one".as_bytes()))
             .await
             .expect("file creates");
         session
-            .upsert_file_data("/note.txt".into(), Blob::from("two".as_bytes()))
+            .upsert_file_content("/note.txt".into(), Blob::from("two".as_bytes()))
             .await
             .expect("file updates");
 
         session.undo().await.expect("file update undoes");
         assert_eq!(
             session
-                .read_file_data("/note.txt".into(), None)
+                .read_file_content("/note.txt".into(), None)
                 .await
                 .expect("file reads")
                 .expect("file exists")
-                .data()
+                .content()
                 .as_ref(),
             b"one"
         );
         session.undo().await.expect("file create undoes");
         assert_eq!(
             session
-                .read_file_data("/note.txt".into(), None)
+                .read_file_content("/note.txt".into(), None)
                 .await
                 .expect("file reads"),
             None
@@ -938,11 +938,11 @@ mod tests {
         session.redo().await.expect("file update redoes");
         assert_eq!(
             session
-                .read_file_data("/note.txt".into(), None)
+                .read_file_content("/note.txt".into(), None)
                 .await
                 .expect("file reads")
                 .expect("file exists")
-                .data()
+                .content()
                 .as_ref(),
             b"two"
         );
@@ -952,11 +952,11 @@ mod tests {
     async fn file_delete_roundtrips_exact_tracked_dependency_closure() {
         let session = setup().await;
         session
-            .upsert_file_data("/deleted.txt".into(), Blob::from("restored".as_bytes()))
+            .upsert_file_content("/deleted.txt".into(), Blob::from("restored".as_bytes()))
             .await
             .expect("file creates");
         session
-            .upsert_file_data("/unrelated.txt".into(), Blob::from("untouched".as_bytes()))
+            .upsert_file_content("/unrelated.txt".into(), Blob::from("untouched".as_bytes()))
             .await
             .expect("unrelated file creates");
         let files = session
@@ -1000,7 +1000,7 @@ mod tests {
             .expect("file deletes");
         assert_eq!(
             session
-                .read_file_data("/deleted.txt".into(), None)
+                .read_file_content("/deleted.txt".into(), None)
                 .await
                 .expect("deleted file reads"),
             None
@@ -1018,11 +1018,11 @@ mod tests {
         session.undo().await.expect("file deletion undoes");
         assert_eq!(
             session
-                .read_file_data("/deleted.txt".into(), None)
+                .read_file_content("/deleted.txt".into(), None)
                 .await
                 .expect("restored file reads")
                 .expect("file is restored")
-                .data()
+                .content()
                 .as_ref(),
             b"restored"
         );
@@ -1041,7 +1041,7 @@ mod tests {
         session.redo().await.expect("file deletion redoes");
         assert_eq!(
             session
-                .read_file_data("/deleted.txt".into(), None)
+                .read_file_content("/deleted.txt".into(), None)
                 .await
                 .expect("redeleted file reads"),
             None
@@ -1061,7 +1061,7 @@ mod tests {
     async fn undo_file_creation_rejects_deleting_untracked_file_state() {
         let session = setup().await;
         session
-            .upsert_file_data("/owned.txt".into(), Blob::from("tracked".as_bytes()))
+            .upsert_file_content("/owned.txt".into(), Blob::from("tracked".as_bytes()))
             .await
             .expect("file creates");
         let file = session
@@ -1089,11 +1089,11 @@ mod tests {
         assert_eq!(value(&session, "file-ui").await.as_deref(), Some("open"));
         assert_eq!(
             session
-                .read_file_data("/owned.txt".into(), None)
+                .read_file_content("/owned.txt".into(), None)
                 .await
                 .expect("file reads")
                 .expect("file remains")
-                .data()
+                .content()
                 .as_ref(),
             b"tracked"
         );

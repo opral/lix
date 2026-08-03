@@ -166,12 +166,12 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let certified_fresh_plugin_file_id =
         crate::transaction::validation::fresh_plugin_file_import_certificate(&prepared_writes)
             .is_some()
-            .then(|| prepared_writes.file_data_writes[0].file_id.clone());
+            .then(|| prepared_writes.file_content_writes[0].file_id.clone());
     let mut host_certified_file_schemas =
         BTreeMap::<String, BTreeMap<String, BTreeSet<String>>>::new();
     let mut host_certified_live_increments =
         BTreeMap::<String, BTreeMap<(String, Option<String>), u64>>::new();
-    for file in &prepared_writes.file_data_writes {
+    for file in &prepared_writes.file_content_writes {
         for batch in file.certified_entity_batches().iter().filter(|batch| {
             batch.complete_file_state
                 && matches!(
@@ -269,13 +269,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .collect::<BTreeSet<_>>();
     deleted_checkpoint_files.extend(
         prepared_writes
-            .file_data_writes
+            .file_content_writes
             .iter()
             .filter(|write| write.plugin_checkpoint().is_none())
             .map(|write| (write.branch_id.clone(), write.file_id.clone())),
     );
     for write in prepared_writes
-        .file_data_writes
+        .file_content_writes
         .iter()
         .filter(|write| write.plugin_checkpoint().is_some())
     {
@@ -285,9 +285,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let entity_columnar_write_sets =
         prepare_entity_columnar_write_sets(&state_rows, &insert_selection, entity_schema_catalog)?;
     release_validated_canonical_value_columns(&mut state_rows);
-    if !prepared_writes.file_data_writes.is_empty() {
+    if !prepared_writes.file_content_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
-        for write in &prepared_writes.file_data_writes {
+        for write in &prepared_writes.file_content_writes {
             if !write.stage_payload_at_commit() {
                 debug_assert!(write.auxiliary_payloads().is_empty());
                 continue;
@@ -311,7 +311,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             }
         }
         drop(blob_writer);
-        for write in &prepared_writes.file_data_writes {
+        for write in &prepared_writes.file_content_writes {
             if let Some(checkpoint) = write.plugin_checkpoint() {
                 crate::transaction::plugin_checkpoint::stage_current_plugin_checkpoint(
                     &mut writes,
@@ -367,7 +367,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let mut certified_packet_root_rows = BTreeMap::<CommitId, Vec<MaterializedLiveStateRow>>::new();
     let mut certified_replacement_markers = BTreeMap::<CommitId, BTreeSet<TrackedStateKey>>::new();
     for file in prepared_writes
-        .file_data_writes
+        .file_content_writes
         .iter()
         .filter(|file| !file.certified_entity_batches().is_empty())
     {
@@ -703,7 +703,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         "lix.perf.materialization.tracked_head"
     ))
     .await?;
-    for file in &prepared_writes.file_data_writes {
+    for file in &prepared_writes.file_content_writes {
         let Some(control) = staged_hot_heads.controls.get_mut(&file.branch_id) else {
             continue;
         };
@@ -742,7 +742,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .map(|commit| (commit.commit_id, commit.created_at))
         .collect::<BTreeMap<_, _>>();
     let certified_files = prepared_writes
-        .file_data_writes
+        .file_content_writes
         .iter()
         .map(|file| crate::live_state::CertifiedEntityBatchFileRef {
             branch_id: &file.branch_id,
@@ -5461,7 +5461,7 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
         .map(|row| row.branch_id.as_str())
         .chain(
             prepared_writes
-                .file_data_writes
+                .file_content_writes
                 .iter()
                 .map(|write| write.branch_id.as_str()),
         )
@@ -5851,7 +5851,7 @@ mod tests {
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
             intermediate_commits: Vec::new(),
-            file_data_writes: Vec::new(),
+            file_content_writes: Vec::new(),
         };
         for row in &rows {
             writes.remember_insert_identity_for_tests(row);
@@ -6263,7 +6263,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -6472,7 +6472,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -6510,7 +6510,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -6547,7 +6547,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -6585,7 +6585,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -6645,7 +6645,7 @@ mod tests {
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
             intermediate_commits: Vec::new(),
-            file_data_writes: Vec::new(),
+            file_content_writes: Vec::new(),
         };
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -6974,7 +6974,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7027,7 +7027,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7080,7 +7080,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7125,7 +7125,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7287,7 +7287,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7332,7 +7332,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7392,7 +7392,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7568,7 +7568,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7612,7 +7612,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7665,7 +7665,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7726,7 +7726,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7799,7 +7799,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7839,7 +7839,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -7953,7 +7953,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -8254,7 +8254,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -8325,7 +8325,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -8356,7 +8356,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -8404,7 +8404,7 @@ mod tests {
                     checkpoint_publications: Vec::new(),
                     extra_commit_parents_by_branch: BTreeMap::new(),
                     intermediate_commits: Vec::new(),
-                    file_data_writes: Vec::new(),
+                    file_content_writes: Vec::new(),
                 },
             )
             .await
@@ -8436,7 +8436,7 @@ mod tests {
                     checkpoint_publications: Vec::new(),
                     extra_commit_parents_by_branch: BTreeMap::new(),
                     intermediate_commits: Vec::new(),
-                    file_data_writes: Vec::new(),
+                    file_content_writes: Vec::new(),
                 },
             )
             .await
@@ -8482,7 +8482,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -8627,7 +8627,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
         )
         .await
@@ -8820,7 +8820,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
             true,
         )
@@ -8852,7 +8852,7 @@ mod tests {
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
                 intermediate_commits: Vec::new(),
-                file_data_writes: Vec::new(),
+                file_content_writes: Vec::new(),
             },
             true,
         )
@@ -8879,7 +8879,7 @@ mod tests {
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
             intermediate_commits: Vec::new(),
-            file_data_writes: Vec::new(),
+            file_content_writes: Vec::new(),
         }
     }
 
@@ -8925,7 +8925,7 @@ mod tests {
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
             intermediate_commits: Vec::new(),
-            file_data_writes: Vec::new(),
+            file_content_writes: Vec::new(),
         }
     }
 

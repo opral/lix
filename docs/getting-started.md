@@ -38,13 +38,13 @@ const lix = await openLix({
 Files are available through SQL and, with `LocalFilesystem`, on disk:
 
 ```ts
-await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
   "/notes/status.md",
   new TextEncoder().encode("# Status\n\nReady"),
 ]);
 
 const file = await lix.execute(
-  "SELECT path, data FROM lix_file WHERE path = $1",
+  "SELECT path, content FROM lix_file WHERE path = $1",
   ["/notes/status.md"],
 );
 ```
@@ -107,10 +107,10 @@ SQL kind, and `row.value(name).asBytes()` for a defensive copy of binary data.
 Use `asBytes()` for byte content:
 
 ```ts
-const file = await lix.execute("SELECT data FROM lix_file WHERE path = $1", [
+const file = await lix.execute("SELECT content FROM lix_file WHERE path = $1", [
   "/notes/status.md",
 ]);
-const bytes = file.rows[0]!.value("data").asBytes();
+const bytes = file.rows[0]!.value("content").asBytes();
 ```
 
 ## Isolate a change on a branch

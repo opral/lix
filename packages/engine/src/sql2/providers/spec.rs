@@ -293,7 +293,7 @@ impl DmlReturning {
 /// Extra planning inputs needed by a DML spec without making `RETURNING`
 /// behavior part of every table implementation.  Most specs ignore it; the
 /// file surface uses it to avoid loading binary blobs unless a return
-/// expression actually references `data`.
+/// expression actually references `content`.
 #[derive(Clone, Debug, Default)]
 pub(super) struct DmlPlanOptions {
     pub(super) returning_columns: BTreeSet<String>,

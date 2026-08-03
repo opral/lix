@@ -175,7 +175,7 @@ simulation_test!(
                 .expect("writer session should open"),
             &engine,
         );
-        let select_sql = "SELECT data FROM lix_file WHERE id = $1";
+        let select_sql = "SELECT content FROM lix_file WHERE id = $1";
         let params = [Value::Text(
             "66726573-682d-836e-8170-73686f742d00".to_string(),
         )];
@@ -188,7 +188,7 @@ simulation_test!(
 
         writer
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                 &[
                     Value::Text("66726573-682d-836e-8170-73686f742d00".to_string()),
                     Value::Text("/fresh-snapshot.txt".to_string()),

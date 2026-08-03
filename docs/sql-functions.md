@@ -132,9 +132,9 @@ above describe Lix surfaces rather than limiting query expressions.
 Use `TEXT` and `BYTEA` to convert between UTF-8 text and bytes:
 
 ```sql
-SELECT CAST(data AS TEXT) FROM lix_file WHERE path = '/notes/readme.md';
+SELECT CAST(content AS TEXT) FROM lix_file WHERE path = '/notes/readme.md';
 
-INSERT INTO lix_file (path, data)
+INSERT INTO lix_file (path, content)
 VALUES ('/notes/hello.txt', CAST('hello world' AS BYTEA));
 ```
 

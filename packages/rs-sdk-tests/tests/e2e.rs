@@ -271,7 +271,7 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
         .expect("workspace should reopen without compiling installed plugins");
     let result = history_lix
         .execute(
-            "SELECT data, lixcol_depth \
+            "SELECT content, lixcol_depth \
              FROM lix_file_history($1) \
              WHERE id = $2 \
              ORDER BY lixcol_depth \
@@ -302,7 +302,7 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
 }
 
 #[tokio::test]
-async fn mixed_file_data_batch_preserves_rows_staged_before_and_after_it() {
+async fn mixed_file_content_batch_preserves_rows_staged_before_and_after_it() {
     const FILE_ID: &str = "01900000-0000-7000-8000-0000000007f1";
     const PATH: &str = "/mixed-batch-order.json";
 
@@ -335,7 +335,7 @@ async fn mixed_file_data_batch_preserves_rows_staged_before_and_after_it() {
     assert_eq!(
         transaction
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                 &[
                     Value::Text(FILE_ID.to_owned()),
                     Value::Text(PATH.to_owned()),
@@ -374,7 +374,7 @@ async fn mixed_file_data_batch_preserves_rows_staged_before_and_after_it() {
     assert_eq!(
         sidecar.rows()[0].get::<serde_json::Value>("value").unwrap(),
         serde_json::json!("after"),
-        "the row staged after RowsWithFileData must remain the final replacement"
+        "the row staged after RowsWithFileContent must remain the final replacement"
     );
     let member = lix
         .execute(
@@ -525,7 +525,7 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
     let mut transaction = rollback_session.begin_transaction().await.unwrap();
     transaction
         .execute(
-            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            "UPDATE lix_file SET content = $1 WHERE path = $2",
             &[
                 Value::Blob(b"first,ROLLED-BACK\ninserted,ROLLBACK\n".to_vec().into()),
                 Value::Text(path.to_string()),
@@ -672,8 +672,8 @@ async fn v2_transport_splice_provenance_is_bound_to_the_observed_file() {
     // base proof for B and derive the complete B -> submitted-byte delta.
     lix.reset_plugin_transition_counters();
     lix.execute_with_options_and_metadata(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         &[Value::Text(path_b.to_owned()), Value::Blob(after_a_blob)],
         ExecuteOptions::default(),
         ExecuteStatementMetadata {
@@ -2921,8 +2921,8 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
     lix.reset_plugin_transition_counters();
     let warm_engine_started = Instant::now();
     lix.execute_with_options_and_metadata(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         &[Value::Text(path.to_owned()), Value::Blob(after_blob)],
         ExecuteOptions::default(),
         ExecuteStatementMetadata {
@@ -3466,7 +3466,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
         let started = Instant::now();
         let inserted = lix
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                 &[
                     Value::Text(FILE_ID.to_owned()),
                     Value::Text(FILE_PATH.to_owned()),
@@ -3555,7 +3555,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
             if let Some(file_input) = file_input {
                 let inserted = transaction
                     .execute(
-                        "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                         &[
                             Value::Text(FILE_ID.to_owned()),
                             Value::Text(FILE_PATH.to_owned()),
@@ -3826,7 +3826,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
             if plugin_lane {
                 let inserted = lix
                     .execute(
-                        "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                         &[
                             Value::Text(FILE_ID.to_owned()),
                             Value::Text(FILE_PATH.to_owned()),
@@ -3843,7 +3843,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
                     .expect("open direct CSV semantic-row transaction");
                 let inserted = transaction
                     .execute(
-                        "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                         &[
                             Value::Text(FILE_ID.to_owned()),
                             Value::Text(FILE_PATH.to_owned()),
@@ -4026,7 +4026,7 @@ async fn csv_ten_mib_universal_entity_benchmark() {
         let started = Instant::now();
         let inserted = lix
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                 &[
                     Value::Text(FILE_ID.to_owned()),
                     Value::Text(FILE_PATH.to_owned()),
@@ -4229,7 +4229,7 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
             let started = Instant::now();
             let inserted = lix
                 .execute(
-                    "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                    "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                     &[
                         Value::Text(FILE_ID.to_owned()),
                         Value::Text(FILE_PATH.to_owned()),
@@ -5971,13 +5971,13 @@ async fn v2_json_entity_write_rollback_keeps_original_bytes_and_actor() {
         .unwrap();
     let staged = transaction
         .execute(
-            "SELECT data FROM lix_file WHERE id = $1",
+            "SELECT content FROM lix_file WHERE id = $1",
             &[Value::Text(file_id.clone())],
         )
         .await
         .unwrap();
     assert_eq!(
-        staged.rows()[0].get::<Vec<u8>>("data").unwrap(),
+        staged.rows()[0].get::<Vec<u8>>("content").unwrap(),
         b"{\"value\":\"rolled-back\"}\n"
     );
     transaction.rollback().await.unwrap();
@@ -6065,7 +6065,7 @@ async fn same_base_json_file_edits_compose_disjoint_semantics_without_resolution
     let mut second_transaction = second.begin_transaction().await.unwrap();
     first_transaction
         .execute(
-            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            "UPDATE lix_file SET content = $1 WHERE path = $2",
             &[
                 Value::Blob(b"{\"a\":\"first\",\"b\":\"base\"}\n".to_vec().into()),
                 Value::Text(path.to_owned()),
@@ -6075,7 +6075,7 @@ async fn same_base_json_file_edits_compose_disjoint_semantics_without_resolution
         .unwrap();
     second_transaction
         .execute(
-            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            "UPDATE lix_file SET content = $1 WHERE path = $2",
             &[
                 Value::Blob(b"{\"a\":\"base\",\"b\":\"second\"}\n".to_vec().into()),
                 Value::Text(path.to_owned()),
@@ -6123,7 +6123,7 @@ async fn stale_json_transaction_renders_retained_same_file_edits_with_resolution
     let mut winner = winner_client.begin_transaction().await.unwrap();
     stale
         .execute(
-            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            "UPDATE lix_file SET content = $1 WHERE path = $2",
             &[
                 Value::Blob(
                     b"{\"overlap\":\"stale\",\"retained\":\"stale\"}\n"
@@ -6137,7 +6137,7 @@ async fn stale_json_transaction_renders_retained_same_file_edits_with_resolution
         .unwrap();
     winner
         .execute(
-            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            "UPDATE lix_file SET content = $1 WHERE path = $2",
             &[
                 Value::Blob(
                     b"{\"overlap\":\"winner\",\"retained\":\"base\"}\n"
@@ -6203,7 +6203,7 @@ async fn stale_json_transaction_batches_conflicts_into_one_render_transition() {
         );
         transaction
             .execute(
-                "UPDATE lix_file SET data = $1 WHERE path = $2",
+                "UPDATE lix_file SET content = $1 WHERE path = $2",
                 &[
                     Value::Blob(
                         serde_json::to_vec(&changed)
@@ -6277,7 +6277,7 @@ async fn stale_plugin_replay_batch_benchmark_probe() {
         for (transaction, value) in [(&mut stale, "stale"), (&mut winner, "winner")] {
             transaction
                 .execute(
-                    "UPDATE lix_file SET data = $1 WHERE path = $2",
+                    "UPDATE lix_file SET content = $1 WHERE path = $2",
                     &[
                         Value::Blob(serde_json::to_vec(&document(value)).unwrap().into()),
                         Value::Text(path.clone()),
@@ -6377,7 +6377,7 @@ async fn same_base_transactions_resolve_reference_plugin_file_overlaps() {
         ] {
             transaction
                 .execute(
-                    "UPDATE lix_file SET data = $1 WHERE path = $2",
+                    "UPDATE lix_file SET content = $1 WHERE path = $2",
                     &[Value::Blob(bytes.into()), Value::Text(path.clone())],
                 )
                 .await
@@ -6436,7 +6436,7 @@ async fn v2_json_rejects_mixed_byte_and_entity_transitions_in_one_transaction() 
     let mut transaction = lix.begin_transaction().await.unwrap();
     transaction
         .execute(
-            "UPDATE lix_file SET data = $1 WHERE path = $2",
+            "UPDATE lix_file SET content = $1 WHERE path = $2",
             &[
                 Value::Blob(bytes_only.clone().into()),
                 Value::Text(path.to_string()),
@@ -7734,7 +7734,7 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
 
     let stale_error = stale
         .execute(
-            "UPDATE lix_file SET data = $1 WHERE id = $2",
+            "UPDATE lix_file SET content = $1 WHERE id = $2",
             &[
                 Value::Blob(b"first,STALE\nsecond,two\n".to_vec().into()),
                 Value::Text(file_id.clone()),
@@ -7800,7 +7800,7 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
 }
 
 #[tokio::test]
-async fn transaction_lix_file_data_uses_session_plugin_runtime() {
+async fn transaction_lix_file_content_uses_session_plugin_runtime() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
@@ -7829,7 +7829,7 @@ async fn transaction_lix_file_data_uses_session_plugin_runtime() {
     let mut tx = lix.begin_transaction().await.unwrap();
     let files = tx
         .execute(
-            "SELECT data FROM lix_file WHERE id = $1",
+            "SELECT content FROM lix_file WHERE id = $1",
             &[Value::Text(file_id)],
         )
         .await
@@ -8165,8 +8165,8 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         &[Value::Text(path.to_string()), Value::Blob(data.into())],
     )
     .await?;
@@ -8183,8 +8183,8 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute_with_options_and_metadata(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         &[Value::Text(path.to_string()), Value::Blob(data.into())],
         ExecuteOptions::default(),
         ExecuteStatementMetadata {
@@ -8205,14 +8205,14 @@ where
 {
     let result = lix
         .execute(
-            "SELECT data FROM lix_file WHERE path = $1",
+            "SELECT content FROM lix_file WHERE path = $1",
             &[Value::Text(path.to_string())],
         )
         .await?;
     result
         .rows()
         .first()
-        .map(|row| row.get::<Vec<u8>>("data"))
+        .map(|row| row.get::<Vec<u8>>("content"))
         .transpose()
 }
 
@@ -8227,7 +8227,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let archives = lix
-        .execute("SELECT path, data FROM lix_file ORDER BY path", &[])
+        .execute("SELECT path, content FROM lix_file ORDER BY path", &[])
         .await
         .unwrap();
     archives
@@ -8239,7 +8239,7 @@ where
                 return None;
             }
             Some(plugin_info_from_archive(
-                row.get::<Vec<u8>>("data").unwrap(),
+                row.get::<Vec<u8>>("content").unwrap(),
             ))
         })
         .collect()

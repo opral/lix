@@ -1869,8 +1869,9 @@ fn build_replay_commit_statements(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let sql =
-            format!("INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES {values_sql}");
+        let sql = format!(
+            "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES {values_sql}"
+        );
         statements.push(SqlStatement { sql, params });
     }
 
@@ -1892,8 +1893,8 @@ fn build_replay_commit_statements(
             .join(", ");
         statements.push(SqlStatement {
             sql: format!(
-                "INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES {values_sql} \
-                 ON CONFLICT(id) DO UPDATE SET data = excluded.data, \
+                "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES {values_sql} \
+                 ON CONFLICT(id) DO UPDATE SET content = excluded.content, \
                  lixcol_metadata = excluded.lixcol_metadata"
             ),
             params,
@@ -1999,7 +2000,7 @@ where
         let batch = &expected[offset..end];
         let placeholders = vec!["?"; batch.len()].join(", ");
         let sql = format!(
-            "SELECT path, data, lixcol_metadata FROM lix_file WHERE path IN ({placeholders})"
+            "SELECT path, content, lixcol_metadata FROM lix_file WHERE path IN ({placeholders})"
         );
         let params = batch
             .iter()
@@ -2303,7 +2304,7 @@ where
     ];
     for (key, archive) in plugins {
         db::block_on(lix.execute(
-            "INSERT INTO lix_file (path, data) VALUES (?, ?)",
+            "INSERT INTO lix_file (path, content) VALUES (?, ?)",
             &[
                 Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
                 Value::Blob(archive.into()),
@@ -2680,7 +2681,7 @@ mod tests {
                 .get(git_sha)
                 .unwrap_or_else(|| panic!("missing Lix commit for Git version {version_index}"));
             let historical = db::block_on(lix.execute(
-                "SELECT data FROM lix_file_history(?) \
+                "SELECT content FROM lix_file_history(?) \
                  WHERE path = '/asset.bin' AND lixcol_depth = 0 AND NOT lixcol_is_deleted",
                 &[Value::Text(lix_commit.clone())],
             ))
@@ -3048,7 +3049,7 @@ mod tests {
         assert_eq!(statements.len(), 1);
         assert_eq!(
             statements[0].sql,
-            "INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data, lixcol_metadata = excluded.lixcol_metadata"
+            "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET content = excluded.content, lixcol_metadata = excluded.lixcol_metadata"
         );
         assert_eq!(
             statements[0].params,
@@ -3085,7 +3086,7 @@ mod tests {
         );
         assert_eq!(
             statements[1].sql,
-            "INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES (?, ?, ?, ?)"
+            "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES (?, ?, ?, ?)"
         );
         assert_eq!(
             statements[1].params,
@@ -3595,7 +3596,7 @@ mod tests {
         for (index, expected) in expected_final.iter().enumerate() {
             let path = format!("/bulk-{index:02}.txt");
             let file_rows = db::block_on(lix.execute(
-                "SELECT data FROM lix_file WHERE path = ?",
+                "SELECT content FROM lix_file WHERE path = ?",
                 &[Value::Text(path.clone())],
             ))
             .expect("reopened rendered text file should query");
@@ -3695,7 +3696,7 @@ mod tests {
         let lix = db::block_on(open_lix_with_storage(storage))
             .expect("replay Lix should reopen with installed plugin");
         let file_rows = db::block_on(lix.execute(
-            "SELECT data FROM lix_file WHERE path = ?",
+            "SELECT content FROM lix_file WHERE path = ?",
             &[Value::Text("/src/index.ts".to_string())],
         ))
         .expect("replayed text file should query");

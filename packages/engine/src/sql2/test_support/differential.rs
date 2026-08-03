@@ -486,7 +486,7 @@ mod tests {
                 ProbeQuery {
                     name: format!("lix_file:{paths:?}"),
                     sql: format!(
-                        "SELECT path, data \
+                        "SELECT path, content \
                          FROM lix_file \
                          WHERE path IN ({placeholders}) \
                          ORDER BY path"

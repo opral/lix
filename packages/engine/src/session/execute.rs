@@ -123,19 +123,19 @@ pub struct CoherentReadBatch {
 /// session API or exposing CAS chunks to callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRead {
-    data: Blob,
+    content: Blob,
     total_size: u64,
     range: Range<u64>,
     content_identity: String,
 }
 
 impl FileRead {
-    pub fn data(&self) -> &Blob {
-        &self.data
+    pub fn content(&self) -> &Blob {
+        &self.content
     }
 
-    pub fn into_data(self) -> Blob {
-        self.data
+    pub fn into_content(self) -> Blob {
+        self.content
     }
 
     pub fn total_size(&self) -> u64 {
@@ -586,17 +586,17 @@ enum IdempotencyReceiptResolution {
 
 // Keep the single-file legacy-topology fallback semantically identical to the
 // public `lix_file` upsert. Batch writes intentionally stay direct-only.
-const NATIVE_FILE_UPSERT_SQL: &str = "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-    ON CONFLICT (path) DO UPDATE SET data = excluded.data";
+const NATIVE_FILE_UPSERT_SQL: &str = "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+    ON CONFLICT (path) DO UPDATE SET content = excluded.content";
 
 fn validate_native_file_upsert_batch(writes: &[(String, Blob)]) -> Result<(), LixError> {
     if writes.is_empty() {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
-            "upsert_file_data_batch requires at least one file",
+            "upsert_file_content_batch requires at least one file",
         )
         .with_details(serde_json::json!({
-            "operation": "upsertFileDataBatch",
+            "operation": "upsertFileContentBatch",
             "argument": "writes",
             "expected": "non-empty array",
         })));
@@ -612,10 +612,10 @@ fn validate_native_file_upsert_batch(writes: &[(String, Blob)]) -> Result<(), Li
         if !paths.insert(path.as_str()) {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                format!("upsert_file_data_batch contains duplicate path '{path}'"),
+                format!("upsert_file_content_batch contains duplicate path '{path}'"),
             )
             .with_details(serde_json::json!({
-                "operation": "upsertFileDataBatch",
+                "operation": "upsertFileContentBatch",
                 "argument": "writes",
                 "path": path,
                 "expected": "unique file paths",
@@ -761,7 +761,7 @@ where
     /// This stays separate from the batch API so the established one-file
     /// transfer path does not pay for batch-vector allocation or duplicate
     /// validation.
-    pub async fn upsert_file_data(&self, path: String, data: Blob) -> Result<u64, LixError> {
+    pub async fn upsert_file_content(&self, path: String, content: Blob) -> Result<u64, LixError> {
         self.ensure_open()?;
         // Preserve the public filesystem path contract before entering a
         // write transaction. The lower-level fast helper maps this validation
@@ -778,8 +778,8 @@ where
                 // second allocation or a second transaction.
                 let fast_path = sql2::execute_fast_lix_file_path_writes(
                     transaction,
-                    vec![(path.clone(), data.clone(), None, None)],
-                    sql2::FastLixFilePathWriteConflict::UpdateData,
+                    vec![(path.clone(), content.clone(), None, None)],
+                    sql2::FastLixFilePathWriteConflict::UpdateContent,
                     None,
                 )
                 .await?;
@@ -797,7 +797,7 @@ where
                 sql2::execute_write_logical_plan_result_with_metadata(
                     transaction,
                     plan,
-                    &[Value::Text(path), Value::Blob(data)],
+                    &[Value::Text(path), Value::Blob(content)],
                     &ExecuteStatementMetadata::default(),
                 )
                 .await
@@ -814,7 +814,7 @@ where
     /// opened. This is deliberately a direct filesystem write: if the path
     /// index cannot route an exceptional layout unambiguously, the batch is
     /// rejected instead of copying the complete payload into a SQL fallback.
-    pub async fn upsert_file_data_batch(
+    pub async fn upsert_file_content_batch(
         &self,
         writes: Vec<(String, Blob)>,
     ) -> Result<u64, LixError> {
@@ -826,19 +826,19 @@ where
                     transaction,
                     writes
                         .into_iter()
-                        .map(|(path, data)| (path, data, None, None))
+                        .map(|(path, content)| (path, content, None, None))
                         .collect(),
-                    sql2::FastLixFilePathWriteConflict::UpdateData,
+                    sql2::FastLixFilePathWriteConflict::UpdateContent,
                     None,
                 )
                 .await?
                 .ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
-                        "upsert_file_data_batch requires a filesystem layout that its direct path index can route unambiguously",
+                        "upsert_file_content_batch requires a filesystem layout that its direct path index can route unambiguously",
                     )
                     .with_details(serde_json::json!({
-                        "operation": "upsertFileDataBatch",
+                        "operation": "upsertFileContentBatch",
                         "expected": "a filesystem layout that the direct path index can route unambiguously",
                     }))
                 })
@@ -850,9 +850,9 @@ where
     ///
     /// This is the structured file-transfer read path. It uses the same
     /// active-branch file selection, plugin rendering, and session file-view
-    /// acknowledgement as `SELECT data FROM lix_file WHERE path = $1`, while
+    /// acknowledgement as `SELECT content FROM lix_file WHERE path = $1`, while
     /// avoiding SQL parsing, planning, and a JSON-shaped result envelope.
-    pub fn read_file_data(
+    pub fn read_file_content(
         &self,
         path: String,
         requested_range: Option<Range<u64>>,
@@ -860,10 +860,10 @@ where
         // SAFETY: the read future owns its path/range and retains only shared
         // references to this Sync session. Rustc cannot prove the Send bound
         // through the higher-ranked scoped SQL-read closure.
-        unsafe { super::AssumeSendFuture::new(self.read_file_data_inner(path, requested_range)) }
+        unsafe { super::AssumeSendFuture::new(self.read_file_content_inner(path, requested_range)) }
     }
 
-    async fn read_file_data_inner(
+    async fn read_file_content_inner(
         &self,
         path: String,
         requested_range: Option<Range<u64>>,
@@ -880,7 +880,7 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        let (data, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _>(
+        let (content, file_view_mutations) = with_static_session_sql_read::<StorageImpl, _, _>(
             read_scope,
             |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| async move {
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
@@ -894,7 +894,7 @@ where
                 let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
                     Arc::new(self.binary_cas.reader(read_store));
                 // A raw file download delivers the same bytes as a direct
-                // `lix_file.data` read, so it must acknowledge rendered
+                // `lix_file.content` read, so it must acknowledge rendered
                 // plugin state for subsequent collaborative writes.
                 let file_view_collector = sql2::SessionFileViews::default();
                 let result = sql2::execute_exact_lix_file_batch_read(
@@ -910,13 +910,13 @@ where
                     requested_range.clone(),
                 )
                 .await?;
-                let data = native_file_read_from_exact_result(result, &paths, requested_range)?;
-                Ok((data, file_view_collector.plugin_file_mutations()))
+                let content = native_file_read_from_exact_result(result, &paths, requested_range)?;
+                Ok((content, file_view_collector.plugin_file_mutations()))
             },
         )
         .await?;
         self.file_views.apply_mutations(file_view_mutations);
-        Ok(data)
+        Ok(content)
     }
 
     pub(crate) async fn execute_for_observe(
@@ -1031,16 +1031,16 @@ where
         }
 
         let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
-        let late_file_data_read = exact_filesystem_read
+        let late_file_content_read = exact_filesystem_read
             .is_none()
-            .then(|| late_materialized_lix_file_data_read(&statement))
+            .then(|| late_materialized_lix_file_content_read(&statement))
             .flatten();
-        let acknowledge_file_views = is_acknowledgeable_file_data_read(&statement, params)
+        let acknowledge_file_views = is_acknowledgeable_file_content_read(&statement, params)
             || matches!(
                 &exact_filesystem_read,
-                Some(ExactFilesystemRead::PathDataBatch(_))
+                Some(ExactFilesystemRead::PathContentBatch(_))
             )
-            || late_file_data_read.is_some();
+            || late_file_content_read.is_some();
         let has_durable_runtime_function = sql2::statement_has_durable_runtime_function(&statement);
         let runtime_write_access = if has_durable_runtime_function {
             let write_access = self.begin_session_write_access().await?;
@@ -1076,7 +1076,7 @@ where
                     params,
                     acknowledge_file_views,
                     exact_filesystem_read,
-                    late_file_data_read,
+                    late_file_content_read,
                     has_durable_runtime_function,
                 )
                 .await
@@ -1716,7 +1716,7 @@ where
         parsed: Vec<datafusion::sql::parser::Statement>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let acknowledge_file_views = parsed.iter().zip(statements).all(|(parsed, statement)| {
-            is_acknowledgeable_file_data_read(parsed, &statement.params)
+            is_acknowledgeable_file_content_read(parsed, &statement.params)
         });
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let read_scope = self
@@ -1838,7 +1838,7 @@ where
         let acknowledge_file_views = parsed
             .iter()
             .zip(statements)
-            .all(|(parsed, (_, params))| is_acknowledgeable_file_data_read(parsed, params));
+            .all(|(parsed, (_, params))| is_acknowledgeable_file_content_read(parsed, params));
 
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let read_scope = self
@@ -2034,7 +2034,7 @@ where
         params: &[Value],
         acknowledge_file_views: bool,
         exact_filesystem_read: Option<ExactFilesystemRead>,
-        late_file_data_read: Option<LateMaterializedLixFileDataRead>,
+        late_file_content_read: Option<LateMaterializedLixFileContentRead>,
         has_durable_runtime_function: bool,
     ) -> Result<
         (
@@ -2104,7 +2104,7 @@ where
                             )
                             .await?
                         }
-                        ExactFilesystemRead::PathDataBatch(paths) => {
+                        ExactFilesystemRead::PathContentBatch(paths) => {
                             sql2::execute_exact_lix_file_batch_read(
                                 &active_branch_id,
                                 live_state,
@@ -2134,7 +2134,7 @@ where
                         }
                         ExactFilesystemRead::RootFileListing
                         | ExactFilesystemRead::RootDirectoryListing => unreachable!(
-                            "root filesystem listings handled before file data readers"
+                            "root filesystem listings handled before file content readers"
                         ),
                     }
                 }
@@ -2163,7 +2163,7 @@ where
         let functions = runtime_functions
             .as_ref()
             .map_or_else(FunctionProviderHandle::system, FunctionContext::provider);
-        let (statement, late_file_data_column) = match late_file_data_read {
+        let (statement, late_file_content_column) = match late_file_content_read {
             Some(plan) => (*plan.statement, Some(plan.data_column_index)),
             None => (statement, None),
         };
@@ -2183,14 +2183,14 @@ where
         let mut query =
             sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params).await?;
         drop(ctx);
-        if let Some(data_column_index) = late_file_data_column {
+        if let Some(data_column_index) = late_file_content_column {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                 Arc::new(self.live_state.reader(read_store.clone()));
             let branch_ref: Arc<dyn BranchRefReader> =
                 Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
             let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
                 Arc::new(self.binary_cas.reader(read_store));
-            hydrate_lix_file_data_result(
+            hydrate_lix_file_content_result(
                 &active_branch_id,
                 Arc::clone(&live_state),
                 filesystem_path_index,
@@ -2223,14 +2223,14 @@ fn native_file_read_from_exact_result(
     requested_range: Option<Range<u64>>,
 ) -> Result<Option<FileRead>, LixError> {
     if requested_range.is_none() {
-        return native_file_data_from_exact_result(result, requested_paths)?
+        return native_file_content_from_exact_result(result, requested_paths)?
             .map(|data| materialize_file_read(data, None))
             .transpose();
     }
     if result.columns.as_slice()
         != [
             "path",
-            "data",
+            "content",
             "total_size",
             "range_start",
             "range_end",
@@ -2300,18 +2300,18 @@ fn native_file_read_from_exact_result(
         )
     })?;
     Ok(Some(FileRead {
-        data,
+        content: data,
         total_size,
         range: range_start..range_end,
         content_identity: std::mem::take(content_identity),
     }))
 }
 
-fn native_file_data_from_exact_result(
+fn native_file_content_from_exact_result(
     result: SqlQueryResult,
     requested_paths: &BTreeSet<String>,
 ) -> Result<Option<Blob>, LixError> {
-    if result.columns.as_slice() != ["path", "data"] {
+    if result.columns.as_slice() != ["path", "content"] {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "native file read returned an unexpected result schema",
@@ -2339,8 +2339,8 @@ fn native_file_data_from_exact_result(
             "native file read returned an unrequested path",
         ));
     }
-    let data = match std::mem::replace(data, Value::Null) {
-        Value::Blob(data) => data,
+    let content = match std::mem::replace(data, Value::Null) {
+        Value::Blob(content) => content,
         // A path-only `lix_file` row is a present empty file on the public
         // surface. Preserve that contract even if a storage layout represents
         // it as SQL NULL internally.
@@ -2352,7 +2352,7 @@ fn native_file_data_from_exact_result(
             ));
         }
     };
-    Ok(Some(data))
+    Ok(Some(content))
 }
 
 fn materialize_file_read(
@@ -2389,7 +2389,7 @@ fn materialize_file_read(
         .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "file read range is too large"))?;
     let data = Blob::from(data.as_bytes().slice(start..end));
     Ok(FileRead {
-        data,
+        content: data,
         total_size,
         range,
         content_identity,
@@ -2421,7 +2421,7 @@ fn validate_execute_statement_metadata(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn hydrate_lix_file_data_result(
+async fn hydrate_lix_file_content_result(
     active_branch_id: &str,
     live_state: Arc<dyn crate::live_state::LiveStateReader>,
     filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
@@ -2437,7 +2437,7 @@ async fn hydrate_lix_file_data_result(
         let Some(Value::Text(path)) = row.get(data_column_index) else {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "late lix_file data placeholder was not a path",
+                "late lix_file content placeholder was not a path",
             ));
         };
         paths.insert(path.clone());
@@ -2464,7 +2464,7 @@ async fn hydrate_lix_file_data_result(
         let [Value::Text(path), data] = row.as_mut_slice() else {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "late lix_file data hydration returned an invalid row",
+                "late lix_file content hydration returned an invalid row",
             ));
         };
         data_by_path.insert(path.clone(), std::mem::replace(data, Value::Null));
@@ -2475,19 +2475,19 @@ async fn hydrate_lix_file_data_result(
         let Some(placeholder) = row.get_mut(data_column_index) else {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "late lix_file data result was missing its placeholder column",
+                "late lix_file content result was missing its placeholder column",
             ));
         };
         let Value::Text(path) = std::mem::replace(placeholder, Value::Null) else {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "late lix_file data placeholder was not a path",
+                "late lix_file content placeholder was not a path",
             ));
         };
         *placeholder = data_by_path.remove(&path).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("late lix_file data hydration did not return '{path}'"),
+                format!("late lix_file content hydration did not return '{path}'"),
             )
         })?;
     }
@@ -3036,7 +3036,7 @@ where
 ///
 /// This intentionally recognizes a narrow, predictable MVP surface. False
 /// negatives merely preserve an omitted entity; false positives can lose one.
-fn is_acknowledgeable_file_data_read(statement: &DataFusionStatement, params: &[Value]) -> bool {
+fn is_acknowledgeable_file_content_read(statement: &DataFusionStatement, params: &[Value]) -> bool {
     let Some(point_read) = simple_point_read(statement) else {
         return false;
     };
@@ -3048,7 +3048,7 @@ fn is_acknowledgeable_file_data_read(statement: &DataFusionStatement, params: &[
                 | SelectItem::ExprWithAlias {
                     expr: expression,
                     ..
-                } if direct_column_name(expression).as_deref() == Some("data")
+                } if direct_column_name(expression).as_deref() == Some("content")
         )
     }) {
         return false;
@@ -3215,17 +3215,17 @@ fn simple_point_read(statement: &DataFusionStatement) -> Option<SimplePointRead<
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LateMaterializedLixFileDataRead {
+struct LateMaterializedLixFileContentRead {
     statement: Box<DataFusionStatement>,
     data_column_index: usize,
 }
 
-/// Defers an unchanged `lix_file.data` projection until DataFusion has applied
+/// Defers an unchanged `lix_file.content` projection until DataFusion has applied
 /// metadata predicates, ordering, and limits. This keeps SQL semantics in
 /// DataFusion while preventing large file bytes from entering Arrow at all.
-fn late_materialized_lix_file_data_read(
+fn late_materialized_lix_file_content_read(
     statement: &DataFusionStatement,
-) -> Option<LateMaterializedLixFileDataRead> {
+) -> Option<LateMaterializedLixFileContentRead> {
     let simple = simple_single_table_select(statement)?;
     if simple.table_name != "lix_file"
         || !simple.unqualified_unquoted_table
@@ -3260,12 +3260,12 @@ fn late_materialized_lix_file_data_read(
             SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => return None,
         };
         let projected_column = direct_projection_identifier(expression)?;
-        if identifier_matches(projected_column, "data") {
+        if identifier_matches(projected_column, "content") {
             if data_column_index.is_some() {
                 return None;
             }
             let (path_expression, output_name) =
-                replaceable_lix_file_data_projection(item, &qualifier)?;
+                replaceable_lix_file_content_projection(item, &qualifier)?;
             *item = SelectItem::ExprWithAlias {
                 expr: path_expression,
                 alias: output_name.clone(),
@@ -3280,7 +3280,7 @@ fn late_materialized_lix_file_data_read(
     if select
         .selection
         .as_ref()
-        .is_some_and(|selection| expression_mentions_column(selection, "data"))
+        .is_some_and(|selection| expression_mentions_column(selection, "content"))
     {
         return None;
     }
@@ -3294,19 +3294,19 @@ fn late_materialized_lix_file_data_read(
         if expressions.iter().any(|order| {
             order.with_fill.is_some()
                 || direct_column_name(&order.expr)
-                    .is_none_or(|column| column == "data" || column == data_output_name)
+                    .is_none_or(|column| column == "content" || column == data_output_name)
         }) {
             return None;
         }
     }
 
-    Some(LateMaterializedLixFileDataRead {
+    Some(LateMaterializedLixFileContentRead {
         statement: Box::new(statement),
         data_column_index,
     })
 }
 
-fn replaceable_lix_file_data_projection(
+fn replaceable_lix_file_content_projection(
     item: &SelectItem,
     qualifier: &Ident,
 ) -> Option<(Expr, Ident)> {
@@ -3318,13 +3318,13 @@ fn replaceable_lix_file_data_projection(
         SelectItem::ExprWithAlias { expr, alias } => (expr, alias.clone()),
         SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => return None,
     };
-    let path_expression = direct_file_data_path_expression(expression, qualifier)?;
+    let path_expression = direct_file_content_path_expression(expression, qualifier)?;
     Some((path_expression, output_name))
 }
 
-fn direct_file_data_path_expression(expression: &Expr, qualifier: &Ident) -> Option<Expr> {
+fn direct_file_content_path_expression(expression: &Expr, qualifier: &Ident) -> Option<Expr> {
     match expression {
-        Expr::Identifier(identifier) if identifier_matches(identifier, "data") => {
+        Expr::Identifier(identifier) if identifier_matches(identifier, "content") => {
             let mut path = identifier.clone();
             path.value = "path".to_string();
             Some(Expr::Identifier(path))
@@ -3334,7 +3334,7 @@ fn direct_file_data_path_expression(expression: &Expr, qualifier: &Ident) -> Opt
                 return None;
             };
             if !identifiers_match(expression_qualifier, qualifier)
-                || !identifier_matches(identifier, "data")
+                || !identifier_matches(identifier, "content")
             {
                 return None;
             }
@@ -3401,7 +3401,7 @@ enum ExactFilesystemRead {
     RootFileListing,
     RootDirectoryListing,
     Point(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn),
-    PathDataBatch(BTreeSet<String>),
+    PathContentBatch(BTreeSet<String>),
     IdManifestBatch(BTreeSet<String>),
 }
 
@@ -3423,8 +3423,8 @@ fn exact_filesystem_read_route(
     if point_read.table_name != "lix_file" || !point_read.exact_table_shape {
         return None;
     }
-    exact_path_data_batch(point_read.select, params)
-        .map(ExactFilesystemRead::PathDataBatch)
+    exact_path_content_batch(point_read.select, params)
+        .map(ExactFilesystemRead::PathContentBatch)
         .or_else(|| {
             exact_id_manifest_batch(point_read.select, params)
                 .map(ExactFilesystemRead::IdManifestBatch)
@@ -3529,7 +3529,7 @@ fn exact_lix_file_point_read(
         return None;
     }
     let column = match projection.value.to_ascii_lowercase().as_str() {
-        "data" => sql2::ExactLixFileReadColumn::Data,
+        "content" => sql2::ExactLixFileReadColumn::Content,
         "lixcol_change_id" => sql2::ExactLixFileReadColumn::ChangeId,
         _ => return None,
     };
@@ -3546,16 +3546,16 @@ fn exact_lix_file_point_read(
 /// Recognizes the exact batch download shape used by Lixray. Keeping the
 /// projection and numbered placeholders strict makes the direct result path
 /// equivalent to the DataFusion query without reimplementing general SQL.
-fn exact_path_data_batch(select: &Select, params: &[Value]) -> Option<BTreeSet<String>> {
+fn exact_path_content_batch(select: &Select, params: &[Value]) -> Option<BTreeSet<String>> {
     let [
         SelectItem::UnnamedExpr(path_projection),
-        SelectItem::UnnamedExpr(data_projection),
+        SelectItem::UnnamedExpr(content_projection),
     ] = select.projection.as_slice()
     else {
         return None;
     };
     if exact_point_column(path_projection).as_deref() != Some("path")
-        || exact_point_column(data_projection).as_deref() != Some("data")
+        || exact_point_column(content_projection).as_deref() != Some("content")
     {
         return None;
     }
@@ -3601,7 +3601,7 @@ fn exact_id_manifest_batch(select: &Select, params: &[Value]) -> Option<BTreeSet
     let [
         SelectItem::UnnamedExpr(id_projection),
         SelectItem::UnnamedExpr(path_projection),
-        SelectItem::UnnamedExpr(data_projection),
+        SelectItem::UnnamedExpr(content_projection),
         SelectItem::UnnamedExpr(metadata_projection),
     ] = select.projection.as_slice()
     else {
@@ -3609,7 +3609,7 @@ fn exact_id_manifest_batch(select: &Select, params: &[Value]) -> Option<BTreeSet
     };
     if exact_point_column(id_projection).as_deref() != Some("id")
         || exact_point_column(path_projection).as_deref() != Some("path")
-        || exact_point_column(data_projection).as_deref() != Some("data")
+        || exact_point_column(content_projection).as_deref() != Some("content")
         || exact_point_column(metadata_projection).as_deref() != Some("lixcol_metadata")
     {
         return None;
@@ -4280,7 +4280,8 @@ mod tests {
             Some(ExactFilesystemRead::RootDirectoryListing)
         );
 
-        let data_by_id = sql2::parse_statement("SELECT data FROM lix_file WHERE id = $1").unwrap();
+        let data_by_id =
+            sql2::parse_statement("SELECT content FROM lix_file WHERE id = $1").unwrap();
         assert_eq!(
             exact_filesystem_read_route(
                 &data_by_id,
@@ -4292,7 +4293,7 @@ mod tests {
                 sql2::ExactLixFileReadSelector::Id(
                     "01920000-0000-7000-8000-0000000000a2".to_string()
                 ),
-                sql2::ExactLixFileReadColumn::Data,
+                sql2::ExactLixFileReadColumn::Content,
             ))
         );
 
@@ -4307,7 +4308,7 @@ mod tests {
         );
 
         let data_by_paths =
-            sql2::parse_statement("SELECT path, data FROM lix_file WHERE path IN ($1, $2, $3)")
+            sql2::parse_statement("SELECT path, content FROM lix_file WHERE path IN ($1, $2, $3)")
                 .unwrap();
         assert_eq!(
             exact_filesystem_read_route(
@@ -4318,14 +4319,14 @@ mod tests {
                     Value::Text("/b.txt".to_string()),
                 ],
             ),
-            Some(ExactFilesystemRead::PathDataBatch(BTreeSet::from([
+            Some(ExactFilesystemRead::PathContentBatch(BTreeSet::from([
                 "/a.txt".to_string(),
                 "/b.txt".to_string(),
             ])))
         );
 
         let manifests_by_id = sql2::parse_statement(
-            "SELECT id, path, data, lixcol_metadata FROM lix_file WHERE id IN ($1, $2)",
+            "SELECT id, path, content, lixcol_metadata FROM lix_file WHERE id IN ($1, $2)",
         )
         .unwrap();
         assert_eq!(
@@ -4390,35 +4391,35 @@ mod tests {
                 vec![Value::Text("unused".to_string())],
             ),
             (
-                "SELECT data, path FROM lix_file WHERE path IN ($1, $2)",
+                "SELECT content, path FROM lix_file WHERE path IN ($1, $2)",
                 vec![
                     Value::Text("/a.txt".to_string()),
                     Value::Text("/b.txt".to_string()),
                 ],
             ),
             (
-                "SELECT path, data FROM lix_file WHERE path IN ($2, $1)",
+                "SELECT path, content FROM lix_file WHERE path IN ($2, $1)",
                 vec![
                     Value::Text("/a.txt".to_string()),
                     Value::Text("/b.txt".to_string()),
                 ],
             ),
             (
-                "SELECT path, data FROM lix_file WHERE path IN ($1, $2) ORDER BY path",
+                "SELECT path, content FROM lix_file WHERE path IN ($1, $2) ORDER BY path",
                 vec![
                     Value::Text("/a.txt".to_string()),
                     Value::Text("/b.txt".to_string()),
                 ],
             ),
             (
-                "SELECT path, data FROM lix_file WHERE path IN ($1, $2) LIMIT 1",
+                "SELECT path, content FROM lix_file WHERE path IN ($1, $2) LIMIT 1",
                 vec![
                     Value::Text("/a.txt".to_string()),
                     Value::Text("/b.txt".to_string()),
                 ],
             ),
             (
-                "SELECT path, data FROM lix_file WHERE path IN ($1, $2)",
+                "SELECT path, content FROM lix_file WHERE path IN ($1, $2)",
                 vec![Value::Text("/a.txt".to_string()), Value::Null],
             ),
         ] {
@@ -4438,23 +4439,23 @@ mod tests {
                 )],
             ),
             (
-                "SELECT data AS bytes FROM lix_file WHERE id = $1",
+                "SELECT content AS bytes FROM lix_file WHERE id = $1",
                 vec![Value::Text(
                     "01920000-0000-7000-8000-0000000000a2".to_string(),
                 )],
             ),
             (
-                "SELECT data FROM lix_file AS file WHERE id = $1",
+                "SELECT content FROM lix_file AS file WHERE id = $1",
                 vec![Value::Text(
                     "01920000-0000-7000-8000-0000000000a2".to_string(),
                 )],
             ),
             (
-                "SELECT data FROM lix_file WHERE id = '01920000-0000-7000-8000-0000000000a2'",
+                "SELECT content FROM lix_file WHERE id = '01920000-0000-7000-8000-0000000000a2'",
                 vec![],
             ),
             (
-                "SELECT data FROM lix_file WHERE id = $1 LIMIT 1",
+                "SELECT content FROM lix_file WHERE id = $1 LIMIT 1",
                 vec![Value::Text(
                     "01920000-0000-7000-8000-0000000000a2".to_string(),
                 )],
@@ -4466,20 +4467,23 @@ mod tests {
                 )],
             ),
             (
-                "SELECT data FROM \"LIX_FILE\" WHERE id = $1",
+                "SELECT content FROM \"LIX_FILE\" WHERE id = $1",
                 vec![Value::Text(
                     "01920000-0000-7000-8000-0000000000a2".to_string(),
                 )],
             ),
             (
-                "SELECT data FROM lix_file WHERE id = $1 AND true",
+                "SELECT content FROM lix_file WHERE id = $1 AND true",
                 vec![Value::Text(
                     "01920000-0000-7000-8000-0000000000a2".to_string(),
                 )],
             ),
-            ("SELECT data FROM lix_file WHERE id = $1", vec![Value::Null]),
             (
-                "SELECT data FROM lix_file WHERE id = $1",
+                "SELECT content FROM lix_file WHERE id = $1",
+                vec![Value::Null],
+            ),
+            (
+                "SELECT content FROM lix_file WHERE id = $1",
                 vec![
                     Value::Text("01920000-0000-7000-8000-0000000000a2".to_string()),
                     Value::Text("extra".to_string()),
@@ -4509,7 +4513,7 @@ mod tests {
             .unwrap();
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES \
+                "INSERT INTO lix_file (id, path, content, lixcol_metadata) VALUES \
                  ('01920000-0000-7000-8000-0000000000f1', '/b.txt', $1, lix_json('{\"rank\":2}')), \
                  ('01920000-0000-7000-8000-0000000000f2', '/nested/a.txt', $2, NULL), \
                  ('01920000-0000-7000-8000-0000000000f3', '/a.txt', $3, NULL)",
@@ -4589,23 +4593,23 @@ mod tests {
     }
 
     #[test]
-    fn late_file_data_read_rewrites_only_unchanged_blob_projections() {
+    fn late_file_content_read_rewrites_only_unchanged_blob_projections() {
         let statement = sql2::parse_statement(
-            "SELECT path, data FROM lix_file WHERE path LIKE $1 ORDER BY path LIMIT 2",
+            "SELECT path, content FROM lix_file WHERE path LIKE $1 ORDER BY path LIMIT 2",
         )
         .unwrap();
-        let plan = late_materialized_lix_file_data_read(&statement).unwrap();
+        let plan = late_materialized_lix_file_content_read(&statement).unwrap();
         assert_eq!(plan.data_column_index, 1);
         assert_eq!(
             plan.statement.to_string(),
-            "SELECT path, path AS data FROM lix_file WHERE path LIKE $1 ORDER BY path LIMIT 2"
+            "SELECT path, path AS content FROM lix_file WHERE path LIKE $1 ORDER BY path LIMIT 2"
         );
 
         let aliased = sql2::parse_statement(
-            "SELECT file.data AS bytes, file.path AS label FROM lix_file AS file WHERE file.path LIKE $1 ORDER BY file.path",
+            "SELECT file.content AS bytes, file.path AS label FROM lix_file AS file WHERE file.path LIKE $1 ORDER BY file.path",
         )
         .unwrap();
-        let plan = late_materialized_lix_file_data_read(&aliased).unwrap();
+        let plan = late_materialized_lix_file_content_read(&aliased).unwrap();
         assert_eq!(plan.data_column_index, 0);
         assert_eq!(
             plan.statement.to_string(),
@@ -4613,20 +4617,20 @@ mod tests {
         );
 
         for sql in [
-            "SELECT path, length(data) FROM lix_file",
-            "SELECT data, upper(path) FROM lix_file",
-            "SELECT data FROM lix_file WHERE data = $1",
-            "SELECT data FROM lix_file ORDER BY data",
-            "SELECT data AS bytes FROM lix_file ORDER BY bytes",
-            "SELECT data FROM lix_file ORDER BY 1",
-            "SELECT DISTINCT data FROM lix_file",
-            "SELECT data, data FROM lix_file",
+            "SELECT path, length(content) FROM lix_file",
+            "SELECT content, upper(path) FROM lix_file",
+            "SELECT content FROM lix_file WHERE content = $1",
+            "SELECT content FROM lix_file ORDER BY content",
+            "SELECT content AS bytes FROM lix_file ORDER BY bytes",
+            "SELECT content FROM lix_file ORDER BY 1",
+            "SELECT DISTINCT content FROM lix_file",
+            "SELECT content, content FROM lix_file",
             "SELECT * FROM lix_file",
-            "SELECT file.data FROM lix_file AS file JOIN lix_file AS other ON file.id = other.id",
+            "SELECT file.content FROM lix_file AS file JOIN lix_file AS other ON file.id = other.id",
         ] {
             let statement = sql2::parse_statement(sql).unwrap();
             assert_eq!(
-                late_materialized_lix_file_data_read(&statement),
+                late_materialized_lix_file_content_read(&statement),
                 None,
                 "unexpected late materialization for {sql}"
             );
@@ -4748,7 +4752,7 @@ mod tests {
         assert_eq!(
             session
                 .execution_disposition(
-                    "INSERT INTO lix_file (path, data) VALUES ('/disposition.txt', 'data')",
+                    "INSERT INTO lix_file (path, content) VALUES ('/disposition.txt', 'content')",
                 )
                 .unwrap(),
             ExecutionDisposition::Durable
@@ -8200,7 +8204,7 @@ mod tests {
         let session = open_session().await;
         session
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4)",
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2), ($3, $4)",
                 &[
                     Value::Text("/b.txt".to_string()),
                     Value::Blob(b"bravo".to_vec().into()),
@@ -8213,7 +8217,7 @@ mod tests {
 
         let result = session
             .execute(
-                "SELECT path, data FROM lix_file WHERE path IN ($1, $2, $3)",
+                "SELECT path, content FROM lix_file WHERE path IN ($1, $2, $3)",
                 &[
                     Value::Text("/b.txt".to_string()),
                     Value::Text("/a.txt".to_string()),
@@ -8223,16 +8227,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.columns(), &["path", "data"]);
+        assert_eq!(result.columns(), &["path", "content"]);
         assert_eq!(result.rows().len(), 2);
         assert_eq!(result.rows()[0].get::<String>("path").unwrap(), "/a.txt");
         assert_eq!(
-            result.rows()[0].value("data").unwrap(),
+            result.rows()[0].value("content").unwrap(),
             &Value::Blob(b"alpha".to_vec().into())
         );
         assert_eq!(result.rows()[1].get::<String>("path").unwrap(), "/b.txt");
         assert_eq!(
-            result.rows()[1].value("data").unwrap(),
+            result.rows()[1].value("content").unwrap(),
             &Value::Blob(b"bravo".to_vec().into())
         );
     }
@@ -8244,7 +8248,7 @@ mod tests {
         let b = "01920000-0000-7000-8000-0000000000a2";
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data, lixcol_metadata) \
+                "INSERT INTO lix_file (id, path, content, lixcol_metadata) \
                  VALUES ($1, $2, $3, $4), ($5, $6, $7, $8)",
                 &[
                     Value::Text(b.to_string()),
@@ -8262,18 +8266,21 @@ mod tests {
 
         let result = session
             .execute(
-                "SELECT id, path, data, lixcol_metadata FROM lix_file WHERE id IN ($1, $2)",
+                "SELECT id, path, content, lixcol_metadata FROM lix_file WHERE id IN ($1, $2)",
                 &[Value::Text(b.to_string()), Value::Text(a.to_string())],
             )
             .await
             .unwrap();
 
-        assert_eq!(result.columns(), &["id", "path", "data", "lixcol_metadata"]);
+        assert_eq!(
+            result.columns(),
+            &["id", "path", "content", "lixcol_metadata"]
+        );
         assert_eq!(result.rows().len(), 2);
         assert_eq!(result.rows()[0].get::<String>("id").unwrap(), a);
         assert_eq!(result.rows()[0].get::<String>("path").unwrap(), "/a.txt");
         assert_eq!(
-            result.rows()[0].value("data").unwrap(),
+            result.rows()[0].value("content").unwrap(),
             &Value::Blob(b"alpha".to_vec().into())
         );
         assert_eq!(
@@ -8283,17 +8290,17 @@ mod tests {
         assert_eq!(result.rows()[1].get::<String>("id").unwrap(), b);
         assert_eq!(result.rows()[1].get::<String>("path").unwrap(), "/b.txt");
         assert_eq!(
-            result.rows()[1].value("data").unwrap(),
+            result.rows()[1].value("content").unwrap(),
             &Value::Blob(b"bravo".to_vec().into())
         );
     }
 
     #[tokio::test]
-    async fn late_file_data_read_preserves_metadata_filters_order_and_limit() {
+    async fn late_file_content_read_preserves_metadata_filters_order_and_limit() {
         let session = open_session().await;
         session
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ($1, $2), ($3, $4), ($5, $6)",
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2), ($3, $4), ($5, $6)",
                 &[
                     Value::Text("/a.txt".to_string()),
                     Value::Blob(b"alpha".to_vec().into()),
@@ -8308,13 +8315,13 @@ mod tests {
 
         let result = session
             .execute(
-                "SELECT path, data FROM lix_file WHERE path LIKE $1 ORDER BY path DESC LIMIT 2",
+                "SELECT path, content FROM lix_file WHERE path LIKE $1 ORDER BY path DESC LIMIT 2",
                 &[Value::Text("%.txt".to_string())],
             )
             .await
             .unwrap();
 
-        assert_eq!(result.columns(), &["path", "data"]);
+        assert_eq!(result.columns(), &["path", "content"]);
         assert_eq!(result.rows().len(), 2);
         assert_eq!(
             result.rows()[0].values(),
@@ -8351,7 +8358,7 @@ mod tests {
     #[test]
     fn execute_result_clone_shares_immutable_backing() {
         let result = ExecuteResult::from_rows(
-            vec!["data".to_string()],
+            vec!["content".to_string()],
             vec![vec![Value::Blob(vec![b'x'; 1024 * 1024].into())]],
         );
         let cloned = result.clone();
@@ -9660,7 +9667,7 @@ mod tests {
         let session = open_session().await;
         session
             .execute_with_options(
-                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
                 &[
                     Value::Text(FILE_ID.to_string()),
                     Value::Text("/origin-key.md".to_string()),
@@ -9675,7 +9682,7 @@ mod tests {
             .expect("seed file should commit");
         session
             .execute(
-                "UPDATE lix_file SET data = $1 WHERE id = $2",
+                "UPDATE lix_file SET content = $1 WHERE id = $2",
                 &[
                     Value::Blob(b"two\n".to_vec().into()),
                     Value::Text(FILE_ID.to_string()),
@@ -9690,7 +9697,7 @@ mod tests {
             .expect("transaction should begin");
         transaction
             .execute_with_options(
-                "UPDATE lix_file SET data = $1 WHERE id = $2".to_owned(),
+                "UPDATE lix_file SET content = $1 WHERE id = $2".to_owned(),
                 vec![
                     Value::Blob(b"three\n".to_vec().into()),
                     Value::Text(FILE_ID.to_string()),

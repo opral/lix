@@ -44,8 +44,8 @@ simulation_test!(
                     0 | 1 => {
                         session
                             .execute(
-                                "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-                                 ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+                                "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                                 ON CONFLICT (path) DO UPDATE SET content = excluded.content",
                                 &[
                                     Value::Text(source.clone()),
                                     Value::Blob(bytes.clone().into()),
@@ -60,7 +60,7 @@ simulation_test!(
                     2 => {
                         session
                             .execute(
-                                "UPDATE lix_file SET data = $2 WHERE path = $1",
+                                "UPDATE lix_file SET content = $2 WHERE path = $1",
                                 &[
                                     Value::Text(source.clone()),
                                     Value::Blob(bytes.clone().into()),
@@ -174,7 +174,7 @@ async fn exercise_rejected_file_batch(
         .map_or_else(|| fresh.clone(), |(path, _)| path.clone());
     let error = session
         .execute(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $3), ($2, $3)",
+            "INSERT INTO lix_file (path, content) VALUES ($1, $3), ($2, $3)",
             &[
                 Value::Text(fresh),
                 Value::Text(duplicate),
@@ -194,7 +194,7 @@ async fn assert_files(
 ) {
     let result = session
         .execute(
-            "SELECT path, data FROM lix_file WHERE path LIKE $1 ORDER BY path",
+            "SELECT path, content FROM lix_file WHERE path LIKE $1 ORDER BY path",
             &[Value::Text(format!("{root}/%"))],
         )
         .await

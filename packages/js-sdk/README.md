@@ -41,7 +41,7 @@ const files = lix.observe("SELECT path FROM lix_file ORDER BY path");
 const initial = await files.next();
 
 await lix.execute(
-	"INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+	"INSERT INTO lix_file (path, content) VALUES ($1, $2)",
 	["/hello.txt", new TextEncoder().encode("hello")],
 );
 const update = await files.next();
@@ -101,14 +101,14 @@ const lix = await openLix({
 });
 
 await lix.execute(
-	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+	"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
 	["/hello.txt", new TextEncoder().encode("world")],
 );
 
-const result = await lix.execute("SELECT data FROM lix_file WHERE path = $1", [
+const result = await lix.execute("SELECT content FROM lix_file WHERE path = $1", [
 	"/hello.txt",
 ]);
-const bytes = result.rows[0]?.value("data").asBytes();
+const bytes = result.rows[0]?.value("content").asBytes();
 
 console.log(bytes && new TextDecoder().decode(bytes));
 
@@ -140,7 +140,7 @@ const draft = await lix.createBranch({ name: "Draft" });
 
 await lix.switchBranch({ branchId: draft.id });
 await lix.execute(
-	"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+	"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
 	["/status.txt", new TextEncoder().encode("draft")],
 );
 
@@ -156,11 +156,11 @@ const tx = await lix.beginTransaction();
 
 try {
 	await tx.execute(
-		"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+		"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
 		["/a.txt", new TextEncoder().encode("1")],
 	);
 	await tx.execute(
-		"INSERT INTO lix_file (path, data) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+		"INSERT INTO lix_file (path, content) VALUES ($1, $2) ON CONFLICT (path) DO UPDATE SET content = excluded.content",
 		["/b.txt", new TextEncoder().encode("2")],
 	);
 	await tx.commit();

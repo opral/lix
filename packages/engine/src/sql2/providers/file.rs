@@ -65,7 +65,7 @@ use crate::sql2::predicate_typecheck::{
 use crate::sql2::write_normalization::{
     InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues, UpdateCell,
     defaultable_bool_insert_value, defaultable_text_insert_value, insert_column_is_omitted,
-    lix_file_data_type_error, lix_file_data_type_error_with_value, scalar_is_binary_or_null,
+    lix_file_content_type_error, lix_file_content_type_error_with_value, scalar_is_binary_or_null,
 };
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 #[cfg(test)]
@@ -96,7 +96,7 @@ use crate::sql2::{
     SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
 };
 use crate::transaction::types::{
-    FileContent, LogicalPrimaryKey, TransactionFileData, TransactionWrite, TransactionWriteMode,
+    FileContent, LogicalPrimaryKey, TransactionFileContent, TransactionWrite, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin,
 };
 
@@ -247,14 +247,14 @@ struct LixFileDmlSourceOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExactLixFileReadColumn {
-    Data,
+    Content,
     ChangeId,
 }
 
 impl ExactLixFileReadColumn {
     fn name(self) -> &'static str {
         match self {
-            Self::Data => "data",
+            Self::Content => "content",
             Self::ChangeId => "lixcol_change_id",
         }
     }
@@ -665,7 +665,7 @@ pub(crate) async fn execute_exact_lix_file_read(
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
                 .with_blob_refs(true)
-                .with_cached_blob_data(column == ExactLixFileReadColumn::Data),
+                .with_cached_blob_data(column == ExactLixFileReadColumn::Content),
         )
         .await?;
     let matches = match selector {
@@ -684,7 +684,7 @@ pub(crate) async fn execute_exact_lix_file_read(
     };
     let rows = scan_indexed_file_batch(&matches, true)?;
     let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
-    let load_data = column == ExactLixFileReadColumn::Data;
+    let load_data = column == ExactLixFileReadColumn::Content;
     let acknowledge_plugin_data = load_data && session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
         plugin_render_context_for_lix_file_scan(
@@ -800,8 +800,8 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
             .expect("lix_file schema should have path")
             .clone(),
         base_schema
-            .field_with_name("data")
-            .expect("lix_file schema should have data")
+            .field_with_name("content")
+            .expect("lix_file schema should have content")
             .clone(),
     ]));
     let mut request = lix_file_scan_request(Some(active_branch_id), Some(schema.as_ref()), None);
@@ -852,14 +852,14 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     let columns = if data_range.is_some() {
         vec![
             "path".to_string(),
-            "data".to_string(),
+            "content".to_string(),
             "total_size".to_string(),
             "range_start".to_string(),
             "range_end".to_string(),
             "content_identity".to_string(),
         ]
     } else {
-        vec!["path".to_string(), "data".to_string()]
+        vec!["path".to_string(), "content".to_string()]
     };
     Ok(SqlQueryResult {
         columns,
@@ -884,7 +884,7 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
 ) -> Result<SqlQueryResult, LixError> {
     let base_schema = lix_file_schema();
     let schema = Arc::new(Schema::new(
-        ["id", "path", "data", "lixcol_metadata"]
+        ["id", "path", "content", "lixcol_metadata"]
             .into_iter()
             .map(|name| {
                 base_schema
@@ -1026,7 +1026,7 @@ impl TableSpec for LixFileSpec {
         // Prefer it for all descriptor-only scans so queries such as
         // `SELECT id FROM lix_file` and `COUNT(*)` do not materialize the
         // complete descriptor/directory live-state domain on every request.
-        // Scans that need file data or the blob revision still load blob rows.
+        // Scans that need file content or the blob revision still load blob rows.
         // A path predicate or exact file/directory ids can narrow those loads
         // to matching cached descriptors instead of scanning complete state.
         let use_path_index = should_use_path_index(&indexed_path_predicate, needs_blob_rows)
@@ -1247,12 +1247,13 @@ impl TableSpec for LixFileSpec {
         let insert_intents = InsertColumnIntents::from_input(input);
         let data_is_explicit = write_ctx.explicit_insert_columns().map_or_else(
             || {
-                insert_intents.includes_column("data")
-                    && !self.options.omitted_insert_columns.contains("data")
+                insert_intents.includes_column("content")
+                    && !self.options.omitted_insert_columns.contains("content")
             },
-            |columns| columns.contains("data"),
+            |columns| columns.contains("content"),
         );
-        let include_data_writes = self.schema.field_with_name("data").is_ok() && data_is_explicit;
+        let include_data_writes =
+            self.schema.field_with_name("content").is_ok() && data_is_explicit;
         let sink = Arc::new(LixFileInsertSink::new(
             write_ctx,
             self.functions.clone(),
@@ -1279,12 +1280,13 @@ impl TableSpec for LixFileSpec {
         let insert_intents = InsertColumnIntents::from_input(input);
         let data_is_explicit = write_ctx.explicit_insert_columns().map_or_else(
             || {
-                insert_intents.includes_column("data")
-                    && !self.options.omitted_insert_columns.contains("data")
+                insert_intents.includes_column("content")
+                    && !self.options.omitted_insert_columns.contains("content")
             },
-            |columns| columns.contains("data"),
+            |columns| columns.contains("content"),
         );
-        let include_data_writes = self.schema.field_with_name("data").is_ok() && data_is_explicit;
+        let include_data_writes =
+            self.schema.field_with_name("content").is_ok() && data_is_explicit;
         let spec = self.clone();
         Ok(Arc::new(move |batches| {
             let write_ctx = write_ctx.clone();
@@ -1346,17 +1348,17 @@ impl TableSpec for LixFileSpec {
                 }
 
                 let count = staged.count;
-                if !staged.state_rows.is_empty() || !staged.file_data_writes.is_empty() {
-                    let intent = if staged.file_data_writes.is_empty() {
+                if !staged.state_rows.is_empty() || !staged.file_content_writes.is_empty() {
+                    let intent = if staged.file_content_writes.is_empty() {
                         TransactionWrite::Rows {
                             mode: TransactionWriteMode::Insert,
                             rows: staged.state_rows,
                         }
                     } else {
-                        TransactionWrite::RowsWithFileData {
+                        TransactionWrite::RowsWithFileContent {
                             mode: TransactionWriteMode::Insert,
                             rows: staged.state_rows,
-                            file_data: staged.file_data_writes,
+                            file_content: staged.file_content_writes,
                             count,
                         }
                     };
@@ -1370,7 +1372,7 @@ impl TableSpec for LixFileSpec {
                     .returning_post_image(
                         &write_ctx,
                         &keys,
-                        returning.required_columns().contains("data"),
+                        returning.required_columns().contains("content"),
                     )
                     .await?;
                 returning.capture(returning.project(&post_image)?);
@@ -1407,8 +1409,10 @@ impl TableSpec for LixFileSpec {
     ) -> Result<PlannedDml> {
         let plugin_archive_delete_target =
             exact_plugin_archive_delete_target_from_filters(filters)?;
-        let needs_data = filters.iter().any(|filter| contains_column(filter, "data"))
-            || options.returning_columns.contains("data");
+        let needs_data = filters
+            .iter()
+            .any(|filter| contains_column(filter, "content"))
+            || options.returning_columns.contains("content");
         let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
         request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
@@ -1499,13 +1503,15 @@ impl LixFileSpec {
         filters: &[Expr],
         returning: Option<DmlReturning>,
     ) -> Result<PlannedDml> {
-        let needs_data = filters.iter().any(|filter| contains_column(filter, "data"))
+        let needs_data = filters
+            .iter()
+            .any(|filter| contains_column(filter, "content"))
             || assignments.iter().any(|(column_name, expr)| {
-                column_name == "path" || physical_expr_contains_column(expr, "data")
+                column_name == "path" || physical_expr_contains_column(expr, "content")
             })
             || returning
                 .as_ref()
-                .is_some_and(|returning| returning.required_columns().contains("data"));
+                .is_some_and(|returning| returning.required_columns().contains("content"));
         let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
         request.filter.branch_ids = explicit_branch_ids_from_dml_filters(filters);
@@ -1617,16 +1623,16 @@ impl LixFileSpec {
                 let count = staged.count;
 
                 if count > 0 {
-                    let intent = if staged.file_data_writes.is_empty() {
+                    let intent = if staged.file_content_writes.is_empty() {
                         TransactionWrite::Rows {
                             mode: TransactionWriteMode::Replace,
                             rows: staged.state_rows,
                         }
                     } else {
-                        TransactionWrite::RowsWithFileData {
+                        TransactionWrite::RowsWithFileContent {
                             mode: TransactionWriteMode::Replace,
                             rows: staged.state_rows,
-                            file_data: staged.file_data_writes,
+                            file_content: staged.file_content_writes,
                             count,
                         }
                     };
@@ -1641,7 +1647,7 @@ impl LixFileSpec {
                         .returning_post_image(
                             &write_ctx,
                             &keys,
-                            returning.required_columns().contains("data"),
+                            returning.required_columns().contains("content"),
                         )
                         .await?;
                     returning.capture(returning.project(&post_image)?);
@@ -1707,7 +1713,7 @@ impl UpsertSupport for LixFileSpec {
         // derived from whether the materialized `data` column carries a value.
         let surface_name = lix_file_surface_name(&self.branch_binding);
         let branch_binding = self.branch_binding.active_branch_id();
-        let include_data_writes = record_batch_has_non_null_column(batch, "data")?;
+        let include_data_writes = record_batch_has_non_null_column(batch, "content")?;
 
         let mut path_resolvers = directory_path_resolvers_from_live_state(
             Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
@@ -1736,9 +1742,9 @@ impl UpsertSupport for LixFileSpec {
             )?
         };
 
-        Ok(StagedUpsert::with_file_data(
+        Ok(StagedUpsert::with_file_content(
             staged.state_rows,
-            staged.file_data_writes,
+            staged.file_content_writes,
         ))
     }
 
@@ -1757,8 +1763,8 @@ impl UpsertSupport for LixFileSpec {
                 "lixcol_untracked",
                 "INSERT into lix_file",
             )?;
-            if !insert_column_is_omitted(batch, "data") {
-                insert_optional_binary_value(batch, row_index, "data")?;
+            if !insert_column_is_omitted(batch, "content") {
+                insert_optional_binary_value(batch, row_index, "content")?;
             }
         }
         Ok(())
@@ -1779,7 +1785,7 @@ impl UpsertSupport for LixFileSpec {
         };
         let materialized = materialize_omitted_column(
             &materialized,
-            "data",
+            "content",
             Arc::new(LargeBinaryArray::from(vec![
                 Some(&[][..]);
                 proposed.num_rows()
@@ -1819,7 +1825,7 @@ impl UpsertSupport for LixFileSpec {
             .returning_post_image(
                 write_ctx,
                 &keys,
-                returning.required_columns().contains("data"),
+                returning.required_columns().contains("content"),
             )
             .await?;
         returning.capture(returning.project(&post_image)?);
@@ -1833,7 +1839,7 @@ impl UpsertSupport for LixFileSpec {
         target: &UpsertConflictTarget,
     ) -> Result<RecordBatch> {
         // Existing rows matching the proposed conflict identity, rendered as
-        // a full `lix_file` batch (with materialized `data`) so the driver can
+        // a full `lix_file` batch (with materialized `content`) so the driver can
         // build the augmented `excluded.*` batch the conflict assignments run
         // over.
         let (target_file_ids, path_predicate) = match target.kind() {
@@ -2062,9 +2068,9 @@ impl UpsertSupport for LixFileSpec {
             &mut || self.functions.call_uuid_v7().to_string(),
         )?;
 
-        Ok(StagedUpsert::with_file_data(
+        Ok(StagedUpsert::with_file_content(
             staged.state_rows,
-            staged.file_data_writes,
+            staged.file_content_writes,
         ))
     }
 }
@@ -2251,17 +2257,17 @@ impl InsertSink for LixFileInsertSink {
             }
         }
 
-        if !staged.state_rows.is_empty() || !staged.file_data_writes.is_empty() {
-            let intent = if staged.file_data_writes.is_empty() {
+        if !staged.state_rows.is_empty() || !staged.file_content_writes.is_empty() {
+            let intent = if staged.file_content_writes.is_empty() {
                 TransactionWrite::Rows {
                     mode: TransactionWriteMode::Insert,
                     rows: staged.state_rows,
                 }
             } else {
-                TransactionWrite::RowsWithFileData {
+                TransactionWrite::RowsWithFileContent {
                     mode: TransactionWriteMode::Insert,
                     rows: staged.state_rows,
-                    file_data: staged.file_data_writes,
+                    file_content: staged.file_content_writes,
                     count: staged.count,
                 }
             };
@@ -2474,7 +2480,7 @@ struct DirectoryDescriptorSnapshot {
 #[derive(Debug, Default)]
 struct LixFileStagedBatch {
     state_rows: RawWriteBatch,
-    file_data_writes: Vec<TransactionFileData>,
+    file_content_writes: Vec<TransactionFileContent>,
     count: u64,
 }
 
@@ -2482,14 +2488,14 @@ impl LixFileStagedBatch {
     fn with_row_capacity(row_capacity: usize) -> Self {
         Self {
             state_rows: RawWriteBatch::with_capacity(row_capacity),
-            file_data_writes: Vec::with_capacity(row_capacity),
+            file_content_writes: Vec::with_capacity(row_capacity),
             count: 0,
         }
     }
 
     fn extend(&mut self, other: Self) -> std::result::Result<(), LixError> {
         self.state_rows.append(other.state_rows);
-        self.file_data_writes.extend(other.file_data_writes);
+        self.file_content_writes.extend(other.file_content_writes);
         self.add_count(other.count)
     }
 
@@ -2498,7 +2504,7 @@ impl LixFileStagedBatch {
         plan: crate::filesystem::FilesystemWritePlan,
     ) -> std::result::Result<(), LixError> {
         self.state_rows.append(plan.rows);
-        self.file_data_writes.extend(plan.file_data);
+        self.file_content_writes.extend(plan.file_content);
         self.add_count(plan.count)
     }
 
@@ -2525,40 +2531,40 @@ impl LixFileStagedBatch {
 pub(crate) enum FastLixFilePathWriteConflict {
     None,
     DoNothing,
-    UpdateData,
-    UpdateDataAndMetadata,
+    UpdateContent,
+    UpdateContentAndMetadata,
     IdDoNothing,
-    IdUpdateData,
-    IdUpdateDataAndMetadata,
+    IdUpdateContent,
+    IdUpdateContentAndMetadata,
 }
 
 impl FastLixFilePathWriteConflict {
     fn targets_id(self) -> bool {
         matches!(
             self,
-            Self::IdDoNothing | Self::IdUpdateData | Self::IdUpdateDataAndMetadata
+            Self::IdDoNothing | Self::IdUpdateContent | Self::IdUpdateContentAndMetadata
         )
     }
 
     fn updates_existing(self) -> bool {
         matches!(
             self,
-            Self::UpdateData
-                | Self::UpdateDataAndMetadata
-                | Self::IdUpdateData
-                | Self::IdUpdateDataAndMetadata
+            Self::UpdateContent
+                | Self::UpdateContentAndMetadata
+                | Self::IdUpdateContent
+                | Self::IdUpdateContentAndMetadata
         )
     }
 
     pub(crate) fn updates_metadata(self) -> bool {
         matches!(
             self,
-            Self::UpdateDataAndMetadata | Self::IdUpdateDataAndMetadata
+            Self::UpdateContentAndMetadata | Self::IdUpdateContentAndMetadata
         )
     }
 
     pub(crate) fn updates_data_only(self) -> bool {
-        matches!(self, Self::UpdateData | Self::IdUpdateData)
+        matches!(self, Self::UpdateContent | Self::IdUpdateContent)
     }
 }
 
@@ -2621,7 +2627,7 @@ pub(crate) async fn execute_fast_lix_file_prepared_path_write(
     execute_fast_lix_file_id_path_writes_inner(
         ctx,
         vec![(None, path, FileContent::PreparedCas(receipt), None, None)],
-        FastLixFilePathWriteConflict::UpdateData,
+        FastLixFilePathWriteConflict::UpdateContent,
         None,
     )
     .await
@@ -2726,14 +2732,14 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                 }
                 FastLixFilePathWriteConflict::DoNothing
                 | FastLixFilePathWriteConflict::IdDoNothing => {}
-                FastLixFilePathWriteConflict::UpdateData
-                | FastLixFilePathWriteConflict::IdUpdateData => {
+                FastLixFilePathWriteConflict::UpdateContent
+                | FastLixFilePathWriteConflict::IdUpdateContent => {
                     let mut context = existing.scope.context(Some(existing.id.clone()));
                     if context.global {
                         context.branch_id = GLOBAL_BRANCH_ID.to_string();
                     }
-                    let file_data_start = staged.file_data_writes.len();
-                    stage_lix_file_data_update_write(
+                    let file_content_start = staged.file_content_writes.len();
+                    stage_lix_file_content_update_write(
                         &mut staged,
                         existing.id.clone(),
                         Some(write.parsed.path),
@@ -2746,14 +2752,14 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
                     attach_fast_file_write_metadata(
-                        &mut staged.file_data_writes[file_data_start..],
+                        &mut staged.file_content_writes[file_content_start..],
                         write.splice_provenance,
                         mutation_identity,
                     );
                     staged.add_count(1)?;
                 }
-                FastLixFilePathWriteConflict::UpdateDataAndMetadata
-                | FastLixFilePathWriteConflict::IdUpdateDataAndMetadata => {
+                FastLixFilePathWriteConflict::UpdateContentAndMetadata
+                | FastLixFilePathWriteConflict::IdUpdateContentAndMetadata => {
                     let mut context = existing.scope.context(None);
                     if context.global {
                         context.branch_id = GLOBAL_BRANCH_ID.to_string();
@@ -2766,8 +2772,8 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                         context: context.clone(),
                     }
                     .append_to(&mut staged.state_rows);
-                    let file_data_start = staged.file_data_writes.len();
-                    stage_lix_file_data_update_write(
+                    let file_content_start = staged.file_content_writes.len();
+                    stage_lix_file_content_update_write(
                         &mut staged,
                         existing.id.clone(),
                         Some(write.parsed.path),
@@ -2780,7 +2786,7 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
                     attach_fast_file_write_metadata(
-                        &mut staged.file_data_writes[file_data_start..],
+                        &mut staged.file_content_writes[file_content_start..],
                         write.splice_provenance,
                         mutation_identity,
                     );
@@ -2805,7 +2811,7 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                 &mut || ctx.functions().call_uuid_v7().to_string(),
             )?;
             attach_fast_file_write_metadata(
-                &mut plan.file_data,
+                &mut plan.file_content,
                 write.splice_provenance,
                 mutation_identity,
             );
@@ -2817,11 +2823,11 @@ async fn execute_fast_lix_file_id_path_writes_inner(
     let mode = match conflict {
         FastLixFilePathWriteConflict::None => TransactionWriteMode::Insert,
         FastLixFilePathWriteConflict::DoNothing
-        | FastLixFilePathWriteConflict::UpdateData
-        | FastLixFilePathWriteConflict::UpdateDataAndMetadata
+        | FastLixFilePathWriteConflict::UpdateContent
+        | FastLixFilePathWriteConflict::UpdateContentAndMetadata
         | FastLixFilePathWriteConflict::IdDoNothing
-        | FastLixFilePathWriteConflict::IdUpdateData
-        | FastLixFilePathWriteConflict::IdUpdateDataAndMetadata => TransactionWriteMode::Replace,
+        | FastLixFilePathWriteConflict::IdUpdateContent
+        | FastLixFilePathWriteConflict::IdUpdateContentAndMetadata => TransactionWriteMode::Replace,
     };
     stage_lix_file_fast_batch(ctx, mode, staged).await.map(Some)
 }
@@ -2987,12 +2993,12 @@ async fn stage_indexed_file_path_writes(
                 context.branch_id = GLOBAL_BRANCH_ID.to_string();
             }
             match conflict {
-                FastLixFilePathWriteConflict::UpdateData
-                | FastLixFilePathWriteConflict::IdUpdateData => {
+                FastLixFilePathWriteConflict::UpdateContent
+                | FastLixFilePathWriteConflict::IdUpdateContent => {
                     context.file_id = Some(entry.id().to_string());
                 }
-                FastLixFilePathWriteConflict::UpdateDataAndMetadata
-                | FastLixFilePathWriteConflict::IdUpdateDataAndMetadata => {
+                FastLixFilePathWriteConflict::UpdateContentAndMetadata
+                | FastLixFilePathWriteConflict::IdUpdateContentAndMetadata => {
                     let metadata_changed = entry.metadata()
                         != write.metadata.as_ref().map(TransactionJson::normalized);
                     context.metadata = write.metadata;
@@ -3017,8 +3023,8 @@ async fn stage_indexed_file_path_writes(
             } else {
                 write.parsed.path
             };
-            let file_data_start = staged.file_data_writes.len();
-            stage_lix_file_data_update_write(
+            let file_content_start = staged.file_content_writes.len();
+            stage_lix_file_content_update_write(
                 &mut staged,
                 entry.id().to_string(),
                 Some(update_path),
@@ -3031,7 +3037,7 @@ async fn stage_indexed_file_path_writes(
             )
             .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
             attach_fast_file_write_metadata(
-                &mut staged.file_data_writes[file_data_start..],
+                &mut staged.file_content_writes[file_content_start..],
                 write.splice_provenance,
                 mutation_identity,
             );
@@ -3057,7 +3063,7 @@ async fn stage_indexed_file_path_writes(
                 &mut || ctx.functions().call_uuid_v7().to_string(),
             )?;
             attach_fast_file_write_metadata(
-                &mut plan.file_data,
+                &mut plan.file_content,
                 write.splice_provenance,
                 mutation_identity,
             );
@@ -3135,14 +3141,14 @@ async fn load_exact_existing_materializations(
     Ok(materializations)
 }
 
-pub(crate) async fn execute_fast_lix_file_data_update_by_id(
+pub(crate) async fn execute_fast_lix_file_content_update_by_id(
     ctx: &mut dyn SqlWriteExecutionContext,
     file_id: Option<String>,
     data: crate::Blob,
     splice_provenance: Option<RequestBlobSpliceProvenance>,
     mutation_identity: Option<MutationIdentity>,
 ) -> Result<u64, LixError> {
-    execute_fast_lix_file_data_update_by_id_impl(
+    execute_fast_lix_file_content_update_by_id_impl(
         ctx,
         file_id,
         data,
@@ -3153,7 +3159,7 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
     .await
 }
 
-pub(crate) async fn execute_fast_lix_file_data_update_by_id_with_metadata(
+pub(crate) async fn execute_fast_lix_file_content_update_by_id_with_metadata(
     ctx: &mut dyn SqlWriteExecutionContext,
     file_id: Option<String>,
     data: crate::Blob,
@@ -3161,7 +3167,7 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id_with_metadata(
     splice_provenance: Option<RequestBlobSpliceProvenance>,
     mutation_identity: Option<MutationIdentity>,
 ) -> Result<u64, LixError> {
-    execute_fast_lix_file_data_update_by_id_impl(
+    execute_fast_lix_file_content_update_by_id_impl(
         ctx,
         file_id,
         data,
@@ -3172,7 +3178,7 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id_with_metadata(
     .await
 }
 
-async fn execute_fast_lix_file_data_update_by_id_impl(
+async fn execute_fast_lix_file_content_update_by_id_impl(
     ctx: &mut dyn SqlWriteExecutionContext,
     file_id: Option<String>,
     data: crate::Blob,
@@ -3258,7 +3264,7 @@ async fn execute_fast_lix_file_data_update_by_id_impl(
             }
             .append_to(&mut staged.state_rows);
         }
-        stage_lix_file_data_update_write(
+        stage_lix_file_content_update_write(
             &mut staged,
             existing.id,
             Some(path),
@@ -3270,9 +3276,9 @@ async fn execute_fast_lix_file_data_update_by_id_impl(
             None,
         )
         .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
-        if let Some(file_data) = staged.file_data_writes.last_mut() {
-            file_data.set_splice_provenance(splice_provenance.clone());
-            file_data.set_mutation_identity(mutation_identity);
+        if let Some(file_content) = staged.file_content_writes.last_mut() {
+            file_content.set_splice_provenance(splice_provenance.clone());
+            file_content.set_mutation_identity(mutation_identity);
         }
         staged.add_count(1)?;
     }
@@ -3335,13 +3341,13 @@ fn fast_file_write_id(write: &FastLixFilePathWrite, ctx: &dyn SqlWriteExecutionC
 }
 
 fn attach_fast_file_write_metadata(
-    file_data: &mut [TransactionFileData],
+    file_content: &mut [TransactionFileContent],
     splice_provenance: Option<RequestBlobSpliceProvenance>,
     mutation_identity: Option<MutationIdentity>,
 ) {
-    for file_data in file_data {
-        file_data.set_splice_provenance(splice_provenance.clone());
-        file_data.set_mutation_identity(mutation_identity);
+    for file_content in file_content {
+        file_content.set_splice_provenance(splice_provenance.clone());
+        file_content.set_mutation_identity(mutation_identity);
     }
 }
 
@@ -3369,19 +3375,19 @@ async fn stage_lix_file_fast_batch(
     staged: LixFileStagedBatch,
 ) -> Result<u64, LixError> {
     let count = staged.count;
-    if staged.state_rows.is_empty() && staged.file_data_writes.is_empty() {
+    if staged.state_rows.is_empty() && staged.file_content_writes.is_empty() {
         return Ok(count);
     }
-    let write = if staged.file_data_writes.is_empty() {
+    let write = if staged.file_content_writes.is_empty() {
         TransactionWrite::Rows {
             mode,
             rows: staged.state_rows,
         }
     } else {
-        TransactionWrite::RowsWithFileData {
+        TransactionWrite::RowsWithFileContent {
             mode,
             rows: staged.state_rows,
-            file_data: staged.file_data_writes,
+            file_content: staged.file_content_writes,
             count,
         }
     };
@@ -3610,7 +3616,8 @@ fn lix_file_existing_update_stage_from_batch(
         }
 
         if include_data_writes {
-            let data = update_required_binary_value(batch, assignment_values, row_index, "data")?;
+            let data =
+                update_required_binary_value(batch, assignment_values, row_index, "content")?;
             let data_filename = match data_filename {
                 Some(filename) => Some(filename),
                 None if batch.schema().index_of("name").is_ok() => {
@@ -3631,7 +3638,7 @@ fn lix_file_existing_update_stage_from_batch(
             };
             let has_blob_ref =
                 blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
-            stage_lix_file_data_update_write(
+            stage_lix_file_content_update_write(
                 &mut staged,
                 id.clone(),
                 path,
@@ -3680,7 +3687,7 @@ impl LixFileUpdateColumns {
                 "path" => LixFileDescriptorUpdate::Path,
                 "directory_id" | "name" => LixFileDescriptorUpdate::Topology,
                 // Payload and descriptor attributes retain the current path.
-                "data" => {
+                "content" => {
                     impact.data = true;
                     continue;
                 }
@@ -3741,7 +3748,7 @@ fn reject_lix_file_update_plugin_storage_paths(
                 if !update_columns.data {
                     return Err(lix_error_to_datafusion_error(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
-                        "UPDATE lix_file for plugin archive paths requires data".to_string(),
+                        "UPDATE lix_file for plugin archive paths requires content".to_string(),
                     )));
                 }
             }
@@ -3842,7 +3849,7 @@ fn lix_file_path_update_stage_from_batch(
                 batch,
                 assignment_values,
                 row_index,
-                "data",
+                "content",
             )?)
         } else {
             None
@@ -3863,7 +3870,7 @@ fn lix_file_path_update_stage_from_batch(
         if let Some(data) = assigned_data {
             let has_blob_ref =
                 blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
-            stage_lix_file_data_update_write(
+            stage_lix_file_content_update_write(
                 &mut staged,
                 id.clone(),
                 Some(path),
@@ -3875,10 +3882,10 @@ fn lix_file_path_update_stage_from_batch(
                 None,
             )?;
         } else if plugin_rewrite_file_ids.contains(&id) {
-            let data = required_binary_value(batch, row_index, "data")?;
+            let data = required_binary_value(batch, row_index, "content")?;
             let has_blob_ref =
                 blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
-            stage_lix_file_data_update_write(
+            stage_lix_file_content_update_write(
                 &mut staged,
                 id.clone(),
                 Some(path),
@@ -3918,7 +3925,7 @@ fn path_update_plugin_rewrite_file_ids(
         // Path-only UPDATE sources already materialize `data` so a plugin
         // handoff can restage the file. Use those bytes for typed matching;
         // this adds no storage or rendering work beyond the existing source.
-        let data = required_binary_value(batch, row_index, "data")?;
+        let data = required_binary_value(batch, row_index, "content")?;
 
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
@@ -3986,7 +3993,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
         let id = defaultable_text_insert_value(batch, row_index, "id", "INSERT into lix_file")?;
         let context = file_row_context_from_batch(batch, row_index, branch_binding)?;
         let data = if include_data_writes {
-            insert_optional_binary_value(batch, row_index, "data")?
+            insert_optional_binary_value(batch, row_index, "content")?
         } else {
             None
         };
@@ -4000,7 +4007,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
             if plugin_key.is_some() && data.is_none() {
                 return Err(lix_error_to_datafusion_error(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    "INSERT into lix_file for plugin archive paths requires data".to_string(),
+                    "INSERT into lix_file for plugin archive paths requires content".to_string(),
                 )));
             }
             reject_read_only_lix_file_insert_field(batch, row_index, "directory_id")?;
@@ -4048,7 +4055,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 None => {
                     let Some(generate_id) = generate_directory_id.as_deref_mut() else {
                         return Err(DataFusionError::Execution(
-                            "INSERT into lix_file with data requires id generator".to_string(),
+                            "INSERT into lix_file with content requires id generator".to_string(),
                         ));
                     };
                     Some(generate_id())
@@ -4124,7 +4131,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 }
                 None => None,
             };
-            stage_lix_file_data_insert_write(
+            stage_lix_file_content_insert_write(
                 &mut staged,
                 id,
                 path,
@@ -4143,7 +4150,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
     Ok(staged)
 }
 
-fn stage_lix_file_data_insert_write(
+fn stage_lix_file_content_insert_write(
     staged: &mut LixFileStagedBatch,
     file_id: String,
     path: Option<String>,
@@ -4152,7 +4159,7 @@ fn stage_lix_file_data_insert_write(
     context: FilesystemRowContext,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
-    let file_payload = TransactionFileData::new(
+    let file_payload = TransactionFileContent::new(
         file_id,
         path,
         filename,
@@ -4162,13 +4169,13 @@ fn stage_lix_file_data_insert_write(
         content,
     );
     if !file_payload.is_empty() {
-        stage_lix_file_data_blob_ref_write(staged, &file_payload, &context, origin)?;
+        stage_lix_file_content_blob_ref_write(staged, &file_payload, &context, origin)?;
     }
-    staged.file_data_writes.push(file_payload);
+    staged.file_content_writes.push(file_payload);
     Ok(())
 }
 
-fn stage_lix_file_data_update_write(
+fn stage_lix_file_content_update_write(
     staged: &mut LixFileStagedBatch,
     file_id: String,
     path: Option<String>,
@@ -4179,7 +4186,7 @@ fn stage_lix_file_data_update_write(
     base_blob_hash: Option<BlobId>,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
-    let file_payload = TransactionFileData::new(
+    let file_payload = TransactionFileContent::new(
         file_id.clone(),
         path,
         filename,
@@ -4196,27 +4203,27 @@ fn stage_lix_file_data_update_write(
             append_blob_ref_tombstone_row(&mut staged.state_rows, file_id, context.clone());
             staged.state_rows.set_origin(row_index, origin.clone());
         }
-        staged.file_data_writes.push(file_payload);
+        staged.file_content_writes.push(file_payload);
         return Ok(());
     }
-    stage_lix_file_data_blob_ref_write(staged, &file_payload, &context, origin.clone())?;
-    staged.file_data_writes.push(file_payload);
+    stage_lix_file_content_blob_ref_write(staged, &file_payload, &context, origin.clone())?;
+    staged.file_content_writes.push(file_payload);
     Ok(())
 }
 
-fn stage_lix_file_data_blob_ref_write(
+fn stage_lix_file_content_blob_ref_write(
     staged: &mut LixFileStagedBatch,
-    file_data: &TransactionFileData,
+    file_content: &TransactionFileContent,
     context: &FilesystemRowContext,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
     let row_index = staged.state_rows.len();
     BlobRefRowInput {
-        file_id: file_data.file_id.clone(),
-        blob_hash: file_data
+        file_id: file_content.file_id.clone(),
+        blob_hash: file_content
             .blob_hash()
             .expect("non-empty payload should have blob hash"),
-        size_bytes: file_data.len(),
+        size_bytes: file_content.len(),
         context: FilesystemRowContext {
             file_id: None,
             metadata: None,
@@ -4635,7 +4642,7 @@ fn lix_file_record_batch_from_path_selection(
                     .map(|entry| Some(entry.name.as_str()))
                     .collect::<Vec<_>>(),
             )),
-            "data" => Arc::new(LargeBinaryArray::from(
+            "content" => Arc::new(LargeBinaryArray::from(
                 entries.iter().map(|_| Some(&[][..])).collect::<Vec<_>>(),
             )),
             "lixcol_entity_pk" => Arc::new(StringArray::from(
@@ -4834,7 +4841,7 @@ impl LixFileRecordBatchColumns {
                 "path" => Arc::clone(&paths),
                 "directory_id" => Arc::clone(&directory_ids),
                 "name" => Arc::clone(&names),
-                "data" => Arc::clone(&data_values),
+                "content" => Arc::clone(&data_values),
                 "lixcol_entity_pk" => Arc::clone(&entity_pks),
                 "lixcol_schema_key" => Arc::clone(&schema_keys),
                 "lixcol_file_id" => Arc::clone(&file_ids),
@@ -4880,7 +4887,7 @@ async fn lix_file_record_batch_from_prepared(
         .iter()
         .map(|field| field.name().as_str())
         .collect::<Vec<_>>();
-    let needs_data = load_data && projected_columns.contains(&"data");
+    let needs_data = load_data && projected_columns.contains(&"content");
     let PreparedLixFileRows {
         live_rows,
         mut file_rows,
@@ -5677,10 +5684,13 @@ fn scan_needs_data(
     let projected_needs_data = match projection {
         Some(indices) => indices
             .iter()
-            .any(|index| base_schema.field(*index).name() == "data"),
+            .any(|index| base_schema.field(*index).name() == "content"),
         None => true,
     };
-    projected_needs_data || filters.iter().any(|filter| contains_column(filter, "data"))
+    projected_needs_data
+        || filters
+            .iter()
+            .any(|filter| contains_column(filter, "content"))
 }
 
 fn scan_needs_required_blob_rows(
@@ -5692,14 +5702,14 @@ fn scan_needs_required_blob_rows(
         Some(indices) => indices.iter().any(|index| {
             matches!(
                 base_schema.field(*index).name().as_str(),
-                "data" | "lixcol_change_id"
+                "content" | "lixcol_change_id"
             )
         }),
         None => true,
     };
     projects_blob_column
         || filters.iter().any(|filter| {
-            contains_column(filter, "data") || contains_column(filter, "lixcol_change_id")
+            contains_column(filter, "content") || contains_column(filter, "lixcol_change_id")
         })
 }
 
@@ -6542,33 +6552,33 @@ fn validate_lix_file_update_assignments(
         })?;
         if !matches!(
             column_name.as_str(),
-            "path" | "directory_id" | "name" | "data" | "lixcol_metadata"
+            "path" | "directory_id" | "name" | "content" | "lixcol_metadata"
         ) {
             return Err(DataFusionError::Execution(format!(
                 "UPDATE lix_file cannot stage read-only column '{column_name}'"
             )));
         }
-        if column_name == "data" {
-            reject_non_binary_lix_file_data_assignment(expr)?;
+        if column_name == "content" {
+            reject_non_binary_lix_file_content_assignment(expr)?;
         }
     }
     Ok(())
 }
 
-fn reject_non_binary_lix_file_data_assignment(expr: &Expr) -> Result<()> {
+fn reject_non_binary_lix_file_content_assignment(expr: &Expr) -> Result<()> {
     if let Expr::Literal(value, _) = expr {
         if !scalar_is_binary_or_null(value) {
-            return Err(non_binary_lix_file_data_assignment_error());
+            return Err(non_binary_lix_file_content_assignment_error());
         }
     }
 
     Ok(())
 }
 
-fn non_binary_lix_file_data_assignment_error() -> DataFusionError {
-    lix_file_data_type_error(
+fn non_binary_lix_file_content_assignment_error() -> DataFusionError {
+    lix_file_content_type_error(
         "UPDATE lix_file",
-        "data",
+        "content",
         "use X'...' or a binary parameter for file contents",
     )
 }
@@ -6668,10 +6678,10 @@ fn update_required_binary_value(
 ) -> Result<Vec<u8>> {
     match assignment_values.assigned_cell(row_index, column_name)? {
         UpdateCell::Unassigned | UpdateCell::Assigned(SqlCell::Null) => {
-            Err(lix_file_data_type_error(
+            Err(lix_file_content_type_error(
                 "UPDATE lix_file",
                 column_name,
-                "use X'' for an empty file or omit data to leave contents unchanged",
+                "use X'' for an empty file or omit content to leave contents unchanged",
             ))
         }
         UpdateCell::Assigned(SqlCell::Value(
@@ -6680,7 +6690,7 @@ fn update_required_binary_value(
         UpdateCell::Assigned(SqlCell::Value(ScalarValue::FixedSizeBinary(_, Some(value)))) => {
             Ok(value)
         }
-        UpdateCell::Assigned(SqlCell::Value(other)) => Err(lix_file_data_type_error_with_value(
+        UpdateCell::Assigned(SqlCell::Value(other)) => Err(lix_file_content_type_error_with_value(
             "UPDATE lix_file",
             column_name,
             &other,
@@ -6697,7 +6707,7 @@ fn required_binary_value(
     match optional_scalar_value(batch, row_index, column_name)? {
         Some(ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value))) => Ok(value),
         Some(ScalarValue::FixedSizeBinary(_, Some(value))) => Ok(value),
-        Some(other) => Err(lix_file_data_type_error_with_value(
+        Some(other) => Err(lix_file_content_type_error_with_value(
             "UPDATE lix_file",
             column_name,
             &other,
@@ -6775,16 +6785,16 @@ fn insert_optional_binary_value(
             | ScalarValue::Binary(None)
             | ScalarValue::LargeBinary(None)
             | ScalarValue::FixedSizeBinary(_, None),
-        ) => Err(lix_file_data_type_error(
+        ) => Err(lix_file_content_type_error(
             "INSERT into lix_file",
             column_name,
-            "use X'' for an empty file or omit data to create an empty file",
+            "use X'' for an empty file or omit content to create an empty file",
         )),
         Some(ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value))) => {
             Ok(Some(value))
         }
         Some(ScalarValue::FixedSizeBinary(_, Some(value))) => Ok(Some(value)),
-        Some(other) => Err(lix_file_data_type_error_with_value(
+        Some(other) => Err(lix_file_content_type_error_with_value(
             "INSERT into lix_file",
             column_name,
             &other,
@@ -6824,7 +6834,7 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, false),
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
-        Field::new("data", DataType::LargeBinary, false),
+        Field::new("content", DataType::LargeBinary, false),
         json_field("lixcol_entity_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
@@ -7407,11 +7417,11 @@ mod tests {
 
     #[test]
     fn contains_column_finds_nested_cast_and_function_references() {
-        let cast_data = Expr::Cast(Cast::new(Box::new(column("data")), DataType::Utf8));
+        let cast_data = Expr::Cast(Cast::new(Box::new(column("content")), DataType::Utf8));
         let function_data = scalar_function_expr("some_fn", vec![cast_data.clone()]);
 
-        assert!(super::contains_column(&cast_data, "data"));
-        assert!(super::contains_column(&function_data, "data"));
+        assert!(super::contains_column(&cast_data, "content"));
+        assert!(super::contains_column(&function_data, "content"));
         assert!(!super::contains_column(&function_data, "path"));
     }
 
@@ -7420,7 +7430,10 @@ mod tests {
         let schema = super::lix_file_schema();
         let projection = vec![schema.index_of("id").expect("id column")];
         let filter = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(scalar_function_expr("octet_length", vec![column("data")])),
+            Box::new(scalar_function_expr(
+                "octet_length",
+                vec![column("content")],
+            )),
             Operator::Gt,
             Box::new(Expr::Literal(ScalarValue::Int64(Some(0)), None)),
         ));
@@ -7774,7 +7787,7 @@ mod tests {
             PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
             test_functions(),
         );
-        let projection = vec![spec.schema().index_of("data").expect("data column")];
+        let projection = vec![spec.schema().index_of("content").expect("data column")];
         let filters = vec![eq_filter("id", "01920000-0000-7000-8000-0000000000d2")];
 
         let planned = spec
@@ -8418,7 +8431,7 @@ mod tests {
             columns.push("path");
         }
         if update_columns.data {
-            columns.push("data");
+            columns.push("content");
         }
         if update_columns.writes_descriptor() {
             columns.extend(["directory_id", "name"]);
@@ -8464,7 +8477,7 @@ mod tests {
         exact_load_requests: Vec<LiveStateExactBatchRequest>,
     }
 
-    struct IndexedFileDataUpdateWriteContext {
+    struct IndexedFileContentUpdateWriteContext {
         index: Arc<FilesystemPathIndex>,
         blob_rows: Vec<MaterializedLiveStateRow>,
         writes: Vec<TransactionWrite>,
@@ -8632,7 +8645,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl SqlWriteExecutionContext for IndexedFileDataUpdateWriteContext {
+    impl SqlWriteExecutionContext for IndexedFileContentUpdateWriteContext {
         fn active_branch_id(&self) -> &str {
             "01920000-0000-7000-8000-0000000000b1"
         }
@@ -8714,7 +8727,7 @@ mod tests {
         ) -> Result<TransactionWriteOutcome, LixError> {
             let count = match &write {
                 TransactionWrite::Rows { rows, .. } => rows.len() as u64,
-                TransactionWrite::RowsWithFileData { count, .. } => *count,
+                TransactionWrite::RowsWithFileContent { count, .. } => *count,
             };
             self.writes.push(write);
             Ok(TransactionWriteOutcome { count })
@@ -9172,7 +9185,7 @@ mod tests {
                 Field::new("id", DataType::Utf8, false),
                 Field::new("directory_id", DataType::Utf8, true),
                 Field::new("name", DataType::Utf8, false),
-                Field::new("data", DataType::Binary, true),
+                Field::new("content", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
@@ -9199,7 +9212,7 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, false),
-                Field::new("data", DataType::Binary, true),
+                Field::new("content", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
@@ -9225,7 +9238,7 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, false),
-                Field::new("data", DataType::Binary, true),
+                Field::new("content", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
@@ -9243,7 +9256,7 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, false),
-                Field::new("data", DataType::Binary, true),
+                Field::new("content", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
@@ -9263,7 +9276,7 @@ mod tests {
                 Field::new("path", DataType::Utf8, false),
                 Field::new("directory_id", DataType::Utf8, true),
                 Field::new("name", DataType::Utf8, false),
-                Field::new("data", DataType::Binary, true),
+                Field::new("content", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
@@ -9285,7 +9298,7 @@ mod tests {
                 Field::new("path", DataType::Utf8, false),
                 Field::new("directory_id", DataType::Utf8, true),
                 Field::new("name", DataType::Utf8, false),
-                Field::new("data", DataType::Binary, true),
+                Field::new("content", DataType::Binary, true),
                 Field::new("lixcol_metadata", DataType::Utf8, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
@@ -9306,7 +9319,7 @@ mod tests {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
-                Field::new("data", DataType::Binary, true),
+                Field::new("content", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
@@ -9395,13 +9408,13 @@ mod tests {
         let mut staged = super::LixFileStagedBatch::with_row_capacity(FILE_COUNT);
         let owner_pointers = staged.state_rows.aligned_owner_allocation_ptrs();
         let owner_capacities = staged.state_rows.aligned_owner_capacities();
-        let file_data_pointer = staged.file_data_writes.as_ptr();
-        let file_data_capacity = staged.file_data_writes.capacity();
+        let file_content_pointer = staged.file_content_writes.as_ptr();
+        let file_content_capacity = staged.file_content_writes.capacity();
         let context = FilesystemRowContext::active_branch("01920000-0000-7000-8000-000000002710");
 
         for index in 0..FILE_COUNT {
             let file_id = format!("01920000-0000-7000-8000-{index:012x}");
-            super::stage_lix_file_data_insert_write(
+            super::stage_lix_file_content_insert_write(
                 &mut staged,
                 file_id.clone(),
                 None,
@@ -9414,7 +9427,7 @@ mod tests {
         }
 
         assert_eq!(staged.state_rows.len(), FILE_COUNT);
-        assert_eq!(staged.file_data_writes.len(), FILE_COUNT);
+        assert_eq!(staged.file_content_writes.len(), FILE_COUNT);
         assert_eq!(
             staged.state_rows.aligned_owner_allocation_ptrs(),
             owner_pointers
@@ -9423,8 +9436,8 @@ mod tests {
             staged.state_rows.aligned_owner_capacities(),
             owner_capacities
         );
-        assert_eq!(staged.file_data_writes.as_ptr(), file_data_pointer);
-        assert_eq!(staged.file_data_writes.capacity(), file_data_capacity);
+        assert_eq!(staged.file_content_writes.as_ptr(), file_content_pointer);
+        assert_eq!(staged.file_content_writes.capacity(), file_content_capacity);
         assert_eq!(
             staged.state_rows.shared_string_count(),
             FILE_COUNT + 2,
@@ -9653,7 +9666,7 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         let data_column = batch
-            .column(batch.schema().index_of("data").unwrap())
+            .column(batch.schema().index_of("content").unwrap())
             .as_any()
             .downcast_ref::<LargeBinaryArray>()
             .unwrap();
@@ -9760,7 +9773,7 @@ mod tests {
         .expect("blob ref should project data for its descriptor");
 
         let data_column = batch
-            .column(batch.schema().index_of("data").unwrap())
+            .column(batch.schema().index_of("content").unwrap())
             .as_any()
             .downcast_ref::<LargeBinaryArray>()
             .expect("data should be large binary array");
@@ -10394,7 +10407,7 @@ mod tests {
     }
 
     #[test]
-    fn file_data_update_rejects_invalid_existing_plugin_storage_path() {
+    fn file_content_update_rejects_invalid_existing_plugin_storage_path() {
         let error = lix_file_update_stage_from_batch_for_test(
             &data_update_batch_with_path("/.lix/plugins/nested/plugin_sentinel.lixplugin"),
             None,
@@ -10515,7 +10528,7 @@ mod tests {
         .expect("decode file path update");
 
         assert_eq!(staged.count, 1);
-        assert_eq!(staged.file_data_writes.len(), 0);
+        assert_eq!(staged.file_content_writes.len(), 0);
         assert_eq!(staged.state_rows.len(), 1);
         let descriptor = staged
             .state_rows
@@ -10561,7 +10574,7 @@ mod tests {
         .expect("decode file path update");
 
         assert!(
-            staged.file_data_writes.is_empty(),
+            staged.file_content_writes.is_empty(),
             "path-only update should not rewrite file data"
         );
         assert!(
@@ -10701,12 +10714,12 @@ mod tests {
         .expect("decode file path and data update");
 
         assert_eq!(staged.count, 1);
-        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(staged.file_content_writes.len(), 1);
         assert_eq!(
-            staged.file_data_writes[0].file_id,
+            staged.file_content_writes[0].file_id,
             "01920000-0000-7000-8000-0000000000d2"
         );
-        assert_eq!(staged.file_data_writes[0].data(), b"hello");
+        assert_eq!(staged.file_content_writes[0].content(), b"hello");
         assert!(
             staged
                 .state_rows
@@ -10751,16 +10764,16 @@ mod tests {
         .expect("decode file descriptor and data update");
 
         assert_eq!(staged.count, 1);
-        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(staged.file_content_writes.len(), 1);
         assert_eq!(
-            staged.file_data_writes[0].file_id,
+            staged.file_content_writes[0].file_id,
             "01920000-0000-7000-8000-0000000000d2"
         );
         assert_eq!(
-            staged.file_data_writes[0].path.as_deref(),
+            staged.file_content_writes[0].path.as_deref(),
             Some("/docs/readme.md")
         );
-        assert_eq!(staged.file_data_writes[0].data(), b"hello");
+        assert_eq!(staged.file_content_writes[0].content(), b"hello");
         let blob_ref_row = staged
             .state_rows
             .iter()
@@ -10774,7 +10787,7 @@ mod tests {
             .clone();
         assert_eq!(
             snapshot["blob_hash"].as_str(),
-            staged.file_data_writes[0]
+            staged.file_content_writes[0]
                 .blob_hash()
                 .map(BlobId::to_hex)
                 .as_deref()
@@ -10785,7 +10798,7 @@ mod tests {
     fn file_metadata_data_update_reuses_materialized_path_without_resolver() {
         let batch = metadata_data_update_batch();
         let assignments = vec![
-            literal_assignment("data", ScalarValue::Binary(Some(b"updated".to_vec()))),
+            literal_assignment("content", ScalarValue::Binary(Some(b"updated".to_vec()))),
             literal_assignment(
                 "lixcol_metadata",
                 ScalarValue::Utf8(Some(r#"{"source":"upload"}"#.to_string())),
@@ -10809,8 +10822,10 @@ mod tests {
             "directory moves must retain resolver validation"
         );
 
-        let assignment_values =
-            super::UpdateAssignmentValues::from_batch_columns(&batch, &["data", "lixcol_metadata"]);
+        let assignment_values = super::UpdateAssignmentValues::from_batch_columns(
+            &batch,
+            &["content", "lixcol_metadata"],
+        );
         let staged = super::lix_file_update_stage_from_batch(
             &batch,
             &assignment_values,
@@ -10837,16 +10852,16 @@ mod tests {
             descriptor.metadata.map(TransactionJson::value),
             Some(&serde_json::json!({"source": "upload"}))
         );
-        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(staged.file_content_writes.len(), 1);
         assert_eq!(
-            staged.file_data_writes[0].path.as_deref(),
+            staged.file_content_writes[0].path.as_deref(),
             Some("/docs/readme.md")
         );
-        assert_eq!(staged.file_data_writes[0].data(), b"updated");
+        assert_eq!(staged.file_content_writes[0].content(), b"updated");
     }
 
     #[test]
-    fn file_data_update_without_path_ignores_materialized_path_column() {
+    fn file_content_update_without_path_ignores_materialized_path_column() {
         let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
             None,
@@ -10860,9 +10875,9 @@ mod tests {
         .expect("decode file data update");
 
         assert_eq!(staged.count, 1);
-        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(staged.file_content_writes.len(), 1);
         assert_eq!(
-            staged.file_data_writes[0].file_id,
+            staged.file_content_writes[0].file_id,
             "01920000-0000-7000-8000-0000000000d2"
         );
         assert_eq!(staged.state_rows.len(), 1);
@@ -10870,7 +10885,7 @@ mod tests {
     }
 
     #[test]
-    fn file_data_update_to_empty_ignores_blob_ref_in_other_scope() {
+    fn file_content_update_to_empty_ignores_blob_ref_in_other_scope() {
         let staged = lix_file_update_stage_from_batch_with_blob_keys_for_test(
             &empty_data_update_batch(),
             None,
@@ -10900,7 +10915,7 @@ mod tests {
     fn file_insert_stages_non_null_data() {
         let batch = data_insert_batch();
 
-        let staged = lix_file_insert_stage_from_batch(&batch, None).expect("decode file data");
+        let staged = lix_file_insert_stage_from_batch(&batch, None).expect("decode file content");
 
         assert_eq!(staged.count, 1);
         assert_eq!(staged.state_rows.len(), 2);
@@ -10923,16 +10938,16 @@ mod tests {
             blob_ref_row.file_id.map(|file_id| file_id.as_str()),
             Some("01920000-0000-7000-8000-0000000000d2")
         );
-        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(staged.file_content_writes.len(), 1);
         assert_eq!(
-            staged.file_data_writes[0].file_id,
+            staged.file_content_writes[0].file_id,
             "01920000-0000-7000-8000-0000000000d2"
         );
         assert_eq!(
-            staged.file_data_writes[0].branch_id,
+            staged.file_content_writes[0].branch_id,
             "01920000-0000-7000-8000-0000000000b1"
         );
-        assert_eq!(staged.file_data_writes[0].data(), b"hello");
+        assert_eq!(staged.file_content_writes[0].content(), b"hello");
         let snapshot: serde_json::Value = blob_ref_row
             .snapshot
             .as_ref()
@@ -10941,7 +10956,7 @@ mod tests {
             .clone();
         assert_eq!(
             snapshot["blob_hash"].as_str(),
-            staged.file_data_writes[0]
+            staged.file_content_writes[0]
                 .blob_hash()
                 .map(BlobId::to_hex)
                 .as_deref()
@@ -11069,9 +11084,9 @@ mod tests {
         .expect("decode file path data");
 
         assert_eq!(staged.count, 1);
-        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(staged.file_content_writes.len(), 1);
         assert_eq!(
-            staged.file_data_writes[0].file_id,
+            staged.file_content_writes[0].file_id,
             "01920000-0000-7000-8000-0000000000d2"
         );
         assert_eq!(staged.state_rows.len(), 2);
@@ -11324,7 +11339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_data_update_reuses_source_blob_ref_keys() {
+    async fn file_content_update_reuses_source_blob_ref_keys() {
         let mut write_context = CapturingWriteContext {
             rows: file_dml_rows(),
             ..CapturingWriteContext::default()
@@ -11335,7 +11350,7 @@ mod tests {
             .plan_update(
                 write_ctx,
                 vec![literal_assignment(
-                    "data",
+                    "content",
                     ScalarValue::LargeBinary(Some(Vec::new())),
                 )],
                 &[],
@@ -11350,14 +11365,14 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(write_context.scan_count, 1);
-        let TransactionWrite::RowsWithFileData {
-            rows, file_data, ..
+        let TransactionWrite::RowsWithFileContent {
+            rows, file_content, ..
         } = &write_context.writes[0]
         else {
             panic!("data update should stage rows and file data");
         };
-        assert!(file_data[0].data().is_empty());
-        assert!(file_data[0].had_blob_ref);
+        assert!(file_content[0].content().is_empty());
+        assert!(file_content[0].had_blob_ref);
         assert!(
             rows.iter().any(|row| {
                 row.schema_key == super::BLOB_REF_SCHEMA_KEY && row.snapshot.is_none()
@@ -11374,7 +11389,7 @@ mod tests {
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let assignments = vec![
-            literal_assignment("data", ScalarValue::Binary(Some(b"updated".to_vec()))),
+            literal_assignment("content", ScalarValue::Binary(Some(b"updated".to_vec()))),
             literal_assignment(
                 "lixcol_metadata",
                 ScalarValue::Utf8(Some(r#"{"source":"upload"}"#.to_string())),
@@ -11389,8 +11404,11 @@ mod tests {
         assert_eq!(write_context.path_index_count, 0);
         assert_eq!(write_context.exact_load_requests.len(), 1);
         assert_eq!(write_context.scan_count, 0);
-        assert_eq!(staged.file_data.len(), 1);
-        assert_eq!(staged.file_data[0].path.as_deref(), Some("/docs/readme.md"));
+        assert_eq!(staged.file_content.len(), 1);
+        assert_eq!(
+            staged.file_content[0].path.as_deref(),
+            Some("/docs/readme.md")
+        );
     }
 
     #[tokio::test]
@@ -11436,7 +11454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_file_data_update_uses_path_index_and_target_blob_scan() {
+    async fn fast_file_content_update_uses_path_index_and_target_blob_scan() {
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let scan_requests = Arc::new(Mutex::new(Vec::new()));
         let index = Arc::new(
@@ -11455,7 +11473,7 @@ mod tests {
             .expect("filesystem path index should build"),
         );
         let old_data = b"old";
-        let mut write_context = IndexedFileDataUpdateWriteContext {
+        let mut write_context = IndexedFileContentUpdateWriteContext {
             index,
             blob_rows: vec![live_blob_ref_row(
                 "01920000-0000-7000-8000-0000000000d2",
@@ -11469,7 +11487,7 @@ mod tests {
             path_index_requests: Arc::clone(&path_index_requests),
         };
 
-        let count = super::execute_fast_lix_file_data_update_by_id(
+        let count = super::execute_fast_lix_file_content_update_by_id(
             &mut write_context,
             Some("01920000-0000-7000-8000-0000000000d2".to_string()),
             b"new".to_vec().into(),
@@ -11494,14 +11512,15 @@ mod tests {
             );
         }
 
-        let TransactionWrite::RowsWithFileData { file_data, .. } = &write_context.writes[0] else {
+        let TransactionWrite::RowsWithFileContent { file_content, .. } = &write_context.writes[0]
+        else {
             panic!("data update should stage file data");
         };
-        assert_eq!(file_data.len(), 1);
-        assert_eq!(file_data[0].path.as_deref(), Some("/docs/readme.md"));
-        assert_eq!(file_data[0].data(), b"new");
-        assert!(file_data[0].had_blob_ref);
-        assert!(file_data[0].splice_provenance().is_none());
+        assert_eq!(file_content.len(), 1);
+        assert_eq!(file_content[0].path.as_deref(), Some("/docs/readme.md"));
+        assert_eq!(file_content[0].content(), b"new");
+        assert!(file_content[0].had_blob_ref);
+        assert!(file_content[0].splice_provenance().is_none());
 
         let next: crate::Blob = b"next".as_slice().into();
         let provenance = crate::common::RequestBlobSpliceProvenance::new_validated_for_test(
@@ -11511,7 +11530,7 @@ mod tests {
             1,
             b"ex".to_vec(),
         );
-        let count = super::execute_fast_lix_file_data_update_by_id(
+        let count = super::execute_fast_lix_file_content_update_by_id(
             &mut write_context,
             Some("01920000-0000-7000-8000-0000000000d2".to_string()),
             next,
@@ -11524,14 +11543,18 @@ mod tests {
         .await
         .expect("fast spliced data update should stage");
         assert_eq!(count, 1);
-        let TransactionWrite::RowsWithFileData { file_data, .. } = &write_context.writes[1] else {
+        let TransactionWrite::RowsWithFileContent { file_content, .. } = &write_context.writes[1]
+        else {
             panic!("spliced data update should stage file data");
         };
-        assert_eq!(file_data[0].file_id, "01920000-0000-7000-8000-0000000000d2");
-        assert_eq!(file_data[0].data(), b"next");
-        assert_eq!(file_data[0].splice_provenance(), Some(&provenance));
         assert_eq!(
-            file_data[0].mutation_identity(),
+            file_content[0].file_id,
+            "01920000-0000-7000-8000-0000000000d2"
+        );
+        assert_eq!(file_content[0].content(), b"next");
+        assert_eq!(file_content[0].splice_provenance(), Some(&provenance));
+        assert_eq!(
+            file_content[0].mutation_identity(),
             Some(crate::common::MutationIdentity {
                 namespace_seed: [7; 16],
                 operation_proof: [17; 32],
@@ -11571,7 +11594,7 @@ mod tests {
                 )),
                 None,
             )],
-            super::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
+            super::FastLixFilePathWriteConflict::UpdateContentAndMetadata,
             None,
         )
         .await
@@ -11582,18 +11605,18 @@ mod tests {
         assert_eq!(write_context.exact_load_requests.len(), 1);
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
         assert_eq!(write_context.scan_count, 0);
-        let TransactionWrite::RowsWithFileData {
-            rows, file_data, ..
+        let TransactionWrite::RowsWithFileContent {
+            rows, file_content, ..
         } = &write_context.writes[0]
         else {
             panic!("path upsert should stage descriptor, blob, and file data");
         };
-        assert_eq!(file_data.len(), 1);
-        assert_eq!(file_data[0].path.as_deref(), Some("/readme.md"));
-        assert_eq!(file_data[0].data(), b"new");
-        assert!(file_data[0].had_blob_ref);
+        assert_eq!(file_content.len(), 1);
+        assert_eq!(file_content[0].path.as_deref(), Some("/readme.md"));
+        assert_eq!(file_content[0].content(), b"new");
+        assert!(file_content[0].had_blob_ref);
         assert_eq!(
-            file_data[0].base_blob_hash(),
+            file_content[0].base_blob_hash(),
             Some(BlobId::from_content(old_data)),
             "the exact indexed blob hash should be retained for optional CAS reuse",
         );
@@ -11653,16 +11676,16 @@ mod tests {
         .expect("prepared path write should stage");
 
         assert!(outcome.is_some());
-        let TransactionWrite::RowsWithFileData {
-            rows, file_data, ..
+        let TransactionWrite::RowsWithFileContent {
+            rows, file_content, ..
         } = &write_context.writes[0]
         else {
             panic!("prepared path write should use ordinary file transaction rows");
         };
-        assert_eq!(file_data.len(), 1);
-        assert!(file_data[0].inline_data().is_none());
-        assert_eq!(file_data[0].blob_hash(), Some(blob_id));
-        assert_eq!(file_data[0].len(), size_bytes);
+        assert_eq!(file_content.len(), 1);
+        assert!(file_content[0].inline_data().is_none());
+        assert_eq!(file_content[0].blob_hash(), Some(blob_id));
+        assert_eq!(file_content[0].len(), size_bytes);
         let blob_ref = rows
             .iter()
             .find(|row| row.schema_key == super::BLOB_REF_SCHEMA_KEY)
@@ -11732,7 +11755,7 @@ mod tests {
                     Some(missing_provenance.clone()),
                 ),
             ],
-            super::FastLixFilePathWriteConflict::UpdateData,
+            super::FastLixFilePathWriteConflict::UpdateContent,
             Some(crate::common::MutationIdentity {
                 namespace_seed: [8; 16],
                 operation_proof: [18; 32],
@@ -11746,19 +11769,25 @@ mod tests {
         assert_eq!(write_context.exact_load_requests.len(), 1);
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
         assert_eq!(write_context.scan_count, 0);
-        let TransactionWrite::RowsWithFileData {
-            rows, file_data, ..
+        let TransactionWrite::RowsWithFileContent {
+            rows, file_content, ..
         } = &write_context.writes[0]
         else {
             panic!("mixed path upsert should stage file data");
         };
-        assert_eq!(file_data.len(), 2);
-        assert!(file_data[0].had_blob_ref);
-        assert!(!file_data[1].had_blob_ref);
-        assert_eq!(file_data[0].splice_provenance(), Some(&existing_provenance));
-        assert_eq!(file_data[1].splice_provenance(), Some(&missing_provenance));
-        assert!(file_data.iter().all(|file_data| {
-            file_data.mutation_identity()
+        assert_eq!(file_content.len(), 2);
+        assert!(file_content[0].had_blob_ref);
+        assert!(!file_content[1].had_blob_ref);
+        assert_eq!(
+            file_content[0].splice_provenance(),
+            Some(&existing_provenance)
+        );
+        assert_eq!(
+            file_content[1].splice_provenance(),
+            Some(&missing_provenance)
+        );
+        assert!(file_content.iter().all(|file_content| {
+            file_content.mutation_identity()
                 == Some(crate::common::MutationIdentity {
                     namespace_seed: [8; 16],
                     operation_proof: [18; 32],
@@ -11784,7 +11813,7 @@ mod tests {
                 None,
                 None,
             )],
-            super::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
+            super::FastLixFilePathWriteConflict::UpdateContentAndMetadata,
             None,
         )
         .await
@@ -11794,13 +11823,13 @@ mod tests {
         assert_eq!(write_context.path_index_count, 1);
         assert!(write_context.exact_load_requests.is_empty());
         assert_eq!(write_context.scan_count, 0);
-        let TransactionWrite::RowsWithFileData {
-            rows, file_data, ..
+        let TransactionWrite::RowsWithFileContent {
+            rows, file_content, ..
         } = &write_context.writes[0]
         else {
             panic!("nested path upsert should stage descriptors and file data");
         };
-        assert_eq!(file_data.len(), 1);
+        assert_eq!(file_content.len(), 1);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.schema_key == super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
@@ -11835,7 +11864,7 @@ mod tests {
                     None,
                 ),
             ],
-            super::FastLixFilePathWriteConflict::UpdateData,
+            super::FastLixFilePathWriteConflict::UpdateContent,
             None,
         )
         .await
@@ -11861,7 +11890,7 @@ mod tests {
         let error = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![("/docs".to_string(), b"file".to_vec().into(), None, None)],
-            super::FastLixFilePathWriteConflict::UpdateData,
+            super::FastLixFilePathWriteConflict::UpdateContent,
             None,
         )
         .await
@@ -11928,7 +11957,7 @@ mod tests {
                     None,
                 ),
             ],
-            super::FastLixFilePathWriteConflict::UpdateData,
+            super::FastLixFilePathWriteConflict::UpdateContent,
             None,
         )
         .await
@@ -11943,14 +11972,14 @@ mod tests {
         );
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 2);
         assert_eq!(write_context.scan_count, 0);
-        let TransactionWrite::RowsWithFileData {
-            rows, file_data, ..
+        let TransactionWrite::RowsWithFileContent {
+            rows, file_content, ..
         } = &write_context.writes[0]
         else {
             panic!("scope-isolated path upsert should stage file data");
         };
-        assert_eq!(file_data.len(), 2);
-        assert!(file_data.iter().all(|write| !write.had_blob_ref));
+        assert_eq!(file_content.len(), 2);
+        assert!(file_content.iter().all(|write| !write.had_blob_ref));
         assert!(rows.iter().all(|row| row.snapshot.is_some()));
     }
 
@@ -11979,7 +12008,7 @@ mod tests {
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![("/readme.md".to_string(), Vec::new().into(), None, None)],
-            super::FastLixFilePathWriteConflict::UpdateData,
+            super::FastLixFilePathWriteConflict::UpdateContent,
             None,
         )
         .await
@@ -11990,14 +12019,14 @@ mod tests {
         assert_eq!(write_context.exact_load_requests.len(), 1);
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
         assert_eq!(write_context.scan_count, 0);
-        let TransactionWrite::RowsWithFileData {
-            rows, file_data, ..
+        let TransactionWrite::RowsWithFileContent {
+            rows, file_content, ..
         } = &write_context.writes[0]
         else {
             panic!("empty path upsert should stage a blob tombstone and file data");
         };
-        assert!(file_data[0].data().is_empty());
-        assert!(file_data[0].had_blob_ref);
+        assert!(file_content[0].content().is_empty());
+        assert!(file_content[0].had_blob_ref);
         assert!(
             rows.iter().any(|row| {
                 row.schema_key == super::BLOB_REF_SCHEMA_KEY && row.snapshot.is_none()
@@ -12026,7 +12055,7 @@ mod tests {
         let outcome = super::execute_fast_lix_file_path_writes(
             &mut write_context,
             vec![("/shared.md".to_string(), b"new".to_vec().into(), None, None)],
-            super::FastLixFilePathWriteConflict::UpdateDataAndMetadata,
+            super::FastLixFilePathWriteConflict::UpdateContentAndMetadata,
             None,
         )
         .await
@@ -12062,7 +12091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_insert_sink_stages_file_data_writes() {
+    async fn file_insert_sink_stages_file_content_writes() {
         let batch = data_insert_batch();
         let mut write_context = CapturingWriteContext {
             rows: vec![live_directory_row(
@@ -12085,10 +12114,10 @@ mod tests {
         let writes = &write_context.writes;
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            TransactionWrite::RowsWithFileData {
+            TransactionWrite::RowsWithFileContent {
                 mode,
                 rows,
-                file_data,
+                file_content,
                 count,
                 ..
             } => {
@@ -12103,11 +12132,14 @@ mod tests {
                     rows.iter()
                         .any(|row| row.schema_key == "lix_binary_blob_ref")
                 );
-                assert_eq!(file_data.len(), 1);
-                assert_eq!(file_data[0].file_id, "01920000-0000-7000-8000-0000000000d2");
-                assert_eq!(file_data[0].path.as_deref(), Some("/docs/readme.md"));
-                assert_eq!(file_data[0].data(), b"hello");
-                assert!(!file_data[0].had_blob_ref);
+                assert_eq!(file_content.len(), 1);
+                assert_eq!(
+                    file_content[0].file_id,
+                    "01920000-0000-7000-8000-0000000000d2"
+                );
+                assert_eq!(file_content[0].path.as_deref(), Some("/docs/readme.md"));
+                assert_eq!(file_content[0].content(), b"hello");
+                assert!(!file_content[0].had_blob_ref);
             }
             other => panic!("expected insert with file data staged write, got {other:?}"),
         }
@@ -12144,15 +12176,18 @@ mod tests {
         let writes = &write_context.writes;
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            TransactionWrite::RowsWithFileData {
+            TransactionWrite::RowsWithFileContent {
                 rows,
-                file_data,
+                file_content,
                 count,
                 ..
             } => {
                 assert_eq!(*count, 1);
-                assert_eq!(file_data.len(), 1);
-                assert_eq!(file_data[0].file_id, "01920000-0000-7000-8000-0000000000d2");
+                assert_eq!(file_content.len(), 1);
+                assert_eq!(
+                    file_content[0].file_id,
+                    "01920000-0000-7000-8000-0000000000d2"
+                );
                 let descriptor = rows
                     .iter()
                     .find(|row| row.schema_key == "lix_file_descriptor")

@@ -55,7 +55,7 @@ test("remote observe applies every blob delta before coalescing delivery", async
 			sequence: 0,
 			mutationSequence: 10,
 			result: {
-				columns: ["data"],
+				columns: ["content"],
 				rows: [[{ kind: "blob", base64: "YWJjZGVm" }]],
 				rowsAffected: 0,
 				notices: [],
@@ -100,7 +100,7 @@ test("remote observe applies every blob delta before coalescing delivery", async
 		},
 	});
 
-	const events = lix.observe("SELECT data FROM lix_file WHERE id = $1", [
+	const events = lix.observe("SELECT content FROM lix_file WHERE id = $1", [
 		"file-1",
 	]);
 	await new Promise((resolve) => setTimeout(resolve, 0));
@@ -108,7 +108,7 @@ test("remote observe applies every blob delta before coalescing delivery", async
 	expect(latest?.sequence).toBe(2);
 	expect(latest?.mutationSequence).toBe(12);
 	expect(
-		new TextDecoder().decode(latest?.result.rows[0]?.value("data").asBytes()),
+		new TextDecoder().decode(latest?.result.rows[0]?.value("content").asBytes()),
 	).toBe("abX!ef");
 
 	events.close();

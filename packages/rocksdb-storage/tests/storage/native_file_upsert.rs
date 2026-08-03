@@ -26,7 +26,7 @@ where
 
     assert_eq!(
         session
-            .upsert_file_data(
+            .upsert_file_content(
                 "/native/deep/payload.bin".to_string(),
                 b"first".to_vec().into()
             )
@@ -34,11 +34,11 @@ where
             .expect("create through native file upsert"),
         1
     );
-    assert_file_data(&session, "/native/deep/payload.bin", b"first").await;
+    assert_file_content(&session, "/native/deep/payload.bin", b"first").await;
 
     assert_eq!(
         session
-            .upsert_file_data(
+            .upsert_file_content(
                 "/native/deep/payload.bin".to_string(),
                 b"second".to_vec().into()
             )
@@ -46,23 +46,23 @@ where
             .expect("update through native file upsert"),
         1
     );
-    assert_file_data(&session, "/native/deep/payload.bin", b"second").await;
+    assert_file_content(&session, "/native/deep/payload.bin", b"second").await;
 
     // Empty content is a present empty file. For an existing blob-backed file,
     // the fast helper also stages the matching blob-reference tombstone.
     assert_eq!(
         session
-            .upsert_file_data("/native/deep/payload.bin".to_string(), Vec::new().into())
+            .upsert_file_content("/native/deep/payload.bin".to_string(), Vec::new().into())
             .await
             .expect("empty native file upsert"),
         1
     );
-    assert_file_data(&session, "/native/deep/payload.bin", b"").await;
+    assert_file_content(&session, "/native/deep/payload.bin", b"").await;
 
     let fast_batch_parent = active_branch_commit_id(&session).await;
     assert_eq!(
         session
-            .upsert_file_data_batch(file_writes(&[
+            .upsert_file_content_batch(file_writes(&[
                 ("/native/deep/payload.bin", b"batch-update"),
                 ("/native/batch/one.bin", b"one"),
                 ("/native/batch/two.bin", b"two"),
@@ -73,15 +73,15 @@ where
         4
     );
     assert_active_branch_head_parent(&session, &fast_batch_parent).await;
-    assert_file_data(&session, "/native/deep/payload.bin", b"batch-update").await;
-    assert_file_data(&session, "/native/batch/one.bin", b"one").await;
-    assert_file_data(&session, "/native/batch/two.bin", b"two").await;
-    assert_file_data(&session, "/native/batch/empty.bin", b"").await;
+    assert_file_content(&session, "/native/deep/payload.bin", b"batch-update").await;
+    assert_file_content(&session, "/native/batch/one.bin", b"one").await;
+    assert_file_content(&session, "/native/batch/two.bin", b"two").await;
+    assert_file_content(&session, "/native/batch/empty.bin", b"").await;
 
     let fast_batch_update_parent = active_branch_commit_id(&session).await;
     assert_eq!(
         session
-            .upsert_file_data_batch(file_writes(&[
+            .upsert_file_content_batch(file_writes(&[
                 ("/native/batch/one.bin", b"updated-one"),
                 ("/native/batch/two.bin", b""),
                 ("/native/batch/empty.bin", b"updated-empty"),
@@ -91,19 +91,19 @@ where
         3
     );
     assert_active_branch_head_parent(&session, &fast_batch_update_parent).await;
-    assert_file_data(&session, "/native/batch/one.bin", b"updated-one").await;
-    assert_file_data(&session, "/native/batch/two.bin", b"").await;
-    assert_file_data(&session, "/native/batch/empty.bin", b"updated-empty").await;
+    assert_file_content(&session, "/native/batch/one.bin", b"updated-one").await;
+    assert_file_content(&session, "/native/batch/two.bin", b"").await;
+    assert_file_content(&session, "/native/batch/empty.bin", b"updated-empty").await;
 
     let head_before_prevalidation_errors = active_branch_commit_id(&session).await;
     let empty_error = session
-        .upsert_file_data_batch(Vec::new())
+        .upsert_file_content_batch(Vec::new())
         .await
         .expect_err("empty native file batches should be rejected");
     assert_eq!(empty_error.code, LixError::CODE_INVALID_PARAM);
 
     let duplicate_error = session
-        .upsert_file_data_batch(file_writes(&[
+        .upsert_file_content_batch(file_writes(&[
             ("/native/batch/duplicate.bin", b"first"),
             ("/native/batch/duplicate.bin", b"second"),
         ]))
@@ -113,7 +113,7 @@ where
     assert_file_missing(&session, "/native/batch/duplicate.bin").await;
 
     let path_error = session
-        .upsert_file_data_batch(file_writes(&[
+        .upsert_file_content_batch(file_writes(&[
             ("/native/batch/must-not-write.bin", b"first"),
             ("relative.bin", b"invalid"),
         ]))
@@ -137,7 +137,7 @@ where
     session
         .execute(
             "INSERT INTO lix_file_by_branch \
-             (id, path, data, lixcol_global, lixcol_branch_id) \
+             (id, path, content, lixcol_global, lixcol_branch_id) \
              VALUES ($1, $2, $3, true, 'ffffffff-ffff-7fff-bfff-ffffffffffff')",
             &[
                 Value::Text("abc1de5c-4b72-748d-84df-8fc7b1beedda".to_string()),
@@ -150,7 +150,7 @@ where
     session
         .execute(
             "INSERT INTO lix_file_by_branch \
-             (id, path, data, lixcol_branch_id) \
+             (id, path, content, lixcol_branch_id) \
              VALUES ($1, $2, $3, $4)",
             &[
                 Value::Text("abc1de5c-4b72-748d-84df-8fc7b1beedda".to_string()),
@@ -165,7 +165,7 @@ where
     let overlay_batch_parent = active_branch_commit_id(&session).await;
     assert_eq!(
         session
-            .upsert_file_data_batch(file_writes(&[
+            .upsert_file_content_batch(file_writes(&[
                 ("/native/overlap.bin", b"updated"),
                 ("/native/batch/overlay-companion.bin", b"companion"),
             ]))
@@ -174,21 +174,21 @@ where
         2
     );
     assert_active_branch_head_parent(&session, &overlay_batch_parent).await;
-    assert_file_data_by_branch(
+    assert_file_content_by_branch(
         &session,
         "abc1de5c-4b72-748d-84df-8fc7b1beedda",
         &active_branch_id,
         b"updated",
     )
     .await;
-    assert_file_data_by_branch(
+    assert_file_content_by_branch(
         &session,
         "abc1de5c-4b72-748d-84df-8fc7b1beedda",
         "ffffffff-ffff-7fff-bfff-ffffffffffff",
         b"g",
     )
     .await;
-    assert_file_data(
+    assert_file_content(
         &session,
         "/native/batch/overlay-companion.bin",
         b"companion",
@@ -249,7 +249,7 @@ where
 {
     let result = session
         .execute(
-            "SELECT data FROM lix_file WHERE path = $1",
+            "SELECT content FROM lix_file WHERE path = $1",
             &[Value::Text(path.to_string())],
         )
         .await
@@ -260,13 +260,13 @@ where
     );
 }
 
-async fn assert_file_data<S>(session: &SessionContext<S>, path: &str, expected: &[u8])
+async fn assert_file_content<S>(session: &SessionContext<S>, path: &str, expected: &[u8])
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let result = session
         .execute(
-            "SELECT data FROM lix_file WHERE path = $1",
+            "SELECT content FROM lix_file WHERE path = $1",
             &[Value::Text(path.to_string())],
         )
         .await
@@ -275,12 +275,12 @@ where
         .rows()
         .first()
         .expect("native upserted file should remain visible")
-        .get::<Vec<u8>>("data")
+        .get::<Vec<u8>>("content")
         .expect("file data should decode");
     assert_eq!(actual, expected);
 }
 
-async fn assert_file_data_by_branch<S>(
+async fn assert_file_content_by_branch<S>(
     session: &SessionContext<S>,
     id: &str,
     branch_id: &str,
@@ -290,7 +290,7 @@ async fn assert_file_data_by_branch<S>(
 {
     let result = session
         .execute(
-            "SELECT data FROM lix_file_by_branch \
+            "SELECT content FROM lix_file_by_branch \
              WHERE id = $1 AND lixcol_branch_id = $2",
             &[
                 Value::Text(id.to_string()),
@@ -303,7 +303,7 @@ async fn assert_file_data_by_branch<S>(
         .rows()
         .first()
         .expect("native upserted file should remain visible by branch")
-        .get::<Vec<u8>>("data")
+        .get::<Vec<u8>>("content")
         .expect("file data should decode");
     assert_eq!(actual, expected);
 }

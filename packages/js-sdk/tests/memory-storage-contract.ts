@@ -400,15 +400,15 @@ async function writeBytes(
 	data: Uint8Array,
 ): Promise<void> {
 	await lix.execute(
-		"INSERT INTO lix_file (path, data) VALUES ($1, $2) " +
-			"ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+		"INSERT INTO lix_file (path, content) VALUES ($1, $2) " +
+			"ON CONFLICT (path) DO UPDATE SET content = excluded.content",
 		[path, data],
 	);
 }
 
 async function readTextFile(lix: SqlExecutor, path: string): Promise<string> {
-	const result = await lix.execute("SELECT data FROM lix_file WHERE path = $1", [path]);
-	const bytes = result.rows[0]?.value("data").asBytes();
+	const result = await lix.execute("SELECT content FROM lix_file WHERE path = $1", [path]);
+	const bytes = result.rows[0]?.value("content").asBytes();
 	if (!bytes) throw new Error(`expected file at ${path}`);
 	return new TextDecoder().decode(bytes);
 }

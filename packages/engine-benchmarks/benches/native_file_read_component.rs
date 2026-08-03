@@ -1,7 +1,7 @@
 //! Direct native-file-read component benchmark.
 //!
-//! This compares the normal exact SQL read (`SELECT data FROM lix_file WHERE
-//! path = $1`) with [`SessionContext::read_file_data`]. Both arms return a
+//! This compares the normal exact SQL read (`SELECT content FROM lix_file WHERE
+//! path = $1`) with [`SessionContext::read_file_content`]. Both arms return a
 //! `Blob` before the timer stops: the comparison therefore includes SQL result
 //! materialization and extraction, but deliberately excludes HTTP framing and
 //! JSON/Base64 serialization, which belong to the end-to-end benchmark.
@@ -314,7 +314,7 @@ where
         let result = self
             .session
             .execute(
-                "SELECT data FROM lix_file WHERE path = $1",
+                "SELECT content FROM lix_file WHERE path = $1",
                 &[Value::Text(path)],
             )
             .await
@@ -324,11 +324,11 @@ where
 
     async fn native_read(&self, path: String) -> Blob {
         self.session
-            .read_file_data(path, None)
+            .read_file_content(path, None)
             .await
             .expect("execute native file read")
             .expect("seeded timed file must exist")
-            .into_data()
+            .into_content()
     }
 
     async fn visible_commit_count(&self) -> usize {
@@ -687,7 +687,7 @@ fn print_summary(
             "pairs": pairs.len(),
             "confidence_level": 0.99,
             "t_critical": speedup.t_critical,
-            "comparison": "SQL exact lix_file read / SessionContext::read_file_data; both end at an extracted usable Blob",
+            "comparison": "SQL exact lix_file read / SessionContext::read_file_content; both end at an extracted usable Blob",
             "sql_read_p50_ns": percentile(&mut sql, 50),
             "sql_read_p95_ns": percentile(&mut sql, 95),
             "sql_read_mean_ns": mean_u64(&sql),
@@ -760,7 +760,7 @@ where
     let entries = seed_entries(file_count);
     for chunk in entries.chunks(seed_batch_size) {
         let rows_affected = session
-            .upsert_file_data_batch(chunk.to_vec())
+            .upsert_file_content_batch(chunk.to_vec())
             .await
             .expect("seed native read mixed corpus batch");
         assert_eq!(
@@ -782,7 +782,7 @@ where
     while commit_count < history_commits {
         let file_index = commit_count % generic_file_count(file_count);
         let rows_affected = session
-            .upsert_file_data(
+            .upsert_file_content(
                 generic_path(file_index),
                 Blob::from(generic_payload(
                     file_index,
@@ -847,7 +847,7 @@ fn blob_from_exact_sql(result: ExecuteResult) -> Blob {
         .rows()
         .first()
         .expect("seeded SQL exact read must return a row");
-    row.get::<Blob>("data")
+    row.get::<Blob>("content")
         .expect("SQL exact read must return a blob data column")
 }
 

@@ -348,7 +348,7 @@ async fn seed_snapshot(config: &Config, ids: &[String]) -> Vec<u8> {
             .join(",");
         let result = session
             .execute(
-                &format!("INSERT INTO lix_file (id, path, data) VALUES {values}"),
+                &format!("INSERT INTO lix_file (id, path, content) VALUES {values}"),
                 &[],
             )
             .await
@@ -411,14 +411,14 @@ fn quoted_ids(ids: &[String]) -> String {
 
 fn select_sql(ids: &[String]) -> String {
     format!(
-        "SELECT id, data FROM lix_file WHERE id IN ({})",
+        "SELECT id, content FROM lix_file WHERE id IN ({})",
         quoted_ids(ids)
     )
 }
 
 fn update_sql(ids: &[String]) -> String {
     format!(
-        "UPDATE lix_file SET data = $1 WHERE id IN ({})",
+        "UPDATE lix_file SET content = $1 WHERE id IN ({})",
         quoted_ids(ids)
     )
 }

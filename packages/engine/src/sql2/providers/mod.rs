@@ -45,9 +45,9 @@ pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
     execute_exact_lix_file_batch_read, execute_exact_lix_file_id_manifest_batch_read,
     execute_exact_lix_file_read, execute_exact_lix_file_root_listing,
-    execute_fast_lix_file_data_update_by_id, execute_fast_lix_file_data_update_by_id_with_metadata,
-    execute_fast_lix_file_id_path_writes, execute_fast_lix_file_path_writes,
-    execute_fast_lix_file_prepared_path_write,
+    execute_fast_lix_file_content_update_by_id,
+    execute_fast_lix_file_content_update_by_id_with_metadata, execute_fast_lix_file_id_path_writes,
+    execute_fast_lix_file_path_writes, execute_fast_lix_file_prepared_path_write,
 };
 #[cfg(test)]
 pub(crate) use filesystem_working_change::filesystem_working_change_schema;
@@ -1114,21 +1114,21 @@ mod tests {
     }
 
     #[test]
-    fn file_data_surfaces_use_large_binary() {
+    fn file_content_surfaces_use_large_binary() {
         let catalog = PublicCatalog::from_visible_schemas(&[]).expect("catalog should build");
 
         for surface_name in ["lix_file", "lix_file_by_branch", "lix_file_history"] {
             let schema = catalog
                 .surface_schema(surface_name)
                 .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
-            let data_field = schema
-                .field_with_name("data")
-                .unwrap_or_else(|_| panic!("{surface_name}.data should exist"));
+            let content_field = schema
+                .field_with_name("content")
+                .unwrap_or_else(|_| panic!("{surface_name}.content should exist"));
 
             assert_eq!(
-                data_field.data_type(),
+                content_field.data_type(),
                 &DataType::LargeBinary,
-                "{surface_name}.data should avoid Arrow Binary's 32-bit offset limit",
+                "{surface_name}.content should avoid Arrow Binary's 32-bit offset limit",
             );
         }
     }

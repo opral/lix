@@ -1159,11 +1159,11 @@ where
                 "/lix/v1/transaction/rollback",
                 post(rollback_transaction::<S>),
             )
-            .route("/lix/v1/file", get(read_file_data::<S>))
-            .route("/lix/v1/file/upsert", post(upsert_file_data::<S>))
+            .route("/lix/v1/file", get(read_file_content::<S>))
+            .route("/lix/v1/file/upsert", post(upsert_file_content::<S>))
             .route(
                 "/lix/v1/file/upsert-batch",
-                post(upsert_file_data_batch::<S>),
+                post(upsert_file_content_batch::<S>),
             )
             .route("/lix/v1/branch/create", post(create_branch::<S>))
             .route("/lix/v1/checkpoint/create", post(create_checkpoint::<S>))
@@ -1833,7 +1833,7 @@ where
 /// This intentionally covers only the dominant file-transfer shape. It keeps
 /// the normal execute response envelope, but avoids JSON base64 expansion and
 /// decoding for the file payload itself.
-async fn upsert_file_data<S>(
+async fn upsert_file_content<S>(
     Extension(lease): Extension<SessionLease<S>>,
     Query(request): Query<BinaryFileUpdateRequest>,
     headers: HeaderMap,
@@ -1852,7 +1852,7 @@ where
             .to_owned();
         let progress = lease
             .run_durable(move |lix| async move {
-                lix.upsert_file_data_part(
+                lix.upsert_file_content_part(
                     upload_id,
                     path,
                     content_range.start,
@@ -1882,7 +1882,7 @@ where
         return Ok(response);
     }
     let result = lease
-        .run_durable(move |lix| async move { lix.upsert_file_data(path, body).await })
+        .run_durable(move |lix| async move { lix.upsert_file_content(path, body).await })
         .await?;
     Ok(Json(ExecuteResponse::try_from(
         ExecuteResult::from_rows_affected(result),
@@ -1939,10 +1939,10 @@ fn parse_file_upload_content_range(
 /// Upserts a bounded batch of files from one deterministic octet-stream frame.
 ///
 /// The frame is `u32be entry_count`, followed by one `u32be path_length`,
-/// `u32be data_length`, UTF-8 path, and raw data sequence per entry. Data
+/// `u32be content_length`, UTF-8 path, and raw content sequence per entry. Content
 /// payloads remain `Bytes` slices through the SDK boundary; only paths need a
 /// `String` allocation.
-async fn upsert_file_data_batch<S>(
+async fn upsert_file_content_batch<S>(
     Extension(lease): Extension<SessionLease<S>>,
     body: Bytes,
 ) -> Result<Json<ExecuteResponse>, ApiError>
@@ -1951,7 +1951,7 @@ where
 {
     let writes = parse_binary_file_upsert_batch(body)?;
     let result = lease
-        .run_durable(move |lix| async move { lix.upsert_file_data_batch(writes).await })
+        .run_durable(move |lix| async move { lix.upsert_file_content_batch(writes).await })
         .await?;
     Ok(Json(ExecuteResponse::try_from(
         ExecuteResult::from_rows_affected(result),
@@ -1990,14 +1990,14 @@ fn parse_binary_file_upsert_batch(body: Bytes) -> Result<Vec<(String, Blob)>, Ap
                 "batch frame path length for entry {entry_index} does not fit this platform",
             ))
         })?;
-        let data_length = usize::try_from(read_binary_file_upsert_batch_u32(
+        let content_length = usize::try_from(read_binary_file_upsert_batch_u32(
             &body,
             &mut offset,
-            "data length",
+            "content length",
         )?)
         .map_err(|_| {
             ApiError::bad_request(format!(
-                "batch frame data length for entry {entry_index} does not fit this platform",
+                "batch frame content length for entry {entry_index} does not fit this platform",
             ))
         })?;
         let path_range = take_binary_file_upsert_batch_range(
@@ -2022,17 +2022,17 @@ fn parse_binary_file_upsert_batch(body: Bytes) -> Result<Vec<(String, Blob)>, Ap
                 "batch frame contains duplicate path for entry {entry_index}",
             )));
         }
-        let data_range = take_binary_file_upsert_batch_range(
+        let content_range = take_binary_file_upsert_batch_range(
             &body,
             &mut offset,
-            data_length,
-            "data",
+            content_length,
+            "content",
             entry_index,
         )?;
         // `Bytes::slice` preserves the request allocation. Do not replace it
         // with `to_vec`: large file bodies are intentionally forwarded as
         // shared immutable Blob storage.
-        writes.push((path, Blob::from(body.slice(data_range))));
+        writes.push((path, Blob::from(body.slice(content_range))));
     }
 
     if offset != body.len() {
@@ -2092,7 +2092,7 @@ fn take_binary_file_upsert_batch_range(
 /// file (`false`), whose body is also empty. The response is explicitly
 /// non-cacheable because the session's rendered plugin view is part of the
 /// collaboration protocol.
-async fn read_file_data<S>(
+async fn read_file_content<S>(
     Extension(lease): Extension<SessionLease<S>>,
     Query(request): Query<BinaryFileReadRequest>,
     headers: HeaderMap,
@@ -2115,7 +2115,7 @@ where
     let first_path = path.clone();
     let data = lease
         .run_cancellable_read(move |lix| async move {
-            lix.read_file_data(first_path, Some(first_requested_range))
+            lix.read_file_content(first_path, Some(first_requested_range))
                 .await
         })
         .await?;
@@ -2134,7 +2134,7 @@ where
                 .unwrap_or(0..total_size);
             let next_offset = first_range.end;
             let end_offset = response_range.end;
-            let first = read.into_data().into_bytes();
+            let first = read.into_content().into_bytes();
             let body_stream = async_stream::stream! {
                 yield Ok::<Bytes, io::Error>(first);
                 let mut next_offset = next_offset;
@@ -2145,7 +2145,7 @@ where
                     let read_path = path.clone();
                     let read = match lease
                         .run_cancellable_read(move |lix| async move {
-                            lix.read_file_data(read_path, Some(next_offset..next_end))
+                            lix.read_file_content(read_path, Some(next_offset..next_end))
                                 .await
                         })
                         .await {
@@ -2171,7 +2171,7 @@ where
                         break;
                     }
                     next_offset = actual_range.end;
-                    yield Ok(read.into_data().into_bytes());
+                    yield Ok(read.into_content().into_bytes());
                 }
             };
             let body = axum::body::Body::from_stream(body_stream);
@@ -3630,7 +3630,7 @@ fn multiplex_observe_payload(
 }
 
 fn point_blob_bytes(result: &ExecuteResult) -> Option<&[u8]> {
-    if result.columns() != ["data"]
+    if result.columns() != ["content"]
         || result.rows().len() != 1
         || result.rows_affected() != 0
         || !result.notices().is_empty()
@@ -5964,7 +5964,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                "sql": "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
                 "params": [
                     { "kind": "text", "value": "/payload.bin" },
                     { "kind": "blob", "base64": "b2xk" }
@@ -6001,7 +6001,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "sql": "SELECT content FROM lix_file WHERE path = $1",
                 "params": [{ "kind": "text", "value": "/payload.bin" }]
             })),
         )
@@ -6038,7 +6038,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "sql": "SELECT content FROM lix_file WHERE path = $1",
                 "params": [{ "kind": "text", "value": "/payload.bin" }]
             })),
         )
@@ -6073,7 +6073,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "sql": "SELECT content FROM lix_file WHERE path = $1",
                 "params": [{ "kind": "text", "value": "/created.bin" }]
             })),
         )
@@ -6492,7 +6492,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                "sql": "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
                 "params": [
                     { "kind": "text", "value": "/batch/updated.bin" },
                     { "kind": "blob", "base64": "b2xk" }
@@ -6529,7 +6529,7 @@ mod tests {
                 "/lix/v1/execute",
                 Some(&session_id),
                 Some(json!({
-                    "sql": "SELECT data FROM lix_file WHERE path = $1",
+                    "sql": "SELECT content FROM lix_file WHERE path = $1",
                     "params": [{ "kind": "text", "value": path }]
                 })),
             )
@@ -6579,7 +6579,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "sql": "SELECT content FROM lix_file WHERE path = $1",
                 "params": [{ "kind": "text", "value": "/batch/must-not-write.bin" }]
             })),
         )
@@ -6632,7 +6632,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "sql": "SELECT content FROM lix_file WHERE path = $1",
                 "params": [{ "kind": "text", "value": "/batch/duplicate.bin" }]
             })),
         )
@@ -7140,7 +7140,7 @@ mod tests {
         let app = app().await;
         let root = &app.server.inner.root;
         root.execute(
-            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
             &[
                 Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
                 Value::Blob(build_json_plugin_archive().into()),
@@ -7149,7 +7149,7 @@ mod tests {
         .await
         .expect("JSON plugin should install");
         root.execute(
-            "INSERT INTO lix_file (path, data) VALUES ('/remote-conflict.json', $1)",
+            "INSERT INTO lix_file (path, content) VALUES ('/remote-conflict.json', $1)",
             &[Value::Blob(
                 br#"{"value":"base"}
 "#
@@ -7178,7 +7178,7 @@ mod tests {
                 session_id,
                 transaction_id,
                 Some(json!({
-                    "sql": "UPDATE lix_file SET data = $1 WHERE path = '/remote-conflict.json'",
+                    "sql": "UPDATE lix_file SET content = $1 WHERE path = '/remote-conflict.json'",
                     "params": [{
                         "kind": "blob",
                         "base64": base64
@@ -7239,7 +7239,7 @@ mod tests {
                 "/lix/v1/execute",
                 Some(session_id),
                 Some(json!({
-                    "sql": "SELECT data FROM lix_file WHERE path = '/remote-conflict.json'"
+                    "sql": "SELECT content FROM lix_file WHERE path = '/remote-conflict.json'"
                 })),
             )
             .await;
@@ -7265,7 +7265,7 @@ mod tests {
             .await;
             let root = &app.server.inner.root;
             root.execute(
-                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
                 &[
                     Value::Text("/.lix/plugins/plugin_json.lixplugin".to_owned()),
                     Value::Blob(build_json_plugin_archive().into()),
@@ -7278,7 +7278,7 @@ mod tests {
                 .map(|slot| (format!("k{slot}"), JsonValue::String("base".into())))
                 .collect::<serde_json::Map<_, _>>();
             root.execute(
-                "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
                 &[
                     Value::Text(path.to_owned()),
                     Value::Blob(serde_json::to_vec(&base).unwrap().into()),
@@ -7297,7 +7297,7 @@ mod tests {
                     "/lix/v1/observe",
                     Some(&session_id),
                     Some(json!({
-                        "sql": "SELECT data FROM lix_file WHERE path = $1",
+                        "sql": "SELECT content FROM lix_file WHERE path = $1",
                         "params": [{ "kind": "text", "value": path }]
                     })),
                 )
@@ -7345,13 +7345,13 @@ mod tests {
                 .inner
                 .root
                 .execute(
-                    "SELECT data FROM lix_file WHERE path = $1",
+                    "SELECT content FROM lix_file WHERE path = $1",
                     &[Value::Text(self.path.to_owned())],
                 )
                 .await
                 .expect("wave base should read")
                 .rows()[0]
-                .get::<Vec<u8>>("data")
+                .get::<Vec<u8>>("content")
                 .expect("wave base should be bytes")
         }
 
@@ -7374,7 +7374,7 @@ mod tests {
                     session_id,
                     &transaction_id,
                     Some(json!({
-                        "sql": "UPDATE lix_file SET data = $1 WHERE path = $2",
+                        "sql": "UPDATE lix_file SET content = $1 WHERE path = $2",
                         "params": [
                             {
                                 "kind": "blob",
@@ -7499,7 +7499,7 @@ mod tests {
                     "/lix/v1/execute",
                     Some(session_id),
                     Some(json!({
-                        "sql": "SELECT data FROM lix_file WHERE path = $1",
+                        "sql": "SELECT content FROM lix_file WHERE path = $1",
                         "params": [{ "kind": "text", "value": self.path }]
                     })),
                 )
@@ -7804,7 +7804,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                "sql": "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
                 "params": [
                     { "kind": "text", "value": "/must-not-exist.bin" },
                     blob_splice_json(absent_base, result, 0, 0, result),
@@ -7821,7 +7821,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "sql": "SELECT content FROM lix_file WHERE path = $1",
                 "params": [{ "kind": "text", "value": "/must-not-exist.bin" }],
             })),
         )
@@ -7846,7 +7846,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                "sql": "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
                 "params": [
                     { "kind": "text", "value": "/aggregate-base.bin" },
                     wire_blob_json(&base),
@@ -7864,7 +7864,7 @@ mod tests {
             .map(|index| {
                 if index == 0 {
                     json!({
-                        "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                        "sql": "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
                         "params": [
                             { "kind": "text", "value": "/must-not-execute.bin" },
                             splice.clone(),
@@ -7895,7 +7895,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "SELECT data FROM lix_file WHERE path = $1",
+                "sql": "SELECT content FROM lix_file WHERE path = $1",
                 "params": [{ "kind": "text", "value": "/must-not-execute.bin" }],
             })),
         )
@@ -8186,7 +8186,7 @@ mod tests {
             "/lix/v1/execute",
             Some(&session_id),
             Some(json!({
-                "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                "sql": "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
                 "params": [
                     { "kind": "text", "value": "/large.bin" },
                     blob,
@@ -8514,7 +8514,7 @@ mod tests {
             sequence,
             mutation_sequence: sequence,
             rows: ExecuteResult::from_rows(
-                vec!["data".to_string()],
+                vec!["content".to_string()],
                 vec![vec![Value::Blob(bytes.into())]],
             ),
         }

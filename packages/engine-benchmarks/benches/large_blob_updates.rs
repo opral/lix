@@ -30,8 +30,8 @@ const MANIFEST_SPACE: SpaceId = SpaceId(0x0005_0001);
 const MANIFEST_CHUNK_SPACE: SpaceId = SpaceId(0x0005_0002);
 const PAYLOAD_SPACE: SpaceId = SpaceId(0x0005_0003);
 const PRESENCE_SPACE: SpaceId = SpaceId(0x0005_0004);
-const UPSERT_SQL: &str = "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-                          ON CONFLICT (path) DO UPDATE SET data = excluded.data";
+const UPSERT_SQL: &str = "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+                          ON CONFLICT (path) DO UPDATE SET content = excluded.content";
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
@@ -412,7 +412,7 @@ where
                 let data = deterministic_bytes(len, prepared.version ^ offset as u64);
                 let progress = self
                     .session
-                    .upsert_file_data_part(
+                    .upsert_file_content_part(
                         upload_id.clone(),
                         prepared.path.clone(),
                         offset as u64,

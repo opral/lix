@@ -78,7 +78,7 @@ async fn sequential_batches_survive_observation_cache_eviction() {
 
     let updates = (0..DOCUMENTS)
         .map(|index| ExecuteBatchStatement {
-            sql: "UPDATE lix_file SET data = $1 WHERE path = $2".to_string(),
+            sql: "UPDATE lix_file SET content = $1 WHERE path = $2".to_string(),
             params: vec![
                 Value::Blob(format!("after {index}\n").into_bytes().into()),
                 Value::Text(format!("/scale-document-{index:04}.txt")),
@@ -175,7 +175,7 @@ fn file_insert_statement(
     extension: &str,
     documents: impl IntoIterator<Item = Vec<u8>>,
 ) -> ExecuteBatchStatement {
-    let mut sql = String::from("INSERT INTO lix_file (path, data) VALUES ");
+    let mut sql = String::from("INSERT INTO lix_file (path, content) VALUES ");
     let mut params = Vec::new();
     for (index, document) in documents.into_iter().enumerate() {
         if index > 0 {
@@ -197,13 +197,13 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "SELECT data FROM lix_file WHERE path = $1",
+        "SELECT content FROM lix_file WHERE path = $1",
         &[Value::Text(path.to_owned())],
     )
     .await
     .expect("imported file should read")
     .rows()[0]
-        .get::<Vec<u8>>("data")
+        .get::<Vec<u8>>("content")
         .expect("imported file data should be bytes")
 }
 
@@ -212,7 +212,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
         &[
             Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
             Value::Blob(archive.to_vec().into()),

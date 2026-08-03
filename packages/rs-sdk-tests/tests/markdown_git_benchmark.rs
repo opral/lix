@@ -1009,8 +1009,8 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
-         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        "INSERT INTO lix_file (path, content) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET content = excluded.content",
         &[Value::Text(path.to_owned()), Value::Blob(data.into())],
     )
     .await
@@ -1022,13 +1022,13 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "SELECT data FROM lix_file WHERE path = $1",
+        "SELECT content FROM lix_file WHERE path = $1",
         &[Value::Text(path.to_owned())],
     )
     .await
     .expect("read benchmark file")
     .rows()[0]
-        .get::<Vec<u8>>("data")
+        .get::<Vec<u8>>("content")
         .expect("benchmark file should be bytes")
 }
 

@@ -48,7 +48,7 @@ const lix = await openLix({
   storage: new LocalFilesystem({ path: "./workspace", syncAllFiles: true }),
 });
 
-await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
   "/notes/status.txt",
   new TextEncoder().encode("ready"),
 ]);

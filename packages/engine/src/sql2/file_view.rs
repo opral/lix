@@ -85,7 +85,7 @@ impl SessionFileViews {
     }
 
     /// Records a plugin state that was materialized for a read-only
-    /// `lix_file.data` result and therefore delivered through this session.
+    /// `lix_file.content` result and therefore delivered through this session.
     pub(crate) fn remember_plugin_file_view(
         &self,
         key: SessionFileViewKey,

@@ -39,11 +39,11 @@ async function runCycle(index) {
 	const lix = await openLix();
 	try {
 		await lix.execute(
-			"INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+			"INSERT INTO lix_file (path, content) VALUES ($1, $2)",
 			[`/.lix/plugins/${csvPlugin.key}.lixplugin`, csvPlugin.archiveBytes],
 		);
 		await lix.execute(
-			"INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+			"INSERT INTO lix_file (path, content) VALUES ($1, $2)",
 			[
 				`/benchmark-${index}.csv`,
 				new TextEncoder().encode("name,age\nAda,36\nGrace,37\n"),

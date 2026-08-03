@@ -245,33 +245,33 @@ where
     /// This structured path is intended for file transfer clients. It uses the
     /// engine's filesystem fast-write path and retains normal plugin and
     /// transaction behavior.
-    pub async fn upsert_file_data(
+    pub async fn upsert_file_content(
         &self,
         path: impl Into<String>,
-        data: impl Into<Blob>,
+        content: impl Into<Blob>,
     ) -> Result<u64, LixError> {
         self.session
-            .upsert_file_data(path.into(), data.into())
+            .upsert_file_content(path.into(), content.into())
             .await
     }
 
     /// Sends one sequential resumable part through the same logical file
     /// upsert. The final part atomically publishes the ordinary file version.
-    pub async fn upsert_file_data_part(
+    pub async fn upsert_file_content_part(
         &self,
         upload_id: impl Into<String>,
         path: impl Into<String>,
         start: u64,
         total_size: u64,
-        data: impl Into<Blob>,
+        content: impl Into<Blob>,
     ) -> Result<lix_engine::FileUploadProgress, LixError> {
         self.session
-            .upsert_file_data_part(
+            .upsert_file_content_part(
                 upload_id.into(),
                 path.into(),
                 start,
                 total_size,
-                data.into(),
+                content.into(),
             )
             .await
     }
@@ -282,23 +282,23 @@ where
     /// Each item is a full logical file path and its bytes. Paths must be
     /// unique within the batch. This direct-only API rejects exceptional
     /// layouts that its path index cannot route unambiguously.
-    pub async fn upsert_file_data_batch(
+    pub async fn upsert_file_content_batch(
         &self,
         writes: Vec<(String, Blob)>,
     ) -> Result<u64, LixError> {
-        self.session.upsert_file_data_batch(writes).await
+        self.session.upsert_file_content_batch(writes).await
     }
 
     /// Reads one file's bytes by full logical path without parsing SQL.
     ///
     /// The returned `None` means the file is absent; `Some` with an empty
     /// [`Blob`] means a present empty file.
-    pub async fn read_file_data(
+    pub async fn read_file_content(
         &self,
         path: impl Into<String>,
         range: Option<std::ops::Range<u64>>,
     ) -> Result<Option<lix_engine::FileRead>, LixError> {
-        self.session.read_file_data(path.into(), range).await
+        self.session.read_file_content(path.into(), range).await
     }
 
     #[doc(hidden)]
