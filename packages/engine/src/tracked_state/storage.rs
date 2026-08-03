@@ -822,12 +822,24 @@ struct DecodedCommitDeltaSegment {
 struct DecodedCommitDeltaCacheEntry {
     digest: [u8; 32],
     encoded: Bytes,
+    /// Replacement-part bytes are content-addressed independently of their
+    /// publishing commit, while decoding synthesizes commit ids and lifecycle
+    /// timestamps from these bounds. Cache that semantic binding with the
+    /// bytes so identical post-images in consecutive commits cannot reuse a
+    /// leaf decoded for the previous owner.
+    expected_bounds: Option<CommitDeltaSegmentBounds>,
     decoded: Arc<DecodedCommitDeltaSegment>,
 }
 
 impl DecodedCommitDeltaCacheEntry {
     fn resident_bytes(&self) -> usize {
-        size_of::<Self>() + self.encoded.len() + self.decoded.resident_bytes
+        size_of::<Self>()
+            + self.encoded.len()
+            + self
+                .expected_bounds
+                .as_ref()
+                .map_or(0, |bounds| bounds.first_key.len() + bounds.last_key.len())
+            + self.decoded.resident_bytes
     }
 }
 
@@ -845,11 +857,11 @@ impl DecodedCommitDeltaCache {
         bytes: &[u8],
         expected_bounds: Option<&CommitDeltaSegmentBounds>,
     ) -> Result<Option<Arc<DecodedCommitDeltaSegment>>, LixError> {
-        let Some(position) = self
-            .entries
-            .iter()
-            .position(|entry| entry.digest == digest && entry.encoded.as_ref() == bytes)
-        else {
+        let Some(position) = self.entries.iter().position(|entry| {
+            entry.digest == digest
+                && entry.encoded.as_ref() == bytes
+                && entry.expected_bounds.as_ref() == expected_bounds
+        }) else {
             return Ok(None);
         };
         validate_decoded_commit_delta_bounds(
@@ -869,11 +881,13 @@ impl DecodedCommitDeltaCache {
         &mut self,
         digest: [u8; 32],
         encoded: Bytes,
+        expected_bounds: Option<CommitDeltaSegmentBounds>,
         decoded: Arc<DecodedCommitDeltaSegment>,
     ) {
         let entry = DecodedCommitDeltaCacheEntry {
             digest,
             encoded,
+            expected_bounds,
             decoded,
         };
         let entry_bytes = entry.resident_bytes();
@@ -881,7 +895,9 @@ impl DecodedCommitDeltaCache {
             return;
         }
         if let Some(position) = self.entries.iter().position(|existing| {
-            existing.digest == entry.digest && existing.encoded == entry.encoded
+            existing.digest == entry.digest
+                && existing.encoded == entry.encoded
+                && existing.expected_bounds == entry.expected_bounds
         }) {
             let previous = self
                 .entries
@@ -6488,7 +6504,12 @@ fn decode_commit_delta_with_payloads_cached(
     decoded_commit_delta_cache()
         .lock()
         .expect("decoded commit-delta cache lock poisoned")
-        .insert(digest, Bytes::copy_from_slice(bytes), Arc::clone(&decoded));
+        .insert(
+            digest,
+            Bytes::copy_from_slice(bytes),
+            expected_bounds.cloned(),
+            Arc::clone(&decoded),
+        );
     Ok(Some(decoded))
 }
 
@@ -7410,6 +7431,7 @@ mod tests {
         cache.insert(
             digest,
             encoded.clone().into(),
+            None,
             std::sync::Arc::clone(&decoded),
         );
         let reused = cache

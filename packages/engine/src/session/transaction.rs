@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::Value;
 use crate::catalog::CatalogFingerprint;
 use crate::functions::{DeterministicRuntimeGuard, FunctionContext};
 use crate::observe_invalidation::ObserveInvalidation;
@@ -32,6 +33,7 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) has_started_statement: bool,
+    pub(super) prepared_literal_params: Vec<Value>,
 }
 
 impl<StorageImpl> SessionContext<StorageImpl>
@@ -90,6 +92,7 @@ where
             commit_coordinator: Arc::clone(&self.commit_coordinator),
             telemetry: self.telemetry.clone(),
             has_started_statement: false,
+            prepared_literal_params: Vec::new(),
         })
     }
 }

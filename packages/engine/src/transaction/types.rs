@@ -3703,6 +3703,10 @@ pub(crate) struct StagedCommitChangeRefs {
     /// separate so staging/finalization clones only `Arc` owners rather than
     /// copying schema/file/entity or metadata columns.
     selected_change_batches: Vec<StagedCommitChangeBatch>,
+    /// Certified immutable mutation columns for this commit. This owner is
+    /// attached only at drain, after complete-replacement certification, and
+    /// is cloned through commit finalization in O(1).
+    ordered_mutation_journal: Option<Arc<crate::transaction::staging::OrderedMutationJournal>>,
     pub(crate) allow_empty: bool,
 }
 
@@ -3715,6 +3719,7 @@ impl Default for StagedCommitChangeRefs {
             created_at: LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z"),
             tracked_change_count: 0,
             selected_change_batches: Vec::new(),
+            ordered_mutation_journal: None,
             allow_empty: false,
         }
     }
@@ -3722,6 +3727,10 @@ impl Default for StagedCommitChangeRefs {
 
 impl StagedCommitChangeRefs {
     pub(crate) fn absorb_cohort_membership(&mut self, mut other: Self) {
+        debug_assert!(
+            self.ordered_mutation_journal.is_none() && other.ordered_mutation_journal.is_none(),
+            "immutable replacement journals cannot join commit cohorts"
+        );
         self.tracked_change_count = self
             .tracked_change_count
             .saturating_add(other.tracked_change_count);
@@ -3925,6 +3934,31 @@ impl<'a> StagedCommitChangeRef<'a> {
 }
 
 impl StagedCommitChangeRefs {
+    pub(crate) fn attach_ordered_mutation_journal(
+        &mut self,
+        journal: Arc<crate::transaction::staging::OrderedMutationJournal>,
+    ) -> Result<(), LixError> {
+        if self.ordered_mutation_journal.replace(journal).is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "commit received more than one immutable mutation journal",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ordered_mutation_journal(
+        &self,
+    ) -> Option<&Arc<crate::transaction::staging::OrderedMutationJournal>> {
+        self.ordered_mutation_journal.as_ref()
+    }
+
+    pub(crate) fn take_ordered_mutation_journal(
+        &mut self,
+    ) -> Option<Arc<crate::transaction::staging::OrderedMutationJournal>> {
+        self.ordered_mutation_journal.take()
+    }
+
     pub(crate) fn new(
         commit_id: CommitId,
         commit_change_id: ChangeId,
@@ -3938,6 +3972,7 @@ impl StagedCommitChangeRefs {
             created_at,
             tracked_change_count: 0,
             selected_change_batches: Vec::new(),
+            ordered_mutation_journal: None,
             allow_empty: false,
         }
     }

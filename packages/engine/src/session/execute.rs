@@ -34,7 +34,7 @@ use tracing::Instrument as _;
 use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
-use super::transaction::SessionTransaction;
+use super::transaction::{SessionTransaction, transaction_state_error};
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
 
@@ -2565,7 +2565,52 @@ where
         self.has_started_statement = true;
         let operation = async {
             let _operation_guard = self.begin_session_operation()?;
-            let auto_parameterized = (may_reuse_literal_shape && params.is_empty())
+            if may_reuse_literal_shape
+                && params.is_empty()
+                && let Some(parameter_count) = self.transaction.as_ref().and_then(|transaction| {
+                    transaction.prepared_literal_mutation_parameter_count(sql)
+                })
+            {
+                if self.prepared_literal_params.len() != parameter_count {
+                    self.prepared_literal_params.clear();
+                    self.prepared_literal_params
+                        .resize_with(parameter_count, || Value::Text(String::new()));
+                }
+                if self
+                    .sql_planning_cache
+                    .decode_certified_update_literals_into_values(
+                        sql,
+                        &mut self.prepared_literal_params,
+                    )
+                {
+                    let (transaction_slot, prepared_params) =
+                        (&mut self.transaction, &self.prepared_literal_params);
+                    let transaction = transaction_slot
+                        .as_mut()
+                        .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
+                    transaction
+                        .flush_cached_prepared_mutation_barrier(
+                            options.origin_key.as_deref(),
+                            prepared_params,
+                        )
+                        .await?;
+                    let previous_origin_key =
+                        transaction.replace_origin_key(options.origin_key.clone());
+                    let result = transaction
+                        .try_execute_cached_prepared_mutation(prepared_params)
+                        .await;
+                    transaction.replace_origin_key(previous_origin_key);
+                    match result {
+                        Ok(Some(result)) => {
+                            return Ok(ExecuteResult::from_sql_write_result(result));
+                        }
+                        Ok(None) => {}
+                        Err(error) => return Err(normalize_sql_surface_error(error, sql)),
+                    }
+                }
+            }
+            let auto_parameterized = params
+                .is_empty()
                 .then(|| self.sql_planning_cache.auto_parameterized_update(sql))
                 .flatten();
             let (planning_sql, statement, auto_params) =
@@ -2598,21 +2643,20 @@ where
                     .try_execute_prepared_mutation(&planning_sql, params)
                     .await;
                 transaction.replace_origin_key(previous_origin_key);
-                return match result {
-                    Ok(Some(result)) => Ok(ExecuteResult::from_sql_write_result(result)),
-                    Ok(None) => Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "prepared transaction mutation disappeared during warm execution",
-                    )),
-                    Err(error) => Err(normalize_sql_surface_error(error, sql)),
-                };
+                match result {
+                    Ok(Some(result)) => {
+                        return Ok(ExecuteResult::from_sql_write_result(result));
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(normalize_sql_surface_error(error, sql)),
+                }
             }
             let is_read = matches!(
                 sql2::bind_statement_route(&statement)?,
                 sql2::BoundStatementRoute::Read
             );
             if is_read {
-                transaction.flush_prepared_mutations().await?;
+                transaction.flush_prepared_mutations_for_read().await?;
             } else {
                 transaction
                     .flush_prepared_mutation_barrier(
@@ -2748,7 +2792,7 @@ where
     ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
         let _operation_guard = self.begin_session_operation()?;
         let transaction = self.transaction_mut()?;
-        transaction.flush_prepared_mutations().await?;
+        transaction.flush_prepared_mutations_for_read().await?;
         <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_live_state_batch(
             transaction,
             request,
@@ -5924,6 +5968,7 @@ mod tests {
             "required": ["id", "value"],
             "additionalProperties": false
         });
+        crate::transaction::take_direct_journal_replacement_publications();
         let mut transaction = session.begin_transaction().await.unwrap();
         transaction
             .execute(
@@ -8896,6 +8941,648 @@ mod tests {
                 .expect("JSON value should decode"),
             serde_json::json!({"step": 2})
         );
+    }
+
+    #[tokio::test]
+    async fn packed_mutation_membership_defers_to_transaction_overlay() {
+        const ROW_COUNT: usize = 1_024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "packed_journal_overlay_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("overlay probe schema should register");
+        let inserts = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ($1, lix_json($2))"
+                    .to_string(),
+                params: vec![
+                    Value::Text(format!("{row_index:04}")),
+                    Value::Text("{\"state\":\"base\"}".to_string()),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session
+            .execute_batch(&inserts)
+            .await
+            .expect("packed base should seed");
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        let update_sql =
+            "UPDATE packed_journal_overlay_probe SET value = lix_json($1) WHERE path = $2";
+        transaction
+            .execute(
+                update_sql,
+                &[
+                    Value::Text("{\"state\":\"updated-base\"}".to_string()),
+                    Value::Text("0000".to_string()),
+                ],
+            )
+            .await
+            .expect("base update should prepare packed membership");
+        transaction
+            .execute(
+                "INSERT INTO packed_journal_overlay_probe (path, value) VALUES ('2000', lix_json('{\"state\":\"inserted\"}'))",
+                &[],
+            )
+            .await
+            .expect("transaction-local insert should stage");
+        let inserted_update = transaction
+            .execute(
+                update_sql,
+                &[
+                    Value::Text("{\"state\":\"updated-insert\"}".to_string()),
+                    Value::Text("2000".to_string()),
+                ],
+            )
+            .await
+            .expect("update must observe the transaction-local insert");
+        assert_eq!(inserted_update.rows_affected(), 1);
+
+        transaction
+            .execute(
+                "DELETE FROM packed_journal_overlay_probe WHERE path = '0001'",
+                &[],
+            )
+            .await
+            .expect("transaction-local delete should stage");
+        let deleted_update = transaction
+            .execute(
+                update_sql,
+                &[
+                    Value::Text("{\"state\":\"must-not-resurrect\"}".to_string()),
+                    Value::Text("0001".to_string()),
+                ],
+            )
+            .await
+            .expect("update after a staged delete should remain a no-op");
+        assert_eq!(deleted_update.rows_affected(), 0);
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let rows = session
+            .execute(
+                "SELECT path, value FROM packed_journal_overlay_probe \
+                 WHERE path IN ('0000', '0001', '2000') ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("committed overlay result should be readable");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.rows()[0].get::<String>("path").unwrap(), "0000");
+        assert_eq!(
+            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!({"state": "updated-base"})
+        );
+        assert_eq!(rows.rows()[1].get::<String>("path").unwrap(), "2000");
+        assert_eq!(
+            rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!({"state": "updated-insert"})
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_complete_journal_replacement_preserves_disjoint_insert() {
+        const ROW_COUNT: usize = 1_024;
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized storage should create engine");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("replacement session should open");
+        let concurrent_session = engine
+            .open_workspace_session()
+            .await
+            .expect("concurrent session should open");
+        let schema = serde_json::json!({
+            "x-lix-key": "stale_journal_replacement_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("stale replacement schema should register");
+        let inserts = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql: "INSERT INTO stale_journal_replacement_probe (path, value) VALUES ($1, lix_json($2))"
+                    .to_string(),
+                params: vec![
+                    Value::Text(format!("{row_index:04}")),
+                    Value::Text("{\"state\":\"base\"}".to_string()),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session
+            .execute_batch(&inserts)
+            .await
+            .expect("packed base should seed");
+        let original_created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM stale_journal_replacement_probe WHERE path = '0000'",
+                &[],
+            )
+            .await
+            .expect("seed lifecycle should be readable")
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .unwrap()
+            .clone();
+        let mut replacement = session
+            .begin_transaction()
+            .await
+            .expect("replacement transaction should begin");
+        let update_sql =
+            "UPDATE stale_journal_replacement_probe SET value = lix_json($1) WHERE path = $2";
+        for row_index in 0..ROW_COUNT {
+            let result = replacement
+                .execute(
+                    update_sql,
+                    &[
+                        Value::Text("{\"state\":\"replacement\"}".to_string()),
+                        Value::Text(format!("{row_index:04}")),
+                    ],
+                )
+                .await
+                .expect("replacement row should stage");
+            assert_eq!(result.rows_affected(), 1);
+        }
+
+        concurrent_session
+            .execute(
+                "INSERT INTO stale_journal_replacement_probe (path, value) \
+                 VALUES ('2000', lix_json('{\"state\":\"concurrent\"}'))",
+                &[],
+            )
+            .await
+            .expect("disjoint insert should commit first");
+        replacement
+            .commit()
+            .await
+            .expect("stale disjoint replacement should reconcile");
+
+        let rows = concurrent_session
+            .execute(
+                "SELECT COUNT(*) AS count FROM stale_journal_replacement_probe",
+                &[],
+            )
+            .await
+            .expect("final generation should be readable");
+        assert_eq!(
+            rows.rows()[0].get::<i64>("count").unwrap(),
+            (ROW_COUNT + 1) as i64,
+            "the stale complete-set proof must not erase the disjoint insert"
+        );
+        let concurrent = concurrent_session
+            .execute(
+                "SELECT value FROM stale_journal_replacement_probe WHERE path = '2000'",
+                &[],
+            )
+            .await
+            .expect("concurrent row should remain point-readable");
+        assert_eq!(
+            concurrent.rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"state": "concurrent"})
+        );
+        let reconciled_created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM stale_journal_replacement_probe WHERE path = '0000'",
+                &[],
+            )
+            .await
+            .expect("reconciled lifecycle should be readable")
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .unwrap()
+            .clone();
+        assert_eq!(reconciled_created_at, original_created_at);
+    }
+
+    #[tokio::test]
+    async fn sequential_complete_update_seals_direct_journal() {
+        const ROW_COUNT: usize = 8_193;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "direct_journal_seal_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("direct journal schema should register");
+        let inserts = (0..ROW_COUNT)
+            .map(|row_index| ExecuteBatchStatement {
+                sql:
+                    "INSERT INTO direct_journal_seal_probe (path, value) VALUES ($1, lix_json($2))"
+                        .to_string(),
+                params: vec![
+                    Value::Text(format!("{row_index:04}")),
+                    Value::Text("{\"state\":\"base\"}".to_string()),
+                ],
+            })
+            .collect::<Vec<_>>();
+        session
+            .execute_batch(&inserts)
+            .await
+            .expect("packed base should seed");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("direct journal transaction should begin");
+        let update_sql =
+            "UPDATE direct_journal_seal_probe SET value = lix_json($1) WHERE path = $2";
+        for row_index in 0..ROW_COUNT {
+            let result = transaction
+                .execute(
+                    update_sql,
+                    &[
+                        Value::Text("{\"state\":\"replacement\"}".to_string()),
+                        Value::Text(format!("{row_index:04}")),
+                    ],
+                )
+                .await
+                .expect("direct journal row should stage");
+            assert_eq!(result.rows_affected(), 1);
+        }
+        assert_eq!(
+            crate::transaction::take_direct_journal_replacement_publications(),
+            0
+        );
+        let visible = transaction
+            .execute(
+                "SELECT path, value FROM direct_journal_seal_probe \
+                 WHERE path IN ('0000', '4096', '8192') ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("point reads must route across immutable journal chunks");
+        assert_eq!(visible.len(), 3);
+        for (row, expected_path) in visible.rows().iter().zip(["0000", "4096", "8192"]) {
+            assert_eq!(row.get::<String>("path").unwrap(), expected_path);
+            assert_eq!(
+                row.get::<serde_json::Value>("value").unwrap(),
+                serde_json::json!({"state": "replacement"})
+            );
+        }
+        transaction
+            .commit()
+            .await
+            .expect("direct journal should commit");
+        assert_eq!(
+            crate::transaction::take_direct_journal_replacement_publications(),
+            1,
+            "the complete scalar generation must seal without PreparedStateBatch"
+        );
+
+        // Replacement-part bytes are content-addressed without their commit
+        // owner. Publishing the same post-image again must bind a fresh
+        // physical commit instead of reusing the decoded leaf from above.
+        let mut repeated = session
+            .begin_transaction()
+            .await
+            .expect("repeated direct journal transaction should begin");
+        for row_index in 0..ROW_COUNT {
+            repeated
+                .execute(
+                    update_sql,
+                    &[
+                        Value::Text("{\"state\":\"replacement\"}".to_string()),
+                        Value::Text(format!("{row_index:04}")),
+                    ],
+                )
+                .await
+                .expect("identical repeated journal row should stage");
+        }
+        repeated
+            .commit()
+            .await
+            .expect("identical replacement generation should commit");
+        assert_eq!(
+            crate::transaction::take_direct_journal_replacement_publications(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_mutation_journal_is_visible_before_commit() {
+        const ROW_COUNT: usize = 1_024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "journal_read_your_writes_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute_batch(
+                &(0..ROW_COUNT)
+                    .map(|row_index| ExecuteBatchStatement {
+                        sql: "INSERT INTO journal_read_your_writes_probe (path, value) VALUES ($1, lix_json($2))".to_string(),
+                        params: vec![
+                            Value::Text(format!("{row_index:04}")),
+                            Value::Text("{\"state\":\"base\"}".to_string()),
+                        ],
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+
+        let original_created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM journal_read_your_writes_probe WHERE path = '0000'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .unwrap()
+            .clone();
+
+        let mut transaction = session.begin_transaction().await.unwrap();
+        let update_sql =
+            "UPDATE journal_read_your_writes_probe SET value = lix_json($1) WHERE path = $2";
+        for row_index in 0..ROW_COUNT {
+            transaction
+                .execute(
+                    update_sql,
+                    &[
+                        Value::Text("{\"state\":\"replacement\"}".to_string()),
+                        Value::Text(format!("{row_index:04}")),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let visible = transaction
+            .execute(
+                "SELECT path, value, lixcol_created_at FROM journal_read_your_writes_probe \
+                 WHERE path IN ('0000', '1023') ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("a read barrier must expose the immutable mutation journal");
+        assert_eq!(visible.len(), 2);
+        for row in visible.rows() {
+            assert_eq!(
+                row.get::<serde_json::Value>("value").unwrap(),
+                serde_json::json!({"state": "replacement"})
+            );
+            assert_eq!(
+                row.get::<String>("lixcol_created_at").unwrap().as_str(),
+                original_created_at.as_str()
+            );
+        }
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            crate::transaction::take_direct_journal_replacement_publications(),
+            1,
+            "an intervening read must not reconstruct the immutable journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_journal_fallback_preserves_created_at() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "mixed_journal_lifecycle_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO mixed_journal_lifecycle_probe (path, value) \
+                 VALUES ('existing', lix_json('{\"state\":\"base\"}'))",
+                &[],
+            )
+            .await
+            .unwrap();
+        let original_created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM mixed_journal_lifecycle_probe WHERE path = 'existing'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .unwrap()
+            .clone();
+
+        let mut transaction = session.begin_transaction().await.unwrap();
+        transaction
+            .execute(
+                "INSERT INTO mixed_journal_lifecycle_probe (path, value) \
+                 VALUES ('inserted', lix_json('{\"state\":\"inserted\"}'))",
+                &[],
+            )
+            .await
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE mixed_journal_lifecycle_probe SET value = lix_json($1) WHERE path = $2",
+                &[
+                    Value::Text("{\"state\":\"updated\"}".to_string()),
+                    Value::Text("existing".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM mixed_journal_lifecycle_probe WHERE path = 'existing'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .unwrap()
+            .clone();
+        assert_eq!(created_at, original_created_at);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_parent_without_collection_lifecycle_uses_safe_lane() {
+        const ROW_COUNT: usize = 1_024;
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "rooted_journal_parent_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute_batch(
+                &(0..ROW_COUNT)
+                    .map(|row_index| ExecuteBatchStatement {
+                        sql: "INSERT INTO rooted_journal_parent_probe (path, value) VALUES ($1, lix_json($2))".to_string(),
+                        params: vec![
+                            Value::Text(format!("{row_index:04}")),
+                            Value::Text("{\"state\":\"base\"}".to_string()),
+                        ],
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        let original_created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM rooted_journal_parent_probe WHERE path = '0000'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .unwrap()
+            .clone();
+        session.create_checkpoint().await.unwrap();
+
+        crate::transaction::take_direct_journal_replacement_publications();
+        let mut transaction = session.begin_transaction().await.unwrap();
+        let update_sql =
+            "UPDATE rooted_journal_parent_probe SET value = lix_json($1) WHERE path = $2";
+        for row_index in 0..ROW_COUNT {
+            transaction
+                .execute(
+                    update_sql,
+                    &[
+                        Value::Text("{\"state\":\"replacement\"}".to_string()),
+                        Value::Text(format!("{row_index:04}")),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let visible_created_at = transaction
+            .execute(
+                "SELECT lixcol_created_at FROM rooted_journal_parent_probe WHERE path = '0000'",
+                &[],
+            )
+            .await
+            .expect("fallback read must hydrate lifecycle without lowering the journal")
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .unwrap()
+            .clone();
+        assert_eq!(visible_created_at, original_created_at);
+        transaction
+            .commit()
+            .await
+            .expect("a parent without collection lifecycle authority must use the safe lane");
+        assert_eq!(
+            crate::transaction::take_direct_journal_replacement_publications(),
+            0
+        );
+        let committed_created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM rooted_journal_parent_probe WHERE path = '0000'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .unwrap()
+            .clone();
+        assert_eq!(committed_created_at, original_created_at);
     }
 
     #[tokio::test]
