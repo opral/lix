@@ -21,10 +21,10 @@ lclippy = "b NPROC=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null 
 # for the Linux host. Cargo's host-config isolates those flags from the Wasm
 # target while keeping host linking on mold.
 [host.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+rustflags = "-C link-arg=-fuse-ld=mold"
 
 [host.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+rustflags = "-C link-arg=-fuse-ld=mold"
 
 # keep host and generic-target rustflags in sync
 [target.'cfg(all())']
@@ -36,7 +36,7 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 # Use the parallel mold linker for native Linux binaries, build scripts, and
 # proc macros. WebAssembly targets remain linker-neutral.
 [target.'cfg(all(target_os = "linux", not(target_family = "wasm")))']
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+rustflags = "-C link-arg=-fuse-ld=mold"
 
 [target.wasm32-unknown-unknown]
 # rustflags = [

@@ -29,6 +29,27 @@ jobs:
       - name: Validate change fragments
         run: node scripts/validate-changes.mjs
 
+  cargo-config:
+    name: Cargo config (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: blacksmith-32vcpu-ubuntu-2404
+          - name: macOS arm64
+            runner: blacksmith-12vcpu-macos-15
+          - name: Windows x64
+            runner: blacksmith-16vcpu-windows-2025
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Cargo configuration
+        run: cargo metadata --format-version 1 --no-deps
+
   cargo:
     name: Cargo ${{ matrix.name }}
     runs-on: blacksmith-32vcpu-ubuntu-2404
