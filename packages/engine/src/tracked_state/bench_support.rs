@@ -563,13 +563,25 @@ where
             let scanned = super::scoped_range::scan_scoped_range_scope(&read, &root.tree, &prefix)
                 .await
                 .expect("scan benchmark production scope");
-            let encoded = crate::storage_codec::encode(
-                "benchmark current-state scoped-range scan",
-                &(scanned.coverage, scanned.parts),
-            )
-            .expect("encode benchmark production scope scan");
-            digest.update(&(encoded.len() as u64).to_be_bytes());
-            digest.update(&encoded);
+            match scanned.coverage {
+                Some(marker) => {
+                    digest.update(&[1]);
+                    digest.update(&marker.row_count.to_be_bytes());
+                    digest.update(&marker.part_count.to_be_bytes());
+                }
+                None => {
+                    digest.update(&[0]);
+                }
+            }
+            digest.update(&(scanned.parts.len() as u64).to_be_bytes());
+            for part in scanned.parts {
+                for bytes in [&part.first_key, &part.last_key, &part.payload.bytes] {
+                    digest.update(&(bytes.len() as u64).to_be_bytes());
+                    digest.update(bytes);
+                }
+                digest.update(&part.row_count.to_be_bytes());
+                digest.update(&part.payload.version.to_be_bytes());
+            }
         }
         *digest.finalize().as_bytes()
     }

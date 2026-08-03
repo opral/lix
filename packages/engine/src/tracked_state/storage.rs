@@ -47,9 +47,9 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE: &str =
     "tracked_state.commit_delta_segment.v6";
 pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE: &str = "tracked_state.change_locator.v2";
 pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE: &str =
-    "tracked_state.commit_state_manifest.v4";
+    "tracked_state.commit_state_manifest.v6";
 pub(crate) const TRACKED_STATE_COMMIT_STATE_SEAL_NAMESPACE: &str =
-    "tracked_state.commit_state_semantic_authority.v2";
+    "tracked_state.commit_state_semantic_authority.v3";
 const MIN_CURRENT_STATE_SCOPED_RANGE_POINT_READS: u16 = 4;
 pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0001),
@@ -89,14 +89,17 @@ const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
 // replacements authoritative through their immutable part manifest. The
 // payload-less certified-reference encoding is intentionally rejected.
 const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD14";
-const COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC: &[u8] = b"LXSA2";
+const COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC: &[u8] = b"LXSA3";
+const COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT: &str = "lix.commit-state.semantic-authority.v3";
 // Version 4 makes lossless columnar mutation parts a first-class, exclusive
 // commit payload. LXCS3 repositories are intentionally rejected: there is no
 // compatibility decoder beneath the new authority.
 // Version 5 additionally replaces the nested current-state catalog/directory
 // with one authenticated scoped-range serving root. LXCS4 repositories are
 // intentionally rejected rather than interpreted with mixed root semantics.
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS5";
+// Version 6 binds the scope-run v3 node protocol and shared runtime scope
+// identities. LXCS5 roots cannot be reinterpreted under its content hashes.
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS6";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -1910,7 +1913,7 @@ fn commit_state_semantic_seal(manifest: &CommitStateManifest) -> Result<Vec<u8>,
     // stop at its original baseline. A later rebuilt root may change only the
     // mutable manifest; semantic comparison intentionally ignores that field.
     let payload = storage_codec::encode("commit-state semantic authority", manifest)?;
-    let digest = blake3::Hasher::new_derive_key("lix.commit-state.semantic-authority.v2")
+    let digest = blake3::Hasher::new_derive_key(COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT)
         .update(&payload)
         .finalize();
     let mut encoded = Vec::with_capacity(
@@ -1931,9 +1934,10 @@ fn decode_commit_state_semantic_authority(bytes: &[u8]) -> Result<CommitStateMan
     let (expected_digest, payload) = payload
         .split_at_checked(TRACKED_STATE_HASH_BYTES)
         .ok_or_else(|| replacement_payload_error("commit-state semantic authority is truncated"))?;
-    let actual_digest = blake3::Hasher::new_derive_key("lix.commit-state.semantic-authority.v2")
-        .update(payload)
-        .finalize();
+    let actual_digest =
+        blake3::Hasher::new_derive_key(COMMIT_STATE_SEMANTIC_AUTHORITY_HASH_CONTEXT)
+            .update(payload)
+            .finalize();
     if expected_digest != actual_digest.as_bytes() {
         return Err(replacement_payload_error(
             "commit-state semantic authority digest is invalid",
@@ -2154,15 +2158,11 @@ pub(crate) async fn stage_sparse_current_state_scoped_range(
     let mut new_row_count = 0u64;
     let mut replacements = Vec::with_capacity(splice.leaf_count());
     for leaf_index in 0..splice.leaf_count() {
-        let leaf_key_indices = splice.leaf_key_indices(leaf_index).to_vec();
-        let leaf_parts = splice.leaf_parts(leaf_index).to_vec();
+        let leaf_key_indices = splice.leaf_key_indices(leaf_index);
+        let leaf_parts = splice.leaf_parts(leaf_index);
         old_part_count = old_part_count
             .checked_add(leaf_parts.len() as u64)
             .ok_or_else(|| replacement_payload_error("scoped-range part count overflows"))?;
-        old_row_count = leaf_parts.iter().try_fold(old_row_count, |sum, part| {
-            sum.checked_add(part.row_count)
-                .ok_or_else(|| replacement_payload_error("scoped-range row count overflows"))
-        })?;
 
         let mut pending = leaf_key_indices
             .iter()
@@ -2175,7 +2175,10 @@ pub(crate) async fn stage_sparse_current_state_scoped_range(
             .into_iter()
             .peekable();
         let mut output = Vec::with_capacity(leaf_parts.len() + leaf_key_indices.len());
-        for part in &leaf_parts {
+        for part in leaf_parts {
+            old_row_count = old_row_count
+                .checked_add(part.row_count)
+                .ok_or_else(|| replacement_payload_error("scoped-range row count overflows"))?;
             let descriptor = current_state_descriptor_from_scoped_range_part(part)?;
             let mut gap = Vec::new();
             while pending
@@ -12904,18 +12907,33 @@ mod tests {
         let manifest = commit_state_manifest_fixture();
         let payload = storage_codec::encode("tracked_state commit_state_manifest", &manifest)
             .expect("fixture should encode");
-        let mut legacy = b"LXCS3".to_vec();
-        legacy.extend_from_slice(&payload);
-        let error = decode_commit_state_manifest(&legacy)
-            .expect_err("the hard cut must reject the previous manifest format");
-        assert!(error.message.contains("unsupported format"));
+        for magic in [b"LXCS3".as_slice(), b"LXCS5".as_slice()] {
+            let mut legacy = magic.to_vec();
+            legacy.extend_from_slice(&payload);
+            let error = decode_commit_state_manifest(&legacy)
+                .expect_err("the hard cut must reject pre-v6 manifest formats");
+            assert!(error.message.contains("unsupported format"));
+        }
 
-        let mut legacy_seal = b"LXSA1".to_vec();
-        legacy_seal.extend_from_slice(&[0; TRACKED_STATE_HASH_BYTES]);
-        legacy_seal.extend_from_slice(&payload);
-        let error = super::decode_commit_state_semantic_authority(&legacy_seal)
-            .expect_err("the hard cut must reject the previous semantic seal");
-        assert!(error.message.contains("unsupported format"));
+        for magic in [b"LXSA1".as_slice(), b"LXSA2".as_slice()] {
+            let mut legacy_seal = magic.to_vec();
+            legacy_seal.extend_from_slice(&[0; TRACKED_STATE_HASH_BYTES]);
+            legacy_seal.extend_from_slice(&payload);
+            let error = super::decode_commit_state_semantic_authority(&legacy_seal)
+                .expect_err("the hard cut must reject pre-v3 semantic seals");
+            assert!(error.message.contains("unsupported format"));
+        }
+
+        let legacy_digest =
+            blake3::Hasher::new_derive_key("lix.commit-state.semantic-authority.v2")
+                .update(&payload)
+                .finalize();
+        let mut retagged_v2 = super::COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC.to_vec();
+        retagged_v2.extend_from_slice(legacy_digest.as_bytes());
+        retagged_v2.extend_from_slice(&payload);
+        let error = super::decode_commit_state_semantic_authority(&retagged_v2)
+            .expect_err("an LXSA2 digest must not become valid under an LXSA3 prefix");
+        assert!(error.message.contains("digest is invalid"));
     }
 
     #[tokio::test]
