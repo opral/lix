@@ -2643,31 +2643,24 @@ where
         else {
             return Ok(None);
         };
-        let Some(left) = storage::load_complete_current_state_part_set_from_published_manifest(
-            &self.store,
-            &left_state,
-            &scope,
-        )
-        .await?
-        else {
+        let Some(left_root) = left_state.current_state_scoped_ranges.as_ref() else {
             return Ok(None);
         };
-        let Some(right) = storage::load_complete_current_state_part_set_from_published_manifest(
-            &self.store,
-            &right_state,
-            &scope,
-        )
-        .await?
-        else {
+        let Some(right_root) = right_state.current_state_scoped_ranges.as_ref() else {
             return Ok(None);
         };
-        let windows = super::current_state_part::diff_current_state_part_descriptors(
+        let prefix = super::current_state_envelope::current_state_scope_prefix(&scope)?;
+        match super::scoped_range::prove_scoped_range_scope_equal(
             &self.store,
-            &left.directory,
-            &right.directory,
+            &left_root.tree,
+            &right_root.tree,
+            &prefix,
         )
-        .await?;
-        Ok(Some(windows.is_empty()))
+        .await?
+        {
+            super::scoped_range::ScopedRangeScopeEqualityProof::Equal => Ok(Some(true)),
+            super::scoped_range::ScopedRangeScopeEqualityProof::NotProven => Ok(None),
+        }
     }
 
     /// Returns the compact write-set union for an ancestor/descendant
@@ -3291,7 +3284,7 @@ where
                 .map(|&index| encoded[index].clone())
                 .collect::<Vec<_>>();
             #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_crud_current_state_catalog_attempt();
+            crate::storage_bench::record_crud_current_state_scoped_range_attempt();
             let cold_catalog = storage::load_complete_current_state_values_from_replay_manifest(
                 &self.store,
                 &head.state_manifest,
@@ -3324,17 +3317,17 @@ where
                     values[index] = value;
                 }
                 #[cfg(feature = "storage-benches")]
-                crate::storage_bench::record_crud_current_state_catalog_hit();
+                crate::storage_bench::record_crud_current_state_scoped_range_hit();
                 return Ok(values);
             }
             #[cfg(feature = "storage-benches")]
             if cold_catalog_error {
-                crate::storage_bench::record_crud_current_state_catalog_error();
+                crate::storage_bench::record_crud_current_state_scoped_range_error();
             }
         }
         let catalog = if head_values.iter().all(Option::is_none) {
             #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_crud_current_state_catalog_attempt();
+            crate::storage_bench::record_crud_current_state_scoped_range_attempt();
             storage::load_complete_current_state_values_from_replay_manifest(
                 &self.store,
                 &head.state_manifest,
@@ -3347,18 +3340,18 @@ where
         match catalog {
             Ok(Some(values)) => {
                 #[cfg(feature = "storage-benches")]
-                crate::storage_bench::record_crud_current_state_catalog_hit();
+                crate::storage_bench::record_crud_current_state_scoped_range_hit();
                 return Ok(values);
             }
             Ok(None) => {
                 #[cfg(feature = "storage-benches")]
-                crate::storage_bench::record_crud_current_state_directory_recovery();
+                crate::storage_bench::record_crud_current_state_scoped_range_fallback();
             }
             Err(_) => {
                 #[cfg(feature = "storage-benches")]
-                crate::storage_bench::record_crud_current_state_catalog_error();
+                crate::storage_bench::record_crud_current_state_scoped_range_error();
                 #[cfg(feature = "storage-benches")]
-                crate::storage_bench::record_crud_current_state_directory_recovery();
+                crate::storage_bench::record_crud_current_state_scoped_range_fallback();
             }
         }
         let interval = self.point_replay_interval(commit_id).await?;
@@ -4992,8 +4985,7 @@ mod tests {
                 ),
                 replay_debt: Default::default(),
                 mutations: Default::default(),
-                current_state_catalog: None,
-                current_state_coverage_anchor: None,
+                current_state_scoped_ranges: None,
                 snapshot_root: Some(snapshot_root),
             },
         )

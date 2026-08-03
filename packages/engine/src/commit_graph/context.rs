@@ -671,8 +671,7 @@ mod tests {
                     bytes: 0,
                 },
                 mutations: CommitStateMutationInventory::default(),
-                current_state_catalog: None,
-                current_state_coverage_anchor: None,
+                current_state_scoped_ranges: None,
                 snapshot_root: None,
             },
         )
@@ -1082,8 +1081,7 @@ mod tests {
                     bytes: 0,
                 },
                 mutations: staged.mutation_inventory().clone(),
-                current_state_catalog: None,
-                current_state_coverage_anchor: None,
+                current_state_scoped_ranges: None,
                 snapshot_root: None,
             },
         )
@@ -1587,8 +1585,7 @@ mod tests {
                     bytes: record.tracked_state_rootless_bytes,
                 },
                 mutations,
-                current_state_catalog: None,
-                current_state_coverage_anchor: None,
+                current_state_scoped_ranges: None,
                 snapshot_root: None,
             },
         )

@@ -617,6 +617,29 @@ impl StorageWriteSet {
         Some(Bytes::copy_from_slice(group.value_bytes(put.value)))
     }
 
+    /// Takes an owned snapshot of ordinary puts in one storage lane for an
+    /// async read-your-writes planner. The owned bytes keep the planner's
+    /// future `Send` without requiring `StorageWriteSet` to be `Sync`.
+    pub(crate) fn staged_values_in_space(&self, space: StorageSpace) -> Vec<(Bytes, Bytes)> {
+        let Some(group) = self
+            .group_index
+            .get(&space.id)
+            .and_then(|index| self.groups.get(*index))
+        else {
+            return Vec::new();
+        };
+        group
+            .puts
+            .iter()
+            .map(|put| {
+                (
+                    Bytes::copy_from_slice(group.key_bytes(put.key)),
+                    Bytes::copy_from_slice(group.value_bytes(put.value)),
+                )
+            })
+            .collect()
+    }
+
     pub fn extend(&mut self, other: Self) {
         let Self {
             groups,

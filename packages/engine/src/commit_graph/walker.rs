@@ -1070,8 +1070,7 @@ mod tests {
                     bytes: record.tracked_state_rootless_bytes,
                 },
                 mutations: CommitStateMutationInventory::default(),
-                current_state_catalog: None,
-                current_state_coverage_anchor: None,
+                current_state_scoped_ranges: None,
                 snapshot_root: None,
             },
         )

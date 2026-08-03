@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use lix_engine::storage_adapter::StorageAdapter;
 use lix_engine::tracked_state::bench::{
-    BenchCurrentStateDirectoryDiffMode, BenchCurrentStatePointFixture, BenchCurrentStatePointMode,
-    BenchCurrentStatePointTarget, BenchCurrentStateSparseShape, seed_current_state_point_fixture,
+    BenchCurrentStatePointFixture, BenchCurrentStatePointMode, BenchCurrentStatePointTarget,
+    BenchCurrentStateSparseShape, seed_current_state_point_fixture,
 };
 use lix_rocksdb_storage::RocksDB;
 use lix_slatedb_storage::SlateDB;
@@ -97,79 +97,50 @@ async fn run_backend<S>(
     .await;
     let setup = setup.elapsed();
     let mode = std::env::var("LIX_CURRENT_STATE_MODE").unwrap_or_default();
-    if let Some(diff_mode) = match mode.as_str() {
-        "directory-diff-merkle" => Some(BenchCurrentStateDirectoryDiffMode::Merkle),
-        "directory-diff-flatten" => Some(BenchCurrentStateDirectoryDiffMode::Flatten),
-        _ => None,
-    } {
+    if mode == "scope-scan" {
         let started = Instant::now();
         let mut digest = [0; 32];
         for _ in 0..samples {
-            digest = black_box(fixture.diff_current_state_directory(diff_mode).await);
+            digest = black_box(fixture.scan_current_state_scope().await);
         }
         println!(
-            "current_state_directory_diff_profile,backend={backend},authority=published,mode={diff_mode:?},shape={sparse_shape:?},rows={rows},sparse_commits={sparse_commits},samples={samples},elapsed_ms={:.3},digest={}",
+            "current_state_scoped_range_scan_profile,backend={backend},authority=published,shape={sparse_shape:?},rows={rows},sparse_commits={sparse_commits},samples={samples},elapsed_ms={:.3},digest={}",
             millis(started.elapsed()),
             hex_digest(digest),
         );
         return;
     }
-    if mode == "directory-diff" {
-        assert_eq!(
-            fixture
-                .diff_current_state_directory(BenchCurrentStateDirectoryDiffMode::Merkle)
-                .await,
-            fixture
-                .diff_current_state_directory(BenchCurrentStateDirectoryDiffMode::Flatten)
-                .await,
-            "Merkle and flattened directory comparison must agree",
-        );
-        let (merkle, flatten) = measure_directory_diff_pair(&fixture, warmups, samples).await;
-        println!(
-            "current_state_directory_diff,backend={backend},authority=published,measurement=interleaved,shape={sparse_shape:?},rows={rows},sparse_commits={sparse_commits},merkle_p50_us={:.3},merkle_p95_us={:.3},flatten_p50_us={:.3},flatten_p95_us={:.3},p50_reduction_pct={:.2},p95_reduction_pct={:.2}",
-            micros(merkle.0),
-            micros(merkle.1),
-            micros(flatten.0),
-            micros(flatten.1),
-            reduction_percent(merkle.0, flatten.0),
-            reduction_percent(merkle.1, flatten.1),
-        );
-        return;
-    }
-    if mode == "persistent" || mode == "replay" {
-        let selected = if mode == "persistent" {
-            BenchCurrentStatePointMode::PersistentCatalog
-        } else {
-            BenchCurrentStatePointMode::FirstParentReplay
+    if mode == "scoped" || mode == "replay" {
+        let selected = match mode.as_str() {
+            "scoped" => BenchCurrentStatePointMode::ScopedRange,
+            _ => BenchCurrentStatePointMode::FirstParentReplay,
         };
         let measured = measure(&fixture, selected, warmups, samples).await;
         println!(
-            "current_state_scope_sharing,backend={backend},mode={mode},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},setup_ms={:.3},catalog_staged_encoded_bytes={},directory_staged_encoded_bytes={},sparse_directory_staged_encoded_bytes={},sparse_staged_puts={},sparse_written_bytes={},sparse_directory_nodes_loaded={},sparse_directory_descriptors_visited={},sparse_directory_nodes_encoded={},sparse_publication_p50_us={:.3},sparse_publication_p95_us={:.3},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},catalog_manifest_bytes={},replay_manifest_bytes={},p50_us={:.3},p95_us={:.3}",
-            fixture.catalog_entry_count(),
+            "current_state_scope_sharing,backend={backend},mode={mode},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},setup_ms={:.3},scoped_range_staged_puts={},scoped_range_staged_bytes={},sparse_scoped_range_staged_puts={},sparse_scoped_range_staged_bytes={},sparse_staged_puts={},sparse_written_bytes={},sparse_publication_p50_us={:.3},sparse_publication_p95_us={:.3},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},scoped_manifest_bytes={},replay_manifest_bytes={},p50_us={:.3},p95_us={:.3}",
+            fixture.scope_count(),
             millis(setup),
-            fixture.catalog_staged_encoded_bytes(),
-            fixture.directory_staged_encoded_bytes(),
-            fixture.sparse_directory_staged_encoded_bytes(),
+            fixture.scoped_range_staged_puts(),
+            fixture.scoped_range_staged_bytes(),
+            fixture.sparse_scoped_range_staged_puts(),
+            fixture.sparse_scoped_range_staged_bytes(),
             fixture.sparse_staged_puts(),
             fixture.sparse_written_bytes(),
-            fixture.sparse_directory_nodes_loaded(),
-            fixture.sparse_directory_descriptors_visited(),
-            fixture.sparse_directory_nodes_encoded(),
             fixture.sparse_publication_p50_nanos() as f64 / 1_000.0,
             fixture.sparse_publication_p95_nanos() as f64 / 1_000.0,
             fixture.first_sparse_elapsed_nanos() as f64 / 1_000_000.0,
             fixture.first_sparse_staged_puts(),
             fixture.first_sparse_written_bytes(),
-            fixture.catalog_manifest_bytes(),
+            fixture.scoped_manifest_bytes(),
             fixture.replay_manifest_bytes(),
             micros(measured.0),
             micros(measured.1),
         );
         return;
     }
-    let persistent = measure(
+    let scoped = measure(
         &fixture,
-        BenchCurrentStatePointMode::CatalogThenReplay,
+        BenchCurrentStatePointMode::ScopedRange,
         warmups,
         samples,
     )
@@ -182,89 +153,29 @@ async fn run_backend<S>(
     )
     .await;
     println!(
-        "current_state_scope_sharing,backend={backend},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},setup_ms={:.3},catalog_staged_encoded_bytes={},directory_staged_encoded_bytes={},sparse_directory_staged_encoded_bytes={},sparse_staged_puts={},sparse_written_bytes={},sparse_directory_nodes_loaded={},sparse_directory_descriptors_visited={},sparse_directory_nodes_encoded={},sparse_publication_p50_us={:.3},sparse_publication_p95_us={:.3},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},catalog_manifest_bytes={},replay_manifest_bytes={},serving_p50_us={:.3},serving_p95_us={:.3},replay_p50_us={:.3},replay_p95_us={:.3},p50_reduction_pct={:.2},p95_reduction_pct={:.2}",
-        fixture.catalog_entry_count(),
+        "current_state_scope_sharing,backend={backend},shape={sparse_shape:?},target={point_target:?},rows={rows},scopes={},sparse_commits={sparse_commits},setup_ms={:.3},scoped_range_staged_puts={},scoped_range_staged_bytes={},sparse_scoped_range_staged_puts={},sparse_scoped_range_staged_bytes={},sparse_staged_puts={},sparse_written_bytes={},sparse_publication_p50_us={:.3},sparse_publication_p95_us={:.3},first_sparse_ms={:.3},first_sparse_staged_puts={},first_sparse_written_bytes={},scoped_manifest_bytes={},replay_manifest_bytes={},serving_p50_us={:.3},serving_p95_us={:.3},replay_p50_us={:.3},replay_p95_us={:.3},p50_reduction_pct={:.2},p95_reduction_pct={:.2}",
+        fixture.scope_count(),
         millis(setup),
-        fixture.catalog_staged_encoded_bytes(),
-        fixture.directory_staged_encoded_bytes(),
-        fixture.sparse_directory_staged_encoded_bytes(),
+        fixture.scoped_range_staged_puts(),
+        fixture.scoped_range_staged_bytes(),
+        fixture.sparse_scoped_range_staged_puts(),
+        fixture.sparse_scoped_range_staged_bytes(),
         fixture.sparse_staged_puts(),
         fixture.sparse_written_bytes(),
-        fixture.sparse_directory_nodes_loaded(),
-        fixture.sparse_directory_descriptors_visited(),
-        fixture.sparse_directory_nodes_encoded(),
         fixture.sparse_publication_p50_nanos() as f64 / 1_000.0,
         fixture.sparse_publication_p95_nanos() as f64 / 1_000.0,
         fixture.first_sparse_elapsed_nanos() as f64 / 1_000_000.0,
         fixture.first_sparse_staged_puts(),
         fixture.first_sparse_written_bytes(),
-        fixture.catalog_manifest_bytes(),
+        fixture.scoped_manifest_bytes(),
         fixture.replay_manifest_bytes(),
-        micros(persistent.0),
-        micros(persistent.1),
+        micros(scoped.0),
+        micros(scoped.1),
         micros(replay.0),
         micros(replay.1),
-        reduction_percent(persistent.0, replay.0),
-        reduction_percent(persistent.1, replay.1),
+        reduction_percent(scoped.0, replay.0),
+        reduction_percent(scoped.1, replay.1),
     );
-}
-
-async fn measure_directory_diff_pair<S>(
-    fixture: &BenchCurrentStatePointFixture<S>,
-    warmups: usize,
-    samples: usize,
-) -> ((Duration, Duration), (Duration, Duration))
-where
-    S: lix_engine::storage::Storage,
-{
-    let expected = fixture
-        .diff_current_state_directory(BenchCurrentStateDirectoryDiffMode::Flatten)
-        .await;
-    for warmup in 0..warmups {
-        for mode in alternating_directory_diff_modes(warmup) {
-            assert_eq!(
-                black_box(fixture.diff_current_state_directory(mode).await),
-                expected
-            );
-        }
-    }
-    let mut merkle = Vec::with_capacity(samples);
-    let mut flatten = Vec::with_capacity(samples);
-    for sample in 0..samples {
-        for mode in alternating_directory_diff_modes(sample) {
-            let started = Instant::now();
-            assert_eq!(
-                black_box(fixture.diff_current_state_directory(mode).await),
-                expected
-            );
-            match mode {
-                BenchCurrentStateDirectoryDiffMode::Merkle => merkle.push(started.elapsed()),
-                BenchCurrentStateDirectoryDiffMode::Flatten => flatten.push(started.elapsed()),
-            }
-        }
-    }
-    (percentiles(merkle), percentiles(flatten))
-}
-
-fn alternating_directory_diff_modes(round: usize) -> [BenchCurrentStateDirectoryDiffMode; 2] {
-    if round.is_multiple_of(2) {
-        [
-            BenchCurrentStateDirectoryDiffMode::Merkle,
-            BenchCurrentStateDirectoryDiffMode::Flatten,
-        ]
-    } else {
-        [
-            BenchCurrentStateDirectoryDiffMode::Flatten,
-            BenchCurrentStateDirectoryDiffMode::Merkle,
-        ]
-    }
-}
-
-fn percentiles(mut timings: Vec<Duration>) -> (Duration, Duration) {
-    timings.sort_unstable();
-    let p50 = timings[timings.len() / 2];
-    let p95 = timings[timings.len().saturating_mul(95).div_ceil(100) - 1];
-    (p50, p95)
 }
 
 async fn measure<S>(

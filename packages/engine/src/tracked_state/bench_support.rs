@@ -39,8 +39,7 @@ fn stage_bench_commit_deltas(
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
-            current_state_catalog: None,
-            current_state_coverage_anchor: None,
+            current_state_scoped_ranges: None,
             snapshot_root: None,
         },
     )?;
@@ -67,15 +66,8 @@ pub struct BenchTrackedFixture<StorageImpl: Storage> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchCurrentStatePointMode {
-    PersistentCatalog,
-    CatalogThenReplay,
+    ScopedRange,
     FirstParentReplay,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BenchCurrentStateDirectoryDiffMode {
-    Flatten,
-    Merkle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,17 +89,15 @@ pub struct BenchCurrentStatePointFixture<StorageImpl: Storage> {
     base_manifest: CommitStateManifest,
     current_manifest: CommitStateManifest,
     encoded_key: bytes::Bytes,
-    catalog_entry_count: usize,
-    catalog_manifest_bytes: u64,
+    scope_count: usize,
+    scoped_manifest_bytes: u64,
     replay_manifest_bytes: u64,
-    catalog_staged_encoded_bytes: u64,
-    directory_staged_encoded_bytes: u64,
-    sparse_directory_staged_encoded_bytes: u64,
+    scoped_range_staged_puts: u64,
+    scoped_range_staged_bytes: u64,
+    sparse_scoped_range_staged_puts: u64,
+    sparse_scoped_range_staged_bytes: u64,
     sparse_staged_puts: u64,
     sparse_written_bytes: u64,
-    sparse_directory_nodes_loaded: u64,
-    sparse_directory_descriptors_visited: u64,
-    sparse_directory_nodes_encoded: u64,
     sparse_publication_p50_nanos: u64,
     sparse_publication_p95_nanos: u64,
     first_sparse_elapsed_nanos: u64,
@@ -119,7 +109,7 @@ pub async fn seed_current_state_point_fixture<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
     replacement_rows: usize,
     unrelated_sparse_commits: usize,
-    catalog_entry_count: usize,
+    scope_count: usize,
     sparse_shape: BenchCurrentStateSparseShape,
     point_target: BenchCurrentStatePointTarget,
 ) -> BenchCurrentStatePointFixture<StorageImpl>
@@ -127,15 +117,27 @@ where
     StorageImpl: Storage,
 {
     assert!(replacement_rows > 0);
-    assert!(catalog_entry_count > 0);
-    let _ = crate::storage_bench::take_crud_current_state_catalog_bytes();
-    let _ = crate::storage_bench::take_crud_current_state_directory_bytes();
+    assert!(scope_count > 0);
     let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(11);
     let updated_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(22);
-    let parent_id = bench_addressable_commit_id("persistent-catalog-parent");
     let entity_pks = (0..replacement_rows)
         .map(|index| EntityPk::single(format!("entity-{index:09}")))
         .collect::<Vec<_>>();
+    let alpha_scope = super::types::CommitDeltaReplacementScope {
+        schema_key: "bench_current_state_alpha".to_string(),
+        file_id: None,
+    };
+    let alpha_generation = super::storage::CommitDeltaReplacementGeneration {
+        scope: alpha_scope.clone(),
+        fallback_commit_id: None,
+        lifecycle_summary: super::storage::CommitDeltaLifecycleSummary {
+            scope: alpha_scope,
+            ordered_identity_digest: [17; 32],
+            uniform_created_at: created_at,
+        },
+    };
+
+    let parent_id = bench_addressable_commit_id("scoped-range-parent");
     let parent_rows = entity_pks
         .iter()
         .enumerate()
@@ -144,7 +146,7 @@ where
                 schema_key: "bench_current_state_alpha",
                 file_id: None,
                 entity_pk,
-                change_id: ChangeId::for_test_label(&format!("catalog-parent-{index}")),
+                change_id: ChangeId::for_test_label(&format!("scoped-parent-{index}")),
                 commit_id: parent_id,
                 deleted: false,
                 created_at,
@@ -157,86 +159,33 @@ where
             authored: true,
         })
         .collect::<Vec<_>>();
-    let scope = super::types::CommitDeltaReplacementScope {
-        schema_key: "bench_current_state_alpha".to_string(),
-        file_id: None,
-    };
-    let generation = super::storage::CommitDeltaReplacementGeneration {
-        scope: scope.clone(),
-        fallback_commit_id: None,
-        lifecycle_summary: super::storage::CommitDeltaLifecycleSummary {
-            scope,
-            ordered_identity_digest: [17; 32],
-            uniform_created_at: created_at,
-        },
-    };
     let mut writes = storage.new_write_set();
-    let parent_stage = super::storage::stage_ordered_addressable_replacement_parts(
+    let staged = super::storage::stage_ordered_addressable_replacement_parts(
         &mut writes,
         parent_rows.iter().copied().map(Ok),
-        &generation,
+        &alpha_generation,
     )
     .expect("stage benchmark replacement parts");
-    let mut parent_mutations = parent_stage.mutation_inventory().clone();
-    let parent_publication = super::storage::stage_current_state_catalog_from_published_parent(
-        &storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open benchmark root read"),
-        &mut writes,
-        None,
-        parent_id,
-        crate::ANONYMOUS_ACCOUNT_ID,
-        &parent_mutations,
-    )
-    .await
-    .expect("certify benchmark parent catalog");
-    let (parent_catalog, parent_anchor) = parent_publication.parts();
-    parent_mutations.parts.clear();
-    let mut current_manifest = bench_current_state_manifest(
-        parent_id,
-        None,
-        1,
-        parent_mutations,
-        parent_catalog,
-        parent_anchor,
-    );
-    super::storage::stage_certified_commit_state_manifest(
-        &mut writes,
-        &current_manifest,
-        &parent_publication,
-    )
-    .expect("stage benchmark parent manifest");
-    storage
-        .commit_write_set(writes, StorageWriteOptions::default())
-        .await
-        .expect("commit benchmark parent");
+    let (mut current_manifest, mut scoped_range_staged_puts, mut scoped_range_staged_bytes, _, _) =
+        publish_bench_current_state_commit(
+            &storage,
+            writes,
+            None,
+            parent_id,
+            1,
+            staged.mutation_inventory().clone(),
+        )
+        .await;
+    let mut commits = vec![parent_id];
 
-    for index in 1..catalog_entry_count {
-        let authority_commit_id = bench_addressable_commit_id(&format!("catalog-scope-{index}"));
+    for index in 1..scope_count {
+        let commit_id = bench_addressable_commit_id(&format!("scoped-range-scope-{index}"));
         let schema_key = format!("bench_scope_{index:08}");
         let file_id = format!("file-{:05}", index % 10_000);
         let entity_pk = EntityPk::single("entity");
         let scope = super::types::CommitDeltaReplacementScope {
             schema_key: schema_key.clone(),
             file_id: Some(file_id.clone()),
-        };
-        let row = TrackedStateCommitDeltaRef {
-            delta: TrackedStateDeltaRef {
-                schema_key: &schema_key,
-                file_id: Some(&file_id),
-                entity_pk: &entity_pk,
-                change_id: ChangeId::for_test_label(&format!("catalog-scope-change-{index}")),
-                commit_id: authority_commit_id,
-                deleted: false,
-                created_at,
-                updated_at,
-            },
-            snapshot: JsonSlotRef::Inline("{}"),
-            metadata: JsonSlotRef::None,
-            origin_key: None,
-            base_coordinate: None,
-            authored: true,
         };
         let generation = super::storage::CommitDeltaReplacementGeneration {
             scope: scope.clone(),
@@ -247,182 +196,12 @@ where
                 uniform_created_at: created_at,
             },
         };
-        let mut authority_writes = storage.new_write_set();
-        let staged = super::storage::stage_ordered_addressable_replacement_parts(
-            &mut authority_writes,
-            std::iter::once(Ok(row)),
-            &generation,
-        )
-        .expect("stage valid benchmark scope replacement");
-        let mut mutations = staged.mutation_inventory().clone();
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open benchmark scope parent read");
-        let published_parent =
-            super::storage::load_published_commit_state_manifest(&read, current_manifest.commit_id)
-                .await
-                .expect("load benchmark scope parent authority")
-                .expect("benchmark scope parent authority exists");
-        let publication = super::storage::stage_current_state_catalog_from_published_parent(
-            &read,
-            &mut authority_writes,
-            Some(&published_parent),
-            authority_commit_id,
-            crate::ANONYMOUS_ACCOUNT_ID,
-            &mutations,
-        )
-        .await
-        .expect("certify benchmark scope catalog");
-        let (catalog, anchor) = publication.parts();
-        mutations.parts.clear();
-        let authority_manifest = bench_current_state_manifest(
-            authority_commit_id,
-            Some(current_manifest.commit_id),
-            u16::try_from(index + 1)
-                .expect("benchmark catalog construction depth fits u16")
-                .min(super::COMMIT_STATE_MAX_REPLAY_DEPTH),
-            mutations,
-            catalog,
-            anchor,
-        );
-        super::storage::stage_certified_commit_state_manifest(
-            &mut authority_writes,
-            &authority_manifest,
-            &publication,
-        )
-        .expect("stage benchmark scope authority");
-        drop(read);
-        storage
-            .commit_write_set(authority_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit benchmark scope authority");
-        current_manifest = authority_manifest;
-    }
-
-    let replay_base_id = if catalog_entry_count == 1 {
-        parent_id
-    } else {
-        let refresh_id = bench_addressable_commit_id("persistent-catalog-alpha-refresh");
-        let refresh_rows = entity_pks
-            .iter()
-            .enumerate()
-            .map(|(index, entity_pk)| TrackedStateCommitDeltaRef {
-                delta: TrackedStateDeltaRef {
-                    schema_key: "bench_current_state_alpha",
-                    file_id: None,
-                    entity_pk,
-                    change_id: ChangeId::for_test_label(&format!("catalog-refresh-{index}")),
-                    commit_id: refresh_id,
-                    deleted: false,
-                    created_at,
-                    updated_at,
-                },
-                snapshot: JsonSlotRef::Inline("{}"),
-                metadata: JsonSlotRef::None,
-                origin_key: None,
-                base_coordinate: None,
-                authored: true,
-            })
-            .collect::<Vec<_>>();
-        let mut refresh_writes = storage.new_write_set();
-        let refresh_stage = super::storage::stage_ordered_addressable_replacement_parts(
-            &mut refresh_writes,
-            refresh_rows.iter().copied().map(Ok),
-            &generation,
-        )
-        .expect("stage benchmark alpha refresh");
-        let mut refresh_mutations = refresh_stage.mutation_inventory().clone();
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open benchmark refresh parent read");
-        let published_parent =
-            super::storage::load_published_commit_state_manifest(&read, current_manifest.commit_id)
-                .await
-                .expect("load benchmark refresh parent authority")
-                .expect("benchmark refresh parent authority exists");
-        let publication = super::storage::stage_current_state_catalog_from_published_parent(
-            &read,
-            &mut refresh_writes,
-            Some(&published_parent),
-            refresh_id,
-            crate::ANONYMOUS_ACCOUNT_ID,
-            &refresh_mutations,
-        )
-        .await
-        .expect("certify benchmark alpha refresh");
-        let (catalog, anchor) = publication.parts();
-        refresh_mutations.parts.clear();
-        let refresh_manifest = bench_current_state_manifest(
-            refresh_id,
-            Some(current_manifest.commit_id),
-            1,
-            refresh_mutations,
-            catalog,
-            anchor,
-        );
-        super::storage::stage_certified_commit_state_manifest(
-            &mut refresh_writes,
-            &refresh_manifest,
-            &publication,
-        )
-        .expect("stage benchmark alpha refresh authority");
-        drop(read);
-        storage
-            .commit_write_set(refresh_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit benchmark alpha refresh");
-        current_manifest = refresh_manifest;
-        refresh_id
-    };
-
-    let base_manifest = current_manifest.clone();
-    let mut commits = vec![replay_base_id];
-    let mut catalog_manifest_bytes = 0u64;
-    let mut replay_manifest_bytes = 0u64;
-    let mut sparse_staged_puts = 0u64;
-    let mut sparse_written_bytes = 0u64;
-    let mut sparse_directory_nodes_loaded = 0u64;
-    let mut sparse_directory_descriptors_visited = 0u64;
-    let mut sparse_directory_nodes_encoded = 0u64;
-    let mut sparse_publication_nanos = Vec::with_capacity(unrelated_sparse_commits);
-    let mut first_sparse_elapsed_nanos = 0u64;
-    let mut first_sparse_staged_puts = 0u64;
-    let mut first_sparse_written_bytes = 0u64;
-    let _ = crate::storage_bench::take_crud_current_state_directory_accounting();
-    let base_directory_staged_encoded_bytes =
-        crate::storage_bench::take_crud_current_state_directory_bytes();
-    let beta_pk = EntityPk::single("unrelated");
-    for index in 0..unrelated_sparse_commits {
-        let sparse_started = Instant::now();
-        let commit_id = bench_addressable_commit_id(&format!("catalog-child-{index}"));
-        let touches_alpha = sparse_shape == BenchCurrentStateSparseShape::TouchedScope;
-        let present_scope = !touches_alpha && catalog_entry_count > 1 && index % 4 == 0;
-        let schema_key = if touches_alpha {
-            "bench_current_state_alpha".to_string()
-        } else if present_scope {
-            format!("bench_scope_{:08}", 1 + index % (catalog_entry_count - 1))
-        } else {
-            "bench_current_state_beta".to_string()
-        };
-        let file_id = present_scope.then(|| {
-            format!(
-                "file-{:05}",
-                (1 + index % (catalog_entry_count - 1)) % 10_000
-            )
-        });
-        let sparse_pk = if touches_alpha {
-            &entity_pks[replacement_rows / 4]
-        } else {
-            &beta_pk
-        };
         let row = TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key: &schema_key,
-                file_id: file_id.as_deref(),
-                entity_pk: sparse_pk,
-                change_id: ChangeId::for_test_label(&format!("catalog-child-change-{index}")),
+                file_id: Some(&file_id),
+                entity_pk: &entity_pk,
+                change_id: ChangeId::for_test_label(&format!("scoped-scope-change-{index}")),
                 commit_id,
                 deleted: false,
                 created_at,
@@ -435,7 +214,79 @@ where
             authored: true,
         };
         let mut writes = storage.new_write_set();
-        let stage = super::storage::stage_ordered_addressable_commit_deltas(
+        let staged = super::storage::stage_ordered_addressable_replacement_parts(
+            &mut writes,
+            std::iter::once(Ok(row)),
+            &generation,
+        )
+        .expect("stage benchmark scope replacement");
+        let (manifest, puts, bytes, _, _) = publish_bench_current_state_commit(
+            &storage,
+            writes,
+            Some(&current_manifest),
+            commit_id,
+            u16::try_from(index + 1)
+                .expect("benchmark scope depth fits u16")
+                .min(super::COMMIT_STATE_MAX_REPLAY_DEPTH),
+            staged.mutation_inventory().clone(),
+        )
+        .await;
+        current_manifest = manifest;
+        scoped_range_staged_puts = scoped_range_staged_puts.saturating_add(puts);
+        scoped_range_staged_bytes = scoped_range_staged_bytes.saturating_add(bytes);
+        commits.push(commit_id);
+    }
+    let base_manifest = current_manifest.clone();
+
+    let beta_pk = EntityPk::single("unrelated");
+    let mut scoped_manifest_bytes = 0u64;
+    let mut replay_manifest_bytes = 0u64;
+    let mut sparse_scoped_range_staged_puts = 0u64;
+    let mut sparse_scoped_range_staged_bytes = 0u64;
+    let mut sparse_staged_puts = 0u64;
+    let mut sparse_written_bytes = 0u64;
+    let mut sparse_publication_nanos = Vec::with_capacity(unrelated_sparse_commits);
+    let mut first_sparse_elapsed_nanos = 0u64;
+    let mut first_sparse_staged_puts = 0u64;
+    let mut first_sparse_written_bytes = 0u64;
+    for index in 0..unrelated_sparse_commits {
+        let sparse_started = Instant::now();
+        let commit_id = bench_addressable_commit_id(&format!("scoped-range-child-{index}"));
+        let touches_alpha = sparse_shape == BenchCurrentStateSparseShape::TouchedScope;
+        let present_scope = !touches_alpha && scope_count > 1 && index % 4 == 0;
+        let schema_key = if touches_alpha {
+            "bench_current_state_alpha".to_string()
+        } else if present_scope {
+            format!("bench_scope_{:08}", 1 + index % (scope_count - 1))
+        } else {
+            "bench_current_state_beta".to_string()
+        };
+        let file_id =
+            present_scope.then(|| format!("file-{:05}", (1 + index % (scope_count - 1)) % 10_000));
+        let sparse_pk = if touches_alpha {
+            &entity_pks[replacement_rows / 4]
+        } else {
+            &beta_pk
+        };
+        let row = TrackedStateCommitDeltaRef {
+            delta: TrackedStateDeltaRef {
+                schema_key: &schema_key,
+                file_id: file_id.as_deref(),
+                entity_pk: sparse_pk,
+                change_id: ChangeId::for_test_label(&format!("scoped-child-change-{index}")),
+                commit_id,
+                deleted: false,
+                created_at,
+                updated_at,
+            },
+            snapshot: JsonSlotRef::Inline("{}"),
+            metadata: JsonSlotRef::None,
+            origin_key: None,
+            base_coordinate: None,
+            authored: true,
+        };
+        let mut writes = storage.new_write_set();
+        let staged = super::storage::stage_ordered_addressable_commit_deltas(
             &mut writes,
             std::iter::once(Ok(row)),
             true,
@@ -443,70 +294,42 @@ where
         )
         .expect("stage benchmark sparse mutation")
         .expect("benchmark sparse mutation is addressable");
-        let mut mutations = stage.mutation_inventory().clone();
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open benchmark parent read");
-        let published_parent =
-            super::storage::load_published_commit_state_manifest(&read, current_manifest.commit_id)
-                .await
-                .expect("load benchmark sparse parent authority")
-                .expect("benchmark sparse parent authority exists");
-        let publication_started = Instant::now();
-        let publication = super::storage::stage_current_state_catalog_from_published_parent(
-            &read,
-            &mut writes,
-            Some(&published_parent),
-            commit_id,
-            crate::ANONYMOUS_ACCOUNT_ID,
-            &mut mutations,
-        )
-        .await
-        .expect("reuse benchmark persistent catalog");
-        sparse_publication_nanos
-            .push(u64::try_from(publication_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
-        let (catalog, anchor) = publication.parts();
-        drop(read);
-        current_manifest = bench_current_state_manifest(
-            commit_id,
-            commits.last().copied(),
-            u16::try_from(commits.len() + 1)
-                .expect("benchmark replay depth fits u16")
-                .min(super::COMMIT_STATE_MAX_REPLAY_DEPTH),
-            mutations,
-            catalog,
-            anchor,
+        let (manifest, range_puts, range_bytes, publication_nanos, stats) =
+            publish_bench_current_state_commit(
+                &storage,
+                writes,
+                Some(&current_manifest),
+                commit_id,
+                u16::try_from(commits.len() + 1)
+                    .expect("benchmark replay depth fits u16")
+                    .min(super::COMMIT_STATE_MAX_REPLAY_DEPTH),
+                staged.mutation_inventory().clone(),
+            )
+            .await;
+        let elapsed = u64::try_from(sparse_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        sparse_publication_nanos.push(publication_nanos);
+        sparse_scoped_range_staged_puts =
+            sparse_scoped_range_staged_puts.saturating_add(range_puts);
+        sparse_scoped_range_staged_bytes =
+            sparse_scoped_range_staged_bytes.saturating_add(range_bytes);
+        sparse_staged_puts = sparse_staged_puts.saturating_add(stats.staged_puts);
+        sparse_written_bytes = sparse_written_bytes.saturating_add(stats.written_bytes);
+        scoped_manifest_bytes = scoped_manifest_bytes.saturating_add(
+            u64::try_from(bench_manifest_encoded_len(&manifest))
+                .expect("benchmark manifest length fits u64"),
         );
-        catalog_manifest_bytes += u64::try_from(bench_manifest_encoded_len(&current_manifest))
-            .expect("benchmark manifest length fits u64");
-        let mut replay_manifest = current_manifest.clone();
-        replay_manifest.current_state_catalog = None;
-        replay_manifest_bytes += u64::try_from(bench_manifest_encoded_len(&replay_manifest))
-            .expect("benchmark manifest length fits u64");
-        super::storage::stage_certified_commit_state_manifest(
-            &mut writes,
-            &current_manifest,
-            &publication,
-        )
-        .expect("stage benchmark sparse manifest");
-        let (_, stats) = storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit benchmark sparse child");
-        sparse_staged_puts += stats.staged_puts;
-        sparse_written_bytes += stats.written_bytes;
-        let directory_accounting =
-            crate::storage_bench::take_crud_current_state_directory_accounting();
-        sparse_directory_nodes_loaded += directory_accounting.nodes_loaded;
-        sparse_directory_descriptors_visited += directory_accounting.descriptors_visited;
-        sparse_directory_nodes_encoded += directory_accounting.nodes_encoded;
+        let mut replay_manifest = manifest.clone();
+        replay_manifest.current_state_scoped_ranges = None;
+        replay_manifest_bytes = replay_manifest_bytes.saturating_add(
+            u64::try_from(bench_manifest_encoded_len(&replay_manifest))
+                .expect("benchmark replay manifest length fits u64"),
+        );
         if index == 0 {
-            first_sparse_elapsed_nanos =
-                u64::try_from(sparse_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            first_sparse_elapsed_nanos = elapsed;
             first_sparse_staged_puts = stats.staged_puts;
             first_sparse_written_bytes = stats.written_bytes;
         }
+        current_manifest = manifest;
         commits.push(commit_id);
     }
     sparse_publication_nanos.sort_unstable();
@@ -524,8 +347,6 @@ where
         )
         .copied()
         .unwrap_or_default();
-    let sparse_directory_staged_encoded_bytes =
-        crate::storage_bench::take_crud_current_state_directory_bytes();
 
     let target_index = if sparse_shape == BenchCurrentStateSparseShape::TouchedScope
         && point_target == BenchCurrentStatePointTarget::HotMutated
@@ -534,12 +355,11 @@ where
     } else {
         replacement_rows / 2
     };
-    let target = &entity_pks[target_index];
     let encoded_key = bytes::Bytes::from(super::codec::encode_key_ref(
         super::types::TrackedStateKeyRef {
             schema_key: "bench_current_state_alpha",
             file_id: None,
-            entity_pk: target,
+            entity_pk: &entity_pks[target_index],
         },
     ));
     BenchCurrentStatePointFixture {
@@ -548,18 +368,15 @@ where
         base_manifest,
         current_manifest,
         encoded_key,
-        catalog_entry_count,
-        catalog_manifest_bytes,
+        scope_count,
+        scoped_manifest_bytes,
         replay_manifest_bytes,
-        catalog_staged_encoded_bytes: crate::storage_bench::take_crud_current_state_catalog_bytes(),
-        directory_staged_encoded_bytes: base_directory_staged_encoded_bytes
-            .saturating_add(sparse_directory_staged_encoded_bytes),
-        sparse_directory_staged_encoded_bytes,
+        scoped_range_staged_puts,
+        scoped_range_staged_bytes,
+        sparse_scoped_range_staged_puts,
+        sparse_scoped_range_staged_bytes,
         sparse_staged_puts,
         sparse_written_bytes,
-        sparse_directory_nodes_loaded,
-        sparse_directory_descriptors_visited,
-        sparse_directory_nodes_encoded,
         sparse_publication_p50_nanos,
         sparse_publication_p95_nanos,
         first_sparse_elapsed_nanos,
@@ -568,32 +385,94 @@ where
     }
 }
 
+async fn publish_bench_current_state_commit<StorageImpl: Storage>(
+    storage: &StorageAdapter<StorageImpl>,
+    mut writes: StorageWriteSet,
+    parent: Option<&CommitStateManifest>,
+    commit_id: CommitId,
+    replay_depth: u16,
+    mut mutations: super::types::CommitStateMutationInventory,
+) -> (CommitStateManifest, u64, u64, u64, StorageWriteSetStats) {
+    let read = storage
+        .begin_read(StorageReadOptions::default())
+        .await
+        .expect("open benchmark scoped-range parent read");
+    let published_parent = match parent {
+        Some(parent) => Some(
+            super::storage::load_published_commit_state_manifest(&read, parent.commit_id)
+                .await
+                .expect("load benchmark scoped-range parent")
+                .expect("benchmark scoped-range parent exists"),
+        ),
+        None => None,
+    };
+    let before = writes.stats();
+    let publication_started = Instant::now();
+    let publication = super::storage::stage_current_state_scoped_ranges_from_published_parent(
+        &read,
+        &mut writes,
+        published_parent.as_ref(),
+        commit_id,
+        crate::ANONYMOUS_ACCOUNT_ID,
+        &mutations,
+    )
+    .await
+    .expect("stage benchmark production scoped-range publication");
+    let publication_nanos =
+        u64::try_from(publication_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let after = writes.stats();
+    let range_puts = after.staged_puts.saturating_sub(before.staged_puts);
+    let range_bytes = after.written_bytes.saturating_sub(before.written_bytes);
+    if mutations.replacement_generation.is_some() {
+        mutations.parts.clear();
+    }
+    let manifest = bench_current_state_manifest(
+        commit_id,
+        parent.map(|parent| parent.commit_id),
+        replay_depth,
+        mutations,
+        publication.root(),
+    );
+    super::storage::stage_certified_commit_state_manifest(&mut writes, &manifest, &publication)
+        .expect("stage benchmark certified scoped-range manifest");
+    drop(read);
+    let (_, stats) = storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await
+        .expect("commit benchmark scoped-range authority");
+    (manifest, range_puts, range_bytes, publication_nanos, stats)
+}
+
 impl<StorageImpl> BenchCurrentStatePointFixture<StorageImpl>
 where
     StorageImpl: Storage,
 {
-    pub fn catalog_entry_count(&self) -> usize {
-        self.catalog_entry_count
+    pub fn scope_count(&self) -> usize {
+        self.scope_count
     }
 
-    pub fn catalog_manifest_bytes(&self) -> u64 {
-        self.catalog_manifest_bytes
+    pub fn scoped_manifest_bytes(&self) -> u64 {
+        self.scoped_manifest_bytes
     }
 
     pub fn replay_manifest_bytes(&self) -> u64 {
         self.replay_manifest_bytes
     }
 
-    pub fn catalog_staged_encoded_bytes(&self) -> u64 {
-        self.catalog_staged_encoded_bytes
+    pub fn scoped_range_staged_puts(&self) -> u64 {
+        self.scoped_range_staged_puts
     }
 
-    pub fn directory_staged_encoded_bytes(&self) -> u64 {
-        self.directory_staged_encoded_bytes
+    pub fn scoped_range_staged_bytes(&self) -> u64 {
+        self.scoped_range_staged_bytes
     }
 
-    pub fn sparse_directory_staged_encoded_bytes(&self) -> u64 {
-        self.sparse_directory_staged_encoded_bytes
+    pub fn sparse_scoped_range_staged_puts(&self) -> u64 {
+        self.sparse_scoped_range_staged_puts
+    }
+
+    pub fn sparse_scoped_range_staged_bytes(&self) -> u64 {
+        self.sparse_scoped_range_staged_bytes
     }
 
     pub fn sparse_staged_puts(&self) -> u64 {
@@ -602,18 +481,6 @@ where
 
     pub fn sparse_written_bytes(&self) -> u64 {
         self.sparse_written_bytes
-    }
-
-    pub fn sparse_directory_nodes_loaded(&self) -> u64 {
-        self.sparse_directory_nodes_loaded
-    }
-
-    pub fn sparse_directory_descriptors_visited(&self) -> u64 {
-        self.sparse_directory_descriptors_visited
-    }
-
-    pub fn sparse_directory_nodes_encoded(&self) -> u64 {
-        self.sparse_directory_nodes_encoded
     }
 
     pub fn sparse_publication_p50_nanos(&self) -> u64 {
@@ -643,149 +510,66 @@ where
             .await
             .expect("begin benchmark current-state point read");
         match mode {
-            BenchCurrentStatePointMode::PersistentCatalog
-            | BenchCurrentStatePointMode::CatalogThenReplay => {
-                if mode == BenchCurrentStatePointMode::CatalogThenReplay {
-                    let head = *self.commits.last().expect("benchmark has a head commit");
-                    let values = super::storage::load_commit_delta_values_encoded_with_cache(
-                        &read,
-                        head,
-                        std::slice::from_ref(&self.encoded_key),
-                        None,
-                    )
-                    .await
-                    .expect("probe benchmark head delta");
-                    if values[0].is_some() {
-                        return 1;
-                    }
-                }
+            BenchCurrentStatePointMode::ScopedRange => {
                 let state = super::storage::load_published_commit_state_manifest(
                     &read,
                     self.current_manifest.commit_id,
                 )
                 .await
-                .expect("load benchmark current-state manifest")
-                .expect("benchmark current-state manifest exists");
-                let values = if mode == BenchCurrentStatePointMode::PersistentCatalog {
+                .expect("load benchmark scoped-range manifest")
+                .expect("benchmark scoped-range manifest exists");
+                let values =
                     super::storage::load_complete_current_state_values_from_published_manifest(
                         &read,
                         &state,
                         std::slice::from_ref(&self.encoded_key),
                     )
                     .await
-                } else {
-                    super::storage::load_complete_current_state_values_from_published_replay_manifest(
-                        &read,
-                        &state,
-                        std::slice::from_ref(&self.encoded_key),
-                    )
-                    .await
-                }
-                .expect("read benchmark current-state catalog");
-                if let Some(values) = values {
-                    return usize::from(values[0].is_some());
-                }
-                if mode == BenchCurrentStatePointMode::PersistentCatalog {
-                    panic!("benchmark point is not covered");
-                }
-                self.read_point_by_replay(&read).await
+                    .expect("read benchmark production scoped-range tree")
+                    .expect("benchmark production scope is covered");
+                usize::from(values[0].is_some())
             }
             BenchCurrentStatePointMode::FirstParentReplay => self.read_point_by_replay(&read).await,
         }
     }
 
-    pub async fn diff_current_state_directory(
-        &self,
-        mode: BenchCurrentStateDirectoryDiffMode,
-    ) -> [u8; 32] {
+    /// Hashes the production scope scan at both benchmark endpoints. This is
+    /// useful for profiling broad serving-index reads without retaining the
+    /// removed layout-specific diff mini-engine.
+    pub async fn scan_current_state_scope(&self) -> [u8; 32] {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("begin benchmark current-state directory diff");
+            .expect("begin benchmark current-state scope scan");
         let scope = super::types::CommitDeltaReplacementScope {
             schema_key: "bench_current_state_alpha".to_string(),
             file_id: None,
         };
-        let left_state = super::storage::load_published_commit_state_manifest(
-            &read,
-            self.base_manifest.commit_id,
-        )
-        .await
-        .expect("load benchmark base published manifest")
-        .expect("benchmark base published manifest exists");
-        let right_state = super::storage::load_published_commit_state_manifest(
-            &read,
-            self.current_manifest.commit_id,
-        )
-        .await
-        .expect("load benchmark head published manifest")
-        .expect("benchmark head published manifest exists");
-        let left = super::storage::load_complete_current_state_part_set_from_published_manifest(
-            &read,
-            &left_state,
-            &scope,
-        )
-        .await
-        .expect("authenticate benchmark base current-state entry")
-        .expect("benchmark base scope is covered");
-        let right = super::storage::load_complete_current_state_part_set_from_published_manifest(
-            &read,
-            &right_state,
-            &scope,
-        )
-        .await
-        .expect("authenticate benchmark head current-state entry")
-        .expect("benchmark head scope is covered");
-        let windows = match mode {
-            BenchCurrentStateDirectoryDiffMode::Flatten => {
-                let left = super::current_state_part::load_current_state_part_descriptors(
-                    &read,
-                    &left.directory,
-                )
+        let prefix = super::current_state_envelope::current_state_scope_prefix(&scope)
+            .expect("encode benchmark scope prefix");
+        let mut digest =
+            blake3::Hasher::new_derive_key("lix benchmark current-state scoped-range scan v1");
+        for manifest in [&self.base_manifest, &self.current_manifest] {
+            let published =
+                super::storage::load_published_commit_state_manifest(&read, manifest.commit_id)
+                    .await
+                    .expect("load benchmark scope-scan manifest")
+                    .expect("benchmark scope-scan manifest exists");
+            let root = published
+                .current_state_scoped_ranges
+                .as_ref()
+                .expect("benchmark scope-scan root exists");
+            let scanned = super::scoped_range::scan_scoped_range_scope(&read, &root.tree, &prefix)
                 .await
-                .expect("flatten benchmark base directory");
-                let right = super::current_state_part::load_current_state_part_descriptors(
-                    &read,
-                    &right.directory,
-                )
-                .await
-                .expect("flatten benchmark head directory");
-                super::current_state_part::diff_current_state_part_descriptor_slices(&left, &right)
-                    .expect("compare flattened benchmark directories")
-            }
-            BenchCurrentStateDirectoryDiffMode::Merkle => {
-                super::current_state_part::diff_current_state_part_descriptors(
-                    &read,
-                    &left.directory,
-                    &right.directory,
-                )
-                .await
-                .expect("Merkle-diff benchmark directories")
-            }
-        };
-        let mut digest = blake3::Hasher::new_derive_key(
-            "lix benchmark current-state descriptor diff windows v1",
-        );
-        for window in windows {
-            digest.update(&(window.first_key.len() as u64).to_be_bytes());
-            digest.update(&window.first_key);
-            digest.update(&(window.last_key.len() as u64).to_be_bytes());
-            digest.update(&window.last_key);
-            let left = crate::storage_codec::encode(
-                "benchmark current-state descriptor diff left window",
-                &window.left,
+                .expect("scan benchmark production scope");
+            let encoded = crate::storage_codec::encode(
+                "benchmark current-state scoped-range scan",
+                &(scanned.coverage, scanned.parts),
             )
-            .expect("encode benchmark left descriptor window");
-            let right = crate::storage_codec::encode(
-                "benchmark current-state descriptor diff right window",
-                &window.right,
-            )
-            .expect("encode benchmark right descriptor window");
-            digest.update(&(left.len() as u64).to_be_bytes());
-            digest.update(&left);
-            digest.update(&(right.len() as u64).to_be_bytes());
-            digest.update(&right);
+            .expect("encode benchmark production scope scan");
+            digest.update(&(encoded.len() as u64).to_be_bytes());
+            digest.update(&encoded);
         }
         *digest.finalize().as_bytes()
     }
@@ -824,8 +608,7 @@ fn bench_current_state_manifest(
     parent_commit_id: Option<CommitId>,
     replay_depth: u16,
     mutations: super::types::CommitStateMutationInventory,
-    current_state_catalog: Option<Box<super::types::CurrentStateCatalogRoot>>,
-    current_state_coverage_anchor: Option<Box<super::types::CurrentStateCoverageAnchor>>,
+    current_state_scoped_ranges: Option<Box<super::types::CurrentStateScopedRangeRoot>>,
 ) -> CommitStateManifest {
     CommitStateManifest {
         commit_id,
@@ -840,8 +623,7 @@ fn bench_current_state_manifest(
             bytes: u64::from(mutations.member_count),
         },
         mutations,
-        current_state_catalog,
-        current_state_coverage_anchor,
+        current_state_scoped_ranges,
         snapshot_root: None,
     }
 }
