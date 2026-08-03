@@ -5941,6 +5941,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordered_batch_update_preserves_non_uniform_lifecycle_without_journal_admission() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "non_uniform_journal_admission_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        for path in ["a", "b"] {
+            session
+                .execute(
+                    "INSERT INTO non_uniform_journal_admission_probe (path, value) VALUES ($1, $2)",
+                    &[
+                        Value::Text(path.to_string()),
+                        Value::Text("base".to_string()),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let before = session
+            .execute(
+                "SELECT path, lixcol_created_at FROM non_uniform_journal_admission_probe ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        let update_sql =
+            "UPDATE non_uniform_journal_admission_probe SET value = $1 WHERE path = $2";
+        for version in ["first", "second"] {
+            session
+                .execute_batch(&[
+                    ExecuteBatchStatement {
+                        sql: update_sql.to_string(),
+                        params: vec![
+                            Value::Text(version.to_string()),
+                            Value::Text("a".to_string()),
+                        ],
+                    },
+                    ExecuteBatchStatement {
+                        sql: update_sql.to_string(),
+                        params: vec![
+                            Value::Text(version.to_string()),
+                            Value::Text("b".to_string()),
+                        ],
+                    },
+                ])
+                .await
+                .unwrap();
+        }
+        let after = session
+            .execute(
+                "SELECT path, lixcol_created_at FROM non_uniform_journal_admission_probe ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.rows(), after.rows());
+    }
+
+    #[tokio::test]
     async fn certified_parameter_batch_revalidates_after_staged_schema_amendment() {
         // Keep this at the production typed-transport boundary. A separate
         // route-selection unit test pins the threshold itself.
@@ -5979,7 +6052,9 @@ mod tests {
             "required": ["id", "value"],
             "additionalProperties": false
         });
-        crate::transaction::take_direct_journal_replacement_publications();
+        crate::transaction::take_direct_journal_replacement_publications(
+            "amended_parameter_insert_probe",
+        );
         let mut transaction = session.begin_transaction().await.unwrap();
         transaction
             .execute(
@@ -9280,7 +9355,9 @@ mod tests {
             assert_eq!(result.rows_affected(), 1);
         }
         assert_eq!(
-            crate::transaction::take_direct_journal_replacement_publications(),
+            crate::transaction::take_direct_journal_replacement_publications(
+                "direct_journal_seal_probe",
+            ),
             0
         );
         let visible = transaction
@@ -9304,7 +9381,9 @@ mod tests {
             .await
             .expect("direct journal should commit");
         assert_eq!(
-            crate::transaction::take_direct_journal_replacement_publications(),
+            crate::transaction::take_direct_journal_replacement_publications(
+                "direct_journal_seal_probe",
+            ),
             1,
             "the complete scalar generation must seal without PreparedStateBatch"
         );
@@ -9333,7 +9412,9 @@ mod tests {
             .await
             .expect("identical replacement generation should commit");
         assert_eq!(
-            crate::transaction::take_direct_journal_replacement_publications(),
+            crate::transaction::take_direct_journal_replacement_publications(
+                "direct_journal_seal_probe",
+            ),
             1
         );
     }
@@ -9425,7 +9506,9 @@ mod tests {
         }
         transaction.commit().await.unwrap();
         assert_eq!(
-            crate::transaction::take_direct_journal_replacement_publications(),
+            crate::transaction::take_direct_journal_replacement_publications(
+                "journal_read_your_writes_probe",
+            ),
             1,
             "an intervening read must not reconstruct the immutable journal"
         );
@@ -9560,7 +9643,9 @@ mod tests {
             .clone();
         session.create_checkpoint().await.unwrap();
 
-        crate::transaction::take_direct_journal_replacement_publications();
+        crate::transaction::take_direct_journal_replacement_publications(
+            "rooted_journal_parent_probe",
+        );
         let mut transaction = session.begin_transaction().await.unwrap();
         let update_sql =
             "UPDATE rooted_journal_parent_probe SET value = lix_json($1) WHERE path = $2";
@@ -9593,7 +9678,9 @@ mod tests {
             .await
             .expect("a parent without collection lifecycle authority must use the safe lane");
         assert_eq!(
-            crate::transaction::take_direct_journal_replacement_publications(),
+            crate::transaction::take_direct_journal_replacement_publications(
+                "rooted_journal_parent_probe",
+            ),
             0
         );
         let committed_created_at = session

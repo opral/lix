@@ -34,6 +34,7 @@ use crate::transaction::types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
     CertifiedRawWriteBatchPreparation, CompleteCollectionReplacementProof, PreparedRowFacts,
     RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
+    TypedMutationJournalBatch,
 };
 use crate::wasm::WasmEntityKey;
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
@@ -810,6 +811,7 @@ async fn try_execute_direct_path_value_replacement_batch(
     let mut primary_key_offsets = Vec::with_capacity(row_count);
     let mut previous_row = None;
     let mut primary_keys_strictly_ordered = true;
+    let mut parameter_identity_hasher = blake3::Hasher::new();
     for statement_index in 0..row_count {
         let DirectParameterValue::String(primary_key) =
             parameter_batch.value(primary_key_param_index, statement_index)
@@ -825,9 +827,110 @@ async fn try_execute_direct_path_value_replacement_batch(
             primary_keys_strictly_ordered &= previous < primary_key;
         }
         previous_row = Some(statement_index);
+        parameter_identity_hasher.update(&(primary_key.len() as u64).to_le_bytes());
+        parameter_identity_hasher.update(primary_key.as_bytes());
         let start = primary_key_arena.len();
         primary_key_arena.extend_from_slice(primary_key.as_bytes());
         primary_key_offsets.push((start, primary_key_arena.len()));
+    }
+    let parameter_identity_digest = *parameter_identity_hasher.finalize().as_bytes();
+    let active_branch_id = ctx.active_branch_id().to_owned();
+    let scope = crate::collection_generation::CollectionScopeRef {
+        schema_key: &spec.schema_key,
+        file_id: None,
+    };
+    // Generation controls describe committed HOT state. Any staged member can
+    // change the effective identity set, so it must force the overlay-aware
+    // candidate scan instead of certifying the committed digest.
+    let has_staged_collection_rows = ctx.has_staged_collection_rows(&active_branch_id, scope)?;
+    let collection_generation = ctx
+        .load_collection_generation(&active_branch_id, scope)
+        .await?;
+    let certified_ordered_generation = primary_keys_strictly_ordered
+        && !has_staged_collection_rows
+        && collection_generation.is_some_and(|generation| {
+            generation.live_count == row_count as u64
+                && generation.ordered_identity_digest == Some(parameter_identity_digest)
+        });
+    let typed_journal_admitted = if certified_ordered_generation {
+        ctx.can_stage_typed_mutation_journal_replace(
+            &spec.schema_key,
+            row_count as u64,
+            parameter_identity_digest,
+        )
+        .await?
+    } else {
+        false
+    };
+    if typed_journal_admitted {
+        let mut snapshots = Vec::with_capacity(
+            primary_key_arena
+                .len()
+                .saturating_add(row_count.saturating_mul(32)),
+        );
+        let mut snapshot_offsets = Vec::with_capacity(row_count);
+        for (statement_index, &(identity_start, identity_end)) in
+            primary_key_offsets.iter().enumerate()
+        {
+            let primary_key = std::str::from_utf8(&primary_key_arena[identity_start..identity_end])
+                .expect("borrowed SQL text remains UTF-8 in its mutation arena");
+            let snapshot_start = snapshots.len();
+            snapshots.extend_from_slice(b"{\"path\":");
+            append_canonical_json_string(&mut snapshots, primary_key)
+                .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
+            snapshots.extend_from_slice(b",\"value\":");
+            match parameter_batch.value(replacement.value_param_index, statement_index) {
+                DirectParameterValue::Null => snapshots.extend_from_slice(b"null"),
+                DirectParameterValue::String(raw) => {
+                    append_canonical_json_parameter(&mut snapshots, raw).map_err(|error| {
+                        with_parameter_batch_statement_index(error, statement_index)
+                    })?;
+                }
+                DirectParameterValue::Boolean(_) => {
+                    unreachable!("the certified replacement value parameter is text")
+                }
+            }
+            snapshots.push(b'}');
+            snapshot_offsets.push((snapshot_start, snapshots.len()));
+        }
+        let journal = TypedMutationJournalBatch::new(
+            schema_plan_id,
+            spec.schema_key.as_str().into(),
+            active_branch_id.into(),
+            primary_key_arena,
+            primary_key_offsets,
+            snapshots,
+            snapshot_offsets,
+            parameter_identity_digest,
+        )?;
+        ctx.stage_typed_mutation_journal_replace(journal)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.entity_update_value_batch.stage_typed_journal",
+                row_count
+            ))
+            .await?;
+        #[cfg(test)]
+        {
+            ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+                executions.set(executions.get().saturating_add(1));
+            });
+            CERTIFIED_REPLACEMENT_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+                executions.set(executions.get().saturating_add(1));
+            });
+            CERTIFIED_GENERATION_IDENTITY_REPLACEMENTS.with(|executions| {
+                executions.set(executions.get().saturating_add(1));
+            });
+        }
+        #[cfg(feature = "storage-benches")]
+        if record_value_certificate {
+            crate::storage_bench::record_certified_entity_update_value_batch_hit(row_count);
+        }
+        return Ok(Some(
+            (0..row_count)
+                .map(|_| SqlWriteResult::affected(1))
+                .collect(),
+        ));
     }
     let primary_key_arena = SharedStr::from_utf8(bytes::Bytes::from(primary_key_arena))
         .map_err(|_| LixError::unknown("certified replacement primary-key arena is not UTF-8"))?;
@@ -872,18 +975,6 @@ async fn try_execute_direct_path_value_replacement_batch(
         .as_deref()
         .unwrap_or(entity_pks.as_slice());
     let unique_row_count = unique_entity_pks.len();
-    let active_branch_id = ctx.active_branch_id().to_owned();
-    let scope = crate::collection_generation::CollectionScopeRef {
-        schema_key: &spec.schema_key,
-        file_id: None,
-    };
-    // Generation controls describe committed HOT state. Any staged member can
-    // change the effective identity set, so it must force the overlay-aware
-    // candidate scan instead of certifying the committed digest.
-    let has_staged_collection_rows = ctx.has_staged_collection_rows(&active_branch_id, scope)?;
-    let collection_generation = ctx
-        .load_collection_generation(&active_branch_id, scope)
-        .await?;
     let ordered_identity_digest =
         crate::collection_generation::ordered_single_string_identity_digest(
             unique_entity_pks.iter(),

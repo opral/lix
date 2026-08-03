@@ -95,7 +95,7 @@ pub(crate) struct ImmutableMutationJournalChunk {
     identity_offsets: Arc<[(u32, u32)]>,
     snapshot_arena: Bytes,
     snapshot_offsets: Arc<[(u32, u32)]>,
-    large_snapshot_refs: Arc<[(u16, crate::json_store::JsonRef)]>,
+    large_snapshot_refs: Arc<[(u32, crate::json_store::JsonRef)]>,
     durable_predecessors: Option<Arc<[CertifiedCurrentStatePredecessor]>>,
     timestamp: LixTimestamp,
 }
@@ -290,8 +290,8 @@ impl ImmutableMutationJournalChunk {
                 let bytes = &snapshot_arena[start as usize..end as usize];
                 (bytes.len() > crate::json_store::JSON_INLINE_MAX_BYTES).then(|| {
                     (
-                        u16::try_from(index)
-                            .expect("immutable mutation chunk row ordinal fits u16"),
+                        u32::try_from(index)
+                            .expect("immutable mutation chunk row ordinal fits u32"),
                         crate::json_store::JsonRef::for_content(bytes),
                     )
                 })
@@ -361,7 +361,7 @@ impl ImmutableMutationJournalChunk {
         if snapshot.len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
             return crate::json_store::JsonSlotRef::Inline(snapshot);
         }
-        let index = u16::try_from(index).expect("immutable mutation chunk row ordinal fits u16");
+        let index = u32::try_from(index).expect("immutable mutation chunk row ordinal fits u32");
         let position = self
             .large_snapshot_refs
             .binary_search_by_key(&index, |(ordinal, _)| *ordinal)
@@ -4359,6 +4359,50 @@ mod tests {
         assert_eq!(chunk.identity(0), "a");
         assert_eq!(chunk.identity(1), "b");
         assert_eq!(chunk.identity_arena.len(), 2);
+    }
+
+    #[test]
+    fn immutable_journal_large_snapshot_refs_support_more_than_u16_rows() {
+        const ROW_COUNT: usize = 65_537;
+        let mut identities = Vec::with_capacity(ROW_COUNT * 6);
+        let mut identity_offsets = Vec::with_capacity(ROW_COUNT);
+        let mut snapshots = Vec::with_capacity(ROW_COUNT * 2 + 512);
+        let mut snapshot_offsets = Vec::with_capacity(ROW_COUNT);
+        for row in 0..ROW_COUNT {
+            let start = identities.len();
+            identities.extend_from_slice(format!("{row:06}").as_bytes());
+            identity_offsets.push((start, identities.len()));
+
+            let start = snapshots.len();
+            if row + 1 == ROW_COUNT {
+                snapshots.extend(std::iter::repeat_n(
+                    b'x',
+                    crate::json_store::JSON_INLINE_MAX_BYTES + 1,
+                ));
+            } else {
+                snapshots.extend_from_slice(b"{}");
+            }
+            snapshot_offsets.push((start, snapshots.len()));
+        }
+
+        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+            SchemaPlanId::for_test(0),
+            "schema".into(),
+            "branch".into(),
+            None,
+            identities,
+            identity_offsets,
+            snapshots,
+            snapshot_offsets,
+            None,
+            LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
+        )
+        .expect("journal chunk above the u16 row boundary");
+
+        assert!(matches!(
+            chunk.snapshot_slot(ROW_COUNT - 1),
+            crate::json_store::JsonSlotRef::Ref(_)
+        ));
     }
 
     #[test]
