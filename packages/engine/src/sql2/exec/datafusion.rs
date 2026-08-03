@@ -5219,6 +5219,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integer_primary_key_update_and_delete_narrow_candidate_scans() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let component_types = [crate::entity_pk::EntityPkComponentType::Integer];
+        let entity_pk = crate::entity_pk::EntityPk::from_external_parts(
+            vec!["42".to_string()],
+            &component_types,
+        )
+        .expect("integer fixture identity should encode");
+
+        for (sql, params) in [
+            (
+                "UPDATE integer_state_schema SET value = $1 WHERE id = $2",
+                vec![Value::Text("updated".to_string()), Value::Integer(42)],
+            ),
+            (
+                "DELETE FROM integer_state_schema WHERE id = $1",
+                vec![Value::Integer(42)],
+            ),
+        ] {
+            let mut row = live_entity_row("42", branch_id, "before");
+            row.entity_pk = entity_pk.clone();
+            row.schema_key = "integer_state_schema".to_string();
+            row.snapshot_content = Some(json!({ "id": 42, "value": "before" }).to_string().into());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut ctx = DummySqlWriteExecutionContext {
+                active_branch_id: branch_id,
+                blob_reader: Arc::new(DummyBlobReader),
+                live_state: Arc::new(CapturingRowsLiveStateReader {
+                    rows: vec![row],
+                    requests: Arc::clone(&requests),
+                }),
+                staged_writes: Arc::new(Mutex::new(CapturingStagedWrites::default())),
+                schema_definitions: vec![json!({
+                    "x-lix-key": "integer_state_schema",
+                    "x-lix-primary-key": ["/id"],
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "value": { "type": "string" }
+                    },
+                    "required": ["id", "value"],
+                    "additionalProperties": false
+                })],
+            };
+
+            let (result, path) =
+                execute_write_sql_trace(&mut ctx, sql, &params, WriteExecutorMode::Auto)
+                    .await
+                    .expect("integer point write should execute");
+
+            assert_eq!(path, WriteExecutorPath::Fast, "{sql}");
+            assert_eq!(result.rows, vec![vec![Value::Integer(1)]], "{sql}");
+            let requests = requests.lock().expect("captured requests lock");
+            let [request] = requests.as_slice() else {
+                panic!("integer point write should issue one candidate scan: {sql}");
+            };
+            assert_eq!(request.filter.entity_pks, vec![entity_pk.clone()], "{sql}");
+        }
+    }
+
+    #[tokio::test]
     async fn execute_sql_file_path_upsert_uses_indexed_conflict_candidates() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(StaticBlobReader {
