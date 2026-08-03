@@ -7061,10 +7061,7 @@ fn validate_commit_state_mutation_inventory(
         && (!inventory.parts.is_empty()
             || inventory.replacement_parts.is_none()
             || inventory.replacement_generation.is_none()
-            || inventory
-                .replacement_part_digests
-                .iter()
-                .any(|digest| *digest == [0; 32]))
+            || inventory.replacement_part_digests.contains(&[0; 32]))
     {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
