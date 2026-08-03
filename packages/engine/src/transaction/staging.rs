@@ -930,6 +930,27 @@ impl TransactionWriteBuffer {
         }
     }
 
+    pub(crate) fn certify_complete_collection_replacement(
+        &self,
+        expected_live_count: u64,
+        expected_ordered_identity_digest: [u8; 32],
+    ) -> Result<bool, LixError> {
+        let mut rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction journal rows for replacement certification",
+            )
+        })?;
+        let batch = match &mut *rows {
+            StagedPreparedRows::AppendOnly { rows, .. }
+            | StagedPreparedRows::Indexed { rows, .. } => rows,
+        };
+        Ok(batch.certify_complete_collection_replacement(
+            expected_live_count,
+            expected_ordered_identity_digest,
+        ))
+    }
+
     pub(crate) fn is_file_cohort_eligible(&self, branch_id: &str) -> bool {
         let rows = self.rows.lock().unwrap_or_else(|error| error.into_inner());
         let rows = match &*rows {

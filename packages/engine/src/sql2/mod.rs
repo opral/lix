@@ -54,6 +54,7 @@ pub(crate) use entity_columnar_layout::{
     encode_registered_entity_row_groups,
 };
 pub(crate) use entity_projection::EntityProjectionDecoder;
+pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
 pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{
@@ -62,8 +63,9 @@ pub(crate) use exec::{
     execute_read_statement_in_session_from_parsed, execute_transaction_read_statement_from_parsed,
     execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,
     execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
-    prepare_read_session, prepare_read_session_at_head,
-    write_plan_requires_post_stage_returning_checkpoint,
+    prepare_path_value_replacement_program, prepare_path_value_replacement_row,
+    prepare_path_value_replacement_row_known_live, prepare_read_session,
+    prepare_read_session_at_head, write_plan_requires_post_stage_returning_checkpoint,
 };
 #[cfg(test)]
 pub(crate) use exec::{

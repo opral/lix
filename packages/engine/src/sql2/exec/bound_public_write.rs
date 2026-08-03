@@ -2759,6 +2759,65 @@ async fn try_execute_direct_path_value_replacement(
     spec: &EntitySurfaceSpec,
     params: &[Value],
 ) -> Result<Option<SqlWriteResult>, LixError> {
+    let Some(program) = prepare_path_value_replacement_program(ctx, plan, spec) else {
+        return Ok(None);
+    };
+    execute_prepared_path_value_replacement(ctx, &program, params)
+        .await
+        .map(Some)
+}
+
+/// Immutable admission program for the ordinary tracked `path/value` point
+/// replacement. The generic logical plan proves this shape once; explicit
+/// transactions can then reuse these bound slots without reparsing, cloning,
+/// resolving, and descending through the write executor for every row.
+#[derive(Debug)]
+pub(crate) struct PreparedPathValueReplacementProgram {
+    pub(crate) schema_key: String,
+    pub(crate) schema_plan_id: SchemaPlanId,
+    primary_key_param_index: usize,
+    value_param_index: usize,
+}
+
+pub(crate) struct PreparedPathValueReplacementRow {
+    pub(crate) entity_pk: EntityPk,
+    pub(crate) snapshot: TransactionJson,
+}
+
+impl PreparedPathValueReplacementProgram {
+    pub(crate) fn primary_key<'a>(&self, params: &'a [Value]) -> Result<&'a str, LixError> {
+        let Some(Value::Text(primary_key)) = params.get(self.primary_key_param_index) else {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "prepared path replacement primary key must be text",
+            ));
+        };
+        Ok(primary_key)
+    }
+}
+
+pub(crate) fn prepare_path_value_replacement_program_from_logical(
+    ctx: &dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+) -> Option<PreparedPathValueReplacementProgram> {
+    let BoundWriteTarget::Entity(surface) = &plan.bound.target else {
+        return None;
+    };
+    let schema_key = match surface {
+        EntityWriteSurface::Base { schema_key } | EntityWriteSurface::ByBranch { schema_key } => {
+            schema_key
+        }
+    };
+    let catalog = ctx.public_catalog().ok()?;
+    let spec = catalog.entity_spec(schema_key)?;
+    prepare_path_value_replacement_program(ctx, plan, spec)
+}
+
+pub(crate) fn prepare_path_value_replacement_program(
+    ctx: &dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
+) -> Option<PreparedPathValueReplacementProgram> {
     if spec.has_inter_row_constraints
         || !matches!(plan.bound.input, BoundWriteInput::None)
         || plan.bound.conflict.is_some()
@@ -2772,44 +2831,90 @@ async fn try_execute_direct_path_value_replacement(
                 .any(|path| path.as_slice() == [assignment.column.name.as_str()])
         })
     {
-        return Ok(None);
+        return None;
     }
     let Some(primary_key_param_index) =
         bound_single_text_primary_key_param(spec, &plan.bound.predicate)
     else {
-        return Ok(None);
+        return None;
     };
     let Some(replacement) =
         direct_path_value_replacement(spec, plan, Some(primary_key_param_index))
     else {
-        return Ok(None);
-    };
-    let Some(Value::Text(primary_key)) = params.get(primary_key_param_index) else {
-        return Ok(None);
-    };
-    let replacement_value = match params.get(replacement.value_param_index) {
-        Some(Value::Text(value)) => Some(value.as_str()),
-        Some(Value::Null) => None,
-        _ => return Ok(None),
+        return None;
     };
     let Some(schema_catalog) = ctx.schema_catalog_snapshot() else {
-        return Ok(None);
+        return None;
     };
     let Some((schema_plan_id, schema_plan)) = schema_catalog.plan_for_key(&spec.schema_key) else {
-        return Ok(None);
+        return None;
     };
     if !schema_plan.accepts_canonical_certificate() {
-        return Ok(None);
+        return None;
     }
 
-    let entity_pk = EntityPk::single(primary_key.clone());
-    let candidates =
-        scan_entity_candidates_for_pks(ctx, plan, spec, vec![entity_pk.clone()], false).await?;
+    Some(PreparedPathValueReplacementProgram {
+        schema_key: spec.schema_key.clone(),
+        schema_plan_id,
+        primary_key_param_index,
+        value_param_index: replacement.value_param_index,
+    })
+}
+
+pub(crate) async fn execute_prepared_path_value_replacement(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    program: &PreparedPathValueReplacementProgram,
+    params: &[Value],
+) -> Result<SqlWriteResult, LixError> {
+    let Some(row) = prepare_path_value_replacement_row(ctx, program, params).await? else {
+        return Ok(SqlWriteResult::affected(0));
+    };
+    let rows = CertifiedParameterReplacementBatch::new(
+        vec![row.entity_pk],
+        vec![row.snapshot],
+        program.schema_key.as_str().into(),
+        ctx.active_branch_id().into(),
+        CertifiedRawWriteBatchPreparation {
+            schema_plan_id: program.schema_plan_id,
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+            tracked_keys_strictly_ordered: true,
+            complete_collection_replacement: None,
+        },
+    )?;
+    ctx.stage_certified_parameter_batch_replace(rows).await?;
+    Ok(SqlWriteResult::affected(1))
+}
+
+pub(crate) async fn prepare_path_value_replacement_row(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    program: &PreparedPathValueReplacementProgram,
+    params: &[Value],
+) -> Result<Option<PreparedPathValueReplacementRow>, LixError> {
+    let primary_key = program.primary_key(params)?;
+    let entity_pk = EntityPk::single(primary_key.to_owned());
+    let candidates = ctx
+        .scan_live_state_batch(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![program.schema_key.clone()],
+                entity_pks: vec![entity_pk.clone()],
+                branch_ids: vec![ctx.active_branch_id().to_owned()],
+                include_tombstones: false,
+                ..LiveStateFilter::default()
+            },
+            ..LiveStateScanRequest::default()
+        })
+        .await?;
     if candidates.is_empty() {
-        return Ok(Some(SqlWriteResult::affected(0)));
+        return Ok(None);
     }
     if candidates.len() != 1 {
-        return Ok(None);
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "prepared path replacement resolved multiple visible rows",
+        ));
     }
     let candidate = candidates.row(0);
     if candidate.untracked()
@@ -2818,8 +2923,31 @@ async fn try_execute_direct_path_value_replacement(
         || candidate.metadata().is_some()
         || candidate.branch_id() != ctx.active_branch_id()
     {
-        return Ok(None);
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "prepared path replacement escaped its certified storage scope",
+        ));
     }
+
+    prepare_path_value_replacement_row_known_live(program, params).map(Some)
+}
+
+pub(crate) fn prepare_path_value_replacement_row_known_live(
+    program: &PreparedPathValueReplacementProgram,
+    params: &[Value],
+) -> Result<PreparedPathValueReplacementRow, LixError> {
+    let primary_key = program.primary_key(params)?;
+    let replacement_value = match params.get(program.value_param_index) {
+        Some(Value::Text(value)) => Some(value.as_str()),
+        Some(Value::Null) => None,
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "prepared path replacement value must be text or null",
+            ));
+        }
+    };
+    let entity_pk = EntityPk::single(primary_key.to_owned());
 
     let mut normalized = Vec::with_capacity(primary_key.len().saturating_add(32));
     normalized.extend_from_slice(b"{\"path\":");
@@ -2837,27 +2965,14 @@ async fn try_execute_direct_path_value_replacement(
         TransactionJson::from_certified_row_content_arena(normalized, vec![(0, normalized_len)])?
             .pop()
             .expect("one certified replacement snapshot");
-    let rows = CertifiedParameterReplacementBatch::new(
-        vec![entity_pk],
-        vec![snapshot],
-        spec.schema_key.as_str().into(),
-        ctx.active_branch_id().into(),
-        CertifiedRawWriteBatchPreparation {
-            schema_plan_id,
-            facts: PreparedRowFacts {
-                row_content_validated: true,
-                requires_transaction_validation: false,
-            },
-            tracked_keys_strictly_ordered: true,
-            complete_collection_replacement: None,
-        },
-    )?;
-    ctx.stage_certified_parameter_batch_replace(rows).await?;
     #[cfg(test)]
     CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| {
         executions.set(executions.get().saturating_add(1));
     });
-    Ok(Some(SqlWriteResult::affected(1)))
+    Ok(PreparedPathValueReplacementRow {
+        entity_pk,
+        snapshot,
+    })
 }
 
 /// Stage entity INSERT/UPDATE rows and, when requested, retain their final

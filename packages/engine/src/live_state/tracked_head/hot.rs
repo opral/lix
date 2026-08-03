@@ -1984,6 +1984,36 @@ impl HotStateTransactionCache {
     }
 }
 
+pub(crate) struct PackedIdentityMembership {
+    cache: Arc<HotStateTransactionCache>,
+    commit_id: CommitId,
+    schema_key: String,
+    live_count: u64,
+    ordered_identity_digest: [u8; 32],
+    encoded_key: Vec<u8>,
+}
+
+impl PackedIdentityMembership {
+    pub(crate) fn contains(&mut self, entity_pk: &EntityPk) -> Result<Option<bool>, LixError> {
+        self.encoded_key.clear();
+        let encoded = crate::tracked_state::encode_key_ref_into(
+            &mut self.encoded_key,
+            TrackedStateKeyRef {
+                schema_key: &self.schema_key,
+                file_id: None,
+                entity_pk,
+            },
+        );
+        self.cache
+            .commit_delta_points
+            .cached_live_member(self.commit_id, &self.encoded_key[encoded])
+    }
+
+    pub(crate) fn complete_generation(&self) -> (u64, [u8; 32]) {
+        (self.live_count, self.ordered_identity_digest)
+    }
+}
+
 fn hot_state_cache_lock_error() -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
@@ -3925,6 +3955,85 @@ impl<S> HotStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    pub(crate) async fn prepare_packed_identity_membership(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        schema_key: &str,
+    ) -> Result<Option<PackedIdentityMembership>, LixError> {
+        let Some(cache) = self.transaction_cache.as_ref() else {
+            return Ok(None);
+        };
+        let base_refs =
+            packed_exclusive_schema_base_refs(&self.store, branch_id, generation, schema_key)
+                .await?;
+        let [base_ref] = base_refs.as_slice() else {
+            return Ok(None);
+        };
+        let collection = self
+            .collection_control(
+                branch_id,
+                generation,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key,
+                    file_id: None,
+                },
+            )
+            .await?;
+        let Some(ordered_identity_digest) = collection.ordered_identity_digest else {
+            return Ok(None);
+        };
+        if collection.active_generation != generation
+            || collection.live_count == DEFERRED_ROOT_LIVE_COUNT
+        {
+            return Ok(None);
+        }
+        let filter = TrackedStateFilter {
+            schema_keys: vec![schema_key.to_owned()],
+            file_ids: vec![NullableKeyFilter::Null],
+            ..TrackedStateFilter::default()
+        };
+        let Some(hot) =
+            hot_scan_entries(&self.store, branch_id, generation, &filter, Some(1), None).await?
+        else {
+            return Ok(None);
+        };
+        let has_hot_rows = match hot {
+            HotScanEntries::Decoded(rows) => !rows.is_empty(),
+            HotScanEntries::Finite(batches) => batches
+                .iter()
+                .flat_map(|batch| batch.values.iter())
+                .any(Option::is_some),
+        };
+        if has_hot_rows {
+            return Ok(None);
+        }
+        let certified = scan_certified_entity_batch_rows(
+            &self.store,
+            branch_id,
+            generation,
+            &TrackedStateScanRequest {
+                filter,
+                read_columns: Default::default(),
+                limit: Some(1),
+            },
+            Some(1),
+            Some(cache),
+        )
+        .await?;
+        if !certified.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PackedIdentityMembership {
+            cache: Arc::clone(cache),
+            commit_id: base_ref.commit_id,
+            schema_key: schema_key.to_owned(),
+            live_count: collection.live_count,
+            ordered_identity_digest,
+            encoded_key: Vec::new(),
+        }))
+    }
+
     async fn collection_control(
         &self,
         branch_id: &str,

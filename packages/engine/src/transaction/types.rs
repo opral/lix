@@ -567,6 +567,31 @@ impl CertifiedParameterBatch {
         origin_key: Option<&SharedStr>,
         timestamp: LixTimestamp,
     ) -> Result<PreparedStateBatch, LixError> {
+        self.into_dense_prepared_timestamps(origin_key, DenseParameterTimestamps::Scalar(timestamp))
+    }
+
+    pub(crate) fn into_dense_prepared_with_timestamps(
+        self,
+        origin_key: Option<&SharedStr>,
+        timestamps: Vec<LixTimestamp>,
+    ) -> Result<PreparedStateBatch, LixError> {
+        if timestamps.len() != self.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified replacement timestamp column is not aligned",
+            ));
+        }
+        self.into_dense_prepared_timestamps(
+            origin_key,
+            DenseParameterTimestamps::PerRow(timestamps),
+        )
+    }
+
+    fn into_dense_prepared_timestamps(
+        self,
+        origin_key: Option<&SharedStr>,
+        timestamps: DenseParameterTimestamps,
+    ) -> Result<PreparedStateBatch, LixError> {
         let Self {
             entity_pks,
             snapshots,
@@ -617,7 +642,7 @@ impl CertifiedParameterBatch {
                 facts: certificate.facts,
                 schema_key: schema_key_ordinal,
                 origin_key,
-                timestamps: DenseParameterTimestamps::Scalar(timestamp),
+                timestamps,
                 commit_id: None,
                 branch_id: branch_id_ordinal,
                 direct_change_ids: None,
@@ -2676,6 +2701,48 @@ impl PreparedStateBatch {
         &self,
     ) -> Option<CompleteCollectionReplacementProof> {
         self.complete_collection_replacement
+    }
+
+    pub(crate) fn certify_complete_collection_replacement(
+        &mut self,
+        expected_live_count: u64,
+        expected_ordered_identity_digest: [u8; 32],
+    ) -> bool {
+        if self.len() as u64 != expected_live_count
+            || self.is_empty()
+            || !self.certified_tracked_keys_strictly_ordered
+        {
+            return false;
+        }
+        let Some(actual_digest) =
+            crate::collection_generation::ordered_single_string_identity_digest(
+                self.iter().map(|row| row.entity_pk),
+            )
+        else {
+            return false;
+        };
+        if actual_digest != expected_ordered_identity_digest {
+            return false;
+        }
+        let Some(replay_bytes) = self.iter().try_fold(0_u64, |bytes, row| {
+            if row.snapshot.is_none() || row.file_id.is_some() || row.untracked || row.global {
+                return None;
+            }
+            let row_bytes = row
+                .schema_key
+                .len()
+                .checked_add(row.entity_pk.estimated_heap_bytes())?
+                .checked_add(128)?
+                .checked_add(row.snapshot?.normalized().len())?;
+            bytes.checked_add(u64::try_from(row_bytes).ok()?)
+        }) else {
+            return false;
+        };
+        self.complete_collection_replacement = Some(CompleteCollectionReplacementProof {
+            ordered_identity_digest: expected_ordered_identity_digest,
+            replay_bytes,
+        });
+        true
     }
 
     pub(crate) fn iter(&self) -> PreparedStateRows<'_> {

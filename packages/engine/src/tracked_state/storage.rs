@@ -766,6 +766,47 @@ struct CommitDeltaPointReadCacheInner {
 }
 
 impl CommitDeltaPointReadCache {
+    pub(crate) fn cached_live_member(
+        &self,
+        commit_id: CommitId,
+        encoded_key: &[u8],
+    ) -> Result<Option<bool>, LixError> {
+        let manifest = {
+            let cache = self.inner.lock().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "transaction commit-delta point cache lock is poisoned",
+                )
+            })?;
+            let Some((_, manifest)) = cache
+                .manifests
+                .iter()
+                .find(|(cached_commit_id, _)| *cached_commit_id == commit_id)
+            else {
+                return Ok(None);
+            };
+            Arc::clone(manifest)
+        };
+        if manifest.selected_source_commit_id.is_some() || manifest.inline_segment().is_some() {
+            return Ok(None);
+        }
+        let Some(segment_index) = commit_delta_segment_for_key(&manifest, encoded_key) else {
+            return Ok(Some(false));
+        };
+        let Some(segment) = self.segment(
+            commit_id,
+            segment_index,
+            manifest.segments.get(segment_index),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            find_commit_delta_value(&segment.leaf, encoded_key, commit_id)?
+                .is_some_and(|value| !value.deleted),
+        ))
+    }
+
     fn should_admit_segment(
         &self,
         commit_id: CommitId,
