@@ -21,9 +21,9 @@ use crate::json_store::{
 };
 use crate::live_state::{TrackedHeadContext, stage_collect_stale_working_diff_indexes};
 use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
-    StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
-    StorageWriteSet,
+    PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
+    StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
+    StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
@@ -254,6 +254,7 @@ async fn stage_sweep_unreachable_content_nodes(
             .collect(
                 store,
                 StorageScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
                     resume_after: resume_after.clone(),
                     ..StorageScanOptions::default()
                 },
@@ -679,6 +680,9 @@ where
     }
     let mut live_catalog_nodes = BTreeSet::<[u8; 32]>::new();
     let mut live_current_state_directory_nodes = BTreeSet::<[u8; 32]>::new();
+    let mut live_current_state_data_parts = BTreeSet::<[u8; 32]>::new();
+    let mut live_current_state_ref_summaries = BTreeMap::<[u8; 32], [u8; 32]>::new();
+    let mut live_current_state_payload_hashes = BTreeSet::<[u8; 32]>::new();
     let mut catalog_roots = BTreeMap::new();
     let mut live_manifests = BTreeMap::new();
     let live_commit_ids = live_commits.iter().copied().collect::<Vec<_>>();
@@ -714,9 +718,7 @@ where
             .and_then(|parent_id| live_manifests.get(parent_id));
         crate::tracked_state::validate_current_state_catalog_parent_manifest(manifest, parent)?;
         crate::tracked_state::validate_current_state_catalog_transition_root(
-            store,
-            manifest,
-            parent.and_then(|parent| parent.current_state_catalog.as_deref()),
+            store, manifest, parent,
         )
         .await?;
     }
@@ -805,17 +807,87 @@ where
     live_current_state_directory_nodes.extend(directory_nodes);
     for descriptors in descriptor_sets {
         for descriptor in descriptors {
-            let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
-            if !packed.commits.contains_key(&owner) {
+            match descriptor.source_kind {
+                0 => {
+                    let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+                    if !packed.commits.contains_key(&owner) {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "live current-state directory references missing immutable-part owner '{owner}'"
+                            ),
+                        ));
+                    }
+                    retained_authority_commits.insert(owner);
+                }
+                1 => {
+                    live_current_state_data_parts.insert(descriptor.content_digest);
+                    if let Some(previous) = live_current_state_ref_summaries
+                        .insert(descriptor.content_digest, descriptor.payload_refs_digest)
+                        && previous != descriptor.payload_refs_digest
+                    {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "native current-state descriptors disagree about payload refs",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "live current-state directory contains an unknown part source",
+                    ));
+                }
+            }
+        }
+    }
+    let native_keys = live_current_state_ref_summaries
+        .keys()
+        .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
+        .collect::<Vec<_>>();
+    let native_refs = PointReadPlan::new(
+        crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
+        &native_keys,
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?;
+    for ((_, refs_digest), value) in live_current_state_ref_summaries
+        .iter()
+        .zip(native_refs.value)
+    {
+        let bytes = match value {
+            Some(StorageProjectedValue::FullValue(bytes)) => bytes,
+            Some(StorageProjectedValue::KeyOnly) | None => {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "live current-state directory references missing immutable-part owner '{owner}'"
-                    ),
+                    "live current-state directory references a missing payload-ref summary",
                 ));
             }
-            retained_authority_commits.insert(owner);
-        }
+        };
+        live_current_state_payload_hashes.extend(
+            crate::tracked_state::decode_current_state_data_part_refs(refs_digest, &bytes)?,
+        );
+    }
+    let native_part_presence = PointReadPlan::new(
+        crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+        &native_keys,
+    )
+    .materialize(
+        store,
+        StorageGetOptions {
+            projection: StorageCoreProjection::KeyOnly,
+        },
+    )
+    .await?;
+    if native_part_presence
+        .value
+        .into_iter()
+        .any(|value| !matches!(value, Some(StorageProjectedValue::KeyOnly)))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "live current-state directory references a missing native data part",
+        ));
     }
     if let Some((commit_id, source_commit_id)) = live_commits.iter().find_map(|commit_id| {
         packed
@@ -864,6 +936,7 @@ where
             GcRoot::BranchHead(_) | GcRoot::StandaloneChange(_) => None,
         })
         .collect::<BTreeSet<_>>();
+    live_payload_hashes.extend(live_current_state_payload_hashes);
     for change_id in &standalone_root_ids {
         collect_change_payload_hashes(
             standalone_changes
@@ -971,8 +1044,22 @@ where
     stage_sweep_unreachable_content_nodes(
         store,
         writes,
+        crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
+        &live_current_state_data_parts,
+    )
+    .await?;
+    stage_sweep_unreachable_content_nodes(
+        store,
+        writes,
         crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
         &live_current_state_directory_nodes,
+    )
+    .await?;
+    stage_sweep_unreachable_content_nodes(
+        store,
+        writes,
+        crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+        &live_current_state_data_parts,
     )
     .await?;
     for commit_id in &sweep_authority_commits {
@@ -1289,6 +1376,8 @@ mod tests {
         for space in [
             crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
             crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
             for node_id in [live_id, dead_id] {
                 writes.put(
@@ -1313,6 +1402,8 @@ mod tests {
         for space in [
             crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
             crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
             super::stage_sweep_unreachable_content_nodes(&read, &mut sweep, space, &live)
                 .await
@@ -1334,6 +1425,8 @@ mod tests {
         for space in [
             crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
             crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
             let loaded = PointReadPlan::new(space, &keys)
                 .materialize(&read, StorageGetOptions::default())

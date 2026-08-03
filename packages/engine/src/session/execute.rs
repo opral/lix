@@ -7640,6 +7640,29 @@ mod tests {
             )
             .await
             .unwrap();
+        let mixed_hot_cold = session
+            .execute(
+                "SELECT path, value FROM packed_replacement_probe \
+                 WHERE path IN ('/00000', '/16000') ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed_hot_cold.len(), 2);
+        assert_eq!(
+            mixed_hot_cold.rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"overlay": true}),
+            "a mixed exact batch must retain the head-delta hit"
+        );
+        assert_eq!(
+            mixed_hot_cold.rows()[1]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!({"second": 16_000}),
+            "a mixed exact batch must resolve its cold key from inherited current state"
+        );
         session
             .execute(
                 "DELETE FROM packed_replacement_probe WHERE path = '/32767'",
@@ -7752,6 +7775,60 @@ mod tests {
                 .created_at(),
             reinserted_created_at,
             "full updates must preserve the newer lifecycle of a reinserted identity"
+        );
+
+        let read = session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let native = crate::storage_adapter::ScanPlan::prefix(
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            crate::storage_adapter::StoragePrefix {
+                bytes: bytes::Bytes::new(),
+            },
+        )
+        .collect(
+            &read,
+            crate::storage_adapter::StorageScanOptions {
+                projection: crate::storage_adapter::StorageCoreProjection::KeyOnly,
+                limit_rows: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let native_key = native
+            .value
+            .entries
+            .first()
+            .expect("sparse descendants must publish a native current-state part")
+            .key
+            .clone();
+        drop(read);
+        let mut corrupt = session.storage.new_write_set();
+        corrupt.delete(
+            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            native_key,
+        );
+        session
+            .storage
+            .commit_write_set(corrupt, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = SharedStorageAdapterRead::new(
+            session
+                .storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap(),
+        );
+        let mut gc_writes = session.storage.new_write_set();
+        assert!(
+            crate::gc::stage_repository_gc(read, &mut gc_writes)
+                .await
+                .is_err(),
+            "GC must fail closed before sweeping when a live native part is missing"
         );
     }
 

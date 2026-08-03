@@ -778,6 +778,7 @@ async fn load_complete_current_state_values_encoded_inner(
     state: &CommitStateManifest,
     encoded_keys: &[Bytes],
     validate_publication: bool,
+    prefer_recent_replay: bool,
 ) -> Result<Option<Vec<Option<TrackedStateIndexValue>>>, LixError> {
     if encoded_keys.is_empty() {
         return Ok(Some(Vec::new()));
@@ -802,15 +803,12 @@ async fn load_complete_current_state_values_encoded_inner(
             .or_default()
             .push(index);
     }
-    let Some(touched_scopes) =
+    let Some(_touched_scopes) =
         commit_state_inventory_exact_touched_scopes(state.commit_id, &state.mutations)?
     else {
         return Ok(None);
     };
-    if scope_keys
-        .keys()
-        .any(|scope| touched_scopes.binary_search(scope).is_ok())
-    {
+    if prefer_recent_replay && current_inventory_may_contain_any_key(state, encoded_keys)? {
         return Ok(None);
     }
     if state
@@ -878,7 +876,10 @@ async fn load_complete_current_state_values_encoded_inner(
         }
     }
 
-    let mut routed = BTreeMap::<([u8; 16], u32), (CurrentStatePartDescriptor, Vec<usize>)>::new();
+    let mut routed = BTreeMap::<
+        (u8, [u8; 16], u32, [u8; 32], u16),
+        (CurrentStatePartDescriptor, Vec<usize>),
+    >::new();
     let mut values = vec![None; encoded_keys.len()];
     let directory_keys = sets
         .iter()
@@ -903,16 +904,26 @@ async fn load_complete_current_state_values_encoded_inner(
                 continue;
             };
             routed
-                .entry((descriptor.owner_commit_id, descriptor.part_index))
+                .entry((
+                    descriptor.source_kind,
+                    descriptor.owner_commit_id,
+                    descriptor.part_index,
+                    descriptor.content_digest,
+                    descriptor.source_row_offset,
+                ))
                 .or_insert_with(|| (descriptor, Vec::new()))
                 .1
                 .push(output_index);
         }
     }
 
-    let storage_keys = routed
-        .values()
-        .map(|(descriptor, _)| {
+    let replacement = routed
+        .iter()
+        .filter(|(_, (descriptor, _))| descriptor.source_kind == 0)
+        .collect::<Vec<_>>();
+    let storage_keys = replacement
+        .iter()
+        .map(|(_, (descriptor, _))| {
             let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
             let mut key = commit_delta_segment_key(owner, descriptor.part_index as usize)?;
             key.extend_from_slice(&descriptor.content_digest);
@@ -922,29 +933,80 @@ async fn load_complete_current_state_values_encoded_inner(
     let loaded = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
         .materialize(store, StorageGetOptions::default())
         .await?;
-    for ((_, (descriptor, output_indices)), value) in routed.into_iter().zip(loaded.value) {
+    for ((_, (descriptor, output_indices)), value) in replacement.into_iter().zip(loaded.value) {
         let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
             replacement_payload_error("current-state directory references a missing part")
         })?;
         let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
-        let bounds = CommitDeltaSegmentBounds {
-            first_key: descriptor.first_key,
-            last_key: descriptor.last_key,
-            replacement_part: Some(StoredReplacementPart {
-                content_digest: descriptor.content_digest,
-                owner_commit_id: descriptor.owner_commit_id,
-                first_address: descriptor.part_index.saturating_mul(
-                    u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
-                        .expect("replacement row bound fits u32"),
-                ),
-                uniform_created_at: descriptor.uniform_created_at,
-                uniform_updated_at: descriptor.uniform_updated_at,
-            }),
-        };
-        let leaf = decode_commit_delta_segment(&bytes, Some(&bounds), owner)?;
+        let decoded = crate::tracked_state::replacement_part::decode_replacement_part(
+            &descriptor.content_digest,
+            &bytes,
+        )?;
         for output_index in output_indices {
-            values[output_index] =
-                find_commit_delta_value(&leaf, &encoded_keys[output_index], owner)?;
+            let Some(found) = decoded.find(&encoded_keys[*output_index])? else {
+                continue;
+            };
+            let physical_ordinal = u32::from(found.ordinal);
+            let slice_start = u32::from(descriptor.source_row_offset);
+            if physical_ordinal < slice_start
+                || physical_ordinal >= slice_start + u32::from(descriptor.row_count)
+            {
+                return Err(replacement_payload_error(
+                    "replacement current-state route escaped its source slice",
+                ));
+            }
+            let packed = descriptor
+                .part_index
+                .checked_mul(
+                    u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("row bound fits u32"),
+                )
+                .and_then(|base| base.checked_add(physical_ordinal))
+                .and_then(|address| address.checked_add(1))
+                .ok_or_else(|| replacement_payload_error("replacement address overflows"))?;
+            values[*output_index] = Some(TrackedStateIndexValue {
+                change_id: change_id_from_packed_address(owner, packed),
+                commit_id: owner,
+                deleted: false,
+                created_at: descriptor.uniform_created_at,
+                updated_at: descriptor.uniform_updated_at,
+            });
+        }
+    }
+    let native = routed
+        .iter()
+        .filter(|(_, (descriptor, _))| descriptor.source_kind == 1)
+        .collect::<Vec<_>>();
+    let native_keys = native
+        .iter()
+        .map(|(_, (descriptor, _))| StorageKey(Bytes::copy_from_slice(&descriptor.content_digest)))
+        .collect::<Vec<_>>();
+    let loaded = PointReadPlan::new(
+        crate::tracked_state::current_state_data_part::CURRENT_STATE_DATA_PART_SPACE,
+        &native_keys,
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?;
+    for ((_, (descriptor, output_indices)), value) in native.into_iter().zip(loaded.value) {
+        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+            replacement_payload_error("current-state directory references a missing native part")
+        })?;
+        let rows = crate::tracked_state::current_state_data_part::decode_current_state_data_part(
+            &descriptor.content_digest,
+            &bytes,
+        )?;
+        let start = usize::from(descriptor.source_row_offset);
+        let end = start + usize::from(descriptor.row_count);
+        let rows = rows.get(start..end).ok_or_else(|| {
+            replacement_payload_error("native current-state source slice is out of bounds")
+        })?;
+        for output_index in output_indices {
+            if let Ok(index) = rows.binary_search_by(|row| {
+                row.encoded_key
+                    .as_slice()
+                    .cmp(encoded_keys[*output_index].as_ref())
+            }) {
+                values[*output_index] = Some(rows[index].value.clone());
+            }
         }
     }
     Ok(Some(values))
@@ -956,21 +1018,27 @@ pub(crate) async fn load_complete_current_state_values_encoded(
     state: &CommitStateManifest,
     encoded_keys: &[Bytes],
 ) -> Result<Option<Vec<Option<TrackedStateIndexValue>>>, LixError> {
-    load_complete_current_state_values_encoded_inner(store, state, encoded_keys, true).await
+    load_complete_current_state_values_encoded_inner(store, state, encoded_keys, true, true).await
 }
 
 /// Uses a manifest returned by [`load_commit_state_manifest`] or
 /// [`load_commit_state_manifests`]. The opaque handle proves that the mutable
 /// manifest matched its immutable semantic authority in the caller's coherent
 /// read.
-#[cfg(feature = "storage-benches")]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) async fn load_complete_current_state_values_from_published_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &PublishedCommitStateManifest,
     encoded_keys: &[Bytes],
 ) -> Result<Option<Vec<Option<TrackedStateIndexValue>>>, LixError> {
-    load_complete_current_state_values_encoded_inner(store, &state.manifest, encoded_keys, false)
-        .await
+    load_complete_current_state_values_encoded_inner(
+        store,
+        &state.manifest,
+        encoded_keys,
+        false,
+        false,
+    )
+    .await
 }
 
 /// Tries the serving catalog from a one-read replay manifest. The inner cost
@@ -981,7 +1049,33 @@ pub(crate) async fn load_complete_current_state_values_from_replay_manifest(
     state: &CommitStateManifest,
     encoded_keys: &[Bytes],
 ) -> Result<Option<Vec<Option<TrackedStateIndexValue>>>, LixError> {
-    load_complete_current_state_values_encoded_inner(store, state, encoded_keys, true).await
+    // `load_point_replay_commit_state` decoded this exact manifest from the
+    // immutable semantic-authority seal, including its certified catalog root.
+    // Re-reading mutable manifests and the original coverage anchor would add
+    // three point I/Os without strengthening that authority.
+    load_complete_current_state_values_encoded_inner(store, state, encoded_keys, false, true).await
+}
+
+fn current_inventory_may_contain_any_key(
+    state: &CommitStateManifest,
+    encoded_keys: &[Bytes],
+) -> Result<bool, LixError> {
+    let manifest = commit_delta_manifest_from_inventory(&state.mutations);
+    if let Some(inline) = manifest.inline_segment() {
+        let leaf = decode_commit_delta_segment(inline, None, state.commit_id)?;
+        for encoded_key in encoded_keys {
+            if find_commit_delta_entry_index(&leaf, encoded_key)?.is_some() {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    Ok(encoded_keys.iter().any(|encoded_key| {
+        manifest.segments.iter().any(|segment| {
+            segment.first_key.as_slice() <= encoded_key.as_ref()
+                && encoded_key.as_ref() <= segment.last_key.as_slice()
+        })
+    }))
 }
 
 pub(crate) async fn validate_current_state_catalog_requested_scopes(
@@ -1033,8 +1127,8 @@ pub(crate) fn validate_current_state_catalog_entry_against_authority(
     if set.coverage_anchor_commit_id != *origin.commit_id.as_uuid().as_bytes()
         || set.scope != anchor.scope
         || set.generation_integrity_digest != anchor.generation_integrity_digest
-        || set.state_lineage_digest != anchor.state_lineage_digest
-        || set.directory != anchor.directory
+        || (set.state_lineage_digest == anchor.state_lineage_digest
+            && set.directory != anchor.directory)
     {
         return Err(replacement_payload_error(
             "current-state catalog entry disagrees with its coverage anchor",
@@ -2029,6 +2123,372 @@ pub(crate) async fn stage_current_state_catalog_from_staged_parent(
         inventory,
     )
     .await
+}
+
+/// Rewrites one exactly scoped current-state partition from its certified
+/// parent post-image and the current commit's sealed mutation parts. Untouched
+/// parent descriptors are reused byte-for-byte; only intersecting bounded
+/// parts and insertion gaps become native current-state data parts.
+pub(crate) async fn stage_sparse_current_state_part_set(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    parent: &crate::tracked_state::types::CurrentStatePartSet,
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+) -> Result<Option<crate::tracked_state::types::CurrentStatePartSet>, LixError> {
+    use crate::tracked_state::current_state_data_part::{
+        CURRENT_STATE_DATA_PART_REFS_SPACE, CURRENT_STATE_DATA_PART_SPACE, CurrentStateDataRow,
+        decode_current_state_data_part, encode_bounded_current_state_data_parts,
+    };
+
+    let staged_segments = staged_commit_delta_segment_bytes(writes, commit_id, inventory)?;
+    let members = staged_commit_delta_members(store, commit_id, inventory, staged_segments).await?;
+    if members.iter().any(|member| {
+        member.key.schema_key == parent.scope.schema_key
+            && member.key.file_id == parent.scope.file_id
+            && !member.value.deleted
+            && member.change.snapshot == crate::json_store::JsonSlot::None
+    }) {
+        // Selected/reference rows may intentionally omit their payload from
+        // the local mutation part. Until that authority is available through
+        // the same read-your-writes view, drop only this rebuildable serving
+        // entry and leave canonical replay responsible for the scope.
+        return Ok(None);
+    }
+    let mut mutations = BTreeMap::<Vec<u8>, Option<CurrentStateDataRow>>::new();
+    for member in members {
+        if member.key.schema_key != parent.scope.schema_key
+            || member.key.file_id != parent.scope.file_id
+        {
+            continue;
+        }
+        let encoded_key = crate::tracked_state::codec::encode_key(&member.key);
+        let row = (!member.value.deleted).then(|| CurrentStateDataRow {
+            encoded_key: encoded_key.clone(),
+            value: member.value,
+            snapshot: member.change.snapshot,
+            metadata: member.change.metadata,
+        });
+        if mutations.insert(encoded_key, row).is_some() {
+            return Err(replacement_payload_error(
+                "sparse current-state rewrite contains a duplicate identity",
+            ));
+        }
+    }
+    if mutations.is_empty() {
+        return Ok(Some(parent.clone()));
+    }
+
+    let (reusable_directory_nodes, parent_descriptors) =
+        super::current_state_part::load_current_state_part_directory_reachability_for_write(
+            store,
+            writes,
+            &parent.directory,
+        )
+        .await?;
+    let mut output = Vec::with_capacity(parent_descriptors.len() + mutations.len());
+    let mut pending = mutations.into_iter().peekable();
+    for descriptor in parent_descriptors {
+        let mut gap = Vec::new();
+        while pending
+            .peek()
+            .is_some_and(|(key, _)| key.as_slice() < descriptor.first_key.as_slice())
+        {
+            let (_, row) = pending.next().expect("peeked sparse mutation");
+            if let Some(row) = row {
+                gap.push(row);
+            }
+        }
+        stage_native_current_state_rows(writes, &gap, &mut output)?;
+
+        let touches_descriptor = pending
+            .peek()
+            .is_some_and(|(key, _)| key.as_slice() <= descriptor.last_key.as_slice());
+        if !touches_descriptor {
+            output.push(descriptor);
+            continue;
+        }
+        let mut rows = load_current_state_descriptor_rows(store, writes, &descriptor)
+            .await?
+            .into_iter()
+            .map(|row| (row.encoded_key.clone(), row))
+            .collect::<BTreeMap<_, _>>();
+        while pending
+            .peek()
+            .is_some_and(|(key, _)| key.as_slice() <= descriptor.last_key.as_slice())
+        {
+            let (key, row) = pending.next().expect("peeked sparse mutation");
+            match row {
+                Some(mut row) => {
+                    if let Some(previous) = rows.get(&key) {
+                        row.value.created_at = previous.value.created_at;
+                    }
+                    rows.insert(key, row);
+                }
+                None => {
+                    rows.remove(&key);
+                }
+            }
+        }
+        stage_native_current_state_rows(
+            writes,
+            &rows.into_values().collect::<Vec<_>>(),
+            &mut output,
+        )?;
+    }
+    let tail = pending
+        .filter_map(|(_, row)| row)
+        .collect::<Vec<CurrentStateDataRow>>();
+    stage_native_current_state_rows(writes, &tail, &mut output)?;
+
+    let directory = super::current_state_part::stage_current_state_part_directory_reusing(
+        writes,
+        &output,
+        &reusable_directory_nodes,
+    )?;
+    let inventory_bytes =
+        storage_codec::encode("sparse current-state lineage inventory", inventory)?;
+    let state_lineage_digest =
+        *blake3::Hasher::new_derive_key("lix sparse current-state lineage v1")
+            .update(&parent.state_lineage_digest)
+            .update(commit_id.as_uuid().as_bytes())
+            .update(&(inventory_bytes.len() as u64).to_be_bytes())
+            .update(&inventory_bytes)
+            .update(&directory.root_id)
+            .update(&directory.descriptor_digest)
+            .finalize()
+            .as_bytes();
+    let rewritten = crate::tracked_state::types::CurrentStatePartSet {
+        scope: parent.scope.clone(),
+        coverage_anchor_commit_id: parent.coverage_anchor_commit_id,
+        generation_integrity_digest: parent.generation_integrity_digest,
+        state_lineage_digest,
+        directory,
+    };
+
+    fn stage_native_current_state_rows(
+        writes: &mut StorageWriteSet,
+        rows: &[CurrentStateDataRow],
+        output: &mut Vec<CurrentStatePartDescriptor>,
+    ) -> Result<(), LixError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let timestamp = crate::common::LixTimestamp::from_unix_millis_utc_lossy(0);
+        for part in encode_bounded_current_state_data_parts(rows)? {
+            writes.put(
+                CURRENT_STATE_DATA_PART_SPACE,
+                key(part.digest.to_vec()),
+                value(part.bytes.to_vec()),
+            );
+            writes.put(
+                CURRENT_STATE_DATA_PART_REFS_SPACE,
+                key(part.digest.to_vec()),
+                value(part.refs_bytes.to_vec()),
+            );
+            output.push(CurrentStatePartDescriptor {
+                first_key: part.first_key,
+                last_key: part.last_key,
+                content_digest: part.digest,
+                payload_refs_digest: part.refs_digest,
+                source_kind: 1,
+                owner_commit_id: [0; 16],
+                part_index: 0,
+                source_row_offset: 0,
+                row_count: part.row_count,
+                uniform_created_at: timestamp,
+                uniform_updated_at: timestamp,
+            });
+        }
+        Ok(())
+    }
+
+    async fn load_current_state_descriptor_rows(
+        store: &(impl StorageAdapterRead + ?Sized),
+        writes: &mut StorageWriteSet,
+        descriptor: &CurrentStatePartDescriptor,
+    ) -> Result<Vec<CurrentStateDataRow>, LixError> {
+        let rows = match descriptor.source_kind {
+            0 => {
+                let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+                let mut physical_key =
+                    commit_delta_segment_key(owner, descriptor.part_index as usize)?;
+                physical_key.extend_from_slice(&descriptor.content_digest);
+                let staged =
+                    writes.staged_value(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &physical_key);
+                let bytes = if let Some(bytes) = staged {
+                    bytes
+                } else {
+                    get_one(
+                        store,
+                        TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+                        physical_key,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        replacement_payload_error("current-state source part is missing")
+                    })?
+                };
+                let decoded = crate::tracked_state::replacement_part::decode_replacement_part(
+                    &descriptor.content_digest,
+                    &bytes,
+                )?;
+                let start = usize::from(descriptor.source_row_offset);
+                let end = start + usize::from(descriptor.row_count);
+                if end > decoded.len() {
+                    return Err(replacement_payload_error(
+                        "current-state source slice is out of bounds",
+                    ));
+                }
+                (start..end)
+                    .map(|ordinal| {
+                        let encoded_key = decoded.key(ordinal)?.ok_or_else(|| {
+                            replacement_payload_error("replacement source omitted a key")
+                        })?;
+                        let packed = descriptor
+                            .part_index
+                            .checked_mul(
+                                u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                                    .expect("row bound fits u32"),
+                            )
+                            .and_then(|base| {
+                                base.checked_add(u32::try_from(ordinal).expect("ordinal fits u32"))
+                            })
+                            .and_then(|address| address.checked_add(1))
+                            .ok_or_else(|| {
+                                replacement_payload_error("replacement source address overflows")
+                            })?;
+                        Ok(CurrentStateDataRow {
+                            encoded_key: encoded_key.to_vec(),
+                            value: TrackedStateIndexValue {
+                                change_id: change_id_from_packed_address(owner, packed),
+                                commit_id: owner,
+                                deleted: false,
+                                created_at: descriptor.uniform_created_at,
+                                updated_at: descriptor.uniform_updated_at,
+                            },
+                            snapshot: owned_json_slot(decoded.snapshot(ordinal)?.ok_or_else(
+                                || replacement_payload_error("replacement source omitted snapshot"),
+                            )?),
+                            metadata: owned_json_slot(decoded.metadata(ordinal)?.ok_or_else(
+                                || replacement_payload_error("replacement source omitted metadata"),
+                            )?),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, LixError>>()?
+            }
+            1 => {
+                let physical_key = descriptor.content_digest.to_vec();
+                let staged = writes.staged_value(CURRENT_STATE_DATA_PART_SPACE, &physical_key);
+                let bytes = if let Some(bytes) = staged {
+                    bytes
+                } else {
+                    get_one(store, CURRENT_STATE_DATA_PART_SPACE, physical_key)
+                        .await?
+                        .ok_or_else(|| {
+                            replacement_payload_error("native current-state part is missing")
+                        })?
+                };
+                let decoded = decode_current_state_data_part(&descriptor.content_digest, &bytes)?;
+                let start = usize::from(descriptor.source_row_offset);
+                let end = start + usize::from(descriptor.row_count);
+                decoded
+                    .get(start..end)
+                    .ok_or_else(|| {
+                        replacement_payload_error("native current-state slice is out of bounds")
+                    })?
+                    .to_vec()
+            }
+            _ => {
+                return Err(replacement_payload_error(
+                    "current-state descriptor has unknown source",
+                ));
+            }
+        };
+        if rows.first().map(|row| row.encoded_key.as_slice())
+            != Some(descriptor.first_key.as_slice())
+            || rows.last().map(|row| row.encoded_key.as_slice())
+                != Some(descriptor.last_key.as_slice())
+        {
+            return Err(replacement_payload_error(
+                "current-state source slice disagrees with descriptor bounds",
+            ));
+        }
+        Ok(rows)
+    }
+
+    fn owned_json_slot(slot: crate::json_store::JsonSlotRef<'_>) -> crate::json_store::JsonSlot {
+        match slot {
+            crate::json_store::JsonSlotRef::None => crate::json_store::JsonSlot::None,
+            crate::json_store::JsonSlotRef::Ref(reference) => {
+                crate::json_store::JsonSlot::Ref(reference.clone())
+            }
+            crate::json_store::JsonSlotRef::Inline(json) => {
+                crate::json_store::JsonSlot::Inline(json.into())
+            }
+        }
+    }
+    Ok(Some(rewritten))
+}
+
+fn staged_commit_delta_segment_bytes(
+    writes: &StorageWriteSet,
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+) -> Result<Vec<Option<Bytes>>, LixError> {
+    let manifest = commit_delta_manifest_from_inventory(inventory);
+    manifest
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(segment_index, bounds)| {
+            let physical_key =
+                commit_delta_segment_key_for_bounds(commit_id, segment_index, bounds)?;
+            Ok(writes.staged_value(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &physical_key))
+        })
+        .collect()
+}
+
+async fn staged_commit_delta_members(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+    staged_segments: Vec<Option<Bytes>>,
+) -> Result<Vec<CommitDeltaMember>, LixError> {
+    let manifest = commit_delta_manifest_from_inventory(inventory);
+    let mut members = Vec::with_capacity(inventory.member_count as usize);
+    if let Some(inline) = manifest.inline_segment() {
+        collect_strict_commit_delta_members(inline, None, commit_id, 0, &mut members)?;
+    } else {
+        for ((segment_index, bounds), staged) in
+            manifest.segments.iter().enumerate().zip(staged_segments)
+        {
+            let physical_key =
+                commit_delta_segment_key_for_bounds(commit_id, segment_index, bounds)?;
+            let bytes = if let Some(bytes) = staged {
+                bytes
+            } else {
+                get_one(
+                    store,
+                    TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+                    physical_key,
+                )
+                .await?
+                .ok_or_else(|| {
+                    replacement_payload_error("sparse rewrite cannot read its mutation part")
+                })?
+            };
+            collect_strict_commit_delta_members(
+                &bytes,
+                Some(bounds),
+                commit_id,
+                u32::try_from(segment_index).expect("segment index fits u32"),
+                &mut members,
+            )?;
+        }
+    }
+    validate_commit_delta_member_order_and_ids(commit_id, &members)?;
+    Ok(members)
 }
 
 fn commit_delta_segment_key(
@@ -9418,7 +9878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistent_catalog_reuses_untouched_scope_and_invalidates_touched_scope() {
+    async fn persistent_catalog_reuses_untouched_scope_and_rewrites_touched_scope() {
         let storage = StorageAdapter::new(Memory::new());
         let parent_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x0199_2000_0000_7000_8000_0000_0000_0000,
@@ -9482,6 +9942,36 @@ mod tests {
             .current_state_catalog
             .clone()
             .expect("parent should publish a catalog");
+        let selected_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_2000_0000_7000_8000_0000_1000_0000,
+        ));
+        let mut selected_delta = commit_delta_refs(selected_id, std::slice::from_ref(&alpha[0]));
+        selected_delta[0].delta.change_id = parent_stage
+            .change_id_at(0)
+            .expect("replacement row should have an address");
+        selected_delta[0].authored = false;
+        let mut selected_writes = storage.new_write_set();
+        let selected_stage = super::stage_ordered_addressable_commit_deltas(
+            &mut selected_writes,
+            selected_delta.iter().copied().map(Ok),
+            true,
+            false,
+        )
+        .expect("selected mutation should stage")
+        .expect("selected mutation should be addressable");
+        let selected_publication = super::stage_current_state_catalog_from_published_parent(
+            &read,
+            &mut selected_writes,
+            Some(&parent),
+            selected_id,
+            selected_stage.mutation_inventory(),
+        )
+        .await
+        .expect("omitted selected payload must not fail commit publication");
+        assert!(
+            selected_publication.parts().0.is_none(),
+            "only the unsupported serving entry should be dropped"
+        );
         let beta = CommitDeltaFixture {
             schema_key: "beta".to_string(),
             file_id: None,
@@ -9591,7 +10081,9 @@ mod tests {
         let touching_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x0199_2000_0000_7000_8000_0002_0000_0000,
         ));
-        let touching_deltas = commit_delta_refs(touching_id, std::slice::from_ref(&alpha[0]));
+        let mut touching_deltas = commit_delta_refs(touching_id, std::slice::from_ref(&alpha[0]));
+        touching_deltas[0].delta.created_at = LixTimestamp::from_unix_millis_utc_lossy(999);
+        touching_deltas[0].snapshot = crate::json_store::JsonSlotRef::Inline("{\"updated\":true}");
         let mut touching_writes = storage.new_write_set();
         let touching_stage = super::stage_ordered_addressable_commit_deltas(
             &mut touching_writes,
@@ -9610,9 +10102,111 @@ mod tests {
             &mut touching_inventory,
         )
         .await
-        .expect("same-scope invalidation should succeed");
+        .expect("same-scope sparse rewrite should succeed");
         let (touching_catalog, _) = touching_publication.parts();
-        assert!(touching_catalog.is_none(), "touched scope must be removed");
+        let touching_catalog = touching_catalog.expect("touched scope should remain served");
+        assert_ne!(
+            touching_catalog.root_id,
+            child
+                .current_state_catalog
+                .as_ref()
+                .expect("child catalog exists")
+                .root_id,
+            "touched scope must publish a new post-image catalog"
+        );
+        let mut touching = fixture_commit_state_manifest(touching_id, touching_inventory.clone());
+        touching.parent_commit_ids = vec![child_id];
+        touching.replay_debt.depth = super::MIN_CURRENT_STATE_CATALOG_POINT_READS;
+        touching.current_state_catalog = Some(touching_catalog.clone());
+        let staged_touching = super::stage_certified_commit_state_manifest_with_handle(
+            &mut touching_writes,
+            &touching,
+            &touching_publication,
+        )
+        .expect("sparse post-image manifest should stage");
+        let staged_child_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_2000_0000_7000_8000_0002_1000_0000,
+        ));
+        let mut staged_child_deltas =
+            commit_delta_refs(staged_child_id, std::slice::from_ref(&alpha[2]));
+        staged_child_deltas[0].snapshot =
+            crate::json_store::JsonSlotRef::Inline("{\"staged_child\":true}");
+        let staged_child_stage = super::stage_ordered_addressable_commit_deltas(
+            &mut touching_writes,
+            staged_child_deltas.iter().copied().map(Ok),
+            true,
+            false,
+        )
+        .expect("staged child mutation should stage")
+        .expect("staged child mutation should be addressable");
+        let staged_child_inventory = staged_child_stage.mutation_inventory().clone();
+        let staged_child_publication = super::stage_current_state_catalog_from_staged_parent(
+            &read,
+            &mut touching_writes,
+            &staged_touching,
+            staged_child_id,
+            &staged_child_inventory,
+        )
+        .await
+        .expect("staged child should read parent catalog, directory, and data parts");
+        let (staged_child_catalog, _) = staged_child_publication.parts();
+        let mut staged_child =
+            fixture_commit_state_manifest(staged_child_id, staged_child_inventory);
+        staged_child.parent_commit_ids = vec![touching_id];
+        staged_child.replay_debt.depth = super::MIN_CURRENT_STATE_CATALOG_POINT_READS;
+        staged_child.current_state_catalog = staged_child_catalog;
+        super::stage_certified_commit_state_manifest(
+            &mut touching_writes,
+            &staged_child,
+            &staged_child_publication,
+        )
+        .expect("staged child manifest should stage in the same write set");
+        drop(read);
+        storage
+            .commit_write_set(touching_writes, StorageWriteOptions::default())
+            .await
+            .expect("sparse post-image should commit atomically");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("sparse post-image read should open");
+        let published_touching = super::load_published_commit_state_manifest(&read, touching_id)
+            .await
+            .expect("sparse manifest should load")
+            .expect("sparse manifest should exist");
+        let updated_key = Bytes::from(encode_key_ref(TrackedStateKeyRef {
+            schema_key: &alpha[0].schema_key,
+            file_id: alpha[0].file_id.as_deref(),
+            entity_pk: &alpha[0].entity_pk,
+        }));
+        assert!(
+            super::load_complete_current_state_values_from_replay_manifest(
+                &read,
+                &published_touching.manifest,
+                std::slice::from_ref(&updated_key),
+            )
+            .await
+            .expect("hot-key replay preference should resolve")
+            .is_none(),
+            "a key authored by the head must retain the cheaper OLTP replay path"
+        );
+        let updated = super::load_complete_current_state_values_from_published_manifest(
+            &read,
+            &published_touching,
+            std::slice::from_ref(&updated_key),
+        )
+        .await
+        .expect("sparse point should resolve")
+        .expect("sparse scope should remain covered");
+        assert_eq!(
+            updated[0].as_ref().map(|value| value.commit_id),
+            Some(touching_id)
+        );
+        assert_eq!(
+            updated[0].as_ref().map(|value| value.created_at),
+            Some(created_at),
+            "ordinary updates must retain the insertion lifecycle timestamp"
+        );
 
         let mut forged_root = parent_root;
         forged_root.parent_root_id = child
@@ -9660,12 +10254,108 @@ mod tests {
             crate::tracked_state::current_state_part::validate_current_state_catalog_transition_root(
                 &read,
                 &forged_touching,
-                child.current_state_catalog.as_deref(),
+                Some(&child),
             )
             .await
             .is_err(),
             "recomputed attestation must not authorize a stale touched scope"
         );
+
+        let insert_delete_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_2000_0000_7000_8000_0003_0000_0000,
+        ));
+        let delete = CommitDeltaFixture {
+            change_id: ChangeId::for_test_label("catalog-alpha-delete"),
+            deleted: true,
+            ..alpha[1].clone()
+        };
+        let insert = CommitDeltaFixture {
+            schema_key: "alpha".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::single("entity-inserted"),
+            change_id: ChangeId::for_test_label("catalog-alpha-insert"),
+            deleted: false,
+            created_at,
+            updated_at,
+        };
+        let sparse_fixtures = [delete, insert];
+        let mut sparse_deltas = commit_delta_refs(insert_delete_id, &sparse_fixtures);
+        sparse_deltas[1].snapshot = crate::json_store::JsonSlotRef::Inline("{\"inserted\":true}");
+        let mut sparse_writes = storage.new_write_set();
+        let sparse_stage = super::stage_ordered_addressable_commit_deltas(
+            &mut sparse_writes,
+            sparse_deltas.iter().copied().map(Ok),
+            true,
+            false,
+        )
+        .expect("insert/delete mutation should stage")
+        .expect("insert/delete mutation should be addressable");
+        let mut sparse_inventory = sparse_stage.mutation_inventory().clone();
+        let sparse_publication = super::stage_current_state_catalog_from_published_parent(
+            &read,
+            &mut sparse_writes,
+            Some(&published_touching),
+            insert_delete_id,
+            &mut sparse_inventory,
+        )
+        .await
+        .expect("insert/delete post-image should stage");
+        let (sparse_catalog, _) = sparse_publication.parts();
+        let mut sparse = fixture_commit_state_manifest(insert_delete_id, sparse_inventory);
+        sparse.parent_commit_ids = vec![touching_id];
+        sparse.replay_debt.depth = super::MIN_CURRENT_STATE_CATALOG_POINT_READS;
+        sparse.current_state_catalog = sparse_catalog;
+        super::stage_certified_commit_state_manifest(
+            &mut sparse_writes,
+            &sparse,
+            &sparse_publication,
+        )
+        .expect("insert/delete manifest should stage");
+        drop(read);
+        storage
+            .commit_write_set(sparse_writes, StorageWriteOptions::default())
+            .await
+            .expect("insert/delete post-image should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("insert/delete read should open");
+        let published_sparse = super::load_published_commit_state_manifest(&read, insert_delete_id)
+            .await
+            .expect("insert/delete manifest should load")
+            .expect("insert/delete manifest should exist");
+        let mut keys = TrackedStateKeyBatchBuilder::with_row_capacity(4);
+        for key in [
+            alpha[0].key(),
+            alpha[1].key(),
+            sparse_fixtures[1].key(),
+            TrackedStateKey {
+                schema_key: "alpha".to_string(),
+                file_id: None,
+                entity_pk: EntityPk::single("authoritative-miss"),
+            },
+        ] {
+            keys.push(TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+        }
+        let resolved = super::load_complete_current_state_values_from_published_manifest(
+            &read,
+            &published_sparse,
+            &keys.finish(),
+        )
+        .await
+        .expect("insert/delete points should resolve")
+        .expect("insert/delete scope should remain covered");
+        assert!(resolved[0].is_some(), "untouched row must survive");
+        assert!(resolved[1].is_none(), "delete must be authoritative");
+        assert_eq!(
+            resolved[2].as_ref().map(|value| value.commit_id),
+            Some(insert_delete_id)
+        );
+        assert!(resolved[3].is_none(), "exact miss must be authoritative");
     }
 
     #[tokio::test]
