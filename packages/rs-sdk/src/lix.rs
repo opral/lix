@@ -8,7 +8,7 @@ use lix_engine::{
     MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, RedoReceipt,
     SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
 };
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use crate::client_state::ClientState;
 
@@ -315,23 +315,21 @@ where
     }
 
     #[doc(hidden)]
-    pub async fn execute_with_idempotency_and_options_and_metadata(
-        &self,
-        sql: &str,
-        params: &[Value],
+    pub fn execute_with_idempotency_and_options_and_metadata(
+        self: Arc<Self>,
+        sql: String,
+        params: Vec<Value>,
         options: ExecuteOptions,
         metadata: ExecuteStatementMetadata,
         idempotency: Option<ExecuteIdempotency>,
-    ) -> Result<ExecuteResult, LixError> {
-        self.session
-            .execute_with_idempotency_and_options_and_metadata(
-                sql,
-                params,
-                options,
-                metadata,
-                idempotency,
-            )
-            .await
+    ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + 'static {
+        Arc::clone(&self.session).execute_with_idempotency_and_options_and_metadata(
+            sql,
+            params,
+            options,
+            metadata,
+            idempotency,
+        )
     }
 
     /// Executes statements sequentially against one atomic snapshot.
@@ -376,21 +374,19 @@ where
     }
 
     #[doc(hidden)]
-    pub async fn execute_batch_with_idempotency_and_options_and_metadata(
-        &self,
-        statements: &[ExecuteBatchStatement],
+    pub fn execute_batch_with_idempotency_and_options_and_metadata(
+        self: Arc<Self>,
+        statements: Vec<ExecuteBatchStatement>,
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.session
-            .execute_batch_with_idempotency_and_options_and_metadata(
-                statements,
-                options,
-                statement_metadata,
-                idempotency,
-            )
-            .await
+    ) -> impl Future<Output = Result<Vec<ExecuteResult>, LixError>> + Send + 'static {
+        Arc::clone(&self.session).execute_batch_with_idempotency_and_options_and_metadata(
+            statements,
+            options,
+            statement_metadata,
+            idempotency,
+        )
     }
 
     pub fn observe(
@@ -523,13 +519,13 @@ where
         self.inner.execute(sql, params).await
     }
 
-    pub async fn execute_with_options(
+    pub fn execute_with_options(
         &mut self,
-        sql: &str,
-        params: &[Value],
+        sql: String,
+        params: Vec<Value>,
         options: ExecuteOptions,
-    ) -> Result<ExecuteResult, LixError> {
-        self.inner.execute_with_options(sql, params, options).await
+    ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + '_ {
+        self.inner.execute_with_options(sql, params, options)
     }
 
     pub async fn commit(self) -> Result<(), LixError> {

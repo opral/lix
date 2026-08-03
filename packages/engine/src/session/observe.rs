@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use tokio::sync::watch;
 
@@ -59,7 +59,16 @@ impl<StorageImpl> ObserveEvents<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    pub async fn next(&mut self) -> Result<Option<ObserveEvent>, LixError> {
+    pub fn next(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<ObserveEvent>, LixError>> + Send + '_ {
+        // SAFETY: ObserveEvents is exclusively borrowed for the whole future;
+        // its session/storage handles are Send and its shared references target
+        // Sync coordinator, catalog, and immutable query state.
+        unsafe { super::AssumeSendFuture::new(self.next_inner()) }
+    }
+
+    async fn next_inner(&mut self) -> Result<Option<ObserveEvent>, LixError> {
         if self.closed || self.session.is_closed() {
             self.close();
             return Ok(None);

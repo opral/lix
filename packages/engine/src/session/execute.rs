@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -718,25 +719,32 @@ where
     /// SQL writes, while in-process callers may continue to own their own
     /// transaction/retry contract. Read routes ignore a supplied key.
     #[doc(hidden)]
-    pub async fn execute_with_idempotency_and_options_and_metadata(
-        &self,
-        sql: &str,
-        params: &[Value],
+    pub fn execute_with_idempotency_and_options_and_metadata(
+        self: Arc<Self>,
+        sql: String,
+        params: Vec<Value>,
         options: ExecuteOptions,
         metadata: ExecuteStatementMetadata,
         idempotency: Option<ExecuteIdempotency>,
-    ) -> Result<ExecuteResult, LixError> {
-        validate_execute_statement_metadata(params.len(), &metadata, None)?;
-        Box::pin(self.execute_with_kind(
-            sql,
-            params,
-            options,
-            metadata,
-            "execute",
-            idempotency,
-            true,
-        ))
-        .await
+    ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + 'static {
+        // SAFETY: the future owns its Arc session and request payload. Every
+        // storage read/write handle is Send by the Storage contract; remaining
+        // compiler failures are higher-ranked shared references to Sync data.
+        unsafe {
+            super::AssumeSendFuture::new(async move {
+                validate_execute_statement_metadata(params.len(), &metadata, None)?;
+                self.execute_with_kind(
+                    &sql,
+                    &params,
+                    options,
+                    metadata,
+                    "execute",
+                    idempotency,
+                    true,
+                )
+                .await
+            })
+        }
     }
 
     /// Upserts one file's bytes by its full logical path without constructing
@@ -832,7 +840,18 @@ where
     /// active-branch file selection, plugin rendering, and session file-view
     /// acknowledgement as `SELECT data FROM lix_file WHERE path = $1`, while
     /// avoiding SQL parsing, planning, and a JSON-shaped result envelope.
-    pub async fn read_file_data(
+    pub fn read_file_data(
+        &self,
+        path: String,
+        requested_range: Option<Range<u64>>,
+    ) -> impl Future<Output = Result<Option<FileRead>, LixError>> + Send + '_ {
+        // SAFETY: the read future owns its path/range and retains only shared
+        // references to this Sync session. Rustc cannot prove the Send bound
+        // through the higher-ranked scoped SQL-read closure.
+        unsafe { super::AssumeSendFuture::new(self.read_file_data_inner(path, requested_range)) }
+    }
+
+    async fn read_file_data_inner(
         &self,
         path: String,
         requested_range: Option<Range<u64>>,
@@ -1393,21 +1412,28 @@ where
     /// contain at least one SQL write. Pure read batches and batches that only
     /// persist runtime-function state retain their existing execution path.
     #[doc(hidden)]
-    pub async fn execute_batch_with_idempotency_and_options_and_metadata(
-        &self,
-        statements: &[ExecuteBatchStatement],
+    pub fn execute_batch_with_idempotency_and_options_and_metadata(
+        self: Arc<Self>,
+        statements: Vec<ExecuteBatchStatement>,
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.execute_batch_with_options_and_metadata_inner(
-            statements,
-            options,
-            statement_metadata,
-            idempotency,
-            true,
-        )
-        .await
+    ) -> impl Future<Output = Result<Vec<ExecuteResult>, LixError>> + Send + 'static {
+        // SAFETY: as above, this future owns the Arc session, statements, and
+        // metadata; transaction state crosses awaits only through mutable
+        // references and every storage transaction is Send.
+        unsafe {
+            super::AssumeSendFuture::new(async move {
+                self.execute_batch_with_options_and_metadata_inner(
+                    &statements,
+                    options,
+                    statement_metadata,
+                    idempotency,
+                    true,
+                )
+                .await
+            })
+        }
     }
 
     async fn execute_batch_with_options_inner(
@@ -2507,10 +2533,10 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
-        Box::pin(self.execute_with_options(sql, params, ExecuteOptions::default())).await
+        Box::pin(self.execute_with_options_inner(sql, params, ExecuteOptions::default())).await
     }
 
-    pub async fn execute_with_options(
+    async fn execute_with_options_inner(
         &mut self,
         sql: &str,
         params: &[Value],
@@ -2597,6 +2623,23 @@ where
             telemetry.finish(&result);
         }
         result
+    }
+
+    pub fn execute_with_options(
+        &mut self,
+        sql: String,
+        params: Vec<Value>,
+        options: ExecuteOptions,
+    ) -> impl Future<Output = Result<ExecuteResult, LixError>> + Send + '_ {
+        // SAFETY: the future exclusively borrows this Send transaction and
+        // owns its SQL and parameter payload. Higher-ranked string references
+        // are created and consumed entirely inside that exclusive borrow.
+        unsafe {
+            super::AssumeSendFuture::new(async move {
+                self.execute_with_options_inner(&sql, &params, options)
+                    .await
+            })
+        }
     }
 
     #[cfg(test)]
@@ -8787,8 +8830,9 @@ mod tests {
         transaction
             .execute_with_options(
                 "UPDATE lix_key_value SET value = 'updated' \
-                 WHERE key = 'origin-key-address'",
-                &[],
+                 WHERE key = 'origin-key-address'"
+                    .to_owned(),
+                Vec::new(),
                 ExecuteOptions {
                     origin_key: Some("tx-origin".to_string()),
                     ..Default::default()
@@ -8855,8 +8899,8 @@ mod tests {
             .expect("transaction should begin");
         transaction
             .execute_with_options(
-                "UPDATE lix_file SET data = $1 WHERE id = $2",
-                &[
+                "UPDATE lix_file SET data = $1 WHERE id = $2".to_owned(),
+                vec![
                     Value::Blob(b"three\n".to_vec().into()),
                     Value::Text(FILE_ID.to_string()),
                 ],

@@ -6812,7 +6812,7 @@ where
     /// transaction-scoped snapshot. A missing or stale accelerator is an
     /// ordinary `None`; callers retain the historical tracked-state oracle.
     pub(crate) async fn working_diff_at_head(
-        &self,
+        &mut self,
         branch_id: &str,
         head_commit_id: CommitId,
         request: &TrackedStateDiffRequest,

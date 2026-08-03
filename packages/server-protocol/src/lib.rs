@@ -41,7 +41,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    runtime::Handle,
     sync::{Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock, mpsc, watch},
     task::JoinHandle,
 };
@@ -663,105 +662,78 @@ where
         }
     }
 
-    async fn run<T, F, Fut>(&self, operation: F) -> Result<T, LixError>
+    async fn run_detached<T, Fut>(
+        &self,
+        operation: Fut,
+        join_context: &'static str,
+    ) -> Result<T, LixError>
     where
         T: Send + 'static,
-        F: FnOnce(Arc<Lix<S>>) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<T, LixError>> + 'static,
+        Fut: Future<Output = Result<T, LixError>> + Send + 'static,
     {
-        let runtime = Handle::try_current().map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("access Lix server runtime: {error}"),
-            )
-        })?;
-        let lix = Arc::clone(&self.record.lix);
-        // `spawn_blocking` work is detached when its JoinHandle is dropped.
-        // Keep a lease inside that work so an HTTP timeout/cancellation cannot
-        // make an operation look idle and eligible for session eviction while
-        // it is still running.
+        // Dropping a Tokio JoinHandle detaches its task. Keep a lease inside
+        // durable work so HTTP cancellation cannot make an active session look
+        // idle or eligible for eviction before the operation reaches its
+        // terminal boundary.
         let operation_lease = self.clone();
         let durable_terminal_storage_notifier = self.durable_terminal_storage_notifier.clone();
         let parent = tracing::Span::current();
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        tokio::task::spawn_blocking(move || {
-            let _operation_lease = operation_lease;
-            let result = tracing::dispatcher::with_default(&dispatch, || {
-                parent.in_scope(|| {
-                    runtime.block_on(async move {
-                        let lix = lix.read().await;
-                        operation(Arc::clone(&lix)).await
-                    })
-                })
-            });
-            if let (Some(notifier), Err(error)) = (&durable_terminal_storage_notifier, &result) {
-                notifier.signal_if_terminal(error);
+        tokio::spawn(
+            async move {
+                let _operation_lease = operation_lease;
+                let result = operation.await;
+                if let (Some(notifier), Err(error)) = (&durable_terminal_storage_notifier, &result)
+                {
+                    notifier.signal_if_terminal(error);
+                }
+                result
             }
-            result
-        })
+            .instrument(parent)
+            .with_current_subscriber(),
+        )
         .await
         .map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("join Lix server operation: {error}"),
+                format!("{join_context}: {error}"),
             )
         })?
     }
 
-    /// Runs a read whose work can be discarded when the request future is
-    /// dropped. The cancellation sender deliberately lives in the caller
-    /// future: dropping an HTTP timeout's waiter wakes the blocking runtime,
-    /// which drops the session read lock and its operation lease.
-    async fn run_cancellable_read<T, F, Fut>(&self, operation: F) -> Result<T, LixError>
+    async fn run_durable<T, F, Fut>(&self, operation: F) -> Result<T, LixError>
     where
         T: Send + 'static,
         F: FnOnce(Arc<Lix<S>>) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<T, LixError>> + 'static,
+        Fut: Future<Output = Result<T, LixError>> + Send + 'static,
     {
-        let runtime = Handle::try_current().map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("access Lix server runtime: {error}"),
-            )
-        })?;
         let lix = Arc::clone(&self.record.lix);
-        let operation_lease = self.clone();
-        let durable_terminal_storage_notifier = self.durable_terminal_storage_notifier.clone();
-        let (cancel_on_drop, mut cancelled) = tokio::sync::oneshot::channel::<()>();
-        let parent = tracing::Span::current();
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        let result = tokio::task::spawn_blocking(move || {
-            let _operation_lease = operation_lease;
-            let result = tracing::dispatcher::with_default(&dispatch, || {
-                parent.in_scope(|| {
-                    runtime.block_on(async move {
-                        tokio::select! {
-                            biased;
-                            result = async {
-                                let lix = lix.read().await;
-                                operation(Arc::clone(&lix)).await
-                            } => result,
-                            _ = &mut cancelled => Err(LixError::new(
-                                LixError::CODE_CLOSED,
-                                "Lix read operation was cancelled",
-                            )),
-                        }
-                    })
-                })
-            });
-            if let (Some(notifier), Err(error)) = (&durable_terminal_storage_notifier, &result) {
-                notifier.signal_if_terminal(error);
-            }
-            result
-        })
+        self.run_detached(
+            async move {
+                let lix = lix.read_owned().await;
+                let current = Arc::clone(&lix);
+                operation(current).await
+            },
+            "join Lix server operation",
+        )
         .await
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("join Lix server operation: {error}"),
-            )
-        })?;
-        drop(cancel_on_drop);
+    }
+
+    /// Runs a read inline on Tokio. Dropping the request future directly drops
+    /// the engine future and its session read lock; no cancellation relay or
+    /// second executor is involved.
+    async fn run_cancellable_read<T, F, Fut>(&self, operation: F) -> Result<T, LixError>
+    where
+        F: FnOnce(Arc<Lix<S>>) -> Fut,
+        Fut: Future<Output = Result<T, LixError>>,
+    {
+        let result = {
+            let lix = Arc::clone(&self.record.lix).read_owned().await;
+            let current = Arc::clone(&lix);
+            operation(current).await
+        };
+        if let (Some(notifier), Err(error)) = (&self.durable_terminal_storage_notifier, &result) {
+            notifier.signal_if_terminal(error);
+        }
         result
     }
 
@@ -782,8 +754,8 @@ where
                 self.run_cancellable_read(move |lix| async move {
                     let idempotency = bind_idempotency_to_session_branch(&lix, idempotency).await?;
                     lix.execute_with_idempotency_and_options_and_metadata(
-                        &sql,
-                        &params,
+                        sql,
+                        params,
                         options,
                         metadata,
                         idempotency,
@@ -793,11 +765,11 @@ where
                 .await
             }
             ExecutionDisposition::Durable => {
-                self.run(move |lix| async move {
+                self.run_durable(move |lix| async move {
                     let idempotency = bind_idempotency_to_session_branch(&lix, idempotency).await?;
                     lix.execute_with_idempotency_and_options_and_metadata(
-                        &sql,
-                        &params,
+                        sql,
+                        params,
                         options,
                         metadata,
                         idempotency,
@@ -825,7 +797,7 @@ where
                 self.run_cancellable_read(move |lix| async move {
                     let idempotency = bind_idempotency_to_session_branch(&lix, idempotency).await?;
                     lix.execute_batch_with_idempotency_and_options_and_metadata(
-                        &statements,
+                        statements,
                         options,
                         statement_metadata,
                         idempotency,
@@ -835,10 +807,10 @@ where
                 .await
             }
             ExecutionDisposition::Durable => {
-                self.run(move |lix| async move {
+                self.run_durable(move |lix| async move {
                     let idempotency = bind_idempotency_to_session_branch(&lix, idempotency).await?;
                     lix.execute_batch_with_idempotency_and_options_and_metadata(
-                        &statements,
+                        statements,
                         options,
                         statement_metadata,
                         idempotency,
@@ -875,50 +847,54 @@ where
         params: Vec<Value>,
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
-        let mut transactions = self.record.transactions.lock().await;
-        let mut active = transactions.active.take().ok_or_else(|| {
-            completed_transaction_error(&transactions, &transaction_id).unwrap_or_else(|| {
-                remote_transaction_state_error("Lix session has no active transaction")
-            })
-        })?;
-        if active.id != transaction_id {
-            transactions.active = Some(active);
-            return Err(remote_transaction_state_error(
-                "remote transaction capability does not match the active transaction",
-            ));
-        }
-        let runtime = Handle::try_current().map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("access Lix server runtime: {error}"),
-            )
-        })?;
-        let operation_lease = self.clone();
-        let parent = tracing::Span::current();
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        let joined = tokio::task::spawn_blocking(move || {
-            let _operation_lease = operation_lease;
-            let result = tracing::dispatcher::with_default(&dispatch, || {
-                parent.in_scope(|| {
-                    runtime.block_on(async {
-                        active
-                            .transaction
-                            .execute_with_options(&sql, &params, options)
-                            .await
-                    })
-                })
-            });
-            (active, result)
-        })
-        .await
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("join Lix server transaction operation: {error}"),
-            )
-        })?;
-        transactions.active = Some(joined.0);
-        joined.1
+        let record = Arc::clone(&self.record);
+        let (cancel_on_drop, mut cancelled) = tokio::sync::oneshot::channel::<()>();
+        let result = self.run_detached(
+            async move {
+                let mut transactions = record.transactions.lock().await;
+                let mut active = transactions.active.take().ok_or_else(|| {
+                    completed_transaction_error(&transactions, &transaction_id).unwrap_or_else(
+                        || remote_transaction_state_error("Lix session has no active transaction"),
+                    )
+                })?;
+                if active.id != transaction_id {
+                    transactions.active = Some(active);
+                    return Err(remote_transaction_state_error(
+                        "remote transaction capability does not match the active transaction",
+                    ));
+                }
+                tokio::select! {
+                    biased;
+                    _ = &mut cancelled => {
+                        let rollback = active.transaction.rollback().await;
+                        let completed = rollback
+                            .map(|()| RemoteTransactionOutcome::RolledBack);
+                        transactions.completed.push_back(CompletedRemoteTransaction {
+                            id: transaction_id,
+                            result: completed.clone(),
+                        });
+                        while transactions.completed.len() > MAX_COMPLETED_REMOTE_TRANSACTIONS {
+                            transactions.completed.pop_front();
+                        }
+                        match completed {
+                            Ok(_) => Err(LixError::new(
+                                LixError::CODE_CLOSED,
+                                "cancelled remote transaction statement rolled back its transaction",
+                            )),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    result = active.transaction.execute_with_options(sql, params, options) => {
+                        transactions.active = Some(active);
+                        result
+                    }
+                }
+            },
+            "join Lix server transaction operation",
+        )
+        .await;
+        drop(cancel_on_drop);
+        result
     }
 
     async fn commit_transaction(&self, transaction_id: String) -> Result<(), LixError> {
@@ -936,77 +912,62 @@ where
         transaction_id: String,
         requested: RemoteTransactionOutcome,
     ) -> Result<(), LixError> {
-        let mut transactions = self.record.transactions.lock().await;
-        let Some(active) = transactions.active.take() else {
-            return completed_transaction_result(&transactions, &transaction_id, requested);
-        };
-        if active.id != transaction_id {
-            transactions.active = Some(active);
-            return Err(remote_transaction_state_error(
-                "remote transaction capability does not match the active transaction",
-            ));
-        }
-        let result = match requested {
-            RemoteTransactionOutcome::Committed => self
-                .run(move |_| async move { active.transaction.commit().await })
-                .await
-                .map(|()| RemoteTransactionOutcome::Committed),
-            RemoteTransactionOutcome::RolledBack => self
-                .run(move |_| async move { active.transaction.rollback().await })
-                .await
-                .map(|()| RemoteTransactionOutcome::RolledBack),
-        };
-        transactions
-            .completed
-            .push_back(CompletedRemoteTransaction {
-                id: transaction_id,
-                result: result.clone(),
-            });
-        while transactions.completed.len() > MAX_COMPLETED_REMOTE_TRANSACTIONS {
-            transactions.completed.pop_front();
-        }
-        result.map(|_| ())
+        let record = Arc::clone(&self.record);
+        self.run_detached(
+            async move {
+                let mut transactions = record.transactions.lock().await;
+                let Some(active) = transactions.active.take() else {
+                    return completed_transaction_result(&transactions, &transaction_id, requested);
+                };
+                if active.id != transaction_id {
+                    transactions.active = Some(active);
+                    return Err(remote_transaction_state_error(
+                        "remote transaction capability does not match the active transaction",
+                    ));
+                }
+                let result = match requested {
+                    RemoteTransactionOutcome::Committed => active
+                        .transaction
+                        .commit()
+                        .await
+                        .map(|()| RemoteTransactionOutcome::Committed),
+                    RemoteTransactionOutcome::RolledBack => active
+                        .transaction
+                        .rollback()
+                        .await
+                        .map(|()| RemoteTransactionOutcome::RolledBack),
+                };
+                transactions
+                    .completed
+                    .push_back(CompletedRemoteTransaction {
+                        id: transaction_id,
+                        result: result.clone(),
+                    });
+                while transactions.completed.len() > MAX_COMPLETED_REMOTE_TRANSACTIONS {
+                    transactions.completed.pop_front();
+                }
+                result.map(|_| ())
+            },
+            "join Lix server transaction finalization",
+        )
+        .await
     }
 
     async fn switch_branch(
         &self,
         options: SwitchBranchOptions,
     ) -> Result<lix_sdk::SwitchBranchReceipt, LixError> {
-        let runtime = Handle::try_current().map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("access Lix server runtime: {error}"),
-            )
-        })?;
         let lix = Arc::clone(&self.record.lix);
-        let operation_lease = self.clone();
-        let durable_terminal_storage_notifier = self.durable_terminal_storage_notifier.clone();
-        let parent = tracing::Span::current();
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        tokio::task::spawn_blocking(move || {
-            let _operation_lease = operation_lease;
-            let result = tracing::dispatcher::with_default(&dispatch, || {
-                parent.in_scope(|| {
-                    runtime.block_on(async move {
-                        let mut lix = lix.write().await;
-                        let (switched, receipt) = lix.switch_branch_session(options).await?;
-                        *lix = Arc::new(switched);
-                        Ok(receipt)
-                    })
-                })
-            });
-            if let (Some(notifier), Err(error)) = (&durable_terminal_storage_notifier, &result) {
-                notifier.signal_if_terminal(error);
-            }
-            result
-        })
+        self.run_detached(
+            async move {
+                let mut lix = lix.write().await;
+                let (switched, receipt) = lix.switch_branch_session(options).await?;
+                *lix = Arc::new(switched);
+                Ok(receipt)
+            },
+            "join Lix server branch switch",
+        )
         .await
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("join Lix server branch switch: {error}"),
-            )
-        })?
     }
 
     async fn observe(
@@ -1017,7 +978,7 @@ where
     ) -> Result<ServerObserve<S>, LixError> {
         let lix = self.record.lix.read().await;
         Ok(ServerObserve {
-            events: Arc::new(Mutex::new(lix.observe(sql, params)?)),
+            events: AsyncMutex::new(lix.observe(sql, params)?),
             terminal_sender,
         })
     }
@@ -1125,7 +1086,7 @@ struct ServerObserve<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    events: Arc<Mutex<ObserveEvents<S>>>,
+    events: AsyncMutex<ObserveEvents<S>>,
     terminal_sender: TerminalStorageStreamSender,
 }
 
@@ -1134,51 +1095,10 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     async fn next(&self) -> Result<Option<ObserveEvent>, LixError> {
-        let runtime = Handle::try_current().map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("access Lix observe runtime: {error}"),
-            )
-        })?;
-        let events = Arc::clone(&self.events);
-        let terminal_sender = self.terminal_sender.clone();
-        let (cancel_on_drop, cancel) = tokio::sync::oneshot::channel::<()>();
-        let parent = tracing::Span::current();
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        let result = tokio::task::spawn_blocking(move || {
-            let result = tracing::dispatcher::with_default(&dispatch, || {
-                parent.in_scope(|| {
-                    let mut events = events.lock().map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("lock Lix observe stream: {error}"),
-                        )
-                    })?;
-                    runtime.block_on(async {
-                        tokio::select! {
-                            biased;
-                            result = events.next() => result,
-                            _ = cancel => Err(LixError::new(
-                                LixError::CODE_CLOSED,
-                                "Lix observe wait was cancelled",
-                            )),
-                        }
-                    })
-                })
-            });
-            if let Err(error) = &result {
-                terminal_sender.signal_if_terminal(error);
-            }
-            result
-        })
-        .await
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("join Lix observe operation: {error}"),
-            )
-        })?;
-        drop(cancel_on_drop);
+        let result = self.events.lock().await.next().await;
+        if let Err(error) = &result {
+            self.terminal_sender.signal_if_terminal(error);
+        }
         result
     }
 }
@@ -1952,7 +1872,7 @@ where
             .map_err(|_| ApiError::bad_request("Lix-Upload-Id must be ASCII"))?
             .to_owned();
         let progress = lease
-            .run(move |lix| async move {
+            .run_durable(move |lix| async move {
                 lix.upsert_file_data_part(
                     upload_id,
                     path,
@@ -1983,7 +1903,7 @@ where
         return Ok(response);
     }
     let result = lease
-        .run(move |lix| async move { lix.upsert_file_data(path, body).await })
+        .run_durable(move |lix| async move { lix.upsert_file_data(path, body).await })
         .await?;
     Ok(Json(ExecuteResponse::try_from(
         ExecuteResult::from_rows_affected(result),
@@ -2052,7 +1972,7 @@ where
 {
     let writes = parse_binary_file_upsert_batch(body)?;
     let result = lease
-        .run(move |lix| async move { lix.upsert_file_data_batch(writes).await })
+        .run_durable(move |lix| async move { lix.upsert_file_data_batch(writes).await })
         .await?;
     Ok(Json(ExecuteResponse::try_from(
         ExecuteResult::from_rows_affected(result),
@@ -2381,7 +2301,7 @@ where
         from_commit_id: request.from_commit_id,
     };
     let receipt = lease
-        .run(move |lix| async move { lix.create_branch(options).await })
+        .run_durable(move |lix| async move { lix.create_branch(options).await })
         .await?;
     Ok(Json(CreateBranchResponse {
         id: receipt.id,
@@ -2398,7 +2318,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let receipt = lease
-        .run(move |lix| async move { lix.create_checkpoint().await })
+        .run_durable(move |lix| async move { lix.create_checkpoint().await })
         .await?;
     Ok(Json(CreateCheckpointResponse {
         commit_id: receipt.commit_id,
@@ -2412,7 +2332,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let receipt = lease
-        .run(move |lix| async move { lix.undo().await })
+        .run_durable(move |lix| async move { lix.undo().await })
         .await?;
     Ok(Json(UndoResponse {
         branch_id: receipt.branch_id,
@@ -2428,7 +2348,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let receipt = lease
-        .run(move |lix| async move { lix.redo().await })
+        .run_durable(move |lix| async move { lix.redo().await })
         .await?;
     Ok(Json(RedoResponse {
         branch_id: receipt.branch_id,
@@ -9017,7 +8937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_keeps_sql_span_under_protocol_request_across_blocking_runtime() {
+    async fn execute_keeps_sql_span_under_protocol_request_on_native_runtime() {
         let capture = CaptureLayer::default();
         let spans = Arc::clone(&capture.spans);
         let _subscriber =
@@ -9835,6 +9755,102 @@ mod tests {
                 .status(),
             StatusCode::OK,
             "dropped transaction state must release the lifecycle pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_remote_transaction_statement_rolls_back_instead_of_replaying() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let transaction_id = begin_remote_transaction(&app.router, &session_id).await;
+        let record = app
+            .server
+            .inner
+            .registry
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .expect("transaction session remains registered");
+        let registry_guard = record.transactions.lock().await;
+
+        let router = app.router.clone();
+        let request_session_id = session_id.clone();
+        let request_transaction_id = transaction_id.clone();
+        let statement = tokio::spawn(async move {
+            remote_transaction_request(
+                &router,
+                "POST",
+                "/lix/v1/transaction/execute",
+                &request_session_id,
+                &request_transaction_id,
+                Some(json!({
+                    "sql": "INSERT INTO lix_key_value (key, value) VALUES ('cancelled-statement', 'must-not-commit')"
+                })),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while record.lease_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached transaction statement should retain its own lease");
+
+        statement.abort();
+        assert!(
+            statement
+                .await
+                .expect_err("outer transaction statement request was cancelled")
+                .is_cancelled()
+        );
+        drop(registry_guard);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if record
+                    .transactions
+                    .lock()
+                    .await
+                    .completed
+                    .iter()
+                    .any(|completed| completed.id == transaction_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled statement should finish rollback");
+
+        let commit = remote_transaction_request(
+            &app.router,
+            "POST",
+            "/lix/v1/transaction/commit",
+            &session_id,
+            &transaction_id,
+            None,
+        )
+        .await;
+        assert_eq!(commit.status(), StatusCode::BAD_REQUEST);
+
+        let result = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT COUNT(*) AS count FROM lix_key_value WHERE key = 'cancelled-statement'"
+            })),
+        )
+        .await;
+        assert_eq!(result.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(result).await["rows"][0][0],
+            json!({ "kind": "int", "value": 0 })
         );
     }
 
