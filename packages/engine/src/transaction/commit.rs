@@ -40,7 +40,9 @@ use crate::tracked_state::{
     stage_addressable_commit_deltas, stage_change_locators, stage_commit_state_manifest,
     stage_ordered_addressable_commit_deltas,
 };
-use crate::transaction::staging::{PreparedInsertSelection, PreparedWriteSet};
+use crate::transaction::staging::{
+    OrderedMutationJournal, PreparedInsertSelection, PreparedWriteSet,
+};
 #[cfg(test)]
 use crate::transaction::types::StagedCommitChangeBatchBuilder;
 use crate::transaction::types::{
@@ -88,6 +90,10 @@ std::thread_local! {
 }
 
 #[cfg(test)]
+static DIRECT_JOURNAL_REPLACEMENT_PUBLICATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
 pub(crate) fn take_ordered_packed_current_base_publications() -> usize {
     ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| publications.replace(0))
 }
@@ -106,6 +112,11 @@ pub(crate) fn take_complete_replacement_packed_current_base_retirements() -> usi
 #[cfg(test)]
 pub(crate) fn take_rootless_replacement_generation_publications() -> usize {
     ROOTLESS_REPLACEMENT_GENERATION_PUBLICATIONS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_direct_journal_replacement_publications() -> usize {
+    DIRECT_JOURNAL_REPLACEMENT_PUBLICATIONS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Commits prepared transaction rows into tracked history and unified current
@@ -207,6 +218,14 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         crate::gc::stage_checkpoint_gc_state(&mut writes, &publication.gc_state)?;
     }
     let mut json_writer = JsonStoreContext::new().writer();
+    let ordered_replacements = prepared_writes
+        .commit_change_refs_by_branch
+        .values()
+        .filter_map(|refs| {
+            refs.ordered_mutation_journal()
+                .map(|journal| (refs.commit_id, Arc::clone(journal)))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let filesystem_view_changed = prepared_writes.state_rows.iter().any(|row| {
         matches!(
@@ -497,13 +516,27 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     }
 
     let selected_change_records = load_selected_change_records(read, &commit_rows).await?;
-    let replacement_generations = certify_complete_replacement_generations(
+    let mut replacement_generations = certify_complete_replacement_generations(
         read,
         &state_rows,
         &row_index.tracked_row_indices_by_commit,
         &tracked_roots,
     )
     .await?;
+    for (commit_id, generation) in
+        certify_ordered_journal_replacement_generations(read, &ordered_replacements, &tracked_roots)
+            .await?
+    {
+        if replacement_generations
+            .insert(commit_id, generation)
+            .is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "commit has both prepared and immutable replacement authorities",
+            ));
+        }
+    }
 
     let staged_delta_index = stage_tracked_commit_delta_index(
         read,
@@ -518,6 +551,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &certified_packet_json_refs,
         &insert_selection,
         &replacement_generations,
+        &ordered_replacements,
     )
     .await?;
 
@@ -527,6 +561,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &tracked_roots,
         &staged_delta_index.ordered_addressable_commits,
         &certified_packet_root_rows,
+        &ordered_replacements,
     );
     let replacement_generation_commits = replacement_generations
         .keys()
@@ -551,6 +586,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &commit_rows,
         &certified_packet_root_rows,
         &staged_delta_index.inventories,
+        &ordered_replacements,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -571,6 +607,19 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &certified_packet_root_rows,
         &certified_packet_json_refs,
     )?;
+    for journal in ordered_replacements.values() {
+        json_writer.stage_batch(
+            &mut writes,
+            JsonWritePlacementRef::OutOfBand,
+            journal.iter().filter_map(|row| match row.snapshot_slot() {
+                crate::json_store::JsonSlotRef::Ref(json_ref) => Some(
+                    NormalizedJsonRef::trusted_prehashed(row.snapshot(), *json_ref),
+                ),
+                crate::json_store::JsonSlotRef::Inline(_)
+                | crate::json_store::JsonSlotRef::None => None,
+            }),
+        )?;
+    }
 
     let branch_control_observations =
         observe_branch_head_controls(read, &tracked_roots, &state_rows, &engine_rows).await?;
@@ -634,6 +683,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &branch_control_observations,
         &checkpoint_epochs,
         &staged_delta_index.ordered_addressable_commits,
+        &replacement_generation_commits,
+        &ordered_replacements,
     ))
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -1022,6 +1073,7 @@ async fn stage_changelog_commits(
     commit_rows: &[FinalizedCommitRow],
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
     mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
+    ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
     let staged_commit_ids = commit_rows
@@ -1129,10 +1181,17 @@ async fn stage_changelog_commits(
             .get(&commit_id)
             .map_or(0, Vec::len)
             .checked_add(
-                certified_packet_root_rows
+                ordered_replacements
                     .get(&commit_id)
-                    .map_or(0, Vec::len),
+                    .map_or(0, |journal| journal.row_count()),
             )
+            .and_then(|rows| {
+                rows.checked_add(
+                    certified_packet_root_rows
+                        .get(&commit_id)
+                        .map_or(0, Vec::len),
+                )
+            })
             .and_then(|rows| {
                 rows.checked_add(selected_change_count(&commit.selected_change_batches))
             })
@@ -1141,7 +1200,9 @@ async fn stage_changelog_commits(
         let commit_row_indices = tracked_row_indices_by_commit
             .get(&commit_id)
             .map(Vec::as_slice);
-        let commit_delta_bytes = if let Some(proof) = state_rows
+        let commit_delta_bytes = if let Some(journal) = ordered_replacements.get(&commit_id) {
+            journal.replacement_proof().replay_bytes
+        } else if let Some(proof) = state_rows
             .complete_collection_replacement_proof()
             .filter(|_| commit_row_indices.is_some_and(|indices| indices.len() == state_rows.len()))
         {
@@ -1314,6 +1375,9 @@ async fn stage_changelog_commits(
         };
         commits.push(record.clone());
         let change_count = state_row_indices.len()
+            + ordered_replacements
+                .get(&commit_row.commit_id)
+                .map_or(0, |journal| journal.row_count())
             + certified_packet_root_rows
                 .get(&commit_row.commit_id)
                 .map_or(0, Vec::len)
@@ -1893,6 +1957,7 @@ async fn stage_tracked_commit_delta_index(
     certified_packet_json_refs: &BTreeMap<CommitId, Vec<CertifiedRootJsonRefs>>,
     insert_selection: &PreparedInsertSelection,
     replacement_generations: &BTreeMap<CommitId, CommitDeltaReplacementGeneration>,
+    ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
 ) -> Result<StagedCommitDeltaIndex, LixError> {
     let mut ordered_addressable_commits = BTreeSet::new();
     let mut inventories = BTreeMap::new();
@@ -1901,6 +1966,61 @@ async fn stage_tracked_commit_delta_index(
         .map(|commit| (commit.commit_id, commit))
         .collect::<BTreeMap<_, _>>();
     for root in tracked_roots {
+        if let Some(journal) = ordered_replacements.get(&root.commit_id) {
+            #[cfg(test)]
+            DIRECT_JOURNAL_REPLACEMENT_PUBLICATIONS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !state_rows.is_empty()
+                || certified_packet_root_rows
+                    .get(&root.commit_id)
+                    .is_some_and(|rows| !rows.is_empty())
+                || commit_rows
+                    .get(&root.commit_id)
+                    .is_some_and(|commit| !commit.selected_change_batches.is_empty())
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable replacement journal overlaps another commit payload lane",
+                ));
+            }
+            let generation = replacement_generations
+                .get(&root.commit_id)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "immutable replacement journal has no lifecycle generation",
+                    )
+                })?;
+            let created_at = generation.lifecycle_summary.uniform_created_at;
+            let stage = crate::tracked_state::stage_ordered_addressable_replacement_parts(
+                writes,
+                journal.iter().map(|row| {
+                    Ok(TrackedStateCommitDeltaRef {
+                        delta: TrackedStateDeltaRef {
+                            schema_key: journal.schema_key(),
+                            file_id: None,
+                            entity_pk: row.entity_pk(),
+                            // Direct-address encoders derive the final id from
+                            // part/row coordinates and ignore this sentinel.
+                            change_id: ChangeId::default(),
+                            commit_id: root.commit_id,
+                            deleted: false,
+                            created_at,
+                            updated_at: journal.timestamp(),
+                        },
+                        snapshot: row.snapshot_slot(),
+                        metadata: crate::json_store::JsonSlotRef::None,
+                        origin_key: None,
+                        base_coordinate: None,
+                        authored: true,
+                    })
+                }),
+                generation,
+            )?;
+            inventories.insert(root.commit_id, stage.mutation_inventory().clone());
+            ordered_addressable_commits.insert(root.commit_id);
+            continue;
+        }
         let state_row_indices = tracked_row_indices_by_commit
             .get(&root.commit_id)
             .map(Vec::as_slice)
@@ -2331,6 +2451,113 @@ async fn certify_complete_replacement_generations(
     Ok(generations)
 }
 
+async fn certify_ordered_journal_replacement_generations(
+    read: &(impl StorageAdapterRead + ?Sized),
+    journals: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
+    tracked_roots: &[PendingTrackedRoot],
+) -> Result<BTreeMap<CommitId, CommitDeltaReplacementGeneration>, LixError> {
+    let mut generations = BTreeMap::new();
+    for root in tracked_roots {
+        let Some(journal) = journals.get(&root.commit_id) else {
+            continue;
+        };
+        if journal.commit_id() != root.commit_id || journal.row_count() == 0 {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable replacement journal owner or cardinality changed",
+            ));
+        }
+        let scope = CommitDeltaReplacementScope {
+            schema_key: journal.schema_key().to_owned(),
+            file_id: None,
+        };
+        let proof = journal.replacement_proof();
+        let mut current = root.parent_commit_id;
+        let mut seen = BTreeSet::new();
+        let mut lifecycle_summary = None;
+        let fallback_commit_id = loop {
+            let Some(commit_id) = current else {
+                break None;
+            };
+            if !seen.insert(commit_id) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot certify immutable replacement '{}': first-parent cycle includes '{commit_id}'",
+                        root.commit_id
+                    ),
+                ));
+            }
+            let record = ChangelogContext::new()
+                .reader(read)
+                .load_commits(ChangelogCommitLoadRequest {
+                    commit_ids: &[commit_id],
+                })
+                .await?
+                .into_iter()
+                .next()
+                .and_then(|(_, record)| record)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "immutable replacement '{}' has missing parent '{commit_id}'",
+                            root.commit_id
+                        ),
+                    )
+                })?;
+            if !record.tracked_state_rootless {
+                break Some(commit_id);
+            }
+            let Some(metadata) = load_commit_delta_replay_metadata(read, commit_id).await? else {
+                break Some(commit_id);
+            };
+            if metadata.single_partition.as_ref() != Some(&scope) {
+                break Some(commit_id);
+            }
+            if let Some(parent_generation) = metadata.replacement_generation {
+                if parent_generation.scope != scope {
+                    break Some(commit_id);
+                }
+                if usize::try_from(metadata.member_count).ok() != Some(journal.row_count())
+                    || parent_generation.lifecycle_summary.ordered_identity_digest
+                        != proof.ordered_identity_digest
+                {
+                    break Some(commit_id);
+                }
+                lifecycle_summary = Some(parent_generation.lifecycle_summary);
+                break parent_generation.fallback_commit_id;
+            }
+            let Some(summary) = metadata.lifecycle_summary.as_ref() else {
+                break Some(commit_id);
+            };
+            if usize::try_from(metadata.member_count).ok() != Some(journal.row_count())
+                || summary.scope != scope
+                || summary.ordered_identity_digest != proof.ordered_identity_digest
+            {
+                break Some(commit_id);
+            }
+            lifecycle_summary = Some(summary.clone());
+            current = record.parent_commit_ids.first().copied();
+        };
+        let Some(lifecycle_summary) = lifecycle_summary else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable replacement journal lacks parent lifecycle authority; hydrate predecessors and lower it before commit",
+            ));
+        };
+        generations.insert(
+            root.commit_id,
+            CommitDeltaReplacementGeneration {
+                scope,
+                fallback_commit_id,
+                lifecycle_summary,
+            },
+        );
+    }
+    Ok(generations)
+}
+
 fn certified_complete_replacement_scope(
     state_rows: &PreparedStateBatch,
     row_indices: &[RowIndex],
@@ -2404,10 +2631,15 @@ fn select_new_rootless_ordered_commits(
     tracked_roots: &[PendingTrackedRoot],
     ordered_addressable_commits: &BTreeSet<CommitId>,
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
+    ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
 ) -> BTreeSet<CommitId> {
     let can_start_rootless_interval = tracked_roots.len() == 1;
     let mut rootless = BTreeSet::new();
     for root in tracked_roots {
+        if ordered_replacements.contains_key(&root.commit_id) {
+            rootless.insert(root.commit_id);
+            continue;
+        }
         let row_indices = tracked_row_indices_by_commit
             .get(&root.commit_id)
             .map(Vec::as_slice)
@@ -2863,6 +3095,8 @@ async fn stage_tracked_head(
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     checkpoint_epochs: &BTreeMap<String, CommitId>,
     ordered_addressable_commits: &BTreeSet<CommitId>,
+    replacement_generation_commits: &BTreeSet<CommitId>,
+    ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
 ) -> Result<StagedHotHeads, LixError> {
     let lifecycle_ids = lifecycle_snapshot_commit_ids(
         tracked_roots,
@@ -3006,6 +3240,7 @@ async fn stage_tracked_head(
             });
         let complete_replacement_schema =
             (state_rows.complete_collection_replacement_proof().is_some()
+                && replacement_generation_commits.contains(&root.commit_id)
                 && ordered_addressable_commits.contains(&root.commit_id)
                 && !is_checkpoint_publication
                 && state_row_indices.len() >= PACKED_CURRENT_BASE_MIN_ROWS
@@ -3149,6 +3384,55 @@ async fn stage_tracked_head(
             .as_ref()
             .map(|epoch| epoch.coverage)
             .unwrap_or_default();
+        if let Some(journal) = ordered_replacements.get(&root.commit_id) {
+            if is_checkpoint_publication
+                || !staged.selected_change_batches.is_empty()
+                || !untracked_deltas.is_empty()
+                || !engine_rows.is_empty()
+                || !explicit_branch_targets.is_empty()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable replacement journal entered an incompatible HOT publication lane",
+                ));
+            }
+            let (generation, _retired_predecessor_bases) = tracked_head
+                .writer(read, writes)
+                .stage_complete_collection_replacement_current_base(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    journal.schema_key(),
+                    journal.row_count(),
+                    entity_columnar_write_sets,
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_direct_replacement_parts"
+                ))
+                .await?;
+            if let Some(epoch) = working_diff_epoch {
+                let next_epoch = TrackedWorkingDiffEpoch {
+                    checkpoint_commit_id: epoch.checkpoint_commit_id,
+                    generation,
+                    coverage,
+                };
+                if next_epoch != epoch {
+                    stage_tracked_working_diff_epoch(writes, &root.branch_id, next_epoch)?;
+                }
+            }
+            let mut control = normal_branch_head_control(
+                root,
+                parent_control,
+                generation,
+                working_diff_checkpoint_commit_id,
+            )?;
+            control.note_schemas(std::iter::once(journal.schema_key()));
+            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+            continue;
+        }
         if can_publish_ordered_packed_current_base {
             #[cfg(test)]
             ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| {
@@ -5784,6 +6068,7 @@ mod tests {
             &certified_json_refs,
             &PreparedInsertSelection::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .await
         .expect("mixed certified delta should stage");
@@ -7700,6 +7985,7 @@ mod tests {
             &commits,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .await
         .expect("child-before-parent input should still stage parent first");
@@ -7811,6 +8097,7 @@ mod tests {
             &mut staged_root_rebuild_commits,
             &row_indices,
             &commit_rows,
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
         )

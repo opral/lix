@@ -21,6 +21,8 @@ pub(crate) use commit::take_complete_replacement_packed_current_base_publication
 #[cfg(test)]
 pub(crate) use commit::take_complete_replacement_packed_current_base_retirements;
 #[cfg(test)]
+pub(crate) use commit::take_direct_journal_replacement_publications;
+#[cfg(test)]
 pub(crate) use commit::take_ordered_packed_current_base_publications;
 #[cfg(test)]
 pub(crate) use commit::take_rootless_replacement_generation_publications;

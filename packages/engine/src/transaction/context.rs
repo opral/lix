@@ -52,8 +52,9 @@ use crate::gc::{
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{
-    BranchHeadControlCache, LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest,
-    LiveStateFilter, LiveStateProjection, LiveStateScanRequest, MaterializedLiveStateBatch,
+    BranchHeadControlCache, CertifiedCurrentStatePredecessor, LiveStateContext,
+    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
+    LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
     MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
     StagedLiveStateRows, TrackedHeadContext, TrackedWorkingDiff, overlay_load_exact_batch,
     overlay_scan_batch,
@@ -107,18 +108,17 @@ use crate::transaction::normalization::{
 };
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{
-    PreparedStateRowOverlay, PreparedWriteSet, TransactionWriteBuffer,
-    TransactionWriteBufferCheckpoint,
+    ImmutableMutationChunkStage, ImmutableMutationJournalChunk, PreparedStateRowOverlay,
+    PreparedWriteSet, TransactionWriteBuffer, TransactionWriteBufferCheckpoint,
 };
 use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
 use crate::transaction::types::{
-    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
-    CertifiedRawWriteBatchPreparation, PreparedRowFacts, PreparedStateBatch,
-    PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef, StagedCommitChangeBatch,
-    StagedCommitChangeBatchBuilder, TransactionFileData, TransactionJson, TransactionWrite,
-    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
+    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
+    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileData, TransactionJson,
+    TransactionWrite, TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteOutcome, TransactionWriteRow, canonicalize_transaction_json_batch,
     stage_json_from_value,
 };
@@ -489,11 +489,19 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
         Arc<crate::sql2::PreparedPathValueReplacementProgram>,
     )>,
     prepared_mutation_membership: PreparedMutationMembership,
+    /// Once proven, a homogeneous prepared generation can avoid locking the
+    /// generic row overlay for every independent scalar mutation. Changing
+    /// the prepared program invalidates this transaction-local proof.
+    prepared_mutation_overlay_empty: bool,
     /// One logical timestamp for a homogeneous columnar mutation generation.
     /// Immutable replacement parts require their post-image rows to share the
     /// same lifecycle boundary, so sealing must not preserve per-call clocks.
     prepared_mutation_timestamp: Option<LixTimestamp>,
     mutation_journal: Option<TransactionMutationJournal>,
+    /// Sealing consumes the journal's owned column buffers. If any fallible
+    /// validation or staging step rejects those buffers, this transaction can
+    /// no longer provide statement atomicity and must remain rollback-only.
+    mutation_journal_terminal_error: Option<LixError>,
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
@@ -537,6 +545,9 @@ struct TransactionMutationJournal {
     snapshot_offsets: Vec<(usize, usize)>,
     timestamp: Option<LixTimestamp>,
 }
+
+const INITIAL_MUTATION_JOURNAL_ROWS: usize = 16;
+const INITIAL_MUTATION_JOURNAL_ARENA_BYTES: usize = 1_024;
 
 enum PreparedMutationMembership {
     Unprepared,
@@ -795,6 +806,30 @@ where
                 format!("branch '{}' does not exist", self.active_branch_id),
             ));
         };
+
+        // A complete-set journal is certified against the coherent opening
+        // snapshot. If this branch advanced, expose its identities—with exact
+        // current predecessor lifecycle—to the established stale-write
+        // classifier and generic reconciliation lane. Unchanged-head commits
+        // retain the zero-reconstruction direct path.
+        let journal_descriptors = prepared_writes.ordered_mutation_journal_descriptors();
+        if !journal_descriptors.is_empty() {
+            let base = self
+                .live_state
+                .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
+            let mut predecessors_by_commit = BTreeMap::new();
+            for descriptor in journal_descriptors {
+                let predecessors = load_immutable_mutation_predecessors(
+                    &base,
+                    &descriptor.schema_key,
+                    &descriptor.branch_id,
+                    &descriptor.entity_pk_chunks,
+                )
+                .await?;
+                predecessors_by_commit.insert(descriptor.commit_id, predecessors);
+            }
+            prepared_writes.hydrate_and_lower_ordered_mutation_journals(predecessors_by_commit)?;
+        }
 
         let mut tracked = self.tracked_state.reader(read);
         let opening_head_text = opening_head.to_string();
@@ -1360,8 +1395,10 @@ where
                 sql_planning_cache,
                 prepared_mutation_program: None,
                 prepared_mutation_membership: PreparedMutationMembership::Unprepared,
+                prepared_mutation_overlay_empty: false,
                 prepared_mutation_timestamp: None,
                 mutation_journal: None,
+                mutation_journal_terminal_error: None,
                 staged_writes,
                 filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
                 filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
@@ -6327,6 +6364,9 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<Option<crate::sql2::SqlWriteResult>, LixError> {
+        if let Some(error) = &self.mutation_journal_terminal_error {
+            return Err(error.clone());
+        }
         let Some((cached_sql, program)) = self.prepared_mutation_program.as_ref() else {
             return Ok(None);
         };
@@ -6362,6 +6402,21 @@ where
                 None => PreparedMutationMembership::Unavailable,
             };
         }
+        if !self.prepared_mutation_overlay_empty {
+            if self.staged_writes.staged_identity_may_affect(
+                &self.active_branch_id,
+                &program.schema_key,
+                None,
+                &entity_pk,
+            )? {
+                // A transaction-local predecessor is part of the mutable
+                // overlay, not durable history. Keep dependent statements on
+                // the generic executor so INSERT/UPDATE/DELETE coalescing
+                // retains lifecycle and constraint semantics.
+                return Ok(None);
+            }
+            self.prepared_mutation_overlay_empty = !self.staged_writes.has_staged_state_rows()?;
+        }
         let cached_membership = match &mut self.prepared_mutation_membership {
             PreparedMutationMembership::Packed(membership) => membership.contains(&entity_pk)?,
             PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
@@ -6394,9 +6449,9 @@ where
         let journal = journal_slot.get_or_insert_with(|| TransactionMutationJournal {
             program: Arc::clone(&program),
             origin_key: origin_key.clone(),
-            entity_pks: Vec::with_capacity(4_096),
-            snapshot_arena: Vec::with_capacity(4_096 * 64),
-            snapshot_offsets: Vec::with_capacity(4_096),
+            entity_pks: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
+            snapshot_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
+            snapshot_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
             timestamp: None,
         });
         debug_assert!(Arc::ptr_eq(&journal.program, &program));
@@ -6430,6 +6485,50 @@ where
             .is_some_and(|(cached_sql, _)| cached_sql.as_ref() == sql)
     }
 
+    pub(crate) fn prepared_literal_mutation_parameter_count(&self, sql: &str) -> Option<usize> {
+        let (shape, program) = self.prepared_mutation_program.as_ref()?;
+        self.sql_planning_cache
+            .update_literal_shape_matches(sql, shape)
+            .then(|| program.parameter_count())
+    }
+
+    pub(crate) async fn flush_cached_prepared_mutation_barrier(
+        &mut self,
+        next_origin_key: Option<&str>,
+        params: &[Value],
+    ) -> Result<(), LixError> {
+        let cached_sql = self
+            .prepared_mutation_program
+            .as_ref()
+            .map(|(sql, _)| Arc::clone(sql))
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "cached mutation barrier has no prepared mutation program",
+                )
+            })?;
+        self.flush_prepared_mutation_barrier(&cached_sql, next_origin_key, params)
+            .await
+    }
+
+    pub(crate) async fn try_execute_cached_prepared_mutation(
+        &mut self,
+        params: &[Value],
+    ) -> Result<Option<crate::sql2::SqlWriteResult>, LixError> {
+        let cached_sql = self
+            .prepared_mutation_program
+            .as_ref()
+            .map(|(sql, _)| Arc::clone(sql))
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "cached mutation execution has no prepared mutation program",
+                )
+            })?;
+        self.try_execute_prepared_mutation(&cached_sql, params)
+            .await
+    }
+
     pub(crate) fn remember_prepared_mutation(
         &mut self,
         sql: &str,
@@ -6442,6 +6541,7 @@ where
         {
             self.prepared_mutation_program = None;
             self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
+            self.prepared_mutation_overlay_empty = false;
             self.prepared_mutation_timestamp = None;
             return Ok(());
         }
@@ -6449,41 +6549,119 @@ where
             crate::sql2::prepare_path_value_replacement_program(self, plan)
                 .map(|program| (Arc::<str>::from(sql), Arc::new(program)));
         self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
+        self.prepared_mutation_overlay_empty = false;
         self.prepared_mutation_timestamp = None;
         Ok(())
     }
 
     pub(crate) async fn flush_prepared_mutations(&mut self) -> Result<(), LixError> {
-        let complete_generation = match (
-            &self.prepared_mutation_program,
-            &self.prepared_mutation_membership,
-        ) {
-            (Some((_, program)), PreparedMutationMembership::Packed(membership)) => Some((
-                program.schema_key.clone(),
-                self.active_branch_id.clone(),
-                membership.complete_generation(),
-            )),
-            (
-                _,
-                PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable,
-            )
-            | (None, PreparedMutationMembership::Packed(_)) => None,
-        };
-        self.flush_mutation_journal().await?;
-        if let Some((schema_key, branch_id, (live_count, ordered_identity_digest))) =
-            complete_generation
+        if let Some(error) = &self.mutation_journal_terminal_error {
+            return Err(error.clone());
+        }
+        let generation_seed = self.prepared_mutation_collection_generation_seed();
+        let mut complete_generation = resolve_prepared_mutation_collection_generation(
+            generation_seed,
+            self.opening_read(),
+            Arc::clone(&self.live_state),
+            Arc::clone(&self.branch_head_control_cache),
+            self.active_branch_id.clone(),
+        )
+        .await?
+        .map(|(schema_key, generation)| (schema_key, self.active_branch_id.clone(), generation));
+        if let Some((schema_key, _, (live_count, ordered_identity_digest))) =
+            complete_generation.as_ref()
         {
-            self.staged_writes.certify_complete_collection_replacement(
-                schema_key.as_str(),
-                &branch_id,
-                live_count,
-                ordered_identity_digest,
-            )?;
+            let opening_read = self.opening_read();
+            if opening_parent_complete_lifecycle_created_at(
+                &opening_read,
+                self.opening_active_branch_head,
+                schema_key,
+                *live_count,
+                *ordered_identity_digest,
+            )
+            .await?
+            .is_none()
+            {
+                complete_generation = None;
+            }
+        }
+        self.flush_mutation_journal().await?;
+        let replacement_certified =
+            if let Some((schema_key, branch_id, (live_count, ordered_identity_digest))) =
+                complete_generation
+            {
+                self.staged_writes.certify_complete_collection_replacement(
+                    schema_key.as_str(),
+                    &branch_id,
+                    live_count,
+                    ordered_identity_digest,
+                )?
+            } else {
+                false
+            };
+        if !replacement_certified {
+            self.lower_provisional_mutations_to_prepared().await?;
         }
         self.prepared_mutation_program = None;
         self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
+        self.prepared_mutation_overlay_empty = false;
         self.prepared_mutation_timestamp = None;
         Ok(())
+    }
+
+    /// Flushes pending mutations into the transaction-visible row overlay.
+    /// The immutable journal itself is a staged read source, so an intervening
+    /// read seals only the current mutable chunk and does not reconstruct a
+    /// `PreparedStateBatch`.
+    pub(crate) async fn flush_prepared_mutations_for_read(&mut self) -> Result<(), LixError> {
+        self.flush_mutation_journal().await?;
+        let generation_seed = self.prepared_mutation_collection_generation_seed();
+        let Some((schema_key, (live_count, ordered_identity_digest))) =
+            resolve_prepared_mutation_collection_generation(
+                generation_seed,
+                self.opening_read(),
+                Arc::clone(&self.live_state),
+                Arc::clone(&self.branch_head_control_cache),
+                self.active_branch_id.clone(),
+            )
+            .await?
+        else {
+            self.hydrate_provisional_mutation_predecessors().await?;
+            return Ok(());
+        };
+        let opening_read = self.opening_read();
+        if let Some(created_at) = opening_parent_complete_lifecycle_created_at(
+            &opening_read,
+            self.opening_active_branch_head,
+            &schema_key,
+            live_count,
+            ordered_identity_digest,
+        )
+        .await?
+        {
+            self.staged_writes
+                .set_ordered_mutation_overlay_created_at(created_at)?;
+        } else {
+            self.hydrate_provisional_mutation_predecessors().await?;
+        }
+        Ok(())
+    }
+
+    fn prepared_mutation_collection_generation_seed(
+        &self,
+    ) -> Option<(String, Option<(u64, [u8; 32])>)> {
+        let Some((_, program)) = &self.prepared_mutation_program else {
+            return None;
+        };
+        let generation = match &self.prepared_mutation_membership {
+            PreparedMutationMembership::Packed(membership) => {
+                Some(membership.complete_generation())
+            }
+            PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
+                None
+            }
+        };
+        Some((program.schema_key.clone(), generation))
     }
 
     pub(crate) async fn flush_prepared_mutation_barrier(
@@ -6500,13 +6678,7 @@ where
             .mutation_journal
             .as_ref()
             .is_none_or(|journal| journal.origin_key.as_deref() == next_origin_key);
-        let ordered_append = if same_program
-            && same_origin
-            && self
-                .mutation_journal
-                .as_ref()
-                .is_none_or(|journal| journal.entity_pks.len() < 4_096)
-        {
+        let ordered_append = if same_program && same_origin {
             self.prepared_mutation_program
                 .as_ref()
                 .and_then(|(_, program)| program.primary_key(params).ok())
@@ -6520,18 +6692,38 @@ where
         } else {
             false
         };
-        if !same_program || !same_origin || !ordered_append {
+        let chunk_has_capacity = self
+            .mutation_journal
+            .as_ref()
+            .is_none_or(|journal| journal.entity_pks.len() < 4_096);
+        if !same_program || !same_origin || !ordered_append || !chunk_has_capacity {
             self.flush_mutation_journal().await?;
+        }
+        if !same_program || !same_origin || !ordered_append {
+            self.lower_provisional_mutations_to_prepared().await?;
+            self.prepared_mutation_overlay_empty = false;
         }
         if !same_program {
             self.prepared_mutation_program = None;
             self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
+            self.prepared_mutation_overlay_empty = false;
             self.prepared_mutation_timestamp = None;
         }
         Ok(())
     }
 
     async fn flush_mutation_journal(&mut self) -> Result<(), LixError> {
+        if let Some(error) = &self.mutation_journal_terminal_error {
+            return Err(error.clone());
+        }
+        let result = self.flush_mutation_journal_inner().await;
+        if let Err(error) = &result {
+            self.mutation_journal_terminal_error = Some(error.clone());
+        }
+        result
+    }
+
+    async fn flush_mutation_journal_inner(&mut self) -> Result<(), LixError> {
         let Some(journal) = self.mutation_journal.take() else {
             return Ok(());
         };
@@ -6545,39 +6737,166 @@ where
             crate::storage_bench::record_transaction_rows_staged(row_count);
             crate::storage_bench::record_transaction_untracked_rows(0);
         }
-        let rows = CertifiedParameterReplacementBatch::new(
-            journal.entity_pks,
-            TransactionJson::from_certified_row_content_arena(
-                journal.snapshot_arena,
-                journal.snapshot_offsets,
-            )?,
+        let timestamp = journal.timestamp.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "non-empty transaction mutation journal has no lifecycle timestamp",
+            )
+        })?;
+        let chunk = ImmutableMutationJournalChunk::try_new(
+            journal.program.schema_plan_id,
             journal.program.schema_key.as_str().into(),
             self.active_branch_id.clone().into(),
-            CertifiedRawWriteBatchPreparation {
-                schema_plan_id: journal.program.schema_plan_id,
-                facts: PreparedRowFacts {
-                    row_content_validated: true,
-                    requires_transaction_validation: false,
-                },
-                tracked_keys_strictly_ordered: true,
-                complete_collection_replacement: None,
-            },
-        )?
-        .into_dense_prepared(
-            journal.origin_key.as_ref(),
-            journal.timestamp.ok_or_else(|| {
+            journal.origin_key,
+            journal.entity_pks,
+            journal.snapshot_arena,
+            journal.snapshot_offsets,
+            None,
+            timestamp,
+        )?;
+        match self.staged_writes.stage_immutable_mutation_chunk(chunk)? {
+            ImmutableMutationChunkStage::Staged => {}
+            ImmutableMutationChunkStage::RequiresGeneric(chunk) => {
+                self.lower_provisional_mutations_to_prepared().await?;
+                let chunk = self.hydrate_immutable_mutation_chunk(chunk).await?;
+                self.staged_writes
+                    .stage_write(PreparedTransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
+                        rows: chunk.into_prepared(false)?,
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn lower_provisional_mutations_to_prepared(&mut self) -> Result<(), LixError> {
+        self.hydrate_provisional_mutation_predecessors().await?;
+        self.staged_writes.lower_immutable_mutations_to_prepared()
+    }
+
+    async fn hydrate_provisional_mutation_predecessors(&mut self) -> Result<(), LixError> {
+        let Some(descriptor) = self
+            .staged_writes
+            .provisional_mutation_journal_descriptor()?
+        else {
+            return Ok(());
+        };
+        if descriptor.predecessors_complete() {
+            return Ok(());
+        }
+        let schema_key = descriptor.schema_key().to_owned();
+        let branch_id = descriptor.branch_id().to_owned();
+        let row_count = descriptor
+            .entity_pk_chunks()
+            .iter()
+            .map(|chunk| chunk.len())
+            .sum();
+        let mut predecessors = Vec::with_capacity(row_count);
+        for entity_pks in descriptor.entity_pk_chunks() {
+            let request = LiveStateExactBatchRequest {
+                rows: entity_pks
+                    .iter()
+                    .cloned()
+                    .map(|entity_pk| LiveStateExactRowRequest {
+                        schema_key: schema_key.clone(),
+                        branch_id: branch_id.clone(),
+                        entity_pk,
+                        file_id: None,
+                    })
+                    .collect(),
+                projection: LiveStateProjection::default(),
+                untracked: Some(false),
+                include_tombstones: false,
+            };
+            let current = load_opening_exact_live_state_batch(
+                self.opening_read(),
+                Arc::clone(&self.live_state),
+                Arc::clone(&self.branch_head_control_cache),
+                &request,
+            )
+            .await?;
+            for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
+                let row = current.row(slot).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "partial immutable mutation lost its current-state predecessor",
+                    )
+                })?;
+                if row.schema_key() != schema_key
+                    || row.branch_id() != branch_id
+                    || row.entity_pk() != expected_entity_pk
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "partial immutable mutation predecessor order changed",
+                    ));
+                }
+                predecessors.push(row.durable_predecessor().cloned().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "partial immutable mutation predecessor lacks durable evidence",
+                    )
+                })?);
+            }
+        }
+        self.staged_writes
+            .hydrate_immutable_mutation_predecessors(predecessors)?;
+        Ok(())
+    }
+
+    async fn hydrate_immutable_mutation_chunk(
+        &mut self,
+        mut chunk: ImmutableMutationJournalChunk,
+    ) -> Result<ImmutableMutationJournalChunk, LixError> {
+        let entity_pks = Arc::clone(chunk.entity_pks());
+        let request = LiveStateExactBatchRequest {
+            rows: entity_pks
+                .iter()
+                .cloned()
+                .map(|entity_pk| LiveStateExactRowRequest {
+                    schema_key: chunk.schema_key().to_owned(),
+                    branch_id: chunk.branch_id().to_owned(),
+                    entity_pk,
+                    file_id: None,
+                })
+                .collect(),
+            projection: LiveStateProjection::default(),
+            untracked: Some(false),
+            include_tombstones: false,
+        };
+        let current = load_opening_exact_live_state_batch(
+            self.opening_read(),
+            Arc::clone(&self.live_state),
+            Arc::clone(&self.branch_head_control_cache),
+            &request,
+        )
+        .await?;
+        let mut predecessors = Vec::with_capacity(entity_pks.len());
+        for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
+            let row = current.row(slot).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "non-empty transaction mutation journal has no lifecycle timestamp",
+                    "mixed immutable mutation lost its current-state predecessor",
                 )
-            })?,
-        )?;
-        self.staged_writes
-            .stage_write(PreparedTransactionWrite::Rows {
-                mode: TransactionWriteMode::Replace,
-                rows,
             })?;
-        Ok(())
+            if row.schema_key() != chunk.schema_key()
+                || row.branch_id() != chunk.branch_id()
+                || row.entity_pk() != expected_entity_pk
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "mixed immutable mutation predecessor order changed",
+                ));
+            }
+            predecessors.push(row.durable_predecessor().cloned().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "mixed immutable mutation predecessor lacks durable evidence",
+                )
+            })?);
+        }
+        chunk.attach_durable_predecessors(predecessors)?;
+        Ok(chunk)
     }
 
     /// Returns this transaction's prepared runtime functions.
@@ -7323,6 +7642,61 @@ where
     }
 }
 
+async fn load_immutable_mutation_predecessors<R>(
+    reader: &R,
+    schema_key: &str,
+    branch_id: &str,
+    entity_pk_chunks: &[Arc<[EntityPk]>],
+) -> Result<Vec<CertifiedCurrentStatePredecessor>, LixError>
+where
+    R: LiveStateReader + ?Sized,
+{
+    let row_count = entity_pk_chunks.iter().map(|chunk| chunk.len()).sum();
+    let mut predecessors = Vec::with_capacity(row_count);
+    for entity_pks in entity_pk_chunks {
+        let request = LiveStateExactBatchRequest {
+            rows: entity_pks
+                .iter()
+                .cloned()
+                .map(|entity_pk| LiveStateExactRowRequest {
+                    schema_key: schema_key.to_owned(),
+                    branch_id: branch_id.to_owned(),
+                    entity_pk,
+                    file_id: None,
+                })
+                .collect(),
+            projection: LiveStateProjection::default(),
+            untracked: Some(false),
+            include_tombstones: false,
+        };
+        let current = reader.load_exact_batch(&request).await?;
+        for (slot, expected_entity_pk) in entity_pks.iter().enumerate() {
+            let row = current.row(slot).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation lost its current-state predecessor",
+                )
+            })?;
+            if row.schema_key() != schema_key
+                || row.branch_id() != branch_id
+                || row.entity_pk() != expected_entity_pk
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation predecessor order changed",
+                ));
+            }
+            predecessors.push(row.durable_predecessor().cloned().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation predecessor lacks durable evidence",
+                )
+            })?);
+        }
+    }
+    Ok(predecessors)
+}
+
 fn conflict_resolution_limits(conflict_count: usize) -> Result<WasmTransitionLimits, LixError> {
     let conflict_count = u32::try_from(conflict_count).map_err(|_| {
         LixError::new(
@@ -7364,6 +7738,82 @@ fn empty_state_transition(current: CommitId, desired: CommitId) -> LixError {
         LixError::CODE_INTERNAL_ERROR,
         format!("tracked-state transition from '{current}' to '{desired}' is empty"),
     )
+}
+
+async fn opening_parent_complete_lifecycle_created_at(
+    read: &(impl StorageAdapterRead + ?Sized),
+    parent_commit_id: Option<CommitId>,
+    schema_key: &str,
+    live_count: u64,
+    ordered_identity_digest: [u8; 32],
+) -> Result<Option<LixTimestamp>, LixError> {
+    let Some(parent_commit_id) = parent_commit_id else {
+        return Ok(None);
+    };
+    let Some(manifest) =
+        crate::tracked_state::load_commit_state_manifest(read, parent_commit_id).await?
+    else {
+        return Ok(None);
+    };
+    let expected_scope = crate::tracked_state::CommitDeltaReplacementScope {
+        schema_key: schema_key.to_owned(),
+        file_id: None,
+    };
+    if manifest.mutations.member_count != u32::try_from(live_count).unwrap_or(u32::MAX)
+        || manifest.mutations.single_partition.as_ref() != Some(&expected_scope)
+    {
+        return Ok(None);
+    }
+    Ok(manifest
+        .mutations
+        .lifecycle_summary
+        .as_ref()
+        .filter(|summary| {
+            summary.scope == expected_scope
+                && summary.ordered_identity_digest == ordered_identity_digest
+        })
+        .map(|summary| summary.uniform_created_at))
+}
+
+async fn resolve_prepared_mutation_collection_generation(
+    seed: Option<(String, Option<(u64, [u8; 32])>)>,
+    read: impl StorageAdapterRead + Send,
+    live_state: Arc<LiveStateContext>,
+    branch_head_control_cache: Arc<BranchHeadControlCache>,
+    branch_id: String,
+) -> Result<Option<(String, (u64, [u8; 32]))>, LixError> {
+    let Some((schema_key, generation)) = seed else {
+        return Ok(None);
+    };
+    if let Some(generation) = generation {
+        return Ok(Some((schema_key, generation)));
+    }
+    let base = live_state.transaction_reader(read, branch_head_control_cache);
+    let generation = base
+        .collection_generation(
+            &branch_id,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key: &schema_key,
+                file_id: None,
+            },
+        )
+        .await?
+        .and_then(|generation| {
+            generation
+                .ordered_identity_digest
+                .map(|digest| (generation.live_count, digest))
+        });
+    Ok(generation.map(|generation| (schema_key, generation)))
+}
+
+async fn load_opening_exact_live_state_batch(
+    read: impl StorageAdapterRead + Send,
+    live_state: Arc<LiveStateContext>,
+    branch_head_control_cache: Arc<BranchHeadControlCache>,
+    request: &LiveStateExactBatchRequest,
+) -> Result<MaterializedLiveStateExactBatch, LixError> {
+    let base = live_state.transaction_reader(read, branch_head_control_cache);
+    base.load_exact_batch(request).await
 }
 
 fn diff_record_identity(record: &ChangeRecord) -> (String, EntityPk, Option<String>) {
@@ -7446,7 +7896,7 @@ where
         &self.active_branch_id
     }
 
-    fn live_state(&self) -> Arc<dyn crate::live_state::LiveStateReader> {
+    fn live_state(&self) -> Arc<dyn LiveStateReader> {
         Arc::new(TransactionReadLiveStateReader {
             base: self.live_state.transaction_reader(
                 self.read_store.clone(),
@@ -7579,7 +8029,7 @@ struct TransactionReadLiveStateReader<R: crate::storage_adapter::StorageRead> {
 }
 
 #[async_trait]
-impl<R> crate::live_state::LiveStateReader for TransactionReadLiveStateReader<R>
+impl<R> LiveStateReader for TransactionReadLiveStateReader<R>
 where
     R: crate::storage_adapter::StorageRead + 'static,
 {
@@ -9757,7 +10207,7 @@ struct PluginUpgradeBlobRefSnapshot {
 
 async fn preflight_owned_generation_upgrades(
     host: &PluginRuntimeHost,
-    base: &dyn crate::live_state::LiveStateReader,
+    base: &dyn LiveStateReader,
     staged: &impl StagedLiveStateRows,
     base_blob_reader: &dyn BlobDataReader,
     staged_writes: &TransactionWriteBuffer,

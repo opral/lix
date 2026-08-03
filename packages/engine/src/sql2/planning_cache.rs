@@ -130,6 +130,33 @@ where
         decode_update_string_literals_into(sql, params)
     }
 
+    /// Decodes a shape-certified scalar UPDATE directly into reusable public
+    /// parameter slots. This is the scalar journal counterpart of the shared
+    /// batch decoder: no normalized SQL, AST clone, parameter vector, or
+    /// per-value string allocation is constructed for a warm statement.
+    pub(crate) fn decode_certified_update_literals_into_values(
+        &self,
+        sql: &str,
+        params: &mut [Value],
+    ) -> bool {
+        params.iter_mut().all(|param| match param {
+            Value::Text(value) => {
+                value.clear();
+                true
+            }
+            _ => false,
+        }) && decode_update_string_literals_with(sql, params.len(), |index, segment, escaped| {
+            let Some(Value::Text(value)) = params.get_mut(index) else {
+                return false;
+            };
+            value.push_str(segment);
+            if escaped {
+                value.push('\'');
+            }
+            true
+        })
+    }
+
     /// Returns stable public-surface metadata for one catalog generation.
     ///
     /// Callers are responsible for using a key that changes whenever any
@@ -390,6 +417,23 @@ fn update_string_literals_match_shape(sql: &str, normalized_shape: &str) -> bool
 
 fn decode_update_string_literals_into(sql: &str, params: &mut [String]) -> bool {
     params.iter_mut().for_each(String::clear);
+    decode_update_string_literals_with(sql, params.len(), |index, segment, escaped| {
+        let Some(value) = params.get_mut(index) else {
+            return false;
+        };
+        value.push_str(segment);
+        if escaped {
+            value.push('\'');
+        }
+        true
+    })
+}
+
+fn decode_update_string_literals_with(
+    sql: &str,
+    parameter_count: usize,
+    mut append: impl FnMut(usize, &str, bool) -> bool,
+) -> bool {
     let bytes = sql.as_bytes();
     let mut cursor = 0_usize;
     let mut param_index = 0_usize;
@@ -405,9 +449,10 @@ fn decode_update_string_literals_into(sql: &str, params: &mut [String]) -> bool 
                 cursor += 1;
             }
             b'\'' if !quoted_identifier => {
-                let Some(value) = params.get_mut(param_index) else {
+                if param_index >= parameter_count {
                     return false;
-                };
+                }
+                let current_param = param_index;
                 param_index += 1;
                 cursor += 1;
                 let mut segment_start = cursor;
@@ -419,9 +464,11 @@ fn decode_update_string_literals_into(sql: &str, params: &mut [String]) -> bool 
                     else {
                         return false;
                     };
-                    value.push_str(&sql[segment_start..quote]);
-                    if bytes.get(quote + 1) == Some(&b'\'') {
-                        value.push('\'');
+                    let escaped = bytes.get(quote + 1) == Some(&b'\'');
+                    if !append(current_param, &sql[segment_start..quote], escaped) {
+                        return false;
+                    }
+                    if escaped {
                         cursor = quote + 2;
                         segment_start = cursor;
                         continue;
@@ -433,7 +480,7 @@ fn decode_update_string_literals_into(sql: &str, params: &mut [String]) -> bool 
             _ => cursor += 1,
         }
     }
-    !quoted_identifier && param_index == params.len()
+    !quoted_identifier && param_index == parameter_count
 }
 
 #[cfg(test)]
@@ -559,6 +606,45 @@ mod tests {
             "UPDATE notes SET value = 'only-one'",
             &mut params,
         ));
+    }
+
+    #[test]
+    fn certified_literal_value_decoder_reuses_text_storage() {
+        let cache = test_cache(8);
+        let mut params = vec![
+            Value::Text(String::with_capacity(64)),
+            Value::Text(String::with_capacity(32)),
+        ];
+        let capacities = params
+            .iter()
+            .map(|value| match value {
+                Value::Text(value) => value.capacity(),
+                _ => unreachable!("test slots are text"),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(cache.decode_certified_update_literals_into_values(
+            "UPDATE notes SET value = lix_json('{\"text\":\"it''s warm\"}') WHERE id = 'row-1'",
+            &mut params,
+        ));
+        assert_eq!(
+            params,
+            [
+                Value::Text("{\"text\":\"it's warm\"}".to_string()),
+                Value::Text("row-1".to_string()),
+            ]
+        );
+        assert_eq!(
+            params
+                .iter()
+                .map(|value| match value {
+                    Value::Text(value) => value.capacity(),
+                    _ => unreachable!("test slots stay text"),
+                })
+                .collect::<Vec<_>>(),
+            capacities,
+            "warm decoding must retain the session-owned string buffers"
+        );
     }
 
     #[test]

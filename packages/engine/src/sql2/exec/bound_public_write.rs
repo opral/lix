@@ -2785,6 +2785,12 @@ pub(crate) struct PreparedPathValueReplacementRow {
 }
 
 impl PreparedPathValueReplacementProgram {
+    pub(crate) fn parameter_count(&self) -> usize {
+        self.primary_key_param_index
+            .max(self.value_param_index)
+            .saturating_add(1)
+    }
+
     pub(crate) fn primary_key<'a>(&self, params: &'a [Value]) -> Result<&'a str, LixError> {
         let Some(Value::Text(primary_key)) = params.get(self.primary_key_param_index) else {
             return Err(LixError::new(

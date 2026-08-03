@@ -12,13 +12,14 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use smallvec::SmallVec;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BlobBytesBatch, BlobId};
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
-use crate::common::SharedStr;
+use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_pk::EntityPk;
 #[cfg(test)]
@@ -30,17 +31,20 @@ use crate::live_state::LiveStateRowRequest;
 #[cfg(test)]
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateScanRequest,
-    MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
+    CertifiedCurrentStatePredecessor, LiveStateExactBatchRequest, LiveStateExactRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
+    MaterializedLiveStateExactBatch,
 };
 use crate::transaction::types::StagedCommitChangeRefs;
 use crate::transaction::types::{
-    LogicalPrimaryKey, PreparedStateBatch, PreparedStateRowRef, PreparedTransactionWrite,
-    StageJson, StagedCommitChangeBatch, TransactionFileData, TransactionWriteMode,
-    TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteOutcome,
+    CertifiedParameterReplacementBatch, CertifiedRawWriteBatchPreparation,
+    CompleteCollectionReplacementProof, LogicalPrimaryKey, PreparedRowFacts, PreparedStateBatch,
+    PreparedStateRowRef, PreparedTransactionWrite, StageJson, StagedCommitChangeBatch,
+    TransactionFileData, TransactionJson, TransactionWriteMode, TransactionWriteOperation,
+    TransactionWriteOrigin, TransactionWriteOutcome,
 };
 #[cfg(test)]
-use crate::transaction::types::{TestPreparedStateRow, TransactionJson, stage_json_from_value};
+use crate::transaction::types::{TestPreparedStateRow, stage_json_from_value};
 use crate::{LixError, NullableKeyFilter};
 
 /// Transaction-local write buffer after transaction-boundary preparation.
@@ -52,6 +56,7 @@ use crate::{LixError, NullableKeyFilter};
 pub(crate) struct TransactionWriteBuffer {
     functions: FunctionProviderHandle,
     rows: Mutex<StagedPreparedRows>,
+    ordered_mutations: Mutex<Option<OrderedMutationJournal>>,
     commit_change_refs_by_branch: Mutex<BTreeMap<String, StagedCommitChangeRefs>>,
     first_commit_parent_override_by_branch: Mutex<BTreeMap<String, CommitId>>,
     checkpoint_publications: Mutex<Vec<CheckpointPublication>>,
@@ -68,12 +73,439 @@ pub(crate) struct TransactionWriteBuffer {
 /// to restore an explicit transaction after a post-stage SQL error.
 pub(crate) struct TransactionWriteBufferCheckpoint {
     rows: StagedPreparedRows,
+    ordered_mutations: Option<OrderedMutationJournal>,
     commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
     first_commit_parent_override_by_branch: BTreeMap<String, CommitId>,
     checkpoint_publications: Vec<CheckpointPublication>,
     extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     intermediate_commits: Vec<StagedIntermediateCommit>,
     file_data_writes: Vec<TransactionFileData>,
+}
+
+/// One immutable, fixed-shape journal chunk produced by typed SQL mutation
+/// ingress. Identity and canonical JSON remain columnar owners; commit can
+/// borrow them directly while encoding immutable mutation parts.
+#[derive(Clone, Debug)]
+pub(crate) struct ImmutableMutationJournalChunk {
+    schema_plan_id: SchemaPlanId,
+    schema_key: SharedStr,
+    branch_id: SharedStr,
+    origin_key: Option<SharedStr>,
+    entity_pks: Arc<[EntityPk]>,
+    snapshot_arena: Bytes,
+    snapshot_offsets: Arc<[(u32, u32)]>,
+    large_snapshot_refs: Arc<[(u16, crate::json_store::JsonRef)]>,
+    durable_predecessors: Option<Arc<[CertifiedCurrentStatePredecessor]>>,
+    timestamp: LixTimestamp,
+}
+
+impl PartialEq for ImmutableMutationJournalChunk {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_plan_id == other.schema_plan_id
+            && self.schema_key == other.schema_key
+            && self.branch_id == other.branch_id
+            && self.origin_key == other.origin_key
+            && self.entity_pks == other.entity_pks
+            && self.snapshot_arena == other.snapshot_arena
+            && self.snapshot_offsets == other.snapshot_offsets
+            && self.large_snapshot_refs == other.large_snapshot_refs
+            && self.timestamp == other.timestamp
+            && self.durable_predecessors.as_ref().map(|values| {
+                values
+                    .iter()
+                    .map(CertifiedCurrentStatePredecessor::created_at)
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+            }) == other.durable_predecessors.as_ref().map(|values| {
+                values
+                    .iter()
+                    .map(CertifiedCurrentStatePredecessor::created_at)
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+            })
+    }
+}
+
+impl Eq for ImmutableMutationJournalChunk {}
+
+impl ImmutableMutationJournalChunk {
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        schema_plan_id: SchemaPlanId,
+        schema_key: SharedStr,
+        branch_id: SharedStr,
+        origin_key: Option<SharedStr>,
+        entity_pks: Vec<EntityPk>,
+        snapshot_arena: Vec<u8>,
+        snapshot_offsets: Vec<(usize, usize)>,
+        durable_predecessors: Option<Vec<CertifiedCurrentStatePredecessor>>,
+        timestamp: LixTimestamp,
+    ) -> Result<Self, LixError> {
+        if entity_pks.is_empty() || entity_pks.len() != snapshot_offsets.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation journal columns are empty or misaligned",
+            ));
+        }
+        if durable_predecessors
+            .as_ref()
+            .is_some_and(|predecessors| predecessors.len() != entity_pks.len())
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation predecessor column is misaligned",
+            ));
+        }
+        if !entity_pks.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation journal identities are not strictly ordered",
+            ));
+        }
+        let arena_len = snapshot_arena.len();
+        std::str::from_utf8(&snapshot_arena).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation journal arena is not UTF-8",
+            )
+        })?;
+        let mut previous_end = 0usize;
+        let mut offsets = Vec::with_capacity(snapshot_offsets.len());
+        for (start, end) in snapshot_offsets {
+            if start != previous_end || end <= start || end > arena_len {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation journal offsets are invalid",
+                ));
+            }
+            std::str::from_utf8(&snapshot_arena[start..end]).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation journal offset splits UTF-8",
+                )
+            })?;
+            offsets.push((
+                u32::try_from(start).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "immutable mutation journal arena exceeds u32",
+                    )
+                })?,
+                u32::try_from(end).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "immutable mutation journal arena exceeds u32",
+                    )
+                })?,
+            ));
+            previous_end = end;
+        }
+        if previous_end != arena_len {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation journal offsets do not cover the arena",
+            ));
+        }
+        let large_snapshot_refs = offsets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &(start, end))| {
+                let bytes = &snapshot_arena[start as usize..end as usize];
+                (bytes.len() > crate::json_store::JSON_INLINE_MAX_BYTES).then(|| {
+                    (
+                        u16::try_from(index)
+                            .expect("immutable mutation chunk row ordinal fits u16"),
+                        crate::json_store::JsonRef::for_content(bytes),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(Self {
+            schema_plan_id,
+            schema_key,
+            branch_id,
+            origin_key,
+            entity_pks: entity_pks.into(),
+            snapshot_arena: Bytes::from(snapshot_arena),
+            snapshot_offsets: offsets.into(),
+            large_snapshot_refs: large_snapshot_refs.into(),
+            durable_predecessors: durable_predecessors.map(Into::into),
+            timestamp,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entity_pks.len()
+    }
+
+    pub(crate) fn entity_pks(&self) -> &Arc<[EntityPk]> {
+        &self.entity_pks
+    }
+
+    pub(crate) fn attach_durable_predecessors(
+        &mut self,
+        predecessors: Vec<CertifiedCurrentStatePredecessor>,
+    ) -> Result<(), LixError> {
+        if predecessors.len() != self.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation predecessor column does not match its rows",
+            ));
+        }
+        self.durable_predecessors = Some(predecessors.into());
+        Ok(())
+    }
+
+    pub(crate) fn entity_pk(&self, index: usize) -> &EntityPk {
+        &self.entity_pks[index]
+    }
+
+    pub(crate) fn snapshot(&self, index: usize) -> &str {
+        let (start, end) = self.snapshot_offsets[index];
+        std::str::from_utf8(&self.snapshot_arena[start as usize..end as usize])
+            .expect("validated immutable mutation journal UTF-8")
+    }
+
+    pub(crate) fn snapshot_slot(&self, index: usize) -> crate::json_store::JsonSlotRef<'_> {
+        let snapshot = self.snapshot(index);
+        if snapshot.len() <= crate::json_store::JSON_INLINE_MAX_BYTES {
+            return crate::json_store::JsonSlotRef::Inline(snapshot);
+        }
+        let index = u16::try_from(index).expect("immutable mutation chunk row ordinal fits u16");
+        let position = self
+            .large_snapshot_refs
+            .binary_search_by_key(&index, |(ordinal, _)| *ordinal)
+            .expect("large immutable mutation snapshot has a content ref");
+        crate::json_store::JsonSlotRef::Ref(&self.large_snapshot_refs[position].1)
+    }
+
+    pub(crate) fn schema_key(&self) -> &str {
+        self.schema_key.as_str()
+    }
+
+    pub(crate) fn branch_id(&self) -> &str {
+        self.branch_id.as_str()
+    }
+
+    pub(crate) fn origin_key(&self) -> Option<&str> {
+        self.origin_key.as_deref()
+    }
+
+    pub(crate) fn timestamp(&self) -> LixTimestamp {
+        self.timestamp
+    }
+
+    pub(crate) fn into_prepared(
+        self,
+        allow_missing_predecessors: bool,
+    ) -> Result<PreparedStateBatch, LixError> {
+        let offsets = self
+            .snapshot_offsets
+            .iter()
+            .map(|&(start, end)| (start as usize, end as usize))
+            .collect();
+        let mut rows = CertifiedParameterReplacementBatch::new(
+            self.entity_pks.iter().cloned().collect(),
+            TransactionJson::from_certified_row_content_arena(
+                self.snapshot_arena.to_vec(),
+                offsets,
+            )?,
+            self.schema_key,
+            self.branch_id,
+            CertifiedRawWriteBatchPreparation {
+                schema_plan_id: self.schema_plan_id,
+                facts: PreparedRowFacts {
+                    row_content_validated: true,
+                    requires_transaction_validation: false,
+                },
+                tracked_keys_strictly_ordered: true,
+                complete_collection_replacement: None,
+            },
+        )?
+        .into_dense_prepared(self.origin_key.as_ref(), self.timestamp)?;
+        let Some(predecessors) = self.durable_predecessors else {
+            if allow_missing_predecessors {
+                return Ok(rows);
+            }
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "partial immutable mutation journal lacks durable predecessor evidence",
+            ));
+        };
+        for (index, predecessor) in predecessors.iter().cloned().enumerate() {
+            rows.set_durable_predecessor(index, Some(predecessor));
+        }
+        Ok(rows)
+    }
+}
+
+/// Certified transaction-wide sequence of immutable journal chunks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OrderedMutationJournal {
+    /// Persistent chunk directory. Statement checkpoints clone this owner on
+    /// every scalar execute, so the directory itself must remain O(1) to
+    /// checkpoint; only the once-per-4K append performs copy-on-write.
+    chunks: Arc<Vec<ImmutableMutationJournalChunk>>,
+    row_count: usize,
+    commit_id: CommitId,
+    replacement_proof: Option<CompleteCollectionReplacementProof>,
+    overlay_uniform_created_at: Option<LixTimestamp>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct OrderedMutationJournalRowRef<'a> {
+    chunk: &'a ImmutableMutationJournalChunk,
+    row_index: usize,
+}
+
+impl<'a> OrderedMutationJournalRowRef<'a> {
+    pub(crate) fn entity_pk(&self) -> &'a EntityPk {
+        self.chunk.entity_pk(self.row_index)
+    }
+
+    pub(crate) fn snapshot(&self) -> &'a str {
+        self.chunk.snapshot(self.row_index)
+    }
+
+    pub(crate) fn snapshot_slot(&self) -> crate::json_store::JsonSlotRef<'a> {
+        self.chunk.snapshot_slot(self.row_index)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct OrderedMutationJournalRows<'a> {
+    journal: &'a OrderedMutationJournal,
+    chunk_index: usize,
+    row_index: usize,
+    remaining: usize,
+}
+
+/// Cheap read-only identity projection used to bulk-hydrate provisional
+/// predecessor evidence before generic lowering.
+#[derive(Clone)]
+pub(crate) struct ProvisionalMutationJournalDescriptor {
+    schema_key: SharedStr,
+    branch_id: SharedStr,
+    entity_pk_chunks: Vec<Arc<[EntityPk]>>,
+    predecessors_complete: bool,
+}
+
+pub(crate) enum ImmutableMutationChunkStage {
+    Staged,
+    RequiresGeneric(ImmutableMutationJournalChunk),
+}
+
+impl ProvisionalMutationJournalDescriptor {
+    pub(crate) fn schema_key(&self) -> &str {
+        self.schema_key.as_str()
+    }
+
+    pub(crate) fn branch_id(&self) -> &str {
+        self.branch_id.as_str()
+    }
+
+    pub(crate) fn entity_pk_chunks(&self) -> &[Arc<[EntityPk]>] {
+        &self.entity_pk_chunks
+    }
+
+    pub(crate) fn predecessors_complete(&self) -> bool {
+        self.predecessors_complete
+    }
+}
+
+impl<'a> Iterator for OrderedMutationJournalRows<'a> {
+    type Item = OrderedMutationJournalRowRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.chunk_index < self.journal.chunks.len() {
+            let chunk = &self.journal.chunks[self.chunk_index];
+            if self.row_index < chunk.len() {
+                let row = OrderedMutationJournalRowRef {
+                    chunk,
+                    row_index: self.row_index,
+                };
+                self.row_index += 1;
+                self.remaining -= 1;
+                return Some(row);
+            }
+            self.chunk_index += 1;
+            self.row_index = 0;
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for OrderedMutationJournalRows<'_> {}
+
+impl OrderedMutationJournal {
+    pub(crate) fn iter(&self) -> OrderedMutationJournalRows<'_> {
+        OrderedMutationJournalRows {
+            journal: self,
+            chunk_index: 0,
+            row_index: 0,
+            remaining: self.row_count,
+        }
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    pub(crate) fn commit_id(&self) -> CommitId {
+        self.commit_id
+    }
+
+    pub(crate) fn schema_key(&self) -> &str {
+        self.chunks[0].schema_key()
+    }
+
+    pub(crate) fn branch_id(&self) -> &str {
+        self.chunks[0].branch_id()
+    }
+
+    pub(crate) fn timestamp(&self) -> LixTimestamp {
+        self.chunks[0].timestamp()
+    }
+
+    pub(crate) fn replacement_proof(&self) -> CompleteCollectionReplacementProof {
+        self.replacement_proof
+            .expect("drained ordered mutation journal is replacement-certified")
+    }
+
+    fn into_prepared(self) -> Result<PreparedStateBatch, LixError> {
+        let proof = self.replacement_proof;
+        let schema_key = self.schema_key().to_owned();
+        let branch_id = self.branch_id().to_owned();
+        let mut chunks = Arc::try_unwrap(self.chunks)
+            .unwrap_or_else(|chunks| (*chunks).clone())
+            .into_iter();
+        let Some(first) = chunks.next() else {
+            return Ok(PreparedStateBatch::new());
+        };
+        let mut rows = first.into_prepared(proof.is_some())?;
+        for chunk in chunks {
+            rows.append(chunk.into_prepared(proof.is_some())?);
+        }
+        rows.set_commit_id_all(self.commit_id);
+        if let Some(proof) = proof {
+            if !rows.certify_complete_collection_replacement(
+                &schema_key,
+                &branch_id,
+                u64::try_from(rows.len()).expect("prepared replacement row count fits u64"),
+                proof.ordered_identity_digest,
+            ) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable replacement proof changed during generic lowering",
+                ));
+            }
+        }
+        Ok(rows)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +742,14 @@ pub(crate) struct PreparedWriteSet {
     pub(crate) extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     pub(crate) intermediate_commits: Vec<StagedIntermediateCommit>,
     pub(crate) file_data_writes: Vec<TransactionFileData>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DrainedMutationJournalDescriptor {
+    pub(crate) commit_id: CommitId,
+    pub(crate) schema_key: String,
+    pub(crate) branch_id: String,
+    pub(crate) entity_pk_chunks: Vec<Arc<[EntityPk]>>,
 }
 
 pub(crate) struct PreparedWriteValidationSet<'a> {
@@ -747,6 +1187,78 @@ impl<'a> PreparedWriteValidationSet<'a> {
 }
 
 impl PreparedWriteSet {
+    pub(crate) fn ordered_mutation_journal_descriptors(
+        &self,
+    ) -> Vec<DrainedMutationJournalDescriptor> {
+        self.commit_change_refs_by_branch
+            .values()
+            .filter_map(|refs| {
+                refs.ordered_mutation_journal()
+                    .map(|journal| DrainedMutationJournalDescriptor {
+                        commit_id: refs.commit_id,
+                        schema_key: journal.schema_key().to_owned(),
+                        branch_id: journal.branch_id().to_owned(),
+                        entity_pk_chunks: journal
+                            .chunks
+                            .iter()
+                            .map(|chunk| Arc::clone(chunk.entity_pks()))
+                            .collect(),
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn hydrate_and_lower_ordered_mutation_journals(
+        &mut self,
+        mut predecessors_by_commit: BTreeMap<CommitId, Vec<CertifiedCurrentStatePredecessor>>,
+    ) -> Result<(), LixError> {
+        let journals = self
+            .commit_change_refs_by_branch
+            .values_mut()
+            .filter_map(|refs| {
+                refs.take_ordered_mutation_journal()
+                    .map(|journal| (refs.commit_id, journal))
+            })
+            .collect::<Vec<_>>();
+        for (commit_id, journal) in journals {
+            let mut journal = Arc::try_unwrap(journal).unwrap_or_else(|journal| (*journal).clone());
+            let mut predecessors = predecessors_by_commit
+                .remove(&commit_id)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "stale immutable journal lacks hydrated predecessor evidence",
+                    )
+                })?
+                .into_iter();
+            for chunk in Arc::make_mut(&mut journal.chunks) {
+                let values = predecessors.by_ref().take(chunk.len()).collect::<Vec<_>>();
+                chunk.attach_durable_predecessors(values)?;
+            }
+            if predecessors.next().is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "stale immutable journal has excess predecessor evidence",
+                ));
+            }
+            let rows = journal.into_prepared()?;
+            let previous_len = self.state_rows.len();
+            let row_count = rows.len();
+            self.state_rows.append(rows);
+            self.insert_selection.resize_rows(previous_len);
+            for _ in 0..row_count {
+                self.insert_selection.push_not_insert();
+            }
+        }
+        if !predecessors_by_commit.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "predecessor evidence does not belong to an immutable journal",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn append_cohort_member(
         &mut self,
         mut other: Self,
@@ -921,6 +1433,7 @@ impl TransactionWriteBuffer {
         Self {
             functions,
             rows: Mutex::new(StagedPreparedRows::default()),
+            ordered_mutations: Mutex::new(None),
             commit_change_refs_by_branch: Mutex::new(BTreeMap::new()),
             first_commit_parent_override_by_branch: Mutex::new(BTreeMap::new()),
             checkpoint_publications: Mutex::new(Vec::new()),
@@ -937,6 +1450,62 @@ impl TransactionWriteBuffer {
         expected_live_count: u64,
         expected_ordered_identity_digest: [u8; 32],
     ) -> Result<bool, LixError> {
+        let mut ordered = self.ordered_mutations.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire immutable transaction mutation journal",
+            )
+        })?;
+        if let Some(journal) = ordered.as_mut() {
+            if journal.row_count != usize::try_from(expected_live_count).unwrap_or(usize::MAX)
+                || journal.schema_key() != expected_schema_key
+                || journal.branch_id() != expected_branch_id
+                || journal
+                    .chunks
+                    .iter()
+                    .any(|chunk| chunk.origin_key().is_some())
+            {
+                return Ok(false);
+            }
+            let actual_digest = crate::collection_generation::ordered_single_string_identity_digest(
+                journal
+                    .chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.entity_pks.iter()),
+            );
+            if actual_digest != Some(expected_ordered_identity_digest) {
+                return Ok(false);
+            }
+            let replay_bytes = journal.chunks.iter().try_fold(0_u64, |bytes, chunk| {
+                (0..chunk.len()).try_fold(bytes, |bytes, index| {
+                    let row_bytes = chunk
+                        .schema_key()
+                        .len()
+                        .checked_add(chunk.entity_pk(index).estimated_heap_bytes())
+                        .and_then(|value| value.checked_add(128))
+                        .and_then(|value| value.checked_add(chunk.snapshot(index).len()))
+                        .and_then(|value| u64::try_from(value).ok())
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "immutable mutation replay bytes exceed u64",
+                            )
+                        })?;
+                    bytes.checked_add(row_bytes).ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "immutable mutation replay bytes exceed u64",
+                        )
+                    })
+                })
+            })?;
+            journal.replacement_proof = Some(CompleteCollectionReplacementProof {
+                ordered_identity_digest: expected_ordered_identity_digest,
+                replay_bytes,
+            });
+            return Ok(true);
+        }
+        drop(ordered);
         let mut rows = self.rows.lock().map_err(|_| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -953,6 +1522,231 @@ impl TransactionWriteBuffer {
             expected_live_count,
             expected_ordered_identity_digest,
         ))
+    }
+
+    /// Appends one immutable, strictly ordered typed mutation chunk without
+    /// reconstructing generic prepared rows. The transaction must later
+    /// certify the accumulated journal as a complete replacement; otherwise
+    /// durable predecessor evidence is required for generic lowering.
+    pub(crate) fn stage_immutable_mutation_chunk(
+        &self,
+        chunk: ImmutableMutationJournalChunk,
+    ) -> Result<ImmutableMutationChunkStage, LixError> {
+        let count = chunk.len();
+        let rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction prepared rows",
+            )
+        })?;
+        let rows_are_empty = match &*rows {
+            StagedPreparedRows::AppendOnly { rows, .. }
+            | StagedPreparedRows::Indexed { rows, .. } => rows.is_empty(),
+        };
+        drop(rows);
+        if !rows_are_empty {
+            return Ok(ImmutableMutationChunkStage::RequiresGeneric(chunk));
+        }
+
+        let mut ordered = self.ordered_mutations.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire immutable transaction mutation journal",
+            )
+        })?;
+        if let Some(existing) = ordered.as_ref() {
+            let compatible = existing.schema_key() == chunk.schema_key()
+                && existing.branch_id() == chunk.branch_id()
+                && existing.timestamp() == chunk.timestamp()
+                && existing.chunks[0].origin_key() == chunk.origin_key()
+                && existing
+                    .chunks
+                    .last()
+                    .and_then(|previous| previous.entity_pks.last())
+                    .zip(chunk.entity_pks.first())
+                    .is_some_and(|(previous, next)| previous < next);
+            if !compatible {
+                return Ok(ImmutableMutationChunkStage::RequiresGeneric(chunk));
+            }
+        }
+
+        let mut commit_change_refs = self.commit_change_refs_by_branch.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged commit change refs",
+            )
+        })?;
+        let branch_id = chunk.branch_id().to_owned();
+        let refs = commit_change_refs.entry(branch_id).or_insert_with(|| {
+            let timestamp = self.functions.call_timestamp();
+            StagedCommitChangeRefs::new(
+                CommitId::with_change_address_space(self.functions.call_uuid_v7()),
+                ChangeId::from(self.functions.call_uuid_v7()),
+                ChangeId::from(self.functions.call_uuid_v7()),
+                timestamp,
+            )
+        });
+        refs.add_change_count(count);
+        match ordered.as_mut() {
+            Some(existing) => {
+                existing.row_count = existing.row_count.checked_add(count).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "immutable mutation journal row count overflowed",
+                    )
+                })?;
+                Arc::make_mut(&mut existing.chunks).push(chunk);
+                existing.replacement_proof = None;
+            }
+            None => {
+                *ordered = Some(OrderedMutationJournal {
+                    chunks: Arc::new(vec![chunk]),
+                    row_count: count,
+                    commit_id: refs.commit_id,
+                    replacement_proof: None,
+                    overlay_uniform_created_at: None,
+                });
+            }
+        }
+        Ok(ImmutableMutationChunkStage::Staged)
+    }
+
+    /// Attaches exact current-state predecessor evidence to provisional
+    /// immutable chunks before a partial/mixed journal is lowered. Callers
+    /// obtain this column with one bulk exact read; boolean membership alone
+    /// is deliberately insufficient because it does not preserve created_at.
+    pub(crate) fn hydrate_immutable_mutation_predecessors(
+        &self,
+        predecessors: Vec<CertifiedCurrentStatePredecessor>,
+    ) -> Result<(), LixError> {
+        let mut ordered = self.ordered_mutations.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire immutable transaction mutation journal",
+            )
+        })?;
+        let journal = ordered.as_mut().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction has no provisional immutable mutation journal",
+            )
+        })?;
+        if predecessors.len() != journal.row_count {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "bulk predecessor evidence does not align with immutable mutation rows",
+            ));
+        }
+        let mut predecessors = predecessors.into_iter();
+        for chunk in Arc::make_mut(&mut journal.chunks) {
+            let values = predecessors.by_ref().take(chunk.len()).collect::<Vec<_>>();
+            debug_assert_eq!(values.len(), chunk.len());
+            chunk.durable_predecessors = Some(values.into());
+        }
+        debug_assert!(predecessors.next().is_none());
+        Ok(())
+    }
+
+    pub(crate) fn set_ordered_mutation_overlay_created_at(
+        &self,
+        created_at: LixTimestamp,
+    ) -> Result<(), LixError> {
+        let mut ordered = self.ordered_mutations.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire immutable transaction mutation journal",
+            )
+        })?;
+        let journal = ordered.as_mut().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "transaction has no provisional immutable mutation journal",
+            )
+        })?;
+        journal.overlay_uniform_created_at = Some(created_at);
+        Ok(())
+    }
+
+    pub(crate) fn provisional_mutation_journal_descriptor(
+        &self,
+    ) -> Result<Option<ProvisionalMutationJournalDescriptor>, LixError> {
+        let ordered = self.ordered_mutations.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire immutable transaction mutation journal",
+            )
+        })?;
+        Ok(ordered
+            .as_ref()
+            .map(|journal| ProvisionalMutationJournalDescriptor {
+                schema_key: journal.chunks[0].schema_key.clone(),
+                branch_id: journal.chunks[0].branch_id.clone(),
+                entity_pk_chunks: journal
+                    .chunks
+                    .iter()
+                    .map(|chunk| Arc::clone(&chunk.entity_pks))
+                    .collect(),
+                predecessors_complete: journal
+                    .chunks
+                    .iter()
+                    .all(|chunk| chunk.durable_predecessors.is_some()),
+            }))
+    }
+
+    /// Materializes a provisional journal only for semantics that require the
+    /// generic transaction overlay. Partial journals must first attach durable
+    /// predecessor evidence; certified complete replacements may lower
+    /// without it because their lifecycle is recovered from manifest history.
+    pub(crate) fn lower_immutable_mutations_to_prepared(&self) -> Result<(), LixError> {
+        let mut ordered = self.ordered_mutations.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire immutable transaction mutation journal",
+            )
+        })?;
+        if ordered.as_ref().is_some_and(|journal| {
+            journal.replacement_proof.is_none()
+                && journal
+                    .chunks
+                    .iter()
+                    .any(|chunk| chunk.durable_predecessors.is_none())
+        }) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "partial immutable mutation journal must bulk-hydrate durable predecessors before lowering",
+            ));
+        }
+        let journal = ordered.take();
+        drop(ordered);
+        let Some(journal) = journal else {
+            return Ok(());
+        };
+        let rows = journal.into_prepared()?;
+        let last_key = rows.last().map(TrackedStateKey::from_row);
+        let mut insert_selection = PreparedInsertSelection::new();
+        insert_selection.resize_rows(rows.len());
+        let mut staged = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction prepared rows",
+            )
+        })?;
+        let existing_is_empty = match &*staged {
+            StagedPreparedRows::AppendOnly { rows, .. }
+            | StagedPreparedRows::Indexed { rows, .. } => rows.is_empty(),
+        };
+        if !existing_is_empty {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "cannot lower immutable mutations over existing prepared rows",
+            ));
+        }
+        *staged = StagedPreparedRows::AppendOnly {
+            rows,
+            insert_selection,
+            last_key,
+        };
+        Ok(())
     }
 
     pub(crate) fn is_file_cohort_eligible(&self, branch_id: &str) -> bool {
@@ -1002,6 +1796,12 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged writes lock",
             )
         })?;
+        let ordered_mutations = self.ordered_mutations.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire immutable transaction mutation journal",
+            )
+        })?;
         let file_data_writes = self.file_data_writes.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -1046,6 +1846,7 @@ impl TransactionWriteBuffer {
 
         Ok(TransactionWriteBufferCheckpoint {
             rows: rows.clone(),
+            ordered_mutations: ordered_mutations.clone(),
             commit_change_refs_by_branch: commit_change_refs_by_branch.clone(),
             first_commit_parent_override_by_branch: first_commit_parent_override_by_branch.clone(),
             checkpoint_publications: checkpoint_publications.clone(),
@@ -1064,6 +1865,7 @@ impl TransactionWriteBuffer {
     ) -> Result<(), LixError> {
         let TransactionWriteBufferCheckpoint {
             rows,
+            ordered_mutations,
             commit_change_refs_by_branch,
             first_commit_parent_override_by_branch,
             checkpoint_publications,
@@ -1075,6 +1877,12 @@ impl TransactionWriteBuffer {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let mut ordered_mutations_guard = self.ordered_mutations.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire immutable transaction mutation journal",
             )
         })?;
         let mut file_data_guard = self.file_data_writes.lock().map_err(|_| {
@@ -1120,6 +1928,7 @@ impl TransactionWriteBuffer {
             })?;
 
         *rows_guard = rows;
+        *ordered_mutations_guard = ordered_mutations;
         *file_data_guard = file_data_writes;
         *commit_change_refs_guard = commit_change_refs_by_branch;
         *extra_parents_guard = extra_commit_parents_by_branch;
@@ -1535,6 +2344,12 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged writes lock",
             )
         })?;
+        let mut ordered_mutations_guard = self.ordered_mutations.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire immutable transaction mutation journal",
+            )
+        })?;
         let mut file_data_guard = self.file_data_writes.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -1588,6 +2403,39 @@ impl TransactionWriteBuffer {
                 ..
             } => (rows, insert_selection),
         };
+        let ordered_replacement = std::mem::take(&mut *ordered_mutations_guard);
+        if ordered_replacement
+            .as_ref()
+            .is_some_and(|journal| journal.replacement_proof.is_none())
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation journal reached commit without complete-replacement certification",
+            ));
+        }
+        if ordered_replacement.is_some() && !state_rows.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable replacement journal overlaps generic prepared rows",
+            ));
+        }
+        if let Some(journal) = ordered_replacement {
+            let refs = commit_change_refs_guard
+                .get_mut(journal.branch_id())
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "immutable mutation journal has no commit membership",
+                    )
+                })?;
+            if refs.commit_id != journal.commit_id() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation journal commit owner changed",
+                ));
+            }
+            refs.attach_ordered_mutation_journal(Arc::new(journal))?;
+        }
         Ok(PreparedWriteSet {
             state_rows,
             insert_selection,
@@ -1822,6 +2670,67 @@ impl TransactionWriteBuffer {
     pub(crate) fn staging_overlay(self: &Arc<Self>) -> Result<PreparedStateRowOverlay, LixError> {
         Ok(PreparedStateRowOverlay {
             staged_writes: Arc::clone(self),
+        })
+    }
+
+    /// Returns whether a staged row can override this exact tracked identity.
+    /// The normal monotonically ordered journal answers future identities from
+    /// its tail without building an index; irregular/overlapping transactions
+    /// already have the exact identity map.
+    pub(crate) fn staged_identity_may_affect(
+        &self,
+        branch_id: &str,
+        schema_key: &str,
+        file_id: Option<&str>,
+        entity_pk: &EntityPk,
+    ) -> Result<bool, LixError> {
+        let ordered = self.ordered_mutations.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire immutable transaction mutation journal",
+            )
+        })?;
+        if ordered.as_ref().is_some_and(|journal| {
+            ordered_mutation_journal_row(journal, branch_id, schema_key, file_id, entity_pk)
+                .is_some()
+        }) {
+            return Ok(true);
+        }
+        drop(ordered);
+        let rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        Ok(match &*rows {
+            StagedPreparedRows::AppendOnly { last_key, .. } => {
+                last_key.as_ref().is_some_and(|last_key| {
+                    compare_tracked_key_to_parts(last_key, schema_key, file_id, entity_pk)
+                        != std::cmp::Ordering::Less
+                })
+            }
+            StagedPreparedRows::Indexed { by_identity, .. } => {
+                by_identity.contains_key(&PreparedStateRowIdentity {
+                    schema_key: schema_key.into(),
+                    entity_pk: entity_pk.clone(),
+                    file_id: file_id.map(Into::into),
+                    branch_id: branch_id.into(),
+                })
+            }
+        })
+    }
+
+    pub(crate) fn has_staged_state_rows(&self) -> Result<bool, LixError> {
+        let rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        Ok(match &*rows {
+            StagedPreparedRows::AppendOnly { rows, .. }
+            | StagedPreparedRows::Indexed { rows, .. } => !rows.is_empty(),
         })
     }
 
@@ -2422,11 +3331,14 @@ impl PreparedStateRowOverlay {
             return Ok(MaterializedLiveStateBatch::default());
         }
 
+        let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(0);
+        append_matching_ordered_mutations(&mut rows, &self.staged_writes, request)?;
+
         if self
             .staged_writes
             .append_only_scan_is_definitely_absent(request)?
         {
-            return Ok(MaterializedLiveStateBatch::default());
+            return Ok(rows.finish());
         }
 
         self.staged_writes.ensure_identity_index(false)?;
@@ -2443,13 +3355,17 @@ impl PreparedStateRowOverlay {
                 by_candidate,
                 ..
             } => (rows, by_identity, by_candidate),
-            StagedPreparedRows::AppendOnly { rows, .. } => {
-                debug_assert!(rows.is_empty(), "nonempty reads must promote the journal");
-                return Ok(MaterializedLiveStateBatch::default());
+            StagedPreparedRows::AppendOnly {
+                rows: staged_rows, ..
+            } => {
+                debug_assert!(
+                    staged_rows.is_empty(),
+                    "nonempty reads must promote the journal"
+                );
+                return Ok(rows.finish());
             }
         };
 
-        let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(staged_rows.len());
         if let Some(slots) = by_candidate.slots_for_filter(&request.filter) {
             // `slots_for_filter` already selected these rows by schema and,
             // when present, entity primary key. Rechecking a large entity-PK
@@ -2526,14 +3442,14 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
         if request.rows.is_empty() {
             return Ok(MaterializedLiveStateExactBatch::default());
         }
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
+        let mut slots =
+            load_ordered_mutation_exact_batch(&mut builder, &self.staged_writes, request)?;
         if self
             .staged_writes
             .append_only_exact_batch_is_definitely_absent(request)?
         {
-            return MaterializedLiveStateExactBatch::new(
-                MaterializedLiveStateBatch::default(),
-                vec![None; request.rows.len()],
-            );
+            return MaterializedLiveStateExactBatch::new(builder.finish(), slots);
         }
         self.staged_writes.ensure_identity_index(false)?;
         let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
@@ -2548,38 +3464,35 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
             } => (rows, by_identity),
             StagedPreparedRows::AppendOnly { rows, .. } => {
                 debug_assert!(rows.is_empty(), "nonempty reads must promote the journal");
-                return MaterializedLiveStateExactBatch::new(
-                    MaterializedLiveStateBatch::default(),
-                    vec![None; request.rows.len()],
-                );
+                return MaterializedLiveStateExactBatch::new(builder.finish(), slots);
             }
         };
-        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
-        let slots = request
-            .rows
-            .iter()
-            .map(|request_row| {
-                let identity = PreparedStateRowIdentity::from_exact_request(request_row);
-                let Some(RowSlot::State(index)) = by_identity.get(&identity).copied() else {
-                    return None;
-                };
-                let row = staged_rows.get(index)?;
-                if request
-                    .untracked
-                    .is_some_and(|untracked| row.untracked != untracked)
-                {
-                    return None;
-                }
-                if row.snapshot.is_none() && !request.include_tombstones {
-                    None
-                } else {
-                    Some(
-                        u32::try_from(push_prepared_materialized(&mut builder, row))
-                            .expect("staged exact batch ordinal must fit u32"),
-                    )
-                }
-            })
-            .collect();
+        for (request_index, request_row) in request.rows.iter().enumerate() {
+            if slots[request_index].is_some() {
+                continue;
+            }
+            let identity = PreparedStateRowIdentity::from_exact_request(request_row);
+            let Some(RowSlot::State(index)) = by_identity.get(&identity).copied() else {
+                continue;
+            };
+            let Some(row) = staged_rows.get(index) else {
+                continue;
+            };
+            if request
+                .untracked
+                .is_some_and(|untracked| row.untracked != untracked)
+            {
+                continue;
+            }
+            if row.snapshot.is_none() && !request.include_tombstones {
+                continue;
+            } else {
+                slots[request_index] = Some(
+                    u32::try_from(push_prepared_materialized(&mut builder, row))
+                        .expect("staged exact batch ordinal must fit u32"),
+                );
+            }
+        }
         MaterializedLiveStateExactBatch::new(builder.finish(), slots)
     }
 
@@ -2629,6 +3542,181 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
         }
         Ok(false)
     }
+}
+
+fn ordered_mutation_journal_row<'a>(
+    journal: &'a OrderedMutationJournal,
+    branch_id: &str,
+    schema_key: &str,
+    file_id: Option<&str>,
+    entity_pk: &EntityPk,
+) -> Option<(&'a ImmutableMutationJournalChunk, usize)> {
+    if file_id.is_some() || journal.branch_id() != branch_id || journal.schema_key() != schema_key {
+        return None;
+    }
+    let chunk_index = journal.chunks.partition_point(|chunk| {
+        chunk
+            .entity_pks
+            .last()
+            .is_some_and(|last_entity_pk| last_entity_pk < entity_pk)
+    });
+    let chunk = journal.chunks.get(chunk_index)?;
+    chunk
+        .entity_pks
+        .binary_search(entity_pk)
+        .ok()
+        .map(|index| (chunk, index))
+}
+
+fn push_ordered_mutation_materialized(
+    output: &mut MaterializedLiveStateBatchBuilder,
+    journal: &OrderedMutationJournal,
+    chunk: &ImmutableMutationJournalChunk,
+    row_index: usize,
+) -> Result<usize, LixError> {
+    let snapshot = chunk.snapshot(row_index);
+    let snapshot =
+        SharedStr::from_utf8_slice(chunk.snapshot_arena.clone(), snapshot).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "immutable mutation snapshot escaped its shared arena",
+            )
+        })?;
+    let created_at = if let Some(created_at) = journal.overlay_uniform_created_at {
+        created_at
+    } else {
+        chunk
+            .durable_predecessors
+            .as_ref()
+            .and_then(|predecessors| predecessors.get(row_index))
+            .map(CertifiedCurrentStatePredecessor::created_at)
+            .transpose()?
+            .unwrap_or_else(|| chunk.timestamp())
+    };
+    let ordinal = output.push_materialized_ref(
+        chunk.entity_pk(row_index),
+        chunk.schema_key(),
+        None,
+        Some(snapshot),
+        None,
+        false,
+        created_at,
+        chunk.timestamp(),
+        false,
+        None,
+        Some(journal.commit_id()),
+        false,
+        chunk.branch_id(),
+    );
+    if let Some(predecessor) = chunk
+        .durable_predecessors
+        .as_ref()
+        .and_then(|predecessors| predecessors.get(row_index))
+    {
+        output.set_durable_predecessor(ordinal, predecessor.clone());
+    }
+    Ok(ordinal)
+}
+
+fn append_matching_ordered_mutations(
+    output: &mut MaterializedLiveStateBatchBuilder,
+    staged_writes: &TransactionWriteBuffer,
+    request: &LiveStateScanRequest,
+) -> Result<(), LixError> {
+    let ordered = staged_writes.ordered_mutations.lock().map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "failed to acquire immutable transaction mutation journal",
+        )
+    })?;
+    let Some(journal) = ordered.as_ref() else {
+        return Ok(());
+    };
+    if request.filter.untracked == Some(true)
+        || (!request.filter.schema_keys.is_empty()
+            && !request
+                .filter
+                .schema_keys
+                .iter()
+                .any(|schema_key| schema_key == journal.schema_key()))
+        || (!request.filter.branch_ids.is_empty()
+            && !request
+                .filter
+                .branch_ids
+                .iter()
+                .any(|branch_id| branch_id == journal.branch_id()))
+        || !nullable_key_matches_filters(None, &request.filter.file_ids)
+    {
+        return Ok(());
+    }
+    if request.filter.entity_pks.is_empty() {
+        for chunk in journal.chunks.iter() {
+            for row_index in 0..chunk.len() {
+                push_ordered_mutation_materialized(output, journal, chunk, row_index)?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Preserve the journal's identity order while routing each requested key
+    // through the chunk directory. This avoids the previous O(journal rows ×
+    // requested keys) membership loop for large IN predicates.
+    let mut requested = request.filter.entity_pks.iter().collect::<Vec<_>>();
+    requested.sort_unstable();
+    requested.dedup();
+    for entity_pk in requested {
+        let Some((chunk, row_index)) = ordered_mutation_journal_row(
+            journal,
+            journal.branch_id(),
+            journal.schema_key(),
+            None,
+            entity_pk,
+        ) else {
+            continue;
+        };
+        push_ordered_mutation_materialized(output, journal, chunk, row_index)?;
+    }
+    Ok(())
+}
+
+fn load_ordered_mutation_exact_batch(
+    output: &mut MaterializedLiveStateBatchBuilder,
+    staged_writes: &TransactionWriteBuffer,
+    request: &LiveStateExactBatchRequest,
+) -> Result<Vec<Option<u32>>, LixError> {
+    let ordered = staged_writes.ordered_mutations.lock().map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "failed to acquire immutable transaction mutation journal",
+        )
+    })?;
+    let Some(journal) = ordered.as_ref() else {
+        return Ok(vec![None; request.rows.len()]);
+    };
+    request
+        .rows
+        .iter()
+        .map(|request_row| {
+            if request.untracked == Some(true) {
+                return Ok(None);
+            }
+            let Some((chunk, row_index)) = ordered_mutation_journal_row(
+                journal,
+                &request_row.branch_id,
+                &request_row.schema_key,
+                request_row.file_id.as_deref(),
+                &request_row.entity_pk,
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(
+                u32::try_from(push_ordered_mutation_materialized(
+                    output, journal, chunk, row_index,
+                )?)
+                .expect("staged exact batch ordinal must fit u32"),
+            ))
+        })
+        .collect()
 }
 
 /// Answers the uncommon collection-generation probe directly from the sorted
@@ -4962,9 +6050,9 @@ mod tests {
             test_uuid_value(self.uuid_count)
         }
 
-        fn timestamp(&mut self) -> crate::common::LixTimestamp {
+        fn timestamp(&mut self) -> LixTimestamp {
             self.timestamp_count += 1;
-            crate::common::LixTimestamp::expect_parse(
+            LixTimestamp::expect_parse(
                 "timestamp",
                 &format!("2026-01-01T00:00:00.{:03}Z", self.timestamp_count),
             )
@@ -4995,7 +6083,7 @@ mod tests {
         .expect("test snapshot should prepare");
         TestPreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
-            facts: crate::transaction::types::PreparedRowFacts::default(),
+            facts: PreparedRowFacts::default(),
             entity_pk: EntityPk::single(key),
             schema_key: "lix_key_value".into(),
             file_id: None,
@@ -5003,14 +6091,8 @@ mod tests {
             metadata: None,
             origin: None,
             origin_key: None,
-            created_at: crate::common::LixTimestamp::expect_parse(
-                "created_at",
-                "2026-01-01T00:00:00.000Z",
-            ),
-            updated_at: crate::common::LixTimestamp::expect_parse(
-                "updated_at",
-                "2026-01-01T00:00:00.000Z",
-            ),
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.000Z"),
             global: true,
             change_id: None,
             commit_id: None,
