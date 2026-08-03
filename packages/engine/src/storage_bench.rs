@@ -37,6 +37,7 @@ fn stage_bench_commit_deltas(
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
+            current_state_part_sets: Vec::new(),
             snapshot_root: None,
         },
     )?;
@@ -58,6 +59,9 @@ static ENTITY_POINT_SNAPSHOT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_DELETES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
+static CRUD_COMMIT_STATE_MANIFEST_BYTES: AtomicU64 = AtomicU64::new(0);
+static CRUD_CURRENT_STATE_DIRECTORY_BYTES: AtomicU64 = AtomicU64::new(0);
+static CRUD_CURRENT_STATE_DIRECTORY_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -176,6 +180,30 @@ pub fn take_crud_physical_write_accounting() -> CrudPhysicalWriteAccounting {
         deletes: CRUD_PHYSICAL_DELETES.swap(0, Ordering::Relaxed),
         written_bytes: CRUD_PHYSICAL_WRITTEN_BYTES.swap(0, Ordering::Relaxed),
     }
+}
+
+pub(crate) fn record_crud_commit_state_manifest_bytes(bytes: usize) {
+    CRUD_COMMIT_STATE_MANIFEST_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub fn take_crud_commit_state_manifest_bytes() -> u64 {
+    CRUD_COMMIT_STATE_MANIFEST_BYTES.swap(0, Ordering::Relaxed)
+}
+
+pub(crate) fn record_crud_current_state_directory_bytes(bytes: usize) {
+    CRUD_CURRENT_STATE_DIRECTORY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub fn take_crud_current_state_directory_bytes() -> u64 {
+    CRUD_CURRENT_STATE_DIRECTORY_BYTES.swap(0, Ordering::Relaxed)
+}
+
+pub(crate) fn record_crud_current_state_directory_recovery() {
+    CRUD_CURRENT_STATE_DIRECTORY_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn take_crud_current_state_directory_recoveries() -> u64 {
+    CRUD_CURRENT_STATE_DIRECTORY_RECOVERIES.swap(0, Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

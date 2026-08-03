@@ -1071,6 +1071,7 @@ mod tests {
                     bytes: record.tracked_state_rootless_bytes,
                 },
                 mutations: CommitStateMutationInventory::default(),
+                current_state_part_sets: Vec::new(),
                 snapshot_root: None,
             },
         )

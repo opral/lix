@@ -983,6 +983,9 @@ fn profile_sql_session_bound_updates(
         print_allocation_accounting("seed");
         reset_allocation_accounting();
         let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
+        let _ = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
+        let _ = lix_engine::storage_bench::take_crud_current_state_directory_bytes();
+        let _ = lix_engine::storage_bench::take_crud_current_state_directory_recoveries();
         let _ = lix_engine::storage_bench::take_certified_entity_update_value_batch_accounting();
         let start = Instant::now();
         let result = if spread {
@@ -999,8 +1002,13 @@ fn profile_sql_session_bound_updates(
         let certificate =
             lix_engine::storage_bench::take_certified_entity_update_value_batch_accounting();
         let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
+        let manifest_bytes = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
+        let directory_bytes = lix_engine::storage_bench::take_crud_current_state_directory_bytes();
+        let serving_metadata_bytes = manifest_bytes + directory_bytes;
+        let directory_recoveries =
+            lix_engine::storage_bench::take_crud_current_state_directory_recoveries();
         println!(
-            "tracked_state_crud generated update accounting: logical_rows={bound_update_row_count} certificate_attempts={} certificate_hits={} certificate_misses={} certified_rows={} physical_puts={} physical_deletes={} physical_written_bytes={}",
+            "tracked_state_crud generated update accounting: logical_rows={bound_update_row_count} certificate_attempts={} certificate_hits={} certificate_misses={} certified_rows={} staged_puts={} staged_deletes={} staged_value_bytes={} commit_state_manifest_value_bytes={manifest_bytes} current_state_directory_value_bytes={directory_bytes} encoded_serving_metadata_value_bytes={serving_metadata_bytes} current_state_directory_recoveries={directory_recoveries}",
             certificate.attempts,
             certificate.hits,
             certificate.misses,

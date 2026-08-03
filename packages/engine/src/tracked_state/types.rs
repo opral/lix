@@ -225,6 +225,53 @@ pub(crate) struct StoredReplacementPart {
     pub(crate) uniform_updated_at: LixTimestamp,
 }
 
+/// One immutable post-image range in a committed current-state partition.
+///
+/// This is deliberately distinct from [`CommitStateMutationPart`]. Mutation
+/// parts describe what a commit authored; current-state parts describe the
+/// strictly ordered, non-overlapping state that readers may serve directly.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CurrentStatePartDescriptor {
+    #[musli(bytes)]
+    pub(crate) first_key: Vec<u8>,
+    #[musli(bytes)]
+    pub(crate) last_key: Vec<u8>,
+    pub(crate) content_digest: [u8; 32],
+    pub(crate) owner_commit_id: [u8; 16],
+    pub(crate) part_index: u32,
+    pub(crate) first_ordinal: u32,
+    pub(crate) row_count: u16,
+    pub(crate) uniform_created_at: LixTimestamp,
+    pub(crate) uniform_updated_at: LixTimestamp,
+}
+
+/// Content-addressed root of a persistent current-state range directory.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CurrentStatePartDirectoryRoot {
+    pub(crate) root_id: [u8; 32],
+    pub(crate) descriptor_digest: [u8; 32],
+    pub(crate) row_count: u64,
+    pub(crate) part_count: u32,
+    pub(crate) tree_height: u16,
+}
+
+/// One authoritative current-state collection generation.
+///
+/// The mutation-directory digest binds this rebuildable serving projection to
+/// the commit's historical replacement certificate without making the serving
+/// directory part of commit semantics.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CurrentStatePartSet {
+    pub(crate) scope: CommitDeltaReplacementScope,
+    pub(crate) owner_commit_id: [u8; 16],
+    pub(crate) generation_integrity_digest: [u8; 32],
+    pub(crate) mutation_directory_digest: [u8; 32],
+    pub(crate) directory: CurrentStatePartDirectoryRoot,
+}
+
 /// Point-addressable immutable mutation inventory owned by one commit.
 ///
 /// The fields intentionally mirror the existing commit-delta directory. This
@@ -240,6 +287,10 @@ pub(crate) struct CommitStateMutationInventory {
     /// Exact row counts for every directly addressable part. Empty means the
     /// generic locator-indexed layout.
     pub(crate) direct_part_row_counts: Vec<u16>,
+    /// Compact physical identities for a complete replacement. Range bounds
+    /// live in the rebuildable current-state directory; history can always
+    /// recover them by decoding these immutable parts.
+    pub(crate) replacement_part_digests: Vec<[u8; 32]>,
     /// Authoritative collection-replacement scope. A miss within this scope
     /// cannot fall through to an older first-parent generation.
     #[musli(with = crate::storage_codec::option)]
@@ -264,7 +315,12 @@ impl CommitStateMutationInventory {
     }
 
     pub(crate) fn part_count(&self) -> usize {
-        usize::from(!self.inline_part.is_empty()) + self.parts.len()
+        usize::from(!self.inline_part.is_empty())
+            + if self.replacement_part_digests.is_empty() {
+                self.parts.len()
+            } else {
+                self.replacement_part_digests.len()
+            }
     }
 }
 
@@ -285,6 +341,7 @@ pub(crate) struct CommitStateManifest {
     pub(crate) created_at: LixTimestamp,
     pub(crate) replay_debt: CommitStateReplayDebt,
     pub(crate) mutations: CommitStateMutationInventory,
+    pub(crate) current_state_part_sets: Vec<CurrentStatePartSet>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_root: Option<TrackedStateCommitRoot>,
 }

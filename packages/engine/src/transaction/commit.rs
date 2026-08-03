@@ -4771,6 +4771,21 @@ fn stage_commit_state_manifests(
                 ),
             ));
         }
+        let mut mutations = mutation_inventories
+            .get(&commit.commit_id)
+            .cloned()
+            .unwrap_or_default();
+        let current_state_part_sets: Vec<_> =
+            crate::tracked_state::stage_complete_replacement_current_state_part_set(
+                writes,
+                record.commit_id,
+                &mutations,
+            )?
+            .into_iter()
+            .collect();
+        if !current_state_part_sets.is_empty() {
+            mutations.parts.clear();
+        }
         stage_commit_state_manifest(
             writes,
             &CommitStateManifest {
@@ -4789,10 +4804,8 @@ fn stage_commit_state_manifests(
                 } else {
                     CommitStateReplayDebt::default()
                 },
-                mutations: mutation_inventories
-                    .get(&commit.commit_id)
-                    .cloned()
-                    .unwrap_or_default(),
+                mutations,
+                current_state_part_sets,
                 snapshot_root,
             },
         )?;
@@ -5806,6 +5819,7 @@ mod tests {
                     .get(&commit_id)
                     .cloned()
                     .expect("mixed certified inventory should stage"),
+                current_state_part_sets: Vec::new(),
                 snapshot_root: None,
             },
         )

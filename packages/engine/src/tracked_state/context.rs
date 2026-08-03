@@ -4739,6 +4739,7 @@ mod tests {
                 ),
                 replay_debt: Default::default(),
                 mutations: Default::default(),
+                current_state_part_sets: Vec::new(),
                 snapshot_root: Some(snapshot_root),
             },
         )

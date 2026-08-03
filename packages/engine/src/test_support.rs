@@ -557,6 +557,7 @@ fn stage_test_commit_state_manifest(
             created_at: record.created_at,
             replay_debt,
             mutations,
+            current_state_part_sets: Vec::new(),
             snapshot_root,
         },
     )

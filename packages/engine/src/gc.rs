@@ -778,6 +778,20 @@ where
     );
     for commit_id in &sweep_authority_commits {
         if let Some(entry) = packed.commits.get(commit_id) {
+            if let Some(manifest) =
+                crate::tracked_state::load_commit_state_manifest(store, *commit_id).await?
+            {
+                for set in &manifest.current_state_part_sets {
+                    crate::tracked_state::stage_delete_current_state_part_directory(
+                        store,
+                        writes,
+                        &set.directory,
+                        set.owner_commit_id,
+                        set.mutation_directory_digest,
+                    )
+                    .await?;
+                }
+            }
             let schema_keys = entry
                 .members
                 .iter()
@@ -1391,6 +1405,7 @@ mod tests {
                 bytes: live.tracked_state_rootless_bytes,
             },
             mutations: CommitStateMutationInventory::default(),
+            current_state_part_sets: Vec::new(),
             snapshot_root: None,
         };
         drifted.generation += 1;
@@ -2143,6 +2158,7 @@ mod tests {
                     bytes: record.tracked_state_rootless_bytes,
                 },
                 mutations,
+                current_state_part_sets: Vec::new(),
                 snapshot_root: None,
             },
         )
