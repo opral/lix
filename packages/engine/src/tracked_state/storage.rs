@@ -2159,23 +2159,88 @@ pub(crate) async fn stage_sparse_current_state_scoped_range(
     let mut replacements = Vec::with_capacity(splice.leaf_count());
     for leaf_index in 0..splice.leaf_count() {
         let leaf_key_indices = splice.leaf_key_indices(leaf_index);
-        let leaf_parts = splice.leaf_parts(leaf_index);
+        let leaf_parts = splice.leaf_parts(leaf_index).collect::<Vec<_>>();
         old_part_count = old_part_count
             .checked_add(leaf_parts.len() as u64)
             .ok_or_else(|| replacement_payload_error("scoped-range part count overflows"))?;
 
-        let mut pending = leaf_key_indices
+        let leaf_mutations = leaf_key_indices
             .iter()
             .map(|&key_index| {
                 mutation_rows[key_index]
                     .take()
                     .expect("each sparse mutation is assigned to one leaf")
             })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .peekable();
+            .collect::<Vec<_>>();
         let mut output = Vec::with_capacity(leaf_parts.len() + leaf_key_indices.len());
-        for part in leaf_parts {
+        let compaction_ranges = sparse_current_state_fragment_compaction_ranges(&leaf_parts)?;
+        let mut compaction_index = 0usize;
+        let mut part_index = 0usize;
+        let mut pending = leaf_mutations.into_iter().peekable();
+        while part_index < leaf_parts.len() {
+            if compaction_ranges
+                .get(compaction_index)
+                .is_some_and(|&(start, _)| start == part_index)
+            {
+                let (start, end) = compaction_ranges[compaction_index];
+                let first = leaf_parts[start];
+                let last = leaf_parts[end - 1];
+                let mut gap = Vec::new();
+                while pending
+                    .peek()
+                    .is_some_and(|(key, _)| key.as_slice() < first.first_key.as_slice())
+                {
+                    let (_, row) = pending.next().expect("peeked sparse mutation");
+                    if let Some(row) = row {
+                        gap.push(row);
+                    }
+                }
+                stage_scoped_native_current_state_rows(writes, &gap, true, &mut output)?;
+                let mut rows = BTreeMap::new();
+                for &part in &leaf_parts[start..end] {
+                    old_row_count = old_row_count.checked_add(part.row_count).ok_or_else(|| {
+                        replacement_payload_error("scoped-range row count overflows")
+                    })?;
+                    let descriptor = current_state_descriptor_from_scoped_range_part(part)?;
+                    for row in load_scoped_current_state_descriptor_rows(store, writes, &descriptor)
+                        .await?
+                    {
+                        if rows.insert(row.encoded_key.clone(), row).is_some() {
+                            return Err(replacement_payload_error(
+                                "fragmented current-state run contains duplicate identities",
+                            ));
+                        }
+                    }
+                }
+                while pending
+                    .peek()
+                    .is_some_and(|(key, _)| key.as_slice() <= last.last_key.as_slice())
+                {
+                    let (key, row) = pending.next().expect("peeked compacted mutation");
+                    match row {
+                        Some(mut row) => {
+                            if let Some(previous) = rows.get(&key) {
+                                row.value.created_at = previous.value.created_at;
+                            }
+                            rows.insert(key, row);
+                        }
+                        None => {
+                            rows.remove(&key);
+                        }
+                    }
+                }
+                stage_scoped_native_current_state_rows(
+                    writes,
+                    &rows.into_values().collect::<Vec<_>>(),
+                    false,
+                    &mut output,
+                )?;
+                part_index = end;
+                compaction_index += 1;
+                continue;
+            }
+
+            let part = leaf_parts[part_index];
             old_row_count = old_row_count
                 .checked_add(part.row_count)
                 .ok_or_else(|| replacement_payload_error("scoped-range row count overflows"))?;
@@ -2190,47 +2255,38 @@ pub(crate) async fn stage_sparse_current_state_scoped_range(
                     gap.push(row);
                 }
             }
-            stage_scoped_native_current_state_rows(writes, &gap, &mut output)?;
+            stage_scoped_native_current_state_rows(writes, &gap, true, &mut output)?;
 
             let touches_descriptor = pending
                 .peek()
                 .is_some_and(|(key, _)| key.as_slice() <= descriptor.last_key.as_slice());
             if !touches_descriptor {
                 output.push(descriptor);
+                part_index += 1;
                 continue;
             }
-            let mut rows = load_scoped_current_state_descriptor_rows(store, writes, &descriptor)
-                .await?
-                .into_iter()
-                .map(|row| (row.encoded_key.clone(), row))
-                .collect::<BTreeMap<_, _>>();
+            let rows =
+                load_scoped_current_state_descriptor_rows(store, writes, &descriptor).await?;
+            let mut descriptor_mutations = Vec::new();
             while pending
                 .peek()
                 .is_some_and(|(key, _)| key.as_slice() <= descriptor.last_key.as_slice())
             {
-                let (key, row) = pending.next().expect("peeked sparse mutation");
-                match row {
-                    Some(mut row) => {
-                        if let Some(previous) = rows.get(&key) {
-                            row.value.created_at = previous.value.created_at;
-                        }
-                        rows.insert(key, row);
-                    }
-                    None => {
-                        rows.remove(&key);
-                    }
-                }
+                descriptor_mutations.push(pending.next().expect("peeked sparse mutation"));
             }
-            stage_scoped_native_current_state_rows(
+            stage_fragmented_scoped_current_state_descriptor(
                 writes,
-                &rows.into_values().collect::<Vec<_>>(),
+                &descriptor,
+                &rows,
+                descriptor_mutations,
                 &mut output,
             )?;
+            part_index += 1;
         }
         let tail = pending
             .filter_map(|(_, row)| row)
             .collect::<Vec<CurrentStateDataRow>>();
-        stage_scoped_native_current_state_rows(writes, &tail, &mut output)?;
+        stage_scoped_native_current_state_rows(writes, &tail, true, &mut output)?;
 
         new_part_count = new_part_count
             .checked_add(output.len() as u64)
@@ -2274,9 +2330,175 @@ pub(crate) async fn stage_sparse_current_state_scoped_range(
     ))
 }
 
+const SPARSE_CURRENT_STATE_COMPACTION_MIN_PARTS: usize = 32;
+const SPARSE_CURRENT_STATE_MAX_PROJECTED_SOURCE_PARTS: usize = 16;
+
+fn sparse_current_state_fragment_compaction_ranges(
+    parts: &[&crate::tracked_state::scoped_range::ScopedRangePart],
+) -> Result<Vec<(usize, usize)>, LixError> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < parts.len() {
+        if !crate::tracked_state::current_state_envelope::current_state_descriptor_from_scoped_range_part(parts[start])?.fragmented {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < parts.len()
+            && crate::tracked_state::current_state_envelope::current_state_descriptor_from_scoped_range_part(parts[end])?.fragmented
+        {
+            end += 1;
+        }
+        if end - start >= SPARSE_CURRENT_STATE_COMPACTION_MIN_PARTS {
+            ranges.push((start, end));
+        }
+        start = end;
+    }
+    Ok(ranges)
+}
+
+/// Applies sparse mutations without copying an immutable source part's
+/// untouched rows. Descriptor slices retain the original payload and only
+/// authored post-images become new native parts.
+fn stage_fragmented_scoped_current_state_descriptor(
+    writes: &mut StorageWriteSet,
+    descriptor: &CurrentStatePartDescriptor,
+    rows: &[crate::tracked_state::current_state_data_part::CurrentStateDataRow],
+    mutations: Vec<(
+        Vec<u8>,
+        Option<crate::tracked_state::current_state_data_part::CurrentStateDataRow>,
+    )>,
+    output: &mut Vec<CurrentStatePartDescriptor>,
+) -> Result<(), LixError> {
+    let mutations = mutations
+        .into_iter()
+        .filter(|(key, mutation)| {
+            mutation.is_some()
+                || rows
+                    .binary_search_by(|row| row.encoded_key.as_slice().cmp(key.as_slice()))
+                    .is_ok()
+        })
+        .collect::<Vec<_>>();
+    if mutations.is_empty() {
+        output.push(descriptor.clone());
+        return Ok(());
+    }
+    if sparse_current_state_projected_source_parts(rows, &mutations)
+        > SPARSE_CURRENT_STATE_MAX_PROJECTED_SOURCE_PARTS
+    {
+        let mut post_image = rows
+            .iter()
+            .cloned()
+            .map(|row| (row.encoded_key.clone(), row))
+            .collect::<BTreeMap<_, _>>();
+        for (key, row) in mutations {
+            match row {
+                Some(mut row) => {
+                    if let Some(previous) = post_image.get(&key) {
+                        row.value.created_at = previous.value.created_at;
+                    }
+                    post_image.insert(key, row);
+                }
+                None => {
+                    post_image.remove(&key);
+                }
+            }
+        }
+        return stage_scoped_native_current_state_rows(
+            writes,
+            &post_image.into_values().collect::<Vec<_>>(),
+            false,
+            output,
+        );
+    }
+    let mut retained_start = 0usize;
+    let mut native_run = Vec::new();
+    for (key, mut mutation) in mutations {
+        let insertion = rows.binary_search_by(|row| row.encoded_key.as_slice().cmp(key.as_slice()));
+        if insertion.is_err() && mutation.is_none() {
+            // Deleting an already absent identity is a physical no-op.
+            continue;
+        }
+        let split = insertion.unwrap_or_else(|index| index);
+        if retained_start < split {
+            stage_scoped_native_current_state_rows(writes, &native_run, true, output)?;
+            native_run.clear();
+        }
+        stage_retained_current_state_slice(descriptor, rows, retained_start, split, output)?;
+        if let Ok(index) = insertion {
+            if let Some(row) = mutation.as_mut() {
+                row.value.created_at = rows[index].value.created_at;
+            }
+            retained_start = index + 1;
+        } else {
+            retained_start = split;
+        }
+        if let Some(row) = mutation {
+            native_run.push(row);
+        }
+    }
+    stage_scoped_native_current_state_rows(writes, &native_run, true, output)?;
+    stage_retained_current_state_slice(descriptor, rows, retained_start, rows.len(), output)
+}
+
+fn sparse_current_state_projected_source_parts(
+    rows: &[crate::tracked_state::current_state_data_part::CurrentStateDataRow],
+    mutations: &[(
+        Vec<u8>,
+        Option<crate::tracked_state::current_state_data_part::CurrentStateDataRow>,
+    )],
+) -> usize {
+    let mut retained_start = 0usize;
+    let mut native_open = false;
+    let mut part_count = 0usize;
+    for (key, mutation) in mutations {
+        let insertion = rows.binary_search_by(|row| row.encoded_key.as_slice().cmp(key.as_slice()));
+        if insertion.is_err() && mutation.is_none() {
+            continue;
+        }
+        let split = insertion.unwrap_or_else(|index| index);
+        if retained_start < split {
+            part_count += usize::from(native_open) + 1;
+            native_open = false;
+        }
+        retained_start = insertion.map_or(split, |index| index + 1);
+        native_open |= mutation.is_some();
+    }
+    part_count += usize::from(native_open);
+    part_count + usize::from(retained_start < rows.len())
+}
+
+fn stage_retained_current_state_slice(
+    descriptor: &CurrentStatePartDescriptor,
+    rows: &[crate::tracked_state::current_state_data_part::CurrentStateDataRow],
+    start: usize,
+    end: usize,
+    output: &mut Vec<CurrentStatePartDescriptor>,
+) -> Result<(), LixError> {
+    if start >= end {
+        return Ok(());
+    }
+    let mut retained = descriptor.clone();
+    retained.first_key = rows[start].encoded_key.clone();
+    retained.last_key = rows[end - 1].encoded_key.clone();
+    retained.source_row_offset = retained
+        .source_row_offset
+        .checked_add(
+            u16::try_from(start)
+                .map_err(|_| replacement_payload_error("current-state slice offset overflows"))?,
+        )
+        .ok_or_else(|| replacement_payload_error("current-state slice offset overflows"))?;
+    retained.row_count = u16::try_from(end - start)
+        .map_err(|_| replacement_payload_error("current-state slice row count overflows"))?;
+    retained.fragmented = true;
+    output.push(retained);
+    Ok(())
+}
+
 fn stage_scoped_native_current_state_rows(
     writes: &mut StorageWriteSet,
     rows: &[crate::tracked_state::current_state_data_part::CurrentStateDataRow],
+    fragmented: bool,
     output: &mut Vec<CurrentStatePartDescriptor>,
 ) -> Result<(), LixError> {
     use crate::tracked_state::current_state_data_part::{
@@ -2311,6 +2533,7 @@ fn stage_scoped_native_current_state_rows(
             part_index: 0,
             source_row_offset: 0,
             row_count: part.row_count,
+            fragmented,
             uniform_created_at: timestamp,
             uniform_updated_at: timestamp,
         });
@@ -9732,9 +9955,10 @@ mod tests {
     };
     use crate::tracked_state::types::{
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
-        TRACKED_STATE_HASH_BYTES, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
-        TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateIndexValue,
-        TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateRootId,
+        CurrentStatePartDescriptor, TRACKED_STATE_HASH_BYTES, TrackedStateBaseCoordinate,
+        TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateDeltaRef,
+        TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
+        TrackedStateRootId,
     };
 
     use super::{
@@ -9752,8 +9976,234 @@ mod tests {
         load_owned_commit_delta_entries, scan_change_records_from_commit_deltas,
         scan_commit_delta_inventory, scan_commit_delta_members, scan_commit_delta_values,
         stage_change_locators, stage_commit_state_manifest,
-        stage_delete_commit_delta_inventory_entry, value,
+        stage_delete_commit_delta_inventory_entry,
+        stage_fragmented_scoped_current_state_descriptor, value,
     };
+
+    #[test]
+    fn fragmented_native_source_preserves_lifecycle_and_batches_adjacent_updates() {
+        use crate::json_store::JsonSlot;
+        use crate::tracked_state::current_state_data_part::{
+            CURRENT_STATE_DATA_PART_SPACE, CurrentStateDataRow, decode_current_state_data_part,
+        };
+
+        let storage = StorageAdapter::new(Memory::new());
+        let created_at = LixTimestamp::from_unix_millis_utc_lossy(10);
+        let updated_at = LixTimestamp::from_unix_millis_utc_lossy(20);
+        let replacement_updated_at = LixTimestamp::from_unix_millis_utc_lossy(30);
+        let owner = CommitId::for_test_label("fragmented-native-owner");
+        let rows = [b"a".to_vec(), b"b".to_vec()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, encoded_key)| CurrentStateDataRow {
+                encoded_key,
+                value: TrackedStateIndexValue {
+                    change_id: ChangeId::for_test_label(&format!("fragmented-source-{index}")),
+                    commit_id: owner,
+                    deleted: false,
+                    created_at,
+                    updated_at,
+                },
+                snapshot: JsonSlot::Inline(format!("{{\"version\":{index}}}").into()),
+                metadata: JsonSlot::None,
+            })
+            .collect::<Vec<_>>();
+        let descriptor = CurrentStatePartDescriptor {
+            first_key: rows[0].encoded_key.clone(),
+            last_key: rows[1].encoded_key.clone(),
+            content_digest: [7; 32],
+            payload_refs_digest: [8; 32],
+            source_kind: 1,
+            owner_commit_id: [0; 16],
+            part_index: 0,
+            source_row_offset: 4,
+            row_count: 2,
+            fragmented: false,
+            uniform_created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            uniform_updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+        };
+        let mutations = rows
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let mut row = source.clone();
+                row.value.change_id =
+                    ChangeId::for_test_label(&format!("fragmented-update-{index}"));
+                row.value.commit_id = CommitId::for_test_label("fragmented-native-child");
+                row.value.created_at = replacement_updated_at;
+                row.value.updated_at = replacement_updated_at;
+                (row.encoded_key.clone(), Some(row))
+            })
+            .collect::<Vec<_>>();
+        let mut writes = storage.new_write_set();
+        let mut output = Vec::new();
+        stage_fragmented_scoped_current_state_descriptor(
+            &mut writes,
+            &descriptor,
+            &rows,
+            mutations,
+            &mut output,
+        )
+        .expect("adjacent native updates should fragment");
+        assert_eq!(
+            output.len(),
+            1,
+            "adjacent updates must remain one native run"
+        );
+        assert_eq!(output[0].source_kind, 1);
+        assert_eq!(output[0].row_count, 2);
+        let bytes = writes
+            .staged_value(CURRENT_STATE_DATA_PART_SPACE, &output[0].content_digest)
+            .expect("updated native run should be staged");
+        let decoded = decode_current_state_data_part(&output[0].content_digest, &bytes)
+            .expect("updated native run should decode");
+        assert!(decoded.iter().all(|row| row.value.created_at == created_at));
+
+        let mut writes = storage.new_write_set();
+        let mut output = Vec::new();
+        let mut first_update = decoded[0].clone();
+        first_update.value.created_at = replacement_updated_at;
+        stage_fragmented_scoped_current_state_descriptor(
+            &mut writes,
+            &descriptor,
+            &rows,
+            vec![(first_update.encoded_key.clone(), Some(first_update))],
+            &mut output,
+        )
+        .expect("one native update should retain a source slice");
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[1].source_kind, 1);
+        assert_eq!(output[1].source_row_offset, 5);
+        assert_eq!(output[1].row_count, 1);
+
+        let mut writes = storage.new_write_set();
+        let mut output = Vec::new();
+        stage_fragmented_scoped_current_state_descriptor(
+            &mut writes,
+            &descriptor,
+            &rows,
+            vec![(b"absent".to_vec(), None)],
+            &mut output,
+        )
+        .expect("absent delete should be a physical no-op");
+        assert_eq!(output, vec![descriptor.clone()]);
+        assert!(!output[0].fragmented);
+
+        let alternating_rows = (0..64_u16)
+            .map(|index| CurrentStateDataRow {
+                encoded_key: index.to_be_bytes().to_vec(),
+                value: TrackedStateIndexValue {
+                    change_id: ChangeId::for_test_label(&format!("alternating-source-{index}")),
+                    commit_id: owner,
+                    deleted: false,
+                    created_at,
+                    updated_at,
+                },
+                snapshot: JsonSlot::Inline("{}".into()),
+                metadata: JsonSlot::None,
+            })
+            .collect::<Vec<_>>();
+        let alternating_descriptor = CurrentStatePartDescriptor {
+            first_key: alternating_rows[0].encoded_key.clone(),
+            last_key: alternating_rows.last().unwrap().encoded_key.clone(),
+            content_digest: [9; 32],
+            payload_refs_digest: [10; 32],
+            source_kind: 1,
+            owner_commit_id: [0; 16],
+            part_index: 0,
+            source_row_offset: 0,
+            row_count: alternating_rows.len() as u16,
+            fragmented: false,
+            uniform_created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            uniform_updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+        };
+        let alternating_mutations = alternating_rows
+            .iter()
+            .step_by(2)
+            .map(|source| {
+                let mut row = source.clone();
+                row.value.updated_at = replacement_updated_at;
+                (row.encoded_key.clone(), Some(row))
+            })
+            .collect::<Vec<_>>();
+        let mut writes = storage.new_write_set();
+        let mut output = Vec::new();
+        stage_fragmented_scoped_current_state_descriptor(
+            &mut writes,
+            &alternating_descriptor,
+            &alternating_rows,
+            alternating_mutations,
+            &mut output,
+        )
+        .expect("alternating updates should use the bounded rewrite fallback");
+        assert_eq!(
+            output.len(),
+            1,
+            "alternating updates must not publish one descriptor per authored run"
+        );
+        assert_eq!(output[0].row_count, 64);
+    }
+
+    #[test]
+    fn sparse_leaf_compaction_budget_bounds_low_density_fragment_growth() {
+        let scope = crate::tracked_state::types::CommitDeltaReplacementScope {
+            schema_key: "fragmented".to_string(),
+            file_id: None,
+        };
+        let part = |index: u32, fragmented: bool| {
+            let key = index.to_be_bytes().to_vec();
+            crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor(
+                &scope,
+                &CurrentStatePartDescriptor {
+                    first_key: key.clone(),
+                    last_key: key,
+                    content_digest: *blake3::hash(&index.to_be_bytes()).as_bytes(),
+                    payload_refs_digest: [8; 32],
+                    source_kind: 1,
+                    owner_commit_id: [0; 16],
+                    part_index: 0,
+                    source_row_offset: 0,
+                    row_count: 1,
+                    fragmented,
+                    uniform_created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                    uniform_updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                },
+            )
+            .unwrap()
+        };
+        let mut parts = (0..20_u32)
+            .map(|index| part(index, false))
+            .chain((20..51_u32).map(|index| part(index, true)))
+            .chain((52..116_u32).map(|index| part(index, false)))
+            .collect::<Vec<_>>();
+        assert!(
+            super::sparse_current_state_fragment_compaction_ranges(
+                &parts.iter().collect::<Vec<_>>()
+            )
+            .unwrap()
+            .is_empty()
+        );
+        parts.insert(51, part(51, true));
+        assert_eq!(
+            super::sparse_current_state_fragment_compaction_ranges(
+                &parts.iter().collect::<Vec<_>>()
+            )
+            .unwrap(),
+            vec![(20, 52)],
+            "only the contiguous fragment run should compact; 84 healthy neighbors remain untouched"
+        );
+        let naturally_small = (0..64_u32)
+            .map(|index| part(index, false))
+            .collect::<Vec<_>>();
+        assert!(
+            super::sparse_current_state_fragment_compaction_ranges(
+                &naturally_small.iter().collect::<Vec<_>>()
+            )
+            .unwrap()
+            .is_empty(),
+            "canonical byte-limited parts must never be mistaken for structural fragments"
+        );
+    }
 
     struct SealCountingRead<R> {
         inner: R,

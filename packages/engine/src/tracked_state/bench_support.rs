@@ -74,6 +74,7 @@ pub enum BenchCurrentStatePointMode {
 pub enum BenchCurrentStateSparseShape {
     UnrelatedScopes,
     TouchedScope,
+    TouchedScopeDistinct,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +104,7 @@ pub struct BenchCurrentStatePointFixture<StorageImpl: Storage> {
     first_sparse_elapsed_nanos: u64,
     first_sparse_staged_puts: u64,
     first_sparse_written_bytes: u64,
+    current_state_part_count: u64,
 }
 
 pub async fn seed_current_state_point_fixture<StorageImpl>(
@@ -252,7 +254,11 @@ where
     for index in 0..unrelated_sparse_commits {
         let sparse_started = Instant::now();
         let commit_id = bench_addressable_commit_id(&format!("scoped-range-child-{index}"));
-        let touches_alpha = sparse_shape == BenchCurrentStateSparseShape::TouchedScope;
+        let touches_alpha = matches!(
+            sparse_shape,
+            BenchCurrentStateSparseShape::TouchedScope
+                | BenchCurrentStateSparseShape::TouchedScopeDistinct
+        );
         let present_scope = !touches_alpha && scope_count > 1 && index % 4 == 0;
         let schema_key = if touches_alpha {
             "bench_current_state_alpha".to_string()
@@ -263,7 +269,9 @@ where
         };
         let file_id =
             present_scope.then(|| format!("file-{:05}", (1 + index % (scope_count - 1)) % 10_000));
-        let sparse_pk = if touches_alpha {
+        let sparse_pk = if sparse_shape == BenchCurrentStateSparseShape::TouchedScopeDistinct {
+            &entity_pks[(replacement_rows / 4 + index) % replacement_rows]
+        } else if touches_alpha {
             &entity_pks[replacement_rows / 4]
         } else {
             &beta_pk
@@ -348,7 +356,11 @@ where
         .copied()
         .unwrap_or_default();
 
-    let target_index = if sparse_shape == BenchCurrentStateSparseShape::TouchedScope
+    let target_index = if sparse_shape == BenchCurrentStateSparseShape::TouchedScopeDistinct
+        && point_target == BenchCurrentStatePointTarget::HotMutated
+    {
+        (replacement_rows / 4 + unrelated_sparse_commits.saturating_sub(1)) % replacement_rows
+    } else if sparse_shape == BenchCurrentStateSparseShape::TouchedScope
         && point_target == BenchCurrentStatePointTarget::HotMutated
     {
         replacement_rows / 4
@@ -362,6 +374,10 @@ where
             entity_pk: &entity_pks[target_index],
         },
     ));
+    let current_state_part_count = current_manifest
+        .current_state_scoped_ranges
+        .as_ref()
+        .map_or(0, |root| u64::from(root.tree.part_count));
     BenchCurrentStatePointFixture {
         storage,
         commits,
@@ -382,6 +398,7 @@ where
         first_sparse_elapsed_nanos,
         first_sparse_staged_puts,
         first_sparse_written_bytes,
+        current_state_part_count,
     }
 }
 
@@ -501,6 +518,10 @@ where
 
     pub fn first_sparse_written_bytes(&self) -> u64 {
         self.first_sparse_written_bytes
+    }
+
+    pub fn current_state_part_count(&self) -> u64 {
+        self.current_state_part_count
     }
 
     pub async fn read_point(&self, mode: BenchCurrentStatePointMode) -> usize {

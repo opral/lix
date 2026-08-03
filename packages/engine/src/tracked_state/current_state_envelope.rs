@@ -7,7 +7,7 @@ use crate::tracked_state::scoped_range::{
 use crate::tracked_state::types::{CommitDeltaReplacementScope, CurrentStatePartDescriptor};
 use crate::{LixError, storage_codec};
 
-const LOCATOR_PAYLOAD_VERSION: u16 = 1;
+const LOCATOR_PAYLOAD_VERSION: u16 = 2;
 
 #[derive(musli::Encode, musli::Decode)]
 #[musli(packed)]
@@ -18,6 +18,7 @@ struct CurrentStatePartLocatorPayload {
     owner_commit_id: [u8; 16],
     part_index: u32,
     source_row_offset: u16,
+    fragmented: bool,
     uniform_created_at: crate::common::LixTimestamp,
     uniform_updated_at: crate::common::LixTimestamp,
 }
@@ -60,6 +61,7 @@ pub(crate) fn scoped_range_part_from_current_state_descriptor(
                     owner_commit_id: descriptor.owner_commit_id,
                     part_index: descriptor.part_index,
                     source_row_offset: descriptor.source_row_offset,
+                    fragmented: descriptor.fragmented,
                     uniform_created_at: descriptor.uniform_created_at,
                     uniform_updated_at: descriptor.uniform_updated_at,
                 },
@@ -89,6 +91,7 @@ pub(crate) fn current_state_descriptor_from_scoped_range_part(
         source_row_offset: payload.source_row_offset,
         row_count: u16::try_from(part.row_count)
             .map_err(|_| envelope_error("part row count exceeds its locator codec"))?,
+        fragmented: payload.fragmented,
         uniform_created_at: payload.uniform_created_at,
         uniform_updated_at: payload.uniform_updated_at,
     };

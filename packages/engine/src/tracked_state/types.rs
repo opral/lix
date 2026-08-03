@@ -294,6 +294,10 @@ pub(crate) struct CurrentStatePartDescriptor {
     /// allows sparse deletes and updates to retain untouched source bytes.
     pub(crate) source_row_offset: u16,
     pub(crate) row_count: u16,
+    /// True only for structural slices and authored islands introduced by a
+    /// sparse rewrite. Canonical encodes clear this bit, making compaction
+    /// self-stabilizing without guessing from physical row density.
+    pub(crate) fragmented: bool,
     pub(crate) uniform_created_at: LixTimestamp,
     pub(crate) uniform_updated_at: LixTimestamp,
 }

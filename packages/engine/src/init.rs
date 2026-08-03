@@ -42,16 +42,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V46 makes immutable columnar bases a schema-independent physical detail,
-/// routes broad scans and collection aggregates through DataFusion, binds
-/// authenticated row groups to registered SQL schemas, and stores canonical
-/// entity identities for transactional overlay reconciliation. Older
-/// repositories must fail closed rather than interpret earlier workload-policy
-/// sidecars as schema-authenticated physical layouts.
+/// V53 makes structural fragmentation explicit in current-state range
+/// locators. Sparse rewrites may retain immutable source slices, while
+/// compaction clears the fragment bit on canonical output. Older repositories
+/// must fail closed rather than infer this serving invariant from row density.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"account-attributed-current-state-range-splice.v52";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"explicit-current-state-fragments.v53";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately

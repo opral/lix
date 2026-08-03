@@ -138,6 +138,7 @@ pub(crate) async fn stage_complete_replacement_scoped_range_root(
                     .map_err(|_| scoped_state_error("replacement part index overflows"))?,
                 source_row_offset: 0,
                 row_count,
+                fragmented: false,
                 uniform_created_at: part.uniform_created_at,
                 uniform_updated_at: part.uniform_updated_at,
             })
@@ -329,7 +330,7 @@ mod tests {
     use crate::tracked_state::codec::encode_key_ref;
     use crate::tracked_state::scoped_range::{
         ScopedRangeCoverageMarker, ScopedRangePart, ScopedRangePartPayload, ScopedRangePrefix,
-        plan_scoped_range_part_splice, route_scoped_range_point,
+        plan_scoped_range_part_splice, route_scoped_range_point, scan_scoped_range_interval,
         snapshot_staged_scoped_range_nodes, stage_scoped_range_part_splice,
         stage_scoped_range_tree, validate_scoped_range_tree,
     };
@@ -405,7 +406,7 @@ mod tests {
             scope: replacement_scope.clone(),
             fallback_commit_id: None,
             lifecycle_summary: CommitDeltaLifecycleSummary {
-                scope: replacement_scope,
+                scope: replacement_scope.clone(),
                 ordered_identity_digest: [7; 32],
                 uniform_created_at: created_at,
             },
@@ -480,7 +481,7 @@ mod tests {
             scope: replacement_scope.clone(),
             fallback_commit_id: None,
             lifecycle_summary: CommitDeltaLifecycleSummary {
-                scope: replacement_scope,
+                scope: replacement_scope.clone(),
                 ordered_identity_digest: [7; 32],
                 uniform_created_at: created_at,
             },
@@ -668,6 +669,43 @@ mod tests {
             Some(child_id)
         );
         assert!(values[3].is_none(), "covered exact miss must not replay");
+
+        let first = encoded_key("scoped-publication", &existing);
+        let last = encoded_key("scoped-publication", &inserted);
+        let interval = scan_scoped_range_interval(
+            &child_read,
+            &child.current_state_scoped_ranges.as_deref().unwrap().tree,
+            &crate::tracked_state::current_state_envelope::current_state_scope_prefix(
+                &replacement_scope,
+            )
+            .unwrap(),
+            &first,
+            &last,
+        )
+        .await
+        .expect("sparse post-image parts should scan");
+        let descriptors = interval
+            .parts
+            .iter()
+            .map(|part| {
+                crate::tracked_state::current_state_envelope::current_state_descriptor_from_scoped_range_part(part)
+                    .expect("current-state locator should decode")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(descriptors.len(), 3);
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| (
+                    descriptor.source_kind,
+                    descriptor.source_row_offset,
+                    descriptor.row_count,
+                    descriptor.fragmented,
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 1, true), (0, 2, 1, true), (1, 0, 1, true)],
+            "sparse delete/insert must retain two immutable source slices and write only the insert",
+        );
     }
 
     #[tokio::test]
