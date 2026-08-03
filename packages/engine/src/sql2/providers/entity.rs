@@ -1791,7 +1791,7 @@ fn branch_id_from_column_literal_filter(column_expr: &Expr, literal_expr: &Expr)
 impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
     pub(super) fn new(spec: &'a EntitySurfaceSpec) -> Self {
         Self {
-            primary_key_columns: string_primary_key_columns(spec),
+            primary_key_columns: top_level_primary_key_columns(spec),
             primary_key_component_types: spec.primary_key_component_types.clone(),
         }
     }
@@ -2276,15 +2276,15 @@ fn entity_filter_values_equal(
     }
 }
 
-fn string_primary_key_columns(spec: &EntitySurfaceSpec) -> Vec<&str> {
+fn top_level_primary_key_columns(spec: &EntitySurfaceSpec) -> Vec<&str> {
     spec.primary_key_paths
         .iter()
         .map(|path| {
             let [column_name] = path.as_slice() else {
                 return None;
             };
-            let column = spec.visible_column(column_name)?;
-            (column.column_type == EntityColumnType::String).then_some(column.name.as_str())
+            spec.visible_column(column_name)
+                .map(|column| column.name.as_str())
         })
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default()
@@ -2325,16 +2325,15 @@ fn entity_pk_constraint_from_in_list_filter(
     let Expr::Column(column) = in_list.expr.as_ref() else {
         return None;
     };
-    let values = in_list
-        .list
-        .iter()
-        .map(string_expr_literal)
-        .collect::<Option<Vec<_>>>()?;
-    if values.is_empty() {
+    if in_list.list.is_empty() {
         return None;
     }
     match column.name.as_str() {
-        "lixcol_entity_pk" => values
+        "lixcol_entity_pk" => in_list
+            .list
+            .iter()
+            .map(string_expr_literal)
+            .collect::<Option<Vec<_>>>()?
             .into_iter()
             .map(|value| {
                 let parts = EntityPk::from_json_array_text(&value).ok()?.into_parts();
@@ -2343,9 +2342,16 @@ fn entity_pk_constraint_from_in_list_filter(
             .collect::<Option<BTreeSet<_>>>()
             .map(EntityPkConstraint::Full),
         column_name if primary_key_columns.contains(&column_name) => {
+            let component_type =
+                primary_key_component_type(column_name, primary_key_columns, component_types)?;
+            let values = in_list
+                .list
+                .iter()
+                .map(|expr| primary_key_expr_literal(expr, component_type))
+                .collect::<Option<BTreeSet<_>>>()?;
             Some(EntityPkConstraint::Parts(BTreeMap::from([(
                 column_name.to_string(),
-                values.into_iter().collect(),
+                values,
             )])))
         }
         _ => None,
@@ -2361,19 +2367,60 @@ fn entity_pk_constraint_from_column_literal_filter(
     let Expr::Column(column) = column_expr else {
         return None;
     };
-    let value = string_expr_literal(literal_expr)?;
     match column.name.as_str() {
-        "lixcol_entity_pk" => EntityPk::from_json_array_text(&value)
+        "lixcol_entity_pk" => EntityPk::from_json_array_text(&string_expr_literal(literal_expr)?)
             .ok()
             .and_then(|identity| {
                 EntityPk::from_external_parts(identity.into_parts(), component_types).ok()
             })
             .map(|identity| EntityPkConstraint::Full(BTreeSet::from([identity]))),
         column_name if primary_key_columns.contains(&column_name) => {
+            let component_type =
+                primary_key_component_type(column_name, primary_key_columns, component_types)?;
+            let value = primary_key_expr_literal(literal_expr, component_type)?;
             Some(EntityPkConstraint::Parts(BTreeMap::from([(
                 column_name.to_string(),
                 BTreeSet::from([value]),
             )])))
+        }
+        _ => None,
+    }
+}
+
+fn primary_key_component_type(
+    column_name: &str,
+    primary_key_columns: &[&str],
+    component_types: &[crate::entity_pk::EntityPkComponentType],
+) -> Option<crate::entity_pk::EntityPkComponentType> {
+    primary_key_columns
+        .iter()
+        .position(|candidate| *candidate == column_name)
+        .and_then(|index| component_types.get(index))
+        .copied()
+}
+
+fn primary_key_expr_literal(
+    expr: &Expr,
+    component_type: crate::entity_pk::EntityPkComponentType,
+) -> Option<String> {
+    use crate::entity_pk::EntityPkComponentType;
+
+    if !matches!(component_type, EntityPkComponentType::Integer) {
+        return string_expr_literal(expr);
+    }
+    let Expr::Literal(literal, _) = expr else {
+        return None;
+    };
+    match literal {
+        ScalarValue::Int8(Some(value)) => Some(i64::from(*value).to_string()),
+        ScalarValue::Int16(Some(value)) => Some(i64::from(*value).to_string()),
+        ScalarValue::Int32(Some(value)) => Some(i64::from(*value).to_string()),
+        ScalarValue::Int64(Some(value)) => Some(value.to_string()),
+        ScalarValue::UInt8(Some(value)) => Some(i64::from(*value).to_string()),
+        ScalarValue::UInt16(Some(value)) => Some(i64::from(*value).to_string()),
+        ScalarValue::UInt32(Some(value)) => Some(i64::from(*value).to_string()),
+        ScalarValue::UInt64(Some(value)) => {
+            i64::try_from(*value).ok().map(|value| value.to_string())
         }
         _ => None,
     }
@@ -2405,15 +2452,11 @@ fn entity_pks_from_primary_key_parts(
             })
             .collect();
     }
-    Some(
-        identities
-            .into_iter()
-            .map(|parts| {
-                EntityPk::from_external_parts(parts, component_types)
-                    .expect("schema primary-key projection contains at least one part")
-            })
-            .collect(),
-    )
+    identities
+        .into_iter()
+        .map(|parts| EntityPk::from_external_parts(parts, component_types))
+        .collect::<std::result::Result<BTreeSet<_>, _>>()
+        .ok()
 }
 
 fn identity_matches_parts(
@@ -4089,6 +4132,103 @@ mod tests {
         assert_eq!(
             entity_pks,
             vec![crate::entity_pk::EntityPk::single("entity-a")]
+        );
+    }
+
+    #[tokio::test]
+    async fn integer_primary_key_filter_pushes_exact_identity_into_scan() {
+        let spec = Arc::new(
+            derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "integer_note",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer" },
+                    "body": { "type": "string" }
+                },
+                "required": ["id", "body"]
+            }))
+            .expect("integer primary-key schema should derive"),
+        );
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(column("id")),
+            Operator::Eq,
+            Box::new(Expr::Literal(ScalarValue::Int64(Some(42)), None)),
+        ));
+        let expected = crate::entity_pk::EntityPk::from_external_parts(
+            vec!["42".to_string()],
+            &spec.primary_key_component_types,
+        )
+        .expect("integer identity should encode");
+        let provider = super::EntitySpec::by_branch(
+            Arc::clone(&spec),
+            Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
+            empty_branch_ref(),
+            None,
+        );
+
+        assert_eq!(
+            <super::EntitySpec as super::super::spec::TableSpec>::filter_pushdown(
+                &provider, &filter
+            ),
+            datafusion::logical_expr::TableProviderFilterPushDown::Exact
+        );
+        let (_schema, request, _row_filters) = provider
+            .plan_scan_parts(None, &[filter], None)
+            .await
+            .expect("integer point scan should plan");
+        assert_eq!(request.filter.entity_pks, vec![expected]);
+    }
+
+    #[test]
+    fn mixed_composite_primary_key_filters_use_typed_components() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "versioned_note",
+            "x-lix-primary-key": ["/namespace", "/revision"],
+            "type": "object",
+            "properties": {
+                "namespace": { "type": "string" },
+                "revision": { "type": "integer" },
+                "body": { "type": "string" }
+            },
+            "required": ["namespace", "revision", "body"]
+        }))
+        .expect("mixed primary-key schema should derive");
+        let filters = vec![
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(column("revision")),
+                Operator::Eq,
+                Box::new(Expr::Literal(ScalarValue::UInt32(Some(7)), None)),
+            )),
+            eq_filter("namespace", "docs"),
+        ];
+
+        let actual = super::entity_pks_from_primary_key_filters(&spec, &filters)
+            .expect("mixed primary-key filters should analyze")
+            .expect("complete mixed primary key should route");
+        let expected = crate::entity_pk::EntityPk::from_external_parts(
+            vec!["docs".to_string(), "7".to_string()],
+            &spec.primary_key_component_types,
+        )
+        .expect("mixed identity should encode");
+        assert_eq!(actual, vec![expected]);
+    }
+
+    #[test]
+    fn integer_primary_key_rejects_string_literal_pushdown() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "integer_note",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "integer" } },
+            "required": ["id"]
+        }))
+        .expect("integer primary-key schema should derive");
+
+        assert!(
+            super::entity_pks_from_primary_key_filters(&spec, &[eq_filter("id", "42")])
+                .expect("mismatched filter should be safely ignored")
+                .is_none()
         );
     }
 

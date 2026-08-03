@@ -3647,6 +3647,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integer_primary_key_read_pushes_exact_identity_to_live_state() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let component_types = [crate::entity_pk::EntityPkComponentType::Integer];
+        let entity_pk = crate::entity_pk::EntityPk::from_external_parts(
+            vec!["42".to_string()],
+            &component_types,
+        )
+        .expect("integer fixture identity should encode");
+        let mut row = live_entity_row("42", branch_id, "answer");
+        row.entity_pk = entity_pk.clone();
+        row.schema_key = "integer_state_schema".to_string();
+        row.snapshot_content = Some(json!({ "id": 42, "value": "answer" }).to_string().into());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let ctx = DummySqlExecutionContext {
+            active_branch_id: branch_id,
+            blob_reader: Arc::new(DummyBlobReader),
+            live_state: Arc::new(CapturingRowsLiveStateReader {
+                rows: vec![row],
+                requests: Arc::clone(&requests),
+            }),
+            entity_snapshot_reader: None,
+            schema_definitions: vec![json!({
+                "x-lix-key": "integer_state_schema",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer" },
+                    "value": { "type": "string" }
+                },
+                "required": ["id", "value"],
+                "additionalProperties": false
+            })],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "SELECT value FROM integer_state_schema WHERE id = $1",
+            &[Value::Integer(42)],
+        )
+        .await
+        .expect("integer point read should execute");
+
+        assert_eq!(result.rows, vec![vec![Value::Text("answer".to_string())]]);
+        let requests = requests.lock().expect("captured live-state requests lock");
+        let [request] = requests.as_slice() else {
+            panic!("integer point read should issue one live-state scan");
+        };
+        assert_eq!(request.filter.entity_pks, vec![entity_pk]);
+    }
+
+    #[tokio::test]
     async fn native_entity_primary_key_read_materializes_public_result() {
         let sql = "SELECT id, value FROM test_state_schema \
                    WHERE id IN ('entity-b', 'entity-a') ORDER BY id";
