@@ -287,8 +287,11 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         deleted_checkpoint_files.remove(&(write.branch_id.clone(), write.file_id.clone()));
     }
     let mut insert_selection = prepared_writes.insert_selection;
-    let entity_columnar_write_sets =
-        prepare_entity_columnar_write_sets(&state_rows, &insert_selection, entity_schema_catalog)?;
+    let entity_columnar_write_sets = prepare_entity_columnar_write_sets(
+        &mut state_rows,
+        &insert_selection,
+        entity_schema_catalog,
+    )?;
     release_validated_canonical_value_columns(&mut state_rows);
     if !prepared_writes.file_content_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
@@ -4579,7 +4582,7 @@ fn release_validated_canonical_value_columns(state_rows: &mut PreparedStateBatch
 }
 
 fn prepare_entity_columnar_write_sets(
-    state_rows: &PreparedStateBatch,
+    state_rows: &mut PreparedStateBatch,
     insert_selection: &PreparedInsertSelection,
     entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
 ) -> Result<crate::live_state::EntityColumnarWriteSets, LixError> {
@@ -4590,6 +4593,32 @@ fn prepare_entity_columnar_write_sets(
         insert_selection.len() == state_rows.len() && insert_selection.covers_all(state_rows.len());
     if !publishes_ordered_insert {
         return Ok(crate::live_state::EntityColumnarWriteSets::new());
+    }
+    if let Some((commit_id, schema_key, row_groups)) = state_rows.take_dense_entity_columnar() {
+        let layout_is_current = entity_schema_catalog
+            .and_then(|catalog| catalog.schema(&schema_key))
+            .and_then(|schema| crate::sql2::derive_entity_surface_spec_from_schema(schema).ok())
+            .is_some_and(|spec| {
+                row_groups.manifest.namespace == schema_key
+                    && row_groups
+                        .manifest
+                        .metadata
+                        .get(crate::sql2::ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY)
+                        .is_some_and(|fingerprint| {
+                            fingerprint == &spec.columnar_layout_fingerprint()
+                        })
+                    && row_groups.input_locations.len() == state_rows.len()
+            });
+        if layout_is_current {
+            let mut encoded =
+                crate::live_state::EntityColumnarWriteSets::with_state_row_count(state_rows.len());
+            let (row_group_set, input_locations) = row_groups.into_parts();
+            for (state_row_index, location) in input_locations.into_iter().enumerate() {
+                encoded.set_state_row_location(state_row_index, location);
+            }
+            encoded.insert((commit_id, schema_key), row_group_set);
+            return Ok(encoded);
+        }
     }
     if let Some((commit_id, schema_key, snapshots)) = state_rows.dense_entity_columnar_input() {
         let Some(schema) = entity_schema_catalog.and_then(|catalog| catalog.schema(schema_key))

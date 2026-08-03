@@ -29,7 +29,7 @@ pub(crate) const ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
 pub(crate) const ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
     "lix.entity_columnar.base_coordinates.v1";
 pub(crate) const ENTITY_COLUMNAR_ENTITY_PK_FIELD: &str = "lixcol_entity_pk";
-const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;
+pub(crate) const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;
 const LOW_CARDINALITY_CLUSTER_MAX_BUCKETS: usize = 8;
 const ENTITY_COLUMNAR_MAX_CLUSTER_PARTITIONS: usize = 64;
 
@@ -45,6 +45,7 @@ pub(crate) struct EntityColumnarRowRef<'a> {
     pub(crate) snapshot_value: &'a JsonValue,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct EncodedEntityRowGroups {
     encoded: EncodedRowGroupSet,
     pub(crate) input_locations: Vec<RowGroupRowLocation>,
@@ -80,6 +81,101 @@ where
     Ok(optional_derived_row_group_set(
         encode_registered_entity_row_groups_impl(spec, rows),
     ))
+}
+
+/// Encodes frontend-owned Arrow columns without reconstructing them from
+/// canonical snapshot JSON. The fast contract is deliberately limited to
+/// layouts whose established encoder would not reorder rows for clustering;
+/// clustered layouts retain the general encoder and identical physical
+/// behavior.
+pub(crate) fn encode_unclustered_registered_entity_row_groups(
+    spec: &EntitySurfaceSpec,
+    mut columns: Vec<ArrayRef>,
+    entity_pks: ArrayRef,
+) -> Result<Option<EncodedEntityRowGroups>, LixError> {
+    if columns.len() != spec.columns.len() {
+        return Err(entity_columnar_error(
+            "frontend column count does not match the registered schema",
+        ));
+    }
+    let row_count = entity_pks.len();
+    if row_count == 0 || columns.iter().any(|column| column.len() != row_count) {
+        return Err(entity_columnar_error(
+            "frontend columns are empty or have inconsistent row counts",
+        ));
+    }
+    let primary_key_roots = spec
+        .primary_key_paths
+        .iter()
+        .filter_map(|path| path.first().map(String::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    for (spec_column, array) in spec.columns.iter().zip(&columns) {
+        if spec_column.column_type == EntityColumnType::Boolean {
+            return Ok(None);
+        }
+        if spec_column.column_type != EntityColumnType::String
+            || primary_key_roots.contains(spec_column.name.as_str())
+        {
+            continue;
+        }
+        let Some(strings) = array.as_any().downcast_ref::<StringArray>() else {
+            return Ok(None);
+        };
+        let mut values = std::collections::BTreeSet::new();
+        for value in strings.iter().flatten() {
+            values.insert(value);
+            if values.len() > LOW_CARDINALITY_CLUSTER_MAX_VALUES {
+                break;
+            }
+        }
+        if (2..=LOW_CARDINALITY_CLUSTER_MAX_VALUES).contains(&values.len()) {
+            return Ok(None);
+        }
+    }
+
+    let mut fields = entity_visible_fields(spec);
+    fields.push(Field::new(
+        ENTITY_COLUMNAR_ENTITY_PK_FIELD,
+        DataType::Utf8,
+        false,
+    ));
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_string(),
+        spec.columnar_layout_fingerprint(),
+    );
+    metadata.insert(
+        ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY.to_string(),
+        "true".to_owned(),
+    );
+    let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+    columns.push(entity_pks);
+    let mut batches = Vec::with_capacity(row_count.div_ceil(ROW_GROUP_MAX_ROWS));
+    let mut input_locations = Vec::with_capacity(row_count);
+    for offset in (0..row_count).step_by(ROW_GROUP_MAX_ROWS) {
+        let len = (row_count - offset).min(ROW_GROUP_MAX_ROWS);
+        let group_index = u32::try_from(batches.len())
+            .map_err(|_| entity_columnar_error("row-group index exceeds u32"))?;
+        input_locations.extend((0..len).map(|row_index| RowGroupRowLocation {
+            group_index,
+            row_index: u32::try_from(row_index).expect("row-group size fits u32"),
+        }));
+        batches.push(
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                columns
+                    .iter()
+                    .map(|column| column.slice(offset, len))
+                    .collect(),
+            )
+            .map_err(|error| entity_columnar_error(error.to_string()))?,
+        );
+    }
+    let encoded = encode_row_group_set_preserving_batches(&spec.schema_key, schema, &batches)?;
+    Ok(Some(EncodedEntityRowGroups {
+        encoded,
+        input_locations,
+    }))
 }
 
 fn encode_registered_entity_row_groups_impl<'a, I>(
@@ -335,6 +431,152 @@ mod tests {
         assert_eq!(
             identities,
             std::collections::BTreeSet::from([r#"["a",1]"#, r#"["b",2]"#])
+        );
+    }
+
+    #[test]
+    fn frontend_columns_match_canonical_encoding_when_clustering_is_absent() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "direct_columns",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        }))
+        .expect("schema should derive");
+        let ids = (0..128)
+            .map(|index| format!("id-{index:04}"))
+            .collect::<Vec<_>>();
+        let values = (0..128)
+            .map(|index| format!("value-{index:04}"))
+            .collect::<Vec<_>>();
+        let snapshots = ids
+            .iter()
+            .zip(&values)
+            .map(|(id, value)| json!({"id": id, "value": value}))
+            .collect::<Vec<_>>();
+        let canonical = snapshots
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("snapshots should encode");
+        let identities = ids
+            .iter()
+            .map(|id| EntityPk::from_validated_shared_string(id.as_str().into()))
+            .collect::<Vec<_>>();
+        let canonical_encoding = encode_registered_entity_row_groups(
+            &spec,
+            identities.iter().zip(&snapshots).zip(&canonical).map(
+                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
+                    entity_pk,
+                    snapshot_bytes: canonical.as_bytes(),
+                    snapshot_value: snapshot,
+                },
+            ),
+        )
+        .expect("canonical encoding should succeed")
+        .expect("canonical encoding should exist");
+        let direct_encoding = encode_unclustered_registered_entity_row_groups(
+            &spec,
+            vec![
+                Arc::new(StringArray::from(ids.clone())),
+                Arc::new(StringArray::from(values)),
+            ],
+            Arc::new(StringArray::from(
+                identities
+                    .iter()
+                    .map(EntityPk::as_json_array_text)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("identities should encode"),
+            )),
+        )
+        .expect("direct encoding should succeed")
+        .expect("high-cardinality values should not cluster");
+        assert_eq!(direct_encoding.manifest, canonical_encoding.manifest);
+        assert_eq!(
+            direct_encoding.input_locations,
+            canonical_encoding.input_locations
+        );
+    }
+
+    #[test]
+    fn frontend_json_columns_match_canonical_path_value_encoding() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "path_value_columns",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        }))
+        .expect("schema should derive");
+        let paths = (0..128)
+            .map(|index| format!("/path/{index:04}"))
+            .collect::<Vec<_>>();
+        let json_values = (0..128)
+            .map(|index| json!({"index": index, "nested": [index, index + 1]}))
+            .collect::<Vec<_>>();
+        let snapshots = paths
+            .iter()
+            .zip(&json_values)
+            .map(|(path, value)| json!({"path": path, "value": value}))
+            .collect::<Vec<_>>();
+        let canonical = snapshots
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("snapshots should encode");
+        let identities = paths
+            .iter()
+            .map(|path| EntityPk::from_validated_shared_string(path.as_str().into()))
+            .collect::<Vec<_>>();
+        let canonical_encoding = encode_registered_entity_row_groups(
+            &spec,
+            identities.iter().zip(&snapshots).zip(&canonical).map(
+                |((entity_pk, snapshot), canonical)| EntityColumnarRowRef {
+                    entity_pk,
+                    snapshot_bytes: canonical.as_bytes(),
+                    snapshot_value: snapshot,
+                },
+            ),
+        )
+        .expect("canonical encoding should succeed")
+        .expect("canonical encoding should exist");
+        let direct_encoding = encode_unclustered_registered_entity_row_groups(
+            &spec,
+            vec![
+                Arc::new(StringArray::from(paths.clone())),
+                Arc::new(StringArray::from(
+                    json_values
+                        .iter()
+                        .map(serde_json::to_string)
+                        .collect::<Result<Vec<_>, _>>()
+                        .expect("JSON values should encode"),
+                )),
+            ],
+            Arc::new(StringArray::from(
+                identities
+                    .iter()
+                    .map(EntityPk::as_json_array_text)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("identities should encode"),
+            )),
+        )
+        .expect("direct encoding should succeed")
+        .expect("path/value columns should not cluster");
+        assert_eq!(direct_encoding.manifest, canonical_encoding.manifest);
+        assert_eq!(
+            direct_encoding.input_locations,
+            canonical_encoding.input_locations
         );
     }
 

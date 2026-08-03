@@ -562,6 +562,7 @@ pub(crate) struct CertifiedParameterBatch {
     schema_key: SharedStr,
     branch_id: SharedStr,
     certificate: CertifiedRawWriteBatchPreparation,
+    entity_columnar: Option<crate::sql2::EncodedEntityRowGroups>,
 }
 
 impl CertifiedParameterBatch {
@@ -590,7 +591,16 @@ impl CertifiedParameterBatch {
             schema_key,
             branch_id,
             certificate,
+            entity_columnar: None,
         })
+    }
+
+    pub(crate) fn with_entity_columnar(
+        mut self,
+        entity_columnar: crate::sql2::EncodedEntityRowGroups,
+    ) -> Self {
+        self.entity_columnar = Some(entity_columnar);
+        self
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -634,6 +644,7 @@ impl CertifiedParameterBatch {
             schema_key,
             branch_id,
             certificate,
+            entity_columnar,
         } = self;
         let row_count = entity_pks.len();
         let (mut strings, schema_key_ordinal, branch_id_ordinal) = if schema_key == branch_id {
@@ -682,6 +693,7 @@ impl CertifiedParameterBatch {
                 commit_id: None,
                 branch_id: branch_id_ordinal,
                 direct_change_ids: None,
+                entity_columnar,
             }),
             entity_pks,
             strings,
@@ -2597,6 +2609,9 @@ struct DenseCertifiedParameterSlots {
     /// Absent until commit-delta publication assigns direct addresses. The
     /// compact segment map derives every UUID without a million-row column.
     direct_change_ids: Option<OrderedAddressableCommitDeltaStage>,
+    /// Frontend-built row groups over the same certified typed columns.
+    /// Topology-changing operations drop this derived accelerator.
+    entity_columnar: Option<crate::sql2::EncodedEntityRowGroups>,
 }
 
 #[derive(Debug, Clone)]
@@ -3087,6 +3102,8 @@ impl PreparedStateBatch {
                     && left.commit_id == right.commit_id
                     && left.direct_change_ids.is_none()
                     && right.direct_change_ids.is_none()
+                    && left.entity_columnar.is_none()
+                    && right.entity_columnar.is_none()
                     && self.durable_predecessors.is_empty()
                     && other.durable_predecessors.is_empty()
                     && self.origins.is_empty()
@@ -3467,6 +3484,19 @@ impl PreparedStateBatch {
             commit_id,
             self.strings[dense.schema_key as usize].as_str(),
             &self.json[..dense.len],
+        ))
+    }
+
+    pub(crate) fn take_dense_entity_columnar(
+        &mut self,
+    ) -> Option<(CommitId, String, crate::sql2::EncodedEntityRowGroups)> {
+        let dense = self.dense_certified_parameter.as_mut()?;
+        let commit_id = dense.commit_id?;
+        let encoded = dense.entity_columnar.take()?;
+        Some((
+            commit_id,
+            self.strings[dense.schema_key as usize].to_string(),
+            encoded,
         ))
     }
 
