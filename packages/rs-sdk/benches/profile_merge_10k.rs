@@ -214,12 +214,12 @@ fn build_csv_v2_plugin() -> Vec<u8> {
             include_str!("../../../plugins/csv/manifest.json").as_bytes(),
         ),
         (
-            "schema/csv_v2_table.json",
-            include_str!("../../../plugins/csv/schema/csv_v2_table.json").as_bytes(),
+            "schema/csv_table.json",
+            include_str!("../../../plugins/csv/schema/csv_table.json").as_bytes(),
         ),
         (
-            "schema/csv_v2_row.json",
-            include_str!("../../../plugins/csv/schema/csv_v2_row.json").as_bytes(),
+            "schema/csv_row.json",
+            include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {

@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use base64::Engine as _;
 use bytes::Bytes;
 use lix_engine::wasm::WasmLimits;
 use lix_engine::wasm::v1::{
@@ -24,11 +23,12 @@ use lix_engine::wasm::{
     WasmDocumentCheckpoint, WasmDocumentHandle, WasmDurableDocumentCheckpoint,
     WasmEditCursorHandle, WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChanges,
     WasmEntityKey, WasmEntityTransition, WasmEntityUpdate, WasmFileTransition, WasmFileUpdate,
-    WasmGuestBytes, WasmGuestEntityChanges, WasmHostBytes, WasmHostEntityConflict, WasmInputBytes,
-    WasmOpenEntitiesInput, WasmOpenFileInput, WasmOutputRange, WasmOutputSplice,
-    WasmResolutionCursorHandle, WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
+    WasmGuestBytes, WasmHostBytes, WasmHostEntityConflict, WasmInputBytes, WasmOpenEntitiesInput,
+    WasmOpenFileInput, WasmOutputRange, WasmOutputSplice, WasmResolutionCursorHandle,
+    WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
 };
 use lix_engine::{LixError, SharedStr};
+use lix_plugin_wire::{Operation, Page as EntityPage, Representation, encode_single_section};
 use wasmtime::Store;
 use wasmtime::component::{Component, Linker, Resource, ResourceTable};
 
@@ -40,12 +40,11 @@ use super::{
 // Warm transitions normally retain the engine's 2 MiB fixed page schedule.
 // Cold admission may scale as high as 16 MiB so a valid single text entity
 // (for example a one-line source map) can cross the fused push sink.
-const V3_MAX_BATCH_BYTES: u32 = 16 * 1024 * 1024;
+const COMPONENT_MAX_BATCH_BYTES: u32 = 16 * 1024 * 1024;
 // Admit one fused export per compiled plugin component before allocating its
 // Wasmtime Store. This bounds both actor and pushed-page residency without
 // creating an executor thread or serializing different plugin types.
-const V3_MAX_CONCURRENT_EXECUTIONS_PER_COMPONENT: usize = 1;
-const CERTIFIED_TYPED_CSV_V1: u16 = 1;
+const COMPONENT_MAX_CONCURRENT_EXECUTIONS_PER_COMPONENT: usize = 1;
 const CERTIFIED_CREATED_PACKET_V1: u16 = 2;
 
 fn take_borrowed_resource<T: Send + 'static>(
@@ -55,7 +54,7 @@ fn take_borrowed_resource<T: Send + 'static>(
 ) -> Result<T, LixError> {
     table
         .delete(resource)
-        .map_err(|error| v3_error(format!("{context}: {error}")))
+        .map_err(|error| component_error(format!("{context}: {error}")))
 }
 
 pub(super) mod bindings {
@@ -66,7 +65,7 @@ pub(super) mod bindings {
             "lix:plugin/host.snapshot": super::SnapshotResource,
             "lix:plugin/host.transition": super::TransitionResource,
             "lix:plugin/host.conflict-source": super::ConflictSourceResource,
-            "lix:plugin/host.entity-change-source": super::EntityChangeSourceResource,
+            "lix:plugin/host.entity-source": super::EntitySourceResource,
             "lix:plugin/host.resolution-sink": super::ResolutionSinkResource,
         },
     });
@@ -86,7 +85,7 @@ pub struct ConflictSourceResource {
     state: SharedResolutionState,
 }
 
-pub struct EntityChangeSourceResource {
+pub struct EntitySourceResource {
     state: SharedEntityChangeState,
 }
 
@@ -105,6 +104,8 @@ struct TransitionState {
     started: Instant,
     total_bytes: SharedByteBudget,
     pages: VecDeque<PendingChangePage>,
+    attachments: Vec<Bytes>,
+    pending_attachment: Option<PendingEntityAttachment>,
     counters: WasmTransitionCounters,
     allow_file_replacement: bool,
     file_replacement: Option<PendingFileReplacement>,
@@ -114,6 +115,11 @@ struct PendingFileReplacement {
     expected_len: u64,
     bytes: Vec<u8>,
     complete: bool,
+}
+
+struct PendingEntityAttachment {
+    expected_len: u64,
+    bytes: Vec<u8>,
 }
 
 struct EntityChangeState {
@@ -136,12 +142,12 @@ struct ResolutionState {
     started: Instant,
     total_bytes: u64,
     conflicts: Vec<WasmHostEntityConflict>,
-    resolutions: Vec<V3Resolution>,
+    resolutions: Vec<ComponentResolution>,
     pending: Option<PendingReplacement>,
     counters: WasmTransitionCounters,
 }
 
-enum V3Resolution {
+enum ComponentResolution {
     Take(WasmConflictTake),
     Replace {
         snapshot: Bytes,
@@ -152,7 +158,6 @@ enum V3Resolution {
 
 struct PendingReplacement {
     ordinal: u32,
-    effect: WasmChangeEffect,
     expected_len: u64,
     bytes: Vec<u8>,
 }
@@ -168,13 +173,9 @@ enum PendingChangePage {
     Packet {
         record_count: u32,
         payload: Vec<u8>,
+        attachments: Arc<[Bytes]>,
         max_page_bytes: u32,
         limits: WasmTransitionLimits,
-        creates: WasmCreateContext,
-    },
-    TypedCsv {
-        row_count: u32,
-        payload: Vec<u8>,
         creates: WasmCreateContext,
     },
 }
@@ -185,15 +186,17 @@ impl PendingChangePage {
             Self::Packet {
                 record_count,
                 payload,
+                attachments,
                 max_page_bytes,
                 limits,
                 ..
-            } => decode_inline_change_page(record_count, payload, max_page_bytes, limits),
-            Self::TypedCsv {
-                row_count,
+            } => decode_inline_change_page(
+                record_count,
                 payload,
-                creates,
-            } => decode_typed_csv_rows(row_count, &payload, creates).map_err(v3_error),
+                &attachments,
+                max_page_bytes,
+                limits,
+            ),
         }
     }
 }
@@ -201,11 +204,12 @@ impl PendingChangePage {
 fn decode_inline_change_page(
     record_count: u32,
     payload: Vec<u8>,
+    attachments: &[Bytes],
     max_bytes: u32,
     limits: WasmTransitionLimits,
 ) -> Result<WasmChangePage, LixError> {
     if record_count == 0 {
-        return Err(v3_error("guest returned a zero-record change page"));
+        return Err(component_error("guest returned a zero-record change page"));
     }
     if max_bytes == 0 || max_bytes > limits.max_page_bytes {
         return Err(component_limit(
@@ -218,9 +222,9 @@ fn decode_inline_change_page(
         ));
     }
     let record_count = usize::try_from(record_count)
-        .map_err(|_| v3_error("guest record count exceeds host bounds"))?;
+        .map_err(|_| component_error("guest record count exceeds host bounds"))?;
     if record_count > payload.len() / size_of::<u32>() {
-        return Err(v3_error(
+        return Err(component_error(
             "guest record count exceeds its bounded payload framing",
         ));
     }
@@ -244,12 +248,12 @@ fn decode_inline_change_page(
                 let effect = match record.read_u8()? {
                     0 => WasmChangeEffect::Content,
                     1 => WasmChangeEffect::FormatOnly,
-                    _ => return Err(v3_error("unknown change effect tag")),
+                    _ => return Err(component_error("unknown change effect tag")),
                 };
                 WasmEntityChange::Upsert {
                     entity: WasmEntity {
                         key,
-                        snapshot_content: decode_inline_guest_blob(&mut record)?,
+                        snapshot_content: decode_guest_blob(&mut record, attachments)?,
                     },
                     effect,
                 }
@@ -259,9 +263,9 @@ fn decode_inline_change_page(
                 schema_key: record.read_text()?.to_string(),
                 local_ref: record.read_u64()?,
                 resolved_key: None,
-                snapshot_content: decode_inline_guest_blob(&mut record)?,
+                snapshot_content: decode_guest_blob(&mut record, attachments)?,
             },
-            _ => return Err(v3_error("unknown change tag")),
+            _ => return Err(component_error("unknown change tag")),
         };
         record.finish()?;
         changes.push(change);
@@ -274,11 +278,21 @@ fn decode_inline_change_page(
     })
 }
 
+fn encode_packet_text(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
+    output.extend_from_slice(
+        &u32::try_from(value.len())
+            .map_err(|_| component_error("entity packet text exceeds u32"))?
+            .to_le_bytes(),
+    );
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
 fn decode_entity_key(reader: &mut PacketReader<'_>) -> Result<WasmEntityKey, LixError> {
     let schema_key = reader.read_text()?;
     let pk_count = reader.read_u32()?;
     if pk_count as usize > reader.remaining() / size_of::<u32>() {
-        return Err(v3_error(
+        return Err(component_error(
             "entity primary-key component count exceeds packet bounds",
         ));
     }
@@ -289,16 +303,27 @@ fn decode_entity_key(reader: &mut PacketReader<'_>) -> Result<WasmEntityKey, Lix
     Ok(key)
 }
 
-fn decode_inline_guest_blob(reader: &mut PacketReader<'_>) -> Result<WasmGuestBytes, LixError> {
+fn decode_guest_blob(
+    reader: &mut PacketReader<'_>,
+    attachments: &[Bytes],
+) -> Result<WasmGuestBytes, LixError> {
     match reader.read_u8()? {
         0 => {
             let length = reader.read_u32()? as usize;
             Ok(WasmGuestBytes::Inline(reader.read_bytes(length)?))
         }
-        1 => Err(v3_error(
-            "packet-v1 push pages cannot contain output attachments",
-        )),
-        _ => Err(v3_error("unknown blob-reference tag")),
+        1 => {
+            let ordinal = reader.read_u32()?;
+            let length = reader.read_u64()?;
+            let bytes = attachments
+                .get(ordinal as usize)
+                .ok_or_else(|| component_error("entity attachment ordinal is out of bounds"))?;
+            if bytes.len() as u64 != length {
+                return Err(component_error("entity attachment length does not match"));
+            }
+            Ok(WasmGuestBytes::Inline(bytes.clone()))
+        }
+        _ => Err(component_error("unknown blob-reference tag")),
     }
 }
 
@@ -325,14 +350,14 @@ impl<'a> PacketReader<'a> {
         let end = self
             .offset
             .checked_add(length)
-            .ok_or_else(|| v3_error("packet range overflowed"))?;
+            .ok_or_else(|| component_error("packet range overflowed"))?;
         if end > self.end {
-            return Err(v3_error("truncated packet"));
+            return Err(component_error("truncated packet"));
         }
         let value = self
             .bytes
             .get(self.offset..end)
-            .ok_or_else(|| v3_error("truncated packet"))?;
+            .ok_or_else(|| component_error("truncated packet"))?;
         self.offset = end;
         Ok(value)
     }
@@ -361,7 +386,7 @@ impl<'a> PacketReader<'a> {
         Ok(u32::from_le_bytes(
             self.read_exact(4)?
                 .try_into()
-                .map_err(|_| v3_error("invalid u32 field"))?,
+                .map_err(|_| component_error("invalid u32 field"))?,
         ))
     }
 
@@ -369,22 +394,22 @@ impl<'a> PacketReader<'a> {
         Ok(u64::from_le_bytes(
             self.read_exact(8)?
                 .try_into()
-                .map_err(|_| v3_error("invalid u64 field"))?,
+                .map_err(|_| component_error("invalid u64 field"))?,
         ))
     }
 
     fn read_text(&mut self) -> Result<SharedStr, LixError> {
         let length = self.read_u32()? as usize;
         let bytes = self.read_exact(length)?;
-        let value =
-            std::str::from_utf8(bytes).map_err(|_| v3_error("packet text is not valid UTF-8"))?;
+        let value = std::str::from_utf8(bytes)
+            .map_err(|_| component_error("packet text is not valid UTF-8"))?;
         SharedStr::from_utf8_slice(self.bytes.clone(), value)
-            .ok_or_else(|| v3_error("packet text is outside its page allocation"))
+            .ok_or_else(|| component_error("packet text is outside its page allocation"))
     }
 
     fn finish(&self) -> Result<(), LixError> {
         if self.offset != self.end {
-            return Err(v3_error("packet contains trailing bytes"));
+            return Err(component_error("packet contains trailing bytes"));
         }
         Ok(())
     }
@@ -397,7 +422,7 @@ fn component_limit(message: impl Into<String>) -> LixError {
 fn validate_source_admission(length: u64, limits: WasmTransitionLimits) -> Result<(), LixError> {
     if length > limits.max_total_bytes {
         return Err(component_limit(
-            "v3 source exceeds max-total-bytes before admission",
+            "component source exceeds max-total-bytes before admission",
         ));
     }
     Ok(())
@@ -416,6 +441,8 @@ impl TransitionState {
             started: Instant::now(),
             total_bytes: total_bytes.unwrap_or_default(),
             pages: VecDeque::new(),
+            attachments: Vec::new(),
+            pending_attachment: None,
             counters: WasmTransitionCounters {
                 guest_export_calls: 1,
                 ..WasmTransitionCounters::default()
@@ -428,17 +455,26 @@ impl TransitionState {
     fn check_active(&self) -> Result<(), bindings::lix::plugin::host::HostError> {
         if self.started.elapsed().as_nanos() >= u128::from(self.limits.total_deadline_nanoseconds) {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 transition deadline elapsed".to_owned(),
+                "component transition deadline elapsed".to_owned(),
             ));
         }
         Ok(())
+    }
+
+    fn take_pages(&mut self) -> Result<VecDeque<PendingChangePage>, LixError> {
+        if self.pending_attachment.is_some() {
+            return Err(component_error(
+                "entity attachment remained incomplete after plugin return",
+            ));
+        }
+        Ok(std::mem::take(&mut self.pages))
     }
 
     fn charge_page(&mut self, bytes: usize) -> Result<(), bindings::lix::plugin::host::HostError> {
         self.check_active()?;
         if bytes > self.limits.max_page_bytes as usize {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 source or sink page exceeds max-page-bytes".to_owned(),
+                "component source or sink page exceeds max-page-bytes".to_owned(),
             ));
         }
         self.charge_total(bytes)
@@ -459,12 +495,12 @@ impl TransitionState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *total_bytes = total_bytes.checked_add(bytes as u64).ok_or_else(|| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 transition byte count overflowed".to_owned(),
+                "component transition byte count overflowed".to_owned(),
             )
         })?;
         if *total_bytes > self.limits.max_total_bytes {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 transition exceeds max-total-bytes".to_owned(),
+                "component transition exceeds max-total-bytes".to_owned(),
             ));
         }
         self.counters.component_boundary_bytes = self
@@ -498,7 +534,7 @@ impl ResolutionState {
     fn check_active(&self) -> Result<(), bindings::lix::plugin::host::HostError> {
         if self.started.elapsed().as_nanos() >= u128::from(self.limits.total_deadline_nanoseconds) {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 conflict deadline elapsed".to_owned(),
+                "component conflict deadline elapsed".to_owned(),
             ));
         }
         Ok(())
@@ -508,17 +544,17 @@ impl ResolutionState {
         self.check_active()?;
         if bytes > self.limits.max_page_bytes as usize {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 conflict chunk exceeds max-page-bytes".to_owned(),
+                "component conflict chunk exceeds max-page-bytes".to_owned(),
             ));
         }
         self.total_bytes = self.total_bytes.checked_add(bytes as u64).ok_or_else(|| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 conflict byte count overflowed".to_owned(),
+                "component conflict byte count overflowed".to_owned(),
             )
         })?;
         if self.total_bytes > self.limits.max_total_bytes {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 conflict transition exceeds max-total-bytes".to_owned(),
+                "component conflict transition exceeds max-total-bytes".to_owned(),
             ));
         }
         self.counters.component_boundary_bytes = self
@@ -531,7 +567,7 @@ impl ResolutionState {
     fn next_ordinal(&self) -> Result<u32, bindings::lix::plugin::host::HostError> {
         u32::try_from(self.resolutions.len()).map_err(|_| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 conflict resolution count exceeds u32".to_owned(),
+                "component conflict resolution count exceeds u32".to_owned(),
             )
         })
     }
@@ -543,13 +579,13 @@ impl ResolutionState {
         let expected = self.next_ordinal()?;
         if ordinal != expected {
             return Err(bindings::lix::plugin::host::HostError::Rejected(format!(
-                "v3 conflict resolution ordinal {ordinal}, expected {expected}"
+                "component conflict resolution ordinal {ordinal}, expected {expected}"
             )));
         }
         let index = ordinal as usize;
         if self.conflicts.get(index).is_none() {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 conflict resolver returned excess output".to_owned(),
+                "component conflict resolver returned excess output".to_owned(),
             ));
         }
         Ok(index)
@@ -614,7 +650,7 @@ impl EntityChangeState {
     fn check_active(&self) -> Result<(), bindings::lix::plugin::host::HostError> {
         if self.started.elapsed().as_nanos() >= u128::from(self.limits.total_deadline_nanoseconds) {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 entity transition deadline elapsed".to_owned(),
+                "component entity transition deadline elapsed".to_owned(),
             ));
         }
         Ok(())
@@ -624,7 +660,7 @@ impl EntityChangeState {
         self.check_active()?;
         if bytes > self.limits.max_page_bytes as usize {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 entity-change chunk exceeds max-page-bytes".to_owned(),
+                "component entity-change chunk exceeds max-page-bytes".to_owned(),
             ));
         }
         let mut total_bytes = self
@@ -633,12 +669,12 @@ impl EntityChangeState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *total_bytes = total_bytes.checked_add(bytes as u64).ok_or_else(|| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 entity-change byte count overflowed".to_owned(),
+                "component entity-change byte count overflowed".to_owned(),
             )
         })?;
         if *total_bytes > self.limits.max_total_bytes {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 entity transition exceeds max-total-bytes".to_owned(),
+                "component entity transition exceeds max-total-bytes".to_owned(),
             ));
         }
         self.counters.component_boundary_bytes = self
@@ -647,6 +683,27 @@ impl EntityChangeState {
             .saturating_add(bytes as u64);
         Ok(())
     }
+}
+
+fn merge_entity_input_profile(
+    target: &mut WasmTransitionCounters,
+    source: &WasmTransitionCounters,
+) {
+    target.entity_input_pages = target
+        .entity_input_pages
+        .saturating_add(source.entity_input_pages);
+    target.entity_input_records = target
+        .entity_input_records
+        .saturating_add(source.entity_input_records);
+    target.entity_input_wire_bytes = target
+        .entity_input_wire_bytes
+        .saturating_add(source.entity_input_wire_bytes);
+    target.entity_input_attachment_reads = target
+        .entity_input_attachment_reads
+        .saturating_add(source.entity_input_attachment_reads);
+    target.entity_input_attachment_bytes = target
+        .entity_input_attachment_bytes
+        .saturating_add(source.entity_input_attachment_bytes);
 }
 
 fn conflict_value<'a>(
@@ -663,9 +720,9 @@ fn conflict_value<'a>(
 fn read_host_bytes(value: &WasmHostBytes, offset: u64, length: u32) -> Result<Vec<u8>, LixError> {
     let end = offset
         .checked_add(u64::from(length))
-        .ok_or_else(|| v3_error("v3 conflict range overflowed"))?;
+        .ok_or_else(|| component_error("component conflict range overflowed"))?;
     if end > value.len() {
-        return Err(v3_error("v3 conflict range is out of bounds"));
+        return Err(component_error("component conflict range is out of bounds"));
     }
     match value {
         WasmHostBytes::Inline(bytes) => Ok(bytes.slice(offset as usize..end as usize).to_vec()),
@@ -675,14 +732,14 @@ fn read_host_bytes(value: &WasmHostBytes, offset: u64, length: u32) -> Result<Ve
         WasmHostBytes::Source(slice) => slice
             .source
             .read(
-                slice
-                    .range
-                    .offset
-                    .checked_add(offset)
-                    .ok_or_else(|| v3_error("v3 conflict source offset overflowed"))?,
+                slice.range.offset.checked_add(offset).ok_or_else(|| {
+                    component_error("component conflict source offset overflowed")
+                })?,
                 length,
             )
-            .map_err(|error| v3_error(format!("failed to read v3 conflict source: {error}"))),
+            .map_err(|error| {
+                component_error(format!("failed to read component conflict source: {error}"))
+            }),
     }
 }
 
@@ -701,17 +758,9 @@ fn create_context_from_uuid(value: &str) -> Option<WasmCreateContext> {
 
 #[cfg(test)]
 fn create_context_from_generated_entity(
-    plugin_key: &str,
+    generated_schema: &str,
     entity: &WasmEntity<WasmHostBytes>,
 ) -> Option<WasmCreateContext> {
-    let generated_schema = match plugin_key {
-        "plugin_csv" => "csv_v2_row",
-        "plugin_json" => "json_array_item",
-        "plugin_markdown" => "markdown_node_v2",
-        "plugin_git_text" => "git_text_line_v2",
-        // Excalidraw identities are native format IDs, not host-generated IDs.
-        _ => return None,
-    };
     if entity.key.schema_key.as_str() != generated_schema {
         return None;
     }
@@ -727,7 +776,7 @@ fn ensure_source_page(
 ) -> Result<(), bindings::lix::plugin::host::HostError> {
     if length > max_page_bytes {
         return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-            "v3 source read exceeds max-page-bytes".to_owned(),
+            "component source read exceeds max-page-bytes".to_owned(),
         ));
     }
     Ok(())
@@ -737,7 +786,7 @@ impl bindings::lix::plugin::host::HostSnapshot for WasiHostState {
     fn file_len(&mut self, resource: Resource<SnapshotResource>) -> u64 {
         self.table
             .get(&resource)
-            .expect("v3 root resource must be live")
+            .expect("component root resource must be live")
             .root
             .bytes
             .len()
@@ -773,7 +822,7 @@ impl bindings::lix::plugin::host::HostSnapshot for WasiHostState {
             .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.to_string()))?;
         if bytes.len() != length as usize {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 root returned a short read".to_owned(),
+                "component root returned a short read".to_owned(),
             ));
         }
         let mut state = state
@@ -787,13 +836,17 @@ impl bindings::lix::plugin::host::HostSnapshot for WasiHostState {
             .counters
             .source_bytes_read
             .saturating_add(bytes.len() as u64);
+        state.counters.file_read_calls = state.counters.file_read_calls.saturating_add(1);
+        state.counters.file_bytes_read = state
+            .counters
+            .file_bytes_read
+            .saturating_add(bytes.len() as u64);
         Ok(bytes)
     }
 
-    fn read_record(
+    fn read_state(
         &mut self,
         resource: Resource<SnapshotResource>,
-        space: bindings::lix::plugin::host::MapSpace,
         key: Vec<u8>,
         offset: u64,
         max_bytes: u32,
@@ -813,10 +866,7 @@ impl bindings::lix::plugin::host::HostSnapshot for WasiHostState {
                 .limits
                 .max_page_bytes,
         )?;
-        let total_len = match space {
-            bindings::lix::plugin::host::MapSpace::Entity => root.entities.value_len(&key),
-            bindings::lix::plugin::host::MapSpace::State => root.state.value_len(&key),
-        };
+        let total_len = root.state.value_len(&key);
         let Some(total_len) = total_len else {
             let mut state = state
                 .lock()
@@ -824,22 +874,24 @@ impl bindings::lix::plugin::host::HostSnapshot for WasiHostState {
             state.charge_source(key.len())?;
             state.counters.component_import_calls =
                 state.counters.component_import_calls.saturating_add(1);
+            state.counters.state_read_calls = state.counters.state_read_calls.saturating_add(1);
+            state.counters.state_key_bytes = state
+                .counters
+                .state_key_bytes
+                .saturating_add(key.len() as u64);
             return Ok(None);
         };
         if offset > total_len {
             return Err(bindings::lix::plugin::host::HostError::InvalidRange);
         }
         let length = u64::from(max_bytes).min(total_len - offset);
-        let value = match space {
-            bindings::lix::plugin::host::MapSpace::Entity => {
-                root.entities.read(&key, offset, length)
-            }
-            bindings::lix::plugin::host::MapSpace::State => root.state.read(&key, offset, length),
-        }
-        .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.to_string()))?;
+        let value = root
+            .state
+            .read(&key, offset, length)
+            .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.to_string()))?;
         let bytes = value.ok_or_else(|| {
             bindings::lix::plugin::host::HostError::Rejected(
-                "v3 snapshot record disappeared during read".to_owned(),
+                "component snapshot record disappeared during read".to_owned(),
             )
         })?;
         let mut state = state
@@ -852,6 +904,15 @@ impl bindings::lix::plugin::host::HostSnapshot for WasiHostState {
         state.counters.source_bytes_read = state
             .counters
             .source_bytes_read
+            .saturating_add(bytes.len() as u64);
+        state.counters.state_read_calls = state.counters.state_read_calls.saturating_add(1);
+        state.counters.state_key_bytes = state
+            .counters
+            .state_key_bytes
+            .saturating_add(key.len() as u64);
+        state.counters.state_value_bytes_read = state
+            .counters
+            .state_value_bytes_read
             .saturating_add(bytes.len() as u64);
         Ok(Some(bindings::lix::plugin::host::RecordChunk {
             total_len,
@@ -869,7 +930,7 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
     fn max_batch_bytes(&mut self, resource: Resource<TransitionResource>) -> u32 {
         self.table
             .get(&resource)
-            .expect("v3 transition resource must be live")
+            .expect("component transition resource must be live")
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -885,7 +946,7 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
     ) -> Result<(), bindings::lix::plugin::host::HostError> {
         if key.starts_with(b"\0lix/") {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 host-reserved state key".to_owned(),
+                "component host-reserved state key".to_owned(),
             ));
         }
         let state = self
@@ -917,7 +978,7 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
     ) -> Result<(), bindings::lix::plugin::host::HostError> {
         if key.starts_with(b"\0lix/") {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 host-reserved state key".to_owned(),
+                "component host-reserved state key".to_owned(),
             ));
         }
         let state = self
@@ -942,10 +1003,137 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
         Ok(())
     }
 
-    fn emit_changes(
+    fn begin_entity_attachment(
         &mut self,
         resource: Resource<TransitionResource>,
-        page: bindings::lix::plugin::host::ChangePage,
+        total_length: u64,
+    ) -> Result<u32, bindings::lix::plugin::host::HostError> {
+        let shared = self
+            .table
+            .get(&resource)
+            .map_err(host_table_error)?
+            .state
+            .clone();
+        let mut state = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.check_active()?;
+        if state.pending_attachment.is_some() {
+            return Err(bindings::lix::plugin::host::HostError::Rejected(
+                "entity attachment is already open".to_owned(),
+            ));
+        }
+        if state.attachments.len() >= state.limits.max_attachment_refs as usize {
+            return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
+                "entity attachment count exceeds its transition limit".to_owned(),
+            ));
+        }
+        if total_length > state.limits.max_total_bytes {
+            return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
+                "entity attachment exceeds max-total-bytes".to_owned(),
+            ));
+        }
+        let capacity = usize::try_from(total_length).map_err(|_| {
+            bindings::lix::plugin::host::HostError::LimitExceeded(
+                "entity attachment exceeds host address space".to_owned(),
+            )
+        })?;
+        let ordinal = u32::try_from(state.attachments.len()).map_err(|_| {
+            bindings::lix::plugin::host::HostError::LimitExceeded(
+                "entity attachment ordinal exceeds u32".to_owned(),
+            )
+        })?;
+        state.pending_attachment = Some(PendingEntityAttachment {
+            expected_len: total_length,
+            bytes: Vec::with_capacity(capacity),
+        });
+        state.counters.component_import_calls =
+            state.counters.component_import_calls.saturating_add(1);
+        Ok(ordinal)
+    }
+
+    fn write_entity_attachment(
+        &mut self,
+        resource: Resource<TransitionResource>,
+        chunk: Vec<u8>,
+    ) -> Result<(), bindings::lix::plugin::host::HostError> {
+        let shared = self
+            .table
+            .get(&resource)
+            .map_err(host_table_error)?
+            .state
+            .clone();
+        let mut state = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.charge_page(chunk.len())?;
+        let pending = state.pending_attachment.as_mut().ok_or_else(|| {
+            bindings::lix::plugin::host::HostError::Rejected(
+                "entity attachment chunk has no open attachment".to_owned(),
+            )
+        })?;
+        let next_len = pending
+            .bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| {
+                bindings::lix::plugin::host::HostError::LimitExceeded(
+                    "entity attachment length overflowed".to_owned(),
+                )
+            })?;
+        if next_len as u64 > pending.expected_len {
+            return Err(bindings::lix::plugin::host::HostError::Rejected(
+                "entity attachment exceeds its declared length".to_owned(),
+            ));
+        }
+        pending.bytes.extend_from_slice(&chunk);
+        state.counters.component_import_calls =
+            state.counters.component_import_calls.saturating_add(1);
+        state.counters.entity_output_attachment_writes = state
+            .counters
+            .entity_output_attachment_writes
+            .saturating_add(1);
+        state.counters.entity_output_attachment_bytes = state
+            .counters
+            .entity_output_attachment_bytes
+            .saturating_add(chunk.len() as u64);
+        Ok(())
+    }
+
+    fn finish_entity_attachment(
+        &mut self,
+        resource: Resource<TransitionResource>,
+    ) -> Result<(), bindings::lix::plugin::host::HostError> {
+        let shared = self
+            .table
+            .get(&resource)
+            .map_err(host_table_error)?
+            .state
+            .clone();
+        let mut state = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.check_active()?;
+        let pending = state.pending_attachment.take().ok_or_else(|| {
+            bindings::lix::plugin::host::HostError::Rejected(
+                "entity attachment finish has no open attachment".to_owned(),
+            )
+        })?;
+        if pending.bytes.len() as u64 != pending.expected_len {
+            return Err(bindings::lix::plugin::host::HostError::Rejected(
+                "entity attachment ended before its declared length".to_owned(),
+            ));
+        }
+        state.attachments.push(Bytes::from(pending.bytes));
+        state.counters.component_import_calls =
+            state.counters.component_import_calls.saturating_add(1);
+        Ok(())
+    }
+
+    fn emit_entities(
+        &mut self,
+        resource: Resource<TransitionResource>,
+        mut page: bindings::lix::plugin::host::EntityPage,
     ) -> Result<(), bindings::lix::plugin::host::HostError> {
         let state = self
             .table
@@ -957,83 +1145,60 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.check_active()?;
-        if state.counters.packet_pages >= u64::from(state.limits.max_pages) {
+        let decoded = EntityPage::decode(&page.payload).map_err(|error| {
+            bindings::lix::plugin::host::HostError::Rejected(format!(
+                "invalid entity page: {error:?}"
+            ))
+        })?;
+        let page_wire_bytes = page.payload.len() as u64;
+        if state.counters.packet_pages.saturating_add(1) > u64::from(state.limits.max_pages) {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 change page count exceeds its limit".to_owned(),
+                "entity page count exceeds its transition limit".to_owned(),
             ));
         }
         state.charge_page(page.payload.len())?;
-        if page.record_count == 0 {
-            return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 change page is empty".to_owned(),
-            ));
-        }
-        state.counters.component_import_calls =
-            state.counters.component_import_calls.saturating_add(1);
-        state.counters.packet_pages = state.counters.packet_pages.saturating_add(1);
-        state.counters.packet_records = state
-            .counters
-            .packet_records
-            .saturating_add(u64::from(page.record_count));
         let limits = state.limits;
         let creates = state.creates;
-        let page = PendingChangePage::Packet {
-            record_count: page.record_count,
+        let attachments: Arc<[Bytes]> = state.attachments.clone().into();
+        let total_record_count = decoded.record_count();
+        let section = decoded.section().map_err(|error| {
+            bindings::lix::plugin::host::HostError::Rejected(format!(
+                "invalid entity page section: {error:?}"
+            ))
+        })?;
+        let payload_end = section.payload.len();
+        let record_count = section.record_count;
+        if section.representation != Representation::Snapshots {
+            return Err(bindings::lix::plugin::host::HostError::Rejected(
+                "entity page must use snapshot records".to_owned(),
+            ));
+        }
+        page.payload.truncate(payload_end);
+        let pending = PendingChangePage::Packet {
+            record_count,
             payload: page.payload,
+            attachments,
             max_page_bytes: limits.max_page_bytes,
             limits,
             creates,
         };
-        state.pages.push_back(page);
-        Ok(())
-    }
-
-    fn emit_packed(
-        &mut self,
-        resource: Resource<TransitionResource>,
-        batch: bindings::lix::plugin::host::PackedPage,
-    ) -> Result<(), bindings::lix::plugin::host::HostError> {
-        let state = self
-            .table
-            .get(&resource)
-            .map_err(host_table_error)?
-            .state
-            .clone();
-        let mut state = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.check_active()?;
-        if batch.codec != "lix.csv.rows" || batch.format_version != CERTIFIED_TYPED_CSV_V1 {
-            return Err(bindings::lix::plugin::host::HostError::Rejected(format!(
-                "unsupported v3 packed codec '{}'/{}",
-                batch.codec, batch.format_version
-            )));
-        }
-        if state.counters.packet_pages >= u64::from(state.limits.max_pages) {
-            return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 CSV batch count exceeds its limit".to_owned(),
-            ));
-        }
-        state.charge_page(batch.payload.len())?;
-        if batch.record_count == 0 {
-            return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 CSV batch is empty".to_owned(),
-            ));
-        }
         state.counters.component_import_calls =
             state.counters.component_import_calls.saturating_add(1);
         state.counters.packet_pages = state.counters.packet_pages.saturating_add(1);
         state.counters.packet_records = state
             .counters
             .packet_records
-            .saturating_add(u64::from(batch.record_count));
-        let creates = state.creates;
-        let page = PendingChangePage::TypedCsv {
-            row_count: batch.record_count,
-            payload: batch.payload,
-            creates,
-        };
-        state.pages.push_back(page);
+            .saturating_add(u64::from(total_record_count));
+        state.counters.entity_output_pages = state.counters.entity_output_pages.saturating_add(1);
+        state.counters.entity_output_records = state
+            .counters
+            .entity_output_records
+            .saturating_add(u64::from(total_record_count));
+        state.counters.entity_output_wire_bytes = state
+            .counters
+            .entity_output_wire_bytes
+            .saturating_add(page_wire_bytes);
+        state.pages.push_back(pending);
         Ok(())
     }
 
@@ -1163,13 +1328,13 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
     }
 }
 
-impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
+impl bindings::lix::plugin::host::HostEntitySource for WasiHostState {
     fn next_page(
         &mut self,
-        resource: Resource<EntityChangeSourceResource>,
+        resource: Resource<EntitySourceResource>,
         max_bytes: u32,
     ) -> Result<
-        Option<bindings::lix::plugin::host::EntityChangeInputPage>,
+        Option<bindings::lix::plugin::host::EntityPage>,
         bindings::lix::plugin::host::HostError,
     > {
         let shared = self
@@ -1183,8 +1348,17 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.check_active()?;
         ensure_source_page(max_bytes, state.limits.max_page_bytes)?;
+        let envelope_bytes = u32::try_from(
+            lix_plugin_wire::single_section_overhead("", &[]).expect("fixed page overhead"),
+        )
+        .expect("fixed page overhead fits u32");
+        let payload_budget = max_bytes.checked_sub(envelope_bytes).ok_or_else(|| {
+            bindings::lix::plugin::host::HostError::LimitExceeded(
+                "entity input page budget cannot hold its envelope".to_owned(),
+            )
+        })?;
         let Some(changes) = state
-            .next_page(max_bytes)
+            .next_page(payload_budget)
             .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?
         else {
             state.counters.component_import_calls =
@@ -1193,17 +1367,21 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
         };
         if changes.is_empty() {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 entity source returned an empty page".to_owned(),
+                "component entity source returned an empty page".to_owned(),
             ));
         }
         state.lazy_snapshots.clear();
-        let mut boundary_bytes = 0usize;
-        let mut inputs = Vec::with_capacity(changes.len());
+        let record_count = u32::try_from(changes.len()).map_err(|_| {
+            bindings::lix::plugin::host::HostError::LimitExceeded(
+                "entity input page record count exceeds u32".to_owned(),
+            )
+        })?;
+        let mut payload = Vec::new();
         for change in changes {
             let ordinal = state.next_ordinal;
             state.next_ordinal = state.next_ordinal.checked_add(1).ok_or_else(|| {
                 bindings::lix::plugin::host::HostError::LimitExceeded(
-                    "v3 entity input ordinal overflowed".to_owned(),
+                    "component entity input ordinal overflowed".to_owned(),
                 )
             })?;
             let (schema_key, entity_pk, snapshot_content, effect) = match change {
@@ -1246,84 +1424,86 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
                     WasmChangeEffect::Content,
                 ),
             };
-            let metadata_bytes = schema_key
-                .len()
-                .checked_add(entity_pk.iter().map(String::len).sum::<usize>())
-                .and_then(|bytes| bytes.checked_add(32))
-                .ok_or_else(|| {
-                    bindings::lix::plugin::host::HostError::LimitExceeded(
-                        "v3 entity page byte count overflowed".to_owned(),
-                    )
-                })?;
-            let snapshot_len = snapshot_content.as_ref().map(WasmHostBytes::len);
-            let inline_snapshot = if let Some(snapshot_content) = snapshot_content {
-                let length = usize::try_from(snapshot_content.len()).ok();
-                let fits_record = length.is_some_and(|length| {
-                    metadata_bytes
-                        .checked_add(length)
-                        .is_some_and(|bytes| bytes <= state.limits.max_record_bytes as usize)
-                });
-                let fits_page = length.is_some_and(|length| {
-                    boundary_bytes
-                        .checked_add(metadata_bytes)
-                        .and_then(|bytes| bytes.checked_add(length))
-                        .is_some_and(|bytes| bytes <= max_bytes as usize)
-                });
-                if fits_record && fits_page {
-                    let length = u32::try_from(snapshot_content.len()).map_err(|_| {
+            let record_start = payload.len();
+            payload.extend_from_slice(&0_u32.to_le_bytes());
+            if snapshot_content.is_some() {
+                payload.push(0);
+            } else {
+                payload.push(1);
+            }
+            encode_packet_text(&mut payload, &schema_key)
+                .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?;
+            payload.extend_from_slice(
+                &u32::try_from(entity_pk.len())
+                    .map_err(|_| {
                         bindings::lix::plugin::host::HostError::LimitExceeded(
-                            "v3 inline entity snapshot exceeds u32".to_owned(),
+                            "entity input primary key has too many components".to_owned(),
                         )
-                    })?;
-                    Some(
-                        read_host_bytes(&snapshot_content, 0, length).map_err(|error| {
+                    })?
+                    .to_le_bytes(),
+            );
+            for component in &entity_pk {
+                encode_packet_text(&mut payload, component).map_err(|error| {
+                    bindings::lix::plugin::host::HostError::Rejected(error.message)
+                })?;
+            }
+            if let Some(snapshot_content) = snapshot_content {
+                payload.push(match effect {
+                    WasmChangeEffect::Content => 0,
+                    WasmChangeEffect::FormatOnly => 1,
+                });
+                let inline_len = u32::try_from(snapshot_content.len()).ok();
+                let inline_fits = inline_len.is_some_and(|length| {
+                    payload
+                        .len()
+                        .checked_add(1 + 4 + length as usize)
+                        .is_some_and(|end| {
+                            end <= payload_budget as usize
+                                && end - record_start <= state.limits.max_record_bytes as usize
+                        })
+                });
+                if inline_fits {
+                    let length = inline_len.expect("checked inline length");
+                    payload.push(0);
+                    payload.extend_from_slice(&length.to_le_bytes());
+                    payload.extend_from_slice(
+                        &read_host_bytes(&snapshot_content, 0, length).map_err(|error| {
                             bindings::lix::plugin::host::HostError::Rejected(error.message)
                         })?,
-                    )
+                    );
                 } else {
+                    payload.push(1);
+                    payload.extend_from_slice(&ordinal.to_le_bytes());
+                    payload.extend_from_slice(&snapshot_content.len().to_le_bytes());
                     state.lazy_snapshots.insert(ordinal, snapshot_content);
-                    None
                 }
-            } else {
-                None
-            };
-            boundary_bytes = boundary_bytes
-                .checked_add(schema_key.len())
-                .and_then(|bytes| {
-                    entity_pk
-                        .iter()
-                        .try_fold(bytes, |bytes, value| bytes.checked_add(value.len()))
-                })
-                .and_then(|bytes| {
-                    inline_snapshot
-                        .as_ref()
-                        .map_or(Some(bytes), |snapshot| bytes.checked_add(snapshot.len()))
-                })
-                .and_then(|bytes| bytes.checked_add(32))
-                .ok_or_else(|| {
-                    bindings::lix::plugin::host::HostError::LimitExceeded(
-                        "v3 entity page byte count overflowed".to_owned(),
-                    )
-                })?;
-            inputs.push(bindings::lix::plugin::host::EntityChangeInput {
-                ordinal,
-                schema_key,
-                entity_pk,
-                snapshot_len,
-                snapshot: inline_snapshot,
-                effect: match effect {
-                    WasmChangeEffect::Content => bindings::lix::plugin::host::ChangeEffect::Content,
-                    WasmChangeEffect::FormatOnly => {
-                        bindings::lix::plugin::host::ChangeEffect::FormatOnly
-                    }
-                },
-            });
+            }
+            let record_len = u32::try_from(payload.len() - record_start - 4).map_err(|_| {
+                bindings::lix::plugin::host::HostError::LimitExceeded(
+                    "entity input record exceeds u32".to_owned(),
+                )
+            })?;
+            payload[record_start..record_start + 4].copy_from_slice(&record_len.to_le_bytes());
         }
-        if boundary_bytes > max_bytes as usize {
+        let page = encode_single_section(
+            Representation::Snapshots,
+            Operation::Mixed,
+            "",
+            &[],
+            record_count,
+            payload,
+        )
+        .map_err(|error| {
+            bindings::lix::plugin::host::HostError::Rejected(format!(
+                "failed to encode entity input page: {error:?}"
+            ))
+        })?;
+        if page.len() > max_bytes as usize {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 entity input page exceeds the requested byte limit".to_owned(),
+                "entity input page exceeds the requested byte limit".to_owned(),
             ));
         }
+        let boundary_bytes = page.len();
         state.charge(boundary_bytes)?;
         state.counters.component_import_calls =
             state.counters.component_import_calls.saturating_add(1);
@@ -1332,14 +1512,23 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
             .counters
             .source_bytes_read
             .saturating_add(boundary_bytes as u64);
-        Ok(Some(bindings::lix::plugin::host::EntityChangeInputPage {
-            changes: inputs,
+        state.counters.entity_input_pages = state.counters.entity_input_pages.saturating_add(1);
+        state.counters.entity_input_records = state
+            .counters
+            .entity_input_records
+            .saturating_add(u64::from(record_count));
+        state.counters.entity_input_wire_bytes = state
+            .counters
+            .entity_input_wire_bytes
+            .saturating_add(boundary_bytes as u64);
+        Ok(Some(bindings::lix::plugin::host::EntityPage {
+            payload: page,
         }))
     }
 
-    fn read_snapshot(
+    fn read_attachment(
         &mut self,
-        resource: Resource<EntityChangeSourceResource>,
+        resource: Resource<EntitySourceResource>,
         ordinal: u32,
         offset: u64,
         length: u32,
@@ -1369,10 +1558,18 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
             .counters
             .source_bytes_read
             .saturating_add(bytes.len() as u64);
+        state.counters.entity_input_attachment_reads = state
+            .counters
+            .entity_input_attachment_reads
+            .saturating_add(1);
+        state.counters.entity_input_attachment_bytes = state
+            .counters
+            .entity_input_attachment_bytes
+            .saturating_add(bytes.len() as u64);
         Ok(Some(bytes))
     }
 
-    fn drop(&mut self, resource: Resource<EntityChangeSourceResource>) -> wasmtime::Result<()> {
+    fn drop(&mut self, resource: Resource<EntitySourceResource>) -> wasmtime::Result<()> {
         self.table.delete(resource)?;
         Ok(())
     }
@@ -1383,7 +1580,7 @@ impl bindings::lix::plugin::host::HostConflictSource for WasiHostState {
         u32::try_from(
             self.table
                 .get(&resource)
-                .expect("v3 conflict source must be live")
+                .expect("component conflict source must be live")
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1483,7 +1680,7 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
     fn max_batch_bytes(&mut self, resource: Resource<ResolutionSinkResource>) -> u32 {
         self.table
             .get(&resource)
-            .expect("v3 resolution sink must be live")
+            .expect("component resolution sink must be live")
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1509,13 +1706,13 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
         state.check_active()?;
         if state.pending.is_some() {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 replacement is incomplete".to_owned(),
+                "component replacement is incomplete".to_owned(),
             ));
         }
         let index = state.validate_ordinal(ordinal)?;
         if conflict_value(&state.conflicts[index], side).is_none() {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 conflict resolver selected an absent side".to_owned(),
+                "component conflict resolver selected an absent side".to_owned(),
             ));
         }
         let take = match side {
@@ -1523,7 +1720,7 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
             bindings::lix::plugin::host::ConflictSide::A => WasmConflictTake::A,
             bindings::lix::plugin::host::ConflictSide::B => WasmConflictTake::B,
         };
-        state.resolutions.push(V3Resolution::Take(take));
+        state.resolutions.push(ComponentResolution::Take(take));
         state.counters.component_import_calls =
             state.counters.component_import_calls.saturating_add(1);
         state.counters.conflict_resolution_takes =
@@ -1548,11 +1745,11 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
         state.check_active()?;
         if state.pending.is_some() {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 replacement is incomplete".to_owned(),
+                "component replacement is incomplete".to_owned(),
             ));
         }
         state.validate_ordinal(ordinal)?;
-        state.resolutions.push(V3Resolution::Delete);
+        state.resolutions.push(ComponentResolution::Delete);
         state.counters.component_import_calls =
             state.counters.component_import_calls.saturating_add(1);
         Ok(())
@@ -1562,7 +1759,6 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
         &mut self,
         resource: Resource<ResolutionSinkResource>,
         ordinal: u32,
-        effect: bindings::lix::plugin::host::ResolutionEffect,
         total_length: u64,
     ) -> Result<(), bindings::lix::plugin::host::HostError> {
         let shared = self
@@ -1577,28 +1773,22 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
         state.check_active()?;
         if state.pending.is_some() {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 replacement is already open".to_owned(),
+                "component replacement is already open".to_owned(),
             ));
         }
         state.validate_ordinal(ordinal)?;
         if total_length > state.limits.max_total_bytes {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 replacement exceeds max-total-bytes".to_owned(),
+                "component replacement exceeds max-total-bytes".to_owned(),
             ));
         }
         let capacity = usize::try_from(total_length).map_err(|_| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
-                "v3 replacement exceeds host address space".to_owned(),
+                "component replacement exceeds host address space".to_owned(),
             )
         })?;
         state.pending = Some(PendingReplacement {
             ordinal,
-            effect: match effect {
-                bindings::lix::plugin::host::ResolutionEffect::Content => WasmChangeEffect::Content,
-                bindings::lix::plugin::host::ResolutionEffect::FormatOnly => {
-                    WasmChangeEffect::FormatOnly
-                }
-            },
             expected_len: total_length,
             bytes: Vec::with_capacity(capacity),
         });
@@ -1624,7 +1814,7 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
         state.charge(chunk.len())?;
         let pending = state.pending.as_mut().ok_or_else(|| {
             bindings::lix::plugin::host::HostError::Rejected(
-                "v3 replacement chunk has no open replacement".to_owned(),
+                "component replacement chunk has no open replacement".to_owned(),
             )
         })?;
         let next_len = pending
@@ -1633,12 +1823,12 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
             .checked_add(chunk.len())
             .ok_or_else(|| {
                 bindings::lix::plugin::host::HostError::LimitExceeded(
-                    "v3 replacement length overflowed".to_owned(),
+                    "component replacement length overflowed".to_owned(),
                 )
             })?;
         if next_len as u64 > pending.expected_len {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 replacement exceeds its declared length".to_owned(),
+                "component replacement exceeds its declared length".to_owned(),
             ));
         }
         pending.bytes.extend_from_slice(&chunk);
@@ -1663,18 +1853,18 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
         state.check_active()?;
         let pending = state.pending.take().ok_or_else(|| {
             bindings::lix::plugin::host::HostError::Rejected(
-                "v3 replacement finish has no open replacement".to_owned(),
+                "component replacement finish has no open replacement".to_owned(),
             )
         })?;
         if pending.bytes.len() as u64 != pending.expected_len {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 replacement ended before its declared length".to_owned(),
+                "component replacement ended before its declared length".to_owned(),
             ));
         }
         debug_assert_eq!(pending.ordinal as usize, state.resolutions.len());
-        state.resolutions.push(V3Resolution::Replace {
+        state.resolutions.push(ComponentResolution::Replace {
             snapshot: Bytes::from(pending.bytes),
-            effect: pending.effect,
+            effect: WasmChangeEffect::Content,
         });
         state.counters.component_import_calls =
             state.counters.component_import_calls.saturating_add(1);
@@ -1685,188 +1875,6 @@ impl bindings::lix::plugin::host::HostResolutionSink for WasiHostState {
         self.table.delete(resource)?;
         Ok(())
     }
-}
-
-fn decode_typed_csv_rows(
-    row_count: u32,
-    payload: &[u8],
-    creates: WasmCreateContext,
-) -> Result<WasmChangePage, String> {
-    if row_count == 0 {
-        return Err("typed CSV batch is empty".to_owned());
-    }
-    let mut input = TypedCsvReader { payload, offset: 0 };
-    let mut snapshots = Vec::with_capacity(payload.len().saturating_mul(2));
-    let mut rows = Vec::with_capacity(row_count as usize);
-    for _ in 0..row_count {
-        let local_ref = u64::from(input.u32()?);
-        let order_rank = input.u64()?;
-        validate_typed_csv_order_rank(order_rank)?;
-        let ending = input.u8()?;
-        if ending > 4 {
-            return Err("typed CSV row has an invalid terminator code".to_owned());
-        }
-        let quote_layout_len = input.u32()? as usize;
-        let quote_layout = input.bytes(quote_layout_len)?;
-        let field_count = input.u16()?;
-        if field_count == 0 {
-            return Err("typed CSV row has no fields".to_owned());
-        }
-        validate_typed_csv_quote_layout(quote_layout, field_count)?;
-        let snapshot_start = snapshots.len();
-        snapshots.extend_from_slice(b"{\"cells\":[");
-        for field in 0..field_count {
-            if field > 0 {
-                snapshots.push(b',');
-            }
-            let cell_len = input.u32()? as usize;
-            let cell = input.bytes(cell_len)?;
-            let cell = std::str::from_utf8(cell)
-                .map_err(|error| format!("typed CSV cell is not UTF-8: {error}"))?;
-            write_json_string(&mut snapshots, cell);
-        }
-        snapshots.push(b']');
-        let id = creates
-            .component(local_ref)
-            .map_err(|error| error.to_string())?;
-        snapshots.extend_from_slice(b",\"id\":");
-        write_json_string(&mut snapshots, &id);
-        if !quote_layout.is_empty() || ending != 0 {
-            snapshots.extend_from_slice(b",\"layout\":{");
-            let mut comma = false;
-            if !quote_layout.is_empty() {
-                snapshots.extend_from_slice(b"\"force_quote\":");
-                let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(quote_layout);
-                write_json_string(&mut snapshots, &encoded);
-                comma = true;
-            }
-            if ending != 0 {
-                if comma {
-                    snapshots.push(b',');
-                }
-                snapshots.extend_from_slice(b"\"terminator\":");
-                write_json_string(
-                    &mut snapshots,
-                    match ending {
-                        1 => "",
-                        2 => "\n",
-                        3 => "\r\n",
-                        4 => "\r",
-                        _ => unreachable!("typed terminator was validated"),
-                    },
-                );
-            }
-            snapshots.push(b'}');
-        }
-        snapshots.extend_from_slice(b",\"order_key\":\"");
-        use std::fmt::Write as _;
-        write!(&mut VecFormatter(&mut snapshots), "{order_rank:016x}")
-            .map_err(|_| "failed to encode CSV order rank".to_owned())?;
-        snapshots.extend_from_slice(b"\"}");
-        rows.push((
-            local_ref,
-            WasmEntityKey::from_owned_parts("csv_v2_row", vec![id]),
-            snapshot_start,
-            snapshots.len(),
-        ));
-    }
-    if input.offset != payload.len() {
-        return Err("typed CSV batch has trailing bytes".to_owned());
-    }
-    let snapshots = Bytes::from(snapshots);
-    let changes = rows
-        .into_iter()
-        .map(
-            |(local_ref, resolved_key, start, end)| WasmEntityChange::Create {
-                schema_key: "csv_v2_row".to_owned(),
-                local_ref,
-                resolved_key: Some(resolved_key),
-                snapshot_content: WasmGuestBytes::Inline(snapshots.slice(start..end)),
-            },
-        )
-        .collect();
-    Ok(WasmChangePage {
-        format_version: PACKET_FORMAT_V1,
-        changes: WasmGuestEntityChanges { changes },
-        outputs: None,
-    })
-}
-
-fn validate_typed_csv_rows(row_count: u32, payload: &[u8]) -> Result<(u32, u32), String> {
-    if row_count == 0 {
-        return Err("typed CSV batch is empty".to_owned());
-    }
-    let mut input = TypedCsvReader { payload, offset: 0 };
-    let mut first_local_ref = None;
-    let mut previous_local_ref: Option<u32> = None;
-    for _ in 0..row_count {
-        let local_ref = input.u32()?;
-        if let Some(previous) = previous_local_ref {
-            if previous >= local_ref {
-                return Err("typed CSV local refs must be strictly increasing".to_owned());
-            }
-            if previous.checked_add(1) != Some(local_ref) {
-                return Err("typed CSV local refs must be contiguous within a page".to_owned());
-            }
-        }
-        first_local_ref.get_or_insert(local_ref);
-        previous_local_ref = Some(local_ref);
-        let order_rank = input.u64()?;
-        validate_typed_csv_order_rank(order_rank)?;
-        let ending = input.u8()?;
-        if ending > 4 {
-            return Err("typed CSV row has an invalid terminator code".to_owned());
-        }
-        let quote_layout_len = input.u32()? as usize;
-        let quote_layout = input.bytes(quote_layout_len)?;
-        let field_count = input.u16()?;
-        if field_count == 0 {
-            return Err("typed CSV row has no fields".to_owned());
-        }
-        validate_typed_csv_quote_layout(quote_layout, field_count)?;
-        for _ in 0..field_count {
-            let cell_len = input.u32()? as usize;
-            std::str::from_utf8(input.bytes(cell_len)?)
-                .map_err(|error| format!("typed CSV cell is not UTF-8: {error}"))?;
-        }
-    }
-    if input.offset != payload.len() {
-        return Err("typed CSV batch has trailing bytes".to_owned());
-    }
-    Ok((
-        first_local_ref.expect("positive row count has a first local ref"),
-        previous_local_ref.expect("positive row count has a last local ref"),
-    ))
-}
-
-fn validate_typed_csv_order_rank(order_rank: u64) -> Result<(), String> {
-    if order_rank & 0xff == 0 {
-        return Err("typed CSV row has an invalid order rank".to_owned());
-    }
-    Ok(())
-}
-
-fn validate_typed_csv_quote_layout(quote_layout: &[u8], field_count: u16) -> Result<(), String> {
-    if quote_layout.is_empty() {
-        return Ok(());
-    }
-    let maximum = usize::from(field_count).div_ceil(8);
-    if quote_layout.len() > maximum || quote_layout.last() == Some(&0) {
-        return Err(
-            "typed CSV quote layout must be a minimal nonzero bitset within the field count"
-                .to_owned(),
-        );
-    }
-    let remainder = field_count % 8;
-    if remainder != 0
-        && quote_layout.len() == maximum
-        && quote_layout
-            .last()
-            .is_some_and(|byte| byte & !((1 << remainder) - 1) != 0)
-    {
-        return Err("typed CSV quote layout has bits beyond the final field".to_owned());
-    }
-    Ok(())
 }
 
 struct ValidatedCreatedPacketPage {
@@ -2055,37 +2063,6 @@ impl CertifiedPacketEntityKeys {
         self.insert_compact(schema_key.clone(), fingerprint, create_ref, existing)
     }
 
-    fn insert_create_ref_range(
-        &mut self,
-        schema_key: &str,
-        first: u64,
-        last: u64,
-        existing: &Self,
-    ) -> Result<(), LixError> {
-        let collides = |keys: &CertifiedPacketSchemaKeys| {
-            keys.create_refs
-                .iter()
-                .any(|local_ref| first <= *local_ref && *local_ref <= last)
-                || keys
-                    .explicit_create_refs
-                    .iter()
-                    .any(|local_ref| first <= *local_ref && *local_ref <= last)
-                || keys
-                    .create_ref_ranges
-                    .iter()
-                    .any(|(range_first, range_last)| *range_first <= last && first <= *range_last)
-        };
-        if existing.schemas.get(schema_key).is_some_and(collides) {
-            return Err(duplicate_certified_packet_key());
-        }
-        let page = self.schemas.entry(schema_key.to_owned()).or_default();
-        if collides(page) {
-            return Err(duplicate_certified_packet_key());
-        }
-        page.create_ref_ranges.push((first, last));
-        Ok(())
-    }
-
     fn extend(&mut self, page: Self) {
         for (schema_key, page) in page.schemas {
             let keys = self.schemas.entry(schema_key).or_default();
@@ -2157,7 +2134,7 @@ impl CertifiedPacketEntityKeys {
 }
 
 fn duplicate_certified_packet_key() -> LixError {
-    v3_error("a component entity key may occur only once across certified packet pages")
+    component_error("a component entity key may occur only once across certified packet pages")
 }
 
 fn validate_new_certified_packet_keys(
@@ -2218,14 +2195,14 @@ fn validate_created_packet_page(
     if record_count == 0 {
         return Err("packet page is empty".to_owned());
     }
-    let mut input = TypedCsvReader { payload, offset: 0 };
+    let mut input = PacketSliceReader { payload, offset: 0 };
     let mut schemas = Vec::<String>::new();
     let mut identities = Vec::with_capacity(record_count as usize);
     let mut previous_local_ref = None;
     for _ in 0..record_count {
         let record_len = input.u32()? as usize;
         let record_bytes = input.bytes(record_len)?;
-        let mut record = TypedCsvReader {
+        let mut record = PacketSliceReader {
             payload: record_bytes,
             offset: 0,
         };
@@ -2309,45 +2286,33 @@ fn validate_created_packet_page(
     if input.offset != payload.len() {
         return Err("packet page has trailing bytes".to_owned());
     }
-    // Dense Git-text rows have a valid generic schema but no storage-native
-    // streaming validator yet. Keep them on the ordinary bounded packet path
-    // instead of falsely certifying a segment the engine cannot consume.
-    if schemas.iter().any(|schema| schema == "git_text_line_v2") {
-        return Ok(None);
-    }
     Ok(Some(ValidatedCreatedPacketPage {
         schemas,
         identities,
     }))
 }
 
-struct TypedCsvReader<'a> {
+struct PacketSliceReader<'a> {
     payload: &'a [u8],
     offset: usize,
 }
 
-impl<'a> TypedCsvReader<'a> {
+impl<'a> PacketSliceReader<'a> {
     fn bytes(&mut self, length: usize) -> Result<&'a [u8], String> {
         let end = self
             .offset
             .checked_add(length)
-            .ok_or_else(|| "typed CSV batch range overflowed".to_owned())?;
+            .ok_or_else(|| "packet range overflowed".to_owned())?;
         let value = self
             .payload
             .get(self.offset..end)
-            .ok_or_else(|| "typed CSV batch ended early".to_owned())?;
+            .ok_or_else(|| "packet ended early".to_owned())?;
         self.offset = end;
         Ok(value)
     }
 
     fn u8(&mut self) -> Result<u8, String> {
         Ok(self.bytes(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, String> {
-        Ok(u16::from_le_bytes(
-            self.bytes(2)?.try_into().expect("exact u16 width"),
-        ))
     }
 
     fn u32(&mut self) -> Result<u32, String> {
@@ -2361,38 +2326,6 @@ impl<'a> TypedCsvReader<'a> {
             self.bytes(8)?.try_into().expect("exact u64 width"),
         ))
     }
-}
-
-struct VecFormatter<'a>(&'a mut Vec<u8>);
-
-impl std::fmt::Write for VecFormatter<'_> {
-    fn write_str(&mut self, value: &str) -> std::fmt::Result {
-        self.0.extend_from_slice(value.as_bytes());
-        Ok(())
-    }
-}
-
-fn write_json_string(output: &mut Vec<u8>, value: &str) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    output.push(b'"');
-    for &byte in value.as_bytes() {
-        match byte {
-            b'"' => output.extend_from_slice(br#"\""#),
-            b'\\' => output.extend_from_slice(br#"\\"#),
-            b'\n' => output.extend_from_slice(br#"\n"#),
-            b'\r' => output.extend_from_slice(br#"\r"#),
-            b'\t' => output.extend_from_slice(br#"\t"#),
-            0x08 => output.extend_from_slice(br#"\b"#),
-            0x0c => output.extend_from_slice(br#"\f"#),
-            0x00..=0x1f => {
-                output.extend_from_slice(b"\\u00");
-                output.push(HEX[usize::from(byte >> 4)]);
-                output.push(HEX[usize::from(byte & 0x0f)]);
-            }
-            _ => output.push(byte),
-        }
-    }
-    output.push(b'"');
 }
 
 impl bindings::lix::plugin::host::Host for WasiHostState {}
@@ -2409,17 +2342,18 @@ fn read_source_all(
     const CHUNK_BYTES: u32 = 1024 * 1024;
     let length = source.len();
     let mut output = Vec::with_capacity(
-        usize::try_from(length).map_err(|_| v3_error("v3 source exceeds host address space"))?,
+        usize::try_from(length)
+            .map_err(|_| component_error("component source exceeds host address space"))?,
     );
     let mut offset = 0_u64;
     while offset < length {
         let chunk = u32::try_from((length - offset).min(u64::from(CHUNK_BYTES)))
-            .expect("bounded v3 source read fits u32");
-        let bytes = source
-            .read(offset, chunk)
-            .map_err(|error| v3_error(format!("failed to read v3 source: {error}")))?;
+            .expect("bounded component source read fits u32");
+        let bytes = source.read(offset, chunk).map_err(|error| {
+            component_error(format!("failed to read component source: {error}"))
+        })?;
         if bytes.len() != chunk as usize {
-            return Err(v3_error("v3 source returned a short read"));
+            return Err(component_error("component source returned a short read"));
         }
         output.extend_from_slice(&bytes);
         offset += u64::from(chunk);
@@ -2427,7 +2361,7 @@ fn read_source_all(
     Ok(output)
 }
 
-struct V3Factory {
+struct ComponentFactory {
     component: Component,
     linker: Arc<Linker<WasiHostState>>,
     runtime: Arc<super::WasmtimeSharedRuntime>,
@@ -2442,7 +2376,9 @@ pub(super) async fn compile_component(
     limits: WasmLimits,
 ) -> Result<Arc<dyn WasmComponentFactory>, LixError> {
     if limits.max_memory_bytes == 0 {
-        return Err(v3_error("v3 component memory limit must be positive"));
+        return Err(component_error(
+            "component component memory limit must be positive",
+        ));
     }
     let profile = if limits.max_fuel.is_some() {
         CompileProfile::FuelAndTimeout
@@ -2461,50 +2397,50 @@ pub(super) async fn compile_component(
         .await?;
     let mut linker = Linker::<WasiHostState>::new(engine);
     add_to_linker_sync(&mut linker)
-        .map_err(|error| wasm_runtime_error("failed to configure v3 WASI linker", error))?;
+        .map_err(|error| wasm_runtime_error("failed to configure component WASI linker", error))?;
     bindings::Plugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(&mut linker, |state| {
         state
     })
-    .map_err(|error| wasm_runtime_error("failed to configure v3 plugin linker", error))?;
-    Ok(Arc::new(V3Factory {
+    .map_err(|error| wasm_runtime_error("failed to configure component plugin linker", error))?;
+    Ok(Arc::new(ComponentFactory {
         component,
         linker: Arc::new(linker),
         runtime: runtime.shared.clone(),
         limits,
         profile,
         execution_permit: Arc::new(tokio::sync::Semaphore::new(
-            V3_MAX_CONCURRENT_EXECUTIONS_PER_COMPONENT,
+            COMPONENT_MAX_CONCURRENT_EXECUTIONS_PER_COMPONENT,
         )),
     }))
 }
 
 #[async_trait]
-impl WasmComponentFactory for V3Factory {
+impl WasmComponentFactory for ComponentFactory {
     async fn instantiate_actor(&self) -> Result<Box<dyn WasmComponentActor>, LixError> {
         let initial_execution_permit = self
             .execution_permit
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| v3_error("v3 component execution scheduler stopped"))?;
+            .map_err(|_| component_error("component component execution scheduler stopped"))?;
         let engine = self.runtime.engine(self.profile);
         let timeout_ticker = self
             .runtime
             .timeout_ticker(self.profile)?
-            .ok_or_else(|| v3_error("v3 actor requires an epoch timeout ticker"))?;
+            .ok_or_else(|| component_error("component actor requires an epoch timeout ticker"))?;
         let mut store = create_store(engine, self.limits)?;
         store.epoch_deadline_trap();
         let bindings = bindings::Plugin::instantiate(&mut store, &self.component, &self.linker)
             .map_err(|error| wasm_runtime_error("failed to instantiate plugin actor", error))?;
         let guest = bindings.lix_plugin_api().clone();
-        let worker = V3Worker {
+        let worker = ComponentWorker {
             store,
             guest,
             limits: self.limits,
             documents: HashMap::new(),
             next_document: 1,
         };
-        Ok(Box::new(V3Actor {
+        Ok(Box::new(ComponentActor {
             worker,
             execution_permit: self.execution_permit.clone(),
             initial_execution_permit: Some(initial_execution_permit),
@@ -2524,21 +2460,21 @@ impl WasmComponentFactory for V3Factory {
     }
 }
 
-struct V3Worker {
+struct ComponentWorker {
     store: Store<WasiHostState>,
     guest: bindings::exports::lix::plugin::api::Guest,
     limits: WasmLimits,
-    documents: HashMap<u64, V3Document>,
+    documents: HashMap<u64, ComponentDocument>,
     next_document: u64,
 }
 
 #[derive(Clone)]
-struct V3Document {
+struct ComponentDocument {
     root: ArenaRoot,
 }
 
 struct ResolutionWorkerOutput {
-    resolutions: Vec<V3Resolution>,
+    resolutions: Vec<ComponentResolution>,
     counters: WasmTransitionCounters,
 }
 
@@ -2570,14 +2506,14 @@ fn hydration_replacement_edit(replacement_len: u64, accepted_len: u64) -> WasmOu
     }
 }
 
-impl V3Worker {
+impl ComponentWorker {
     fn open_file(
         &mut self,
         document: u64,
         limits: WasmTransitionLimits,
         input: WasmOpenFileInput,
     ) -> Result<FileWorkerOutput, LixError> {
-        let limits = v3_transition_limits(limits)?;
+        let limits = component_transition_limits(limits)?;
         validate_source_admission(input.file.len(), limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
@@ -2592,7 +2528,7 @@ impl V3Worker {
         let arena_store = ArenaStore::default();
         let root = ArenaRoot::import(
             arena_store,
-            "csv-v3-arena",
+            "plugin-file-arena",
             &bytes,
             std::iter::empty(),
             std::iter::empty(),
@@ -2605,7 +2541,9 @@ impl V3Worker {
                 root: root.clone(),
                 state: state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 snapshot: {error}")))?;
+            .map_err(|error| {
+                component_error(format!("failed to register component snapshot: {error}"))
+            })?;
         let transition = self
             .store
             .data_mut()
@@ -2614,14 +2552,13 @@ impl V3Worker {
                 transaction: root.transaction(),
                 state: state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 transition: {error}")))?;
+            .map_err(|error| {
+                component_error(format!("failed to register component transition: {error}"))
+            })?;
         let transition_rep = transition.rep();
         let binding_input = bindings::exports::lix::plugin::api::TransitionRequest::Open(
             bindings::exports::lix::plugin::api::OpenRequest {
-                descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                    path: input.descriptor.path,
-                    media_type: input.descriptor.media_type,
-                },
+                path: required_plugin_path(input.descriptor.path, "open")?,
                 accepted,
                 creates: bindings::exports::lix::plugin::api::CreateContext {
                     high: input.creates.high,
@@ -2637,17 +2574,19 @@ impl V3Worker {
         let transition = take_borrowed_resource(
             &mut self.store.data_mut().table,
             transition,
-            "failed to recover v3 transaction",
+            "failed to recover component transaction",
         )?;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 drop(transition);
-                return Err(v3_error(format!("v3 open-file rejected input: {error:?}")));
+                return Err(component_error(format!(
+                    "component open-file rejected input: {error:?}"
+                )));
             }
             Err(error) => {
                 drop(transition);
-                return Err(wasm_runtime_error("v3 open-file trapped", error));
+                return Err(wasm_runtime_error("component open-file trapped", error));
             }
         }
         let TransitionResource {
@@ -2655,19 +2594,22 @@ impl V3Worker {
             state: transaction_state,
         } = transition;
         drop(transaction_state);
-        let root = transaction
-            .commit()
-            .map_err(|error| v3_error(format!("failed to commit v3 arena root: {error}")))?;
-        self.documents.insert(document, V3Document { root });
+        let root = transaction.commit().map_err(|error| {
+            component_error(format!("failed to commit component arena root: {error}"))
+        })?;
+        self.documents.insert(document, ComponentDocument { root });
         self.next_document = self.next_document.max(document.saturating_add(1));
         let mut state = Arc::try_unwrap(state)
-            .map_err(|_| v3_error("v3 transition resources remained live after open-file"))?
+            .map_err(|_| {
+                component_error("component transition resources remained live after open-file")
+            })?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
+        let pages = state.take_pages()?;
         Ok(FileWorkerOutput {
-            pages: state.pages,
+            pages,
             counters: state.counters,
         })
     }
@@ -2679,19 +2621,19 @@ impl V3Worker {
         limits: WasmTransitionLimits,
         update: WasmFileUpdate,
     ) -> Result<FileWorkerOutput, LixError> {
-        let limits = v3_transition_limits(limits)?;
+        let limits = component_transition_limits(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
         let root = tracing::debug_span!(
             target: "lix_perf",
-            "lix.perf.v3_arena_prepare"
+            "lix.perf.component_arena_prepare"
         )
         .in_scope(|| {
             self.documents
                 .get(&document)
                 .map(|document| document.root.clone())
-                .ok_or_else(|| v3_error("unknown v3 document handle"))
+                .ok_or_else(|| component_error("unknown component document handle"))
         })?;
         let state = Arc::new(Mutex::new(TransitionState::new(
             limits,
@@ -2710,7 +2652,9 @@ impl V3Worker {
                 root: root.successor_checkpoint(),
                 state: state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 before root: {error}")))?;
+            .map_err(|error| {
+                component_error(format!("failed to register component before root: {error}"))
+            })?;
         let mut transaction = root.transaction();
         let mut binding_edits = Vec::with_capacity(update.edits.len());
         for edit in update.edits {
@@ -2721,10 +2665,12 @@ impl V3Worker {
                     .read(
                         range.offset,
                         u32::try_from(range.length)
-                            .map_err(|_| v3_error("v3 after-range exceeds u32"))?,
+                            .map_err(|_| component_error("component after-range exceeds u32"))?,
                     )
                     .map_err(|error| {
-                        v3_error(format!("failed to read v3 after-range bytes: {error}"))
+                        component_error(format!(
+                            "failed to read component after-range bytes: {error}"
+                        ))
                     })?,
             };
             transaction.edit_bytes(ArenaByteEdit {
@@ -2732,7 +2678,7 @@ impl V3Worker {
                 delete_len: edit.delete_len,
                 insert: insert.clone(),
             });
-            binding_edits.push(bindings::exports::lix::plugin::api::InputSplice {
+            binding_edits.push(bindings::exports::lix::plugin::api::FileEdit {
                 offset: edit.offset,
                 delete_len: edit.delete_len,
                 insert,
@@ -2746,18 +2692,20 @@ impl V3Worker {
                 transaction,
                 state: state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 transition: {error}")))?;
+            .map_err(|error| {
+                component_error(format!("failed to register component transition: {error}"))
+            })?;
         let transition_rep = transition.rep();
-        let binding_update = bindings::exports::lix::plugin::api::TransitionRequest::Update(
-            bindings::exports::lix::plugin::api::UpdateRequest {
-                before_descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                    path: update.before_descriptor.path,
-                    media_type: update.before_descriptor.media_type,
-                },
-                after_descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                    path: update.after_descriptor.path,
-                    media_type: update.after_descriptor.media_type,
-                },
+        let binding_update = bindings::exports::lix::plugin::api::TransitionRequest::FileChanged(
+            bindings::exports::lix::plugin::api::FileChangedRequest {
+                before_path: required_plugin_path(
+                    update.before_descriptor.path,
+                    "file-changed predecessor",
+                )?,
+                after_path: required_plugin_path(
+                    update.after_descriptor.path,
+                    "file-changed successor",
+                )?,
                 before,
                 edits: binding_edits,
                 creates: bindings::exports::lix::plugin::api::CreateContext {
@@ -2766,30 +2714,31 @@ impl V3Worker {
                 },
             },
         );
-        let result = tracing::debug_span!(target: "lix_perf", "lix.perf.v3_guest_file_changed")
-            .in_scope(|| {
-                self.guest.call_apply(
-                    &mut self.store,
-                    &binding_update,
-                    Resource::new_borrow(transition_rep),
-                )
-            });
+        let result =
+            tracing::debug_span!(target: "lix_perf", "lix.perf.component_guest_file_changed")
+                .in_scope(|| {
+                    self.guest.call_apply(
+                        &mut self.store,
+                        &binding_update,
+                        Resource::new_borrow(transition_rep),
+                    )
+                });
         let transition = take_borrowed_resource(
             &mut self.store.data_mut().table,
             transition,
-            "failed to recover v3 transaction",
+            "failed to recover component transaction",
         )?;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 drop(transition);
-                return Err(v3_error(format!(
-                    "v3 file-changed rejected input: {error:?}"
+                return Err(component_error(format!(
+                    "component file-changed rejected input: {error:?}"
                 )));
             }
             Err(error) => {
                 drop(transition);
-                return Err(wasm_runtime_error("v3 file-changed trapped", error));
+                return Err(wasm_runtime_error("component file-changed trapped", error));
             }
         }
         let TransitionResource {
@@ -2797,23 +2746,26 @@ impl V3Worker {
             state: transaction_state,
         } = transition;
         drop(transaction_state);
-        let root = tracing::debug_span!(target: "lix_perf", "lix.perf.v3_arena_commit").in_scope(
-            || {
-                transaction
-                    .commit()
-                    .map_err(|error| v3_error(format!("failed to commit v3 arena root: {error}")))
-            },
-        )?;
-        self.documents.insert(next_document, V3Document { root });
+        let root = tracing::debug_span!(target: "lix_perf", "lix.perf.component_arena_commit")
+            .in_scope(|| {
+                transaction.commit().map_err(|error| {
+                    component_error(format!("failed to commit component arena root: {error}"))
+                })
+            })?;
+        self.documents
+            .insert(next_document, ComponentDocument { root });
         self.next_document = self.next_document.max(next_document.saturating_add(1));
         let mut state = Arc::try_unwrap(state)
-            .map_err(|_| v3_error("v3 transition resources remained live after file-changed"))?
+            .map_err(|_| {
+                component_error("component transition resources remained live after file-changed")
+            })?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
+        let pages = state.take_pages()?;
         Ok(FileWorkerOutput {
-            pages: state.pages,
+            pages,
             counters: state.counters,
         })
     }
@@ -2824,19 +2776,18 @@ impl V3Worker {
         limits: WasmTransitionLimits,
         cold: WasmColdFileUpdate,
     ) -> Result<FileWorkerOutput, LixError> {
-        let limits = v3_transition_limits(limits)?;
+        let limits = component_transition_limits(limits)?;
         cold.validate(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
-        let derived_successor = cold.before.is_none();
-        let root_bytes = match cold.before.as_ref() {
-            Some(before) => read_source_all(before)?,
-            None => read_source_all(&cold.after)?,
-        };
+        let before_source = cold.before.as_ref().ok_or_else(|| {
+            component_error("component cold successor requires accepted predecessor bytes")
+        })?;
+        let root_bytes = read_source_all(before_source)?;
         let root = ArenaRoot::import(
             ArenaStore::default(),
-            "v3-cold-successor",
+            "component-cold-successor",
             &root_bytes,
             std::iter::empty(),
             std::iter::empty(),
@@ -2848,30 +2799,17 @@ impl V3Worker {
             false,
             Some(total_bytes.clone()),
         )?));
-        let before = (!derived_successor)
-            .then(|| {
-                self.store.data_mut().table.push(SnapshotResource {
-                    root: root.clone(),
-                    state: state.clone(),
-                })
+        let before = self
+            .store
+            .data_mut()
+            .table
+            .push(SnapshotResource {
+                root: root.clone(),
+                state: state.clone(),
             })
-            .transpose()
             .map_err(|error| {
-                v3_error(format!(
-                    "failed to register v3 cold-successor snapshot: {error}"
-                ))
-            })?;
-        let after = derived_successor
-            .then(|| {
-                self.store.data_mut().table.push(SnapshotResource {
-                    root: root.clone(),
-                    state: state.clone(),
-                })
-            })
-            .transpose()
-            .map_err(|error| {
-                v3_error(format!(
-                    "failed to register v3 cold-successor submitted snapshot: {error}"
+                component_error(format!(
+                    "failed to register component cold-successor snapshot: {error}"
                 ))
             })?;
         let entity_state = Arc::new(Mutex::new(EntityChangeState::from_entities(
@@ -2883,12 +2821,12 @@ impl V3Worker {
             .store
             .data_mut()
             .table
-            .push(EntityChangeSourceResource {
+            .push(EntitySourceResource {
                 state: entity_state.clone(),
             })
             .map_err(|error| {
-                v3_error(format!(
-                    "failed to register v3 cold-successor entity source: {error}"
+                component_error(format!(
+                    "failed to register component cold-successor entity source: {error}"
                 ))
             })?;
         let mut transaction = root.transaction();
@@ -2901,10 +2839,12 @@ impl V3Worker {
                     .read(
                         range.offset,
                         u32::try_from(range.length)
-                            .map_err(|_| v3_error("v3 after-range exceeds u32"))?,
+                            .map_err(|_| component_error("component after-range exceeds u32"))?,
                     )
                     .map_err(|error| {
-                        v3_error(format!("failed to read v3 after-range bytes: {error}"))
+                        component_error(format!(
+                            "failed to read component after-range bytes: {error}"
+                        ))
                     })?,
             };
             transaction.edit_bytes(ArenaByteEdit {
@@ -2912,7 +2852,7 @@ impl V3Worker {
                 delete_len: edit.delete_len,
                 insert: insert.clone(),
             });
-            binding_edits.push(bindings::exports::lix::plugin::api::InputSplice {
+            binding_edits.push(bindings::exports::lix::plugin::api::FileEdit {
                 offset: edit.offset,
                 delete_len: edit.delete_len,
                 insert,
@@ -2927,35 +2867,36 @@ impl V3Worker {
                 state: state.clone(),
             })
             .map_err(|error| {
-                v3_error(format!(
-                    "failed to register v3 cold-successor transition: {error}"
+                component_error(format!(
+                    "failed to register component cold-successor transition: {error}"
                 ))
             })?;
         let transition_rep = transition.rep();
-        let binding_input = bindings::exports::lix::plugin::api::ColdSuccessorRequest {
-            before_descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                path: cold.before_descriptor.path,
-                media_type: cold.before_descriptor.media_type,
+        let binding_input = bindings::exports::lix::plugin::api::TransitionRequest::ColdFileChanged(
+            bindings::exports::lix::plugin::api::ColdFileChangedRequest {
+                before_path: required_plugin_path(
+                    cold.before_descriptor.path,
+                    "cold-file-changed predecessor",
+                )?,
+                after_path: required_plugin_path(
+                    cold.after_descriptor.path,
+                    "cold-file-changed successor",
+                )?,
+                before,
+                edits: binding_edits,
+                entities: source,
+                creates: bindings::exports::lix::plugin::api::CreateContext {
+                    high: cold.creates.high,
+                    low: cold.creates.low,
+                },
             },
-            after_descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                path: cold.after_descriptor.path,
-                media_type: cold.after_descriptor.media_type,
-            },
-            before,
-            after,
-            edits: binding_edits,
-            entities: source,
-            creates: bindings::exports::lix::plugin::api::CreateContext {
-                high: cold.creates.high,
-                low: cold.creates.low,
-            },
-        };
+        );
         let result = tracing::debug_span!(
             target: "lix_perf",
-            "lix.perf.v3_guest_cold_successor"
+            "lix.perf.component_guest_cold_successor"
         )
         .in_scope(|| {
-            self.guest.call_cold_successor(
+            self.guest.call_apply(
                 &mut self.store,
                 &binding_input,
                 Resource::new_borrow(transition_rep),
@@ -2964,19 +2905,22 @@ impl V3Worker {
         let transition = take_borrowed_resource(
             &mut self.store.data_mut().table,
             transition,
-            "failed to recover v3 cold-successor transaction",
+            "failed to recover component cold-successor transaction",
         )?;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 drop(transition);
-                return Err(v3_error(format!(
-                    "v3 cold-successor rejected input: {error:?}"
+                return Err(component_error(format!(
+                    "component cold-successor rejected input: {error:?}"
                 )));
             }
             Err(error) => {
                 drop(transition);
-                return Err(wasm_runtime_error("v3 cold-successor trapped", error));
+                return Err(wasm_runtime_error(
+                    "component cold-successor trapped",
+                    error,
+                ));
             }
         }
         let TransitionResource {
@@ -2985,18 +2929,18 @@ impl V3Worker {
         } = transition;
         drop(transaction_state);
         let root = transaction.commit().map_err(|error| {
-            v3_error(format!(
-                "failed to commit v3 cold-successor arena root: {error}"
+            component_error(format!(
+                "failed to commit component cold-successor arena root: {error}"
             ))
         })?;
-        self.documents.insert(document, V3Document { root });
+        self.documents.insert(document, ComponentDocument { root });
         self.next_document = self.next_document.max(document.saturating_add(1));
         let entity_state = Arc::try_unwrap(entity_state)
-            .map_err(|_| v3_error("v3 cold-successor entity source remained live"))?
+            .map_err(|_| component_error("component cold-successor entity source remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut state = Arc::try_unwrap(state)
-            .map_err(|_| v3_error("v3 cold-successor resources remained live"))?
+            .map_err(|_| component_error("component cold-successor resources remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.counters.component_import_calls = state
@@ -3015,10 +2959,12 @@ impl V3Worker {
             .counters
             .source_bytes_read
             .saturating_add(entity_state.counters.source_bytes_read);
+        merge_entity_input_profile(&mut state.counters, &entity_state.counters);
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
+        let pages = state.take_pages()?;
         Ok(FileWorkerOutput {
-            pages: state.pages,
+            pages,
             counters: state.counters,
         })
     }
@@ -3028,21 +2974,23 @@ impl V3Worker {
         limits: WasmTransitionLimits,
         mut update: WasmConflictUpdate,
     ) -> Result<ResolutionWorkerOutput, LixError> {
-        let limits = v3_transition_limits(limits)?;
+        let limits = component_transition_limits(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
         let mut conflicts = Vec::new();
         while let Some(page) = update.conflicts.next_page(limits.max_page_bytes)? {
             if page.conflicts.is_empty() {
-                return Err(v3_error("v3 conflict source returned an empty page"));
+                return Err(component_error(
+                    "component conflict source returned an empty page",
+                ));
             }
             for conflict in page.conflicts {
                 let expected = u32::try_from(conflicts.len())
-                    .map_err(|_| v3_error("v3 conflict count exceeds u32"))?;
+                    .map_err(|_| component_error("component conflict count exceeds u32"))?;
                 if conflict.ordinal != expected {
-                    return Err(v3_error(format!(
-                        "v3 conflict source ordinal {}, expected {expected}",
+                    return Err(component_error(format!(
+                        "component conflict source ordinal {}, expected {expected}",
                         conflict.ordinal
                     )));
                 }
@@ -3058,7 +3006,11 @@ impl V3Worker {
             .push(ConflictSourceResource {
                 state: state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 conflict source: {error}")))?;
+            .map_err(|error| {
+                component_error(format!(
+                    "failed to register component conflict source: {error}"
+                ))
+            })?;
         let sink = self
             .store
             .data_mut()
@@ -3066,13 +3018,14 @@ impl V3Worker {
             .push(ResolutionSinkResource {
                 state: state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 resolution sink: {error}")))?;
+            .map_err(|error| {
+                component_error(format!(
+                    "failed to register component resolution sink: {error}"
+                ))
+            })?;
         let sink_rep = sink.rep();
         let binding_input = bindings::exports::lix::plugin::api::ConflictUpdate {
-            descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                path: update.descriptor.path,
-                media_type: update.descriptor.media_type,
-            },
+            path: required_plugin_path(update.descriptor.path, "conflict resolution")?,
             conflicts: source,
         };
         let result = self.guest.call_resolve_conflicts(
@@ -3084,24 +3037,31 @@ impl V3Worker {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                return Err(v3_error(format!(
-                    "v3 resolve-conflicts rejected input: {error:?}"
+                return Err(component_error(format!(
+                    "component resolve-conflicts rejected input: {error:?}"
                 )));
             }
             Err(error) => {
-                return Err(wasm_runtime_error("v3 resolve-conflicts trapped", error));
+                return Err(wasm_runtime_error(
+                    "component resolve-conflicts trapped",
+                    error,
+                ));
             }
         }
         let mut state = Arc::try_unwrap(state)
-            .map_err(|_| v3_error("v3 conflict resources remained live after resolution"))?
+            .map_err(|_| {
+                component_error("component conflict resources remained live after resolution")
+            })?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.pending.is_some() {
-            return Err(v3_error("v3 conflict replacement remained incomplete"));
+            return Err(component_error(
+                "component conflict replacement remained incomplete",
+            ));
         }
         if state.resolutions.len() != expected_count {
-            return Err(v3_error(format!(
-                "v3 conflict resolver returned {} results for {expected_count} conflicts",
+            return Err(component_error(format!(
+                "component conflict resolver returned {} results for {expected_count} conflicts",
                 state.resolutions.len()
             )));
         }
@@ -3123,7 +3083,7 @@ impl V3Worker {
         limits: WasmTransitionLimits,
         update: WasmEntityUpdate,
     ) -> Result<EntityWorkerOutput, LixError> {
-        let limits = v3_transition_limits(limits)?;
+        let limits = component_transition_limits(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
@@ -3131,7 +3091,7 @@ impl V3Worker {
             .documents
             .get(&document)
             .map(|document| document.root.clone())
-            .ok_or_else(|| v3_error("unknown v3 document handle"))?;
+            .ok_or_else(|| component_error("unknown component document handle"))?;
         let total_bytes = SharedByteBudget::default();
         let entity_state = Arc::new(Mutex::new(EntityChangeState::from_changes(
             limits,
@@ -3152,17 +3112,21 @@ impl V3Worker {
                 root: root.clone(),
                 state: transition_state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 entity snapshot: {error}")))?;
+            .map_err(|error| {
+                component_error(format!(
+                    "failed to register component entity snapshot: {error}"
+                ))
+            })?;
         let source = self
             .store
             .data_mut()
             .table
-            .push(EntityChangeSourceResource {
+            .push(EntitySourceResource {
                 state: entity_state.clone(),
             })
             .map_err(|error| {
-                v3_error(format!(
-                    "failed to register v3 entity-change source: {error}"
+                component_error(format!(
+                    "failed to register component entity-change source: {error}"
                 ))
             })?;
         let transition = self
@@ -3174,22 +3138,22 @@ impl V3Worker {
                 state: transition_state.clone(),
             })
             .map_err(|error| {
-                v3_error(format!("failed to register v3 entity transition: {error}"))
+                component_error(format!(
+                    "failed to register component entity transition: {error}"
+                ))
             })?;
         let transition_rep = transition.rep();
-        let binding_input = bindings::exports::lix::plugin::api::EntityUpdate {
-            before_descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                path: update.before_descriptor.path,
-                media_type: update.before_descriptor.media_type,
+        let binding_input = bindings::exports::lix::plugin::api::TransitionRequest::EntitiesChanged(
+            bindings::exports::lix::plugin::api::EntitiesChangedRequest {
+                before_path: required_plugin_path(
+                    update.before_descriptor.path,
+                    "entities-changed predecessor",
+                )?,
+                before,
+                changes: source,
             },
-            after_descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                path: update.after_descriptor.path,
-                media_type: update.after_descriptor.media_type,
-            },
-            before,
-            changes: source,
-        };
-        let result = self.guest.call_entities_changed(
+        );
+        let result = self.guest.call_apply(
             &mut self.store,
             &binding_input,
             Resource::new_borrow(transition_rep),
@@ -3197,19 +3161,22 @@ impl V3Worker {
         let transition = take_borrowed_resource(
             &mut self.store.data_mut().table,
             transition,
-            "failed to recover v3 entity transition",
+            "failed to recover component entity transition",
         )?;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 drop(transition);
-                return Err(v3_error(format!(
-                    "v3 entities-changed rejected input: {error:?}"
+                return Err(component_error(format!(
+                    "component entities-changed rejected input: {error:?}"
                 )));
             }
             Err(error) => {
                 drop(transition);
-                return Err(wasm_runtime_error("v3 entities-changed trapped", error));
+                return Err(wasm_runtime_error(
+                    "component entities-changed trapped",
+                    error,
+                ));
             }
         }
         let TransitionResource {
@@ -3218,16 +3185,15 @@ impl V3Worker {
         } = transition;
         drop(transaction_state);
         let mut state = Arc::try_unwrap(transition_state)
-            .map_err(|_| v3_error("v3 entity transition resources remained live"))?
+            .map_err(|_| component_error("component entity transition resources remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let replacement = state
-            .file_replacement
-            .take()
-            .ok_or_else(|| v3_error("v3 entities-changed did not emit a file replacement"))?;
+        let replacement = state.file_replacement.take().ok_or_else(|| {
+            component_error("component entities-changed did not emit a file replacement")
+        })?;
         if !replacement.complete {
-            return Err(v3_error(
-                "v3 entities-changed file replacement is incomplete",
+            return Err(component_error(
+                "component entities-changed file replacement is incomplete",
             ));
         }
         transaction.edit_bytes(ArenaByteEdit {
@@ -3235,14 +3201,14 @@ impl V3Worker {
             delete_len: root.bytes.len(),
             insert: replacement.bytes.clone(),
         });
-        let successor = transaction
-            .commit()
-            .map_err(|error| v3_error(format!("failed to commit v3 entity root: {error}")))?;
+        let successor = transaction.commit().map_err(|error| {
+            component_error(format!("failed to commit component entity root: {error}"))
+        })?;
         self.documents
-            .insert(next_document, V3Document { root: successor });
+            .insert(next_document, ComponentDocument { root: successor });
         self.next_document = self.next_document.max(next_document.saturating_add(1));
         let entity_state = Arc::try_unwrap(entity_state)
-            .map_err(|_| v3_error("v3 entity-change source remained live"))?
+            .map_err(|_| component_error("component entity-change source remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.counters.component_import_calls = state
@@ -3261,6 +3227,7 @@ impl V3Worker {
             .counters
             .source_bytes_read
             .saturating_add(entity_state.counters.source_bytes_read);
+        merge_entity_input_profile(&mut state.counters, &entity_state.counters);
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
         Ok(EntityWorkerOutput {
@@ -3275,7 +3242,7 @@ impl V3Worker {
         limits: WasmTransitionLimits,
         input: WasmOpenEntitiesInput,
     ) -> Result<HydrateWorkerOutput, LixError> {
-        let limits = v3_transition_limits(limits)?;
+        let limits = component_transition_limits(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
@@ -3299,7 +3266,7 @@ impl V3Worker {
         )?));
         let root = ArenaRoot::import(
             ArenaStore::default(),
-            "v3-cold-successor",
+            "component-cold-successor",
             &bytes,
             std::iter::empty(),
             std::iter::empty(),
@@ -3320,16 +3287,22 @@ impl V3Worker {
                 })
             })
             .transpose()
-            .map_err(|error| v3_error(format!("failed to register v3 cold snapshot: {error}")))?;
+            .map_err(|error| {
+                component_error(format!(
+                    "failed to register component cold snapshot: {error}"
+                ))
+            })?;
         let source = self
             .store
             .data_mut()
             .table
-            .push(EntityChangeSourceResource {
+            .push(EntitySourceResource {
                 state: entity_state.clone(),
             })
             .map_err(|error| {
-                v3_error(format!("failed to register v3 hydration source: {error}"))
+                component_error(format!(
+                    "failed to register component hydration source: {error}"
+                ))
             })?;
         let transition = self
             .store
@@ -3339,17 +3312,19 @@ impl V3Worker {
                 transaction: root.transaction(),
                 state: state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 cold transition: {error}")))?;
+            .map_err(|error| {
+                component_error(format!(
+                    "failed to register component cold transition: {error}"
+                ))
+            })?;
         let transition_rep = transition.rep();
-        let request = bindings::exports::lix::plugin::api::HydrateRequest {
-            descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                path: input.descriptor.path,
-                media_type: input.descriptor.media_type,
+        let request = bindings::exports::lix::plugin::api::TransitionRequest::Restore(
+            bindings::exports::lix::plugin::api::RestoreRequest {
+                accepted,
+                entities: source,
             },
-            accepted,
-            entities: source,
-        };
-        let result = self.guest.call_hydrate(
+        );
+        let result = self.guest.call_apply(
             &mut self.store,
             &request,
             Resource::new_borrow(transition_rep),
@@ -3357,19 +3332,22 @@ impl V3Worker {
         let transition = take_borrowed_resource(
             &mut self.store.data_mut().table,
             transition,
-            "failed to recover v3 cold transition",
+            "failed to recover component cold transition",
         )?;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 drop(transition);
-                return Err(v3_error(format!(
-                    "v3 cold hydration rejected input: {error:?}"
+                return Err(component_error(format!(
+                    "component cold hydration rejected input: {error:?}"
                 )));
             }
             Err(error) => {
                 drop(transition);
-                return Err(wasm_runtime_error("v3 cold hydration trapped", error));
+                return Err(wasm_runtime_error(
+                    "component cold hydration trapped",
+                    error,
+                ));
             }
         }
         let TransitionResource {
@@ -3386,7 +3364,9 @@ impl V3Worker {
             .map(|replacement| Bytes::copy_from_slice(&replacement.bytes));
         if let Some(replacement) = replacement {
             if !replacement.complete {
-                return Err(v3_error("v3 hydration file replacement is incomplete"));
+                return Err(component_error(
+                    "component hydration file replacement is incomplete",
+                ));
             }
             transaction.edit_bytes(ArenaByteEdit {
                 offset: 0,
@@ -3394,23 +3374,23 @@ impl V3Worker {
                 insert: replacement.bytes,
             });
         } else if input.accepted.is_none() {
-            return Err(v3_error(
-                "v3 derived cold hydration did not emit a file replacement",
+            return Err(component_error(
+                "component derived cold hydration did not emit a file replacement",
             ));
         }
         drop(transition_state);
-        let root = transaction
-            .commit()
-            .map_err(|error| v3_error(format!("failed to commit v3 cold root: {error}")))?;
-        self.documents.insert(document, V3Document { root });
+        let root = transaction.commit().map_err(|error| {
+            component_error(format!("failed to commit component cold root: {error}"))
+        })?;
+        self.documents.insert(document, ComponentDocument { root });
         self.next_document = self.next_document.max(document.saturating_add(1));
         let mut counters = Arc::try_unwrap(state)
-            .map_err(|_| v3_error("v3 cold hydration resources remained live"))?
+            .map_err(|_| component_error("component cold hydration resources remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .counters;
         let entity_state = Arc::try_unwrap(entity_state)
-            .map_err(|_| v3_error("v3 hydration source remained live"))?
+            .map_err(|_| component_error("component hydration source remained live"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         counters.component_import_calls = counters
@@ -3419,6 +3399,7 @@ impl V3Worker {
         counters.component_boundary_bytes = counters
             .component_boundary_bytes
             .saturating_add(entity_state.counters.component_boundary_bytes);
+        merge_entity_input_profile(&mut counters, &entity_state.counters);
         counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
         Ok(HydrateWorkerOutput {
@@ -3433,12 +3414,12 @@ impl V3Worker {
             .documents
             .get(&document)
             .cloned()
-            .ok_or_else(|| v3_error("unknown v3 document handle"))?;
+            .ok_or_else(|| component_error("unknown component document handle"))?;
         let handle = self.next_document;
         self.next_document = self
             .next_document
             .checked_add(1)
-            .ok_or_else(|| v3_error("v3 document handle overflowed"))?;
+            .ok_or_else(|| component_error("component document handle overflowed"))?;
         self.documents.insert(handle, document);
         Ok(handle)
     }
@@ -3453,12 +3434,7 @@ struct CursorState {
     transition: WasmTransitionHandle,
     pages: VecDeque<PendingChangePage>,
     complete_file_state: bool,
-    certified_csv_pages: Vec<Bytes>,
-    certified_csv_rows: u64,
-    certified_csv_creates: Option<WasmCreateContext>,
-    certified_csv_last_local_ref: Option<u32>,
     certified_all_entity_keys: CertifiedPacketEntityKeys,
-    certified_csv_entity_keys: CertifiedPacketEntityKeys,
     certified_packet_pages: Vec<Bytes>,
     certified_packet_rows: u64,
     certified_packet_creates: Option<WasmCreateContext>,
@@ -3476,20 +3452,20 @@ struct OutputState {
     values: Vec<Bytes>,
 }
 
-struct V3EditCursorState {
+struct ComponentEditCursorState {
     transition: WasmTransitionHandle,
     page: Option<WasmEditPage>,
 }
 
-struct V3Actor {
-    worker: V3Worker,
+struct ComponentActor {
+    worker: ComponentWorker,
     execution_permit: Arc<tokio::sync::Semaphore>,
     initial_execution_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     _timeout_ticker: TimeoutTickerLease,
     next_handle: u64,
     cursors: HashMap<u64, CursorState>,
     resolution_cursors: HashMap<u64, ResolutionCursorState>,
-    edit_cursors: HashMap<u64, V3EditCursorState>,
+    edit_cursors: HashMap<u64, ComponentEditCursorState>,
     outputs: HashMap<u64, OutputState>,
     transitions: HashMap<u64, WasmTransitionCounters>,
     transition_permits: HashMap<u64, tokio::sync::OwnedSemaphorePermit>,
@@ -3547,13 +3523,13 @@ fn is_guest_trap(error: &LixError) -> bool {
     error.code == LixError::CODE_INTERNAL_ERROR && error.message.contains(" trapped")
 }
 
-impl V3Actor {
+impl ComponentActor {
     fn allocate_handle(&mut self) -> Result<u64, LixError> {
         let handle = self.next_handle;
         self.next_handle = self
             .next_handle
             .checked_add(1)
-            .ok_or_else(|| v3_error("v3 actor handle overflowed"))?;
+            .ok_or_else(|| component_error("component actor handle overflowed"))?;
         Ok(handle)
     }
 
@@ -3562,13 +3538,13 @@ impl V3Actor {
         self.next_document = self
             .next_document
             .checked_add(1)
-            .ok_or_else(|| v3_error("v3 document handle overflowed"))?;
+            .ok_or_else(|| component_error("component document handle overflowed"))?;
         Ok(document)
     }
 
     fn ensure_active(&self) -> Result<(), LixError> {
         if self.retired {
-            return Err(v3_error("v3 actor is retired"));
+            return Err(component_error("component actor is retired"));
         }
         Ok(())
     }
@@ -3586,7 +3562,7 @@ impl V3Actor {
             None => scheduler
                 .acquire_owned()
                 .await
-                .map_err(|_| v3_error("v3 component execution scheduler stopped")),
+                .map_err(|_| component_error("component component execution scheduler stopped")),
         }
     }
 
@@ -3598,7 +3574,7 @@ impl V3Actor {
 }
 
 #[async_trait]
-impl WasmComponentActor for V3Actor {
+impl WasmComponentActor for ComponentActor {
     fn cold_open_hydrates_without_render(&self) -> bool {
         true
     }
@@ -3626,7 +3602,7 @@ impl WasmComponentActor for V3Actor {
             .worker
             .documents
             .get(&document.0)
-            .ok_or_else(|| v3_error("unknown v3 document handle"))?
+            .ok_or_else(|| component_error("unknown component document handle"))?
             .root
             .successor_checkpoint();
         let retained_bytes = u64::try_from(root.retained_heap_bytes()).unwrap_or(u64::MAX);
@@ -3656,10 +3632,14 @@ impl WasmComponentActor for V3Actor {
         self.ensure_active()?;
         let root = checkpoint
             .downcast_ref::<ArenaRoot>()
-            .ok_or_else(|| v3_error("v3 document checkpoint belongs to another runtime"))?
+            .ok_or_else(|| {
+                component_error("component document checkpoint belongs to another runtime")
+            })?
             .clone();
         let document = self.allocate_document()?;
-        self.worker.documents.insert(document, V3Document { root });
+        self.worker
+            .documents
+            .insert(document, ComponentDocument { root });
         self.worker.next_document = self.worker.next_document.max(document.saturating_add(1));
         Ok(WasmDocumentHandle(document))
     }
@@ -3672,14 +3652,18 @@ impl WasmComponentActor for V3Actor {
         self.ensure_active()?;
         let root =
             ArenaRoot::decode_successor_checkpoint(accepted, checkpoint).map_err(|error| {
-                v3_error(format!("failed to decode v3 document checkpoint: {error}"))
+                component_error(format!(
+                    "failed to decode component document checkpoint: {error}"
+                ))
             })?;
         self.durable_checkpoint.insert(
             root.state.id(),
             WasmDurableDocumentCheckpoint::new(checkpoint.to_vec().into())?,
         );
         let document = self.allocate_document()?;
-        self.worker.documents.insert(document, V3Document { root });
+        self.worker
+            .documents
+            .insert(document, ComponentDocument { root });
         self.worker.next_document = self.worker.next_document.max(document.saturating_add(1));
         Ok(WasmDocumentHandle(document))
     }
@@ -3713,12 +3697,7 @@ impl WasmComponentActor for V3Actor {
                 transition,
                 pages: output.pages,
                 complete_file_state: true,
-                certified_csv_pages: Vec::new(),
-                certified_csv_rows: 0,
-                certified_csv_creates: None,
-                certified_csv_last_local_ref: None,
                 certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
-                certified_csv_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
@@ -3777,7 +3756,7 @@ impl WasmComponentActor for V3Actor {
         self.transitions.insert(transition.0, resolved.counters);
         self.prospective_documents.track(transition, document);
         self.edit_cursors
-            .insert(edits.0, V3EditCursorState { transition, page });
+            .insert(edits.0, ComponentEditCursorState { transition, page });
         self.transition_permits.insert(transition.0, permit);
         Ok(WasmEntityTransition {
             transition,
@@ -3819,12 +3798,7 @@ impl WasmComponentActor for V3Actor {
                 transition,
                 pages: output.pages,
                 complete_file_state: false,
-                certified_csv_pages: Vec::new(),
-                certified_csv_rows: 0,
-                certified_csv_creates: None,
-                certified_csv_last_local_ref: None,
                 certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
-                certified_csv_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
@@ -3871,12 +3845,7 @@ impl WasmComponentActor for V3Actor {
                 transition,
                 pages: output.pages,
                 complete_file_state: false,
-                certified_csv_pages: Vec::new(),
-                certified_csv_rows: 0,
-                certified_csv_creates: None,
-                certified_csv_last_local_ref: None,
                 certified_all_entity_keys: CertifiedPacketEntityKeys::default(),
-                certified_csv_entity_keys: CertifiedPacketEntityKeys::default(),
                 certified_packet_pages: Vec::new(),
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
@@ -3932,7 +3901,7 @@ impl WasmComponentActor for V3Actor {
         self.prospective_documents.track(transition, next_document);
         self.edit_cursors.insert(
             edits.0,
-            V3EditCursorState {
+            ComponentEditCursorState {
                 transition,
                 page: Some(WasmEditPage {
                     edits: vec![WasmOutputSplice {
@@ -3992,13 +3961,14 @@ impl WasmComponentActor for V3Actor {
                 page_ordinals.push(ordinal);
                 ordinal = ordinal
                     .checked_add(1)
-                    .ok_or_else(|| v3_error("v3 resolution ordinal overflowed"))?;
+                    .ok_or_else(|| component_error("component resolution ordinal overflowed"))?;
                 page_resolutions.push(match resolution {
-                    V3Resolution::Take(side) => WasmConflictResolution::Take(side),
-                    V3Resolution::Delete => WasmConflictResolution::Delete,
-                    V3Resolution::Replace { snapshot, effect } => {
-                        let index = u32::try_from(page_outputs.len())
-                            .map_err(|_| v3_error("v3 replacement output count exceeds u32"))?;
+                    ComponentResolution::Take(side) => WasmConflictResolution::Take(side),
+                    ComponentResolution::Delete => WasmConflictResolution::Delete,
+                    ComponentResolution::Replace { snapshot, effect } => {
+                        let index = u32::try_from(page_outputs.len()).map_err(|_| {
+                            component_error("component replacement output count exceeds u32")
+                        })?;
                         let length = snapshot.len() as u64;
                         page_outputs.push(snapshot);
                         WasmConflictResolution::Replace {
@@ -4054,66 +4024,25 @@ impl WasmComponentActor for V3Actor {
         let cursor = self
             .cursors
             .get_mut(&cursor.0)
-            .ok_or_else(|| v3_error("unknown v3 change cursor"))?;
+            .ok_or_else(|| component_error("unknown component change cursor"))?;
         if cursor.transition != transition {
-            return Err(v3_error("v3 change cursor belongs to another transition"));
+            return Err(component_error(
+                "component change cursor belongs to another transition",
+            ));
         }
         loop {
             match cursor.pages.pop_front() {
-                Some(PendingChangePage::TypedCsv {
-                    row_count,
+                Some(PendingChangePage::Packet {
+                    record_count,
                     payload,
+                    attachments,
+                    max_page_bytes,
+                    limits,
                     creates,
                 }) => {
-                    let (first_local_ref, last_local_ref) =
-                        validate_typed_csv_rows(row_count, &payload).map_err(v3_error)?;
-                    if cursor
-                        .certified_csv_last_local_ref
-                        .is_some_and(|previous| previous >= first_local_ref)
-                    {
-                        return Err(v3_error(
-                            "certified CSV local refs must increase across pages",
-                        ));
-                    }
-                    if cursor
-                        .certified_csv_creates
-                        .is_some_and(|existing| existing != creates)
-                    {
-                        return Err(v3_error(
-                            "one certified CSV transition used multiple create contexts",
-                        ));
-                    }
-                    let mut page_keys = CertifiedPacketEntityKeys::default();
-                    page_keys.insert_create_ref_range(
-                        "csv_v2_row",
-                        u64::from(first_local_ref),
-                        u64::from(last_local_ref),
-                        &cursor.certified_all_entity_keys,
-                    )?;
-                    cursor.certified_csv_creates = Some(creates);
-                    cursor.certified_csv_rows = cursor
-                        .certified_csv_rows
-                        .checked_add(u64::from(row_count))
-                        .ok_or_else(|| v3_error("certified CSV row count overflowed"))?;
-                    cursor.certified_csv_last_local_ref = Some(last_local_ref);
-                    cursor.certified_csv_pages.push(Bytes::from(payload));
-                    cursor.certified_all_entity_keys.extend_ref(&page_keys);
-                    cursor.certified_csv_entity_keys.extend(page_keys);
-                }
-                Some(page @ PendingChangePage::Packet { .. }) => {
-                    let PendingChangePage::Packet {
-                        record_count,
-                        payload,
-                        max_page_bytes,
-                        limits,
-                        creates,
-                    } = page
-                    else {
-                        unreachable!("matched packet page")
-                    };
                     if let Some(validated_page) =
                         validate_created_packet_page(record_count, &payload, creates)
-                            .map_err(v3_error)?
+                            .map_err(component_error)?
                     {
                         // Certified immutable segments are the ownership unit
                         // for complete bulk state. Sparse successors stay as
@@ -4124,6 +4053,7 @@ impl WasmComponentActor for V3Actor {
                             let decoded = PendingChangePage::Packet {
                                 record_count,
                                 payload,
+                                attachments,
                                 max_page_bytes,
                                 limits,
                                 creates,
@@ -4141,7 +4071,7 @@ impl WasmComponentActor for V3Actor {
                             .certified_packet_creates
                             .is_some_and(|existing| existing != creates)
                         {
-                            return Err(v3_error(
+                            return Err(component_error(
                                 "one certified packet transition used multiple create contexts",
                             ));
                         }
@@ -4153,7 +4083,9 @@ impl WasmComponentActor for V3Actor {
                         cursor.certified_packet_rows = cursor
                             .certified_packet_rows
                             .checked_add(u64::from(record_count))
-                            .ok_or_else(|| v3_error("certified packet row count overflowed"))?;
+                            .ok_or_else(|| {
+                                component_error("certified packet row count overflowed")
+                            })?;
                         cursor.certified_packet_schema_keys.extend(schema_keys);
                         cursor.certified_all_entity_keys.extend_ref(&page_keys);
                         cursor.certified_packet_entity_keys.extend(page_keys);
@@ -4162,6 +4094,7 @@ impl WasmComponentActor for V3Actor {
                         let decoded = PendingChangePage::Packet {
                             record_count,
                             payload,
+                            attachments,
                             max_page_bytes,
                             limits,
                             creates,
@@ -4190,10 +4123,10 @@ impl WasmComponentActor for V3Actor {
         let cursor = self
             .resolution_cursors
             .get_mut(&cursor.0)
-            .ok_or_else(|| v3_error("unknown v3 resolution cursor"))?;
+            .ok_or_else(|| component_error("unknown component resolution cursor"))?;
         if cursor.transition != transition {
-            return Err(v3_error(
-                "v3 resolution cursor belongs to another transition",
+            return Err(component_error(
+                "component resolution cursor belongs to another transition",
             ));
         }
         Ok(cursor.pages.pop_front())
@@ -4210,22 +4143,7 @@ impl WasmComponentActor for V3Actor {
         else {
             return Vec::new();
         };
-        let mut batches = Vec::with_capacity(2);
-        if let Some(creates) = cursor.certified_csv_creates.take() {
-            let schema_keys = vec!["csv_v2_row".to_owned()];
-            let create_ranges = cursor
-                .certified_csv_entity_keys
-                .take_create_ranges_for(&schema_keys);
-            batches.push(WasmCertifiedEntityBatch {
-                format: CERTIFIED_TYPED_CSV_V1,
-                schema_keys,
-                row_count: std::mem::take(&mut cursor.certified_csv_rows),
-                creates,
-                create_ranges,
-                complete_file_state: cursor.complete_file_state,
-                pages: std::mem::take(&mut cursor.certified_csv_pages),
-            });
-        }
+        let mut batches = Vec::with_capacity(1);
         if let Some(creates) = cursor.certified_packet_creates.take() {
             let schema_keys = std::mem::take(&mut cursor.certified_packet_schema_keys)
                 .into_iter()
@@ -4245,7 +4163,6 @@ impl WasmComponentActor for V3Actor {
             });
         }
         cursor.certified_all_entity_keys = CertifiedPacketEntityKeys::default();
-        cursor.certified_csv_entity_keys = CertifiedPacketEntityKeys::default();
         batches
     }
 
@@ -4258,10 +4175,10 @@ impl WasmComponentActor for V3Actor {
     ) -> Result<Option<WasmEditPage>, LixError> {
         match self.edit_cursors.get_mut(&cursor.0) {
             Some(state) if state.transition == transition => Ok(state.page.take()),
-            Some(_) => Err(v3_error(
-                "v3 hydration edit cursor belongs to another transition",
+            Some(_) => Err(component_error(
+                "component hydration edit cursor belongs to another transition",
             )),
-            None => Err(v3_error("unknown v3 hydration edit cursor")),
+            None => Err(component_error("unknown component hydration edit cursor")),
         }
     }
 
@@ -4274,15 +4191,17 @@ impl WasmComponentActor for V3Actor {
         let outputs = self
             .outputs
             .get(&outputs.0)
-            .ok_or_else(|| v3_error("unknown v3 byte outputs"))?;
+            .ok_or_else(|| component_error("unknown component byte outputs"))?;
         if outputs.transition != transition {
-            return Err(v3_error("v3 byte outputs belong to another transition"));
+            return Err(component_error(
+                "component byte outputs belong to another transition",
+            ));
         }
         outputs
             .values
             .get(index as usize)
             .map(|bytes| bytes.len() as u64)
-            .ok_or_else(|| v3_error("v3 byte output index is out of bounds"))
+            .ok_or_else(|| component_error("component byte output index is out of bounds"))
     }
 
     async fn read_output(
@@ -4296,19 +4215,23 @@ impl WasmComponentActor for V3Actor {
         let outputs = self
             .outputs
             .get(&outputs.0)
-            .ok_or_else(|| v3_error("unknown v3 byte outputs"))?;
+            .ok_or_else(|| component_error("unknown component byte outputs"))?;
         if outputs.transition != transition {
-            return Err(v3_error("v3 byte outputs belong to another transition"));
+            return Err(component_error(
+                "component byte outputs belong to another transition",
+            ));
         }
         let bytes = outputs
             .values
             .get(index as usize)
-            .ok_or_else(|| v3_error("v3 byte output index is out of bounds"))?;
+            .ok_or_else(|| component_error("component byte output index is out of bounds"))?;
         let end = offset
             .checked_add(u64::from(length))
-            .ok_or_else(|| v3_error("v3 byte output range overflowed"))?;
+            .ok_or_else(|| component_error("component byte output range overflowed"))?;
         if end > bytes.len() as u64 {
-            return Err(v3_error("v3 byte output range is out of bounds"));
+            return Err(component_error(
+                "component byte output range is out of bounds",
+            ));
         }
         Ok(bytes.slice(offset as usize..end as usize).to_vec())
     }
@@ -4331,7 +4254,7 @@ impl WasmComponentActor for V3Actor {
         self.prospective_documents.accept(transition);
         self.transitions
             .remove(&transition.0)
-            .ok_or_else(|| v3_error("unknown v3 transition"))
+            .ok_or_else(|| component_error("unknown component transition"))
     }
 
     async fn discard_transition(
@@ -4373,20 +4296,28 @@ impl WasmComponentActor for V3Actor {
     }
 }
 
-impl Drop for V3Actor {
+impl Drop for ComponentActor {
     fn drop(&mut self) {
         self.retired = true;
     }
 }
 
-fn v3_error(message: impl Into<String>) -> LixError {
+fn required_plugin_path(path: Option<String>, transition: &str) -> Result<String, LixError> {
+    path.ok_or_else(|| {
+        component_error(format!(
+            "component {transition} requires a resolved plugin-owned file path"
+        ))
+    })
+}
+
+fn component_error(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INVALID_PLUGIN, message)
 }
 
-fn v3_transition_limits(
+fn component_transition_limits(
     mut limits: WasmTransitionLimits,
 ) -> Result<WasmTransitionLimits, LixError> {
-    limits.max_page_bytes = V3_MAX_BATCH_BYTES.min(
+    limits.max_page_bytes = COMPONENT_MAX_BATCH_BYTES.min(
         u32::try_from(limits.max_total_bytes)
             .unwrap_or(u32::MAX)
             .max(limits.max_record_bytes),
@@ -4401,6 +4332,21 @@ fn v3_transition_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_lifecycle_boundary_requires_a_resolved_path() {
+        assert_eq!(
+            required_plugin_path(Some("/document.csv".to_owned()), "open")
+                .expect("resolved plugin path"),
+            "/document.csv"
+        );
+        let error = required_plugin_path(None, "open").expect_err("missing path must fail");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert_eq!(
+            error.message,
+            "component open requires a resolved plugin-owned file path"
+        );
+    }
 
     #[test]
     fn oversized_durable_checkpoint_is_omitted_without_rejecting_the_root() {
@@ -4606,6 +4552,7 @@ mod tests {
         let ordinary = decode_inline_change_page(
             1,
             ordinary_payload.clone(),
+            &[],
             ordinary_payload.len() as u32,
             WasmTransitionLimits::default(),
         )
@@ -4635,80 +4582,6 @@ mod tests {
         assert_eq!(
             duplicate_certified.message,
             "a component entity key may occur only once across certified packet pages"
-        );
-    }
-
-    #[test]
-    fn typed_csv_ranges_share_packet_identity_validation() {
-        let creates = WasmCreateContext {
-            high: 0x019a_0000_0000_7000,
-            low: 0x8000_0000,
-        };
-        let mut csv_first = CertifiedPacketEntityKeys::default();
-        csv_first
-            .insert_create_ref_range(
-                "csv_v2_row",
-                0,
-                219_999,
-                &CertifiedPacketEntityKeys::default(),
-            )
-            .expect("typed CSV range is initially unique");
-        let duplicate_packet = accept_page(&create_page("csv_v2_row", 17), creates, &mut csv_first)
-            .expect_err("packet create must not repeat a typed CSV identity");
-        assert_eq!(
-            duplicate_packet.message,
-            "a component entity key may occur only once across certified packet pages"
-        );
-
-        let mut packet_first = CertifiedPacketEntityKeys::default();
-        accept_page(&create_page("csv_v2_row", 17), creates, &mut packet_first)
-            .expect("packet create is initially unique");
-        let mut csv_range = CertifiedPacketEntityKeys::default();
-        let duplicate_csv = csv_range
-            .insert_create_ref_range("csv_v2_row", 0, 219_999, &packet_first)
-            .expect_err("typed CSV range must not repeat a packet identity");
-        assert_eq!(
-            duplicate_csv.message,
-            "a component entity key may occur only once across certified packet pages"
-        );
-    }
-
-    #[test]
-    fn certified_authority_ranges_stay_partitioned_by_batch_context() {
-        let mut csv_keys = CertifiedPacketEntityKeys::default();
-        csv_keys
-            .insert_create_ref_range("csv_v2_row", 1, 1, &CertifiedPacketEntityKeys::default())
-            .expect("CSV identity is unique");
-        let mut packet_keys = CertifiedPacketEntityKeys::default();
-        packet_keys
-            .insert(
-                CreatedPacketIdentity::Create {
-                    schema_key: "csv_v2_row".to_owned(),
-                    local_ref: 2,
-                },
-                WasmCreateContext {
-                    high: 0x019b_0000_0000_7000,
-                    low: 0x8000_0000,
-                },
-                &csv_keys,
-            )
-            .expect("packet identity is unique across the transition");
-
-        assert_eq!(
-            csv_keys.take_create_ranges_for(&["csv_v2_row".to_owned()]),
-            vec![WasmCertifiedCreateRange {
-                schema_key: "csv_v2_row".to_owned(),
-                first_local_ref: 1,
-                last_local_ref: 1,
-            }]
-        );
-        assert_eq!(
-            packet_keys.take_create_ranges_for(&["csv_v2_row".to_owned()]),
-            vec![WasmCertifiedCreateRange {
-                schema_key: "csv_v2_row".to_owned(),
-                first_local_ref: 2,
-                last_local_ref: 2,
-            }]
         );
     }
 
@@ -4773,82 +4646,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_csv_certification_rejects_invalid_order_ranks() {
-        assert!(validate_typed_csv_order_rank(1).is_ok());
-        assert!(validate_typed_csv_order_rank(0xff).is_ok());
-        assert_eq!(
-            validate_typed_csv_order_rank(0).unwrap_err(),
-            "typed CSV row has an invalid order rank"
-        );
-        assert_eq!(
-            validate_typed_csv_order_rank(0x100).unwrap_err(),
-            "typed CSV row has an invalid order rank"
-        );
-    }
-
-    #[test]
-    fn typed_csv_certification_rejects_noncanonical_quote_layouts() {
-        fn row(quote_layout: &[u8], field_count: u16) -> Vec<u8> {
-            let mut payload = Vec::new();
-            payload.extend_from_slice(&1u32.to_le_bytes());
-            payload.extend_from_slice(&1u64.to_le_bytes());
-            payload.push(0);
-            payload.extend_from_slice(&(quote_layout.len() as u32).to_le_bytes());
-            payload.extend_from_slice(quote_layout);
-            payload.extend_from_slice(&field_count.to_le_bytes());
-            for _ in 0..field_count {
-                payload.extend_from_slice(&0u32.to_le_bytes());
-            }
-            payload
-        }
-
-        assert!(validate_typed_csv_quote_layout(&[], 9).is_ok());
-        assert!(validate_typed_csv_quote_layout(&[1], 9).is_ok());
-        assert!(validate_typed_csv_quote_layout(&[0, 1], 9).is_ok());
-        assert_eq!(
-            validate_typed_csv_quote_layout(&[1, 0], 9).unwrap_err(),
-            "typed CSV quote layout must be a minimal nonzero bitset within the field count"
-        );
-        assert_eq!(
-            validate_typed_csv_quote_layout(&[1, 2], 9).unwrap_err(),
-            "typed CSV quote layout has bits beyond the final field"
-        );
-        assert_eq!(
-            validate_typed_csv_quote_layout(&[1, 1, 1], 9).unwrap_err(),
-            "typed CSV quote layout must be a minimal nonzero bitset within the field count"
-        );
-        assert!(validate_typed_csv_rows(1, &row(&[0, 1], 9)).is_ok());
-        assert_eq!(
-            validate_typed_csv_rows(1, &row(&[1, 0], 9)).unwrap_err(),
-            "typed CSV quote layout must be a minimal nonzero bitset within the field count"
-        );
-        assert_eq!(
-            validate_typed_csv_rows(1, &row(&[1, 2], 9)).unwrap_err(),
-            "typed CSV quote layout has bits beyond the final field"
-        );
-    }
-
-    #[test]
-    fn typed_csv_certification_rejects_authority_holes() {
-        fn append_row(payload: &mut Vec<u8>, local_ref: u32) {
-            payload.extend_from_slice(&local_ref.to_le_bytes());
-            payload.extend_from_slice(&1_u64.to_le_bytes());
-            payload.push(0);
-            payload.extend_from_slice(&0_u32.to_le_bytes());
-            payload.extend_from_slice(&1_u16.to_le_bytes());
-            payload.extend_from_slice(&0_u32.to_le_bytes());
-        }
-
-        let mut payload = Vec::new();
-        append_row(&mut payload, 1);
-        append_row(&mut payload, 3);
-        assert_eq!(
-            validate_typed_csv_rows(2, &payload).unwrap_err(),
-            "typed CSV local refs must be contiguous within a page"
-        );
-    }
-
-    #[test]
     fn entity_sources_and_transition_sinks_share_one_byte_budget() {
         struct EmptyEntitySource;
         impl lix_engine::wasm::WasmEntitySource for EmptyEntitySource {
@@ -4893,13 +4690,14 @@ mod tests {
     }
 
     #[test]
-    fn v3_binding_preserves_scaled_cold_pages() {
+    fn component_binding_preserves_scaled_cold_pages() {
         let cold = WasmTransitionLimits::for_cold_file_bytes(5_298_078);
-        let admitted = v3_transition_limits(cold).expect("scaled cold page should be admitted");
+        let admitted =
+            component_transition_limits(cold).expect("scaled cold page should be admitted");
 
         assert!(admitted.max_page_bytes > 7 * 1024 * 1024);
         assert_eq!(admitted.max_record_bytes, admitted.max_page_bytes);
-        assert!(admitted.max_page_bytes <= V3_MAX_BATCH_BYTES);
+        assert!(admitted.max_page_bytes <= COMPONENT_MAX_BATCH_BYTES);
     }
 
     #[test]
@@ -4946,7 +4744,7 @@ mod tests {
             ))),
         };
         assert_eq!(
-            create_context_from_generated_entity("plugin_json", &user_key),
+            create_context_from_generated_entity("json_array_item", &user_key),
             None
         );
 
@@ -4955,7 +4753,7 @@ mod tests {
             snapshot_content: WasmHostBytes::Inline(Bytes::from_static(b"{}")),
         };
         assert_eq!(
-            create_context_from_generated_entity("plugin_json", &generated_item),
+            create_context_from_generated_entity("json_array_item", &generated_item),
             Some(creates)
         );
     }
@@ -4964,11 +4762,11 @@ mod tests {
     fn only_runtime_traps_trigger_actor_retirement() {
         assert!(is_guest_trap(&LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "v3 file-changed trapped: unreachable"
+            "component file-changed trapped: unreachable"
         )));
         assert!(!is_guest_trap(&LixError::new(
             LixError::CODE_INVALID_PLUGIN,
-            "v3 file-changed rejected input"
+            "component file-changed rejected input"
         )));
     }
 }

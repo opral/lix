@@ -337,7 +337,6 @@ pub(crate) fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
         schema_key,
         "lix_active_account"
             | "lix_binary_blob_ref"
-            | "lix_derived_file_ref"
             | "lix_change"
             | "lix_directory_descriptor"
             | "lix_file_descriptor"

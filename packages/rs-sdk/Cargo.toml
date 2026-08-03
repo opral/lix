@@ -18,13 +18,14 @@ workspace = true
 
 [dependencies]
 lix_engine = { workspace = true }
+lix_plugin_wire = { workspace = true }
+lix_plugin_layout = { workspace = true }
 lix_local_filesystem = { workspace = true, optional = true }
 lix_rocksdb_storage = { workspace = true, optional = true }
 lix_slatedb_storage = { workspace = true, optional = true }
 lix_sqlite_storage = { workspace = true, optional = true }
 
 async-trait = "0.1"
-base64 = "0.22"
 blake3 = { version = "1", optional = true }
 bytes = "1"
 lru = { version = "0.18", optional = true }

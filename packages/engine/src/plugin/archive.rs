@@ -149,10 +149,10 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
 
     Ok(InstalledPlugin {
         key: loaded.manifest.key,
-        runtime: loaded.manifest.runtime,
-        api_version: loaded.manifest.api_version,
+        runtime: super::PluginRuntime::WasmComponent,
+        api_version: crate::wasm::WASM_COMPONENT_API_VERSION.to_owned(),
         path_glob: loaded.manifest.file_match.path_glob,
-        content_type: loaded.manifest.file_match.content_type,
+        content: loaded.manifest.file_match.content,
         entry: loaded.manifest.entry,
         schema_keys: loaded.schema_keys,
         manifest_json: loaded.normalized_manifest_json,
@@ -181,7 +181,7 @@ pub(crate) fn load_installed_plugin_metadata_from_archive_bytes(
         archive_path: archive_path.to_string(),
         archive_blob_hash: archive_blob_hash.to_string(),
         path_glob: loaded.manifest.file_match.path_glob,
-        content_type: loaded.manifest.file_match.content_type,
+        content: loaded.manifest.file_match.content,
         schema_keys: loaded.schema_keys,
     })
 }
@@ -242,7 +242,7 @@ fn load_plugin_archive(
                 "Plugin archive declares duplicate schema '{schema_key}'"
             )));
         }
-        if schema_has_uuid_v7_primary_key_default(&schema_json) {
+        if schema_has_generated_uuid_primary_key(&schema_json) {
             create_schema_keys.push(schema_key.clone());
         }
         schema_keys.push(schema_key);
@@ -259,29 +259,44 @@ fn load_plugin_archive(
     })
 }
 
-fn schema_has_uuid_v7_primary_key_default(schema: &JsonValue) -> bool {
+fn schema_has_generated_uuid_primary_key(schema: &JsonValue) -> bool {
     let Some(primary_key) = schema
         .get("x-lix-primary-key")
         .and_then(JsonValue::as_array)
     else {
         return false;
     };
-    if primary_key.len() != 1 || primary_key[0].as_str() != Some("/id") {
+    let [pointer] = primary_key.as_slice() else {
         return false;
-    }
-    schema
-        .get("properties")
+    };
+    let Some(pointer) = pointer.as_str() else {
+        return false;
+    };
+    schema_property_at_pointer(schema, pointer)
         .and_then(JsonValue::as_object)
-        .and_then(|properties| properties.get("id"))
-        .and_then(JsonValue::as_object)
-        .is_some_and(|id| {
-            id.get("type").and_then(JsonValue::as_str) == Some("string")
-                && id.get("format").and_then(JsonValue::as_str) == Some("uuid")
-                && id
+        .is_some_and(|field| {
+            field.get("type").and_then(JsonValue::as_str) == Some("string")
+                && field.get("format").and_then(JsonValue::as_str) == Some("uuid")
+                && field
                     .get("x-lix-default")
                     .and_then(JsonValue::as_str)
                     .is_some_and(|expression| expression.trim() == "lix_uuid_v7()")
         })
+}
+
+fn schema_property_at_pointer<'a>(schema: &'a JsonValue, pointer: &str) -> Option<&'a JsonValue> {
+    if !pointer.starts_with('/') {
+        return None;
+    }
+    let mut current = schema;
+    for encoded in pointer[1..].split('/') {
+        let segment = encoded.replace("~1", "/").replace("~0", "~");
+        current = current
+            .get("properties")
+            .and_then(JsonValue::as_object)?
+            .get(&segment)?;
+    }
+    Some(current)
 }
 
 /// Production component snapshots currently use a durable JSON representation that
@@ -1114,9 +1129,6 @@ mod tests {
 
     const MANIFEST: &[u8] = br#"{
         "key":"plugin_test",
-        "runtime":"wasm-component",
-        "api_version":"1.0.0",
-        "materialization":"blob",
         "match":{"path_glob":"*.test"},
         "entry":"plugin.wasm",
         "schemas":["schema/plugin_test_note.json"]
@@ -1134,9 +1146,6 @@ mod tests {
     fn v2_archive_with_schema(schema: &JsonValue) -> Vec<u8> {
         let manifest = br#"{
             "key":"plugin_test",
-            "runtime":"wasm-component",
-            "api_version":"1.0.0",
-            "materialization":"blob",
             "match":{"path_glob":"*.test"},
             "entry":"plugin.wasm",
             "schemas":["schema/plugin_test_note.json"]
@@ -1813,9 +1822,6 @@ mod benchmark_probe {
     fn benchmark_archive(wasm_bytes: usize) -> Vec<u8> {
         let manifest = br#"{
             "key":"plugin_bench",
-            "runtime":"wasm-component",
-            "api_version":"1.0.0",
-            "materialization":"blob",
             "match":{"path_glob":"*.bench"},
             "entry":"plugin.wasm",
             "schemas":["schema/plugin_bench_note.json"]

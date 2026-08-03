@@ -1,9 +1,9 @@
 [package]
-name = "plugin_git_text"
+name = "plugin_text"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-description = "Git-compatible line-row plugin for the fused Lix Wasm Component API"
+description = "byte-exact line-row plugin for the fused Lix Wasm Component API"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true

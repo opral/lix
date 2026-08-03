@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "x-lix-key": "csv_v2_row",
+  "x-lix-key": "csv_row",
   "x-lix-primary-key": ["/id"],
   "description": "One decoded CSV record. Row order is controlled by order_key.",
   "type": "object",

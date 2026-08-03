@@ -1,14 +1,15 @@
-# CSV Component API v1
+# CSV plugin
 
-Fused, push-based initial CSV import used only for runtime and boundary
-benchmarking.
+The CSV plugin implements the universal `lix:plugin@1.0.0` lifecycle described
+in [the universal plugin API](../../docs/universal-plugin-api.md). It preserves
+table and row identity, exact source bytes, dialect metadata, sparse edits,
+cold successors, and reopen behavior.
 
-Prototype B emits bounded batches containing compact local row references,
-order ranks, decoded UTF-8 cells, and sparse lexical layout. The Wasm guest
-does not allocate row UUID strings or JSON snapshots. The current host adapter
-rebuilds canonical snapshots into one shared page arena so the unchanged v2
-transaction path can provide a correctness-matched comparison.
+All entity mutations, including initial import, use complete snapshots through
+the universal entity output method. The SDK owns page framing, batching,
+generated primary keys, final flush, and oversized attachments. CSV streams
+rows into that method without constructing a persistent document first.
 
-That adapter is intentionally the boundary for Prototype C: C must lower these
-batches into transaction/storage-native columns without a `Vec<Entity>` or a
-second full row materialization.
+Plugin state stores paged row spans and identity indexes. Those pages are
+rebuildable acceleration data rather than merge authority, and their keys and
+encoding are private implementation details.

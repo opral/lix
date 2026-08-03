@@ -72,7 +72,7 @@ impl DocumentFormat {
             Self::Json => "plugin_json",
             Self::Csv => "plugin_csv",
             Self::Markdown => "plugin_markdown",
-            Self::Text => "plugin_git_text",
+            Self::Text => "plugin_text",
         }
     }
 
@@ -609,12 +609,12 @@ fn build_csv_plugin_archive() -> Vec<u8> {
         include_str!("../../../plugins/csv/manifest.json"),
         &[
             (
-                "schema/csv_v2_table.json",
-                include_str!("../../../plugins/csv/schema/csv_v2_table.json"),
+                "schema/csv_table.json",
+                include_str!("../../../plugins/csv/schema/csv_table.json"),
             ),
             (
-                "schema/csv_v2_row.json",
-                include_str!("../../../plugins/csv/schema/csv_v2_row.json"),
+                "schema/csv_row.json",
+                include_str!("../../../plugins/csv/schema/csv_row.json"),
             ),
         ],
     )
@@ -625,19 +625,19 @@ fn build_markdown_plugin_archive() -> Vec<u8> {
         Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown")),
         include_str!("../../../plugins/markdown/manifest.json"),
         &[(
-            "schema/markdown_node_v2.json",
-            include_str!("../../../plugins/markdown/schema/markdown_node_v2.json"),
+            "schema/markdown_node.json",
+            include_str!("../../../plugins/markdown/schema/markdown_node.json"),
         )],
     )
 }
 
 fn build_text_plugin_archive() -> Vec<u8> {
     build_plugin_archive(
-        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text")),
+        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_TEXT_plugin_text")),
         include_str!("../../../plugins/text/manifest.json"),
         &[(
-            "schema/git_text_line_v2.json",
-            include_str!("../../../plugins/text/schema/git_text_line_v2.json"),
+            "schema/text_line.json",
+            include_str!("../../../plugins/text/schema/text_line.json"),
         )],
     )
 }

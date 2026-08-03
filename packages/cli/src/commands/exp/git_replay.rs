@@ -29,7 +29,7 @@ const FINAL_VERIFY_TARGET_BYTES: usize = 128 * 1024 * 1024;
 // window before draining responses without depending on a platform's larger
 // pipe capacity or deadlocking behind a large blob response.
 const CAT_FILE_REQUESTS_PER_BATCH: usize = 4;
-const GIT_TEXT_PLUGIN_KEY: &str = "plugin_git_text";
+const TEXT_PLUGIN_KEY: &str = "plugin_text";
 const CSV_PLUGIN_KEY: &str = "plugin_csv";
 const MARKDOWN_PLUGIN_KEY: &str = "plugin_markdown";
 const EXCALIDRAW_PLUGIN_KEY: &str = "plugin_excalidraw";
@@ -1781,10 +1781,9 @@ fn should_delete_old_entry(change: &Change, status: char) -> bool {
     }
 
     match status {
-        // A V2 derived materialization proof is path-bound. Git's path rename
-        // must therefore retire the old descriptor and create a new one, so
-        // the installed Git-text plugin can derive a proof for the new path
-        // in the same atomic replay revision.
+        // Plugin-owned state is path-bound. Retire the old descriptor and
+        // create a new one so the selected plugin initializes the new path in
+        // the same atomic replay revision.
         'D' | 'R' => true,
         'A' | 'C' => false,
         _ => !mode_is_regular_file(&change.new_mode),
@@ -2234,14 +2233,14 @@ where
 {
     let plugins = [
         (
-            GIT_TEXT_PLUGIN_KEY,
+            TEXT_PLUGIN_KEY,
             build_embedded_plugin_archive(
                 include_str!("../../../../../plugins/text/manifest.json"),
                 &[(
-                    "schema/git_text_line_v2.json",
-                    include_bytes!("../../../../../plugins/text/schema/git_text_line_v2.json"),
+                    "schema/text_line.json",
+                    include_bytes!("../../../../../plugins/text/schema/text_line.json"),
                 )],
-                Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text")),
+                Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_TEXT_plugin_text")),
             )?,
         ),
         (
@@ -2250,12 +2249,12 @@ where
                 include_str!("../../../../../plugins/csv/manifest.json"),
                 &[
                     (
-                        "schema/csv_v2_table.json",
-                        include_bytes!("../../../../../plugins/csv/schema/csv_v2_table.json"),
+                        "schema/csv_table.json",
+                        include_bytes!("../../../../../plugins/csv/schema/csv_table.json"),
                     ),
                     (
-                        "schema/csv_v2_row.json",
-                        include_bytes!("../../../../../plugins/csv/schema/csv_v2_row.json"),
+                        "schema/csv_row.json",
+                        include_bytes!("../../../../../plugins/csv/schema/csv_row.json"),
                     ),
                 ],
                 Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv")),
@@ -2266,8 +2265,8 @@ where
             build_embedded_plugin_archive(
                 include_str!("../../../../../plugins/markdown/manifest.json"),
                 &[(
-                    "schema/markdown_node_v2.json",
-                    include_bytes!("../../../../../plugins/markdown/schema/markdown_node_v2.json"),
+                    "schema/markdown_node.json",
+                    include_bytes!("../../../../../plugins/markdown/schema/markdown_node.json"),
                 )],
                 Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown")),
             )?,
@@ -3342,7 +3341,7 @@ mod tests {
             "initialization plus four replayed commits should publish five checkpoints"
         );
         let text_rows = db::block_on(lix.execute(
-            "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
+            "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = ?",
             &[Value::Text(stable_file_id(&git_path(b"docs/renamed.txt")))],
         ))
         .expect("Git text rows should be queryable after replay");
@@ -3351,7 +3350,7 @@ mod tests {
             "renamed text file must derive Git-text semantic rows at its new path"
         );
         let csv_rows = db::block_on(lix.execute(
-            "SELECT lixcol_entity_pk FROM csv_v2_row WHERE lixcol_file_id = ?",
+            "SELECT lixcol_entity_pk FROM csv_row WHERE lixcol_file_id = ?",
             &[Value::Text(stable_file_id(&git_path(b"table.csv")))],
         ))
         .expect("CSV rows should be queryable after replay");
@@ -3361,7 +3360,7 @@ mod tests {
             "CSV replay must eagerly materialize both records"
         );
         let binary_rows = db::block_on(lix.execute(
-            "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
+            "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = ?",
             &[Value::Text(stable_file_id(&git_path(b"binary.bin")))],
         ))
         .expect("Git text rows should query for binary fixture");
@@ -3450,7 +3449,7 @@ mod tests {
         let lix =
             db::block_on(open_lix_with_storage(storage)).expect("replay Lix should reopen cleanly");
         let rows = db::block_on(lix.execute(
-            "SELECT lixcol_entity_pk FROM csv_v2_row WHERE lixcol_file_id = ?",
+            "SELECT lixcol_entity_pk FROM csv_row WHERE lixcol_file_id = ?",
             &[Value::Text(stable_file_id(&git_path(b"table.csv")))],
         ))
         .expect("CSV rows should be queryable after replay");
@@ -3615,7 +3614,7 @@ mod tests {
             );
 
             let semantic_rows = db::block_on(lix.execute(
-                "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
+                "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = ?",
                 &[Value::Text(stable_file_id(&git_path(
                     path.trim_start_matches('/').as_bytes(),
                 )))],
@@ -3711,7 +3710,7 @@ mod tests {
         assert_eq!(rendered, Some(b"a\na\n".as_slice()));
 
         let semantic_rows = db::block_on(lix.execute(
-            "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
+            "SELECT lixcol_entity_pk FROM text_line WHERE lixcol_file_id = ?",
             &[Value::Text(stable_file_id(&git_path(b"src/index.ts")))],
         ))
         .expect("replayed Git-text rows should query");

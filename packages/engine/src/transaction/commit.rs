@@ -17,7 +17,7 @@ use crate::changelog::{
     TransactionChangeRecordRef, TransactionChangelogAppend,
 };
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
-use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
@@ -45,7 +45,6 @@ use crate::transaction::types::{
     PreparedStateBatch, PreparedStateRowRef, StagedCommitChangeBatch, StagedCommitChangeRef,
     StagedCommitChangeRefs,
 };
-use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use tracing::Instrument as _;
@@ -167,7 +166,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             batch.complete_file_state
                 && matches!(
                     batch.format,
-                    crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+                    1 | crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
                         | crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
                 )
         }) {
@@ -2498,9 +2497,7 @@ fn selected_refs_require_complete_snapshot(
     selected_changes(selected_change_batches).any(|change_ref| {
         matches!(
             change_ref.schema_key(),
-            FILE_DESCRIPTOR_SCHEMA_KEY
-                | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-                | DERIVED_FILE_REF_SCHEMA_KEY
+            FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
         )
     })
 }
@@ -2608,7 +2605,6 @@ async fn build_lifecycle_tracked_snapshots(
                 lifecycle_selected_tracked_row(change_ref, root.commit_id, source, payload)?;
             apply_lifecycle_tracked_snapshot_row(&mut rows, tracked, false)?;
         }
-        validate_lifecycle_derived_materialization_paths(&rows, &root.branch_id, root.commit_id)?;
         snapshots.insert(root.commit_id, rows);
     }
 
@@ -2631,192 +2627,6 @@ async fn build_lifecycle_tracked_snapshots(
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
-const DERIVED_FILE_REF_SCHEMA_KEY: &str = "lix_derived_file_ref";
-
-/// A derived materialization is valid only for the exact descriptor path that
-/// was supplied to its renderer. Normal transactions reject path-only moves
-/// before staging; lifecycle snapshots additionally cover selected historical
-/// refs, such as merge picks, which bypass ordinary write reconciliation.
-///
-/// Keep this at the complete-snapshot seam rather than teaching every caller
-/// that can select historical refs about plugin semantics. It makes the
-/// invariant hold for all future lifecycle publications without adding a
-/// full-state scan to ordinary O(changed-rows) commits.
-fn validate_lifecycle_derived_materialization_paths(
-    rows: &BTreeMap<TrackedStateKey, MaterializedTrackedStateRow>,
-    branch_id: &str,
-    commit_id: CommitId,
-) -> Result<(), LixError> {
-    let mut directories = BTreeMap::<String, LifecycleDirectoryDescriptor>::new();
-    let mut files = BTreeMap::<String, LifecycleFileDescriptor>::new();
-    let mut proofs = Vec::<LifecycleDerivedFileRef>::new();
-
-    for row in rows.values().filter(|row| !row.deleted) {
-        let Some(snapshot) = row.snapshot_content.as_deref() else {
-            continue;
-        };
-        match row.schema_key.as_str() {
-            DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                let descriptor: LifecycleDirectoryDescriptor = serde_json::from_str(snapshot)
-                    .map_err(|error| {
-                        lifecycle_derived_materialization_error(format!(
-                            "branch '{branch_id}' commit '{commit_id}' has an invalid directory descriptor: {error}"
-                        ))
-                    })?;
-                if row.entity_pk.as_single_string_owned().ok().as_deref()
-                    != Some(descriptor.id.as_str())
-                {
-                    return Err(lifecycle_derived_materialization_error(format!(
-                        "branch '{branch_id}' commit '{commit_id}' has a directory descriptor whose id does not match its primary key"
-                    )));
-                }
-                if directories
-                    .insert(descriptor.id.clone(), descriptor)
-                    .is_some()
-                {
-                    return Err(lifecycle_derived_materialization_error(format!(
-                        "branch '{branch_id}' commit '{commit_id}' has duplicate directory descriptor ids"
-                    )));
-                }
-            }
-            FILE_DESCRIPTOR_SCHEMA_KEY => {
-                let descriptor: LifecycleFileDescriptor = serde_json::from_str(snapshot).map_err(
-                    |error| {
-                        lifecycle_derived_materialization_error(format!(
-                            "branch '{branch_id}' commit '{commit_id}' has an invalid file descriptor: {error}"
-                        ))
-                    },
-                )?;
-                if row.entity_pk.as_single_string_owned().ok().as_deref()
-                    != Some(descriptor.id.as_str())
-                {
-                    return Err(lifecycle_derived_materialization_error(format!(
-                        "branch '{branch_id}' commit '{commit_id}' has a file descriptor whose id does not match its primary key"
-                    )));
-                }
-                if files.insert(descriptor.id.clone(), descriptor).is_some() {
-                    return Err(lifecycle_derived_materialization_error(format!(
-                        "branch '{branch_id}' commit '{commit_id}' has duplicate file descriptor ids"
-                    )));
-                }
-            }
-            DERIVED_FILE_REF_SCHEMA_KEY => {
-                let proof: LifecycleDerivedFileRef = serde_json::from_str(snapshot).map_err(
-                    |error| {
-                        lifecycle_derived_materialization_error(format!(
-                            "branch '{branch_id}' commit '{commit_id}' has an invalid derived materialization proof: {error}"
-                        ))
-                    },
-                )?;
-                if row.entity_pk.as_single_string_owned().ok().as_deref() != Some(proof.id.as_str())
-                    || row.file_id.as_deref() != Some(proof.id.as_str())
-                {
-                    return Err(lifecycle_derived_materialization_error(format!(
-                        "branch '{branch_id}' commit '{commit_id}' has a derived materialization proof whose id does not match its row identity"
-                    )));
-                }
-                proofs.push(proof);
-            }
-            _ => {}
-        }
-    }
-
-    if proofs.is_empty() {
-        return Ok(());
-    }
-    let mut directory_paths = BTreeMap::new();
-    for proof in proofs {
-        let file = files.get(&proof.id).ok_or_else(|| {
-            lifecycle_derived_materialization_error(format!(
-                "derived-materialization file '{}' on branch '{branch_id}' commit '{commit_id}' has no live descriptor",
-                proof.id,
-            ))
-        })?;
-        let parent_path = match file.directory_id.as_deref() {
-            Some(directory_id) => Some(lifecycle_directory_path(
-                directory_id,
-                &directories,
-                &mut directory_paths,
-                &mut BTreeSet::new(),
-                branch_id,
-                commit_id,
-            )?),
-            None => None,
-        };
-        let path = compose_file_path(parent_path.as_deref(), &file.name)?;
-        if proof.path != path {
-            return Err(lifecycle_derived_materialization_error(format!(
-                "derived-materialization file '{}' on branch '{branch_id}' commit '{commit_id}' was rendered at '{}' but its final descriptor resolves to '{}'",
-                proof.id, proof.path, path,
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn lifecycle_directory_path(
-    id: &str,
-    directories: &BTreeMap<String, LifecycleDirectoryDescriptor>,
-    paths: &mut BTreeMap<String, String>,
-    visiting: &mut BTreeSet<String>,
-    branch_id: &str,
-    commit_id: CommitId,
-) -> Result<String, LixError> {
-    if let Some(path) = paths.get(id) {
-        return Ok(path.clone());
-    }
-    if !visiting.insert(id.to_string()) {
-        return Err(lifecycle_derived_materialization_error(format!(
-            "derived-materialization validation found a directory cycle at '{id}' on branch '{branch_id}' commit '{commit_id}'"
-        )));
-    }
-    let directory = directories.get(id).ok_or_else(|| {
-        lifecycle_derived_materialization_error(format!(
-            "derived-materialization validation found missing directory '{id}' on branch '{branch_id}' commit '{commit_id}'"
-        ))
-    })?;
-    let parent_path = match directory.parent_id.as_deref() {
-        Some(parent_id) => Some(lifecycle_directory_path(
-            parent_id,
-            directories,
-            paths,
-            visiting,
-            branch_id,
-            commit_id,
-        )?),
-        None => None,
-    };
-    let path = compose_directory_path(parent_path.as_deref(), &directory.name)?;
-    visiting.remove(id);
-    paths.insert(id.to_string(), path.clone());
-    Ok(path)
-}
-
-fn lifecycle_derived_materialization_error(message: impl Into<String>) -> LixError {
-    LixError::new(LixError::CODE_CONSTRAINT_VIOLATION, message).with_hint(
-        "Keep a derived file at the path recorded by its proof, or recreate it at the destination so its plugin can publish a new proof.",
-    )
-}
-
-#[derive(Debug, Deserialize)]
-struct LifecycleDirectoryDescriptor {
-    id: String,
-    parent_id: Option<String>,
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct LifecycleFileDescriptor {
-    id: String,
-    directory_id: Option<String>,
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct LifecycleDerivedFileRef {
-    id: String,
-    path: String,
-}
 
 async fn load_persisted_lifecycle_tracked_snapshot(
     read: &(impl StorageAdapterRead + ?Sized),
@@ -5362,13 +5172,13 @@ mod tests {
     fn host_certified_ownership_change_preserves_old_plugin_tombstone() {
         let mut old_plugin_tombstone = tracked_branch_row("main", "old-plugin-delete");
         old_plugin_tombstone.entity_pk = EntityPk::single("old-plugin-line");
-        old_plugin_tombstone.schema_key = "git_text_line_v2".into();
+        old_plugin_tombstone.schema_key = "plugin_line".into();
         old_plugin_tombstone.file_id = Some("file-a".into());
         old_plugin_tombstone.snapshot = None;
 
         let mut new_plugin_live = tracked_branch_row("main", "new-plugin-create");
         new_plugin_live.entity_pk = EntityPk::single("new-plugin-line");
-        new_plugin_live.schema_key = "git_text_line_v2".into();
+        new_plugin_live.schema_key = "plugin_line".into();
         new_plugin_live.file_id = Some("file-a".into());
         let published_commit_id = new_plugin_live
             .commit_id
@@ -5378,7 +5188,7 @@ mod tests {
             "main".to_string(),
             BTreeMap::from([(
                 "file-a".to_string(),
-                BTreeSet::from(["git_text_line_v2".to_string()]),
+                BTreeSet::from(["plugin_line".to_string()]),
             )]),
         )]);
 
@@ -5413,7 +5223,7 @@ mod tests {
         let published_commit_id = commit_id("published-certified-batch");
         let mut published = tracked_branch_row("main", "published-live-row");
         published.commit_id = Some(published_commit_id);
-        published.schema_key = "git_text_line_v2".into();
+        published.schema_key = "plugin_line".into();
         published.file_id = Some("file-a".into());
 
         let mut intermediate = published.clone();
@@ -5424,7 +5234,7 @@ mod tests {
             "main".to_string(),
             BTreeMap::from([(
                 "file-a".to_string(),
-                BTreeSet::from(["git_text_line_v2".to_string()]),
+                BTreeSet::from(["plugin_line".to_string()]),
             )]),
         )]);
 

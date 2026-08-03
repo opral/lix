@@ -26,11 +26,11 @@ use crate::wasm::{
     WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTransition,
     WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange,
     WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflict, WasmEntityConflictPage,
-    WasmEntityConflictSource, WasmEntityPage, WasmEntitySource, WasmEntityTransition,
-    WasmFileTransition, WasmGuestBytes, WasmHostBytes, WasmHostConflictResolution, WasmHostEntity,
-    WasmHostEntityChanges, WasmInputBytes, WasmInputSplice, WasmOutputRange, WasmSourceRange,
-    WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
-    validate_change_cursor_key_uniqueness,
+    WasmEntityConflictSource, WasmEntityKey, WasmEntityPage, WasmEntitySource,
+    WasmEntityTransition, WasmFileTransition, WasmGuestBytes, WasmHostBytes,
+    WasmHostConflictResolution, WasmHostEntity, WasmHostEntityChanges, WasmInputBytes,
+    WasmInputSplice, WasmOutputRange, WasmSourceRange, WasmTransitionCounters,
+    WasmTransitionHandle, WasmTransitionLimits, validate_change_cursor_key_uniqueness,
 };
 use crate::{Blob, LixError};
 
@@ -61,16 +61,6 @@ impl FileBytesSha256 {
 
     pub(crate) fn matches_lower_hex(self, value: &str) -> bool {
         Self::from_lower_hex(value) == Some(self)
-    }
-
-    pub(crate) fn to_lower_hex(self) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut output = String::with_capacity(64);
-        for byte in self.0 {
-            output.push(char::from(HEX[usize::from(byte >> 4)]));
-            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-        output
     }
 }
 
@@ -156,7 +146,7 @@ impl WasmByteSource for ArcByteSource {
 /// A lazy source keeps the record bounded while retaining immutable ownership
 /// of the complete Snapshot JSON for the guest to read on demand.
 pub(crate) fn host_entity_with_lazy_snapshot(
-    key: crate::wasm::WasmEntityKey,
+    key: WasmEntityKey,
     snapshot: Bytes,
     limits: WasmTransitionLimits,
 ) -> Result<WasmHostEntity, LixError> {
@@ -177,7 +167,7 @@ pub(crate) fn host_entity_with_lazy_snapshot(
 
 /// Change-record counterpart of [`host_entity_with_lazy_snapshot`].
 pub(crate) fn host_entity_change_with_lazy_snapshot(
-    key: crate::wasm::WasmEntityKey,
+    key: WasmEntityKey,
     snapshot: Bytes,
     effect: crate::wasm::WasmChangeEffect,
     limits: WasmTransitionLimits,
@@ -449,20 +439,14 @@ pub(crate) fn transport_splice_preserves_utf8(
     std::str::from_utf8(&after[window_start..window_end]).is_ok()
 }
 
-/// Proves that a trusted transport splice preserves Git's text predicate
-/// without rescanning the full materialized file.
-///
-/// A file already owned by a `git_text` plugin is known to have no NUL byte
-/// in its first 8 KiB. The submitted result is bound to the transport splice,
-/// so checking only the same bounded prefix of the result is sufficient after
-/// a mutation. Unlike UTF-8 validity, Git's predicate has no code-point
-/// boundary context.
-pub(crate) fn transport_splice_preserves_git_text(
+/// Proves that a trusted transport splice preserves a bounded prefix-exclusion
+/// predicate without rescanning unchanged bytes.
+pub(crate) fn transport_splice_preserves_prefix_exclusion(
     after: &[u8],
     provenance: &RequestBlobSpliceProvenance,
+    forbidden_byte: u8,
+    scan_bytes: usize,
 ) -> bool {
-    const GIT_TEXT_SCAN_BYTES: usize = 8_000;
-
     if !provenance.matches_result(after) {
         return false;
     }
@@ -482,7 +466,7 @@ pub(crate) fn transport_splice_preserves_git_text(
         return false;
     }
 
-    !after[..after.len().min(GIT_TEXT_SCAN_BYTES)].contains(&0)
+    !after[..after.len().min(scan_bytes)].contains(&forbidden_byte)
 }
 
 fn validate_transport_splice(
@@ -864,11 +848,12 @@ impl CanonicalJsonBatchBuilder {
     fn push_plugin(
         &mut self,
         bytes: Bytes,
-        key: &crate::wasm::WasmEntityKey,
+        key: &WasmEntityKey,
         schemas: &SchemaAllowlist,
     ) -> Result<usize, LixError> {
         self.parse_count = self.parse_count.saturating_add(1);
-        let certificate = if let Some(plan) = schemas.schema_plan(&key.schema_key) {
+        let plan = schemas.schema_plan(&key.schema_key);
+        let certificate = if let Some(plan) = plan {
             plan.certify_or_normalize_plugin_row(&bytes, key)?
                 .map(|row| (row, plan.shared_fingerprint()))
         } else {
@@ -911,6 +896,57 @@ impl CanonicalJsonBatchBuilder {
             return Err(invalid_guest(
                 "component entity snapshots must be JSON objects",
             ));
+        }
+        if let Some(plan) = plan {
+            if let Err(errors) = plan.compiled_schema.validate(&value) {
+                let details = errors
+                    .take(3)
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(invalid_guest(format!(
+                    "component snapshot failed schema validation: {details}"
+                )));
+            }
+            let primary_key = plan.primary_key.as_deref().ok_or_else(|| {
+                invalid_guest("component snapshot schema has no primary-key definition")
+            })?;
+            let emitted = json_pointer_components(&value, primary_key)?;
+            if emitted.as_slice() != key.entity_pk.as_slice() {
+                return Err(invalid_guest(
+                    "component snapshot primary key does not match its entity key",
+                ));
+            }
+            let component_types = plan.primary_key_component_types.as_deref().ok_or_else(|| {
+                invalid_guest("component snapshot schema has no typed primary key")
+            })?;
+            let entity_pk =
+                EntityPk::from_external_parts(emitted, component_types).map_err(|error| {
+                    invalid_guest(format!("component entity key is invalid: {error}"))
+                })?;
+            let encoded_len = canonical_json_encoded_len(&value)?;
+            let mut normalized = Vec::with_capacity(encoded_len as usize);
+            encode_number_free_json(&value, &mut normalized)?;
+            self.serialize_count = self.serialize_count.saturating_add(1);
+            let start = self.normalized_len;
+            let end = start
+                .checked_add(encoded_len)
+                .ok_or_else(|| invalid_guest("component canonical JSON page exceeds u32"))?;
+            self.normalized_len = end;
+            let row = self.row_kinds.len();
+            self.reserve_certified_columns();
+            let schema_fingerprint_index =
+                self.schema_fingerprint_index(plan.shared_fingerprint())?;
+            self.certified_normalized.push(
+                SharedStr::from_utf8(Bytes::from(normalized))
+                    .map_err(|_| invalid_guest("certified canonical JSON row is not UTF-8"))?,
+            );
+            self.certified_entity_pks.push(entity_pk);
+            self.schema_fingerprint_indices
+                .push(schema_fingerprint_index);
+            self.row_kinds.push(CanonicalJsonBatchRowKind::Certified);
+            self.normalized_ends.push(end);
+            return Ok(row);
         }
         let encoded_len = canonical_json_encoded_len(&value)?;
         let start = self.normalized_len;
@@ -1295,7 +1331,7 @@ impl LiveBatchEntitySource {
             )
         })?;
         host_entity_with_lazy_snapshot(
-            crate::wasm::WasmEntityKey::from_owned_parts(
+            WasmEntityKey::from_owned_parts(
                 row.schema_key().to_owned(),
                 row.entity_pk().clone().into_parts(),
             ),
@@ -1732,7 +1768,7 @@ fn encoded_entity_conflict_record_bytes(
     Ok(size)
 }
 
-fn encoded_entity_key_bytes(key: &crate::wasm::WasmEntityKey) -> Result<u64, LixError> {
+fn encoded_entity_key_bytes(key: &WasmEntityKey) -> Result<u64, LixError> {
     if key.entity_pk.is_empty() {
         return Err(invalid_input(
             "component entity primary keys must not be empty",
@@ -1844,7 +1880,7 @@ pub(crate) struct ValidatedEntityTransition {
 }
 
 fn validate_certified_entity_batches(
-    batches: &[WasmCertifiedEntityBatch],
+    batches: &mut [WasmCertifiedEntityBatch],
     schemas: &SchemaAllowlist,
 ) -> Result<(), LixError> {
     for batch in batches {
@@ -1852,9 +1888,6 @@ fn validate_certified_entity_batches(
             schemas.validate(schema_key)?;
         }
         match batch.format {
-            // Typed CSV is a schema codec: the runtime validates every scalar
-            // field and the engine decoder constructs the fixed row shape.
-            1 if batch.schema_keys.as_slice() == ["csv_v2_row"] => {}
             2 => validate_certified_snapshot_packets(batch, schemas)?,
             format => {
                 return Err(invalid_guest(format!(
@@ -1868,10 +1901,6 @@ fn validate_certified_entity_batches(
 
 const HOST_CERTIFIED_PACKET_TARGET_BYTES: usize = 256 * 1024;
 const HOST_CERTIFIED_PACKET_MIN_ROWS: usize = 64;
-
-fn host_certified_dense_schema(schema_key: &str) -> bool {
-    matches!(schema_key, "git_text_line_v2" | "markdown_node_v2")
-}
 
 /// Retains a complete, eagerly validated generic-text import in dense packet
 /// pages. The ordinary component change list remains intact for changelog and
@@ -1892,7 +1921,7 @@ pub(crate) fn certify_dense_fresh_file(
         let WasmEntityChange::Create { schema_key, .. } = change else {
             return None;
         };
-        host_certified_dense_schema(schema_key).then_some(schema_key.as_str())
+        Some(schema_key.as_str())
     }) else {
         return Ok(());
     };
@@ -1910,7 +1939,32 @@ pub(crate) fn certify_dense_fresh_file(
         return Ok(());
     }
     schemas.validate(schema_key)?;
-    let compressed_pages = schema_key == "markdown_node_v2";
+    let plan = schemas.schema_plan(schema_key).ok_or_else(|| {
+        invalid_guest(format!(
+            "dense batch schema '{schema_key}' has no validation plan"
+        ))
+    })?;
+    if plan
+        .primary_key
+        .as_ref()
+        .is_none_or(|paths| paths.len() != 1)
+    {
+        return Ok(());
+    }
+    let primary_key_path = &plan.primary_key.as_ref().expect("checked above")[0];
+    let snapshot_bytes = transition
+        .changes
+        .changes
+        .iter()
+        .filter_map(|change| match change {
+            WasmEntityChange::Create {
+                snapshot_content: WasmHostBytes::CanonicalJson(snapshot),
+                ..
+            } => Some(snapshot.normalized().len()),
+            _ => None,
+        })
+        .sum::<usize>();
+    let compressed_pages = snapshot_bytes >= 1024 * 1024;
 
     let mut pages = Vec::new();
     let mut page = Vec::with_capacity(HOST_CERTIFIED_PACKET_TARGET_BYTES);
@@ -1927,11 +1981,21 @@ pub(crate) fn certify_dense_fresh_file(
             unreachable!("dense text eligibility was checked above");
         };
         let schema_bytes = schema_key.as_bytes();
-        let snapshot_bytes = snapshot.normalized().as_bytes();
+        let id = creates.component(*local_ref)?;
+        let snapshot_bytes = lix_plugin_layout::insert_generated_id(
+            snapshot.normalized().as_bytes(),
+            primary_key_path,
+            &id,
+        )
+        .map_err(|error| {
+            invalid_guest(format!(
+                "dense batch generated identity is invalid: {error}"
+            ))
+        })?;
         let record_len = 1_usize
             .checked_add(4)
             .and_then(|len| len.checked_add(schema_bytes.len()))
-            .and_then(|len| len.checked_add(8 + 1 + 4))
+            .and_then(|len| len.checked_add(4 + 4 + id.len() + 1 + 4))
             .and_then(|len| len.checked_add(snapshot_bytes.len()))
             .ok_or_else(|| invalid_guest("host certified packet record size overflowed"))?;
         let framed_len = 4_usize
@@ -1961,21 +2025,27 @@ pub(crate) fn certify_dense_fresh_file(
                 .map_err(|_| invalid_guest("host certified packet record exceeds u32"))?
                 .to_le_bytes(),
         );
-        page.push(2);
+        page.push(3);
         page.extend_from_slice(
             &u32::try_from(schema_bytes.len())
                 .map_err(|_| invalid_guest("host certified packet schema exceeds u32"))?
                 .to_le_bytes(),
         );
         page.extend_from_slice(schema_bytes);
-        page.extend_from_slice(&local_ref.to_le_bytes());
+        page.extend_from_slice(&1_u32.to_le_bytes());
+        page.extend_from_slice(
+            &u32::try_from(id.len())
+                .map_err(|_| invalid_guest("generated identity exceeds u32"))?
+                .to_le_bytes(),
+        );
+        page.extend_from_slice(id.as_bytes());
         page.push(0);
         page.extend_from_slice(
             &u32::try_from(snapshot_bytes.len())
                 .map_err(|_| invalid_guest("host certified packet snapshot exceeds u32"))?
                 .to_le_bytes(),
         );
-        page.extend_from_slice(snapshot_bytes);
+        page.extend_from_slice(&snapshot_bytes);
     }
     if !page.is_empty() {
         pages.push(finish_host_certified_packet_page(
@@ -2033,18 +2103,31 @@ fn finish_host_certified_packet_page(
 }
 
 fn validate_certified_snapshot_packets(
-    batch: &WasmCertifiedEntityBatch,
+    batch: &mut WasmCertifiedEntityBatch,
     schemas: &SchemaAllowlist,
 ) -> Result<(), LixError> {
     let mut rows = 0_u64;
     let mut encountered = BTreeSet::new();
-    let mut markdown_ids = BTreeSet::new();
-    let mut markdown_parent_ids = Vec::new();
+    let validate_relationships =
+        batch
+            .schema_keys
+            .iter()
+            .try_fold(false, |found, schema_key| {
+                let plan = schemas.schema_plan(schema_key).ok_or_else(|| {
+                    invalid_guest(format!(
+                        "certified batch schema '{schema_key}' has no validation plan"
+                    ))
+                })?;
+                Ok::<_, LixError>(found || !plan.foreign_keys.is_empty())
+            })?;
+    let mut entity_keys = BTreeSet::new();
+    let mut foreign_keys = Vec::new();
     for page in &batch.pages {
         let mut page = CertifiedPacketReader::new(page);
         while !page.finished() {
             let record_len = page.u32()? as usize;
-            let mut record = CertifiedPacketReader::new(page.bytes(record_len)?);
+            let record_bytes = page.bytes(record_len)?;
+            let mut record = CertifiedPacketReader::new(record_bytes);
             let tag = record.u8()?;
             let schema_key = record.text()?;
             schemas.validate(schema_key)?;
@@ -2070,147 +2153,43 @@ fn validate_certified_snapshot_packets(
                             "certified batch schema '{schema_key}' has no validation plan"
                         ))
                     })?;
-                    if schema_key == "markdown_node_v2" {
-                        if !batch.complete_file_state {
-                            return Err(invalid_guest(
-                                "sparse certified Markdown batches require a durable-base observation",
-                            ));
-                        }
-                        let [id] = components.as_slice() else {
-                            return Err(invalid_guest(
-                                "certified Markdown node key must contain exactly one id",
-                            ));
-                        };
-                        let value: serde_json::Value =
-                            serde_json::from_slice(snapshot).map_err(|error| {
-                                invalid_guest(format!(
-                                    "certified Markdown snapshot is invalid JSON: {error}"
-                                ))
-                            })?;
-                        let object = value.as_object().ok_or_else(|| {
-                            invalid_guest("certified Markdown snapshot must be an object")
-                        })?;
-                        if object.get("id").and_then(serde_json::Value::as_str) != Some(*id) {
-                            return Err(invalid_guest(
-                                "certified Markdown snapshot id does not match its entity key",
-                            ));
-                        }
-                        if object
-                            .get("parent_id")
-                            .is_some_and(|value| !value.is_null() && value.as_str().is_none())
-                        {
-                            return Err(invalid_guest(
-                                "certified Markdown parent_id must be a string or null",
-                            ));
-                        }
-                        if let Err(errors) = plan.compiled_schema.validate(&value) {
-                            let details = errors
-                                .take(3)
-                                .map(|error| error.to_string())
-                                .collect::<Vec<_>>()
-                                .join("; ");
-                            return Err(invalid_guest(format!(
-                                "certified Markdown snapshot failed schema validation: {details}"
-                            )));
-                        }
-                        markdown_ids.insert((*id).to_owned());
-                        markdown_parent_ids.extend(
-                            object
-                                .get("parent_id")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_owned),
-                        );
-                        None
-                    } else {
-                        plan.certify_or_normalize_plugin_row_parts(
-                            snapshot,
-                            schema_key,
-                            &components,
-                        )?
-                        .ok_or_else(|| {
-                            invalid_guest(format!(
-                                "certified batch schema '{schema_key}' has no streaming validator"
-                            ))
-                        })?
-                    }
+                    validate_certified_record(
+                        plan,
+                        schema_key,
+                        &components,
+                        snapshot,
+                        batch.complete_file_state,
+                        validate_relationships,
+                        &mut entity_keys,
+                        &mut foreign_keys,
+                    )?
                 }
                 2 => {
                     let local_ref = record.u64()?;
                     let id = batch.creates.component(local_ref)?;
                     let snapshot = record.inline_blob()?;
-                    let mut value: serde_json::Value =
-                        serde_json::from_slice(snapshot).map_err(|error| {
-                            invalid_guest(format!(
-                                "certified create snapshot is invalid JSON: {error}"
-                            ))
-                        })?;
-                    let object = value.as_object_mut().ok_or_else(|| {
-                        invalid_guest("certified create snapshot must be an object")
-                    })?;
-                    if object
-                        .insert("id".to_owned(), serde_json::Value::String(id.clone()))
-                        .is_some()
-                    {
-                        return Err(invalid_guest(
-                            "certified create snapshot already contains its generated id",
-                        ));
-                    }
-                    let markdown_parent_id = if schema_key == "markdown_node_v2" {
-                        if object
-                            .get("parent_id")
-                            .is_some_and(|value| !value.is_null() && value.as_str().is_none())
-                        {
-                            return Err(invalid_guest(
-                                "certified Markdown parent_id must be a string or null",
-                            ));
-                        }
-                        object
-                            .get("parent_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    } else {
-                        None
-                    };
-                    let snapshot = serde_json::to_vec(&value).map_err(|error| {
-                        invalid_guest(format!(
-                            "certified create snapshot normalization failed: {error}"
-                        ))
-                    })?;
                     let plan = schemas.schema_plan(schema_key).ok_or_else(|| {
                         invalid_guest(format!(
                             "certified batch schema '{schema_key}' has no validation plan"
                         ))
                     })?;
-                    if schema_key == "markdown_node_v2" {
-                        if !batch.complete_file_state {
-                            return Err(invalid_guest(
-                                "sparse certified Markdown batches require a durable-base observation",
-                            ));
-                        }
-                        if let Err(errors) = plan.compiled_schema.validate(&value) {
-                            let details = errors
-                                .take(3)
-                                .map(|error| error.to_string())
-                                .collect::<Vec<_>>()
-                                .join("; ");
-                            return Err(invalid_guest(format!(
-                                "certified Markdown snapshot failed schema validation: {details}"
-                            )));
-                        }
-                        markdown_ids.insert(id);
-                        markdown_parent_ids.extend(markdown_parent_id);
-                        None
-                    } else {
-                        let key =
-                            crate::wasm::WasmEntityKey::from_owned_parts(schema_key, vec![id]);
-                        plan.certify_or_normalize_plugin_row(&snapshot, &key)?
-                            .ok_or_else(|| {
-                                invalid_guest(format!(
-                                    "certified batch schema '{schema_key}' has no streaming validator"
-                                ))
-                            })?
-                            .normalized
-                    }
+                    let [_primary_key_path] = plan.primary_key.as_deref().unwrap_or_default()
+                    else {
+                        return Err(invalid_guest(
+                            "certified creates require exactly one generated primary-key field",
+                        ));
+                    };
+                    let normalized = validate_certified_record(
+                        plan,
+                        schema_key,
+                        &[id.as_str()],
+                        snapshot,
+                        batch.complete_file_state,
+                        validate_relationships,
+                        &mut entity_keys,
+                        &mut foreign_keys,
+                    )?;
+                    normalized
                 }
                 _ => {
                     return Err(invalid_guest(
@@ -2245,15 +2224,118 @@ fn validate_certified_snapshot_packets(
             "certified batch schema header does not match its records",
         ));
     }
-    if let Some(parent_id) = markdown_parent_ids
-        .iter()
-        .find(|parent_id| !markdown_ids.contains(parent_id.as_str()))
+    if let Some((schema_key, components)) =
+        foreign_keys.iter().find(|key| !entity_keys.contains(*key))
     {
         return Err(invalid_guest(format!(
-            "certified Markdown parent_id '{parent_id}' is absent from the complete batch"
+            "certified foreign key '{}:{components:?}' is absent from the complete batch",
+            schema_key
         )));
     }
     Ok(())
+}
+
+type CertifiedEntityKey = (String, Vec<String>);
+
+fn validate_certified_record(
+    plan: &SchemaPlan,
+    schema_key: &str,
+    components: &[&str],
+    snapshot: &[u8],
+    complete_file_state: bool,
+    validate_relationships: bool,
+    entity_keys: &mut BTreeSet<CertifiedEntityKey>,
+    foreign_keys: &mut Vec<CertifiedEntityKey>,
+) -> Result<Option<Vec<u8>>, LixError> {
+    if let Some(normalized) =
+        plan.certify_or_normalize_plugin_row_parts(snapshot, schema_key, components)?
+    {
+        if validate_relationships {
+            entity_keys.insert((
+                schema_key.to_owned(),
+                components.iter().map(|value| (*value).to_owned()).collect(),
+            ));
+        }
+        return Ok(normalized);
+    }
+    if !complete_file_state && !plan.foreign_keys.is_empty() {
+        return Err(invalid_guest(
+            "a certified batch with foreign keys must contain complete file state",
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(snapshot)
+        .map_err(|error| invalid_guest(format!("certified snapshot is invalid JSON: {error}")))?;
+    if let Err(errors) = plan.compiled_schema.validate(&value) {
+        let details = errors
+            .take(3)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(invalid_guest(format!(
+            "certified snapshot failed schema validation: {details}"
+        )));
+    }
+    let primary_key = plan
+        .primary_key
+        .as_deref()
+        .ok_or_else(|| invalid_guest("certified snapshot schema has no primary-key definition"))?;
+    let emitted = json_pointer_components(&value, primary_key)?;
+    if emitted
+        .iter()
+        .map(String::as_str)
+        .ne(components.iter().copied())
+    {
+        return Err(invalid_guest(
+            "certified snapshot primary key does not match its entity key",
+        ));
+    }
+    if validate_relationships {
+        entity_keys.insert((schema_key.to_owned(), emitted));
+        for foreign_key in &plan.foreign_keys {
+            let values = json_pointer_components_optional(&value, &foreign_key.local_properties)?;
+            if let Some(values) = values {
+                foreign_keys.push((foreign_key.referenced_schema.schema_key.clone(), values));
+            }
+        }
+    }
+    let canonical = canonicalize_snapshot(snapshot)?;
+    Ok((canonical.as_slice() != snapshot).then_some(canonical))
+}
+
+fn json_pointer_components(
+    value: &serde_json::Value,
+    paths: &[Vec<String>],
+) -> Result<Vec<String>, LixError> {
+    json_pointer_components_optional(value, paths)?
+        .ok_or_else(|| invalid_guest("certified primary-key component cannot be null"))
+}
+
+fn json_pointer_components_optional(
+    value: &serde_json::Value,
+    paths: &[Vec<String>],
+) -> Result<Option<Vec<String>>, LixError> {
+    let mut components = Vec::with_capacity(paths.len());
+    for path in paths {
+        let mut current = value;
+        for segment in path {
+            current = current.get(segment).ok_or_else(|| {
+                invalid_guest(format!(
+                    "certified snapshot is missing pointer '/{}'",
+                    path.join("/")
+                ))
+            })?;
+        }
+        match current {
+            serde_json::Value::Null => return Ok(None),
+            serde_json::Value::String(value) => components.push(value.clone()),
+            _ => {
+                return Err(invalid_guest(
+                    "certified key components must be strings or null",
+                ));
+            }
+        }
+    }
+    Ok(Some(components))
 }
 
 struct CertifiedPacketReader<'a> {
@@ -2328,11 +2410,12 @@ impl<'a> CertifiedPacketReader<'a> {
 pub(crate) async fn drain_file_transition_changes(
     actor: &mut dyn WasmComponentActor,
     transition: WasmFileTransition,
+    creates: crate::wasm::WasmCreateContext,
     schemas: &SchemaAllowlist,
     limits: WasmTransitionLimits,
 ) -> Result<ValidatedFileTransition, LixError> {
     let transition_handle = transition.transition;
-    match drain_file_transition_changes_inner(actor, transition, schemas, limits).await {
+    match drain_file_transition_changes_inner(actor, transition, creates, schemas, limits).await {
         Ok(validated) => Ok(validated),
         Err(error) => Err(cleanup_rejected_transition(actor, transition_handle, error).await),
     }
@@ -2341,6 +2424,7 @@ pub(crate) async fn drain_file_transition_changes(
 async fn drain_file_transition_changes_inner(
     actor: &mut dyn WasmComponentActor,
     transition: WasmFileTransition,
+    creates: crate::wasm::WasmCreateContext,
     schemas: &SchemaAllowlist,
     limits: WasmTransitionLimits,
 ) -> Result<ValidatedFileTransition, LixError> {
@@ -2401,7 +2485,7 @@ async fn drain_file_transition_changes_inner(
                     WasmEntityChange::Create {
                         schema_key,
                         local_ref,
-                        resolved_key,
+                        mut resolved_key,
                         snapshot_content,
                     } => {
                         let snapshot = resolve_guest_bytes(
@@ -2415,7 +2499,38 @@ async fn drain_file_transition_changes_inner(
                         .await?;
                         let snapshot_row = match &resolved_key {
                             Some(key) => snapshots.push_plugin(snapshot, key, schemas)?,
-                            None => snapshots.push(&snapshot)?,
+                            None => {
+                                let plan = schemas.schema_plan(&schema_key).ok_or_else(|| {
+                                    invalid_guest(format!(
+                                        "created schema '{schema_key}' has no validation plan"
+                                    ))
+                                })?;
+                                let [primary_key_path] =
+                                    plan.primary_key.as_deref().unwrap_or_default()
+                                else {
+                                    return Err(invalid_guest(
+                                        "created entities require exactly one generated primary-key field",
+                                    ));
+                                };
+                                let id = creates.component(local_ref)?;
+                                lix_plugin_layout::validate_generated_id(
+                                    &snapshot,
+                                    primary_key_path,
+                                    &id,
+                                )
+                                .map_err(|error| {
+                                    invalid_guest(format!(
+                                        "created entity identity is invalid: {error}"
+                                    ))
+                                })?;
+                                let key = WasmEntityKey::from_owned_parts(
+                                    schema_key.clone(),
+                                    vec![id],
+                                );
+                                let row = snapshots.push_plugin(snapshot, &key, schemas)?;
+                                resolved_key = Some(key);
+                                row
+                            }
                         };
                         debug_assert_eq!(snapshot_row, page_snapshot_ordinal);
                         page_snapshot_ordinal += 1;
@@ -2497,8 +2612,8 @@ async fn drain_file_transition_changes_inner(
             error.message
         ))
     })?;
-    let certified_batches = actor.take_certified_entity_batches(transition.transition);
-    validate_certified_entity_batches(&certified_batches, schemas)?;
+    let mut certified_batches = actor.take_certified_entity_batches(transition.transition);
+    validate_certified_entity_batches(&mut certified_batches, schemas)?;
     let runtime_counters = actor
         .finish_transition(transition.transition)
         .instrument(tracing::debug_span!(
@@ -3321,12 +3436,43 @@ fn merge_counter_snapshots(
     WasmTransitionCounters {
         source_read_calls: local.source_read_calls.max(runtime.source_read_calls),
         source_bytes_read: local.source_bytes_read.max(runtime.source_bytes_read),
+        file_read_calls: local.file_read_calls.max(runtime.file_read_calls),
+        file_bytes_read: local.file_bytes_read.max(runtime.file_bytes_read),
+        state_read_calls: local.state_read_calls.max(runtime.state_read_calls),
+        state_key_bytes: local.state_key_bytes.max(runtime.state_key_bytes),
+        state_value_bytes_read: local
+            .state_value_bytes_read
+            .max(runtime.state_value_bytes_read),
         packet_pages: local.packet_pages.max(runtime.packet_pages),
         packet_records: local.packet_records.max(runtime.packet_records),
+        entity_input_pages: local.entity_input_pages.max(runtime.entity_input_pages),
+        entity_input_records: local.entity_input_records.max(runtime.entity_input_records),
+        entity_input_wire_bytes: local
+            .entity_input_wire_bytes
+            .max(runtime.entity_input_wire_bytes),
+        entity_output_pages: local.entity_output_pages.max(runtime.entity_output_pages),
+        entity_output_records: local
+            .entity_output_records
+            .max(runtime.entity_output_records),
+        entity_output_wire_bytes: local
+            .entity_output_wire_bytes
+            .max(runtime.entity_output_wire_bytes),
         attachment_reads: local.attachment_reads.max(runtime.attachment_reads),
         attachment_bytes_read: local
             .attachment_bytes_read
             .max(runtime.attachment_bytes_read),
+        entity_input_attachment_reads: local
+            .entity_input_attachment_reads
+            .max(runtime.entity_input_attachment_reads),
+        entity_input_attachment_bytes: local
+            .entity_input_attachment_bytes
+            .max(runtime.entity_input_attachment_bytes),
+        entity_output_attachment_writes: local
+            .entity_output_attachment_writes
+            .max(runtime.entity_output_attachment_writes),
+        entity_output_attachment_bytes: local
+            .entity_output_attachment_bytes
+            .max(runtime.entity_output_attachment_bytes),
         component_import_calls: local
             .component_import_calls
             .max(runtime.component_import_calls),
@@ -3401,16 +3547,23 @@ mod tests {
 
     use super::*;
     use crate::wasm::{
-        WasmChangeCursorHandle, WasmChangeEffect, WasmEditCursorHandle, WasmOpenEntitiesInput,
-        WasmOpenFileInput, WasmOutputSplice,
+        WasmChangeCursorHandle, WasmChangeEffect, WasmCreateContext, WasmEditCursorHandle,
+        WasmOpenEntitiesInput, WasmOpenFileInput, WasmOutputSplice,
     };
 
     const UUID_A: &str = "019a0000-0000-7000-8000-000000000001";
     const UUID_B: &str = "019a0000-0000-7000-8000-000000000002";
     const UUID_C: &str = "019a0000-0000-7000-8000-000000000003";
 
-    fn key(id: &str) -> crate::wasm::WasmEntityKey {
-        crate::wasm::WasmEntityKey::from_owned_parts("csv_row", vec![id.to_owned()])
+    fn test_creates() -> WasmCreateContext {
+        WasmCreateContext {
+            high: 0x019a_0000_0000_7000,
+            low: 0x8000_0000,
+        }
+    }
+
+    fn key(id: &str) -> WasmEntityKey {
+        WasmEntityKey::from_owned_parts("csv_row", vec![id.to_owned()])
     }
 
     fn host_entity(id: &str) -> WasmHostEntity {
@@ -3655,7 +3808,7 @@ mod tests {
     }
 
     #[test]
-    fn git_text_splice_proof_checks_only_gits_bounded_nul_window() {
+    fn prefix_exclusion_splice_proof_checks_only_its_bounded_window() {
         let before = vec![b'a'; 16_000];
         let after: Blob = before.clone().into();
         let valid = RequestBlobSpliceProvenance::new_validated_for_test(
@@ -3665,7 +3818,9 @@ mod tests {
             0,
             Vec::new(),
         );
-        assert!(transport_splice_preserves_git_text(&after, &valid));
+        assert!(transport_splice_preserves_prefix_exclusion(
+            &after, &valid, 0, 8_000
+        ));
 
         let mut nul_in_window = after.to_vec();
         nul_in_window[7_999] = 0;
@@ -3677,9 +3832,11 @@ mod tests {
             8_000,
             vec![0],
         );
-        assert!(!transport_splice_preserves_git_text(
+        assert!(!transport_splice_preserves_prefix_exclusion(
             &nul_in_window,
-            &nul_provenance
+            &nul_provenance,
+            0,
+            8_000,
         ));
     }
 
@@ -3777,18 +3934,17 @@ mod tests {
 
     #[test]
     fn certified_plugin_rows_retain_source_buffers_without_an_arena() {
-        let schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv/schema/csv_v2_row.json"
-        ))
-        .expect("CSV row schema");
+        let schema =
+            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
+                .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
                 crate::domain::Domain::schema_catalog("main", false),
-                crate::schema::SchemaKey::new("csv_v2_row"),
+                crate::schema::SchemaKey::new("csv_row"),
                 schema,
             )])
             .expect("CSV row catalog");
-        let schemas = SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
+        let schemas = SchemaAllowlist::from_catalog(&["csv_row".to_owned()], Arc::new(catalog))
             .expect("CSV allowlist");
 
         let first = Bytes::from(
@@ -3808,20 +3964,14 @@ mod tests {
         batch
             .push_plugin(
                 first,
-                &crate::wasm::WasmEntityKey::from_owned_parts(
-                    "csv_v2_row",
-                    vec![UUID_A.to_owned()],
-                ),
+                &WasmEntityKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]),
                 &schemas,
             )
             .expect("first canonical row");
         batch
             .push_plugin(
                 second,
-                &crate::wasm::WasmEntityKey::from_owned_parts(
-                    "csv_v2_row",
-                    vec![UUID_B.to_owned()],
-                ),
+                &WasmEntityKey::from_owned_parts("csv_row", vec![UUID_B.to_owned()]),
                 &schemas,
             )
             .expect("second canonical row");
@@ -3866,18 +4016,17 @@ mod tests {
 
     #[test]
     fn canonical_plugin_rows_skip_dom_and_share_the_normalized_arena() {
-        let schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv/schema/csv_v2_row.json"
-        ))
-        .expect("CSV row schema");
+        let schema =
+            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
+                .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
                 crate::domain::Domain::schema_catalog("main", false),
-                crate::schema::SchemaKey::new("csv_v2_row"),
+                crate::schema::SchemaKey::new("csv_row"),
                 schema,
             )])
             .expect("CSV row catalog");
-        let schemas = SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
+        let schemas = SchemaAllowlist::from_catalog(&["csv_row".to_owned()], Arc::new(catalog))
             .expect("CSV allowlist");
         let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(2);
         batch
@@ -3885,8 +4034,8 @@ mod tests {
                 Bytes::from_static(
                     br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
                 ),
-                &crate::wasm::WasmEntityKey::from_owned_parts(
-                    "csv_v2_row",
+                &WasmEntityKey::from_owned_parts(
+                    "csv_row",
                     vec![UUID_A.to_owned()],
                 ),
                 &schemas,
@@ -3897,8 +4046,8 @@ mod tests {
                 Bytes::from_static(
                     br#"{"id":"019a0000-0000-7000-8000-000000000002","order_key":"03","cells":["b"]}"#,
                 ),
-                &crate::wasm::WasmEntityKey::from_owned_parts(
-                    "csv_v2_row",
+                &WasmEntityKey::from_owned_parts(
+                    "csv_row",
                     vec![UUID_B.to_owned()],
                 ),
                 &schemas,
@@ -3924,18 +4073,17 @@ mod tests {
 
     #[test]
     fn plugin_row_parser_counts_one_pass_for_canonical_compatibility_and_invalid_rows() {
-        let schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv/schema/csv_v2_row.json"
-        ))
-        .expect("CSV row schema");
+        let schema =
+            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
+                .expect("CSV row schema");
         let catalog =
             CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
                 crate::domain::Domain::schema_catalog("main", false),
-                crate::schema::SchemaKey::new("csv_v2_row"),
+                crate::schema::SchemaKey::new("csv_row"),
                 schema,
             )])
             .expect("CSV row catalog");
-        let schemas = SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
+        let schemas = SchemaAllowlist::from_catalog(&["csv_row".to_owned()], Arc::new(catalog))
             .expect("CSV allowlist");
 
         let mut canonical = CanonicalJsonBatchBuilder::with_row_capacity(1);
@@ -3944,8 +4092,8 @@ mod tests {
                 Bytes::from_static(
                     br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
                 ),
-                &crate::wasm::WasmEntityKey::from_owned_parts(
-                    "csv_v2_row",
+                &WasmEntityKey::from_owned_parts(
+                    "csv_row",
                     vec![UUID_A.to_owned()],
                 ),
                 &schemas,
@@ -3961,8 +4109,8 @@ mod tests {
                 Bytes::from_static(
                     br#" { "id":"019a0000-0000-7000-8000-000000000002", "order_key":"03", "cells":["b"] } "#,
                 ),
-                &crate::wasm::WasmEntityKey::from_owned_parts(
-                    "csv_v2_row",
+                &WasmEntityKey::from_owned_parts(
+                    "csv_row",
                     vec![UUID_B.to_owned()],
                 ),
                 &schemas,
@@ -3983,8 +4131,8 @@ mod tests {
                 Bytes::from_static(
                     br#"{"cells":[1],"id":"019a0000-0000-7000-8000-000000000003","order_key":"05"}"#,
                 ),
-                &crate::wasm::WasmEntityKey::from_owned_parts(
-                    "csv_v2_row",
+                &WasmEntityKey::from_owned_parts(
+                    "csv_row",
                     vec![UUID_C.to_owned()],
                 ),
                 &schemas,
@@ -3998,29 +4146,28 @@ mod tests {
 
     #[test]
     fn streaming_plugin_parser_matches_dom_canonicalization_for_compatibility_corpus() {
-        let row_schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv/schema/csv_v2_row.json"
-        ))
-        .expect("CSV row schema");
+        let row_schema =
+            serde_json::from_str(include_str!("../../../../plugins/csv/schema/csv_row.json"))
+                .expect("CSV row schema");
         let table_schema = serde_json::from_str(include_str!(
-            "../../../../plugins/csv/schema/csv_v2_table.json"
+            "../../../../plugins/csv/schema/csv_table.json"
         ))
         .expect("CSV table schema");
         let catalog = CatalogSnapshot::from_schema_facts(&[
             crate::catalog::SchemaCatalogFact::new(
                 crate::domain::Domain::schema_catalog("main", false),
-                crate::schema::SchemaKey::new("csv_v2_row"),
+                crate::schema::SchemaKey::new("csv_row"),
                 row_schema,
             ),
             crate::catalog::SchemaCatalogFact::new(
                 crate::domain::Domain::schema_catalog("main", false),
-                crate::schema::SchemaKey::new("csv_v2_table"),
+                crate::schema::SchemaKey::new("csv_table"),
                 table_schema,
             ),
         ])
         .expect("CSV catalog");
         let schemas = SchemaAllowlist::from_catalog(
-            &["csv_v2_row".to_owned(), "csv_v2_table".to_owned()],
+            &["csv_row".to_owned(), "csv_table".to_owned()],
             Arc::new(catalog),
         )
         .expect("CSV allowlist");
@@ -4028,24 +4175,24 @@ mod tests {
         let valid = [
             (
                 br#" { "id":"019a0000-0000-7000-8000-000000000001", "order_key":"01", "cells":[ "a", "b" ] } "#.as_slice(),
-                crate::wasm::WasmEntityKey::from_owned_parts(
-                    "csv_v2_row",
+                WasmEntityKey::from_owned_parts(
+                    "csv_row",
                     vec![UUID_A.to_owned()],
                 ),
             ),
             (
                 br#"{"cells":["\uD83D\uDE00","line\u000Abreak"],"\u0069d":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
                     .as_slice(),
-                crate::wasm::WasmEntityKey::from_owned_parts(
-                    "csv_v2_row",
+                WasmEntityKey::from_owned_parts(
+                    "csv_row",
                     vec![UUID_A.to_owned()],
                 ),
             ),
             (
                 br#" { "id":"root", "dialect": { "terminator":"\u000A", "quote":"\u0022", "\u0064elimiter":"," } } "#
                     .as_slice(),
-                crate::wasm::WasmEntityKey::from_owned_parts(
-                    "csv_v2_table",
+                WasmEntityKey::from_owned_parts(
+                    "csv_table",
                     vec!["root".to_owned()],
                 ),
             ),
@@ -4067,7 +4214,7 @@ mod tests {
                     .expect("streaming row certificate")
                     .entity_pk()
                     .clone(),
-                if key.schema_key == "csv_v2_row" {
+                if key.schema_key == "csv_row" {
                     EntityPk::uuid_from_canonical(&key.entity_pk[0]).expect("canonical UUID")
                 } else {
                     EntityPk::single(key.entity_pk[0].as_str())
@@ -4087,8 +4234,8 @@ mod tests {
             let streaming_error = batch
                 .push_plugin(
                     Bytes::copy_from_slice(input),
-                    &crate::wasm::WasmEntityKey::from_owned_parts(
-                        "csv_v2_row",
+                    &WasmEntityKey::from_owned_parts(
+                        "csv_row",
                         vec![UUID_A.to_owned()],
                     ),
                     &schemas,
@@ -4635,6 +4782,7 @@ mod tests {
         let drained = drain_file_transition_changes(
             &mut actor,
             transition,
+            test_creates(),
             &schemas,
             WasmTransitionLimits::default(),
         )
@@ -4697,6 +4845,7 @@ mod tests {
         let drained = drain_file_transition_changes(
             &mut actor,
             transition,
+            test_creates(),
             &schemas,
             WasmTransitionLimits::default(),
         )
@@ -4766,6 +4915,7 @@ mod tests {
         let drained = drain_file_transition_changes(
             &mut actor,
             transition,
+            test_creates(),
             &schemas,
             WasmTransitionLimits::default(),
         )
@@ -4841,6 +4991,7 @@ mod tests {
         let error = drain_file_transition_changes(
             &mut actor,
             transition,
+            test_creates(),
             &SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
             WasmTransitionLimits::default(),
         )
@@ -4864,10 +5015,7 @@ mod tests {
             changes: WasmEntityChanges {
                 changes: vec![WasmEntityChange::Upsert {
                     entity: WasmEntity {
-                        key: crate::wasm::WasmEntityKey::from_owned_parts(
-                            "not_allowed",
-                            vec!["row".to_owned()],
-                        ),
+                        key: WasmEntityKey::from_owned_parts("not_allowed", vec!["row".to_owned()]),
                         snapshot_content: WasmGuestBytes::Output(WasmOutputRange {
                             index: 0,
                             offset: 0,
@@ -4891,6 +5039,7 @@ mod tests {
                 document: WasmDocumentHandle(2),
                 changes: WasmChangeCursorHandle(3),
             },
+            test_creates(),
             &SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
             WasmTransitionLimits::default(),
         )
@@ -4916,6 +5065,7 @@ mod tests {
                 document: WasmDocumentHandle(5),
                 changes: WasmChangeCursorHandle(6),
             },
+            test_creates(),
             &SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
             WasmTransitionLimits::default(),
         )
@@ -4933,12 +5083,10 @@ mod tests {
             change_pages: [WasmChangePage {
                 format_version: PACKET_FORMAT_V1,
                 changes: WasmEntityChanges {
-                    changes: vec![WasmEntityChange::Delete(
-                        crate::wasm::WasmEntityKey::from_owned_parts(
-                            "not_allowed",
-                            vec!["row".to_owned()],
-                        ),
-                    )],
+                    changes: vec![WasmEntityChange::Delete(WasmEntityKey::from_owned_parts(
+                        "not_allowed",
+                        vec!["row".to_owned()],
+                    ))],
                 },
                 outputs: None,
             }]
@@ -4953,6 +5101,7 @@ mod tests {
                 document: WasmDocumentHandle(2),
                 changes: WasmChangeCursorHandle(3),
             },
+            test_creates(),
             &SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
             WasmTransitionLimits::default(),
         )

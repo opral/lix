@@ -7,89 +7,67 @@ mod model;
 mod schemas;
 
 use core::{
-    ArenaMarkdownBlock, ChangeEffect, Document, EntityChange, EntityRecord, IdNamespace,
-    InputSplice, NODE_SCHEMA_KEY, PluginError,
+    ArenaMarkdownBlock, ChangeEffect, Document, EntityChange, EntityRecord, FileEdit, IdNamespace,
+    NODE_SCHEMA_KEY, PluginError,
 };
 use lix_plugin_api as sdk;
 use serde_json::Value;
 
 struct MarkdownPlugin;
 
-const ROOT_STATE: &[u8] = b"markdown/root-v1";
-const BLOCKS_STATE: &[u8] = b"markdown/blocks-v1";
-const BLOCK_SHIFTS_STATE: &[u8] = b"markdown/block-shifts-v1";
+const ROOT_STATE: &[u8] = b"markdown/root";
+const BLOCKS_STATE: &[u8] = b"markdown/blocks";
+const BLOCK_SHIFTS_STATE: &[u8] = b"markdown/block-shifts";
 const LEXICAL_FALLBACK_FIELD: &str = "lexical_fallback_base64";
 const BLOCK_INDEX_MAGIC: &[u8; 4] = b"MDB2";
 const BLOCK_INDEX_HEADER_BYTES: u32 = 16;
 const BLOCK_INDEX_ENTRY_BYTES: u32 = 28;
 const BLOCK_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_BLOCK_SHIFT_RECORDS: usize = 4096;
-const PACKET_PAGE_INITIAL_CAPACITY: usize = 64 * 1024;
 
-impl sdk::FormatPlugin for MarkdownPlugin {
+impl sdk::Plugin for MarkdownPlugin {
     fn cold_file_changed(
-        update: &mut sdk::ColdFileUpdate<'_>,
-        sink: &mut sdk::Sink<'_>,
+        update: &mut sdk::ColdUpdate<'_>,
+        sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
-        let accepted = update
-            .before
-            .as_ref()
-            .map(sdk::Root::read_all)
-            .transpose()?;
-        let submitted = update.after.as_ref().map(sdk::Root::read_all).transpose()?;
-        if accepted.is_some() == submitted.is_some() {
-            return Err(sdk::Error::invalid_input(
-                "Markdown cold successor requires exactly one byte source",
-            ));
-        }
+        let accepted = update.before.read_all()?;
         let mut records = Vec::new();
         while let Some(entity) = update.entities.next()? {
             records.push(EntityRecord {
                 schema_key: entity.schema_key,
                 entity_pk: entity.entity_pk,
-                snapshot: entity.snapshot.ok_or_else(|| {
-                    sdk::Error::invalid_input("Markdown cold successor received a tombstone")
-                })?,
+                snapshot: entity.snapshot,
             });
         }
-        let (document, _) = Document::open_entities(records, accepted).map_err(core_error)?;
-        let namespace = IdNamespace::from_halves(update.creates.high, update.creates.low);
-        let inserts;
-        let splices = if let Some(submitted) = submitted.as_ref() {
-            vec![InputSplice {
-                offset: 0,
-                delete_len: document.bytes().len() as u64,
-                insert: submitted,
-            }]
-        } else {
-            inserts = update
-                .edits
-                .iter()
-                .map(|edit| edit.insert.clone())
-                .collect::<Vec<_>>();
-            update
-                .edits
-                .iter()
-                .zip(&inserts)
-                .map(|(edit, insert)| InputSplice {
-                    offset: edit.offset,
-                    delete_len: edit.delete_len,
-                    insert,
-                })
-                .collect::<Vec<_>>()
-        };
+        let (document, _) = Document::open_entities(records, Some(accepted)).map_err(core_error)?;
+        let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
+        let inserts = update
+            .edits
+            .iter()
+            .map(|edit| edit.insert.clone())
+            .collect::<Vec<_>>();
+        let splices = update
+            .edits
+            .iter()
+            .zip(&inserts)
+            .map(|(edit, insert)| FileEdit {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert,
+            })
+            .collect::<Vec<_>>();
         let (document, mut changes) = document
             .file_changed(&splices, namespace)
             .map_err(core_error)?;
         strip_duplicated_lexical_fallback(&mut changes)?;
-        store_markdown_state(&update.successor, &document)?;
+        store_markdown_state(sink, &document)?;
         emit_changes(changes, update.creates, Some(0), sink)?;
         Ok(())
     }
 
     fn entities_changed(
         update: &mut sdk::EntityUpdate<'_>,
-        sink: &mut sdk::Sink<'_>,
+        sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
@@ -111,24 +89,22 @@ impl sdk::FormatPlugin for MarkdownPlugin {
         Ok(())
     }
 
-    fn hydrate(input: &mut sdk::HydrateFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+    fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
         let mut records = Vec::new();
         while let Some(entity) = input.entities.next()? {
             records.push(EntityRecord {
                 schema_key: entity.schema_key,
                 entity_pk: entity.entity_pk,
-                snapshot: entity.snapshot.ok_or_else(|| {
-                    sdk::Error::invalid_input("Markdown hydration received a tombstone")
-                })?,
+                snapshot: entity.snapshot,
             });
         }
         let accepted = input
             .accepted
             .as_ref()
-            .map(sdk::Root::read_all)
+            .map(sdk::Snapshot::read_all)
             .transpose()?;
         let (document, _) = Document::open_entities(records, accepted).map_err(core_error)?;
-        store_markdown_state(&input.successor, &document)?;
+        store_markdown_state(sink, &document)?;
         if input.accepted.is_none() {
             sink.replace_file(&document.bytes())?;
         }
@@ -162,20 +138,19 @@ impl sdk::FormatPlugin for MarkdownPlugin {
         })
     }
 
-    fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+    fn open(input: &sdk::OpenFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
         let bytes = input.accepted.read_all()?;
-        let namespace = IdNamespace::from_halves(input.creates.high, input.creates.low);
+        let namespace = IdNamespace::from_namespace_bytes(input.creates.namespace_bytes());
         let (document, mut changes) =
-            Document::open_file(bytes, input.file.path.as_deref(), namespace)
-                .map_err(core_error)?;
+            Document::open_file(bytes, Some(input.path.as_str()), namespace).map_err(core_error)?;
         strip_duplicated_lexical_fallback(&mut changes)?;
-        store_markdown_state(&input.successor, &document)?;
+        store_markdown_state(sink, &document)?;
         emit_changes(changes, input.creates, None, sink)?;
         Ok(())
     }
 
-    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
-        let namespace = IdNamespace::from_halves(update.creates.high, update.creates.low);
+    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
+        let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
         let inserts = update
             .edits
             .iter()
@@ -185,20 +160,20 @@ impl sdk::FormatPlugin for MarkdownPlugin {
             .edits
             .iter()
             .zip(&inserts)
-            .map(|(edit, insert)| InputSplice {
+            .map(|(edit, insert)| FileEdit {
                 offset: edit.offset,
                 delete_len: edit.delete_len,
                 insert,
             })
             .collect::<Vec<_>>();
-        if update.before_file.path == update.after_file.path
+        if update.before_path == update.after_path
             && let [edit] = update.edits.as_slice()
             && let Some((changes, root, block_key, block, shifts)) =
                 sparse_block_change(update, edit, &inserts[0], namespace)?
         {
-            update.successor.put_state(ROOT_STATE, &root)?;
-            update.successor.put_state(&block_key, &block)?;
-            update.successor.put_state(BLOCK_SHIFTS_STATE, &shifts)?;
+            sink.put_state(ROOT_STATE, &root)?;
+            sink.put_state(&block_key, &block)?;
+            sink.put_state(BLOCK_SHIFTS_STATE, &shifts)?;
             emit_changes(changes, update.creates, Some(0), sink)?;
             return Ok(());
         }
@@ -209,44 +184,36 @@ impl sdk::FormatPlugin for MarkdownPlugin {
             .map_err(core_error)?;
         strip_duplicated_lexical_fallback(&mut changes)?;
         let (root, blocks) = document.arena_state().map_err(core_error)?;
-        update.successor.put_state(ROOT_STATE, &root)?;
+        sink.put_state(ROOT_STATE, &root)?;
         let (old_index_pages, old_block_pages) = block_page_counts(&update.before)?;
         let encoded = encode_blocks(&blocks)?;
-        update
-            .successor
-            .put_state(BLOCKS_STATE, &encoded.manifest)?;
+        sink.put_state(BLOCKS_STATE, &encoded.manifest)?;
         for (ordinal, page) in encoded.index_pages.iter().enumerate() {
-            update
-                .successor
-                .put_state(&block_index_page_key(ordinal as u32), page)?;
+            sink.put_state(&block_index_page_key(ordinal as u32), page)?;
         }
         for ordinal in encoded.index_pages.len() as u32..old_index_pages {
-            update
-                .successor
-                .delete_state(&block_index_page_key(ordinal))?;
+            sink.delete_state(&block_index_page_key(ordinal))?;
         }
         for (ordinal, page) in encoded.block_pages.iter().enumerate() {
-            update
-                .successor
-                .put_state(&block_page_key(ordinal as u32), page)?;
+            sink.put_state(&block_page_key(ordinal as u32), page)?;
         }
         for ordinal in encoded.block_pages.len() as u32..old_block_pages {
-            update.successor.delete_state(&block_page_key(ordinal))?;
+            sink.delete_state(&block_page_key(ordinal))?;
         }
         if let Some(shifts) = update.before.get_state(BLOCK_SHIFTS_STATE)? {
             for (ordinal, _) in decode_block_shifts(&shifts)? {
-                update.successor.delete_state(&block_overlay_key(ordinal))?;
+                sink.delete_state(&block_overlay_key(ordinal))?;
             }
         }
-        update.successor.delete_state(BLOCK_SHIFTS_STATE)?;
+        sink.delete_state(BLOCK_SHIFTS_STATE)?;
         emit_changes(changes, update.creates, Some(0), sink)?;
         Ok(())
     }
 }
 
 fn store_rendered_markdown_state(
-    before: &sdk::Root<'_>,
-    sink: &mut sdk::Sink<'_>,
+    before: &sdk::Snapshot<'_>,
+    sink: &mut sdk::Output<'_>,
     document: &Document,
 ) -> sdk::Result<()> {
     let (root, blocks) = document.arena_state().map_err(core_error)?;
@@ -294,7 +261,7 @@ fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<
     Ok(bytes)
 }
 
-fn store_markdown_state(successor: &sdk::Transaction, document: &Document) -> sdk::Result<()> {
+fn store_markdown_state(successor: &sdk::Output, document: &Document) -> sdk::Result<()> {
     let (root, blocks) = document.arena_state().map_err(core_error)?;
     successor.put_state(ROOT_STATE, &root)?;
     let encoded = encode_blocks(&blocks)?;
@@ -312,7 +279,7 @@ type SparseBlockResult = (Vec<EntityChange>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)
 
 fn sparse_block_change(
     update: &sdk::FileUpdate<'_>,
-    edit: &sdk::InputSplice,
+    edit: &sdk::FileEdit,
     insert: &[u8],
     namespace: IdNamespace,
 ) -> sdk::Result<Option<SparseBlockResult>> {
@@ -384,7 +351,7 @@ fn sparse_block_change(
         &block,
         0,
         block_len,
-        InputSplice {
+        FileEdit {
             offset: edit.offset - start,
             delete_len: edit.delete_len,
             insert,
@@ -512,7 +479,7 @@ struct BlockEntry {
     blob_len: u32,
 }
 
-fn read_block_entry(root: &sdk::Root<'_>, ordinal: u32) -> sdk::Result<BlockEntry> {
+fn read_block_entry(root: &sdk::Snapshot<'_>, ordinal: u32) -> sdk::Result<BlockEntry> {
     let entries_per_page = (BLOCK_PAGE_BYTES / BLOCK_INDEX_ENTRY_BYTES as usize) as u32;
     let page = ordinal / entries_per_page;
     let offset = u64::from(ordinal % entries_per_page) * u64::from(BLOCK_INDEX_ENTRY_BYTES);
@@ -528,7 +495,7 @@ fn read_block_entry(root: &sdk::Root<'_>, ordinal: u32) -> sdk::Result<BlockEntr
     })
 }
 
-fn read_block_blob(root: &sdk::Root<'_>, entry: BlockEntry) -> sdk::Result<Vec<u8>> {
+fn read_block_blob(root: &sdk::Snapshot<'_>, entry: BlockEntry) -> sdk::Result<Vec<u8>> {
     let mut page = entry.page;
     let mut offset = usize::try_from(entry.blob_offset)
         .map_err(|_| sdk::Error::invalid_input("Markdown block offset exceeds usize"))?;
@@ -568,7 +535,7 @@ fn read_block_blob(root: &sdk::Root<'_>, entry: BlockEntry) -> sdk::Result<Vec<u
     Ok(output)
 }
 
-fn load_markdown_document(root: &sdk::Root<'_>, bytes: Vec<u8>) -> sdk::Result<Document> {
+fn load_markdown_document(root: &sdk::Snapshot<'_>, bytes: Vec<u8>) -> sdk::Result<Document> {
     let root_json = root
         .get_state(ROOT_STATE)?
         .ok_or_else(|| sdk::Error::invalid_input("Markdown arena root is missing"))?;
@@ -607,18 +574,18 @@ fn load_markdown_document(root: &sdk::Root<'_>, bytes: Vec<u8>) -> sdk::Result<D
 }
 
 fn block_page_key(ordinal: u32) -> Vec<u8> {
-    let mut key = b"markdown/block-page-v1/".to_vec();
+    let mut key = b"markdown/block-page/".to_vec();
     key.extend_from_slice(&ordinal.to_le_bytes());
     key
 }
 
 fn block_index_page_key(ordinal: u32) -> Vec<u8> {
-    let mut key = b"markdown/block-index-page-v2/".to_vec();
+    let mut key = b"markdown/block-index-page/".to_vec();
     key.extend_from_slice(&ordinal.to_le_bytes());
     key
 }
 
-fn block_page_counts(root: &sdk::Root<'_>) -> sdk::Result<(u32, u32)> {
+fn block_page_counts(root: &sdk::Snapshot<'_>) -> sdk::Result<(u32, u32)> {
     let Some(header) = root.read_state_range(BLOCKS_STATE, 0, BLOCK_INDEX_HEADER_BYTES)? else {
         return Ok((0, 0));
     };
@@ -648,7 +615,7 @@ fn effective_block_position(base: u64, ordinal: u32, shifts: &[(u32, i64)]) -> s
 }
 
 fn block_overlay_key(ordinal: u32) -> Vec<u8> {
-    let mut key = b"markdown/block-overlay-v1/".to_vec();
+    let mut key = b"markdown/block-overlay/".to_vec();
     key.extend_from_slice(&ordinal.to_le_bytes());
     key
 }
@@ -770,113 +737,44 @@ fn emit_changes(
     changes: impl IntoIterator<Item = EntityChange>,
     creates: sdk::CreateContext,
     create_from_ordinal: Option<u32>,
-    sink: &mut sdk::Sink<'_>,
+    sink: &mut sdk::Output<'_>,
 ) -> sdk::Result<()> {
-    let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
     for change in changes {
-        encoder.push(change, creates, create_from_ordinal, sink)?;
-    }
-    encoder.flush(sink)
-}
-
-fn packet_page_buffer(max_bytes: usize) -> Vec<u8> {
-    Vec::with_capacity(max_bytes.min(PACKET_PAGE_INITIAL_CAPACITY))
-}
-
-struct BatchEncoder {
-    max_bytes: usize,
-    payload: Vec<u8>,
-    records: u32,
-    creates_only: Option<bool>,
-}
-
-impl BatchEncoder {
-    fn new(max_bytes: u32) -> Self {
-        Self {
-            max_bytes: max_bytes as usize,
-            payload: packet_page_buffer(max_bytes as usize),
-            records: 0,
-            creates_only: None,
-        }
-    }
-
-    fn push(
-        &mut self,
-        change: EntityChange,
-        creates: sdk::CreateContext,
-        create_from_ordinal: Option<u32>,
-        sink: &mut sdk::Sink<'_>,
-    ) -> sdk::Result<()> {
-        let mut record = Vec::new();
-        let is_create = encode_change(change, creates, create_from_ordinal, &mut record)?;
-        if record.len() > self.max_bytes {
-            return Err(sdk::Error::limit_exceeded(
-                "one Markdown entity exceeds the plugin batch limit",
-            ));
-        }
-        if self.records > 0
-            && (self.payload.len() + record.len() > self.max_bytes
-                || self.creates_only != Some(is_create))
-        {
-            self.flush(sink)?;
-        }
-        self.creates_only = Some(is_create);
-        self.payload.extend_from_slice(&record);
-        self.records = self
-            .records
-            .checked_add(1)
-            .ok_or_else(|| sdk::Error::limit_exceeded("Markdown batch count overflowed"))?;
-        Ok(())
-    }
-
-    fn flush(&mut self, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
-        if self.records == 0 {
-            return Ok(());
-        }
-        let payload = std::mem::replace(&mut self.payload, packet_page_buffer(self.max_bytes));
-        let records = std::mem::take(&mut self.records);
-        self.creates_only = None;
-        sink.emit_changes(records, payload)
-    }
-}
-
-fn encode_change(
-    change: EntityChange,
-    creates: sdk::CreateContext,
-    create_from_ordinal: Option<u32>,
-    output: &mut Vec<u8>,
-) -> sdk::Result<bool> {
-    let record_start = output.len();
-    output.extend_from_slice(&0_u32.to_le_bytes());
-    match change.snapshot {
-        Some(snapshot) => {
-            let local_ref = change
-                .entity_pk
-                .first()
-                .filter(|_| change.entity_pk.len() == 1)
-                .and_then(|id| local_ref(creates, id))
-                .filter(|ordinal| create_from_ordinal.is_none_or(|minimum| *ordinal >= minimum));
-            if let Some(local_ref) = local_ref {
-                output.push(2);
-                push_text(output, &change.schema_key)?;
-                output.extend_from_slice(&u64::from(local_ref).to_le_bytes());
-                push_inline_blob(output, &remove_created_id(snapshot)?)?;
-            } else {
-                output.push(0);
-                push_entity_key(output, &change.schema_key, &change.entity_pk)?;
-                output.push(effect_tag(change.effect));
-                push_inline_blob(output, &snapshot)?;
+        match change.snapshot {
+            Some(snapshot) => {
+                let local_ref = change
+                    .entity_pk
+                    .first()
+                    .filter(|_| change.entity_pk.len() == 1)
+                    .and_then(|id| local_ref(creates, id))
+                    .filter(|ordinal| {
+                        create_from_ordinal.is_none_or(|minimum| *ordinal >= minimum)
+                    });
+                if let Some(local_ref) = local_ref {
+                    sink.entity(sdk::EntityMutation::Create {
+                        schema_key: &change.schema_key,
+                        local_ref,
+                        snapshot: &snapshot,
+                    })?;
+                } else {
+                    sink.entity(sdk::EntityMutation::Upsert {
+                        schema_key: &change.schema_key,
+                        entity_pk: &change.entity_pk,
+                        snapshot: &snapshot,
+                        effect: match change.effect {
+                            ChangeEffect::Content => sdk::ChangeEffect::Content,
+                            ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
+                        },
+                    })?;
+                }
             }
-        }
-        None => {
-            output.push(1);
-            push_entity_key(output, &change.schema_key, &change.entity_pk)?;
+            None => sink.entity(sdk::EntityMutation::Delete {
+                schema_key: &change.schema_key,
+                entity_pk: &change.entity_pk,
+            })?,
         }
     }
-    let record_len = u32::try_from(output.len() - record_start - 4)
-        .map_err(|_| sdk::Error::limit_exceeded("Markdown packet record exceeds 4GiB"))?;
-    output[record_start..record_start + 4].copy_from_slice(&record_len.to_le_bytes());
-    Ok(output[record_start + 4] == 2)
+    Ok(())
 }
 
 fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {
@@ -888,78 +786,12 @@ fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {
     Some(u32::from_be_bytes(bytes[12..].try_into().ok()?))
 }
 
-fn remove_created_id(snapshot: Vec<u8>) -> sdk::Result<Vec<u8>> {
-    let mut value: Value = serde_json::from_slice(&snapshot).map_err(|error| {
-        sdk::Error::invalid_input(format!("invalid Markdown snapshot: {error}"))
-    })?;
-    value
-        .as_object_mut()
-        .and_then(|object| object.remove("id"))
-        .ok_or_else(|| sdk::Error::invalid_input("created Markdown snapshot has no id"))?;
-    serde_json::to_vec(&value)
-        .map_err(|error| sdk::Error::internal(format!("encode Markdown snapshot: {error}")))
-}
-
-fn effect_tag(effect: ChangeEffect) -> u8 {
-    match effect {
-        ChangeEffect::Content => 0,
-        ChangeEffect::FormatOnly => 1,
-    }
-}
-
-fn push_entity_key(
-    output: &mut Vec<u8>,
-    schema_key: &str,
-    components: &[String],
-) -> sdk::Result<()> {
-    push_text(output, schema_key)?;
-    output.extend_from_slice(
-        &u32::try_from(components.len())
-            .map_err(|_| sdk::Error::limit_exceeded("too many primary-key components"))?
-            .to_le_bytes(),
-    );
-    for component in components {
-        push_text(output, component)?;
-    }
-    Ok(())
-}
-
-fn push_text(output: &mut Vec<u8>, value: &str) -> sdk::Result<()> {
-    output.extend_from_slice(
-        &u32::try_from(value.len())
-            .map_err(|_| sdk::Error::limit_exceeded("packet text is too large"))?
-            .to_le_bytes(),
-    );
-    output.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
-fn push_inline_blob(output: &mut Vec<u8>, bytes: &[u8]) -> sdk::Result<()> {
-    output.push(0);
-    output.extend_from_slice(
-        &u32::try_from(bytes.len())
-            .map_err(|_| sdk::Error::limit_exceeded("snapshot is too large"))?
-            .to_le_bytes(),
-    );
-    output.extend_from_slice(bytes);
-    Ok(())
-}
-
 #[cfg(target_family = "wasm")]
 lix_plugin_api::export_plugin!(MarkdownPlugin);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn packet_page_buffer_does_not_preallocate_the_record_ceiling() {
-        assert_eq!(
-            packet_page_buffer(16 * 1024 * 1024).capacity(),
-            PACKET_PAGE_INITIAL_CAPACITY
-        );
-        assert_eq!(packet_page_buffer(1024).capacity(), 1024);
-    }
 
     #[test]
     fn large_block_index_is_split_into_bounded_pages() {

@@ -4,124 +4,93 @@
 mod core;
 
 use core::{
-    ArenaRowIndex, ChangeEffect, ColdInitialImport, Document, EntityChange, EntityRecord,
-    IdNamespace, InputSplice, ROW_SCHEMA_KEY, RowConflictResolution, TABLE_SCHEMA_KEY,
-    resolve_row_conflict,
+    ArenaRowIndex, ChangeEffect, ColdInitialImport, Document, EntityChange, EntityRecord, FileEdit,
+    IdNamespace, ROW_SCHEMA_KEY, RowConflictResolution, TABLE_SCHEMA_KEY, resolve_row_conflict,
 };
 use lix_plugin_api as sdk;
-use serde_json::Value;
 
 struct CsvPlugin;
 
-const CERTIFIED_CSV_PAGE_BYTES: usize = 256 * 1024;
-const CSV_INDEX_KEY: &[u8] = b"csv/index-v1";
-const CSV_FALLBACK_ENTITIES_KEY: &[u8] = b"csv/fallback-entities-v1";
+const CSV_INDEX_KEY: &[u8] = b"csv/index";
+const CSV_FALLBACK_ENTITIES_KEY: &[u8] = b"csv/fallback-entities";
 const CSV_FALLBACK_ENTITIES_MAGIC: &[u8; 4] = b"CFE2";
-const ID_NAMESPACE_STATE: &[u8] = b"csv/id-namespace-v1";
+const ID_NAMESPACE_STATE: &[u8] = b"csv/id-namespace";
 const CSV_INDEX_HEADER_BYTES: u32 = 36;
 const CSV_INDEX_PAGE_BYTES: usize = 1024 * 1024;
 const CSV_STATE_PAGE_BYTES: usize = 1024 * 1024;
-const PACKET_PAGE_INITIAL_CAPACITY: usize = 64 * 1024;
 
-impl sdk::FormatPlugin for CsvPlugin {
+impl sdk::Plugin for CsvPlugin {
     fn cold_file_changed(
-        update: &mut sdk::ColdFileUpdate<'_>,
-        sink: &mut sdk::Sink<'_>,
+        update: &mut sdk::ColdUpdate<'_>,
+        sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
-        let accepted = update
-            .before
-            .as_ref()
-            .map(sdk::Root::read_all)
-            .transpose()?;
-        let submitted = update.after.as_ref().map(sdk::Root::read_all).transpose()?;
-        if accepted.is_some() == submitted.is_some() {
-            return Err(sdk::Error::invalid_input(
-                "CSV cold successor requires exactly one byte source",
-            ));
-        }
+        let accepted = update.before.read_all()?;
         let mut builder = core::EntityImportBuilder::new();
         while let Some(entity) = update.entities.next()? {
             builder
                 .push(EntityRecord {
                     schema_key: entity.schema_key,
                     entity_pk: entity.entity_pk,
-                    snapshot: entity.snapshot.ok_or_else(|| {
-                        sdk::Error::invalid_input("CSV cold successor received a tombstone")
-                    })?,
+                    snapshot: entity.snapshot,
                 })
                 .map_err(sdk::Error::invalid_input)?;
         }
-        let namespace =
-            IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
+        let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
         let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
-        if let Some(accepted) = accepted {
-            if !document.bytes_equal(&accepted) {
-                let reconcile = [InputSplice {
-                    offset: 0,
-                    delete_len: document.byte_len() as u64,
-                    insert: &accepted,
-                }];
-                document = document
-                    .file_changed_with_paths(
-                        &reconcile,
-                        update.before_file.path.as_deref(),
-                        update.before_file.path.as_deref(),
-                        namespace,
-                    )
-                    .map_err(sdk::Error::invalid_input)?
-                    .0;
-            }
-        }
-        let splices = if let Some(submitted) = submitted.as_ref() {
-            let reconcile = [InputSplice {
+        if !document.bytes_equal(&accepted) {
+            let reconcile = [FileEdit {
                 offset: 0,
                 delete_len: document.byte_len() as u64,
-                insert: submitted,
+                insert: &accepted,
             }];
-            reconcile.to_vec()
-        } else {
-            update
-                .edits
-                .iter()
-                .map(|edit| InputSplice {
-                    offset: edit.offset,
-                    delete_len: edit.delete_len,
-                    insert: &edit.insert,
-                })
-                .collect::<Vec<_>>()
-        };
+            document = document
+                .file_changed_with_paths(
+                    &reconcile,
+                    Some(update.before_path.as_str()),
+                    Some(update.before_path.as_str()),
+                    namespace,
+                )
+                .map_err(sdk::Error::invalid_input)?
+                .0;
+        }
+        let splices = update
+            .edits
+            .iter()
+            .map(|edit| FileEdit {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert: &edit.insert,
+            })
+            .collect::<Vec<_>>();
         let (successor, changes) = document
             .file_changed_with_paths(
                 &splices,
-                update.before_file.path.as_deref(),
-                update.after_file.path.as_deref(),
+                Some(update.before_path.as_str()),
+                Some(update.after_path.as_str()),
                 namespace,
             )
             .map_err(sdk::Error::invalid_input)?;
         if let Some((namespace, state)) = successor.canonical_arena_state() {
-            update.successor.put_state(ID_NAMESPACE_STATE, &namespace)?;
-            store_csv_index(&update.successor, &state)?;
+            sink.put_state(ID_NAMESPACE_STATE, &namespace)?;
+            store_csv_index(sink, &state)?;
         } else {
-            update
-                .successor
-                .put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
+            sink.put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
             store_fallback_entities_fresh(
-                &update.successor,
+                sink,
                 &successor
                     .entity_records()
                     .map_err(sdk::Error::invalid_input)?,
             )?;
         }
-        let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
         for change in changes {
-            encoder.push(change, update.creates, sink)?;
+            emit_change(change, update.creates, sink)?;
         }
-        encoder.flush(sink)
+        Ok(())
     }
 
     fn entities_changed(
         update: &mut sdk::EntityUpdate<'_>,
-        sink: &mut sdk::Sink<'_>,
+        sink: &mut sdk::Output<'_>,
     ) -> sdk::Result<()> {
         let before = update.before.read_all()?;
         let mut changes = Vec::new();
@@ -148,13 +117,9 @@ impl sdk::FormatPlugin for CsvPlugin {
             let namespace = read_namespace(&update.before)?
                 .or_else(|| namespace_from_changes(&changes))
                 .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-            Document::open_file(
-                before.clone(),
-                update.before_file.path.as_deref(),
-                namespace,
-            )
-            .map_err(sdk::Error::invalid_input)?
-            .0
+            Document::open_file(before.clone(), Some(update.before_path.as_str()), namespace)
+                .map_err(sdk::Error::invalid_input)?
+                .0
         };
         let (successor, edits) = document
             .entities_changed(&changes)
@@ -168,21 +133,18 @@ impl sdk::FormatPlugin for CsvPlugin {
         Ok(())
     }
 
-    fn hydrate(input: &mut sdk::HydrateFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+    fn restore(input: &mut sdk::RestoreFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
         let mut records = Vec::new();
         while let Some(entity) = input.entities.next()? {
-            let snapshot = entity
-                .snapshot
-                .ok_or_else(|| sdk::Error::invalid_input("CSV hydration received a tombstone"))?;
             records.push(EntityRecord {
                 schema_key: entity.schema_key,
                 entity_pk: entity.entity_pk,
-                snapshot,
+                snapshot: entity.snapshot,
             });
         }
         let (document, _) =
             Document::open_entities(records.clone()).map_err(sdk::Error::invalid_input)?;
-        store_fallback_entities_fresh(&input.successor, &records)?;
+        store_fallback_entities_fresh(sink, &records)?;
         if input.accepted.is_none() {
             sink.replace_file(&document.bytes())?;
         }
@@ -214,34 +176,42 @@ impl sdk::FormatPlugin for CsvPlugin {
         )
     }
 
-    fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+    fn open(input: &sdk::OpenFile<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
         let bytes = input.accepted.read_all()?;
-        let mut import = ColdInitialImport::open(bytes, input.file.path.as_deref())
+        let mut import = ColdInitialImport::open(bytes, Some(input.path.as_str()))
             .map_err(sdk::Error::invalid_input)?;
         let state = import.arena_state(input.creates.namespace_bytes());
-        input
-            .successor
-            .put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
-        store_csv_index(&input.successor, &state)?;
-        let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
-        encoder.push(import.table_change(), input.creates, sink)?;
-        encoder.flush(sink)?;
-        let page_bytes = (sink.max_batch_bytes() as usize).min(CERTIFIED_CSV_PAGE_BYTES);
-        while let Some((payload, row_count)) = import
-            .next_typed_batch(page_bytes)
-            .map_err(sdk::Error::invalid_input)?
-        {
-            sink.emit_csv_rows(row_count, payload)?;
+        sink.put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
+        store_csv_index(sink, &state)?;
+        emit_change(import.table_change(), input.creates, sink)?;
+        let mut next_local_ref = 0_u32;
+        loop {
+            let id = input.creates.id(next_local_ref);
+            let Some((local_ref, snapshot)) = import
+                .next_entity_snapshot(&id)
+                .map_err(sdk::Error::invalid_input)?
+            else {
+                break;
+            };
+            debug_assert_eq!(local_ref, next_local_ref);
+            sink.entity(sdk::EntityMutation::Create {
+                schema_key: ROW_SCHEMA_KEY,
+                local_ref,
+                snapshot: &snapshot,
+            })?;
+            next_local_ref = next_local_ref
+                .checked_add(1)
+                .ok_or_else(|| sdk::Error::limit_exceeded("CSV row count exceeds u32"))?;
         }
         Ok(())
     }
 
-    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Output<'_>) -> sdk::Result<()> {
         if update
             .before
             .state_len(CSV_FALLBACK_ENTITIES_KEY)?
             .is_some()
-            || update.before_file.path != update.after_file.path
+            || update.before_path != update.after_path
             || update.edits.len() != 1
             || u64::try_from(update.edits[0].insert.len()).expect("usize fits u64")
                 != update.edits[0].delete_len
@@ -284,7 +254,7 @@ impl sdk::FormatPlugin for CsvPlugin {
         } else {
             let import = ColdInitialImport::open(
                 update.before.read_all()?,
-                update.before_file.path.as_deref(),
+                Some(update.before_path.as_str()),
             )
             .map_err(sdk::Error::invalid_input)?;
             let state = import.arena_state(update.creates.namespace_bytes());
@@ -312,16 +282,14 @@ impl sdk::FormatPlugin for CsvPlugin {
             .row_change(ordinal, row)
             .map_err(sdk::Error::invalid_input)?;
         if let Some(state) = discovered_state {
-            store_csv_index(&update.successor, &state)?;
+            store_csv_index(sink, &state)?;
         }
-        let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
-        encoder.push(change, update.creates, sink)?;
-        encoder.flush(sink)?;
+        emit_change(change, update.creates, sink)?;
         Ok(())
     }
 }
 
-fn store_csv_index(successor: &sdk::Transaction<'_>, state: &[u8]) -> sdk::Result<()> {
+fn store_csv_index(successor: &sdk::Output<'_>, state: &[u8]) -> sdk::Result<()> {
     let (header, pages) = split_csv_index(state)?;
     successor.put_state(CSV_INDEX_KEY, header)?;
     for (ordinal, page) in pages.into_iter().enumerate() {
@@ -341,7 +309,7 @@ fn split_csv_index(state: &[u8]) -> sdk::Result<(&[u8], Vec<&[u8]>)> {
     Ok((header, pages))
 }
 
-fn csv_index_page_count(root: &sdk::Root<'_>) -> sdk::Result<u32> {
+fn csv_index_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
     let Some(header) = root.read_state_range(CSV_INDEX_KEY, 0, CSV_INDEX_HEADER_BYTES)? else {
         return Ok(0);
     };
@@ -359,7 +327,7 @@ fn csv_index_page_count(root: &sdk::Root<'_>) -> sdk::Result<u32> {
         .map_err(|_| sdk::Error::limit_exceeded("too many CSV row index pages"))?)
 }
 
-fn delete_csv_index(before: &sdk::Root<'_>, successor: &sdk::Transaction<'_>) -> sdk::Result<()> {
+fn delete_csv_index(before: &sdk::Snapshot<'_>, successor: &sdk::Output<'_>) -> sdk::Result<()> {
     let page_count = csv_index_page_count(before)?;
     successor.delete_state(CSV_INDEX_KEY)?;
     for ordinal in 0..page_count {
@@ -368,7 +336,10 @@ fn delete_csv_index(before: &sdk::Root<'_>, successor: &sdk::Transaction<'_>) ->
     Ok(())
 }
 
-fn delete_csv_index_from_sink(before: &sdk::Root<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+fn delete_csv_index_from_sink(
+    before: &sdk::Snapshot<'_>,
+    sink: &mut sdk::Output<'_>,
+) -> sdk::Result<()> {
     let page_count = csv_index_page_count(before)?;
     sink.delete_state(CSV_INDEX_KEY)?;
     for ordinal in 0..page_count {
@@ -378,14 +349,14 @@ fn delete_csv_index_from_sink(before: &sdk::Root<'_>, sink: &mut sdk::Sink<'_>) 
 }
 
 fn csv_index_page_key(ordinal: u32) -> Vec<u8> {
-    let mut key = b"csv/index-page-v2/".to_vec();
+    let mut key = b"csv/index-page/".to_vec();
     key.extend_from_slice(&ordinal.to_le_bytes());
     key
 }
 
 fn fallback_file_changed(
     update: &sdk::FileUpdate<'_>,
-    sink: &mut sdk::Sink<'_>,
+    sink: &mut sdk::Output<'_>,
 ) -> sdk::Result<()> {
     let before_bytes = update.before.read_all()?;
     let document = if let Some(manifest) = update.before.get_state(CSV_FALLBACK_ENTITIES_KEY)? {
@@ -397,18 +368,17 @@ fn fallback_file_changed(
         if rendered == before_bytes {
             document
         } else {
-            let reconcile = [InputSplice {
+            let reconcile = [FileEdit {
                 offset: 0,
                 delete_len: rendered.len() as u64,
                 insert: &before_bytes,
             }];
-            let namespace =
-                IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
+            let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
             document
                 .file_changed_with_paths(
                     &reconcile,
-                    update.before_file.path.as_deref(),
-                    update.before_file.path.as_deref(),
+                    Some(update.before_path.as_str()),
+                    Some(update.before_path.as_str()),
                     namespace,
                 )
                 .map_err(sdk::Error::invalid_input)?
@@ -417,43 +387,42 @@ fn fallback_file_changed(
     } else {
         let namespace =
             read_namespace(&update.before)?.unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        Document::open_file(before_bytes, update.before_file.path.as_deref(), namespace)
+        Document::open_file(before_bytes, Some(update.before_path.as_str()), namespace)
             .map_err(sdk::Error::invalid_input)?
             .0
     };
     let splices = update
         .edits
         .iter()
-        .map(|edit| InputSplice {
+        .map(|edit| FileEdit {
             offset: edit.offset,
             delete_len: edit.delete_len,
             insert: &edit.insert,
         })
         .collect::<Vec<_>>();
-    let namespace = IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
+    let namespace = IdNamespace::from_namespace_bytes(update.creates.namespace_bytes());
     let (successor, changes) = document
         .file_changed_with_paths(
             &splices,
-            update.before_file.path.as_deref(),
-            update.after_file.path.as_deref(),
+            Some(update.before_path.as_str()),
+            Some(update.after_path.as_str()),
             namespace,
         )
         .map_err(sdk::Error::invalid_input)?;
     let records = successor
         .entity_records()
         .map_err(sdk::Error::invalid_input)?;
-    store_fallback_entities_in_transaction(&update.before, &update.successor, &records)?;
-    delete_csv_index(&update.before, &update.successor)?;
-    let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
+    store_fallback_entities_in_transaction(&update.before, sink, &records)?;
+    delete_csv_index(&update.before, sink)?;
     for change in changes {
-        encoder.push(change, update.creates, sink)?;
+        emit_change(change, update.creates, sink)?;
     }
-    encoder.flush(sink)
+    Ok(())
 }
 
 fn store_fallback_entities_from_sink(
-    before: &sdk::Root<'_>,
-    sink: &mut sdk::Sink<'_>,
+    before: &sdk::Snapshot<'_>,
+    sink: &mut sdk::Output<'_>,
     records: &[EntityRecord],
 ) -> sdk::Result<()> {
     let old_page_count = fallback_entity_page_count(before)?;
@@ -469,8 +438,8 @@ fn store_fallback_entities_from_sink(
 }
 
 fn store_fallback_entities_in_transaction(
-    before: &sdk::Root<'_>,
-    successor: &sdk::Transaction<'_>,
+    before: &sdk::Snapshot<'_>,
+    successor: &sdk::Output<'_>,
     records: &[EntityRecord],
 ) -> sdk::Result<()> {
     let old_page_count = fallback_entity_page_count(before)?;
@@ -486,7 +455,7 @@ fn store_fallback_entities_in_transaction(
 }
 
 fn store_fallback_entities_fresh(
-    successor: &sdk::Transaction<'_>,
+    successor: &sdk::Output<'_>,
     records: &[EntityRecord],
 ) -> sdk::Result<()> {
     let (manifest, pages) = encode_entity_records(records)?;
@@ -575,14 +544,14 @@ fn decode_fallback_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32)> {
     ))
 }
 
-fn fallback_entity_page_count(root: &sdk::Root<'_>) -> sdk::Result<u32> {
+fn fallback_entity_page_count(root: &sdk::Snapshot<'_>) -> sdk::Result<u32> {
     let Some(manifest) = root.get_state(CSV_FALLBACK_ENTITIES_KEY)? else {
         return Ok(0);
     };
     decode_fallback_manifest(&manifest).map(|(_, page_count)| page_count)
 }
 
-fn read_fallback_pages(root: &sdk::Root<'_>, page_count: u32) -> sdk::Result<Vec<Vec<u8>>> {
+fn read_fallback_pages(root: &sdk::Snapshot<'_>, page_count: u32) -> sdk::Result<Vec<Vec<u8>>> {
     let mut pages = Vec::with_capacity(page_count as usize);
     for ordinal in 0..page_count {
         pages.push(
@@ -594,7 +563,7 @@ fn read_fallback_pages(root: &sdk::Root<'_>, page_count: u32) -> sdk::Result<Vec
 }
 
 fn csv_fallback_page_key(ordinal: u32) -> Vec<u8> {
-    let mut key = b"csv/fallback-entity-page-v2/".to_vec();
+    let mut key = b"csv/fallback-entity-page/".to_vec();
     key.extend_from_slice(&ordinal.to_le_bytes());
     key
 }
@@ -679,7 +648,7 @@ impl StateReader {
     }
 }
 
-fn read_namespace(root: &sdk::Root<'_>) -> sdk::Result<Option<IdNamespace>> {
+fn read_namespace(root: &sdk::Snapshot<'_>) -> sdk::Result<Option<IdNamespace>> {
     let Some(bytes) = root.get_state(ID_NAMESPACE_STATE)? else {
         return Ok(None);
     };
@@ -728,63 +697,10 @@ fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<
     Ok(bytes)
 }
 
-fn packet_page_buffer(max_bytes: usize) -> Vec<u8> {
-    Vec::with_capacity(max_bytes.min(PACKET_PAGE_INITIAL_CAPACITY))
-}
-
-struct BatchEncoder {
-    max_bytes: usize,
-    payload: Vec<u8>,
-    records: u32,
-}
-
-impl BatchEncoder {
-    fn new(max_bytes: u32) -> Self {
-        Self {
-            max_bytes: max_bytes as usize,
-            payload: packet_page_buffer(max_bytes as usize),
-            records: 0,
-        }
-    }
-
-    fn push(
-        &mut self,
-        change: EntityChange,
-        creates: sdk::CreateContext,
-        sink: &mut sdk::Sink<'_>,
-    ) -> sdk::Result<()> {
-        let mut record = Vec::new();
-        encode_change(change, creates, &mut record)?;
-        if record.len() > self.max_bytes {
-            return Err(sdk::Error::limit_exceeded(
-                "one CSV entity exceeds the plugin batch limit",
-            ));
-        }
-        if self.records > 0 && self.payload.len() + record.len() > self.max_bytes {
-            self.flush(sink)?;
-        }
-        self.payload.extend_from_slice(&record);
-        self.records = self
-            .records
-            .checked_add(1)
-            .ok_or_else(|| sdk::Error::limit_exceeded("CSV batch record count overflowed"))?;
-        Ok(())
-    }
-
-    fn flush(&mut self, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
-        if self.records == 0 {
-            return Ok(());
-        }
-        let payload = std::mem::replace(&mut self.payload, packet_page_buffer(self.max_bytes));
-        let records = std::mem::take(&mut self.records);
-        sink.emit_changes(records, payload)
-    }
-}
-
-fn encode_change(
+fn emit_change(
     change: EntityChange,
     creates: sdk::CreateContext,
-    output: &mut Vec<u8>,
+    sink: &mut sdk::Output<'_>,
 ) -> sdk::Result<()> {
     match change.schema_key.as_str() {
         TABLE_SCHEMA_KEY | ROW_SCHEMA_KEY => {}
@@ -794,8 +710,6 @@ fn encode_change(
             )));
         }
     }
-    let record_start = output.len();
-    output.extend_from_slice(&0_u32.to_le_bytes());
     match change.snapshot {
         Some(snapshot) => {
             let local_ref = change
@@ -804,31 +718,28 @@ fn encode_change(
                 .first()
                 .and_then(|id| local_ref(creates, id));
             if change.schema_key == ROW_SCHEMA_KEY && local_ref.is_some() {
-                output.push(2);
-                push_text(output, &change.schema_key)?;
-                output
-                    .extend_from_slice(&u64::from(local_ref.expect("checked above")).to_le_bytes());
-                let snapshot = remove_created_id(snapshot)?;
-                push_inline_blob(output, &snapshot)?;
+                sink.entity(sdk::EntityMutation::Create {
+                    schema_key: &change.schema_key,
+                    local_ref: local_ref.expect("checked above"),
+                    snapshot: &snapshot,
+                })?;
             } else {
-                output.push(0);
-                push_entity_key(output, &change.schema_key, &change.entity_pk)?;
-                output.push(effect_tag(change.effect));
-                push_inline_blob(output, &snapshot)?;
+                sink.entity(sdk::EntityMutation::Upsert {
+                    schema_key: &change.schema_key,
+                    entity_pk: &change.entity_pk,
+                    snapshot: &snapshot,
+                    effect: match change.effect {
+                        ChangeEffect::Content => sdk::ChangeEffect::Content,
+                        ChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
+                    },
+                })?;
             }
         }
-        None => {
-            output.push(1);
-            push_entity_key(output, &change.schema_key, &change.entity_pk)?;
-        }
+        None => sink.entity(sdk::EntityMutation::Delete {
+            schema_key: &change.schema_key,
+            entity_pk: &change.entity_pk,
+        })?,
     }
-    let record_len = output
-        .len()
-        .checked_sub(record_start + 4)
-        .ok_or_else(|| sdk::Error::internal("CSV packet record length underflowed"))?;
-    let record_len = u32::try_from(record_len)
-        .map_err(|_| sdk::Error::limit_exceeded("CSV packet record exceeds 4GiB"))?;
-    output[record_start..record_start + 4].copy_from_slice(&record_len.to_le_bytes());
     Ok(())
 }
 
@@ -842,53 +753,13 @@ fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {
     Some(u32::from_be_bytes(bytes[12..].try_into().ok()?))
 }
 
-fn remove_created_id(snapshot: Vec<u8>) -> sdk::Result<Vec<u8>> {
-    let mut value: Value = serde_json::from_slice(&snapshot)
-        .map_err(|error| sdk::Error::invalid_input(format!("invalid CSV row snapshot: {error}")))?;
-    value
-        .as_object_mut()
-        .and_then(|object| object.remove("id"))
-        .ok_or_else(|| sdk::Error::invalid_input("created CSV row snapshot has no id"))?;
-    serde_json::to_vec(&value)
-        .map_err(|error| sdk::Error::internal(format!("encode CSV row snapshot: {error}")))
-}
-
-fn effect_tag(effect: ChangeEffect) -> u8 {
-    match effect {
-        ChangeEffect::Content => 0,
-        ChangeEffect::FormatOnly => 1,
-    }
-}
-
-fn push_entity_key(
-    output: &mut Vec<u8>,
-    schema_key: &str,
-    components: &[String],
-) -> sdk::Result<()> {
-    push_text(output, schema_key)?;
-    let count = u32::try_from(components.len())
-        .map_err(|_| sdk::Error::limit_exceeded("too many primary-key components"))?;
-    output.extend_from_slice(&count.to_le_bytes());
-    for component in components {
-        push_text(output, component)?;
-    }
-    Ok(())
-}
-
 fn push_text(output: &mut Vec<u8>, value: &str) -> sdk::Result<()> {
-    let length = u32::try_from(value.len())
-        .map_err(|_| sdk::Error::limit_exceeded("packet text is too large"))?;
-    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(
+        &u32::try_from(value.len())
+            .map_err(|_| sdk::Error::limit_exceeded("state text is too large"))?
+            .to_le_bytes(),
+    );
     output.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
-fn push_inline_blob(output: &mut Vec<u8>, bytes: &[u8]) -> sdk::Result<()> {
-    output.push(0);
-    let length = u32::try_from(bytes.len())
-        .map_err(|_| sdk::Error::limit_exceeded("snapshot is too large"))?;
-    output.extend_from_slice(&length.to_le_bytes());
-    output.extend_from_slice(bytes);
     Ok(())
 }
 
@@ -898,15 +769,6 @@ lix_plugin_api::export_plugin!(CsvPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn packet_page_buffer_does_not_preallocate_the_record_ceiling() {
-        assert_eq!(
-            packet_page_buffer(16 * 1024 * 1024).capacity(),
-            PACKET_PAGE_INITIAL_CAPACITY
-        );
-        assert_eq!(packet_page_buffer(1024).capacity(), 1024);
-    }
 
     #[test]
     fn large_row_index_is_split_into_bounded_pages() {
@@ -970,7 +832,7 @@ mod tests {
         let inserted_namespace = IdNamespace::from_halves(13, 17);
         let (successor, _) = document
             .file_changed_with_paths(
-                &[InputSplice {
+                &[FileEdit {
                     offset: 0,
                     delete_len: 0,
                     insert: b"new,zero\n",

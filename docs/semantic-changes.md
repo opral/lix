@@ -128,7 +128,7 @@ SELECT
 FROM lix_change AS c
 JOIN lix_file AS f
   ON f.id = c.file_id
-WHERE c.schema_key = 'csv_v2_row'
+WHERE c.schema_key = 'csv_row'
   AND f.path = '/orders.csv'
 ORDER BY c.created_at DESC;
 ```

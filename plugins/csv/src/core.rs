@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-pub const TABLE_SCHEMA_KEY: &str = "csv_v2_table";
-pub const ROW_SCHEMA_KEY: &str = "csv_v2_row";
+pub const TABLE_SCHEMA_KEY: &str = "csv_table";
+pub const ROW_SCHEMA_KEY: &str = "csv_row";
 pub const ROOT_ENTITY_PK: &str = "root";
 
 const ROWS_PER_CHUNK: usize = 512;
@@ -18,6 +18,12 @@ const FIELD_LENGTH_MASK: u32 = !QUOTED_FIELD;
 pub struct IdNamespace(pub [u8; 16]);
 
 impl IdNamespace {
+    pub fn from_namespace_bytes(namespace: [u8; 12]) -> Self {
+        let mut bytes = [0; 16];
+        bytes[..12].copy_from_slice(&namespace);
+        Self(bytes)
+    }
+
     pub fn from_halves(high: u64, low: u64) -> Self {
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&high.to_be_bytes());
@@ -136,7 +142,7 @@ impl RowLayout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InputSplice<'a> {
+pub struct FileEdit<'a> {
     pub offset: u64,
     pub delete_len: u64,
     pub insert: &'a [u8],
@@ -194,7 +200,7 @@ impl PersistentBlob {
 
     fn from_shared(bytes: Arc<Vec<u8>>) -> Result<Self, String> {
         let len = u32::try_from(bytes.len())
-            .map_err(|_| "CSV v2 currently supports files smaller than 4GiB".to_owned())?;
+            .map_err(|_| "CSV supports files smaller than 4GiB".to_owned())?;
         let pieces = if len == 0 {
             Vec::new()
         } else {
@@ -287,7 +293,7 @@ impl PersistentBlob {
         None
     }
 
-    fn splice(&self, splices: &[InputSplice<'_>]) -> Result<Self, String> {
+    fn splice(&self, splices: &[FileEdit<'_>]) -> Result<Self, String> {
         let deleted = splices.iter().try_fold(0u64, |total, splice| {
             total
                 .checked_add(splice.delete_len)
@@ -303,7 +309,7 @@ impl PersistentBlob {
             .and_then(|value| value.checked_add(inserted))
             .ok_or_else(|| "reconstructed CSV size overflow".to_owned())?;
         let result_len = u32::try_from(result_len)
-            .map_err(|_| "CSV v2 currently supports files smaller than 4GiB".to_owned())?;
+            .map_err(|_| "CSV supports files smaller than 4GiB".to_owned())?;
         let mut pieces = Vec::with_capacity(self.pieces.len() + splices.len() * 2);
         let mut cursor = 0u32;
         for splice in splices {
@@ -1521,7 +1527,7 @@ struct ImportedLayout {
 }
 
 /// Incremental cold-start importer. Packet pages are decoded and compacted as
-/// they arrive, so the guest never retains all packet-v1 JSON records or a
+/// they arrive, so the guest never retains all entity snapshots or a
 /// `Vec<String>` per row. The compact arenas are consumed directly when the
 /// accepted renderer document is constructed.
 #[derive(Debug)]
@@ -1670,7 +1676,7 @@ impl EntityImportBuilder {
                 .ok_or_else(|| "CSV rendered length overflowed".to_owned())
         })?;
         if rendered_len > u32::MAX as usize {
-            return Err("CSV v2 currently supports files smaller than 4GiB".to_owned());
+            return Err("CSV supports files smaller than 4GiB".to_owned());
         }
 
         let row_count =
@@ -1910,7 +1916,7 @@ impl Document {
         namespace: IdNamespace,
     ) -> Result<(Self, InitialChanges), String> {
         if bytes.len() > u32::MAX as usize {
-            return Err("CSV v2 currently supports files smaller than 4GiB".to_owned());
+            return Err("CSV supports files smaller than 4GiB".to_owned());
         }
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(path);
@@ -1944,90 +1950,6 @@ impl Document {
             row: 0,
             table_pending: true,
         }
-    }
-
-    /// Encodes a bounded Prototype-B batch without constructing per-row JSON
-    /// snapshots. `start_row` and the returned next-row index are ordinal
-    /// positions in this freshly opened document.
-    pub fn initial_typed_csv_batch(
-        &self,
-        start_row: usize,
-        max_bytes: usize,
-    ) -> Result<Option<(Vec<u8>, u32, usize)>, String> {
-        if start_row >= self.row_count() {
-            return Ok(None);
-        }
-        if max_bytes < 64 {
-            return Err("typed CSV batch limit is too small".to_owned());
-        }
-        let mut payload = Vec::with_capacity(max_bytes.min(1024 * 1024));
-        let mut encoded_row = Vec::with_capacity(256);
-        let mut force_quote = Vec::new();
-        let mut row_ordinal = start_row;
-        let mut row_count = 0u32;
-        while let Some(location) = self.0.index.ordinal_location(row_ordinal) {
-            encoded_row.clear();
-            force_quote.clear();
-            let (chunk, row) = self.0.index.row(location);
-            encoded_row.extend_from_slice(&row.id_slot.to_le_bytes());
-            encoded_row.extend_from_slice(&row.order_rank.to_le_bytes());
-            let exceptional_ending =
-                (row.ending() != Some(self.0.dialect.terminator)).then_some(row.ending());
-            encoded_row.push(match exceptional_ending {
-                None => 0,
-                Some(None) => 1,
-                Some(Some(Terminator::Lf)) => 2,
-                Some(Some(Terminator::CrLf)) => 3,
-                Some(Some(Terminator::Cr)) => 4,
-            });
-            let row_start =
-                usize::try_from(chunk.byte_start + row.relative_start).expect("u32 fits usize");
-            let row_end = row_start + usize::try_from(row.byte_len).expect("u32 fits usize");
-            let row_bytes = self
-                .0
-                .blob
-                .contiguous_range(row_start, row_end)
-                .ok_or_else(|| "initial typed CSV row is not contiguous".to_owned())?;
-            let first = usize::try_from(row.first_field).expect("u32 fits usize");
-            let end = first + usize::from(row.field_count);
-            for (index, field) in chunk.data.fields[first..end].iter().copied().enumerate() {
-                if field_has_unnecessary_quotes(row_bytes, 0, field, self.0.dialect)? {
-                    if force_quote.len() <= index / 8 {
-                        force_quote.resize(index / 8 + 1, 0);
-                    }
-                    force_quote[index / 8] |= 1 << (index % 8);
-                }
-            }
-            encoded_row.extend_from_slice(
-                &u32::try_from(force_quote.len())
-                    .map_err(|_| "CSV quote layout exceeds 4GiB".to_owned())?
-                    .to_le_bytes(),
-            );
-            encoded_row.extend_from_slice(&force_quote);
-            encoded_row.extend_from_slice(&row.field_count.to_le_bytes());
-            for field in chunk.data.fields[first..end].iter().copied() {
-                let length_offset = encoded_row.len();
-                encoded_row.extend_from_slice(&0u32.to_le_bytes());
-                let value_start = encoded_row.len();
-                append_decoded_field(&mut encoded_row, row_bytes, field, self.0.dialect.quote)?;
-                let value_len = u32::try_from(encoded_row.len() - value_start)
-                    .map_err(|_| "decoded CSV cell exceeds 4GiB".to_owned())?;
-                encoded_row[length_offset..length_offset + 4]
-                    .copy_from_slice(&value_len.to_le_bytes());
-            }
-            if encoded_row.len() > max_bytes {
-                return Err("one typed CSV row exceeds the batch limit".to_owned());
-            }
-            if row_count > 0 && payload.len() + encoded_row.len() > max_bytes {
-                break;
-            }
-            payload.extend_from_slice(&encoded_row);
-            row_count = row_count
-                .checked_add(1)
-                .ok_or_else(|| "typed CSV row count overflowed".to_owned())?;
-            row_ordinal += 1;
-        }
-        Ok(Some((payload, row_count, row_ordinal)))
     }
 
     pub fn bytes(&self) -> Vec<u8> {
@@ -2148,7 +2070,7 @@ impl Document {
 
     pub fn file_changed(
         &self,
-        splices: &[InputSplice<'_>],
+        splices: &[FileEdit<'_>],
         namespace: IdNamespace,
     ) -> Result<(Self, Vec<EntityChange>), String> {
         self.file_changed_with_paths(splices, None, None, namespace)
@@ -2156,7 +2078,7 @@ impl Document {
 
     pub fn file_changed_with_paths(
         &self,
-        splices: &[InputSplice<'_>],
+        splices: &[FileEdit<'_>],
         before_path: Option<&str>,
         after_path: Option<&str>,
         namespace: IdNamespace,
@@ -2389,7 +2311,7 @@ impl Document {
         let ordinal = self.0.index.ordinal_of(location);
         let (chunk, row) = self.0.index.row(location);
         let start = chunk.byte_start + row.relative_start;
-        let splice = InputSplice {
+        let splice = FileEdit {
             offset: u64::from(start),
             delete_len: u64::from(row.byte_len),
             insert: &[],
@@ -2492,7 +2414,7 @@ impl Document {
             u32::try_from(self.0.blob.len()).expect("CSV length fits u32")
         };
 
-        let deletion = InputSplice {
+        let deletion = FileEdit {
             offset: u64::from(source_start),
             delete_len: u64::from(source_len),
             insert: &[],
@@ -2510,7 +2432,7 @@ impl Document {
         } else {
             destination
         };
-        let insertion = InputSplice {
+        let insertion = FileEdit {
             offset: u64::from(insertion_offset),
             delete_len: 0,
             insert: &insert,
@@ -2583,7 +2505,7 @@ impl Document {
             ending,
             &semantic.layout.force_quote,
         )?;
-        let splice = InputSplice {
+        let splice = FileEdit {
             offset: u64::from(start),
             delete_len: u64::from(row.byte_len),
             insert: &insert,
@@ -2697,7 +2619,7 @@ impl Document {
                 self.0.dialect,
             )?);
         }
-        let splice = InputSplice {
+        let splice = FileEdit {
             offset: u64::from(offset),
             delete_len: 0,
             insert: &insert,
@@ -2792,7 +2714,7 @@ impl Document {
     }
 }
 
-/// One-shot initial-import view for v3 actors that will not be cached.
+/// One-shot initial-import view for actors that will not be cached.
 ///
 /// This keeps only the submitted bytes and scan drafts while typed pages are
 /// emitted. It deliberately skips the persistent chunk index, identity maps,
@@ -2825,7 +2747,7 @@ struct ColdRowDraft {
 impl ColdInitialImport {
     pub fn open(bytes: Vec<u8>, path: Option<&str>) -> Result<Self, String> {
         if bytes.len() > u32::MAX as usize {
-            return Err("CSV v3 currently supports files smaller than 4GiB".to_owned());
+            return Err("CSV supports files smaller than 4GiB".to_owned());
         }
         std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
         let mut dialect = Dialect::for_path(path);
@@ -2855,7 +2777,7 @@ impl ColdInitialImport {
         )
     }
 
-    /// Compact host-owned state for a document-free v3 successor.
+    /// Compact host-owned state for a document-free successor.
     ///
     /// The page retains one creation namespace, the accepted dialect, and one
     /// u32 source offset per row. A warm byte edit can therefore locate and
@@ -2889,92 +2811,33 @@ impl ColdInitialImport {
         output
     }
 
-    pub fn next_typed_batch(&mut self, max_bytes: usize) -> Result<Option<(Vec<u8>, u32)>, String> {
-        if self.next_row >= self.rows.len() {
+    pub fn next_entity_snapshot(&mut self, id: &str) -> Result<Option<(u32, Vec<u8>)>, String> {
+        let Some(row) = self.rows.get(self.next_row).copied() else {
             return Ok(None);
+        };
+        let local_ref = u32::try_from(self.next_row).expect("validated CSV row count");
+        let mut next_order_rank = self
+            .next_order_rank
+            .checked_add(self.order_step)
+            .expect("CSV order rank stays below u64::MAX");
+        let mut order_remainder = self.order_remainder + self.order_remainder_step;
+        if order_remainder >= self.order_denominator {
+            next_order_rank += 1;
+            order_remainder -= self.order_denominator;
         }
-        if max_bytes < 64 {
-            return Err("typed CSV batch limit is too small".to_owned());
-        }
-        let mut payload = Vec::with_capacity(max_bytes.min(1024 * 1024));
-        let mut encoded_row = Vec::with_capacity(256);
-        let mut force_quote = Vec::new();
-        let mut row_count = 0u32;
-        while let Some(row) = self.rows.get(self.next_row) {
-            encoded_row.clear();
-            force_quote.clear();
-            encoded_row.extend_from_slice(
-                &u32::try_from(self.next_row)
-                    .expect("validated CSV row count")
-                    .to_le_bytes(),
-            );
-            let mut next_order_rank = self
-                .next_order_rank
-                .checked_add(self.order_step)
-                .expect("CSV order rank stays below u64::MAX");
-            let mut order_remainder = self.order_remainder + self.order_remainder_step;
-            if order_remainder >= self.order_denominator {
-                next_order_rank += 1;
-                order_remainder -= self.order_denominator;
-            }
-            let order_rank = next_order_rank | 1;
-            encoded_row.extend_from_slice(&order_rank.to_le_bytes());
-            let exceptional_ending =
-                (row.ending != Some(self.dialect.terminator)).then_some(row.ending);
-            encoded_row.push(match exceptional_ending {
-                None => 0,
-                Some(None) => 1,
-                Some(Some(Terminator::Lf)) => 2,
-                Some(Some(Terminator::CrLf)) => 3,
-                Some(Some(Terminator::Cr)) => 4,
-            });
-            let row_start = row.start as usize;
-            let row_end = row_start + row.byte_len as usize;
-            let row_bytes = &self.bytes[row_start..row_end];
-            let first_field = usize::try_from(row.first_field).expect("u32 fits usize");
-            let fields = &self.fields[first_field..first_field + usize::from(row.field_count)];
-            if row.has_quoted_fields {
-                for (index, field) in fields.iter().copied().enumerate() {
-                    if field_has_unnecessary_quotes(row_bytes, 0, field, self.dialect)? {
-                        if force_quote.len() <= index / 8 {
-                            force_quote.resize(index / 8 + 1, 0);
-                        }
-                        force_quote[index / 8] |= 1 << (index % 8);
-                    }
-                }
-            }
-            encoded_row.extend_from_slice(
-                &u32::try_from(force_quote.len())
-                    .map_err(|_| "CSV quote layout exceeds 4GiB".to_owned())?
-                    .to_le_bytes(),
-            );
-            encoded_row.extend_from_slice(&force_quote);
-            encoded_row.extend_from_slice(&row.field_count.to_le_bytes());
-            for field in fields.iter().copied() {
-                let length_offset = encoded_row.len();
-                encoded_row.extend_from_slice(&0u32.to_le_bytes());
-                let value_start = encoded_row.len();
-                append_decoded_field(&mut encoded_row, row_bytes, field, self.dialect.quote)?;
-                let value_len = u32::try_from(encoded_row.len() - value_start)
-                    .map_err(|_| "decoded CSV cell exceeds 4GiB".to_owned())?;
-                encoded_row[length_offset..length_offset + 4]
-                    .copy_from_slice(&value_len.to_le_bytes());
-            }
-            if encoded_row.len() > max_bytes {
-                return Err("one typed CSV row exceeds the batch limit".to_owned());
-            }
-            if row_count > 0 && payload.len() + encoded_row.len() > max_bytes {
-                break;
-            }
-            payload.extend_from_slice(&encoded_row);
-            self.next_order_rank = next_order_rank;
-            self.order_remainder = order_remainder;
-            row_count = row_count
-                .checked_add(1)
-                .ok_or_else(|| "typed CSV row count overflowed".to_owned())?;
-            self.next_row += 1;
-        }
-        Ok(Some((payload, row_count)))
+        let order_rank = next_order_rank | 1;
+        let snapshot = cold_row_snapshot_bytes(
+            &self.bytes,
+            &self.fields,
+            row,
+            id,
+            &format!("{order_rank:016x}"),
+            self.dialect,
+        )?;
+        self.next_order_rank = next_order_rank;
+        self.order_remainder = order_remainder;
+        self.next_row += 1;
+        Ok(Some((local_ref, snapshot)))
     }
 }
 
@@ -3051,7 +2914,6 @@ impl ArenaRowIndex {
             starts,
         })
     }
-
     pub fn decode_header(bytes: &[u8], state_len: u64) -> Result<Self, String> {
         const HEADER_BYTES: usize = 36;
         if bytes.len() != HEADER_BYTES || &bytes[..8] != b"LIXCSV3\0" {
@@ -3601,14 +3463,18 @@ mod cold_scan_tests {
         }
         let mut import = ColdInitialImport::open(bytes, Some("/fixture.csv")).expect("cold import");
         let mut rows = 0u32;
-        while let Some((_, count)) = import.next_typed_batch(256 * 1024).expect("typed page") {
-            rows += count;
+        while let Some((local_ref, _)) = import
+            .next_entity_snapshot("019a0000-0000-7000-8000-000000000001")
+            .expect("entity snapshot")
+        {
+            assert_eq!(local_ref, rows);
+            rows += 1;
         }
         assert_eq!(rows, 220_001);
     }
 }
 
-fn validate_splices(file_len: usize, splices: &[InputSplice<'_>]) -> Result<(), String> {
+fn validate_splices(file_len: usize, splices: &[FileEdit<'_>]) -> Result<(), String> {
     let mut previous_end = 0u64;
     for (index, splice) in splices.iter().enumerate() {
         let end = splice
@@ -3630,7 +3496,7 @@ fn validate_splices(file_len: usize, splices: &[InputSplice<'_>]) -> Result<(), 
 
 fn affected_row_window(
     index: &RowIndex,
-    splices: &[InputSplice<'_>],
+    splices: &[FileEdit<'_>],
 ) -> Result<(Option<RowLocation>, Option<RowLocation>), String> {
     if index.row_count == 0 {
         return Ok((None, None));
@@ -3652,7 +3518,7 @@ fn affected_row_window(
 
 fn map_offset(
     offset: u32,
-    splices: &[InputSplice<'_>],
+    splices: &[FileEdit<'_>],
     include_at_offset: bool,
 ) -> Result<usize, String> {
     let mut mapped = i128::from(offset);
@@ -4412,6 +4278,65 @@ fn row_snapshot_bytes(
     Ok(output)
 }
 
+fn cold_row_snapshot_bytes(
+    bytes: &[u8],
+    fields: &[FieldRange],
+    row: ColdRowDraft,
+    id: &str,
+    order_key: &str,
+    dialect: Dialect,
+) -> Result<Vec<u8>, String> {
+    let mut output = Vec::with_capacity(128);
+    output.extend_from_slice(b"{\"cells\":[");
+    let row_start = row.start as usize;
+    let row_bytes = &bytes[row_start..row_start + row.byte_len as usize];
+    let first = usize::try_from(row.first_field).expect("u32 fits usize");
+    let end = first + usize::from(row.field_count);
+    let mut force_quote = Vec::new();
+    for (index, field) in fields[first..end].iter().copied().enumerate() {
+        if index > 0 {
+            output.push(b',');
+        }
+        if row.has_quoted_fields && field_has_unnecessary_quotes(row_bytes, 0, field, dialect)? {
+            if force_quote.len() <= index / 8 {
+                force_quote.resize(index / 8 + 1, 0);
+            }
+            force_quote[index / 8] |= 1 << (index % 8);
+        }
+        let value = decoded_field(row_bytes, 0, field, dialect.quote)?;
+        write_canonical_json_string(&mut output, &value);
+    }
+    output.push(b']');
+    output.extend_from_slice(b",\"id\":");
+    write_canonical_json_string(&mut output, id);
+    let exceptional_ending = (row.ending != Some(dialect.terminator)).then_some(row.ending);
+    if !force_quote.is_empty() || exceptional_ending.is_some() {
+        output.extend_from_slice(b",\"layout\":{");
+        let needs_comma = if !force_quote.is_empty() {
+            output.extend_from_slice(b"\"force_quote\":");
+            write_canonical_json_string(&mut output, &URL_SAFE_NO_PAD.encode(force_quote));
+            true
+        } else {
+            false
+        };
+        if let Some(ending) = exceptional_ending {
+            if needs_comma {
+                output.push(b',');
+            }
+            output.extend_from_slice(b"\"terminator\":");
+            write_canonical_json_string(
+                &mut output,
+                ending.map_or("", |terminator| terminator.snapshot()),
+            );
+        }
+        output.push(b'}');
+    }
+    output.extend_from_slice(b",\"order_key\":");
+    write_canonical_json_string(&mut output, order_key);
+    output.push(b'}');
+    Ok(output)
+}
+
 fn table_snapshot(dialect: Dialect) -> Vec<u8> {
     let mut output = Vec::with_capacity(96);
     output.extend_from_slice(b"{\"dialect\":{\"delimiter\":");
@@ -4820,7 +4745,7 @@ fn parse_row_layout(value: &Value, field_count: usize) -> Result<RowLayout, Stri
 fn reject_numbers(value: &Value) -> Result<(), String> {
     match value {
         Value::Number(_) => {
-            Err("number-bearing snapshots are not eligible for packet v1".to_owned())
+            Err("number-bearing snapshots are not eligible for this layout".to_owned())
         }
         Value::Array(values) => values.iter().try_for_each(reject_numbers),
         Value::Object(values) => values.values().try_for_each(reject_numbers),

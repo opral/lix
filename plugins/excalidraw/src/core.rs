@@ -8,14 +8,20 @@ pub const ELEMENT_SCHEMA_KEY: &str = "excalidraw_element";
 pub const FILE_SCHEMA_KEY: &str = "excalidraw_file";
 
 const SCENE_ID: &str = "scene";
-const ELEMENTS_MARKER: &str = "\0lix-excalidraw-elements-v2\0";
-const FILES_MARKER: &str = "\0lix-excalidraw-files-v2\0";
+const ELEMENTS_MARKER: &str = "\0lix-excalidraw-elements\0";
+const FILES_MARKER: &str = "\0lix-excalidraw-files\0";
 const MAX_JSON_DEPTH: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdNamespace(pub [u8; 16]);
 
 impl IdNamespace {
+    pub fn from_namespace_bytes(namespace: [u8; 12]) -> Self {
+        let mut bytes = [0; 16];
+        bytes[..12].copy_from_slice(&namespace);
+        Self(bytes)
+    }
+
     pub fn from_halves(high: u64, low: u64) -> Self {
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&high.to_be_bytes());
@@ -36,7 +42,7 @@ impl IdNamespace {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InputSplice<'a> {
+pub struct FileEdit<'a> {
     pub offset: u64,
     pub delete_len: u64,
     pub insert: &'a [u8],
@@ -559,7 +565,7 @@ impl Document {
 
     pub fn file_changed(
         &self,
-        splices: &[InputSplice<'_>],
+        splices: &[FileEdit<'_>],
         _namespace: IdNamespace,
     ) -> Result<(Self, Vec<EntityChange>), String> {
         if splices.is_empty() {
@@ -1690,7 +1696,7 @@ fn diff_records(before: Vec<EntityRecord>, after: Vec<EntityRecord>) -> Vec<Enti
     changes
 }
 
-fn apply_splices(before: &[u8], splices: &[InputSplice<'_>]) -> Result<Vec<u8>, String> {
+fn apply_splices(before: &[u8], splices: &[FileEdit<'_>]) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut cursor = 0usize;
     for splice in splices {

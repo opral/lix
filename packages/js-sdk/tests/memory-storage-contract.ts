@@ -350,7 +350,7 @@ export function registerMemoryStorageContract({
 					);
 
 					const rows = await lix.execute(
-						"SELECT cells FROM csv_v2_row ORDER BY order_key",
+						"SELECT cells FROM csv_row ORDER BY order_key",
 					);
 					expect(rows.rows.map((row) => row.get("cells"))).toEqual([
 						["name", "age"],

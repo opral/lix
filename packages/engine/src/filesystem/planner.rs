@@ -17,8 +17,7 @@ use crate::live_state::{
 };
 
 use super::keys::{
-    BLOB_REF_SCHEMA_KEY, DERIVED_FILE_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-    FILE_DESCRIPTOR_SCHEMA_KEY,
+    BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
 };
 use super::visibility::VisibleFilesystem;
 use super::{DirectoryPathRecord, derive_directory_paths};
@@ -383,75 +382,6 @@ impl BlobRefRowInput {
     }
 }
 
-/// Durable proof for a plugin-owned file whose bytes are reconstructed from
-/// semantic rows instead of retained in the binary CAS.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DerivedFileRefRowInput {
-    pub(crate) file_id: String,
-    /// Exact filesystem path supplied to the renderer that produced the
-    /// proof. A component may make rendering decisions from its descriptor,
-    /// so the byte digest alone is not sufficient to validate a relocation.
-    pub(crate) path: String,
-    pub(crate) sha256: String,
-    pub(crate) size_bytes: usize,
-    pub(crate) context: FilesystemRowContext,
-}
-
-impl DerivedFileRefRowInput {
-    pub(crate) fn append_to(self, rows: &mut RawWriteBatch) -> Result<(), LixError> {
-        let size_bytes = u64::try_from(self.size_bytes).map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "derived file size exceeds supported range for file '{}' branch '{}'",
-                    self.file_id, self.context.branch_id
-                ),
-            )
-        })?;
-        if self.sha256.len() != 64
-            || !self
-                .sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                format!(
-                    "derived file materialization for '{}' must carry a lowercase SHA-256",
-                    self.file_id
-                ),
-            ));
-        }
-        if !self.path.starts_with('/') {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                format!(
-                    "derived file materialization for '{}' must carry an absolute renderer path",
-                    self.file_id
-                ),
-            ));
-        }
-        let snapshot = json!({
-            "id": self.file_id,
-            "path": self.path,
-            "sha256": self.sha256,
-            "size_bytes": size_bytes,
-        });
-        let file_id = self.file_id;
-        append_state_row(
-            rows,
-            file_id.clone(),
-            DERIVED_FILE_REF_SCHEMA_KEY,
-            Some(snapshot),
-            FilesystemRowContext {
-                file_id: Some(file_id),
-                ..self.context
-            },
-        );
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileDescriptorWriteInput {
     pub(crate) id: Option<String>,
@@ -465,7 +395,6 @@ pub(crate) struct FileDescriptorWriteInput {
 pub(crate) struct FileDeleteInput {
     pub(crate) file_id: String,
     pub(crate) has_blob_ref: bool,
-    pub(crate) has_derived_file_ref: bool,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -1072,35 +1001,6 @@ pub(crate) fn append_blob_ref_tombstone_row(
     );
 }
 
-#[cfg(test)]
-pub(crate) fn derived_file_ref_row(
-    input: DerivedFileRefRowInput,
-) -> Result<TransactionWriteRow, LixError> {
-    let mut rows = RawWriteBatch::with_capacity(1);
-    input.append_to(&mut rows)?;
-    Ok(rows
-        .into_rows()
-        .pop()
-        .expect("derived-file-ref append produces one row"))
-}
-
-pub(crate) fn append_derived_file_ref_tombstone_row(
-    rows: &mut RawWriteBatch,
-    file_id: String,
-    context: FilesystemRowContext,
-) {
-    append_tombstone_row(
-        rows,
-        file_id.clone(),
-        DERIVED_FILE_REF_SCHEMA_KEY,
-        FilesystemRowContext {
-            file_id: Some(file_id),
-            metadata: None,
-            ..context
-        },
-    );
-}
-
 pub(crate) fn plan_parsed_file_path_write_with_resolvers(
     resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     parsed: LixPath,
@@ -1450,9 +1350,7 @@ fn directory_path_from_segments(segments: &[String]) -> String {
 }
 
 pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
-    let mut rows = RawWriteBatch::with_capacity(
-        1 + usize::from(input.has_blob_ref) + usize::from(input.has_derived_file_ref),
-    );
+    let mut rows = RawWriteBatch::with_capacity(1 + usize::from(input.has_blob_ref));
     append_tombstone_row(
         &mut rows,
         input.file_id.clone(),
@@ -1465,9 +1363,6 @@ pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
 
     if input.has_blob_ref {
         append_blob_ref_tombstone_row(&mut rows, input.file_id.clone(), input.context.clone());
-    }
-    if input.has_derived_file_ref {
-        append_derived_file_ref_tombstone_row(&mut rows, input.file_id.clone(), input.context);
     }
 
     FilesystemDeletePlan { rows, count: 1 }
@@ -1791,7 +1686,6 @@ fn collect_recursive_directory_delete(
             let plan = plan_file_delete(FileDeleteInput {
                 file_id: file_id.clone(),
                 has_blob_ref: visible_filesystem.has_blob_ref(context, file_id),
-                has_derived_file_ref: visible_filesystem.has_derived_file_ref(context, file_id),
                 context: context.clone(),
             });
             rows.append(plan.rows);
@@ -1821,10 +1715,10 @@ mod tests {
     use crate::transaction::types::{RawWriteBatch, TransactionJson};
 
     use super::{
-        BlobRefRowInput, DerivedFileRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput,
+        BlobRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput,
         DirectoryDescriptorWriteIntent, DirectoryPathResolver, FileDeleteInput,
         FileDescriptorRowInput, FileDescriptorWriteInput, FileDescriptorWriteIntent,
-        FilesystemRowContext, blob_ref_row, derived_file_ref_row, directory_descriptor_row,
+        FilesystemRowContext, blob_ref_row, directory_descriptor_row,
         directory_descriptor_write_row, file_descriptor_row, file_descriptor_write_row,
         plan_file_descriptor_write,
     };
@@ -2028,24 +1922,6 @@ mod tests {
             snapshot["blob_hash"].as_str(),
             Some(BlobId::from_content(b"Hello").to_hex().as_str())
         );
-    }
-
-    #[test]
-    fn derived_file_ref_row_binds_renderer_path() {
-        let row = derived_file_ref_row(DerivedFileRefRowInput {
-            file_id: "01920000-0000-7000-8000-0000000000d2".to_string(),
-            path: "/docs/readme.txt".to_string(),
-            sha256: "a".repeat(64),
-            size_bytes: 5,
-            context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
-        })
-        .expect("derived ref row should build");
-
-        let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
-        assert_eq!(snapshot["path"], "/docs/readme.txt");
-        assert_eq!(snapshot["sha256"], JsonValue::String("a".repeat(64)));
-        assert_eq!(snapshot["size_bytes"], 5);
     }
 
     #[test]
@@ -2876,7 +2752,6 @@ mod tests {
         let plan = super::plan_file_delete(FileDeleteInput {
             file_id: "01920000-0000-7000-8000-0000000000d2".to_string(),
             has_blob_ref: true,
-            has_derived_file_ref: false,
             context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         });
 
@@ -2918,7 +2793,6 @@ mod tests {
         let plan = super::plan_file_delete(FileDeleteInput {
             file_id: "01920000-0000-7000-8000-0000000000d2".to_string(),
             has_blob_ref: false,
-            has_derived_file_ref: false,
             context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         });
 
@@ -2999,7 +2873,6 @@ mod tests {
                 &context,
                 "01920000-0000-7000-8000-0000000000d2",
             )]),
-            derived_file_refs_by_key: BTreeSet::new(),
         };
 
         let plan = super::plan_recursive_directory_delete(

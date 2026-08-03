@@ -3,30 +3,18 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
-use crate::core::{Document, InputSplice, LINE_SCHEMA_KEY, Line};
-use crate::{
-    PACKET_PAGE_INITIAL_CAPACITY, STATE_PAGE_BYTES, decode_identities, decode_identity_manifest,
-    encode_identities, packet_page_buffer,
-};
-
-#[test]
-fn packet_page_buffer_does_not_preallocate_the_record_ceiling() {
-    assert_eq!(
-        packet_page_buffer(16 * 1024 * 1024).capacity(),
-        PACKET_PAGE_INITIAL_CAPACITY
-    );
-    assert_eq!(packet_page_buffer(1024).capacity(), 1024);
-}
+use crate::core::{Document, FileEdit, LINE_SCHEMA_KEY, Line};
+use crate::{STATE_PAGE_BYTES, decode_identities, decode_identity_manifest, encode_identities};
 
 fn open(bytes: &[u8]) -> (Document, Vec<lix::EntityChange>) {
     let (document, changes) =
         Document::open_file(bytes.to_vec(), |ordinal| format!("line-{ordinal}"))
-            .expect("Git text document should open");
+            .expect("Text document should open");
     (
         document,
         changes
             .collect::<Result<Vec<_>, _>>()
-            .expect("Git text changes should serialize"),
+            .expect("Text changes should serialize"),
     )
 }
 
@@ -90,7 +78,7 @@ fn empty_document_has_zero_rows_and_nonempty_to_empty_tombstones_each_line() {
     let (nonempty, _) = open(b"one\ntwo\n");
     let (after, changes) = nonempty
         .file_changed(
-            &[InputSplice {
+            &[FileEdit {
                 offset: 0,
                 delete_len: u64::try_from(nonempty.bytes().len()).unwrap(),
                 insert: Vec::new(),
@@ -124,7 +112,7 @@ fn localized_line_edit_preserves_that_lines_id_and_leaves_unrelated_rows_untouch
     let before_ids = ids(&document);
     let (after, changes) = document
         .file_changed(
-            &[InputSplice {
+            &[FileEdit {
                 offset: 6,
                 delete_len: 4,
                 insert: b"BETA".to_vec(),
@@ -146,7 +134,7 @@ fn adding_a_duplicate_line_allocates_a_new_identity() {
     let before_ids = ids(&document);
     let (after, changes) = document
         .file_changed(
-            &[InputSplice {
+            &[FileEdit {
                 offset: 2,
                 delete_len: 0,
                 insert: b"a\n".to_vec(),
@@ -168,7 +156,7 @@ fn line_insertion_adds_one_row_without_rewriting_existing_line_entities() {
     let before_ids = ids(&document);
     let (after, changes) = document
         .file_changed(
-            &[InputSplice {
+            &[FileEdit {
                 offset: 6,
                 delete_len: 0,
                 insert: b"middle\n".to_vec(),
@@ -196,7 +184,7 @@ fn durable_identities_survive_insert_reopen_and_second_edit() {
     let (document, _) = open(b"alpha\nomega\n");
     let (after_insert, _) = document
         .file_changed(
-            &[InputSplice {
+            &[FileEdit {
                 offset: 6,
                 delete_len: 0,
                 insert: b"middle\n".to_vec(),
@@ -213,7 +201,7 @@ fn durable_identities_survive_insert_reopen_and_second_edit() {
 
     let (after_edit, changes) = reopened
         .file_changed(
-            &[InputSplice {
+            &[FileEdit {
                 offset: 6,
                 delete_len: 6,
                 insert: b"MIDDLE".to_vec(),
@@ -253,7 +241,7 @@ fn reorder_preserves_ids_and_updates_only_the_moved_rows_order_key() {
     let before_ids = ids(&document);
     let (after, changes) = document
         .file_changed(
-            &[InputSplice {
+            &[FileEdit {
                 offset: 0,
                 delete_len: u64::try_from(document.bytes().len()).unwrap(),
                 insert: b"gamma\nalpha\nbeta\n".to_vec(),
@@ -312,11 +300,11 @@ fn independent_semantic_line_updates_render_as_independent_exact_byte_edits() {
 }
 
 #[test]
-fn git_nul_window_rejects_early_nul_and_allows_nul_after_eight_kib() {
+fn text_nul_window_rejects_early_nul_and_allows_nul_after_eight_kib() {
     assert!(Document::open_file(b"text\0binary".to_vec(), |ordinal| ordinal.to_string()).is_err());
 
     let mut source = vec![b'x'; 8_000];
-    source.extend_from_slice(b"\0still-git-text\n");
+    source.extend_from_slice(b"\0still-text\n");
     let (document, changes) =
         Document::open_file(source.clone(), |ordinal| format!("line-{ordinal}"))
             .expect("a NUL after Git's scan window remains text");
@@ -339,6 +327,6 @@ fn semantic_rows_cannot_smuggle_multiple_logical_lines_into_one_entity() {
             vec![alpha.id().to_owned()],
             malformed,
         )])
-        .expect_err("one row cannot represent multiple logical Git lines");
+        .expect_err("one row cannot represent multiple logical text lines");
     assert!(error.contains("embedded LF"));
 }

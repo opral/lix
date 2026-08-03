@@ -6,6 +6,7 @@
 //! exact registry read and one batched owner read instead of a filesystem
 //! scan.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -23,8 +24,8 @@ use crate::{GLOBAL_BRANCH_ID, LixError};
 
 use super::InstalledPlugin;
 use super::manifest::{
-    PluginContentType, PluginManifest, PluginMaterialization, PluginRuntime,
-    parse_plugin_manifest_json, validate_runtime_api_version,
+    PluginContentMatcher, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
+    validate_runtime_api_version,
 };
 use super::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 
@@ -33,7 +34,7 @@ pub(crate) const PLUGIN_OWNER_KEY: &str = "lix_plugin_owner_v2";
 pub(crate) const MAX_PLUGIN_REGISTRY_ENTRIES: usize = 128;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
-const PLUGIN_REGISTRY_FORMAT_VERSION: u32 = 4;
+const PLUGIN_REGISTRY_FORMAT_VERSION: u32 = 5;
 const PLUGIN_FILE_OWNER_FORMAT_VERSION: u32 = 2;
 const MAX_CACHED_PLUGIN_CATALOGS: usize = 16;
 const DEFAULT_CACHED_PLUGIN_CATALOGS: usize = 8;
@@ -45,7 +46,7 @@ pub(crate) struct PluginRegistryEntryInput {
     pub(crate) runtime: PluginRuntime,
     pub(crate) api_version: String,
     pub(crate) path_glob: String,
-    pub(crate) content_type: Option<PluginContentType>,
+    pub(crate) content: Option<PluginContentMatcher>,
     pub(crate) entry: String,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) create_schema_keys: Vec<String>,
@@ -58,7 +59,7 @@ pub(crate) struct PluginRegistryEntryInput {
 
 /// Metadata needed by current-state plugin matching and execution.
 ///
-/// Path-only matching is encoded explicitly as `content_type: null`. Registry
+/// Path-only matching is encoded explicitly as `content: null`. Registry
 /// rows are an internal engine format, so missing fields are rejected instead
 /// of carrying compatibility for unreleased representations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,9 +69,8 @@ pub(crate) struct PluginRegistryEntry {
     runtime: PluginRuntime,
     api_version: String,
     path_glob: String,
-    #[serde(deserialize_with = "deserialize_required_content_type")]
-    content_type: Option<PluginContentType>,
-    materialization: PluginMaterialization,
+    #[serde(deserialize_with = "deserialize_required_content")]
+    content: Option<PluginContentMatcher>,
     entry: String,
     schema_keys: Vec<String>,
     create_schema_keys: Vec<String>,
@@ -81,27 +81,26 @@ pub(crate) struct PluginRegistryEntry {
     wasm_blob_hash: String,
 }
 
-fn deserialize_required_content_type<'de, D>(
+fn deserialize_required_content<'de, D>(
     deserializer: D,
-) -> Result<Option<PluginContentType>, D::Error>
+) -> Result<Option<PluginContentMatcher>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<PluginContentType>::deserialize(deserializer)
+    Option::<PluginContentMatcher>::deserialize(deserializer)
 }
 
 impl PluginRegistryEntry {
     pub(crate) fn new(input: PluginRegistryEntryInput) -> Result<Self, LixError> {
         let manifest_json =
             canonicalize_json_text(&input.manifest_json, "plugin registry manifest_json")?;
-        let parsed_manifest = parse_plugin_manifest_json(&manifest_json)?;
+        parse_plugin_manifest_json(&manifest_json)?;
         let mut entry = Self {
             key: input.key,
             runtime: input.runtime,
             api_version: input.api_version,
             path_glob: input.path_glob,
-            content_type: input.content_type,
-            materialization: parsed_manifest.manifest.materialization,
+            content: input.content,
             entry: input.entry,
             schema_keys: input.schema_keys,
             create_schema_keys: input.create_schema_keys,
@@ -125,12 +124,8 @@ impl PluginRegistryEntry {
         &self.key
     }
 
-    pub(crate) fn content_type(&self) -> Option<PluginContentType> {
-        self.content_type
-    }
-
-    pub(crate) fn materialization(&self) -> PluginMaterialization {
-        self.materialization
+    pub(crate) fn content(&self) -> Option<PluginContentMatcher> {
+        self.content
     }
 
     pub(crate) fn api_version(&self) -> &str {
@@ -166,15 +161,14 @@ impl PluginRegistryEntry {
         let incompatible = self.key != replacement.key
             || self.api_version != replacement.api_version
             || self.path_glob != replacement.path_glob
-            || self.content_type != replacement.content_type
-            || self.materialization != replacement.materialization
+            || self.content != replacement.content
             || self.schema_keys != replacement.schema_keys
             || self.create_schema_keys != replacement.create_schema_keys;
         if incompatible {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
                 format!(
-                    "owned plugin '{}' may only upgrade between wasm-component generations with the same API version, matcher, materialization, content type, schema keys, and create-default contract",
+                    "owned plugin '{}' may only upgrade between wasm-component generations with the same API version, matcher, content type, schema keys, and create-default contract",
                     self.key
                 ),
             )
@@ -199,7 +193,7 @@ impl PluginRegistryEntry {
             runtime: self.runtime,
             api_version: self.api_version.clone(),
             path_glob: self.path_glob.clone(),
-            content_type: self.content_type,
+            content: self.content,
             entry: self.entry.clone(),
             schema_keys: self.schema_keys.clone(),
             manifest_json: self.manifest_json.clone(),
@@ -736,27 +730,29 @@ impl CompiledPluginCatalog {
         bytes: &[u8],
     ) -> (Option<&PluginRegistryEntry>, u64) {
         let mut utf8 = None;
-        let mut git_text = None;
+        let mut prefix_matches = HashMap::new();
         let mut classified_bytes = 0u64;
-        let selected = self.select_with_content_type(path, |required| {
+        let selected = self.select_with_content(path, |required| {
             let matches = match required {
-                PluginContentType::Text | PluginContentType::Binary => {
+                PluginContentMatcher::Text | PluginContentMatcher::Binary => {
                     let is_utf8 = *utf8.get_or_insert_with(|| {
                         classified_bytes = classified_bytes.saturating_add(bytes.len() as u64);
                         std::str::from_utf8(bytes).is_ok()
                     });
                     match required {
-                        PluginContentType::Text => is_utf8,
-                        PluginContentType::Binary => !is_utf8,
-                        PluginContentType::GitText => {
-                            unreachable!("GitText is handled by its bounded classifier branch")
+                        PluginContentMatcher::Text => is_utf8,
+                        PluginContentMatcher::Binary => !is_utf8,
+                        PluginContentMatcher::PrefixExcludes { .. } => {
+                            unreachable!("prefix predicates use their bounded classifier branch")
                         }
                     }
                 }
-                PluginContentType::GitText => *git_text.get_or_insert_with(|| {
-                    let scan_len = bytes.len().min(PluginContentType::GIT_TEXT_SCAN_BYTES);
-                    classified_bytes = classified_bytes.saturating_add(scan_len as u64);
-                    PluginContentType::GitText.matches_bytes(bytes)
+                matcher @ PluginContentMatcher::PrefixExcludes {
+                    bytes: scan_bytes, ..
+                } => *prefix_matches.entry(matcher).or_insert_with(|| {
+                    classified_bytes =
+                        classified_bytes.saturating_add(bytes.len().min(scan_bytes) as u64);
+                    matcher.matches_bytes(bytes)
                 }),
             };
             Some(matches)
@@ -764,10 +760,10 @@ impl CompiledPluginCatalog {
         (selected, classified_bytes)
     }
 
-    fn select_with_content_type(
+    fn select_with_content(
         &self,
         path: &str,
-        mut content_type_matches: impl FnMut(PluginContentType) -> Option<bool>,
+        mut content_matches: impl FnMut(PluginContentMatcher) -> Option<bool>,
     ) -> Option<&PluginRegistryEntry> {
         if path.is_empty() {
             return None;
@@ -780,8 +776,8 @@ impl CompiledPluginCatalog {
             if selected_rank.is_some_and(|current| rank <= current) {
                 continue;
             }
-            if let Some(required) = self.plugins[index].content_type()
-                && !content_type_matches(required).unwrap_or(false)
+            if let Some(required) = self.plugins[index].content()
+                && !content_matches(required).unwrap_or(false)
             {
                 continue;
             }
@@ -893,18 +889,15 @@ fn validate_entry(entry: &PluginRegistryEntry) -> Result<(), LixError> {
             entry.key
         ))
     })?;
-    validate_runtime_api_version(&manifest).map_err(|error| {
+    validate_runtime_api_version(entry.runtime, &entry.api_version).map_err(|error| {
         invalid_registry(format!(
             "plugin '{}' manifest_json has an unsupported API version: {}",
             entry.key, error.message
         ))
     })?;
     if manifest.key != entry.key
-        || manifest.runtime != entry.runtime
-        || manifest.api_version != entry.api_version
         || manifest.file_match.path_glob != entry.path_glob
-        || manifest.file_match.content_type != entry.content_type
-        || manifest.materialization != entry.materialization
+        || manifest.file_match.content != entry.content
         || manifest.entry != entry.entry
     {
         return Err(invalid_registry(format!(
@@ -1151,39 +1144,36 @@ mod tests {
         std::iter::repeat_n(byte, 64).collect()
     }
 
-    fn manifest_with_content_type(
+    fn manifest_with_content(
         key: &str,
         path_glob: &str,
-        content_type: Option<PluginContentType>,
+        content: Option<PluginContentMatcher>,
     ) -> String {
-        let content_type = content_type
-            .map(|content_type| {
-                let value = serde_json::to_string(&content_type)
-                    .expect("plugin content type should serialize");
-                format!(r#","content_type":{value}"#)
+        let content = content
+            .map(|content| {
+                let value =
+                    serde_json::to_string(&content).expect("plugin content type should serialize");
+                format!(r#","content":{value}"#)
             })
             .unwrap_or_default();
         format!(
             r#"{{
                 "schemas":["schema/default.json"],
                 "entry":"plugin.wasm",
-                "match":{{"path_glob":{path_glob:?}{content_type}}},
-                "api_version":"1.0.0",
-                "materialization":"blob",
-                "runtime":"wasm-component",
+                "match":{{"path_glob":{path_glob:?}{content}}},
                 "key":{key:?}
             }}"#
         )
     }
 
     fn entry(key: &str, path_glob: &str, hash_byte: char) -> PluginRegistryEntry {
-        entry_with_content_type(key, path_glob, None, hash_byte)
+        entry_with_content(key, path_glob, None, hash_byte)
     }
 
-    fn entry_with_content_type(
+    fn entry_with_content(
         key: &str,
         path_glob: &str,
-        content_type: Option<PluginContentType>,
+        content: Option<PluginContentMatcher>,
         hash_byte: char,
     ) -> PluginRegistryEntry {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
@@ -1191,11 +1181,11 @@ mod tests {
             runtime: PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
             path_glob: path_glob.to_string(),
-            content_type,
+            content,
             entry: "plugin.wasm".to_string(),
             schema_keys: vec![format!("{key}_schema")],
             create_schema_keys: Vec::new(),
-            manifest_json: manifest_with_content_type(key, path_glob, content_type),
+            manifest_json: manifest_with_content(key, path_glob, content),
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
             archive_blob_hash: hash(hash_byte),
@@ -1212,12 +1202,12 @@ mod tests {
             runtime: PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
             path_glob: path_glob.to_string(),
-            content_type: Some(PluginContentType::Text),
+            content: Some(PluginContentMatcher::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
             create_schema_keys: vec!["csv_row".to_string()],
             manifest_json: format!(
-                r#"{{"api_version":"1.0.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"materialization":"blob","runtime":"wasm-component","schemas":["schema/csv_row.json"]}}"#
+                r#"{{"entry":"plugin.wasm","key":"{key}","match":{{"content":"text","path_glob":"{path_glob}"}},"schemas":["schema/csv_row.json"]}}"#
             ),
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
@@ -1231,7 +1221,6 @@ mod tests {
     fn durable_registry_rejects_non_v1_component_api() {
         let mut prototype = component_entry('a');
         prototype.api_version = "4.0.0".to_owned();
-        prototype.manifest_json = prototype.manifest_json.replacen("1.0.0", "4.0.0", 1);
         let plugins = vec![prototype];
         let wire = PluginRegistryWire {
             version: PLUGIN_REGISTRY_FORMAT_VERSION,
@@ -1243,7 +1232,7 @@ mod tests {
         let error =
             PluginRegistry::from_wire(wire).expect_err("durable non-v1 components must hard fail");
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
-        assert!(error.message.contains("api_version"));
+        assert!(error.message.contains("lix:plugin"));
         assert!(error.message.contains("1.0.0"));
     }
 
@@ -1263,7 +1252,7 @@ mod tests {
         value.path_glob = "*.tsv".to_string();
         incompatible.push(value);
         let mut value = replacement.clone();
-        value.content_type = Some(PluginContentType::Binary);
+        value.content = Some(PluginContentMatcher::Binary);
         incompatible.push(value);
         let mut value = replacement.clone();
         value.schema_keys = vec!["csv_table".to_string()];
@@ -1355,13 +1344,10 @@ mod tests {
     }
 
     #[test]
-    fn content_type_is_required_and_path_only_matching_is_explicit() {
+    fn content_is_required_and_path_only_matching_is_explicit() {
         let path_only = PluginRegistry::new(vec![entry("plugin_a", "*.json", 'a')]).unwrap();
         let path_only_value = path_only.to_value().unwrap();
-        assert_eq!(
-            path_only_value["plugins"][0]["content_type"],
-            JsonValue::Null
-        );
+        assert_eq!(path_only_value["plugins"][0]["content"], JsonValue::Null);
         assert_eq!(
             PluginRegistry::from_optional_value(Some(&path_only_value)).unwrap(),
             path_only
@@ -1371,18 +1357,18 @@ mod tests {
         missing["plugins"][0]
             .as_object_mut()
             .unwrap()
-            .remove("content_type");
-        assert_invalid(missing, "missing field `content_type`");
+            .remove("content");
+        assert_invalid(missing, "missing field `content`");
 
-        let typed = PluginRegistry::new(vec![entry_with_content_type(
+        let typed = PluginRegistry::new(vec![entry_with_content(
             "plugin_a",
             "*.json",
-            Some(PluginContentType::Text),
+            Some(PluginContentMatcher::Text),
             'a',
         )])
         .unwrap();
         let typed_value = typed.to_value().unwrap();
-        assert_eq!(typed_value["plugins"][0]["content_type"], json!("text"));
+        assert_eq!(typed_value["plugins"][0]["content"], json!("text"));
         assert_eq!(
             PluginRegistry::from_optional_value(Some(&typed_value)).unwrap(),
             typed
@@ -1390,7 +1376,7 @@ mod tests {
         assert_ne!(path_only.generation(), typed.generation());
 
         let mut mismatched = typed_value;
-        mismatched["plugins"][0]["content_type"] = json!("binary");
+        mismatched["plugins"][0]["content"] = json!("binary");
         assert_invalid(mismatched, "does not match manifest_json");
     }
 
@@ -1426,21 +1412,21 @@ mod tests {
     }
 
     #[test]
-    fn installed_plugin_materialization_verifies_extracted_wasm_hash() {
+    fn installed_plugin_verifies_extracted_wasm_hash() {
         let wasm = b"compiled component".to_vec();
         let mut input = PluginRegistryEntryInput {
             key: "plugin_a".to_string(),
             runtime: PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
             path_glob: "*.json".to_string(),
-            content_type: Some(PluginContentType::Text),
+            content: Some(PluginContentMatcher::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["plugin_a_schema".to_string()],
             create_schema_keys: Vec::new(),
-            manifest_json: manifest_with_content_type(
+            manifest_json: manifest_with_content(
                 "plugin_a",
                 "*.json",
-                Some(PluginContentType::Text),
+                Some(PluginContentMatcher::Text),
             ),
             archive_file_id: plugin_storage_archive_file_id("plugin_a"),
             archive_path: plugin_storage_archive_path("plugin_a"),
@@ -1452,7 +1438,7 @@ mod tests {
             .to_installed_plugin(wasm.clone())
             .expect("matching extracted WASM should materialize");
         assert_eq!(installed.key, "plugin_a");
-        assert_eq!(installed.content_type, Some(PluginContentType::Text));
+        assert_eq!(installed.content, Some(PluginContentMatcher::Text));
         assert_eq!(installed.wasm_hash, BlobId::from_content(&wasm));
         assert_eq!(installed.wasm, wasm);
 
@@ -1515,23 +1501,31 @@ mod tests {
     }
 
     #[test]
-    fn compiled_catalog_applies_content_type_only_when_known() {
-        assert!(PluginContentType::Text.matches_bytes(b""));
-        assert!(PluginContentType::Text.matches_bytes(b"hello"));
-        assert!(!PluginContentType::Text.matches_bytes(&[0xff, 0xfe]));
-        assert!(PluginContentType::Binary.matches_bytes(&[0xff, 0xfe]));
-        assert!(PluginContentType::GitText.matches_bytes(&[0xff, 0xfe]));
-        assert!(!PluginContentType::GitText.matches_bytes(b"text\0data"));
-        let mut nul_outside_git_window = vec![b'x'; PluginContentType::GIT_TEXT_SCAN_BYTES];
-        nul_outside_git_window.push(0);
-        assert!(PluginContentType::GitText.matches_bytes(&nul_outside_git_window));
+    fn compiled_catalog_applies_content_only_when_known() {
+        assert!(PluginContentMatcher::Text.matches_bytes(b""));
+        assert!(PluginContentMatcher::Text.matches_bytes(b"hello"));
+        assert!(!PluginContentMatcher::Text.matches_bytes(&[0xff, 0xfe]));
+        assert!(PluginContentMatcher::Binary.matches_bytes(&[0xff, 0xfe]));
+        let prefix_text = PluginContentMatcher::PrefixExcludes {
+            byte: 0,
+            bytes: 8_000,
+        };
+        assert!(prefix_text.matches_bytes(&[0xff, 0xfe]));
+        assert!(!prefix_text.matches_bytes(b"text\0data"));
+        let mut nul_outside_text_window = vec![b'x'; 8_000];
+        nul_outside_text_window.push(0);
+        assert!(prefix_text.matches_bytes(&nul_outside_text_window));
 
-        let text =
-            entry_with_content_type("plugin_text", "*.data", Some(PluginContentType::Text), 'a');
-        let binary = entry_with_content_type(
+        let text = entry_with_content(
+            "plugin_text",
+            "*.data",
+            Some(PluginContentMatcher::Text),
+            'a',
+        );
+        let binary = entry_with_content(
             "plugin_binary",
             "*.data",
-            Some(PluginContentType::Binary),
+            Some(PluginContentMatcher::Binary),
             'b',
         );
         let text_only =
@@ -1540,25 +1534,25 @@ mod tests {
         let classification_calls = Cell::new(0);
         assert!(
             text_only
-                .select_with_content_type("document.other", |required| {
+                .select_with_content("document.other", |required| {
                     classification_calls.set(classification_calls.get() + 1);
-                    Some(required == PluginContentType::Text)
+                    Some(required == PluginContentMatcher::Text)
                 })
                 .is_none()
         );
         assert_eq!(classification_calls.get(), 0);
         assert_eq!(
             text_only
-                .select_with_content_type("document.data", |required| {
-                    Some(required == PluginContentType::Text)
+                .select_with_content("document.data", |required| {
+                    Some(required == PluginContentMatcher::Text)
                 })
                 .map(PluginRegistryEntry::key),
             Some("plugin_text")
         );
         assert!(
             text_only
-                .select_with_content_type("document.data", |required| {
-                    Some(required == PluginContentType::Binary)
+                .select_with_content("document.data", |required| {
+                    Some(required == PluginContentMatcher::Binary)
                 })
                 .is_none()
         );
@@ -1568,16 +1562,16 @@ mod tests {
                 .unwrap();
         assert_eq!(
             catalog
-                .select_with_content_type("document.data", |required| {
-                    Some(required == PluginContentType::Text)
+                .select_with_content("document.data", |required| {
+                    Some(required == PluginContentMatcher::Text)
                 })
                 .map(PluginRegistryEntry::key),
             Some("plugin_text")
         );
         assert_eq!(
             catalog
-                .select_with_content_type("document.data", |required| {
-                    Some(required == PluginContentType::Binary)
+                .select_with_content("document.data", |required| {
+                    Some(required == PluginContentMatcher::Binary)
                 })
                 .map(PluginRegistryEntry::key),
             Some("plugin_binary")
@@ -1607,21 +1601,21 @@ mod tests {
     }
 
     #[test]
-    fn git_text_matcher_uses_git_nul_window_and_is_bounded() {
-        let git_text = entry_with_content_type(
-            "plugin_git_text",
-            "*",
-            Some(PluginContentType::GitText),
-            'a',
-        );
-        let utf8_specific = entry_with_content_type(
+    fn prefix_exclusion_matcher_is_bounded() {
+        let prefix_text = PluginContentMatcher::PrefixExcludes {
+            byte: 0,
+            bytes: 8_000,
+        };
+        let prefix_filtered =
+            entry_with_content("plugin_prefix_filtered", "*", Some(prefix_text), 'a');
+        let utf8_specific = entry_with_content(
             "plugin_utf8_specific",
             "*.data",
-            Some(PluginContentType::Text),
+            Some(PluginContentMatcher::Text),
             'b',
         );
         let catalog = CompiledPluginCatalog::compile(
-            &PluginRegistry::new(vec![git_text, utf8_specific]).unwrap(),
+            &PluginRegistry::new(vec![prefix_filtered, utf8_specific]).unwrap(),
         )
         .unwrap();
 
@@ -1630,16 +1624,15 @@ mod tests {
             catalog.select_for_bytes_with_classification_work("asset.bin", &large_non_utf8_text);
         assert_eq!(
             selected.map(PluginRegistryEntry::key),
-            Some("plugin_git_text")
+            Some("plugin_prefix_filtered")
         );
         assert_eq!(
-            classified_bytes,
-            PluginContentType::GIT_TEXT_SCAN_BYTES as u64,
-            "Git classification must inspect only its fixed NUL window"
+            classified_bytes, 8_000,
+            "prefix classification must inspect only its configured window"
         );
         assert!(
             classified_bytes * 100 < large_non_utf8_text.len() as u64,
-            "the Git-compatible matcher should inspect under 1% of this 1 MiB payload"
+            "the text matcher should inspect under 1% of this 1 MiB payload"
         );
 
         let (selected, _) =

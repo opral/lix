@@ -1,5 +1,5 @@
 {
-  "x-lix-key": "csv_v2_table",
+  "x-lix-key": "csv_table",
   "x-lix-primary-key": ["/id"],
   "description": "CSV dialect metadata.",
   "type": "object",

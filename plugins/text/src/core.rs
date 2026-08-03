@@ -9,18 +9,18 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lix_order_key::OrderKey;
 use serde::Deserialize;
 
-pub(crate) const LINE_SCHEMA_KEY: &str = "git_text_line_v2";
-const GIT_TEXT_SCAN_BYTES: usize = 8_000;
+pub(crate) const LINE_SCHEMA_KEY: &str = "text_line";
+const TEXT_PREFIX_SCAN_BYTES: usize = 8_000;
 
 /// One verified base-relative splice received from the Component adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InputSplice {
+pub(crate) struct FileEdit {
     pub(crate) offset: u64,
     pub(crate) delete_len: u64,
     pub(crate) insert: Vec<u8>,
 }
 
-/// Immutable, byte-exact state for a Git-style text document.
+/// Immutable, byte-exact state for a byte-exact text document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Document(Arc<DocumentInner>);
 
@@ -112,7 +112,7 @@ impl Document {
         bytes: Vec<u8>,
         mut id_for_ordinal: impl FnMut(u64) -> String,
     ) -> Result<(Self, AllUpserts), String> {
-        validate_git_text(&bytes)?;
+        validate_text(&bytes)?;
         let bytes = Arc::new(bytes);
         let chunks = split_lines(Arc::clone(&bytes));
         let order_keys = OrderKey::evenly_between(None, None, chunks.len())?;
@@ -142,11 +142,11 @@ impl Document {
         bytes: Vec<u8>,
         identities: Vec<LineIdentity>,
     ) -> Result<Self, String> {
-        validate_git_text(&bytes)?;
+        validate_text(&bytes)?;
         let bytes = Arc::new(bytes);
         let chunks = split_lines(Arc::clone(&bytes));
         if chunks.len() != identities.len() {
-            return Err("Git text identity state has the wrong line count".to_owned());
+            return Err("Text identity state has the wrong line count".to_owned());
         }
         let lines = chunks
             .into_iter()
@@ -162,7 +162,7 @@ impl Document {
             .collect::<Result<Vec<_>, String>>()?;
         let document = Self::from_lines(lines)?;
         if document.bytes() != bytes.as_slice() {
-            return Err("Git text identity order does not match accepted bytes".to_owned());
+            return Err("Text identity order does not match accepted bytes".to_owned());
         }
         Ok(document)
     }
@@ -205,11 +205,11 @@ impl Document {
 
     pub(crate) fn file_changed(
         &self,
-        splices: &[InputSplice],
+        splices: &[FileEdit],
         mut id_for_ordinal: impl FnMut(u64) -> String,
     ) -> Result<(Self, Vec<lix::EntityChange>), String> {
         let bytes = Arc::new(apply_splices(self.bytes(), splices)?);
-        validate_git_text(&bytes)?;
+        validate_text(&bytes)?;
         let chunks = split_lines(Arc::clone(&bytes));
 
         // Preserve the overwhelmingly common unchanged prefix and suffix
@@ -413,7 +413,7 @@ impl Document {
                 .then_with(|| left.id.cmp(&right.id))
         });
         let bytes = Arc::new(render_lines(&lines)?);
-        validate_git_text(&bytes)?;
+        validate_text(&bytes)?;
         let mut offset = 0usize;
         for line in &mut lines {
             let end = offset
@@ -601,29 +601,31 @@ impl Line {
             .map_err(|error| format!("failed to serialize line order key: {error}"))?;
         let content_len = base64::encoded_len(self.bytes.len(), false)
             .ok_or_else(|| "base64 line snapshot length overflow".to_owned())?;
-        let prefix_len = b"{\"id\":".len()
+        let prefix_len = b"{\"content_base64\":\"".len()
+            + b",\"id\":".len()
             + id.len()
             + b",\"order_key\":".len()
-            + order_key.len()
-            + b",\"content_base64\":\"".len();
+            + order_key.len();
         let capacity = prefix_len
             .checked_add(content_len)
             .and_then(|length| length.checked_add(b"\"}".len()))
             .ok_or_else(|| "line snapshot length overflow".to_owned())?;
 
         let mut snapshot = Vec::with_capacity(capacity);
-        snapshot.extend_from_slice(b"{\"id\":");
-        snapshot.extend_from_slice(&id);
-        snapshot.extend_from_slice(b",\"order_key\":");
-        snapshot.extend_from_slice(&order_key);
-        snapshot.extend_from_slice(b",\"content_base64\":\"");
+        // Certified snapshots use the engine's canonical lexicographic object
+        // key order, avoiding a host-side normalization allocation.
+        snapshot.extend_from_slice(b"{\"content_base64\":\"");
         let content_start = snapshot.len();
         snapshot.resize(content_start + content_len, 0);
         let written = URL_SAFE_NO_PAD
             .encode_slice(self.bytes.as_slice(), &mut snapshot[content_start..])
             .map_err(|error| format!("failed to base64-encode line snapshot: {error}"))?;
         snapshot.truncate(content_start + written);
-        snapshot.extend_from_slice(b"\"}");
+        snapshot.extend_from_slice(b"\",\"id\":");
+        snapshot.extend_from_slice(&id);
+        snapshot.extend_from_slice(b",\"order_key\":");
+        snapshot.extend_from_slice(&order_key);
+        snapshot.push(b'}');
         Ok(snapshot)
     }
 
@@ -686,13 +688,13 @@ fn validate_line_bytes(bytes: &[u8]) -> Result<(), String> {
     };
     if prefix.contains(&b'\n') {
         return Err(
-            "one Git text line may contain one trailing LF but no embedded LF bytes".to_owned(),
+            "one Text line may contain one trailing LF but no embedded LF bytes".to_owned(),
         );
     }
     Ok(())
 }
 
-fn apply_splices(before: &[u8], splices: &[InputSplice]) -> Result<Vec<u8>, String> {
+fn apply_splices(before: &[u8], splices: &[FileEdit]) -> Result<Vec<u8>, String> {
     let mut after = Vec::with_capacity(before.len());
     let mut cursor = 0usize;
     for splice in splices {
@@ -730,21 +732,21 @@ fn render_lines(lines: &[Line]) -> Result<Vec<u8>, String> {
 fn validate_entity_key(schema_key: &str, entity_pk: &[String]) -> Result<(), String> {
     if schema_key != LINE_SCHEMA_KEY {
         return Err(format!(
-            "Git text plugin only accepts schema '{LINE_SCHEMA_KEY}', got '{schema_key}'"
+            "Text plugin only accepts schema '{LINE_SCHEMA_KEY}', got '{schema_key}'"
         ));
     }
     let [id] = entity_pk else {
-        return Err("Git text line entities need exactly one primary-key component".to_owned());
+        return Err("Text line entities need exactly one primary-key component".to_owned());
     };
     if id.is_empty() {
-        return Err("Git text line entity primary key must not be empty".to_owned());
+        return Err("Text line entity primary key must not be empty".to_owned());
     }
     Ok(())
 }
 
-fn validate_git_text(bytes: &[u8]) -> Result<(), String> {
-    if bytes[..bytes.len().min(GIT_TEXT_SCAN_BYTES)].contains(&0) {
-        return Err("Git text documents cannot contain NUL in their first 8 KiB".to_owned());
+fn validate_text(bytes: &[u8]) -> Result<(), String> {
+    if bytes[..bytes.len().min(TEXT_PREFIX_SCAN_BYTES)].contains(&0) {
+        return Err("Text documents cannot contain NUL in their first 8 KiB".to_owned());
     }
     Ok(())
 }
