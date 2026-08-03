@@ -9,10 +9,9 @@ use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::changelog::ChangeRecordProjection;
 use crate::entity_pk::EntityPk;
-use crate::filesystem::DERIVED_FILE_REF_SCHEMA_KEY;
 use crate::plugin::{
     ConflictRank, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry,
-    PluginRegistryEntry, inferred_media_type_for_path,
+    PluginRegistryEntry,
 };
 use crate::storage_adapter::Storage;
 #[cfg(test)]
@@ -665,7 +664,7 @@ where
     let mut derived = BTreeMap::new();
     let mut derived_owners = BTreeMap::new();
     for (file_id, owner) in common_owners {
-        let Some((path @ Some(_), media_type)) = common_descriptors.get(&file_id).cloned() else {
+        let Some(path @ Some(_)) = common_descriptors.get(&file_id).cloned() else {
             continue;
         };
         let Ok(plugin) = pinned_conflict_plugin_entry(
@@ -679,7 +678,6 @@ where
         };
         let descriptor = WasmFileDescriptor {
             path,
-            media_type,
             plugin: WasmPluginSelection {
                 plugin_key: plugin.key().to_owned(),
                 generation: plugin.archive_blob_hash().to_owned(),
@@ -696,7 +694,7 @@ where
             .filter(|&&index| {
                 matches!(
                     merge_plan.conflicts[index].identity.schema_key(),
-                    BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
+                    BLOB_REF_SCHEMA_KEY
                 )
             })
             .count();
@@ -791,13 +789,11 @@ fn is_derived_blob_conflict(
     conflict: &TrackedStateMergeConflict,
     derived_blob_files: &DerivedPluginConflictIndex,
 ) -> bool {
-    matches!(
-        conflict.identity.schema_key(),
-        BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
-    ) && conflict
-        .identity
-        .file_id()
-        .is_some_and(|file_id| derived_blob_files.contains_file(file_id))
+    matches!(conflict.identity.schema_key(), BLOB_REF_SCHEMA_KEY)
+        && conflict
+            .identity
+            .file_id()
+            .is_some_and(|file_id| derived_blob_files.contains_file(file_id))
 }
 
 fn pick_is_derived_plugin_state(
@@ -810,13 +806,11 @@ fn pick_is_derived_plugin_state(
     let Some(owner) = derived_blob_files.owner(file_id) else {
         return false;
     };
-    matches!(
-        pick.selected_row.schema_key(),
-        BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
-    ) || owner
-        .schema_keys()
-        .iter()
-        .any(|schema_key| schema_key == pick.selected_row.schema_key())
+    matches!(pick.selected_row.schema_key(), BLOB_REF_SCHEMA_KEY)
+        || owner
+            .schema_keys()
+            .iter()
+            .any(|schema_key| schema_key == pick.selected_row.schema_key())
 }
 
 /// One historical triple for a plugin-owned semantic entity. The row identity
@@ -909,13 +903,11 @@ fn resolvable_plugin_conflict_keys(
             .expect("derived plugin context has an owner");
         for &index in &context.conflict_indices {
             let conflict = &merge_plan.conflicts[index];
-            if !matches!(
-                conflict.identity.schema_key(),
-                BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
-            ) && owner
-                .schema_keys()
-                .iter()
-                .any(|schema_key| schema_key == conflict.identity.schema_key())
+            if !matches!(conflict.identity.schema_key(), BLOB_REF_SCHEMA_KEY)
+                && owner
+                    .schema_keys()
+                    .iter()
+                    .any(|schema_key| schema_key == conflict.identity.schema_key())
             {
                 eligible.indices.push(index);
             }
@@ -975,6 +967,18 @@ where
             &ChangeRecordProjection::full(),
         )
         .await?;
+    let missing_base_keys = keys
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| base_rows.row(*index).is_none())
+        .map(|(_, key)| key.clone())
+        .collect::<Vec<_>>();
+    let certified_base_rows = reader
+        .load_certified_rows_at_commit(
+            &analysis.commits.base_commit_id.to_string(),
+            &missing_base_keys,
+        )
+        .await?;
 
     let mut groups = BTreeMap::<String, PluginMergeConflictGroup>::new();
     for (index, conflict) in semantic_conflicts.into_iter().enumerate() {
@@ -995,9 +999,14 @@ where
         verify_historical_conflict_row_ref(source, conflict.source.after.as_ref(), "source")?;
 
         let (a, b) = canonical_conflict_variants_ref(conflict, target, source)?;
+        let base = historical_live_payload_ref(base)?.or_else(|| {
+            certified_base_rows
+                .get(&keys[index])
+                .and_then(certified_live_payload)
+        });
         let row = PluginMergeConflictRow {
             identity: conflict.identity.clone(),
-            base: historical_live_payload_ref(base)?,
+            base,
             a: historical_live_payload_ref(a)?,
             b: historical_live_payload_ref(b)?,
         };
@@ -1036,6 +1045,18 @@ where
     Ok(groups)
 }
 
+fn certified_live_payload(
+    row: &crate::live_state::MaterializedLiveStateRow,
+) -> Option<PluginMergeConflictPayload> {
+    if row.deleted {
+        return None;
+    }
+    Some(PluginMergeConflictPayload {
+        snapshot: row.snapshot_content.clone()?,
+        metadata: row.metadata.clone(),
+    })
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct HistoricalFileDescriptor {
     id: String,
@@ -1058,7 +1079,7 @@ async fn historical_conflict_file_descriptors<S>(
     reader: &mut TrackedStateStoreReader<S>,
     analysis: &super::analysis::MergeAnalysis,
     file_ids: &BTreeSet<String>,
-) -> Result<BTreeMap<String, (Option<String>, Option<String>)>, LixError>
+) -> Result<BTreeMap<String, Option<String>>, LixError>
 where
     S: crate::storage_adapter::StorageAdapterRead,
 {
@@ -1101,7 +1122,7 @@ where
             target_rows.row(index),
             source_rows.row(index),
         ) else {
-            descriptors.insert(file_id, (None, None));
+            descriptors.insert(file_id, None);
             continue;
         };
 
@@ -1131,11 +1152,10 @@ where
         )
         .await?;
         let Some(path) = common_historical_path(base_path, target_path, source_path) else {
-            descriptors.insert(file_id, (None, None));
+            descriptors.insert(file_id, None);
             continue;
         };
-        let media_type = inferred_media_type_for_path(Some(&path)).map(str::to_owned);
-        descriptors.insert(file_id, (Some(path), media_type));
+        descriptors.insert(file_id, Some(path));
     }
     Ok(descriptors)
 }
@@ -2007,10 +2027,7 @@ fn merge_conflict_side_details(side: &MergeConflictSide) -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
-    use crate::tracked_state::{
-        TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind, TrackedStateDiffRow,
-        TrackedStateKeyRef,
-    };
+    use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateKeyRef};
 
     fn descriptor_row(
         file_id: &str,
@@ -2075,7 +2092,7 @@ mod tests {
         let owner = PluginFileOwner::new(
             file_id,
             "plugin_csv",
-            vec!["csv_v2_row".to_owned(), "csv_v2_table".to_owned()],
+            vec!["csv_row".to_owned(), "csv_table".to_owned()],
         )
         .unwrap();
         MaterializedTrackedStateRow {
@@ -2115,78 +2132,6 @@ mod tests {
                 verify_historical_conflict_row_ref(Some(batch.row(0)), None, side).is_err(),
                 "{side} certified rows must have matching tracked-root entries"
             );
-        }
-    }
-
-    fn derived_file_ref_conflict(file_id: &str) -> TrackedStateMergeConflict {
-        let identity = TrackedStateDiffIdentity::from_key(TrackedStateKey {
-            schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_owned(),
-            entity_pk: EntityPk::single(file_id),
-            file_id: Some(file_id.to_owned()),
-        });
-        let side = |label: &str| TrackedStateDiffEntry {
-            identity: identity.clone(),
-            kind: TrackedStateDiffKind::Modified,
-            before: None,
-            after: Some(TrackedStateDiffRow {
-                identity: identity.clone(),
-                deleted: false,
-                created_at: crate::common::LixTimestamp::expect_parse(
-                    "created_at",
-                    "2026-01-01T00:00:00Z",
-                ),
-                updated_at: crate::common::LixTimestamp::expect_parse(
-                    "updated_at",
-                    "2026-01-01T00:00:00Z",
-                ),
-                change_id: ChangeId::for_test_label(label),
-                commit_id: CommitId::for_test_label(label),
-            }),
-        };
-        let target = side("target");
-        let source = side("source");
-        TrackedStateMergeConflict {
-            identity,
-            target,
-            source,
-        }
-    }
-
-    fn derived_file_ref_pick(file_id: &str) -> TrackedStateMergePick {
-        let change_id = ChangeId::for_test_label("derived-ref-change");
-        let identity = TrackedStateDiffIdentity::from_key(TrackedStateKey {
-            schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_owned(),
-            entity_pk: EntityPk::single(file_id),
-            file_id: Some(file_id.to_owned()),
-        });
-        TrackedStateMergePick {
-            identity: identity.clone(),
-            change_id,
-            selected_row: TrackedStateDiffRow {
-                identity,
-                deleted: false,
-                created_at: crate::common::LixTimestamp::expect_parse(
-                    "created_at",
-                    "2026-01-01T00:00:00Z",
-                ),
-                updated_at: crate::common::LixTimestamp::expect_parse(
-                    "updated_at",
-                    "2026-01-01T00:00:00Z",
-                ),
-                change_id,
-                commit_id: CommitId::for_test_label("derived-ref-commit"),
-            },
-        }
-    }
-
-    fn derived_file_owner(file_id: &str) -> DerivedPluginConflictIndex {
-        DerivedPluginConflictIndex {
-            owners: BTreeMap::from([(
-                file_id.to_owned(),
-                PluginFileOwner::new(file_id, "plugin_git_text", vec!["git_text_line".to_owned()])
-                    .unwrap(),
-            )]),
-            files: BTreeMap::new(),
         }
     }
 
@@ -2273,7 +2218,7 @@ mod tests {
     fn resolver_take_requires_a_present_snapshot() {
         let conflict = PluginMergeConflictRow {
             identity: TrackedStateDiffIdentity::from_key(TrackedStateKey {
-                schema_key: "csv_v2_row".to_owned(),
+                schema_key: "csv_row".to_owned(),
                 file_id: Some("01920000-0000-7000-8000-0000000000a2".to_owned()),
                 entity_pk: EntityPk::single("row-a"),
             }),
@@ -2309,7 +2254,7 @@ mod tests {
     fn resolver_replace_reuses_validated_canonical_batch_row() {
         let conflict = PluginMergeConflictRow {
             identity: TrackedStateDiffIdentity::from_key(TrackedStateKey {
-                schema_key: "csv_v2_row".to_owned(),
+                schema_key: "csv_row".to_owned(),
                 file_id: Some("01920000-0000-7000-8000-0000000000a2".to_owned()),
                 entity_pk: EntityPk::single("row-a"),
             }),
@@ -2377,7 +2322,7 @@ mod tests {
             .collect::<Vec<_>>();
         let identities =
             TrackedStateDiffIdentity::from_key_refs(entity_pks.len(), |index| TrackedStateKeyRef {
-                schema_key: "csv_v2_row",
+                schema_key: "csv_row",
                 file_id: Some("01920000-0000-7000-8000-0000000000a2"),
                 entity_pk: &entity_pks[index],
             })
@@ -2471,33 +2416,5 @@ mod tests {
             ),
             Some("/docs/readme.md".to_owned())
         );
-    }
-
-    #[test]
-    fn derived_file_ref_conflicts_are_reconciled_with_plugin_semantic_state() {
-        let owners = derived_file_owner("01920000-0000-7000-8000-0000000000a2");
-
-        assert!(is_derived_blob_conflict(
-            &derived_file_ref_conflict("01920000-0000-7000-8000-0000000000a2"),
-            &owners,
-        ));
-        assert!(!is_derived_blob_conflict(
-            &derived_file_ref_conflict("01920000-0000-7000-8000-000000000482"),
-            &owners,
-        ));
-    }
-
-    #[test]
-    fn derived_file_ref_picks_are_not_copied_over_semantic_merge_results() {
-        let owners = derived_file_owner("01920000-0000-7000-8000-0000000000a2");
-
-        assert!(pick_is_derived_plugin_state(
-            &derived_file_ref_pick("01920000-0000-7000-8000-0000000000a2"),
-            &owners,
-        ));
-        assert!(!pick_is_derived_plugin_state(
-            &derived_file_ref_pick("01920000-0000-7000-8000-000000000482"),
-            &owners,
-        ));
     }
 }

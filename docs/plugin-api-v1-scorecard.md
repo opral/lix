@@ -1,5 +1,10 @@
 # Plugin API v1 scorecard
 
+> Historical design record, superseded by
+> [Universal plugin API v1 experiment](universal-plugin-api.md). The gates,
+> pending lanes, and decision figures below describe an earlier prototype and
+> are not acceptance evidence for the selected `lix:plugin@1.0.0` API.
+
 Measured on 2026-07-29 from `origin/main` at `57d619aad`. Release results are
 from a local Linux x86-64 build and are intended for relative design guidance,
 not as stable cross-machine latency thresholds.
@@ -107,7 +112,7 @@ Wasm heap cannot hide host duplication.
 ## Decision
 
 Accepted as the production hard cut after the Wasmtime binding, fused push
-sinks, typed CSV pages, certified storage batches, and sparse arena state were
+sinks, universal entity pages, certified storage batches, and sparse arena state were
 connected end to end. The measured matched lanes were:
 
 | format | v2 p50 | v3 p50 | speedup | memory result |

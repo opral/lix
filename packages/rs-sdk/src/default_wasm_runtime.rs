@@ -316,6 +316,11 @@ impl TrackingStoreLimits {
     fn linear_memory_high_water_bytes(&self) -> u64 {
         u64::try_from(self.linear_memory_high_water_bytes).unwrap_or(u64::MAX)
     }
+
+    fn reset_linear_memory_high_water(&mut self) {
+        self.linear_memory_high_water_bytes = self.current_linear_memory_bytes;
+        self.pending_memory_growth = None;
+    }
 }
 
 impl ResourceLimiter for TrackingStoreLimits {
@@ -434,6 +439,7 @@ fn reset_store_limits(
     store: &mut Store<WasiHostState>,
     limits: WasmLimits,
 ) -> Result<(), LixError> {
+    store.data_mut().limits.reset_linear_memory_high_water();
     if let Some(max_fuel) = limits.max_fuel {
         store
             .set_fuel(max_fuel)

@@ -83,12 +83,12 @@ await writeBundledPlugin({
 	files: [
 		["manifest.json", join(repoRoot, "plugins", "csv", "manifest.json")],
 		[
-			"schema/csv_v2_table.json",
-			join(repoRoot, "plugins", "csv", "schema", "csv_v2_table.json"),
+			"schema/csv_table.json",
+			join(repoRoot, "plugins", "csv", "schema", "csv_table.json"),
 		],
 		[
-			"schema/csv_v2_row.json",
-			join(repoRoot, "plugins", "csv", "schema", "csv_v2_row.json"),
+			"schema/csv_row.json",
+			join(repoRoot, "plugins", "csv", "schema", "csv_row.json"),
 		],
 	],
 });
@@ -101,13 +101,13 @@ await writeBundledPlugin({
 			join(repoRoot, "plugins", "markdown", "manifest.json"),
 		],
 		[
-			"schema/markdown_node_v2.json",
+			"schema/markdown_node.json",
 			join(
 				repoRoot,
 				"plugins",
 				"markdown",
 				"schema",
-				"markdown_node_v2.json",
+				"markdown_node.json",
 			),
 		],
 	],

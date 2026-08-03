@@ -1457,7 +1457,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     for (key, archive) in [
-        ("plugin_git_text", build_text_plugin_archive()),
+        ("plugin_text", build_text_plugin_archive()),
         ("plugin_markdown", build_markdown_plugin_archive()),
         ("plugin_json", build_json_plugin_archive()),
         ("plugin_csv", build_csv_plugin_archive()),
@@ -1663,10 +1663,13 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let text_id = file_id_at_path(lix, "/merge.txt").await;
-    let text_rows = lix.execute(
-        "SELECT id, content_base64 FROM git_text_line_v2 WHERE lixcol_file_id = $1 ORDER BY order_key",
-        &[Value::Text(text_id.clone())],
-    ).await.expect("query text lines");
+    let text_rows = lix
+        .execute(
+            "SELECT id, content_base64 FROM text_line WHERE lixcol_file_id = $1 ORDER BY order_key",
+            &[Value::Text(text_id.clone())],
+        )
+        .await
+        .expect("query text lines");
     let text_index = if target {
         0
     } else {
@@ -1687,7 +1690,7 @@ where
         original.replace("beta", "BETA")
     };
     lix.execute(
-        "UPDATE git_text_line_v2 SET content_base64 = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        "UPDATE text_line SET content_base64 = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Text(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text_value)),
             Value::Text(text_row_id),
@@ -1699,7 +1702,7 @@ where
 
     let markdown_id = file_id_at_path(lix, "/merge.md").await;
     let markdown_rows = lix.execute(
-        "SELECT id, payload_json FROM markdown_node_v2 WHERE lixcol_file_id = $1 AND kind = 'paragraph' ORDER BY order_key",
+        "SELECT id, payload_json FROM markdown_node WHERE lixcol_file_id = $1 AND kind = 'paragraph' ORDER BY order_key",
         &[Value::Text(markdown_id.clone())],
     ).await.expect("query Markdown nodes");
     let markdown_index = if target {
@@ -1718,7 +1721,7 @@ where
         original_payload.replace("beta", "BETA")
     };
     lix.execute(
-        "UPDATE markdown_node_v2 SET payload_json = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        "UPDATE markdown_node SET payload_json = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Text(payload),
             Value::Text(markdown_row_id),
@@ -1738,7 +1741,7 @@ where
     let csv_id = file_id_at_path(lix, "/merge.csv").await;
     let csv_rows = lix
         .execute(
-            "SELECT id FROM csv_v2_row WHERE lixcol_file_id = $1 ORDER BY order_key",
+            "SELECT id FROM csv_row WHERE lixcol_file_id = $1 ORDER BY order_key",
             &[Value::Text(csv_id.clone())],
         )
         .await
@@ -1753,7 +1756,7 @@ where
         json!(["beta", "TWO"])
     };
     lix.execute(
-        "UPDATE csv_v2_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Json(cells),
             Value::Text(csv_row_id),
@@ -1859,12 +1862,9 @@ where
             .count() as i64
     };
     for (table, expected) in [
+        ("text_line", entities + extra_count(0) + cfg.branches as i64),
         (
-            "git_text_line_v2",
-            entities + extra_count(0) + cfg.branches as i64,
-        ),
-        (
-            "markdown_node_v2",
+            "markdown_node",
             entities + 1 + extra_count(1) * 2 + cfg.branches as i64 * 2,
         ),
         (
@@ -1872,7 +1872,7 @@ where
             entities + extra_count(2) * 2 + cfg.branches as i64,
         ),
         (
-            "csv_v2_row",
+            "csv_row",
             entities + extra_count(3) * 2 + cfg.branches as i64 * 2,
         ),
         (
@@ -1894,11 +1894,11 @@ where
 
 fn build_text_plugin_archive() -> Vec<u8> {
     build_plugin_archive(
-        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text")),
+        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_TEXT_plugin_text")),
         include_str!("../../../plugins/text/manifest.json"),
         &[(
-            "schema/git_text_line_v2.json",
-            include_str!("../../../plugins/text/schema/git_text_line_v2.json"),
+            "schema/text_line.json",
+            include_str!("../../../plugins/text/schema/text_line.json"),
         )],
     )
 }
@@ -1908,8 +1908,8 @@ fn build_markdown_plugin_archive() -> Vec<u8> {
         Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown")),
         include_str!("../../../plugins/markdown/manifest.json"),
         &[(
-            "schema/markdown_node_v2.json",
-            include_str!("../../../plugins/markdown/schema/markdown_node_v2.json"),
+            "schema/markdown_node.json",
+            include_str!("../../../plugins/markdown/schema/markdown_node.json"),
         )],
     )
 }
@@ -1941,12 +1941,12 @@ fn build_csv_plugin_archive() -> Vec<u8> {
         include_str!("../../../plugins/csv/manifest.json"),
         &[
             (
-                "schema/csv_v2_table.json",
-                include_str!("../../../plugins/csv/schema/csv_v2_table.json"),
+                "schema/csv_table.json",
+                include_str!("../../../plugins/csv/schema/csv_table.json"),
             ),
             (
-                "schema/csv_v2_row.json",
-                include_str!("../../../plugins/csv/schema/csv_v2_row.json"),
+                "schema/csv_row.json",
+                include_str!("../../../plugins/csv/schema/csv_row.json"),
             ),
         ],
     )

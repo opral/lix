@@ -18,7 +18,6 @@ const LIX_COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 const LIX_FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const LIX_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-const LIX_DERIVED_FILE_REF_SCHEMA_KEY: &str = "lix_derived_file_ref";
 const LIX_CHECKPOINT_MARKER_SCHEMA_KEY: &str = "lix_checkpoint_marker";
 const LIX_UNDO_REDO_MARKER_SCHEMA_KEY: &str = "lix_undo_redo_marker";
 const LIX_COLLECTION_GENERATION_SCHEMA_KEY: &str = "lix_collection_generation";
@@ -38,7 +37,6 @@ const LIX_COMMIT_EDGE_SCHEMA_JSON: &str = include_str!("lix_commit_edge.json");
 const LIX_FILE_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_file_descriptor.json");
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_directory_descriptor.json");
 const LIX_BINARY_BLOB_REF_SCHEMA_JSON: &str = include_str!("lix_binary_blob_ref.json");
-const LIX_DERIVED_FILE_REF_SCHEMA_JSON: &str = include_str!("lix_derived_file_ref.json");
 const LIX_CHECKPOINT_MARKER_SCHEMA_JSON: &str = include_str!("lix_checkpoint_marker.json");
 const LIX_UNDO_REDO_MARKER_SCHEMA_JSON: &str = include_str!("lix_undo_redo_marker.json");
 const LIX_COLLECTION_GENERATION_SCHEMA_JSON: &str = include_str!("lix_collection_generation.json");
@@ -58,7 +56,6 @@ static LIX_COMMIT_EDGE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_FILE_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_DIRECTORY_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_BINARY_BLOB_REF_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
-static LIX_DERIVED_FILE_REF_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_CHECKPOINT_MARKER_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_UNDO_REDO_MARKER_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_COLLECTION_GENERATION_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
@@ -79,7 +76,6 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_FILE_DESCRIPTOR_SCHEMA_KEY,
     LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
     LIX_BINARY_BLOB_REF_SCHEMA_KEY,
-    LIX_DERIVED_FILE_REF_SCHEMA_KEY,
     LIX_CHECKPOINT_MARKER_SCHEMA_KEY,
     LIX_UNDO_REDO_MARKER_SCHEMA_KEY,
     LIX_COLLECTION_GENERATION_SCHEMA_KEY,
@@ -162,12 +158,6 @@ pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonVa
         }
         LIX_BINARY_BLOB_REF_SCHEMA_KEY => Some(LIX_BINARY_BLOB_REF_SCHEMA.get_or_init(|| {
             parse_builtin_schema("lix_binary_blob_ref.json", LIX_BINARY_BLOB_REF_SCHEMA_JSON)
-        })),
-        LIX_DERIVED_FILE_REF_SCHEMA_KEY => Some(LIX_DERIVED_FILE_REF_SCHEMA.get_or_init(|| {
-            parse_builtin_schema(
-                "lix_derived_file_ref.json",
-                LIX_DERIVED_FILE_REF_SCHEMA_JSON,
-            )
         })),
         LIX_CHECKPOINT_MARKER_SCHEMA_KEY => Some(LIX_CHECKPOINT_MARKER_SCHEMA.get_or_init(|| {
             parse_builtin_schema(

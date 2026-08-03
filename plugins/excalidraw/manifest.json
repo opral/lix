@@ -1,11 +1,8 @@
 {
   "key": "plugin_excalidraw",
-  "runtime": "wasm-component",
-  "api_version": "1.0.0",
-  "materialization": "blob",
   "match": {
     "path_glob": "*.excalidraw",
-    "content_type": "text"
+    "content": "text"
   },
   "entry": "plugin.wasm",
   "schemas": [

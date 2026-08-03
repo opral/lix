@@ -6784,8 +6784,8 @@ mod tests {
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
         assert_eq!(
             scans.load(Ordering::SeqCst),
-            3,
-            "a blob-less file performs one exact derived-proof disambiguation"
+            2,
+            "a blob-less file needs no second materialization probe"
         );
         let staged_writes = staged_writes.lock().expect("staged writes lock");
         let overlay = staged_writes.deltas[0]
@@ -6989,8 +6989,8 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
         assert_eq!(
             scans.load(Ordering::SeqCst),
-            3,
-            "a blob-less file performs one exact derived-proof disambiguation"
+            2,
+            "a blob-less file needs no second materialization probe"
         );
         assert!(
             staged_writes

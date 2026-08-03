@@ -49,7 +49,7 @@ async function runCycle(index) {
 				new TextEncoder().encode("name,age\nAda,36\nGrace,37\n"),
 			],
 		);
-		const result = await lix.execute("SELECT count(*) AS count FROM csv_v2_row");
+		const result = await lix.execute("SELECT count(*) AS count FROM csv_row");
 		if (result.rows[0]?.get("count") !== 3) {
 			throw new Error("CSV plugin benchmark returned unexpected rows");
 		}

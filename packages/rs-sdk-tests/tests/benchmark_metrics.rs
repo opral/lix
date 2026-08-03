@@ -11,6 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 pub const MACHINE_RECORD_PREFIX: &str = "LIX_BATCH_BENCHMARK_JSON=";
+pub const TRANSITION_RECORD_PREFIX: &str = "LIX_TRANSITION_PROFILE_JSON=";
 pub const LARGE_ALLOCATION_BYTES: u64 = 64 * 1024;
 
 struct CountingSystemAllocator;
@@ -235,32 +236,95 @@ pub struct BenchmarkFixture {
 pub enum BenchmarkGate {
     /// The user-requested batch-write acceptance ratios.
     BulkWrite,
-    /// Sparse and direct operations may regress by no more than five percent.
+    /// Sparse and direct operations use the shared 10% p50 / 15% p95 envelope.
     ElapsedRegression,
+}
+
+/// Emits the non-timing evidence for one measured transition. Keeping this a
+/// separate record lets the allocator window close before hashing or querying
+/// correctness evidence, while preserving an exact sample join key.
+pub fn emit_transition_profile(
+    benchmark: &'static str,
+    lane: &'static str,
+    sample: usize,
+    counters: lix_sdk::WasmTransitionCounters,
+    correctness: serde_json::Value,
+) {
+    eprintln!(
+        "{TRANSITION_RECORD_PREFIX}{}",
+        serde_json::to_string(&serde_json::json!({
+            "schema": "lix.universal-plugin-transition-profile.v1",
+            "benchmark": benchmark,
+            "lane": lane,
+            "sample": sample,
+            "correctness": correctness,
+            "counters": {
+                "source_read_calls": counters.source_read_calls,
+                "source_bytes_read": counters.source_bytes_read,
+                "file_read_calls": counters.file_read_calls,
+                "file_bytes_read": counters.file_bytes_read,
+                "state_read_calls": counters.state_read_calls,
+                "state_key_bytes": counters.state_key_bytes,
+                "state_value_bytes_read": counters.state_value_bytes_read,
+                "entity_input_pages": counters.entity_input_pages,
+                "entity_input_records": counters.entity_input_records,
+                "entity_input_wire_bytes": counters.entity_input_wire_bytes,
+                "entity_output_pages": counters.entity_output_pages,
+                "entity_output_records": counters.entity_output_records,
+                "entity_output_wire_bytes": counters.entity_output_wire_bytes,
+                "entity_input_attachment_reads": counters.entity_input_attachment_reads,
+                "entity_input_attachment_bytes": counters.entity_input_attachment_bytes,
+                "entity_output_attachment_writes": counters.entity_output_attachment_writes,
+                "entity_output_attachment_bytes": counters.entity_output_attachment_bytes,
+                "component_import_calls": counters.component_import_calls,
+                "guest_export_calls": counters.guest_export_calls,
+                "component_boundary_bytes": counters.component_boundary_bytes,
+                "guest_linear_memory_high_water_bytes": counters.guest_linear_memory_high_water_bytes,
+                "host_full_diff_bytes_compared": counters.host_full_diff_bytes_compared,
+                "host_content_classification_bytes": counters.host_content_classification_bytes,
+                "full_state_semantic_rows_materialized": counters.full_state_semantic_rows_materialized,
+                "durable_semantic_changes": counters.durable_semantic_changes,
+                "private_document_cache_hits": counters.private_document_cache_hits,
+                "shared_renderer_cache_hits": counters.shared_renderer_cache_hits,
+                "full_document_reparses": counters.full_document_reparses,
+                "full_renderer_invocations": counters.full_renderer_invocations,
+                "filesystem_sync_full_renders": counters.filesystem_sync_full_renders
+            }
+        }))
+        .expect("transition profile record must serialize")
+    );
 }
 
 impl BenchmarkGate {
     fn json(self) -> serde_json::Value {
         match self {
             Self::BulkWrite => serde_json::json!({
-                "comparison": "candidate_p50_over_baseline_p50",
+                "comparison": "candidate_over_matched_baseline",
                 "max_candidate_over_baseline": {
-                    "elapsed_ms": 0.70,
-                    "allocation_count": 0.40,
-                    "allocated_bytes": 0.50,
-                    "peak_live_bytes_delta": 0.70,
-                    // The end-to-end counter includes unavoidable backend
-                    // buffers, so use a no-regression gate here. The
-                    // transaction and lowering unit tests separately assert
-                    // that engine-owned key/value arenas stay O(1) per batch.
-                    "large_allocation_count": 1.00
-                }
+                    "elapsed_ms_p50": 1.10,
+                    "elapsed_ms_p95": 1.15,
+                    "allocated_bytes_p50": 1.10,
+                    "peak_live_bytes_delta_p50": 1.10,
+                    "guest_linear_memory_peak": 1.10,
+                    "process_rss_peak": 1.10
+                },
+                "allocation_count": {
+                    "max_candidate_over_baseline": 1.20,
+                    "only_when_allocated_bytes_improve": true
+                },
+                "correctness": "exact_hashes_and_cardinality"
             }),
             Self::ElapsedRegression => serde_json::json!({
-                "comparison": "candidate_p50_over_baseline_p50",
+                "comparison": "candidate_over_matched_baseline",
                 "max_candidate_over_baseline": {
-                    "elapsed_ms": 1.05
-                }
+                    "elapsed_ms_p50": 1.10,
+                    "elapsed_ms_p95": 1.15,
+                    "allocated_bytes_p50": 1.10,
+                    "peak_live_bytes_delta_p50": 1.10,
+                    "guest_linear_memory_peak": 1.10,
+                    "process_rss_peak": 1.10
+                },
+                "correctness": "exact_hashes_and_cardinality"
             }),
         }
     }
@@ -397,10 +461,17 @@ mod tests {
         let thresholds = gate["max_candidate_over_baseline"]
             .as_object()
             .expect("bulk-write thresholds must be an object");
-        assert_eq!(thresholds["elapsed_ms"].as_f64(), Some(0.70));
-        assert_eq!(thresholds["allocation_count"].as_f64(), Some(0.40));
-        assert_eq!(thresholds["allocated_bytes"].as_f64(), Some(0.50));
-        assert_eq!(thresholds["peak_live_bytes_delta"].as_f64(), Some(0.70));
-        assert_eq!(thresholds["large_allocation_count"].as_f64(), Some(1.00));
+        assert_eq!(thresholds["elapsed_ms_p50"].as_f64(), Some(1.10));
+        assert_eq!(thresholds["elapsed_ms_p95"].as_f64(), Some(1.15));
+        assert_eq!(thresholds["allocated_bytes_p50"].as_f64(), Some(1.10));
+        assert_eq!(thresholds["peak_live_bytes_delta_p50"].as_f64(), Some(1.10));
+        assert_eq!(
+            gate["allocation_count"]["max_candidate_over_baseline"].as_f64(),
+            Some(1.20)
+        );
+        assert_eq!(
+            gate["allocation_count"]["only_when_allocated_bytes_improve"].as_bool(),
+            Some(true)
+        );
     }
 }

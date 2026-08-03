@@ -35,7 +35,7 @@ use crate::binary_cas::{BlobDataReader, BlobId, BlobRangeBytes};
 use crate::branch::BranchRefReader;
 use crate::common::{LixPath, MutationIdentity, RequestBlobSpliceProvenance, compose_file_path};
 use crate::entity_pk::EntityPk;
-use crate::filesystem::{DERIVED_FILE_REF_SCHEMA_KEY, FilesystemIndex, filesystem_schema_keys};
+use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::filesystem::{
     FilesystemPathEntry, FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemPathKind,
     FilesystemPathSelection,
@@ -49,12 +49,10 @@ use crate::live_state::{
     MaterializedLiveStateBatchBuilder, MaterializedLiveStateRowRef,
 };
 use crate::plugin::{
-    CompiledPluginCatalog, FileBytesSha256, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorKey,
-    PluginActorStore, PluginFileOwner, PluginMaterialization, PluginRegistry, PluginRegistryEntry,
-    PluginRuntimeHost, VecEntitySource, drain_entity_transition_edits,
-    host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
+    CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorKey, PluginFileOwner,
+    PluginRegistry, PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
     plugin_archive_delete_origin, plugin_archive_file_id_matches, plugin_key_from_archive_path,
-    plugin_state_live_state_projection, plugin_storage_archive_file_id,
+    plugin_storage_archive_file_id,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -73,10 +71,6 @@ use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 #[cfg(test)]
 use crate::transaction::types::TransactionWriteRow;
 use crate::transaction::types::{RawWriteBatch, TransactionJson};
-use crate::wasm::{
-    WasmFileDescriptor, WasmHostEntity, WasmOpenEntitiesInput, WasmPluginSelection,
-    WasmTransitionLimits,
-};
 use crate::{
     GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value,
     serialize_row_metadata,
@@ -90,7 +84,7 @@ use crate::filesystem::{
     BlobRefRowInput, DirectoryPathRecord, DirectoryPathResolver, FileDeleteInput,
     FileDescriptorWriteInput, FileDescriptorWriteIntent, FilesystemBlobRefKey,
     FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext,
-    append_blob_ref_tombstone_row, append_derived_file_ref_tombstone_row, derive_directory_paths,
+    append_blob_ref_tombstone_row, derive_directory_paths,
     directory_path_resolvers_from_live_state, directory_path_resolvers_from_path_index,
     directory_path_resolvers_from_state_batch, filesystem_storage_scope_key, plan_file_delete,
     plan_file_descriptor_write, plan_parsed_file_path_update_with_resolvers,
@@ -230,7 +224,6 @@ struct LixFileSpec {
 
 struct LixFileDmlSourceState {
     blob_ref_keys: BTreeSet<FilesystemBlobRefKey>,
-    derived_file_ref_keys: BTreeSet<FilesystemBlobRefKey>,
     plugin_render: Option<PluginRenderContext>,
     path_resolvers: Option<BTreeMap<String, DirectoryPathResolver>>,
     path_index: Option<FilesystemPathSelection>,
@@ -483,16 +476,7 @@ impl LixFileSpec {
                         None,
                     )
                 };
-                let mut prepared = prepared.map_err(lix_error_to_datafusion_error)?;
-                let file_keys = prepared.blobless_plugin_file_keys();
-                hydrate_derived_file_ref_rows(
-                    Arc::clone(&live_state),
-                    &request,
-                    file_keys,
-                    &mut prepared,
-                )
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
+                let prepared = prepared.map_err(lix_error_to_datafusion_error)?;
                 let plugin_render = if prepared.needs_plugin_render(options.needs_data)
                     || (options.needs_plugin_ownership && !prepared.file_rows.is_empty())
                 {
@@ -513,16 +497,7 @@ impl LixFileSpec {
                 } else {
                     None
                 };
-                hydrate_derived_materialization_rows(
-                    live_state,
-                    &request,
-                    plugin_render.as_ref(),
-                    &mut prepared,
-                )
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
                 let blob_ref_keys = prepared.blob_rows.keys().cloned().collect();
-                let derived_file_ref_keys = prepared.derived_rows.keys().cloned().collect();
                 let source_batch = lix_file_record_batch_from_prepared(
                     &table_schema,
                     &blob_reader,
@@ -535,7 +510,6 @@ impl LixFileSpec {
                 *captured.lock().expect("lix_file DML source mutex poisoned") =
                     Some(LixFileDmlSourceState {
                         blob_ref_keys,
-                        derived_file_ref_keys,
                         plugin_render,
                         path_resolvers,
                         path_index,
@@ -709,7 +683,7 @@ pub(crate) async fn execute_exact_lix_file_read(
         ),
     };
     let rows = scan_indexed_file_batch(&matches, true)?;
-    let mut prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
     let load_data = column == ExactLixFileReadColumn::Data;
     let acknowledge_plugin_data = load_data && session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
@@ -725,13 +699,6 @@ pub(crate) async fn execute_exact_lix_file_read(
     } else {
         None
     };
-    hydrate_derived_materialization_rows(
-        live_state,
-        &request,
-        plugin_render.as_ref(),
-        &mut prepared,
-    )
-    .await?;
     let batch = lix_file_record_batch_from_prepared(
         &schema,
         &blob_reader,
@@ -855,7 +822,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
         .await?;
     let matches = indexed_file_matches(index, &FilePathPredicate::In(paths.clone()));
     let rows = scan_indexed_file_batch(&matches, true)?;
-    let mut prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
     let acknowledge_plugin_data = session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
         plugin_render_context_for_lix_file_scan_cached(
@@ -871,13 +838,6 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     } else {
         None
     };
-    hydrate_derived_materialization_rows(
-        live_state,
-        &request,
-        plugin_render.as_ref(),
-        &mut prepared,
-    )
-    .await?;
 
     // No relational operators remain after exact path selection. Move owned
     // blobs into the result instead of packing them into Arrow only for
@@ -952,7 +912,7 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
         .await?;
     let matches = indexed_file_id_matches(index, file_ids, &FilePathPredicate::All);
     let rows = scan_indexed_file_batch(&matches, true)?;
-    let mut prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
     let acknowledge_plugin_data = session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
         plugin_render_context_for_lix_file_scan(
@@ -967,13 +927,6 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
     } else {
         None
     };
-    hydrate_derived_materialization_rows(
-        live_state,
-        &request,
-        plugin_render.as_ref(),
-        &mut prepared,
-    )
-    .await?;
     let batch =
         lix_file_record_batch_from_prepared(&schema, &blob_reader, plugin_render, true, prepared)
             .await?;
@@ -1217,7 +1170,7 @@ impl TableSpec for LixFileSpec {
                             "lix_file",
                         );
                     }
-                    let mut prepared = if let Some(indexed_matches) = indexed_matches.as_ref() {
+                    let prepared = if let Some(indexed_matches) = indexed_matches.as_ref() {
                         let rows = scan_indexed_file_batch(indexed_matches, needs_blob_rows)
                             .map_err(|error| {
                                 DataFusionError::Execution(format!(
@@ -1266,19 +1219,6 @@ impl TableSpec for LixFileSpec {
                     } else {
                         None
                     };
-                    hydrate_derived_materialization_rows(
-                        Arc::clone(&live_state),
-                        &request,
-                        plugin_render.as_ref(),
-                        &mut prepared,
-                    )
-                    .await
-                    .map_err(|error| {
-                        DataFusionError::Context(
-                            "sql2 lix_file derived-materialization discovery failed".to_string(),
-                            Box::new(lix_error_to_datafusion_error(error)),
-                        )
-                    })?;
                     let batch = lix_file_record_batch_from_prepared(
                         &batch_schema,
                         &blob_reader,
@@ -1508,7 +1448,6 @@ impl TableSpec for LixFileSpec {
                     &matched_batch,
                     branch_binding.active_branch_id(),
                     &source_state.blob_ref_keys,
-                    &source_state.derived_file_ref_keys,
                     plugin_archive_delete_target.as_deref(),
                 )?;
                 let count = staged.count;
@@ -1624,7 +1563,6 @@ impl LixFileSpec {
                     .transpose()?;
                 let LixFileDmlSourceState {
                     blob_ref_keys,
-                    derived_file_ref_keys,
                     plugin_render,
                     path_resolvers: captured_path_resolvers,
                     path_index,
@@ -1672,7 +1610,6 @@ impl LixFileSpec {
                     branch_binding.active_branch_id(),
                     update_columns,
                     &blob_ref_keys,
-                    &derived_file_ref_keys,
                     &plugin_rewrite_file_ids,
                     path_resolvers.as_mut(),
                     &mut || functions.call_uuid_v7().to_string(),
@@ -1941,7 +1878,7 @@ impl UpsertSupport for LixFileSpec {
 
         let live_state: Arc<dyn LiveStateReader> =
             Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let mut prepared = if let Some(indexed_matches) = indexed_matches.as_ref() {
+        let prepared = if let Some(indexed_matches) = indexed_matches.as_ref() {
             // Conflict probes only need the proposed exact IDs or paths. Use
             // the visible filesystem index for descriptor matching, then fetch
             // correlated blob refs solely for those files.
@@ -1979,14 +1916,6 @@ impl UpsertSupport for LixFileSpec {
         } else {
             None
         };
-        hydrate_derived_materialization_rows(
-            live_state,
-            &request,
-            plugin_render.as_ref(),
-            &mut prepared,
-        )
-        .await
-        .map_err(lix_error_to_datafusion_error)?;
         lix_file_record_batch_from_prepared(
             &self.schema,
             &self.blob_reader,
@@ -2061,7 +1990,7 @@ impl UpsertSupport for LixFileSpec {
         // descriptors. Recover only their correlated blob refs; rebuilding
         // the path index here would duplicate the conflict probe's topology
         // read, especially for path-based upserts.
-        let mut rows = match &target_file_ids {
+        let rows = match &target_file_ids {
             FileIdConstraint::Ids(file_ids) => {
                 scan_exact_file_blob_batch(live_state.clone(), &request, file_ids).await
             }
@@ -2072,30 +2001,6 @@ impl UpsertSupport for LixFileSpec {
         .map_err(lix_error_to_datafusion_error)?;
         let blob_ref_keys =
             blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
-        let needs_derived_proof = match &target_file_ids {
-            FileIdConstraint::Ids(file_ids) => blob_ref_keys.len() < file_ids.len(),
-            FileIdConstraint::All => true,
-            FileIdConstraint::None => false,
-        };
-        if needs_derived_proof {
-            let mut derived_request = request.clone();
-            derived_request.filter.schema_keys = vec![DERIVED_FILE_REF_SCHEMA_KEY.to_string()];
-            derived_request.filter.entity_pks = match &target_file_ids {
-                FileIdConstraint::Ids(file_ids) => file_ids
-                    .iter()
-                    .map(|file_id| file_id_entity_pk(file_id))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(lix_error_to_datafusion_error)?,
-                FileIdConstraint::All | FileIdConstraint::None => Vec::new(),
-            };
-            let derived_rows = live_state
-                .scan_batch(&derived_request)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
-            rows = concatenate_live_state_batches([rows, derived_rows]);
-        }
-        let derived_file_ref_keys =
-            derived_file_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
 
         let plugin_rewrite_file_ids = if update_columns.updates_path() && !update_columns.data {
             let plugin_host = self.plugin_host.clone();
@@ -2152,7 +2057,6 @@ impl UpsertSupport for LixFileSpec {
             branch_binding,
             update_columns,
             &blob_ref_keys,
-            &derived_file_ref_keys,
             &plugin_rewrite_file_ids,
             path_resolvers.as_mut(),
             &mut || self.functions.call_uuid_v7().to_string(),
@@ -2449,7 +2353,6 @@ impl FileDescriptorRecord {
 
 #[derive(Clone)]
 struct PluginRenderContext {
-    live_state: Arc<dyn LiveStateReader>,
     host: PluginRuntimeHost,
     branches: BTreeMap<String, BranchPluginRenderContext>,
     owners_by_file: BTreeMap<FilesystemDescriptorKey, PluginFileOwner>,
@@ -2476,21 +2379,6 @@ impl PluginRenderContext {
         self.owner_change_ids_by_file.get(key).map(String::as_str)
     }
 
-    /// Returns only owners whose current durable contract derives file bytes
-    /// from semantic rows. Normal blob-only filesystem reads never need to
-    /// probe this private proof schema.
-    fn derived_materialization_file_keys(&self) -> Vec<FilesystemDescriptorKey> {
-        self.owners_by_file
-            .iter()
-            .filter_map(|(file_key, owner)| {
-                self.branch(file_key.branch_id())
-                    .and_then(|branch| branch.registry.get(owner.plugin_key()))
-                    .filter(|plugin| plugin.materialization() == PluginMaterialization::Derived)
-                    .map(|_| file_key.clone())
-            })
-            .collect()
-    }
-
     fn with_session_file_views(mut self, session_file_views: Option<SessionFileViews>) -> Self {
         self.session_file_views = session_file_views;
         self
@@ -2501,14 +2389,6 @@ impl PluginRenderContext {
 struct BlobRefRecord {
     blob_hash: String,
     inline_data: Option<Vec<u8>>,
-    live: LiveStateRowHandle,
-}
-
-#[derive(Debug, Clone)]
-struct DerivedFileRefRecord {
-    path: String,
-    sha256: String,
-    size_bytes: u64,
     live: LiveStateRowHandle,
 }
 
@@ -2579,43 +2459,6 @@ fn blob_ref_record_from_live_row(
         BlobRefRecord {
             blob_hash: snapshot.blob_hash,
             inline_data: None,
-            live: handle,
-        },
-    )))
-}
-
-#[derive(Debug, Deserialize)]
-struct DerivedFileRefSnapshot {
-    id: String,
-    path: String,
-    sha256: String,
-    size_bytes: u64,
-}
-
-fn derived_file_ref_record_from_live_row(
-    row: MaterializedLiveStateRowRef<'_>,
-    handle: LiveStateRowHandle,
-) -> Result<Option<(FilesystemBlobRefKey, DerivedFileRefRecord)>, LixError> {
-    if row.schema_key() != DERIVED_FILE_REF_SCHEMA_KEY {
-        return Ok(None);
-    }
-    let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
-        return Ok(None);
-    };
-    let snapshot: DerivedFileRefSnapshot =
-        serde_json::from_str(snapshot_content).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("invalid lix_derived_file_ref snapshot JSON: {error}"),
-            )
-        })?;
-    let key = FilesystemBlobRefKey::from_live_row_ref(row, snapshot.id);
-    Ok(Some((
-        key,
-        DerivedFileRefRecord {
-            path: snapshot.path,
-            sha256: snapshot.sha256,
-            size_bytes: snapshot.size_bytes,
             live: handle,
         },
     )))
@@ -2898,7 +2741,6 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                         content.clone(),
                         context,
                         existing.blob_hash.is_some(),
-                        existing.has_derived_file_ref,
                         base_blob_hash,
                         None,
                     )
@@ -2933,7 +2775,6 @@ async fn execute_fast_lix_file_id_path_writes_inner(
                         content.clone(),
                         context,
                         existing.blob_hash.is_some(),
-                        existing.has_derived_file_ref,
                         base_blob_hash,
                         None,
                     )
@@ -3185,7 +3026,6 @@ async fn stage_indexed_file_path_writes(
                 content,
                 context,
                 materialization.has_blob_ref,
-                materialization.has_derived_file_ref,
                 materialization.blob_hash,
                 None,
             )
@@ -3232,7 +3072,6 @@ async fn stage_indexed_file_path_writes(
 #[derive(Debug, Clone, Copy, Default)]
 struct ExistingFileMaterialization {
     has_blob_ref: bool,
-    has_derived_file_ref: bool,
     blob_hash: Option<BlobId>,
 }
 
@@ -3247,9 +3086,6 @@ async fn load_exact_existing_materializations(
         .iter()
         .map(|entry| (entry.key.clone(), Arc::clone(entry)))
         .collect::<BTreeMap<_, _>>();
-    // Preserve the one-point-read fast path for ordinary raw/blob files. A
-    // valid file cannot have both representations, so only blob misses need
-    // the private derived-proof probe below.
     let blob_requests = unique
         .iter()
         .map(|(key, entry)| {
@@ -3296,52 +3132,6 @@ async fn load_exact_existing_materializations(
             .and_then(|snapshot| BlobId::from_hex(&snapshot.blob_hash).ok());
     }
 
-    let derived_requests = unique
-        .iter()
-        .filter(|(key, _)| {
-            !materializations
-                .get(*key)
-                .is_some_and(|materialization| materialization.has_blob_ref)
-        })
-        .map(|(key, entry)| {
-            Ok((
-                key.clone(),
-                LiveStateExactRowRequest {
-                    branch_id: entry.key.branch_id().to_string(),
-                    schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
-                    entity_pk: file_id_entity_pk(entry.id())?,
-                    file_id: Some(entry.id().to_string()),
-                },
-            ))
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    if derived_requests.is_empty() {
-        return Ok(materializations);
-    }
-    let rows = ctx
-        .load_exact_live_state_batch(&LiveStateExactBatchRequest {
-            rows: derived_requests
-                .iter()
-                .map(|(_, request)| request.clone())
-                .collect(),
-            projection: LiveStateProjection::default(),
-            untracked: Some(false),
-            include_tombstones: false,
-        })
-        .await?;
-    for (row_index, (key, _)) in derived_requests.into_iter().enumerate() {
-        let Some(row) = rows.row(row_index) else {
-            continue;
-        };
-        let tracking_mismatch = row.untracked() ^ key.is_untracked();
-        if row.branch_id() != key.branch_id() || row.global() != key.global() || tracking_mismatch {
-            continue;
-        }
-        materializations
-            .entry(key)
-            .or_default()
-            .has_derived_file_ref = true;
-    }
     Ok(materializations)
 }
 
@@ -3414,33 +3204,19 @@ async fn execute_fast_lix_file_data_update_by_id_impl(
     let target_file_ids = BTreeSet::from([file_id.clone()]);
     let indexed_matches = indexed_file_id_matches(index, &target_file_ids, &FilePathPredicate::All);
 
-    // Materialization references are not part of the descriptor index and can
-    // change without a path-index revision. Keep the normal blob-only point
-    // read hot; a missing blob is the only state that can require the private
-    // derived proof lookup.
+    // Blob references are not part of the descriptor index and can change
+    // without a path-index revision.
     let mut blob_request = lix_file_scan_request(Some(&active_branch_id), None, None);
     blob_request.filter.schema_keys = vec![BLOB_REF_SCHEMA_KEY.to_string()];
     blob_request.filter.entity_pks = vec![file_id_entity_pk(&file_id)?];
     let rows = ctx.scan_live_state_batch(&blob_request).await?;
 
-    let mut prepared = prepare_indexed_lix_file_rows(&indexed_matches, rows)?;
-    let needs_derived_proof = prepared.file_rows.values().any(|file| {
-        !prepared
-            .blob_rows
-            .contains_key(&file.blob_ref_key(&prepared.live_rows))
-    });
-    if needs_derived_proof {
-        let mut derived_request = blob_request;
-        derived_request.filter.schema_keys = vec![DERIVED_FILE_REF_SCHEMA_KEY.to_string()];
-        let rows = ctx.scan_live_state_batch(&derived_request).await?;
-        prepared.extend_derived_file_ref_rows(rows)?;
-    }
+    let prepared = prepare_indexed_lix_file_rows(&indexed_matches, rows)?;
 
     let PreparedLixFileRows {
         live_rows,
         file_rows,
         blob_rows,
-        derived_rows,
         file_paths,
         ..
     } = prepared;
@@ -3457,14 +3233,7 @@ async fn execute_fast_lix_file_data_update_by_id_impl(
                 .get(&blob_ref_key)
                 .and_then(|row| BlobId::from_hex(&row.blob_hash).ok());
             let has_blob_ref = blob_rows.contains_key(&blob_ref_key);
-            let has_derived_file_ref = derived_rows.contains_key(&blob_ref_key);
-            (
-                path,
-                file,
-                has_blob_ref,
-                has_derived_file_ref,
-                base_blob_hash,
-            )
+            (path, file, has_blob_ref, base_blob_hash)
         })
         .collect::<Vec<_>>();
     if existing.is_empty() {
@@ -3472,7 +3241,7 @@ async fn execute_fast_lix_file_data_update_by_id_impl(
     }
 
     let mut staged = LixFileStagedBatch::with_row_capacity(existing.len().saturating_mul(3));
-    for (path, existing, has_blob_ref, has_derived_file_ref, base_blob_hash) in existing {
+    for (path, existing, has_blob_ref, base_blob_hash) in existing {
         parse_file_upsert_path(&path, TransactionWriteOperation::Update)
             .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
         let mut context = existing.row_context(&live_rows);
@@ -3497,7 +3266,6 @@ async fn execute_fast_lix_file_data_update_by_id_impl(
             data.clone(),
             context,
             has_blob_ref,
-            has_derived_file_ref,
             base_blob_hash,
             None,
         )
@@ -3635,7 +3403,6 @@ fn lix_file_delete_stage_from_batch(
     batch: &RecordBatch,
     branch_binding: Option<&str>,
     blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
-    derived_file_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
     plugin_archive_delete_target: Option<&str>,
 ) -> Result<LixFileStagedBatch> {
     let mut staged = LixFileStagedBatch::with_row_capacity(batch.num_rows().saturating_mul(3));
@@ -3647,8 +3414,6 @@ fn lix_file_delete_stage_from_batch(
         let mut plan = plan_file_delete(FileDeleteInput {
             file_id: file_id.clone(),
             has_blob_ref: blob_ref_keys
-                .contains(&FilesystemBlobRefKey::from_context(&context, &file_id)),
-            has_derived_file_ref: derived_file_ref_keys
                 .contains(&FilesystemBlobRefKey::from_context(&context, &file_id)),
             context,
         });
@@ -3747,29 +3512,6 @@ fn blob_ref_keys_from_live_rows(
     Ok(keys)
 }
 
-fn derived_file_ref_keys_from_live_rows(
-    rows: &MaterializedLiveStateBatch,
-) -> std::result::Result<BTreeSet<FilesystemBlobRefKey>, LixError> {
-    let mut keys = BTreeSet::new();
-    for row in rows.iter() {
-        if row.schema_key() != DERIVED_FILE_REF_SCHEMA_KEY {
-            continue;
-        }
-        let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
-            continue;
-        };
-        let snapshot: DerivedFileRefSnapshot =
-            serde_json::from_str(snapshot_content).map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("invalid lix_derived_file_ref snapshot JSON: {error}"),
-                )
-            })?;
-        keys.insert(FilesystemBlobRefKey::from_live_row_ref(row, snapshot.id));
-    }
-    Ok(keys)
-}
-
 #[cfg(test)]
 fn lix_file_insert_stage_from_batch(
     batch: &RecordBatch,
@@ -3825,7 +3567,6 @@ fn lix_file_existing_update_stage_from_batch(
     include_descriptor_writes: bool,
     include_data_writes: bool,
     blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
-    derived_file_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
     path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
 ) -> Result<LixFileStagedBatch> {
     let mut staged = LixFileStagedBatch::with_row_capacity(batch.num_rows().saturating_mul(3));
@@ -3890,8 +3631,6 @@ fn lix_file_existing_update_stage_from_batch(
             };
             let has_blob_ref =
                 blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
-            let has_derived_file_ref =
-                derived_file_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
             stage_lix_file_data_update_write(
                 &mut staged,
                 id.clone(),
@@ -3900,7 +3639,6 @@ fn lix_file_existing_update_stage_from_batch(
                 data,
                 context,
                 has_blob_ref,
-                has_derived_file_ref,
                 None,
                 None,
             )?;
@@ -4029,7 +3767,6 @@ fn lix_file_update_stage_from_batch(
     branch_binding: Option<&str>,
     update_columns: LixFileUpdateColumns,
     blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
-    derived_file_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
     plugin_rewrite_file_ids: &BTreeSet<String>,
     path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
     generate_directory_id: &mut dyn FnMut() -> String,
@@ -4049,7 +3786,6 @@ fn lix_file_update_stage_from_batch(
                 branch_binding,
                 update_columns,
                 blob_ref_keys,
-                derived_file_ref_keys,
                 plugin_rewrite_file_ids,
                 path_resolvers,
                 generate_directory_id,
@@ -4062,7 +3798,6 @@ fn lix_file_update_stage_from_batch(
                 update_columns.writes_descriptor(),
                 update_columns.data,
                 blob_ref_keys,
-                derived_file_ref_keys,
                 Some(path_resolvers),
             )
         };
@@ -4075,7 +3810,6 @@ fn lix_file_update_stage_from_batch(
         update_columns.writes_descriptor(),
         update_columns.data,
         blob_ref_keys,
-        derived_file_ref_keys,
         None,
     )
 }
@@ -4086,7 +3820,6 @@ fn lix_file_path_update_stage_from_batch(
     branch_binding: Option<&str>,
     update_columns: LixFileUpdateColumns,
     blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
-    derived_file_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
     plugin_rewrite_file_ids: &BTreeSet<String>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_directory_id: &mut dyn FnMut() -> String,
@@ -4130,8 +3863,6 @@ fn lix_file_path_update_stage_from_batch(
         if let Some(data) = assigned_data {
             let has_blob_ref =
                 blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
-            let has_derived_file_ref =
-                derived_file_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
             stage_lix_file_data_update_write(
                 &mut staged,
                 id.clone(),
@@ -4140,7 +3871,6 @@ fn lix_file_path_update_stage_from_batch(
                 data,
                 context,
                 has_blob_ref,
-                has_derived_file_ref,
                 None,
                 None,
             )?;
@@ -4148,8 +3878,6 @@ fn lix_file_path_update_stage_from_batch(
             let data = required_binary_value(batch, row_index, "data")?;
             let has_blob_ref =
                 blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
-            let has_derived_file_ref =
-                derived_file_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
             stage_lix_file_data_update_write(
                 &mut staged,
                 id.clone(),
@@ -4158,7 +3886,6 @@ fn lix_file_path_update_stage_from_batch(
                 data,
                 context,
                 has_blob_ref,
-                has_derived_file_ref,
                 None,
                 None,
             )?;
@@ -4449,7 +4176,6 @@ fn stage_lix_file_data_update_write(
     content: impl Into<FileContent>,
     context: FilesystemRowContext,
     has_blob_ref: bool,
-    has_derived_file_ref: bool,
     base_blob_hash: Option<BlobId>,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
@@ -4470,28 +4196,10 @@ fn stage_lix_file_data_update_write(
             append_blob_ref_tombstone_row(&mut staged.state_rows, file_id, context.clone());
             staged.state_rows.set_origin(row_index, origin.clone());
         }
-        if has_derived_file_ref {
-            let row_index = staged.state_rows.len();
-            append_derived_file_ref_tombstone_row(
-                &mut staged.state_rows,
-                file_payload.file_id.clone(),
-                context,
-            );
-            staged.state_rows.set_origin(row_index, origin);
-        }
         staged.file_data_writes.push(file_payload);
         return Ok(());
     }
     stage_lix_file_data_blob_ref_write(staged, &file_payload, &context, origin.clone())?;
-    if has_derived_file_ref {
-        let row_index = staged.state_rows.len();
-        append_derived_file_ref_tombstone_row(
-            &mut staged.state_rows,
-            file_payload.file_id.clone(),
-            context,
-        );
-        staged.state_rows.set_origin(row_index, origin);
-    }
     staged.file_data_writes.push(file_payload);
     Ok(())
 }
@@ -4635,7 +4343,6 @@ struct PreparedLixFileRows {
     live_rows: LiveStateBatchOwners,
     file_rows: BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
     blob_rows: BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
-    derived_rows: BTreeMap<FilesystemBlobRefKey, DerivedFileRefRecord>,
     file_paths: BTreeMap<FilesystemDescriptorKey, String>,
     path_ordered_file_keys: Option<Vec<FilesystemDescriptorKey>>,
 }
@@ -4645,12 +4352,9 @@ impl PreparedLixFileRows {
         needs_data
             && self.file_rows.values().any(|file| {
                 plugin_file_can_have_durable_owner(file)
-                    && (!self
+                    && !self
                         .blob_rows
                         .contains_key(&file.blob_ref_key(&self.live_rows))
-                        || self
-                            .derived_rows
-                            .contains_key(&file.blob_ref_key(&self.live_rows)))
             })
     }
 
@@ -4662,41 +4366,10 @@ impl PreparedLixFileRows {
                     && (include_blob_backed
                         || !self
                             .blob_rows
-                            .contains_key(&file.blob_ref_key(&self.live_rows))
-                        || self
-                            .derived_rows
                             .contains_key(&file.blob_ref_key(&self.live_rows)))
             })
             .map(|file| file.key.clone())
             .collect()
-    }
-
-    fn blobless_plugin_file_keys(&self) -> Vec<FilesystemDescriptorKey> {
-        self.file_rows
-            .values()
-            .filter(|file| {
-                plugin_file_can_have_durable_owner(file)
-                    && !self
-                        .blob_rows
-                        .contains_key(&file.blob_ref_key(&self.live_rows))
-            })
-            .map(|file| file.key.clone())
-            .collect()
-    }
-
-    fn extend_derived_file_ref_rows(
-        &mut self,
-        rows: impl Into<MaterializedLiveStateBatch>,
-    ) -> Result<(), LixError> {
-        let batch = self.live_rows.push(rows.into());
-        for row_index in 0..self.live_rows.batch(batch).len() {
-            let handle = live_state_row_handle(batch, row_index);
-            let row = self.live_rows.row(handle);
-            if let Some((key, record)) = derived_file_ref_record_from_live_row(row, handle)? {
-                self.derived_rows.insert(key, record);
-            }
-        }
-        Ok(())
     }
 }
 
@@ -4732,7 +4405,6 @@ fn prepare_lix_file_rows(
     let batch = live_rows.push(rows.into());
     let mut file_rows = BTreeMap::<FilesystemDescriptorKey, FileDescriptorRecord>::new();
     let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
-    let mut derived_rows = BTreeMap::<FilesystemBlobRefKey, DerivedFileRefRecord>::new();
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
 
     for row_index in 0..live_rows.batch(batch).len() {
@@ -4769,11 +4441,6 @@ fn prepare_lix_file_rows(
             BLOB_REF_SCHEMA_KEY => {
                 if let Some((key, record)) = blob_ref_record_from_live_row(row, handle)? {
                     blob_rows.insert(key, record);
-                }
-            }
-            DERIVED_FILE_REF_SCHEMA_KEY => {
-                if let Some((key, record)) = derived_file_ref_record_from_live_row(row, handle)? {
-                    derived_rows.insert(key, record);
                 }
             }
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
@@ -4838,7 +4505,6 @@ fn prepare_lix_file_rows(
         live_rows,
         file_rows,
         blob_rows,
-        derived_rows,
         file_paths,
         path_ordered_file_keys: None,
     })
@@ -4906,7 +4572,6 @@ fn prepare_indexed_lix_file_rows(
     let pushed_indexed_batch = live_rows.push(indexed_builder.finish());
     debug_assert_eq!(pushed_indexed_batch, indexed_batch);
 
-    let mut derived_rows = BTreeMap::<FilesystemBlobRefKey, DerivedFileRefRecord>::new();
     for batch in [indexed_batch, scanned_batch] {
         for row_index in 0..live_rows.batch(batch).len() {
             let handle = live_state_row_handle(batch, row_index);
@@ -4920,12 +4585,6 @@ fn prepare_indexed_lix_file_rows(
                         blob_rows.entry(key).or_insert(record);
                     }
                 }
-                DERIVED_FILE_REF_SCHEMA_KEY => {
-                    if let Some((key, record)) = derived_file_ref_record_from_live_row(row, handle)?
-                    {
-                        derived_rows.insert(key, record);
-                    }
-                }
                 _ => {}
             }
         }
@@ -4935,7 +4594,6 @@ fn prepare_indexed_lix_file_rows(
         live_rows,
         file_rows,
         blob_rows,
-        derived_rows,
         file_paths,
         path_ordered_file_keys: Some(path_ordered_file_keys),
     })
@@ -5227,7 +4885,6 @@ async fn lix_file_record_batch_from_prepared(
         live_rows,
         mut file_rows,
         blob_rows,
-        derived_rows,
         mut file_paths,
         path_ordered_file_keys,
     } = prepared;
@@ -5249,7 +4906,6 @@ async fn lix_file_record_batch_from_prepared(
                 &file_keys,
                 &file_rows,
                 &blob_rows,
-                &derived_rows,
                 &file_paths,
             )
             .await?
@@ -5269,12 +4925,6 @@ async fn lix_file_record_batch_from_prepared(
                 Some(data) => data,
                 None => match rendered_plugin_bytes.remove(&key) {
                     Some(data) => Some(data),
-                    None if derived_rows.contains_key(&blob_key) => {
-                        return Err(invalid_plugin_read_state(format!(
-                            "derived-materialization file '{}' has no renderer output",
-                            file.id
-                        )));
-                    }
                     None => Some(Vec::new()),
                 },
             }
@@ -5284,21 +4934,11 @@ async fn lix_file_record_batch_from_prepared(
         let projected_change_id = blob_rows
             .get(&blob_key)
             .and_then(|blob_ref| live_rows.row(blob_ref.live).change_id())
-            .or_else(|| {
-                derived_rows
-                    .get(&blob_key)
-                    .and_then(|derived| live_rows.row(derived.live).change_id())
-            })
             .or_else(|| live_rows.row(file.live).change_id());
         let live = live_rows.row(file.live);
         let content_live = blob_rows
             .get(&blob_key)
-            .map(|blob_ref| live_rows.row(blob_ref.live))
-            .or_else(|| {
-                derived_rows
-                    .get(&blob_key)
-                    .map(|derived| live_rows.row(derived.live))
-            });
+            .map(|blob_ref| live_rows.row(blob_ref.live));
         let FileDescriptorRecord {
             id,
             directory_id,
@@ -5337,7 +4977,6 @@ async fn exact_path_data_rows_from_prepared(
         live_rows,
         mut file_rows,
         blob_rows,
-        derived_rows,
         mut file_paths,
         path_ordered_file_keys,
     } = prepared;
@@ -5371,7 +5010,6 @@ async fn exact_path_data_rows_from_prepared(
                 &file_keys,
                 &file_rows,
                 &blob_rows,
-                &derived_rows,
                 &file_paths,
             )
             .await?
@@ -5391,11 +5029,6 @@ async fn exact_path_data_rows_from_prepared(
                 .get(&blob_key)
                 .map(|blob_ref| blob_ref.blob_hash.clone())
                 .or_else(|| {
-                    derived_rows
-                        .get(&blob_key)
-                        .map(|derived| derived.sha256.clone())
-                })
-                .or_else(|| {
                     live_rows
                         .row(file.live)
                         .change_id()
@@ -5406,12 +5039,6 @@ async fn exact_path_data_rows_from_prepared(
                 Some(data) => data,
                 None => match rendered_plugin_bytes.remove(&key) {
                     Some(data) => Some(materialize_vec_range(data, range.clone())?),
-                    None if derived_rows.contains_key(&blob_key) => {
-                        return Err(invalid_plugin_read_state(format!(
-                            "derived-materialization file '{}' has no renderer output",
-                            file.id
-                        )));
-                    }
                     None => Some(materialize_vec_range(Vec::new(), range.clone())?),
                 },
             };
@@ -5445,12 +5072,6 @@ async fn exact_path_data_rows_from_prepared(
                 Some(data) => data,
                 None => match rendered_plugin_bytes.remove(&key) {
                     Some(data) => Some(data),
-                    None if derived_rows.contains_key(&blob_key) => {
-                        return Err(invalid_plugin_read_state(format!(
-                            "derived-materialization file '{}' has no renderer output",
-                            file.id
-                        )));
-                    }
                     None => Some(Vec::new()),
                 },
             };
@@ -5646,11 +5267,10 @@ async fn render_plugin_files_for_sql(
     file_keys: &[FilesystemDescriptorKey],
     file_rows: &BTreeMap<FilesystemDescriptorKey, FileDescriptorRecord>,
     blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
-    derived_rows: &BTreeMap<FilesystemBlobRefKey, DerivedFileRefRecord>,
     file_paths: &BTreeMap<FilesystemDescriptorKey, String>,
 ) -> Result<BTreeMap<FilesystemDescriptorKey, Vec<u8>>, LixError> {
     let mut materialized_file_keys = Vec::new();
-    let mut rendered = BTreeMap::new();
+    let rendered = BTreeMap::new();
     for key in file_keys {
         let file = file_rows
             .get(key)
@@ -5664,67 +5284,21 @@ async fn render_plugin_files_for_sql(
         let Some(branch) = plugin_render.branch(key.branch_id()) else {
             return Err(plugin_unavailable_error(file, path, owner));
         };
-        let Some(plugin) = branch.registry.get(owner.plugin_key()) else {
+        let Some(_plugin) = branch.registry.get(owner.plugin_key()) else {
             return Err(plugin_unavailable_error(file, path, owner));
         };
         let blob_key = file.blob_ref_key(live_rows);
         let blob = blob_rows.get(&blob_key);
-        let derived = derived_rows.get(&blob_key);
         if !branch.catalog.matches_plugin(owner.plugin_key(), path) {
-            if derived.is_some() {
-                return Err(invalid_plugin_read_state(format!(
-                    "derived-materialization file '{}' moved outside plugin '{}' matcher",
-                    file.id,
-                    plugin.key(),
-                )));
-            }
             continue;
         }
-        match (blob, derived) {
-            (Some(_), None) => {
-                if plugin.materialization() != PluginMaterialization::Blob {
-                    return Err(invalid_plugin_read_state(format!(
-                        "plugin-owned file '{}' retains a blob despite the '{}' derived-materialization contract",
-                        file.id,
-                        plugin.key(),
-                    )));
-                }
+        match blob {
+            Some(_) => {
                 if plugin_render.session_file_views.is_some() {
                     materialized_file_keys.push(key.clone());
                 }
             }
-            (None, Some(derived)) => {
-                if plugin.materialization() != PluginMaterialization::Derived {
-                    return Err(invalid_plugin_read_state(format!(
-                        "plugin-owned file '{}' has a derived proof despite the '{}' blob-materialization contract",
-                        file.id,
-                        plugin.key(),
-                    )));
-                }
-                let bytes = render_derived_file_for_sql(
-                    plugin_render,
-                    blob_reader,
-                    live_rows,
-                    key,
-                    file,
-                    path,
-                    plugin,
-                    derived,
-                )
-                .await?;
-                if plugin_render.session_file_views.is_some() {
-                    acknowledge_derived_file(plugin_render, live_rows, key, path, plugin, derived)
-                        .await?;
-                }
-                rendered.insert(key.clone(), bytes);
-            }
-            (Some(_), Some(_)) => {
-                return Err(invalid_plugin_read_state(format!(
-                    "plugin-owned file '{}' has both blob and derived materializations",
-                    file.id
-                )));
-            }
-            (None, None) => {
+            None => {
                 return Err(invalid_plugin_read_state(format!(
                     "plugin-owned file '{}' is missing its durable materialization",
                     file.id
@@ -5744,193 +5318,7 @@ async fn render_plugin_files_for_sql(
         )
         .await?;
     }
-    // Blob-backed plugin data is read from CAS. Derived materialization emits
-    // exact bytes from durable semantic rows and retains only a proof row.
     Ok(rendered)
-}
-
-async fn render_derived_file_for_sql(
-    plugin_render: &PluginRenderContext,
-    blob_reader: &Arc<dyn BlobDataReader>,
-    live_rows: &LiveStateBatchOwners,
-    file_key: &FilesystemDescriptorKey,
-    file: &FileDescriptorRecord,
-    path: &str,
-    plugin: &PluginRegistryEntry,
-    derived: &DerivedFileRefRecord,
-) -> Result<Vec<u8>, LixError> {
-    if derived.path != path {
-        return Err(invalid_plugin_read_state(format!(
-            "derived-materialization file '{}' was rendered at '{}' but now resolves to '{}'",
-            file.id, derived.path, path,
-        )));
-    }
-    let semantic_root = live_rows.row(derived.live).change_id().ok_or_else(|| {
-        invalid_plugin_read_state("derived v2 materialization is missing its semantic root")
-    })?;
-    let expected_sha256 = FileBytesSha256::from_lower_hex(&derived.sha256).ok_or_else(|| {
-        invalid_plugin_read_state(format!(
-            "plugin-owned file '{}' has an invalid derived SHA-256 proof",
-            file.id
-        ))
-    })?;
-    let rows = plugin_render
-        .live_state
-        .scan_tracked_batch(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: plugin.schema_keys().to_vec(),
-                branch_ids: vec![file_key.branch_id().to_string()],
-                file_ids: vec![crate::NullableKeyFilter::Value(file.id.clone())],
-                untracked: Some(false),
-                ..LiveStateFilter::default()
-            },
-            projection: plugin_state_live_state_projection(),
-            limit: None,
-        })
-        .await?;
-    let rows = rows.iter().filter(|row| {
-        row.branch_id() == file_key.branch_id()
-            && row.file_id() == Some(file.id.as_str())
-            && !row.global()
-            && !row.untracked()
-            && row.snapshot_content().is_some()
-            && plugin
-                .schema_keys()
-                .binary_search_by(|schema_key| schema_key.as_str().cmp(row.schema_key()))
-                .is_ok()
-    });
-    let limits = WasmTransitionLimits::default();
-    let source = VecEntitySource::new(v2_read_host_entities(rows, limits)?, limits)?;
-    let wasm_hash = BlobId::from_hex(plugin.wasm_blob_hash())?;
-    let factory = match plugin_render
-        .host
-        .cached_plugin_factory(plugin.key(), wasm_hash)?
-    {
-        Some(factory) => factory,
-        None => {
-            let wasm = blob_reader
-                .load_bytes_many(&[wasm_hash])
-                .await?
-                .into_vec()
-                .into_iter()
-                .next()
-                .flatten()
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        format!(
-                            "plugin registry references missing WASM blob '{}'",
-                            wasm_hash.to_hex()
-                        ),
-                    )
-                })?;
-            let installed = plugin.to_installed_plugin(wasm)?;
-            plugin_render
-                .host
-                .load_or_compile_factory(&installed)
-                .await?
-        }
-    };
-    let store_permit = plugin_render.host.actor_cache().admit_store()?;
-    let actor = factory.instantiate_actor().await?;
-    let mut store = PluginActorStore::new(actor, store_permit);
-    let transition = store
-        .actor_mut()
-        .open_entities(
-            limits,
-            WasmOpenEntitiesInput {
-                descriptor: WasmFileDescriptor {
-                    path: Some(path.to_string()),
-                    media_type: inferred_media_type_for_path(Some(path)).map(str::to_owned),
-                    plugin: WasmPluginSelection {
-                        plugin_key: plugin.key().to_string(),
-                        generation: plugin.archive_blob_hash().to_string(),
-                    },
-                },
-                entities: Box::new(source),
-                accepted: None,
-            },
-        )
-        .await;
-    let transition = match transition {
-        Ok(transition) => transition,
-        Err(error) => {
-            let _ = store.actor_mut().retire().await;
-            return Err(error);
-        }
-    };
-    let empty: crate::Blob = Vec::new().into();
-    let validated = match drain_entity_transition_edits(
-        store.actor_mut(),
-        transition,
-        empty.as_ref(),
-        None,
-        None,
-        limits,
-    )
-    .await
-    {
-        Ok(validated) => validated,
-        Err(error) => {
-            let _ = store.actor_mut().retire().await;
-            return Err(error);
-        }
-    };
-    let bytes = validated.bytes;
-    if bytes.len() as u64 != derived.size_bytes
-        || FileBytesSha256::compute(bytes.as_ref()) != expected_sha256
-    {
-        let _ = store.actor_mut().retire().await;
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            format!(
-                "plugin-owned file '{}' does not reproduce its derived materialization proof at semantic root '{}'",
-                file.id, semantic_root
-            ),
-        ));
-    }
-    let document = validated.document;
-    let counters = validated.counters;
-    let drop_result = store.actor_mut().drop_document(document).await;
-    let retire_result = store.actor_mut().retire().await;
-    plugin_render.host.record_transition_counters(counters);
-    drop_result?;
-    retire_result?;
-    Ok(bytes.to_vec())
-}
-
-async fn acknowledge_derived_file(
-    plugin_render: &PluginRenderContext,
-    live_rows: &LiveStateBatchOwners,
-    file_key: &FilesystemDescriptorKey,
-    path: &str,
-    plugin: &PluginRegistryEntry,
-    derived: &DerivedFileRefRecord,
-) -> Result<(), LixError> {
-    let owner_change_id = plugin_render
-        .owner_change_id_for_file(file_key)
-        .ok_or_else(|| invalid_plugin_read_state("v2 plugin owner is missing change_id"))?;
-    if live_rows.row(derived.live).change_id().is_none() {
-        return Err(invalid_plugin_read_state(
-            "derived v2 materialization is missing its semantic root",
-        ));
-    }
-    if let Some(session_file_views) = &plugin_render.session_file_views {
-        session_file_views.remember_plugin_file_view(
-            SessionFileViewKey::new(file_key.branch_id(), file_key.descriptor_id()),
-            SessionPluginFileView {
-                path: path.to_string(),
-                plugin_key: plugin.key().to_string(),
-                plugin_generation: plugin.archive_blob_hash().to_string(),
-                owner_change_id: owner_change_id.to_string(),
-                // The renderer actor is intentionally ephemeral: retaining a
-                // byte copy would defeat derived materialization. Mutations
-                // cold-open from the semantic rows and proof instead.
-                observation: None,
-            },
-        );
-    }
-    Ok(())
 }
 
 async fn acknowledge_materialized_file(
@@ -5995,30 +5383,6 @@ async fn acknowledge_materialized_file(
         );
     }
     Ok(())
-}
-
-fn v2_read_host_entities<'a>(
-    rows: impl IntoIterator<Item = MaterializedLiveStateRowRef<'a>>,
-    limits: WasmTransitionLimits,
-) -> Result<Vec<WasmHostEntity>, LixError> {
-    let mut entities = rows
-        .into_iter()
-        .map(|row| {
-            host_entity_with_lazy_snapshot(
-                crate::wasm::WasmEntityKey::from_owned_parts(
-                    row.schema_key().to_owned(),
-                    row.entity_pk().clone().into_parts(),
-                ),
-                row.snapshot_content()
-                    .expect("cold-open v2 rows retained only live snapshots")
-                    .clone()
-                    .into_bytes(),
-                limits,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    entities.sort_by(|left, right| left.key.cmp(&right.key));
-    Ok(entities)
 }
 
 async fn plugin_render_context_for_lix_file_scan(
@@ -6248,7 +5612,6 @@ async fn plugin_render_context_with_branches(
     }
 
     Ok(Some(PluginRenderContext {
-        live_state,
         host,
         branches,
         owners_by_file,
@@ -6496,45 +5859,6 @@ fn scan_indexed_file_batch(
     Ok(builder.finish())
 }
 
-/// The derived proof is private plugin state, not part of the hot filesystem
-/// read path. Probe it only after ownership discovery establishes that a
-/// selected file is governed by a derived-materialization plugin.
-async fn hydrate_derived_materialization_rows(
-    live_state: Arc<dyn LiveStateReader>,
-    request: &LiveStateScanRequest,
-    plugin_render: Option<&PluginRenderContext>,
-    prepared: &mut PreparedLixFileRows,
-) -> Result<(), LixError> {
-    let Some(plugin_render) = plugin_render else {
-        return Ok(());
-    };
-    let file_keys = plugin_render.derived_materialization_file_keys();
-    hydrate_derived_file_ref_rows(live_state, request, file_keys, prepared).await
-}
-
-async fn hydrate_derived_file_ref_rows(
-    live_state: Arc<dyn LiveStateReader>,
-    request: &LiveStateScanRequest,
-    file_keys: Vec<FilesystemDescriptorKey>,
-    prepared: &mut PreparedLixFileRows,
-) -> Result<(), LixError> {
-    let file_keys = file_keys
-        .into_iter()
-        .filter(|file_key| {
-            prepared.file_rows.get(file_key).is_some_and(|file| {
-                !prepared
-                    .derived_rows
-                    .contains_key(&file.blob_ref_key(&prepared.live_rows))
-            })
-        })
-        .collect::<Vec<_>>();
-    if file_keys.is_empty() {
-        return Ok(());
-    }
-    let rows = scan_exact_derived_file_ref_batch(live_state, request, &file_keys).await?;
-    prepared.extend_derived_file_ref_rows(rows)
-}
-
 async fn scan_exact_file_blob_batch(
     live_state: Arc<dyn LiveStateReader>,
     request: &LiveStateScanRequest,
@@ -6568,35 +5892,6 @@ async fn scan_exact_file_blob_batch(
     let rows = live_state
         .load_exact_batch(&LiveStateExactBatchRequest {
             rows: exact_rows,
-            projection: request.projection.clone(),
-            untracked: request.filter.untracked,
-            include_tombstones: request.filter.include_tombstones,
-        })
-        .await?;
-    Ok(rows.into_present_batch())
-}
-
-async fn scan_exact_derived_file_ref_batch(
-    live_state: Arc<dyn LiveStateReader>,
-    request: &LiveStateScanRequest,
-    file_keys: &[FilesystemDescriptorKey],
-) -> Result<MaterializedLiveStateBatch, LixError> {
-    if file_keys.is_empty() {
-        return Ok(MaterializedLiveStateBatch::default());
-    }
-    let rows = live_state
-        .load_exact_batch(&LiveStateExactBatchRequest {
-            rows: file_keys
-                .iter()
-                .map(|file_key| {
-                    Ok(LiveStateExactRowRequest {
-                        branch_id: file_key.branch_id().to_string(),
-                        schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
-                        entity_pk: file_id_entity_pk(file_key.descriptor_id())?,
-                        file_id: Some(file_key.descriptor_id().to_string()),
-                    })
-                })
-                .collect::<Result<Vec<_>, LixError>>()?,
             projection: request.projection.clone(),
             untracked: request.filter.untracked,
             include_tombstones: request.filter.include_tombstones,
@@ -7611,9 +6906,9 @@ mod tests {
         MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateRow,
     };
     use crate::plugin::{
-        PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginContentType, PluginFileOwner, PluginRegistry,
-        PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime, PluginRuntimeHost,
-        plugin_storage_archive_file_id, plugin_storage_archive_path,
+        PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginContentMatcher, PluginFileOwner,
+        PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntime,
+        PluginRuntimeHost, plugin_storage_archive_file_id, plugin_storage_archive_path,
     };
     use crate::sql2::dml::InsertSink;
     use crate::sql2::providers::upsert::UpsertConflictTarget;
@@ -7621,7 +6916,7 @@ mod tests {
     use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
-    use crate::wasm::{UnsupportedWasmRuntime, WasmHostBytes, WasmTransitionLimits};
+    use crate::wasm::UnsupportedWasmRuntime;
     use crate::{LixError, NullableKeyFilter};
 
     use super::{
@@ -7649,54 +6944,6 @@ mod tests {
 
     fn test_functions() -> FunctionProviderHandle {
         FunctionProviderHandle::system()
-    }
-
-    #[test]
-    fn cold_v2_file_reopen_pages_oversized_snapshot_as_lazy_attachment() {
-        let limits = WasmTransitionLimits::default();
-        let snapshot = serde_json::json!({
-            "value": "x".repeat(limits.max_record_bytes as usize + 32),
-        })
-        .to_string();
-        let rows = vec![MaterializedLiveStateRow {
-            entity_pk: crate::entity_pk::EntityPk::single("large-entity"),
-            schema_key: "large_entity".to_string(),
-            file_id: Some("large-file".to_string()),
-            snapshot_content: Some(snapshot.clone().into()),
-            metadata: None,
-            deleted: false,
-            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            global: false,
-            change_id: None,
-            commit_id: None,
-            untracked: false,
-            branch_id: "main".into(),
-        }];
-
-        let rows = MaterializedLiveStateBatch::from_rows(rows);
-        let entities = super::v2_read_host_entities(rows.iter(), limits)
-            .expect("cold reopen hydration should select a lazy snapshot source");
-        let WasmHostBytes::Source(slice) = &entities[0].snapshot_content else {
-            panic!("an oversized cold-reopen snapshot must not be packet-inline")
-        };
-        assert_eq!(slice.range.offset, 0);
-        assert_eq!(slice.range.length, snapshot.len() as u64);
-        assert_eq!(
-            slice.source.read(0, 64).expect("lazy prefix should read"),
-            snapshot.as_bytes()[..64]
-        );
-
-        let mut source = crate::plugin::VecEntitySource::new(entities, limits)
-            .expect("lazy entity should fit the packet bounds");
-        let page = crate::wasm::WasmEntitySource::next_page(&mut source, limits.max_page_bytes)
-            .expect("cold reopen packet should page")
-            .expect("one entity page should be emitted");
-        assert_eq!(page.entities.len(), 1);
-        assert!(matches!(
-            page.entities[0].snapshot_content,
-            WasmHostBytes::Source(_)
-        ));
     }
 
     #[test]
@@ -9184,7 +8431,6 @@ mod tests {
             update_columns,
             blob_ref_keys,
             &BTreeSet::new(),
-            &BTreeSet::new(),
             path_resolvers,
             generate_directory_id,
         )
@@ -9776,28 +9022,25 @@ mod tests {
         schema_key: &str,
         wasm: &[u8],
     ) -> PluginRegistryEntry {
-        test_plugin_registry_entry_with_content_type(key, path_glob, None, schema_key, wasm)
+        test_plugin_registry_entry_with_content(key, path_glob, None, schema_key, wasm)
     }
 
-    fn test_plugin_registry_entry_with_content_type(
+    fn test_plugin_registry_entry_with_content(
         key: &str,
         path_glob: &str,
-        content_type: Option<PluginContentType>,
+        content: Option<PluginContentMatcher>,
         schema_key: &str,
         wasm: &[u8],
     ) -> PluginRegistryEntry {
         let mut manifest = serde_json::json!({
-            "api_version":"1.0.0",
             "entry": "plugin.wasm",
             "key": key,
             "match": { "path_glob": path_glob },
-            "materialization": "blob",
-            "runtime": "wasm-component",
             "schemas": ["schema/plugin.json"],
         });
-        if let Some(content_type) = content_type {
-            manifest["match"]["content_type"] =
-                serde_json::to_value(content_type).expect("plugin content type should serialize");
+        if let Some(content) = content {
+            manifest["match"]["content"] =
+                serde_json::to_value(content).expect("plugin content type should serialize");
         }
         let manifest_json = manifest.to_string();
         PluginRegistryEntry::new(PluginRegistryEntryInput {
@@ -9805,7 +9048,7 @@ mod tests {
             runtime: PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
             path_glob: path_glob.to_string(),
-            content_type,
+            content,
             entry: "plugin.wasm".to_string(),
             schema_keys: vec![schema_key.to_string()],
             create_schema_keys: Vec::new(),
@@ -9862,9 +9105,6 @@ mod tests {
         let manifest_json = format!(
             r#"{{
                 "key": "plugin_sentinel",
-                "runtime": "wasm-component",
-                "api_version":"1.0.0",
-                "materialization": "blob",
                 "match": {{ "path_glob": "{path_glob}" }},
                 "entry": "plugin.wasm",
                 "schemas": ["schema/plugin_note.json"]
@@ -10946,7 +10186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn path_update_uses_materialized_data_for_content_type_matching() {
+    async fn path_update_uses_materialized_data_for_content_matching() {
         let wasm = b"test wasm";
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
@@ -10961,10 +10201,10 @@ mod tests {
             Arc::new(RowsLiveStateReader {
                 rows: vec![live_plugin_registry_row(
                     "01920000-0000-7000-8000-0000000000b1",
-                    vec![test_plugin_registry_entry_with_content_type(
+                    vec![test_plugin_registry_entry_with_content(
                         "plugin_text",
                         "*.active",
-                        Some(PluginContentType::Text),
+                        Some(PluginContentMatcher::Text),
                         "plugin_text_state",
                         wasm,
                     )],
@@ -11183,7 +10423,6 @@ mod tests {
             ),
             None,
             &BTreeSet::new(),
-            &BTreeSet::new(),
             None,
         )
         .expect_err("non-exact file delete should reject installed archive path");
@@ -11204,7 +10443,6 @@ mod tests {
                 Some("/.lix/plugins/plugin_sentinel.lixplugin"),
             ),
             None,
-            &BTreeSet::new(),
             &BTreeSet::new(),
             Some("plugin_sentinel"),
         )
@@ -11233,7 +10471,6 @@ mod tests {
             let error = lix_file_delete_stage_from_batch(
                 &file_delete_batch_with_id_and_path(file_id, Some(path)),
                 None,
-                &BTreeSet::new(),
                 &BTreeSet::new(),
                 Some("plugin_sentinel"),
             )
@@ -11586,7 +10823,6 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000d2",
             )]),
             &BTreeSet::new(),
-            &BTreeSet::new(),
             None,
             &mut test_id_generator(&["should-not-be-used"]),
         )
@@ -11724,7 +10960,6 @@ mod tests {
                 false,
                 "01920000-0000-7000-8000-0000000000d2",
             )]),
-            &BTreeSet::new(),
             None,
         )
         .expect("decode file delete");
@@ -11765,14 +11000,8 @@ mod tests {
     #[test]
     fn file_delete_without_blob_ref_stages_only_descriptor_tombstone() {
         let batch = file_delete_batch();
-        let staged = lix_file_delete_stage_from_batch(
-            &batch,
-            None,
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            None,
-        )
-        .expect("decode file delete");
+        let staged = lix_file_delete_stage_from_batch(&batch, None, &BTreeSet::new(), None)
+            .expect("decode file delete");
 
         assert_eq!(staged.count, 1);
         assert_eq!(staged.state_rows.len(), 1);
@@ -11797,7 +11026,6 @@ mod tests {
                 false,
                 "01920000-0000-7000-8000-0000000000d2",
             )]),
-            &BTreeSet::new(),
             None,
         )
         .expect("decode file delete");
@@ -12710,8 +11938,8 @@ mod tests {
         assert_eq!(write_context.path_index_count, 1);
         assert_eq!(
             write_context.exact_load_requests.len(),
-            2,
-            "the blob-less scoped descriptors need one derived-proof probe"
+            1,
+            "blob-less scoped descriptors need only the blob-reference probe"
         );
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 2);
         assert_eq!(write_context.scan_count, 0);

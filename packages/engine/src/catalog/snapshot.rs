@@ -3203,9 +3203,8 @@ mod tests {
 
     #[test]
     fn fast_object_validation_compiles_actual_csv_v2_schemas() {
-        let row = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv/schema/csv_v2_row.json"
-        ));
+        let row =
+            compile_actual_fast_schema(include_str!("../../../../plugins/csv/schema/csv_row.json"));
         for value in [
             json!({"id": UUID_A, "order_key": "01", "cells": ["alpha"]}),
             json!({
@@ -3251,7 +3250,7 @@ mod tests {
         }
 
         let table = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv/schema/csv_v2_table.json"
+            "../../../../plugins/csv/schema/csv_table.json"
         ));
         for value in [
             json!({
@@ -3335,11 +3334,10 @@ mod tests {
 
     #[test]
     fn canonical_plugin_row_certificate_proves_csv_schema_and_typed_identity() {
-        let plan = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv/schema/csv_v2_row.json"
-        ));
+        let plan =
+            compile_actual_fast_schema(include_str!("../../../../plugins/csv/schema/csv_row.json"));
         assert!(plan.accepts_canonical_certificate());
-        let key = WasmEntityKey::from_owned_parts("csv_v2_row", vec![UUID_A.to_owned()]);
+        let key = WasmEntityKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]);
         let certified = plan
             .certify_or_normalize_plugin_row(
                 br#"{"cells":["a","b"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
@@ -3491,14 +3489,14 @@ mod tests {
     #[test]
     fn canonical_certificate_covers_csv_table_and_json_v2_schemas() {
         let table = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv/schema/csv_v2_table.json"
+            "../../../../plugins/csv/schema/csv_table.json"
         ));
         assert!(table.accepts_canonical_certificate());
         assert!(
             table
                 .certify_or_normalize_plugin_row(
                     br#"{"dialect":{"delimiter":",","quote":"\"","terminator":"\n"},"id":"root"}"#,
-                    &WasmEntityKey::from_owned_parts("csv_v2_table", vec!["root".to_owned()],),
+                    &WasmEntityKey::from_owned_parts("csv_table", vec!["root".to_owned()],),
                 )
                 .expect("canonical CSV table")
                 .expect("eligible canonical row")
@@ -3563,10 +3561,9 @@ mod tests {
 
     #[test]
     fn canonical_plugin_row_certificate_rejects_hostile_rows() {
-        let plan = compile_actual_fast_schema(include_str!(
-            "../../../../plugins/csv/schema/csv_v2_row.json"
-        ));
-        let key = WasmEntityKey::from_owned_parts("csv_v2_row", vec![UUID_A.to_owned()]);
+        let plan =
+            compile_actual_fast_schema(include_str!("../../../../plugins/csv/schema/csv_row.json"));
+        let key = WasmEntityKey::from_owned_parts("csv_row", vec![UUID_A.to_owned()]);
 
         for bytes in [
             br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),

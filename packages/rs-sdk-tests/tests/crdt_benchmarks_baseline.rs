@@ -474,8 +474,8 @@ fn build_markdown_plugin_archive() -> Vec<u8> {
         Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown")),
         include_str!("../../../plugins/markdown/manifest.json"),
         &[(
-            "schema/markdown_node_v2.json",
-            include_str!("../../../plugins/markdown/schema/markdown_node_v2.json"),
+            "schema/markdown_node.json",
+            include_str!("../../../plugins/markdown/schema/markdown_node.json"),
         )],
     )
 }

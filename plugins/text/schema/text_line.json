@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "x-lix-key": "git_text_line_v2",
+  "x-lix-key": "text_line",
   "x-lix-primary-key": ["/id"],
-  "description": "One byte-exact Git-style text line. Newline bytes remain part of content_base64.",
+  "description": "One byte-exact byte-exact text line. Newline bytes remain part of content_base64.",
   "type": "object",
   "properties": {
     "id": {

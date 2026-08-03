@@ -10,7 +10,7 @@ pub const OBJECT_MEMBER_SCHEMA_KEY: &str = "json_object_member";
 pub const ARRAY_ITEM_SCHEMA_KEY: &str = "json_array_item";
 
 const ROOT_ID: &str = "root";
-const OBJECT_CONTAINER_DOMAIN: &[u8] = b"lix-json-object-container-v2\0";
+const OBJECT_CONTAINER_DOMAIN: &[u8] = b"lix-json-object-container\0";
 const NODES_PER_SPAN_CHUNK: usize = 512;
 const SCALAR_ONLY_SEMANTIC_WRITE: &str = "JSON semantic writes support existing scalar values only; use a file byte write for additions, deletions, containers, moves, ordering, or layout changes";
 
@@ -18,6 +18,12 @@ const SCALAR_ONLY_SEMANTIC_WRITE: &str = "JSON semantic writes support existing 
 pub struct IdNamespace(pub [u8; 16]);
 
 impl IdNamespace {
+    pub fn from_namespace_bytes(namespace: [u8; 12]) -> Self {
+        let mut bytes = [0; 16];
+        bytes[..12].copy_from_slice(&namespace);
+        Self(bytes)
+    }
+
     pub fn from_halves(high: u64, low: u64) -> Self {
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&high.to_be_bytes());
@@ -47,7 +53,7 @@ impl IdNamespace {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InputSplice<'a> {
+pub struct FileEdit<'a> {
     pub offset: u64,
     pub delete_len: u64,
     pub insert: &'a [u8],
@@ -127,7 +133,7 @@ struct BlobPiece {
 impl PersistentBlob {
     fn from_shared(bytes: Arc<Vec<u8>>) -> Result<Self, String> {
         let len = u32::try_from(bytes.len())
-            .map_err(|_| "JSON v2 currently supports files smaller than 4GiB".to_owned())?;
+            .map_err(|_| "JSON supports files smaller than 4GiB".to_owned())?;
         let pieces = if len == 0 {
             Vec::new()
         } else {
@@ -237,7 +243,7 @@ impl PersistentBlob {
         Ok(())
     }
 
-    fn splice(&self, splices: &[InputSplice<'_>]) -> Result<Self, String> {
+    fn splice(&self, splices: &[FileEdit<'_>]) -> Result<Self, String> {
         validate_splices(self.len(), splices)?;
         let deleted = splices.iter().try_fold(0u64, |total, splice| {
             total
@@ -254,7 +260,7 @@ impl PersistentBlob {
             .and_then(|value| value.checked_add(inserted))
             .ok_or_else(|| "reconstructed JSON size overflow".to_owned())?;
         let result_len = u32::try_from(result_len)
-            .map_err(|_| "JSON v2 currently supports files smaller than 4GiB".to_owned())?;
+            .map_err(|_| "JSON supports files smaller than 4GiB".to_owned())?;
         let mut pieces = Vec::with_capacity(self.pieces.len() + splices.len() * 2);
         let mut cursor = 0u32;
         for splice in splices {
@@ -357,7 +363,7 @@ impl NodeKind {
 
 #[derive(Clone, Debug)]
 enum NodeRelation {
-    Root,
+    Snapshot,
     Object {
         parent_id: Arc<str>,
         key: Arc<str>,
@@ -539,7 +545,7 @@ impl Node {
             return None;
         }
         match &self.relation {
-            NodeRelation::Root => Some(Arc::from(ROOT_ID)),
+            NodeRelation::Snapshot => Some(Arc::from(ROOT_ID)),
             NodeRelation::Object { container_id, .. } => container_id.clone(),
             NodeRelation::Array { id, .. } => Some(Arc::clone(id)),
         }
@@ -547,7 +553,7 @@ impl Node {
 
     fn identity(&self) -> EntityIdentity {
         match &self.relation {
-            NodeRelation::Root => EntityIdentity::Root,
+            NodeRelation::Snapshot => EntityIdentity::Snapshot,
             NodeRelation::Object { parent_id, key, .. } => EntityIdentity::Object {
                 parent_id: Arc::clone(parent_id),
                 key: Arc::clone(key),
@@ -559,7 +565,7 @@ impl Node {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum EntityIdentity {
-    Root,
+    Snapshot,
     Object { parent_id: Arc<str>, key: Arc<str> },
     Array(Arc<str>),
 }
@@ -567,7 +573,7 @@ enum EntityIdentity {
 impl EntityIdentity {
     const fn schema_key(&self) -> &'static str {
         match self {
-            Self::Root => ROOT_SCHEMA_KEY,
+            Self::Snapshot => ROOT_SCHEMA_KEY,
             Self::Object { .. } => OBJECT_MEMBER_SCHEMA_KEY,
             Self::Array(_) => ARRAY_ITEM_SCHEMA_KEY,
         }
@@ -575,7 +581,7 @@ impl EntityIdentity {
 
     fn entity_pk(&self) -> Vec<String> {
         match self {
-            Self::Root => vec![ROOT_ID.to_owned()],
+            Self::Snapshot => vec![ROOT_ID.to_owned()],
             Self::Object { parent_id, key } => {
                 vec![parent_id.to_string(), key.to_string()]
             }
@@ -585,7 +591,7 @@ impl EntityIdentity {
 
     fn from_parts(schema_key: &str, entity_pk: &[String]) -> Result<Self, String> {
         match (schema_key, entity_pk) {
-            (ROOT_SCHEMA_KEY, [id]) if id == ROOT_ID => Ok(Self::Root),
+            (ROOT_SCHEMA_KEY, [id]) if id == ROOT_ID => Ok(Self::Snapshot),
             (ROOT_SCHEMA_KEY, _) => Err("json_root requires the single key \"root\"".to_owned()),
             (OBJECT_MEMBER_SCHEMA_KEY, [parent_id, key]) => Ok(Self::Object {
                 parent_id: Arc::from(parent_id.as_str()),
@@ -614,7 +620,7 @@ fn intern_string(strings: &mut HashSet<Arc<str>>, value: &str) -> Arc<str> {
 
 fn intern_identity(identity: EntityIdentity, strings: &mut HashSet<Arc<str>>) -> EntityIdentity {
     match identity {
-        EntityIdentity::Root => EntityIdentity::Root,
+        EntityIdentity::Snapshot => EntityIdentity::Snapshot,
         EntityIdentity::Object { parent_id, key } => EntityIdentity::Object {
             parent_id: intern_string(strings, parent_id.as_ref()),
             key: intern_string(strings, key.as_ref()),
@@ -625,7 +631,7 @@ fn intern_identity(identity: EntityIdentity, strings: &mut HashSet<Arc<str>>) ->
 
 fn identity_fingerprint(identity: &EntityIdentity) -> [u8; 16] {
     match identity {
-        EntityIdentity::Root => fingerprint_components(ROOT_SCHEMA_KEY, &[ROOT_ID]),
+        EntityIdentity::Snapshot => fingerprint_components(ROOT_SCHEMA_KEY, &[ROOT_ID]),
         EntityIdentity::Object { parent_id, key } => fingerprint_components(
             OBJECT_MEMBER_SCHEMA_KEY,
             &[parent_id.as_ref(), key.as_ref()],
@@ -636,7 +642,7 @@ fn identity_fingerprint(identity: &EntityIdentity) -> [u8; 16] {
 
 fn identity_fingerprint_node(node: &Node) -> [u8; 16] {
     match &node.relation {
-        NodeRelation::Root => fingerprint_components(ROOT_SCHEMA_KEY, &[ROOT_ID]),
+        NodeRelation::Snapshot => fingerprint_components(ROOT_SCHEMA_KEY, &[ROOT_ID]),
         NodeRelation::Object { parent_id, key, .. } => fingerprint_components(
             OBJECT_MEMBER_SCHEMA_KEY,
             &[parent_id.as_ref(), key.as_ref()],
@@ -649,7 +655,7 @@ fn identity_fingerprint_node(node: &Node) -> [u8; 16] {
 
 fn fingerprint_components(schema_key: &str, components: &[&str]) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lix-json-entity-lookup-v2\0");
+    hasher.update(b"lix-json-entity-lookup\0");
     hasher.update(
         &u64::try_from(schema_key.len())
             .expect("usize fits u64")
@@ -672,7 +678,7 @@ fn fingerprint_components(schema_key: &str, components: &[&str]) -> [u8; 16] {
 
 #[derive(Clone, Debug)]
 enum RelationSeed {
-    Root,
+    Snapshot,
     Object { parent_id: Arc<str>, key: Arc<str> },
     Array { id: Arc<str>, parent_id: Arc<str> },
 }
@@ -688,7 +694,7 @@ struct JsonParser<'a> {
 impl<'a> JsonParser<'a> {
     fn parse(bytes: &'a [u8], namespace: IdNamespace) -> Result<Vec<Node>, String> {
         if bytes.len() > u32::MAX as usize {
-            return Err("JSON v2 currently supports files smaller than 4GiB".to_owned());
+            return Err("JSON supports files smaller than 4GiB".to_owned());
         }
         std::str::from_utf8(bytes).map_err(|error| format!("JSON must be UTF-8: {error}"))?;
         let mut parser = Self {
@@ -698,7 +704,7 @@ impl<'a> JsonParser<'a> {
             next_array_ordinal: 0,
             nodes: Vec::new(),
         };
-        let root = parser.parse_value(RelationSeed::Root, None, 0, 0)?;
+        let root = parser.parse_value(RelationSeed::Snapshot, None, 0, 0)?;
         let suffix_start = parser.cursor;
         parser.skip_whitespace();
         parser.set_suffix_layout(root, suffix_start, parser.cursor)?;
@@ -737,7 +743,7 @@ impl<'a> JsonParser<'a> {
             None => return Err("JSON value is missing".to_owned()),
         };
         let relation = match relation {
-            RelationSeed::Root => NodeRelation::Root,
+            RelationSeed::Snapshot => NodeRelation::Snapshot,
             RelationSeed::Object { parent_id, key } => {
                 let container_id = kind.is_container().then(|| {
                     Arc::<str>::from(derive_object_container_id(parent_id.as_ref(), key.as_ref()))
@@ -959,7 +965,7 @@ impl<'a> JsonParser<'a> {
             let child = &mut self.nodes[usize::try_from(child).expect("u32 fits usize")];
             child.next_sibling = next;
             match &mut child.relation {
-                NodeRelation::Root => {
+                NodeRelation::Snapshot => {
                     return Err("JSON root cannot be a container child".to_owned());
                 }
                 NodeRelation::Object { order_key, .. } | NodeRelation::Array { order_key, .. } => {
@@ -1051,7 +1057,7 @@ fn layout_for_parsed_prefix(
     actual: &str,
 ) -> Result<Option<Arc<NodeLayout>>, String> {
     let is_canonical = match relation {
-        NodeRelation::Root | NodeRelation::Array { .. } => actual.is_empty(),
+        NodeRelation::Snapshot | NodeRelation::Array { .. } => actual.is_empty(),
         NodeRelation::Object { key, .. } => actual == canonical_object_prefix(key)?,
     };
     if is_canonical {
@@ -1090,7 +1096,7 @@ pub struct ArenaJsonScalar {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArenaJsonRelation {
-    Root,
+    Snapshot,
     Object,
     Array,
 }
@@ -1249,8 +1255,8 @@ impl Document {
                     .span(ordinal)
                     .ok_or_else(|| "JSON scalar span is missing".to_owned())?;
                 let (relation, entity_pk, parent_id, order_key) = match &node.relation {
-                    NodeRelation::Root => (
-                        ArenaJsonRelation::Root,
+                    NodeRelation::Snapshot => (
+                        ArenaJsonRelation::Snapshot,
                         vec![ROOT_ID.to_owned()],
                         None,
                         None,
@@ -1331,7 +1337,7 @@ impl Document {
         } = metadata;
         let mut object = Map::new();
         let schema_key = match (relation, entity_pk.as_slice()) {
-            (ArenaJsonRelation::Root, [id]) if id == ROOT_ID => {
+            (ArenaJsonRelation::Snapshot, [id]) if id == ROOT_ID => {
                 object.insert("id".to_owned(), Value::String(id.clone()));
                 ROOT_SCHEMA_KEY
             }
@@ -1389,7 +1395,7 @@ impl Document {
 
     pub fn file_changed(
         &self,
-        splices: &[InputSplice<'_>],
+        splices: &[FileEdit<'_>],
         namespace: IdNamespace,
     ) -> Result<(Self, Vec<EntityChange>), String> {
         validate_splices(self.0.blob.len(), splices)?;
@@ -1436,7 +1442,7 @@ impl Document {
     fn sparse_scalar_file_changed(
         &self,
         after_blob: PersistentBlob,
-        splices: &[InputSplice<'_>],
+        splices: &[FileEdit<'_>],
         node_index: usize,
     ) -> Result<Option<(Self, Vec<EntityChange>)>, String> {
         let (value_start, old_len) = self
@@ -1534,7 +1540,7 @@ impl Document {
         Ok((after, changes))
     }
 
-    fn single_scalar_node(&self, splices: &[InputSplice<'_>]) -> Result<Option<usize>, String> {
+    fn single_scalar_node(&self, splices: &[FileEdit<'_>]) -> Result<Option<usize>, String> {
         let Some(first) = splices.first() else {
             return Ok(None);
         };
@@ -1595,7 +1601,7 @@ impl Document {
         }
         let splices = edits
             .iter()
-            .map(|edit| InputSplice {
+            .map(|edit| FileEdit {
                 offset: edit.offset,
                 delete_len: edit.delete_len,
                 insert: edit.insert.as_slice(),
@@ -1773,7 +1779,7 @@ impl EntityImportBuilder {
 
 #[derive(Clone, Debug)]
 enum SemanticEntity {
-    Root {
+    Snapshot {
         kind: NodeKind,
         scalar_json: Option<String>,
         layout: Option<Arc<NodeLayout>>,
@@ -1814,7 +1820,7 @@ impl SemanticEntity {
         validate_scalar_fields(kind, scalar_json.as_deref())?;
         let layout = parse_entity_layout(object, &identity, kind, strings)?;
         match identity {
-            EntityIdentity::Root => {
+            EntityIdentity::Snapshot => {
                 require_fields(
                     object,
                     &["id", "kind"],
@@ -1823,7 +1829,7 @@ impl SemanticEntity {
                 if required_string(object, "id")? != ROOT_ID {
                     return Err("json_root snapshot id must be \"root\"".to_owned());
                 }
-                Ok(Self::Root {
+                Ok(Self::Snapshot {
                     kind,
                     scalar_json,
                     layout,
@@ -1898,7 +1904,7 @@ impl SemanticEntity {
 
     fn identity(&self) -> EntityIdentity {
         match self {
-            Self::Root { .. } => EntityIdentity::Root,
+            Self::Snapshot { .. } => EntityIdentity::Snapshot,
             Self::Object { parent_id, key, .. } => EntityIdentity::Object {
                 parent_id: Arc::clone(parent_id),
                 key: Arc::clone(key),
@@ -1909,13 +1915,15 @@ impl SemanticEntity {
 
     const fn kind(&self) -> NodeKind {
         match self {
-            Self::Root { kind, .. } | Self::Object { kind, .. } | Self::Array { kind, .. } => *kind,
+            Self::Snapshot { kind, .. } | Self::Object { kind, .. } | Self::Array { kind, .. } => {
+                *kind
+            }
         }
     }
 
     fn layout(&self) -> Option<&Arc<NodeLayout>> {
         match self {
-            Self::Root { layout, .. }
+            Self::Snapshot { layout, .. }
             | Self::Object { layout, .. }
             | Self::Array { layout, .. } => layout.as_ref(),
         }
@@ -1960,7 +1968,7 @@ impl SemanticEntity {
 
     fn scalar_json(&self) -> Option<&str> {
         match self {
-            Self::Root { scalar_json, .. }
+            Self::Snapshot { scalar_json, .. }
             | Self::Object { scalar_json, .. }
             | Self::Array { scalar_json, .. } => scalar_json.as_deref(),
         }
@@ -1968,7 +1976,7 @@ impl SemanticEntity {
 
     fn parent_id_arc(&self) -> Option<Arc<str>> {
         match self {
-            Self::Root { .. } => None,
+            Self::Snapshot { .. } => None,
             Self::Object { parent_id, .. } | Self::Array { parent_id, .. } => {
                 Some(Arc::clone(parent_id))
             }
@@ -1977,7 +1985,7 @@ impl SemanticEntity {
 
     fn order_key(&self) -> Option<&str> {
         match self {
-            Self::Root { .. } => None,
+            Self::Snapshot { .. } => None,
             Self::Object { order_key, .. } | Self::Array { order_key, .. } => {
                 Some(order_key.as_ref())
             }
@@ -1989,7 +1997,7 @@ impl SemanticEntity {
             return None;
         }
         match self {
-            Self::Root { .. } => Some(ROOT_ID),
+            Self::Snapshot { .. } => Some(ROOT_ID),
             Self::Object { container_id, .. } => container_id.as_deref(),
             Self::Array { id, .. } => Some(id.as_ref()),
         }
@@ -1997,7 +2005,7 @@ impl SemanticEntity {
 
     fn node_relation(&self) -> NodeRelation {
         match self {
-            Self::Root { .. } => NodeRelation::Root,
+            Self::Snapshot { .. } => NodeRelation::Snapshot,
             Self::Object {
                 parent_id,
                 key,
@@ -2028,7 +2036,7 @@ impl SemanticEntity {
             return false;
         }
         match (self, other) {
-            (Self::Root { .. }, Self::Root { .. }) => true,
+            (Self::Snapshot { .. }, Self::Snapshot { .. }) => true,
             (
                 Self::Object {
                     parent_id,
@@ -2083,7 +2091,7 @@ impl SemanticModel {
                 return Err(format!("duplicate JSON entity {identity:?}"));
             }
         }
-        if !by_identity.contains_key(&EntityIdentity::Root) {
+        if !by_identity.contains_key(&EntityIdentity::Snapshot) {
             return Err("JSON entity graph requires one root".to_owned());
         }
         for identities in children.values_mut() {
@@ -2106,7 +2114,7 @@ impl SemanticModel {
         let mut visiting = HashSet::new();
         let mut visited = HashSet::new();
         self.render_entity(
-            &EntityIdentity::Root,
+            &EntityIdentity::Snapshot,
             None,
             &mut output,
             &mut nodes,
@@ -2272,7 +2280,7 @@ fn serialize_node_snapshot(node: &Node, scalar: Option<String>) -> Result<Vec<u8
     output.push(b'{');
     let mut first = true;
     match &node.relation {
-        NodeRelation::Root => {
+        NodeRelation::Snapshot => {
             push_layout_empty_field(&mut output, &mut first, node.layout.as_deref())?;
             push_snapshot_string_field(&mut output, &mut first, b"\"id\":", ROOT_ID)?;
             push_snapshot_string_field(&mut output, &mut first, b"\"kind\":", node.kind.as_str())?;
@@ -2406,7 +2414,7 @@ struct SpliceProvenance {
 }
 
 impl SpliceProvenance {
-    fn new(before_len: u32, splices: &[InputSplice<'_>]) -> Result<Self, String> {
+    fn new(before_len: u32, splices: &[FileEdit<'_>]) -> Result<Self, String> {
         let mut segments = Vec::with_capacity(splices.len() + 1);
         let mut before_cursor = 0u32;
         let mut after_cursor = 0u32;
@@ -2468,7 +2476,7 @@ fn reconcile_trees(
     after: &mut [Node],
     before_bytes: &[u8],
     after_bytes: &[u8],
-    splices: &[InputSplice<'_>],
+    splices: &[FileEdit<'_>],
 ) -> Result<(), String> {
     if before.is_empty() || after.is_empty() {
         return Err("JSON reconciliation requires roots".to_owned());
@@ -2849,7 +2857,7 @@ fn reconcile_child_order(
 
 fn relation_order(relation: &NodeRelation) -> &str {
     match relation {
-        NodeRelation::Root => "",
+        NodeRelation::Snapshot => "",
         NodeRelation::Object { order_key, .. } | NodeRelation::Array { order_key, .. } => {
             order_key.as_ref()
         }
@@ -2858,7 +2866,7 @@ fn relation_order(relation: &NodeRelation) -> &str {
 
 fn set_relation_order(relation: &mut NodeRelation, value: &str) {
     match relation {
-        NodeRelation::Root => {}
+        NodeRelation::Snapshot => {}
         NodeRelation::Object { order_key, .. } | NodeRelation::Array { order_key, .. } => {
             *order_key = Arc::from(value);
         }
@@ -2868,7 +2876,7 @@ fn set_relation_order(relation: &mut NodeRelation, value: &str) {
 fn refresh_parent(nodes: &mut [Node], child: u32, parent_id: Arc<str>) {
     let node = &mut nodes[usize::try_from(child).expect("u32 fits usize")];
     match &mut node.relation {
-        NodeRelation::Root => {}
+        NodeRelation::Snapshot => {}
         NodeRelation::Object {
             parent_id: current,
             key,
@@ -3142,7 +3150,7 @@ fn parse_entity_layout(
     if let Some(prefix) = prefix_json.as_deref() {
         match identity {
             EntityIdentity::Object { key, .. } => validate_object_prefix(prefix, key)?,
-            EntityIdentity::Root | EntityIdentity::Array(_) => {
+            EntityIdentity::Snapshot | EntityIdentity::Array(_) => {
                 if !is_json_whitespace(prefix) {
                     return Err(
                         "JSON root/array prefix_json must contain only JSON whitespace".to_owned(),
@@ -3235,7 +3243,7 @@ fn parse_order_key(raw: &str) -> Result<String, String> {
 
 fn identity_tiebreak(entity: &SemanticEntity) -> &str {
     match entity {
-        SemanticEntity::Root { .. } => "",
+        SemanticEntity::Snapshot { .. } => "",
         SemanticEntity::Object { key, .. } => key,
         SemanticEntity::Array { id, .. } => id,
     }
@@ -3263,7 +3271,7 @@ fn reject_numbers(value: &Value) -> Result<(), String> {
     }
 }
 
-fn validate_splices(file_len: usize, splices: &[InputSplice<'_>]) -> Result<(), String> {
+fn validate_splices(file_len: usize, splices: &[FileEdit<'_>]) -> Result<(), String> {
     let file_len = u64::try_from(file_len).expect("usize fits u64");
     let mut previous_end = 0u64;
     for splice in splices {

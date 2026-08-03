@@ -55,6 +55,13 @@ pub struct IdNamespace {
 }
 
 impl IdNamespace {
+    pub fn from_namespace_bytes(namespace: [u8; 12]) -> Self {
+        Self {
+            high: u64::from_be_bytes(namespace[..8].try_into().expect("eight bytes")),
+            low: u32::from_be_bytes(namespace[8..].try_into().expect("four bytes")),
+        }
+    }
+
     pub const fn from_halves(high: u64, low: u32) -> Self {
         Self { high, low }
     }
@@ -1503,7 +1510,7 @@ pub struct EntityChange {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InputSplice<'a> {
+pub struct FileEdit<'a> {
     pub offset: u64,
     pub delete_len: u64,
     pub insert: &'a [u8],
@@ -1713,7 +1720,7 @@ impl PersistentBytes {
         Ok(())
     }
 
-    fn splice(&self, splices: &[InputSplice<'_>]) -> Result<Self, PluginError> {
+    fn splice(&self, splices: &[FileEdit<'_>]) -> Result<Self, PluginError> {
         let mut pieces = Vec::with_capacity(self.pieces.len() + splices.len() * 2);
         let mut cursor = 0usize;
         let mut result_len = self.len;
@@ -1782,12 +1789,12 @@ fn push_byte_piece(output: &mut Vec<BytePiece>, piece: BytePiece) {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WireNodeSnapshot {
+    format_json: String,
     id: String,
     kind: NodeKind,
-    parent_id: Option<String>,
     order_key: Option<String>,
+    parent_id: Option<String>,
     payload_json: String,
-    format_json: String,
 }
 
 impl WireNodeSnapshot {
@@ -1799,12 +1806,12 @@ impl WireNodeSnapshot {
             PluginError::Internal(format!("failed to encode Markdown node format: {error}"))
         })?;
         Ok(Self {
+            format_json,
             id: node.id,
             kind: node.kind,
-            parent_id: node.parent_id,
             order_key: node.order_key,
+            parent_id: node.parent_id,
             payload_json,
-            format_json,
         })
     }
 
@@ -2183,7 +2190,7 @@ impl Document {
         block_json: &[u8],
         block_start: u64,
         block_end: u64,
-        splice: InputSplice<'_>,
+        splice: FileEdit<'_>,
         namespace: IdNamespace,
         minimum_ordinal: u32,
     ) -> Result<Option<(Vec<EntityChange>, Vec<u8>, Vec<u8>)>, PluginError> {
@@ -2245,7 +2252,7 @@ impl Document {
 
     pub fn file_changed(
         &self,
-        splices: &[InputSplice<'_>],
+        splices: &[FileEdit<'_>],
         namespace: IdNamespace,
     ) -> Result<(Self, Vec<EntityChange>), PluginError> {
         let successor_bytes = self.bytes.splice(splices)?;
@@ -2395,7 +2402,7 @@ impl Document {
                 children: Vec::new(),
             }],
         })?;
-        let bytes = self.bytes.splice(&[InputSplice {
+        let bytes = self.bytes.splice(&[FileEdit {
             offset: u64::try_from(range.start).expect("usize fits u64"),
             delete_len: u64::try_from(range.end - range.start).expect("usize fits u64"),
             insert: &fragment,
@@ -2431,7 +2438,7 @@ impl Document {
 
     fn try_paragraph_replacement(
         &self,
-        splices: &[InputSplice<'_>],
+        splices: &[FileEdit<'_>],
         bytes: &PersistentBytes,
         namespace: IdNamespace,
     ) -> Result<Option<(Vec<DetectedChange>, Arc<Vec<Range<usize>>>, PersistentTree)>, PluginError>
@@ -2546,7 +2553,7 @@ impl Document {
     /// identities without cloning or parsing unrelated siblings.
     fn try_top_level_replacement(
         &self,
-        splices: &[InputSplice<'_>],
+        splices: &[FileEdit<'_>],
         bytes: &PersistentBytes,
         namespace: IdNamespace,
         minimum_ordinal: u32,

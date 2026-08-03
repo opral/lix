@@ -1,10 +1,10 @@
 use serde_json::Value;
 use std::sync::OnceLock;
 
-pub const NODE_SCHEMA_KEY: &str = "markdown_node_v2";
-pub const NODE_SCHEMA_PATH: &str = "schema/markdown_node_v2.json";
+pub const NODE_SCHEMA_KEY: &str = "markdown_node";
+pub const NODE_SCHEMA_PATH: &str = "schema/markdown_node.json";
 
-const NODE_SCHEMA_JSON: &str = include_str!("../schema/markdown_node_v2.json");
+const NODE_SCHEMA_JSON: &str = include_str!("../schema/markdown_node.json");
 
 const SCHEMA_JSONS: [&str; 1] = [NODE_SCHEMA_JSON];
 

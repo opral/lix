@@ -33,7 +33,7 @@ use tracing_subscriber::registry::LookupSpan;
 
 use benchmark_metrics::{
     AllocationScope, BenchmarkFixture, BenchmarkGate, BenchmarkMeasurement, current_live_bytes,
-    emit_sample, emit_summary,
+    emit_sample, emit_summary, emit_transition_profile,
 };
 
 #[derive(Clone, Default)]
@@ -108,6 +108,8 @@ fn is_import_perf_span(name: &str) -> bool {
             | "lix.perf.transaction_prepare_rows"
             | "lix.perf.transaction_path_preflight"
             | "lix.perf.transaction_buffer_stage"
+            | "lix.perf.transaction_storage_prepare"
+            | "lix.perf.transaction_storage_commit"
     )
 }
 
@@ -229,9 +231,9 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
         .await
         .expect("initial plugin file should materialize");
     let file_id = file_id_at_path(&lix, path).await;
-    let edited_row_id = csv_v2_row_id(&active_csv_v2_rows(&lix, &file_id).await, &["row", "first"]);
+    let edited_row_id = csv_row_id(&active_csv_rows(&lix, &file_id).await, &["row", "first"]);
     lix.execute(
-        "UPDATE csv_v2_row SET cells = $1 \
+        "UPDATE csv_row SET cells = $1 \
          WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Json(serde_json::json!(["row", "second"])),
@@ -404,7 +406,7 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
         &lix,
         "plugin_csv",
         &archive,
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
 
@@ -578,7 +580,7 @@ async fn v2_csv_stale_observation_composes_a_keyless_create_with_a_concurrent_ed
         &lix,
         "plugin_csv",
         &archive,
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
 
@@ -632,7 +634,7 @@ async fn v2_transport_splice_provenance_is_bound_to_the_observed_file() {
         &lix,
         "plugin_csv",
         &archive,
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
 
@@ -690,7 +692,7 @@ async fn v2_transport_splice_provenance_is_bound_to_the_observed_file() {
         read_file(&lix, path_b).await.unwrap(),
         Some(after_a.clone())
     );
-    let expected_b_rows = active_csv_v2_rows(&lix, &file_b_id).await;
+    let expected_b_rows = active_csv_rows(&lix, &file_b_id).await;
     assert_eq!(expected_b_rows.len(), 1);
     assert_eq!(
         expected_b_rows[0].cells,
@@ -702,7 +704,7 @@ async fn v2_transport_splice_provenance_is_bound_to_the_observed_file() {
     // both its rendered bytes and durable rows.
     assert_eq!(read_file(&lix, path_a).await.unwrap(), Some(before_a));
     assert_eq!(
-        active_csv_v2_rows(&lix, &file_a_id).await[0].cells,
+        active_csv_rows(&lix, &file_a_id).await[0].cells,
         vec!["alpha".to_owned(), "one".to_owned()]
     );
     for index in 0..12 {
@@ -715,7 +717,7 @@ async fn v2_transport_splice_provenance_is_bound_to_the_observed_file() {
         .unwrap();
     }
     assert_eq!(read_file(&lix, path_b).await.unwrap(), Some(after_a));
-    assert_eq!(active_csv_v2_rows(&lix, &file_b_id).await, expected_b_rows);
+    assert_eq!(active_csv_rows(&lix, &file_b_id).await, expected_b_rows);
 
     lix.close().await.unwrap();
 }
@@ -727,7 +729,7 @@ async fn csv_byte_edit_after_semantic_render_uses_successor_row_boundaries() {
         &lix,
         "plugin_csv",
         &build_csv_plugin_archive(),
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
 
@@ -736,12 +738,12 @@ async fn csv_byte_edit_after_semantic_render_uses_successor_row_boundaries() {
         .await
         .unwrap();
     let file_id = file_id_at_path(&lix, path).await;
-    let initial = active_csv_v2_rows(&lix, &file_id).await;
-    let first_id = csv_v2_row_id(&initial, &["short", "x"]);
-    let second_id = csv_v2_row_id(&initial, &["second", "y"]);
+    let initial = active_csv_rows(&lix, &file_id).await;
+    let first_id = csv_row_id(&initial, &["short", "x"]);
+    let second_id = csv_row_id(&initial, &["second", "y"]);
 
     lix.execute(
-        "UPDATE csv_v2_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Json(serde_json::json!(["much-longer", "x"])),
             Value::Text(first_id.clone()),
@@ -761,9 +763,9 @@ async fn csv_byte_edit_after_semantic_render_uses_successor_row_boundaries() {
         .await
         .expect("a byte edit after semantic rendering must not use stale CSV row offsets");
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after_followup));
-    let rows = active_csv_v2_rows(&lix, &file_id).await;
-    assert_eq!(csv_v2_row_id(&rows, &["much-longer", "x"]), first_id);
-    assert_eq!(csv_v2_row_id(&rows, &["second", "z"]), second_id);
+    let rows = active_csv_rows(&lix, &file_id).await;
+    assert_eq!(csv_row_id(&rows, &["much-longer", "x"]), first_id);
+    assert_eq!(csv_row_id(&rows, &["second", "z"]), second_id);
 
     lix.close().await.unwrap();
 }
@@ -775,19 +777,19 @@ async fn csv_row_structure_edits_use_full_reconciliation() {
         &lix,
         "plugin_csv",
         &build_csv_plugin_archive(),
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
 
     let path = "/row-structure.csv";
     write_file(&lix, path, b"a\nb\n".to_vec()).await.unwrap();
     let file_id = file_id_at_path(&lix, path).await;
-    assert_eq!(active_csv_v2_rows(&lix, &file_id).await.len(), 2);
+    assert_eq!(active_csv_rows(&lix, &file_id).await.len(), 2);
 
     write_file(&lix, path, b"a,b\n".to_vec())
         .await
         .expect("replacing a row terminator must use full CSV reconciliation");
-    let rows = active_csv_v2_rows(&lix, &file_id).await;
+    let rows = active_csv_rows(&lix, &file_id).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].cells, ["a", "b"]);
     assert_eq!(
@@ -798,13 +800,13 @@ async fn csv_row_structure_edits_use_full_reconciliation() {
     write_file(&lix, path, b"old,one\nlast,two\n".to_vec())
         .await
         .unwrap();
-    let before_insert = active_csv_v2_rows(&lix, &file_id).await;
-    let old_id = csv_v2_row_id(&before_insert, &["old", "one"]);
+    let before_insert = active_csv_rows(&lix, &file_id).await;
+    let old_id = csv_row_id(&before_insert, &["old", "one"]);
     write_file(&lix, path, b"new,zero\nold,one\nlast,two\n".to_vec())
         .await
         .expect("prepending a row should use structural reconciliation");
     lix.execute(
-        "UPDATE csv_v2_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Json(serde_json::json!(["old", "ONE"])),
             Value::Text(old_id.clone()),
@@ -813,8 +815,8 @@ async fn csv_row_structure_edits_use_full_reconciliation() {
     )
     .await
     .expect("semantic update after structural insert must use durable row identities");
-    let after_semantic = active_csv_v2_rows(&lix, &file_id).await;
-    assert_eq!(csv_v2_row_id(&after_semantic, &["old", "ONE"]), old_id);
+    let after_semantic = active_csv_rows(&lix, &file_id).await;
+    assert_eq!(csv_row_id(&after_semantic, &["old", "ONE"]), old_id);
     assert!(
         after_semantic
             .iter()
@@ -836,7 +838,7 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
         &lix,
         "plugin_markdown",
         &archive,
-        &["markdown_node_v2"],
+        &["markdown_node"],
     )
     .await;
 
@@ -847,7 +849,7 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
 
     let nodes = lix
         .execute(
-            "SELECT id, kind, payload_json FROM markdown_node_v2 ORDER BY kind",
+            "SELECT id, kind, payload_json FROM markdown_node ORDER BY kind",
             &[],
         )
         .await
@@ -892,7 +894,7 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
     })
     .to_string();
     lix.execute(
-        "UPDATE markdown_node_v2 SET payload_json = $1 WHERE id = $2",
+        "UPDATE markdown_node SET payload_json = $1 WHERE id = $2",
         &[Value::Text(payload_json), Value::Text(paragraph_id)],
     )
     .await
@@ -912,7 +914,7 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after_followup));
     assert!(
         lix.execute(
-            "SELECT payload_json FROM markdown_node_v2 WHERE kind = 'paragraph'",
+            "SELECT payload_json FROM markdown_node WHERE kind = 'paragraph'",
             &[],
         )
         .await
@@ -934,7 +936,7 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
         &lix,
         "plugin_markdown",
         &build_markdown_plugin_archive(),
-        &["markdown_node_v2"],
+        &["markdown_node"],
     )
     .await;
 
@@ -947,7 +949,7 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
     assert_eq!(open_counters.durable_semantic_changes, 3);
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(before));
     assert_eq!(
-        lix.execute("SELECT COUNT(*) AS count FROM markdown_node_v2", &[])
+        lix.execute("SELECT COUNT(*) AS count FROM markdown_node", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -964,7 +966,7 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
     let current = lix
         .execute(
-            "SELECT kind, payload_json FROM markdown_node_v2 ORDER BY kind",
+            "SELECT kind, payload_json FROM markdown_node ORDER BY kind",
             &[],
         )
         .await
@@ -979,7 +981,7 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
     );
     let historical = lix
         .execute(
-            "SELECT kind, payload_json FROM markdown_node_v2_history() \
+            "SELECT kind, payload_json FROM markdown_node_history() \
              WHERE lixcol_depth = 1 ORDER BY kind",
             &[],
         )
@@ -1003,7 +1005,7 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
     );
     assert_eq!(
         reopened
-            .execute("SELECT COUNT(*) AS count FROM markdown_node_v2", &[])
+            .execute("SELECT COUNT(*) AS count FROM markdown_node", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -1034,7 +1036,7 @@ async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
         &lix,
         "plugin_markdown",
         &build_markdown_plugin_archive(),
-        &["markdown_node_v2"],
+        &["markdown_node"],
     )
     .await;
     let path = "/markdown-multi-namespace.md";
@@ -1044,7 +1046,7 @@ async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
     let file_id = file_id_at_path(&lix, path).await;
     let original = lix
         .execute(
-            "SELECT id FROM markdown_node_v2 \
+            "SELECT id FROM markdown_node \
              WHERE kind = 'paragraph' AND lixcol_file_id = $1",
             &[Value::Text(file_id.clone())],
         )
@@ -1059,7 +1061,7 @@ async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
         .unwrap();
     let rows = lix
         .execute(
-            "SELECT id, payload_json FROM markdown_node_v2 \
+            "SELECT id, payload_json FROM markdown_node \
              WHERE kind = 'paragraph' AND lixcol_file_id = $1",
             &[Value::Text(file_id.clone())],
         )
@@ -1086,7 +1088,7 @@ async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
         .unwrap();
     }
     lix.execute(
-        "UPDATE markdown_node_v2 SET payload_json = $1 \
+        "UPDATE markdown_node SET payload_json = $1 \
          WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Text(
@@ -1115,7 +1117,7 @@ async fn v3_markdown_cold_hydration_preserves_later_namespace_ids() {
     .expect("full file reconciliation must reuse the hydrated identity graph");
     let retained = lix
         .execute(
-            "SELECT id, payload_json FROM markdown_node_v2 \
+            "SELECT id, payload_json FROM markdown_node \
              WHERE kind = 'paragraph' AND lixcol_file_id = $1",
             &[Value::Text(file_id)],
         )
@@ -1142,7 +1144,7 @@ async fn v3_markdown_one_large_block_spans_state_pages() {
         &lix,
         "plugin_markdown",
         &build_markdown_plugin_archive(),
-        &["markdown_node_v2"],
+        &["markdown_node"],
     )
     .await;
     let path = "/markdown-large-block.md";
@@ -1166,7 +1168,7 @@ async fn v3_markdown_noncanonical_source_stays_in_file_arena_not_semantic_root()
         &lix,
         "plugin_markdown",
         &build_markdown_plugin_archive(),
-        &["markdown_node_v2"],
+        &["markdown_node"],
     )
     .await;
 
@@ -1176,7 +1178,7 @@ async fn v3_markdown_noncanonical_source_stays_in_file_arena_not_semantic_root()
     write_file(&lix, path, before.clone()).await.unwrap();
     let document = lix
         .execute(
-            "SELECT format_json FROM markdown_node_v2 WHERE kind = 'document'",
+            "SELECT format_json FROM markdown_node WHERE kind = 'document'",
             &[],
         )
         .await
@@ -1253,14 +1255,14 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
                 &lix,
                 plugin_key,
                 &archive,
-                &["markdown_node_v2"],
+                &["markdown_node"],
             )
             .await;
             write_file(&lix, PATH, before.clone())
                 .await
                 .unwrap_or_else(|error| panic!("{label} opening import failed: {error}"));
             let before_ids = lix
-                .execute("SELECT id FROM markdown_node_v2", &[])
+                .execute("SELECT id FROM markdown_node", &[])
                 .await
                 .unwrap()
                 .rows()
@@ -1280,14 +1282,14 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
             let counters = lix.plugin_transition_counters();
             assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(after.clone()));
             let rows = lix
-                .execute("SELECT COUNT(*) AS count FROM markdown_node_v2", &[])
+                .execute("SELECT COUNT(*) AS count FROM markdown_node", &[])
                 .await
                 .unwrap()
                 .rows()[0]
                 .get::<i64>("count")
                 .unwrap() as usize;
             let after_ids = lix
-                .execute("SELECT id FROM markdown_node_v2", &[])
+                .execute("SELECT id FROM markdown_node", &[])
                 .await
                 .unwrap()
                 .rows()
@@ -1327,6 +1329,33 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
                 collector.take_aggregate_millis(),
                 collector.take_close_live_bytes(),
             );
+            let fixture = BenchmarkFixture {
+                input_bytes: after.len(),
+                logical_rows: rows,
+            };
+            emit_sample(
+                BENCHMARK,
+                label,
+                sample,
+                fixture,
+                BenchmarkGate::BulkWrite,
+                measurement,
+            );
+            emit_transition_profile(
+                BENCHMARK,
+                label,
+                sample,
+                counters,
+                serde_json::json!({
+                    "before_sha256": sha256_lower_hex(&before),
+                    "file_sha256": sha256_lower_hex(&after),
+                    "file_bytes": after.len(),
+                    "entity_rows": rows,
+                    "identity_set_sha256": sha256_lower_hex(
+                        after_ids.iter().flat_map(|id| id.as_bytes().iter().copied()).collect::<Vec<_>>().as_slice()
+                    )
+                }),
+            );
             elapsed_ms.push(measurement.elapsed_ms);
             measurements.push(measurement);
             lix.close().await.unwrap();
@@ -1358,7 +1387,7 @@ async fn v2_markdown_merges_unrelated_entities_and_regenerates_derived_bytes() {
         &lix,
         "plugin_markdown",
         &archive,
-        &["markdown_node_v2"],
+        &["markdown_node"],
     )
     .await;
 
@@ -1372,7 +1401,7 @@ async fn v2_markdown_merges_unrelated_entities_and_regenerates_derived_bytes() {
     .unwrap();
     let paragraphs = lix
         .execute(
-            "SELECT id, payload_json FROM markdown_node_v2 WHERE kind = 'paragraph'",
+            "SELECT id, payload_json FROM markdown_node WHERE kind = 'paragraph'",
             &[],
         )
         .await
@@ -1401,7 +1430,7 @@ async fn v2_markdown_merges_unrelated_entities_and_regenerates_derived_bytes() {
         .unwrap();
 
     lix.execute(
-        "UPDATE markdown_node_v2 SET payload_json = $1 WHERE id = $2",
+        "UPDATE markdown_node SET payload_json = $1 WHERE id = $2",
         &[
             Value::Text(
                 serde_json::json!({"inline":[{"type":"text","value":"First from target."}]})
@@ -1418,7 +1447,7 @@ async fn v2_markdown_merges_unrelated_entities_and_regenerates_derived_bytes() {
     .await
     .unwrap();
     lix.execute(
-        "UPDATE markdown_node_v2 SET payload_json = $1 WHERE id = $2",
+        "UPDATE markdown_node SET payload_json = $1 WHERE id = $2",
         &[
             Value::Text(
                 serde_json::json!({"inline":[{"type":"text","value":"Second from source."}]})
@@ -1467,7 +1496,7 @@ async fn v2_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
         &lix,
         "plugin_markdown",
         &archive,
-        &["markdown_node_v2"],
+        &["markdown_node"],
     )
     .await;
 
@@ -1543,7 +1572,7 @@ async fn v3_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
         &lix,
         "plugin_markdown",
         &build_markdown_plugin_archive(),
-        &["markdown_node_v2"],
+        &["markdown_node"],
     )
     .await;
 
@@ -1612,7 +1641,7 @@ async fn v2_csv_same_row_branch_merge_composes_distinct_cells() {
         &lix,
         "plugin_csv",
         &archive,
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
 
@@ -1688,7 +1717,7 @@ async fn v3_csv_same_row_branch_merge_composes_distinct_cells() {
         &lix,
         "plugin_csv",
         &build_csv_plugin_archive(),
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
 
@@ -1697,8 +1726,8 @@ async fn v3_csv_same_row_branch_merge_composes_distinct_cells() {
         .await
         .expect("base row should import");
     let file_id = file_id_at_path(&lix, path).await;
-    let base_row_id = csv_v2_row_id(
-        &active_csv_v2_rows(&lix, &file_id).await,
+    let base_row_id = csv_row_id(
+        &active_csv_rows(&lix, &file_id).await,
         &["alpha", "one", "red"],
     );
     let target_branch_id = lix.active_branch_id().await.unwrap();
@@ -1715,8 +1744,8 @@ async fn v3_csv_same_row_branch_merge_composes_distinct_cells() {
         .await
         .expect("target first-cell edit should commit");
     assert_eq!(
-        csv_v2_row_id(
-            &active_csv_v2_rows(&lix, &file_id).await,
+        csv_row_id(
+            &active_csv_rows(&lix, &file_id).await,
             &["ALPHA", "one", "red"],
         ),
         base_row_id
@@ -1730,8 +1759,8 @@ async fn v3_csv_same_row_branch_merge_composes_distinct_cells() {
         .await
         .expect("source third-cell edit should commit");
     assert_eq!(
-        csv_v2_row_id(
-            &active_csv_v2_rows(&lix, &file_id).await,
+        csv_row_id(
+            &active_csv_rows(&lix, &file_id).await,
             &["alpha", "one", "BLU"],
         ),
         base_row_id
@@ -2028,7 +2057,7 @@ async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
         &lix,
         "plugin_csv",
         &archive,
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
 
@@ -2038,8 +2067,8 @@ async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
     let source_bytes = b"SOURCE,one,red\n".to_vec();
     write_file(&lix, path, base).await.unwrap();
     let file_id = file_id_at_path(&lix, path).await;
-    let row_id = csv_v2_row_id(
-        &active_csv_v2_rows(&lix, &file_id).await,
+    let row_id = csv_row_id(
+        &active_csv_rows(&lix, &file_id).await,
         &["alpha", "one", "red"],
     );
     let target_branch_id = lix.active_branch_id().await.unwrap();
@@ -2060,7 +2089,7 @@ async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
     write_file(&lix, path, source_bytes.clone())
         .await
         .expect("source same-cell edit should commit");
-    let source_order = csv_v2_row_ordering(&lix, &file_id, &row_id).await;
+    let source_order = csv_row_ordering(&lix, &file_id, &row_id).await;
     lix.switch_branch(SwitchBranchOptions {
         branch_id: target_branch_id.clone(),
     })
@@ -2069,7 +2098,7 @@ async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
     write_file(&lix, path, target_bytes.clone())
         .await
         .expect("target same-cell edit should commit");
-    let target_order = csv_v2_row_ordering(&lix, &file_id, &row_id).await;
+    let target_order = csv_row_ordering(&lix, &file_id, &row_id).await;
     assert_ne!(
         source_order, target_order,
         "distinct conflicting rows must have distinct durable ordering tuples"
@@ -2116,7 +2145,7 @@ async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
         &lix,
         "plugin_csv",
         &build_csv_plugin_archive(),
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
 
@@ -2126,8 +2155,8 @@ async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
     let source_bytes = b"SOURC,one,red\n".to_vec();
     write_file(&lix, path, base).await.unwrap();
     let file_id = file_id_at_path(&lix, path).await;
-    let row_id = csv_v2_row_id(
-        &active_csv_v2_rows(&lix, &file_id).await,
+    let row_id = csv_row_id(
+        &active_csv_rows(&lix, &file_id).await,
         &["alpha", "one", "red"],
     );
     let target_branch_id = lix.active_branch_id().await.unwrap();
@@ -2148,7 +2177,7 @@ async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
     write_file(&lix, path, source_bytes.clone())
         .await
         .expect("source same-cell edit should commit");
-    let source_order = csv_v2_row_ordering(&lix, &file_id, &row_id).await;
+    let source_order = csv_row_ordering(&lix, &file_id, &row_id).await;
     lix.switch_branch(SwitchBranchOptions {
         branch_id: target_branch_id.clone(),
     })
@@ -2157,7 +2186,7 @@ async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
     write_file(&lix, path, target_bytes.clone())
         .await
         .expect("target same-cell edit should commit");
-    let target_order = csv_v2_row_ordering(&lix, &file_id, &row_id).await;
+    let target_order = csv_row_ordering(&lix, &file_id, &row_id).await;
     assert_ne!(source_order, target_order);
     let expected = if source_order < target_order {
         target_bytes
@@ -2199,7 +2228,7 @@ async fn v2_csv_delete_vs_edit_remains_a_file_lifecycle_conflict() {
         &lix,
         "plugin_csv",
         &archive,
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
 
@@ -2208,8 +2237,8 @@ async fn v2_csv_delete_vs_edit_remains_a_file_lifecycle_conflict() {
         .await
         .expect("base CSV should import");
     let file_id = file_id_at_path(&lix, path).await;
-    let row_id = csv_v2_row_id(
-        &active_csv_v2_rows(&lix, &file_id).await,
+    let row_id = csv_row_id(
+        &active_csv_rows(&lix, &file_id).await,
         &["alpha", "one", "red"],
     );
     let target_branch_id = lix.active_branch_id().await.unwrap();
@@ -2234,7 +2263,7 @@ async fn v2_csv_delete_vs_edit_remains_a_file_lifecycle_conflict() {
     .await
     .unwrap();
     lix.execute(
-        "UPDATE csv_v2_row SET cells = $1 \
+        "UPDATE csv_row SET cells = $1 \
          WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Json(serde_json::json!(["alpha", "ONE", "red"])),
@@ -2303,7 +2332,7 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
         &lix,
         "plugin_csv",
         &archive,
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
 
@@ -2314,8 +2343,8 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
         .await
         .expect("base CSV should import");
     let file_id = file_id_at_path(&lix, csv_path).await;
-    let row_id = csv_v2_row_id(
-        &active_csv_v2_rows(&lix, &file_id).await,
+    let row_id = csv_row_id(
+        &active_csv_rows(&lix, &file_id).await,
         &["alpha", "one", "red"],
     );
     let target_branch_id = lix.active_branch_id().await.unwrap();
@@ -2329,7 +2358,7 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
         .unwrap();
 
     lix.execute(
-        "UPDATE csv_v2_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Json(serde_json::json!(["TARGET", "one", "red"])),
             Value::Text(row_id.clone()),
@@ -2354,7 +2383,7 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
     .await
     .expect("source descriptor rename should commit");
     lix.execute(
-        "UPDATE csv_v2_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
         &[
             Value::Json(serde_json::json!(["SOURCE", "one", "red"])),
             Value::Text(row_id),
@@ -2376,7 +2405,7 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
         .await
         .expect("descriptor-divergent merge should still preview");
     assert!(preview.conflicts.iter().any(|conflict| {
-        conflict.schema_key == "csv_v2_row" && conflict.file_id.as_deref() == Some(file_id.as_str())
+        conflict.schema_key == "csv_row" && conflict.file_id.as_deref() == Some(file_id.as_str())
     }));
 
     lix.reset_plugin_transition_counters();
@@ -3782,7 +3811,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
                     &lix,
                     "plugin_csv",
                     &archive,
-                    &["csv_v2_table", "csv_v2_row"],
+                    &["csv_table", "csv_row"],
                 )
                 .await;
             } else {
@@ -3878,7 +3907,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
                 );
             } else {
                 let row_count = lix
-                    .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
+                    .execute("SELECT COUNT(*) AS count FROM csv_row", &[])
                     .await
                     .expect("count direct CSV rows")
                     .rows()[0]
@@ -3953,15 +3982,14 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
     );
 }
 
-/// Prototype B retains the fused call and existing engine storage path, but
-/// sends CSV rows as bounded typed batches without guest-side JSON snapshots.
+/// Profiles CSV initial import through the universal entity output API.
 #[tokio::test]
-#[ignore = "Component v3 Prototype B typed CSV batch import benchmark"]
-async fn v3_csv_ten_mib_typed_batch_benchmark() {
+#[ignore = "10 MiB CSV universal entity import benchmark"]
+async fn csv_ten_mib_universal_entity_benchmark() {
     const CSV_ROW_COUNT: usize = 220_000;
     const FILE_ID: &str = "019a0000-0000-7000-8000-000000000320";
     const FILE_PATH: &str = "/v3-typed-batch.csv";
-    const BENCHMARK: &str = "v3_csv_ten_mib_typed_batch_benchmark";
+    const BENCHMARK: &str = "csv_ten_mib_universal_entity_benchmark";
 
     let samples = std::env::var("LIX_BENCH_SAMPLES")
         .ok()
@@ -3981,13 +4009,13 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
     let mut elapsed_ms = Vec::with_capacity(samples);
 
     for sample in 0..samples {
-        let root = tempfile::tempdir().expect("create v3 Prototype B benchmark directory");
+        let root = tempfile::tempdir().expect("create universal CSV benchmark directory");
         let lix = open_lix_with_rocksdb(root.path()).await;
         install_reference_plugin_in_blank_registry(
             &lix,
             "plugin_csv",
             &archive,
-            &["csv_v2_table", "csv_v2_row"],
+            &["csv_table", "csv_row"],
         )
         .await;
 
@@ -4006,28 +4034,28 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
                 ],
             )
             .await
-            .expect("v3 Prototype B CSV import should succeed");
+            .expect("universal CSV import should succeed");
         let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
         assert_eq!(inserted.rows_affected(), 1, "v3 sample {sample}");
 
         let counters = lix.plugin_transition_counters();
         assert_eq!(
             counters.guest_export_calls, 1,
-            "Prototype B must enter the guest exactly once"
+            "universal CSV import must enter the guest exactly once"
         );
         assert_eq!(
             counters.actor_executor_threads_created, 0,
-            "Prototype B must not create actor executor threads"
+            "universal CSV import must not create actor executor threads"
         );
         assert_eq!(
             counters.packet_records,
             (CSV_ROW_COUNT + 1) as u64,
-            "Prototype B must retain exact typed-batch row cardinality"
+            "universal CSV import must retain exact row cardinality"
         );
         assert_eq!(
             counters.durable_semantic_changes,
             (CSV_ROW_COUNT + 1) as u64,
-            "Prototype B must commit the exact semantic row count"
+            "universal CSV import must commit the exact semantic row count"
         );
         assert!(
             counters.packet_pages > 1,
@@ -4036,14 +4064,14 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
         assert_eq!(
             read_file(&lix, FILE_PATH)
                 .await
-                .expect("v3 Prototype B file should read"),
+                .expect("universal CSV file should read"),
             Some(source.clone()),
-            "Prototype B must preserve exact file bytes"
+            "universal CSV import must preserve exact file bytes"
         );
         let row_count = lix
-            .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
+            .execute("SELECT COUNT(*) AS count FROM csv_row", &[])
             .await
-            .expect("v3 Prototype B semantic rows should query")
+            .expect("universal CSV semantic rows should query")
             .rows()[0]
             .get::<i64>("count")
             .expect("CSV row count must be an integer");
@@ -4051,7 +4079,7 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
         let projected = lix
             .execute(
                 "SELECT lixcol_entity_pk, id, order_key, cells \
-                 FROM csv_v2_row WHERE lixcol_file_id = $1 LIMIT 1",
+                 FROM csv_row WHERE lixcol_file_id = $1 LIMIT 1",
                 &[Value::Text(FILE_ID.to_owned())],
             )
             .await
@@ -4076,7 +4104,7 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
 
         let phase_close_live_bytes = collector.take_close_live_bytes();
         eprintln!(
-            "v3_typed_batch_phases sample={sample} elapsed_ms={:.3} \
+            "csv_universal_entity_phases sample={sample} elapsed_ms={:.3} \
              guest_export_calls={} actor_executor_threads_created={} \
              source_sink_import_calls={} packet_pages={} packet_records={} \
              boundary_bytes={} guest_high_water_bytes={} phase_close_live_bytes={:?} phases_ms={:?}",
@@ -4093,7 +4121,7 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
         );
         emit_sample(
             BENCHMARK,
-            "typed_csv_batches",
+            "universal_entities",
             sample,
             fixture,
             BenchmarkGate::BulkWrite,
@@ -4101,20 +4129,32 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
         );
         elapsed_ms.push(measurement.elapsed_ms);
         measurements.push(measurement);
-        lix.close().await.expect("close v3 Prototype B benchmark");
+        lix.close().await.expect("close universal CSV benchmark");
         let reopened = open_lix_with_rocksdb(root.path()).await;
         let reopened_count = reopened
-            .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
+            .execute("SELECT COUNT(*) AS count FROM csv_row", &[])
             .await
             .expect("reopened certified CSV rows should query")
             .rows()[0]
             .get::<i64>("count")
             .expect("reopened CSV row count must be an integer");
         assert_eq!(reopened_count, CSV_ROW_COUNT as i64);
+        emit_transition_profile(
+            BENCHMARK,
+            "universal_entities",
+            sample,
+            counters,
+            serde_json::json!({
+                "file_sha256": sha256_lower_hex(&source),
+                "file_bytes": source.len(),
+                "entity_rows": CSV_ROW_COUNT + 1,
+                "reopen_verified": true
+            }),
+        );
         reopened
             .close()
             .await
-            .expect("close reopened v3 Prototype B benchmark");
+            .expect("close reopened universal CSV benchmark");
     }
 
     elapsed_ms.sort_by(f64::total_cmp);
@@ -4128,7 +4168,7 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
     );
     emit_summary(
         BENCHMARK,
-        "typed_csv_batches",
+        "universal_entities",
         fixture,
         BenchmarkGate::BulkWrite,
         &measurements,
@@ -4281,6 +4321,21 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
                 .get::<i64>("count")
                 .expect("reopened JSON member count must be an integer");
             assert_eq!(reopened_count, JSON_TEN_MIB_PROPERTY_COUNT as i64);
+            emit_transition_profile(
+                BENCHMARK,
+                label,
+                sample,
+                counters,
+                serde_json::json!({
+                    "file_sha256": sha256_lower_hex(&source),
+                    "file_bytes": source.len(),
+                    "entity_rows": JSON_TEN_MIB_PROPERTY_COUNT + 1,
+                    "history_rows": history_count,
+                    "projected_key": projected_key,
+                    "projected_scalar": projected_scalar,
+                    "reopen_verified": true
+                }),
+            );
             reopened
                 .close()
                 .await
@@ -4389,6 +4444,31 @@ async fn v3_json_ten_mib_sparse_successor_benchmark() {
                  phase_close_live_bytes={:?}",
                 collector.take_aggregate_millis(),
                 collector.take_close_live_bytes(),
+            );
+            let fixture = BenchmarkFixture {
+                input_bytes: after.len(),
+                logical_rows: 1,
+            };
+            emit_sample(
+                "v3_json_ten_mib_sparse_successor_benchmark",
+                label,
+                sample,
+                fixture,
+                BenchmarkGate::ElapsedRegression,
+                measurement,
+            );
+            emit_transition_profile(
+                "v3_json_ten_mib_sparse_successor_benchmark",
+                label,
+                sample,
+                counters,
+                serde_json::json!({
+                    "before_sha256": sha256_lower_hex(&before),
+                    "file_sha256": sha256_lower_hex(&after),
+                    "file_bytes": after.len(),
+                    "semantic_changes": 1,
+                    "edited_key": edited_key
+                }),
             );
             elapsed_ms.push(measurement.elapsed_ms);
             measurements.push(measurement);
@@ -4504,6 +4584,32 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
                 counters.full_state_semantic_rows_materialized,
                 counters.full_renderer_invocations,
             );
+            let fixture = BenchmarkFixture {
+                input_bytes: after.len(),
+                logical_rows: JSON_TEN_MIB_PROPERTY_COUNT,
+            };
+            emit_sample(
+                "v3_json_ten_mib_cold_successor_benchmark",
+                label,
+                sample,
+                fixture,
+                BenchmarkGate::ElapsedRegression,
+                measurement,
+            );
+            emit_transition_profile(
+                "v3_json_ten_mib_cold_successor_benchmark",
+                label,
+                sample,
+                counters,
+                serde_json::json!({
+                    "before_sha256": sha256_lower_hex(&before),
+                    "file_sha256": sha256_lower_hex(&after),
+                    "file_bytes": after.len(),
+                    "semantic_changes": 1,
+                    "edited_key": edited_key,
+                    "cold_successor": label == "cold_successor"
+                }),
+            );
             elapsed_ms.push(measurement.elapsed_ms);
             measurements.push(measurement);
             reopened.close().await.unwrap();
@@ -4574,6 +4680,42 @@ async fn v3_json_reopen_uses_one_export_for_cold_successor() {
     reopened.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn universal_entity_page_streams_oversized_output_snapshot() {
+    const PATH: &str = "/universal-oversized-output.json";
+    let value = "x".repeat(3 * 1024 * 1024);
+    let bytes = serde_json::to_vec(&serde_json::json!({ "large": value })).unwrap();
+    let root = tempfile::tempdir().expect("create oversized output directory");
+    let lix = open_lix_with_rocksdb(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    write_file(&lix, PATH, bytes.clone()).await.unwrap();
+    assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(bytes.clone()));
+    let rows = lix
+        .execute(
+            "SELECT scalar_json FROM json_object_member WHERE key = 'large'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let scalar = rows.rows()[0].get::<String>("scalar_json").unwrap();
+    assert_eq!(
+        serde_json::from_str::<String>(&scalar).unwrap().len(),
+        3 * 1024 * 1024
+    );
+    lix.close().await.unwrap();
+
+    let reopened = open_lix_with_rocksdb(root.path()).await;
+    assert_eq!(read_file(&reopened, PATH).await.unwrap(), Some(bytes));
+    reopened.close().await.unwrap();
+}
+
 #[derive(Debug)]
 struct BenchmarkByteSource(Vec<u8>);
 
@@ -4641,7 +4783,6 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
         .expect("compile JSON component");
     let descriptor = WasmFileDescriptor {
         path: Some("/direct-cold.json".to_owned()),
-        media_type: Some("application/json".to_owned()),
         plugin: WasmPluginSelection {
             plugin_key: "plugin_json".to_owned(),
             generation: "direct".to_owned(),
@@ -4821,7 +4962,6 @@ async fn v3_json_direct_cold_successor_benchmark() {
         .unwrap();
     let descriptor = WasmFileDescriptor {
         path: Some("/direct-cold-large.json".to_owned()),
-        media_type: Some("application/json".to_owned()),
         plugin: WasmPluginSelection {
             plugin_key: "plugin_json".to_owned(),
             generation: "direct".to_owned(),
@@ -5100,7 +5240,7 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
         &lix,
         "plugin_csv",
         &build_csv_plugin_archive(),
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
     let path = "/v3-csv-evicted.csv";
@@ -5108,7 +5248,7 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
         .await
         .unwrap();
     let first_id = lix
-        .execute("SELECT id FROM csv_v2_row ORDER BY order_key LIMIT 1", &[])
+        .execute("SELECT id FROM csv_row ORDER BY order_key LIMIT 1", &[])
         .await
         .unwrap()
         .rows()[0]
@@ -5141,7 +5281,7 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
     assert_eq!(eviction_counters.full_document_reparses, 0);
     assert_eq!(eviction_counters.durable_semantic_changes, 1);
     assert_eq!(
-        lix.execute("SELECT id FROM csv_v2_row ORDER BY order_key LIMIT 1", &[],)
+        lix.execute("SELECT id FROM csv_row ORDER BY order_key LIMIT 1", &[],)
             .await
             .unwrap()
             .rows()[0]
@@ -5191,7 +5331,7 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
     );
     assert_eq!(
         reopened
-            .execute("SELECT id FROM csv_v2_row ORDER BY order_key LIMIT 1", &[],)
+            .execute("SELECT id FROM csv_row ORDER BY order_key LIMIT 1", &[],)
             .await
             .unwrap()
             .rows()[0]
@@ -5209,7 +5349,7 @@ async fn v3_csv_cold_hydration_preserves_multiple_create_namespaces() {
         &lix,
         "plugin_csv",
         &build_csv_plugin_archive(),
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
     let path = "/multi-namespace.csv";
@@ -5217,11 +5357,11 @@ async fn v3_csv_cold_hydration_preserves_multiple_create_namespaces() {
         .await
         .unwrap();
     let file_id = file_id_at_path(&lix, path).await;
-    let original_id = csv_v2_row_id(&active_csv_v2_rows(&lix, &file_id).await, &["old", "one"]);
+    let original_id = csv_row_id(&active_csv_rows(&lix, &file_id).await, &["old", "one"]);
     write_file(&lix, path, b"new,zero\nold,one\nlast,two\n".to_vec())
         .await
         .unwrap();
-    let inserted_id = csv_v2_row_id(&active_csv_v2_rows(&lix, &file_id).await, &["new", "zero"]);
+    let inserted_id = csv_row_id(&active_csv_rows(&lix, &file_id).await, &["new", "zero"]);
     assert_ne!(inserted_id, original_id);
 
     for index in 0..20 {
@@ -5236,56 +5376,9 @@ async fn v3_csv_cold_hydration_preserves_multiple_create_namespaces() {
     write_file(&lix, path, b"new,ZERO\nold,one\nlast,two\n".to_vec())
         .await
         .expect("cold hydration must retain IDs from every create namespace");
-    let rows = active_csv_v2_rows(&lix, &file_id).await;
-    assert_eq!(csv_v2_row_id(&rows, &["new", "ZERO"]), inserted_id);
-    assert_eq!(csv_v2_row_id(&rows, &["old", "one"]), original_id);
-
-    lix.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn v3_derived_cold_hydration_renders_from_durable_entities() {
-    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
-    install_reference_plugin_in_blank_registry(
-        &lix,
-        "plugin_json",
-        &build_json_derived_plugin_archive(),
-        &["json_root", "json_object_member", "json_array_item"],
-    )
-    .await;
-    let path = "/derived-cold.json";
-    let source = br#"{"value":"durable"}"#.to_vec();
-    write_file(&lix, path, source.clone()).await.unwrap();
-
-    for index in 0..20 {
-        write_file(
-            &lix,
-            &format!("/derived-evict-{index}.json"),
-            format!(r#"{{"value":{index}}}"#).into_bytes(),
-        )
-        .await
-        .unwrap();
-    }
-    lix.reset_plugin_transition_counters();
-    let successor = br#"{"value":"successor"}"#.to_vec();
-    write_file(&lix, path, successor.clone())
-        .await
-        .expect("derived cold successor should hydrate from durable entities");
-    assert_eq!(
-        read_file(&lix, path)
-            .await
-            .expect("derived cold read should render"),
-        Some(successor)
-    );
-    let counters = lix.plugin_transition_counters();
-    assert!(
-        counters.full_state_semantic_rows_materialized > 0,
-        "derived cold hydration must consume durable entities"
-    );
-    assert_eq!(
-        counters.full_renderer_invocations, 1,
-        "derived cold hydration must render exactly once"
-    );
+    let rows = active_csv_rows(&lix, &file_id).await;
+    assert_eq!(csv_row_id(&rows, &["new", "ZERO"]), inserted_id);
+    assert_eq!(csv_row_id(&rows, &["old", "one"]), original_id);
 
     lix.close().await.unwrap();
 }
@@ -5319,7 +5412,7 @@ async fn v3_file_changed_push_sink_benchmark() {
         &lix,
         "plugin_csv",
         &build_csv_plugin_archive(),
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
     let path = "/push-sink.csv";
@@ -5370,13 +5463,24 @@ async fn v3_file_changed_push_sink_benchmark() {
             BenchmarkGate::ElapsedRegression,
             measurement,
         );
+        emit_transition_profile(
+            BENCHMARK,
+            "v3_push_sink",
+            sample,
+            counters,
+            serde_json::json!({
+                "file_sha256": sha256_lower_hex(&bytes),
+                "file_bytes": bytes.len(),
+                "semantic_changes": 1
+            }),
+        );
         elapsed_ms.push(measurement.elapsed_ms);
         measurements.push(measurement);
     }
 
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(bytes));
     let row_count = lix
-        .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
+        .execute("SELECT COUNT(*) AS count FROM csv_row", &[])
         .await
         .expect("v3 semantic rows should query")
         .rows()[0]
@@ -5556,6 +5660,8 @@ struct ColdMaterializedOpenSample {
 #[tokio::test]
 #[ignore = "large v3 cold-successor CSV and JSON benchmark"]
 async fn v3_cold_successor_csv_and_json_benchmark() {
+    const BENCHMARK: &str = "v3_cold_successor_csv_and_json_benchmark";
+    const CSV_COLD_ROWS: usize = 220_000;
     let samples = std::env::var("LIX_BENCH_SAMPLES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -5648,9 +5754,38 @@ async fn v3_cold_successor_csv_and_json_benchmark() {
                 "v3_cold_successor_phases label={label} sample={sample} phases_ms={:?} phase_close_live_bytes={:?}",
                 phases_ms, phase_close_live_bytes,
             );
+            let counters = lix.plugin_transition_counters();
+            let fixture = BenchmarkFixture {
+                input_bytes: after.len(),
+                logical_rows: if label == "csv-220k-rows" {
+                    CSV_COLD_ROWS + 1
+                } else {
+                    JSON_TEN_MIB_PROPERTY_COUNT + 1
+                },
+            };
+            emit_sample(
+                BENCHMARK,
+                label,
+                sample,
+                fixture,
+                BenchmarkGate::ElapsedRegression,
+                measurement,
+            );
+            emit_transition_profile(
+                BENCHMARK,
+                label,
+                sample,
+                counters,
+                serde_json::json!({
+                    "file_sha256": sha256_lower_hex(&after),
+                    "file_bytes": after.len(),
+                    "entity_rows": fixture.logical_rows,
+                    "cold_successor": true
+                }),
+            );
             lane_samples.push(ColdMaterializedOpenSample {
                 measurement,
-                counters: lix.plugin_transition_counters(),
+                counters,
             });
             lix.close()
                 .await
@@ -5658,6 +5793,23 @@ async fn v3_cold_successor_csv_and_json_benchmark() {
             accepted = after;
         }
         report_cold_materialized_open(label, accepted.len(), &lane_samples);
+        emit_summary(
+            BENCHMARK,
+            label,
+            BenchmarkFixture {
+                input_bytes: accepted.len(),
+                logical_rows: if label == "csv-220k-rows" {
+                    CSV_COLD_ROWS + 1
+                } else {
+                    JSON_TEN_MIB_PROPERTY_COUNT + 1
+                },
+            },
+            BenchmarkGate::ElapsedRegression,
+            &lane_samples
+                .iter()
+                .map(|sample| sample.measurement)
+                .collect::<Vec<_>>(),
+        );
     }
 }
 
@@ -6186,7 +6338,7 @@ async fn same_base_transactions_resolve_reference_plugin_file_overlaps() {
             "csv",
             "plugin_csv",
             build_csv_plugin_archive(),
-            vec!["csv_v2_table", "csv_v2_row"],
+            vec!["csv_table", "csv_row"],
             b"name,value\nitem,base\nother,base\n".to_vec(),
             b"name,value\nitem,first\nother,first\n".to_vec(),
             b"name,value\nitem,second\nother,second\n".to_vec(),
@@ -6195,16 +6347,16 @@ async fn same_base_transactions_resolve_reference_plugin_file_overlaps() {
             "markdown",
             "plugin_markdown",
             build_markdown_plugin_archive(),
-            vec!["markdown_node_v2"],
+            vec!["markdown_node"],
             b"# Base\n\nBase paragraph\n".to_vec(),
             b"# First\n\nFirst paragraph\n".to_vec(),
             b"# Second\n\nSecond paragraph\n".to_vec(),
         ),
         (
             "text",
-            "plugin_git_text",
+            "plugin_text",
             build_text_plugin_archive(),
-            vec!["git_text_line_v2"],
+            vec!["text_line"],
             b"base one\nbase two\n".to_vec(),
             b"first one\nfirst two\n".to_vec(),
             b"second one\nsecond two\n".to_vec(),
@@ -6749,6 +6901,19 @@ async fn v3_excalidraw_large_transition_benchmark() {
                 BenchmarkGate::ElapsedRegression,
                 measurement,
             );
+            emit_transition_profile(
+                BENCHMARK,
+                label,
+                sample,
+                counters,
+                serde_json::json!({
+                    "before_sha256": sha256_lower_hex(&before),
+                    "file_sha256": sha256_lower_hex(&after),
+                    "file_bytes": after.len(),
+                    "entity_rows": ELEMENTS,
+                    "semantic_changes": 1
+                }),
+            );
             measurements.push(measurement);
             lix.close().await.unwrap();
         }
@@ -7065,23 +7230,20 @@ async fn v2_csv_ids_survive_insert_edit_reorder_delete_eviction_and_cold_reopen(
     let initial = b"alpha,one\ndup,same\ndup,same\nomega,last\n".to_vec();
     write_file(&lix, path, initial).await.unwrap();
     let file_id = file_id_at_path(&lix, path).await;
-    let initial_rows = active_csv_v2_rows(&lix, &file_id).await;
-    let alpha_id = csv_v2_row_id(&initial_rows, &["alpha", "one"]);
-    let omega_id = csv_v2_row_id(&initial_rows, &["omega", "last"]);
-    let duplicate_ids = csv_v2_row_ids(&initial_rows, &["dup", "same"]);
+    let initial_rows = active_csv_rows(&lix, &file_id).await;
+    let alpha_id = csv_row_id(&initial_rows, &["alpha", "one"]);
+    let omega_id = csv_row_id(&initial_rows, &["omega", "last"]);
+    let duplicate_ids = csv_row_ids(&initial_rows, &["dup", "same"]);
     assert_eq!(duplicate_ids.len(), 2);
     assert_ne!(duplicate_ids[0], duplicate_ids[1]);
 
     let inserted = b"alpha,one\ninserted,new\ndup,same\ndup,same\nomega,last\n".to_vec();
     write_file(&lix, path, inserted).await.unwrap();
-    let after_insert = active_csv_v2_rows(&lix, &file_id).await;
-    assert_eq!(csv_v2_row_id(&after_insert, &["alpha", "one"]), alpha_id);
-    assert_eq!(csv_v2_row_id(&after_insert, &["omega", "last"]), omega_id);
-    assert_eq!(
-        csv_v2_row_ids(&after_insert, &["dup", "same"]),
-        duplicate_ids
-    );
-    let inserted_id = csv_v2_row_id(&after_insert, &["inserted", "new"]);
+    let after_insert = active_csv_rows(&lix, &file_id).await;
+    assert_eq!(csv_row_id(&after_insert, &["alpha", "one"]), alpha_id);
+    assert_eq!(csv_row_id(&after_insert, &["omega", "last"]), omega_id);
+    assert_eq!(csv_row_ids(&after_insert, &["dup", "same"]), duplicate_ids);
+    let inserted_id = csv_row_id(&after_insert, &["inserted", "new"]);
     assert!(
         !initial_rows.iter().any(|row| row.id == inserted_id),
         "an inserted row must receive a fresh compact identity"
@@ -7089,32 +7251,26 @@ async fn v2_csv_ids_survive_insert_edit_reorder_delete_eviction_and_cold_reopen(
 
     let edited = b"alpha,ONE\ninserted,new\ndup,same\ndup,same\nomega,last\n".to_vec();
     write_file(&lix, path, edited).await.unwrap();
-    let after_edit = active_csv_v2_rows(&lix, &file_id).await;
-    assert_eq!(csv_v2_row_id(&after_edit, &["alpha", "ONE"]), alpha_id);
+    let after_edit = active_csv_rows(&lix, &file_id).await;
+    assert_eq!(csv_row_id(&after_edit, &["alpha", "ONE"]), alpha_id);
 
     let reordered = b"omega,last\ndup,same\nalpha,ONE\ninserted,new\ndup,same\n".to_vec();
     write_file(&lix, path, reordered).await.unwrap();
-    let after_reorder = active_csv_v2_rows(&lix, &file_id).await;
-    assert_eq!(csv_v2_row_id(&after_reorder, &["omega", "last"]), omega_id);
-    assert_eq!(csv_v2_row_id(&after_reorder, &["alpha", "ONE"]), alpha_id);
+    let after_reorder = active_csv_rows(&lix, &file_id).await;
+    assert_eq!(csv_row_id(&after_reorder, &["omega", "last"]), omega_id);
+    assert_eq!(csv_row_id(&after_reorder, &["alpha", "ONE"]), alpha_id);
     assert_eq!(
-        csv_v2_row_id(&after_reorder, &["inserted", "new"]),
+        csv_row_id(&after_reorder, &["inserted", "new"]),
         inserted_id
     );
-    assert_eq!(
-        csv_v2_row_ids(&after_reorder, &["dup", "same"]),
-        duplicate_ids
-    );
+    assert_eq!(csv_row_ids(&after_reorder, &["dup", "same"]), duplicate_ids);
 
     let final_bytes = b"omega,last\ndup,same\ninserted,new\n".to_vec();
     write_file(&lix, path, final_bytes.clone()).await.unwrap();
-    let final_rows = active_csv_v2_rows(&lix, &file_id).await;
-    assert_eq!(csv_v2_row_id(&final_rows, &["omega", "last"]), omega_id);
-    assert_eq!(
-        csv_v2_row_id(&final_rows, &["inserted", "new"]),
-        inserted_id
-    );
-    let remaining_duplicate_ids = csv_v2_row_ids(&final_rows, &["dup", "same"]);
+    let final_rows = active_csv_rows(&lix, &file_id).await;
+    assert_eq!(csv_row_id(&final_rows, &["omega", "last"]), omega_id);
+    assert_eq!(csv_row_id(&final_rows, &["inserted", "new"]), inserted_id);
+    let remaining_duplicate_ids = csv_row_ids(&final_rows, &["dup", "same"]);
     assert_eq!(remaining_duplicate_ids.len(), 1);
     assert!(duplicate_ids.contains(&remaining_duplicate_ids[0]));
     assert!(!final_rows.iter().any(|row| row.id == alpha_id));
@@ -7135,12 +7291,12 @@ async fn v2_csv_ids_survive_insert_edit_reorder_delete_eviction_and_cold_reopen(
         read_file(&lix, path).await.unwrap(),
         Some(final_bytes.clone())
     );
-    assert_eq!(active_csv_v2_rows(&lix, &file_id).await, final_rows);
+    assert_eq!(active_csv_rows(&lix, &file_id).await, final_rows);
     lix.close().await.unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(final_bytes));
-    assert_eq!(active_csv_v2_rows(&lix, &file_id).await, final_rows);
+    assert_eq!(active_csv_rows(&lix, &file_id).await, final_rows);
     lix.close().await.unwrap();
 }
 
@@ -7251,7 +7407,7 @@ async fn v2_csv_actor_state_isolated_by_branch_root() {
     let main_bytes = b"main,one\nshared,row\n".to_vec();
     write_file(&lix, path, main_bytes.clone()).await.unwrap();
     let main_file_id = file_id_at_path(&lix, path).await;
-    let main_rows = active_csv_v2_rows(&lix, &main_file_id).await;
+    let main_rows = active_csv_rows(&lix, &main_file_id).await;
     let main_branch_id = lix.active_branch_id().await.unwrap();
 
     let branch = lix
@@ -7271,11 +7427,11 @@ async fn v2_csv_actor_state_isolated_by_branch_root() {
         read_file(&lix, path).await.unwrap(),
         Some(main_bytes.clone())
     );
-    assert_eq!(active_csv_v2_rows(&lix, &main_file_id).await, main_rows);
+    assert_eq!(active_csv_rows(&lix, &main_file_id).await, main_rows);
 
     let branch_bytes = b"branch,ONE\nshared,row\ninserted,branch\n".to_vec();
     write_file(&lix, path, branch_bytes.clone()).await.unwrap();
-    let branch_rows = active_csv_v2_rows(&lix, &main_file_id).await;
+    let branch_rows = active_csv_rows(&lix, &main_file_id).await;
     assert_ne!(branch_rows, main_rows);
 
     lix.switch_branch(SwitchBranchOptions {
@@ -7284,7 +7440,7 @@ async fn v2_csv_actor_state_isolated_by_branch_root() {
     .await
     .unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(main_bytes));
-    assert_eq!(active_csv_v2_rows(&lix, &main_file_id).await, main_rows);
+    assert_eq!(active_csv_rows(&lix, &main_file_id).await, main_rows);
 
     lix.switch_branch(SwitchBranchOptions {
         branch_id: branch.id,
@@ -7292,7 +7448,7 @@ async fn v2_csv_actor_state_isolated_by_branch_root() {
     .await
     .unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(branch_bytes));
-    assert_eq!(active_csv_v2_rows(&lix, &main_file_id).await, branch_rows);
+    assert_eq!(active_csv_rows(&lix, &main_file_id).await, branch_rows);
     lix.close().await.unwrap();
 }
 
@@ -7314,7 +7470,7 @@ async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions(
     let wasm = std::fs::read(wasm_path).unwrap();
     let compatible = build_csv_plugin_archive_variant(
         &wasm,
-        include_str!("../../../plugins/csv/schema/csv_v2_row.json").as_bytes(),
+        include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
         Some(b"compatible-generation"),
     );
     assert_ne!(original, compatible);
@@ -7335,7 +7491,7 @@ async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions(
     assert_eq!(stale_error.code, LixError::CODE_PLUGIN_OBSERVATION_STALE);
 
     let mut changed_schema: serde_json::Value =
-        serde_json::from_str(include_str!("../../../plugins/csv/schema/csv_v2_row.json")).unwrap();
+        serde_json::from_str(include_str!("../../../plugins/csv/schema/csv_row.json")).unwrap();
     changed_schema["description"] =
         serde_json::Value::String("incompatible replacement definition".to_string());
     let changed_schema = serde_json::to_vec(&changed_schema).unwrap();
@@ -7352,7 +7508,7 @@ async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions(
     let invalid_component = b"\0asm\x0a\0\0\0";
     let trapping = build_csv_plugin_archive_variant(
         invalid_component,
-        include_str!("../../../plugins/csv/schema/csv_v2_row.json").as_bytes(),
+        include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
         Some(b"invalid-component"),
     );
     install_plugin(&lix, "plugin_csv", &trapping)
@@ -7424,7 +7580,7 @@ async fn v2_generation_upgrade_with_disjoint_edits_remains_a_merge_conflict() {
     let wasm = std::fs::read(wasm_path).unwrap();
     let upgraded = build_csv_plugin_archive_variant(
         &wasm,
-        include_str!("../../../plugins/csv/schema/csv_v2_row.json").as_bytes(),
+        include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
         Some(b"source-generation"),
     );
     install_plugin(&lix, "plugin_csv", &upgraded)
@@ -7489,7 +7645,7 @@ async fn v4_csv_dialect_rename_after_eviction_uses_predecessor_descriptor() {
     write_file(&lix, before_path, source.clone()).await.unwrap();
     let file_id = file_id_at_path(&lix, before_path).await;
     assert_eq!(
-        active_csv_v2_rows(&lix, &file_id).await[0].cells,
+        active_csv_rows(&lix, &file_id).await[0].cells,
         ["first", "one"]
     );
 
@@ -7516,7 +7672,7 @@ async fn v4_csv_dialect_rename_after_eviction_uses_predecessor_descriptor() {
     assert_eq!(read_file(&lix, before_path).await.unwrap(), None);
     assert_eq!(read_file(&lix, after_path).await.unwrap(), Some(source));
     assert_eq!(
-        active_csv_v2_rows(&lix, &file_id).await[0].cells,
+        active_csv_rows(&lix, &file_id).await[0].cells,
         ["first,one"],
         "the successor must be reparsed with TSV delimiter semantics"
     );
@@ -7616,14 +7772,14 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
     assert_eq!(read_file(&lix, raw_path).await.unwrap(), Some(edited));
     let active_table_rows = lix
         .execute(
-            "SELECT lixcol_file_id FROM csv_v2_table WHERE lixcol_file_id = $1",
+            "SELECT lixcol_file_id FROM csv_table WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.clone())],
         )
         .await
         .unwrap();
     let active_row_rows = lix
         .execute(
-            "SELECT lixcol_file_id FROM csv_v2_row WHERE lixcol_file_id = $1",
+            "SELECT lixcol_file_id FROM csv_row WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.clone())],
         )
         .await
@@ -7652,7 +7808,7 @@ async fn transaction_lix_file_data_uses_session_plugin_runtime() {
         &lix,
         "plugin_csv",
         &archive,
-        &["csv_v2_table", "csv_v2_row"],
+        &["csv_table", "csv_row"],
     )
     .await;
     let csv = b"name,age\nAda,37\nGrace,85\n".to_vec();
@@ -7746,13 +7902,13 @@ where
     result.rows()[0].get::<String>("id").unwrap()
 }
 
-async fn active_csv_v2_rows<StorageImpl>(lix: &Lix<StorageImpl>, file_id: &str) -> Vec<CsvV2Row>
+async fn active_csv_rows<StorageImpl>(lix: &Lix<StorageImpl>, file_id: &str) -> Vec<CsvV2Row>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let rows = lix
         .execute(
-            "SELECT lixcol_entity_pk, id, order_key, cells FROM csv_v2_row \
+            "SELECT lixcol_entity_pk, id, order_key, cells FROM csv_row \
              WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.to_string())],
         )
@@ -7767,12 +7923,12 @@ where
                 .unwrap()
                 .as_array()
                 .cloned()
-                .expect("csv_v2_row entity_pk must be an array");
+                .expect("csv_row entity_pk must be an array");
             let id = row.get::<String>("id").unwrap();
             assert_eq!(
                 entity_pk,
                 vec![serde_json::Value::String(id.clone())],
-                "csv_v2_row snapshot identity must equal its durable primary key"
+                "csv_row snapshot identity must equal its durable primary key"
             );
             CsvV2Row {
                 id,
@@ -7781,11 +7937,11 @@ where
                     .get::<serde_json::Value>("cells")
                     .unwrap()
                     .as_array()
-                    .expect("csv_v2_row snapshot must have cells")
+                    .expect("csv_row snapshot must have cells")
                     .iter()
                     .map(|cell| {
                         cell.as_str()
-                            .expect("csv_v2_row cells must be strings")
+                            .expect("csv_row cells must be strings")
                             .to_string()
                     })
                     .collect(),
@@ -7798,7 +7954,7 @@ where
 
 /// Returns the exact durable tuple used by the merge planner to canonically
 /// order two competing live versions of one semantic CSV row.
-async fn csv_v2_row_ordering<StorageImpl>(
+async fn csv_row_ordering<StorageImpl>(
     lix: &Lix<StorageImpl>,
     file_id: &str,
     row_id: &str,
@@ -7808,7 +7964,7 @@ where
 {
     let result = lix
         .execute(
-            "SELECT lixcol_updated_at, lixcol_change_id FROM csv_v2_row \
+            "SELECT lixcol_updated_at, lixcol_change_id FROM csv_row \
              WHERE lixcol_file_id = $1 AND id = $2",
             &[
                 Value::Text(file_id.to_owned()),
@@ -7859,7 +8015,7 @@ where
     )
 }
 
-fn csv_v2_row_ids(rows: &[CsvV2Row], cells: &[&str]) -> Vec<String> {
+fn csv_row_ids(rows: &[CsvV2Row], cells: &[&str]) -> Vec<String> {
     let mut ids = rows
         .iter()
         .filter(|row| {
@@ -7874,9 +8030,9 @@ fn csv_v2_row_ids(rows: &[CsvV2Row], cells: &[&str]) -> Vec<String> {
     ids
 }
 
-fn csv_v2_row_id(rows: &[CsvV2Row], cells: &[&str]) -> String {
-    let ids = csv_v2_row_ids(rows, cells);
-    assert_eq!(ids.len(), 1, "expected one csv_v2_row with cells {cells:?}");
+fn csv_row_id(rows: &[CsvV2Row], cells: &[&str]) -> String {
+    let ids = csv_row_ids(rows, cells);
+    assert_eq!(ids.len(), 1, "expected one csv_row with cells {cells:?}");
     ids[0].clone()
 }
 
@@ -8147,12 +8303,12 @@ fn build_csv_plugin_archive() -> Vec<u8> {
             include_str!("../../../plugins/csv/manifest.json").as_bytes(),
         ),
         (
-            "schema/csv_v2_table.json",
-            include_str!("../../../plugins/csv/schema/csv_v2_table.json").as_bytes(),
+            "schema/csv_table.json",
+            include_str!("../../../plugins/csv/schema/csv_table.json").as_bytes(),
         ),
         (
-            "schema/csv_v2_row.json",
-            include_str!("../../../plugins/csv/schema/csv_v2_row.json").as_bytes(),
+            "schema/csv_row.json",
+            include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
@@ -8198,38 +8354,6 @@ fn build_json_plugin_archive() -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
-fn build_json_derived_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"));
-    let wasm = std::fs::read(wasm_path).unwrap();
-    let manifest = include_str!("../../../plugins/json/manifest.json").replace(
-        r#""materialization": "blob""#,
-        r#""materialization": "derived""#,
-    );
-    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for (path, bytes) in [
-        ("manifest.json", manifest.as_bytes()),
-        (
-            "schema/json_root.json",
-            include_str!("../../../plugins/json/schema/json_root.json").as_bytes(),
-        ),
-        (
-            "schema/json_object_member.json",
-            include_str!("../../../plugins/json/schema/json_object_member.json").as_bytes(),
-        ),
-        (
-            "schema/json_array_item.json",
-            include_str!("../../../plugins/json/schema/json_array_item.json").as_bytes(),
-        ),
-        ("plugin.wasm", wasm.as_slice()),
-    ] {
-        writer.start_file(path, options).unwrap();
-        writer.write_all(bytes).unwrap();
-    }
-    writer.finish().unwrap().into_inner()
-}
-
 fn build_markdown_plugin_archive() -> Vec<u8> {
     let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown"));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
@@ -8247,8 +8371,8 @@ fn build_markdown_plugin_archive() -> Vec<u8> {
             include_str!("../../../plugins/markdown/manifest.json").as_bytes(),
         ),
         (
-            "schema/markdown_node_v2.json",
-            include_str!("../../../plugins/markdown/schema/markdown_node_v2.json").as_bytes(),
+            "schema/markdown_node.json",
+            include_str!("../../../plugins/markdown/schema/markdown_node.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
@@ -8259,7 +8383,7 @@ fn build_markdown_plugin_archive() -> Vec<u8> {
 }
 
 fn build_text_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text"));
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_TEXT_plugin_text"));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
             "failed to read bindep-built text v3 wasm at {}: {error}",
@@ -8275,8 +8399,8 @@ fn build_text_plugin_archive() -> Vec<u8> {
             include_str!("../../../plugins/text/manifest.json").as_bytes(),
         ),
         (
-            "schema/git_text_line_v2.json",
-            include_str!("../../../plugins/text/schema/git_text_line_v2.json").as_bytes(),
+            "schema/text_line.json",
+            include_str!("../../../plugins/text/schema/text_line.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {
@@ -8357,8 +8481,8 @@ where
         .await
         .expect("open CSV control schema transaction");
     for schema in [
-        include_str!("../../../plugins/csv/schema/csv_v2_table.json"),
-        include_str!("../../../plugins/csv/schema/csv_v2_row.json"),
+        include_str!("../../../plugins/csv/schema/csv_table.json"),
+        include_str!("../../../plugins/csv/schema/csv_row.json"),
     ] {
         assert_eq!(
             transaction
@@ -8381,7 +8505,7 @@ where
 
 fn native_csv_control_table_insert(file_id: &str) -> NativeJsonControlStatement {
     NativeJsonControlStatement {
-        sql: "INSERT INTO csv_v2_table (id, dialect, lixcol_file_id) VALUES ('root', $1, $2)"
+        sql: "INSERT INTO csv_table (id, dialect, lixcol_file_id) VALUES ('root', $1, $2)"
             .to_owned(),
         params: vec![
             Value::Json(serde_json::json!({
@@ -8436,7 +8560,7 @@ fn native_csv_control_row_insert_chunks(
                 .join(",");
             NativeJsonControlStatement {
                 sql: format!(
-                    "INSERT INTO csv_v2_row (id, order_key, cells, lixcol_file_id) VALUES {values}"
+                    "INSERT INTO csv_row (id, order_key, cells, lixcol_file_id) VALUES {values}"
                 ),
                 params,
             }
@@ -8689,7 +8813,7 @@ fn build_excalidraw_plugin_archive() -> Vec<u8> {
 
 fn build_csv_plugin_archive_variant(
     wasm: &[u8],
-    csv_v2_row_schema: &[u8],
+    csv_row_schema: &[u8],
     generation_marker: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -8701,10 +8825,10 @@ fn build_csv_plugin_archive_variant(
             include_str!("../../../plugins/csv/manifest.json").as_bytes(),
         ),
         (
-            "schema/csv_v2_table.json",
-            include_str!("../../../plugins/csv/schema/csv_v2_table.json").as_bytes(),
+            "schema/csv_table.json",
+            include_str!("../../../plugins/csv/schema/csv_table.json").as_bytes(),
         ),
-        ("schema/csv_v2_row.json", csv_v2_row_schema),
+        ("schema/csv_row.json", csv_row_schema),
         ("plugin.wasm", wasm),
     ] {
         writer.start_file(path, options).unwrap();

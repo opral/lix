@@ -9,70 +9,34 @@ interface host {
     rejected(string),
   }
 
-  enum map-space {
-    entity,
-    state,
-  }
-
   record record-chunk {
     total-len: u64,
     bytes: bytes,
   }
 
-  /// One immutable host-owned file/entity/checkpoint version.
+  /// One immutable host-owned file and plugin-state version.
   resource snapshot {
     file-len: func() -> u64;
     read-file: func(offset: u64, length: u32) -> result<bytes, host-error>;
-    read-record: func(
-      space: map-space,
+    read-state: func(
       key: bytes,
       offset: u64,
       max-bytes: u32,
     ) -> result<option<record-chunk>, host-error>;
   }
 
-  record change-page {
-    record-count: u32,
+  /// One bounded, self-describing page of entity mutations.
+  record entity-page {
     payload: bytes,
   }
 
-  record packed-page {
-    codec: string,
-    format-version: u16,
-    record-count: u32,
-    payload: bytes,
-  }
-
-  enum change-effect {
-    content,
-    format-only,
-  }
-
-  record entity-change-input {
-    ordinal: u32,
-    schema-key: string,
-    entity-pk: list<string>,
-    snapshot-len: option<u64>,
-    /// Snapshots that fit the requested page are carried inline. Oversized
-    /// snapshots leave this empty and are read through `read-snapshot`.
-    snapshot: option<bytes>,
-    effect: change-effect,
-  }
-
-  record entity-change-input-page {
-    changes: list<entity-change-input>,
-  }
-
-  resource entity-change-source {
-    /// Pull one complete bounded page while the enclosing guest export remains
-    /// entered. This avoids one metadata import plus one snapshot import for
-    /// every semantic row and lets the host retain storage-native paging.
+  resource entity-source {
+    /// Pull the same universal page envelope accepted by `emit-entities`.
     next-page: func(
       max-bytes: u32,
-    ) -> result<option<entity-change-input-page>, host-error>;
-    /// Read an oversized snapshot advertised by the most recent page without
-    /// forcing that snapshot into the page allocation.
-    read-snapshot: func(
+    ) -> result<option<entity-page>, host-error>;
+    /// Read an oversized value referenced by the most recent page.
+    read-attachment: func(
       ordinal: u32,
       offset: u64,
       length: u32,
@@ -85,8 +49,12 @@ interface host {
     max-batch-bytes: func() -> u32;
     put-state: func(key: bytes, value: bytes) -> result<_, host-error>;
     delete-state: func(key: bytes) -> result<_, host-error>;
-    emit-changes: func(page: change-page) -> result<_, host-error>;
-    emit-packed: func(page: packed-page) -> result<_, host-error>;
+    emit-entities: func(page: entity-page) -> result<_, host-error>;
+    /// Stages one oversized entity snapshot. The returned ordinal is encoded
+    /// by the SDK in the next universal entity page.
+    begin-entity-attachment: func(total-length: u64) -> result<u32, host-error>;
+    write-entity-attachment: func(chunk: bytes) -> result<_, host-error>;
+    finish-entity-attachment: func() -> result<_, host-error>;
     begin-file-replacement: func(total-length: u64) -> result<_, host-error>;
     write-file-replacement: func(chunk: bytes) -> result<_, host-error>;
     finish-file-replacement: func() -> result<_, host-error>;
@@ -119,11 +87,6 @@ interface host {
     ) -> result<option<bytes>, host-error>;
   }
 
-  enum resolution-effect {
-    content,
-    format-only,
-  }
-
   /// Ordered, host-staged conflict results. Replacement snapshots stream in
   /// bounded chunks; a trap or validation failure publishes nothing.
   resource resolution-sink {
@@ -132,7 +95,6 @@ interface host {
     delete: func(ordinal: u32) -> result<_, host-error>;
     begin-replace: func(
       ordinal: u32,
-      effect: resolution-effect,
       total-length: u64,
     ) -> result<_, host-error>;
     write-replacement: func(chunk: bytes) -> result<_, host-error>;
@@ -141,7 +103,7 @@ interface host {
 }
 
 interface api {
-  use host.{bytes, conflict-source, entity-change-source, resolution-sink, snapshot, transition};
+  use host.{bytes, conflict-source, entity-source, resolution-sink, snapshot, transition};
 
   variant plugin-error {
     invalid-input(string),
@@ -149,75 +111,72 @@ interface api {
     internal(string),
   }
 
-  record file-descriptor {
-    path: option<string>,
-    media-type: option<string>,
-  }
-
   record create-context {
     high: u64,
     low: u32,
   }
 
-  record input-splice {
+  record file-edit {
     offset: u64,
     delete-len: u64,
     insert: bytes,
   }
 
   record open-request {
-    descriptor: file-descriptor,
+    path: string,
     accepted: own<snapshot>,
     creates: create-context,
   }
 
-  record update-request {
-    before-descriptor: file-descriptor,
-    after-descriptor: file-descriptor,
+  record file-changed-request {
+    before-path: string,
+    after-path: string,
     /// Accepted predecessor bytes plus opaque plugin state. Byte updates do
     /// not expose semantic entities through this snapshot; entities are
     /// transition outputs and host authority. This contract is identical for
     /// warm execution and durable cold restoration.
     before: own<snapshot>,
-    edits: list<input-splice>,
+    edits: list<file-edit>,
     creates: create-context,
-  }
-
-  variant transition-request {
-    open(open-request),
-    update(update-request),
   }
 
   record conflict-update {
-    descriptor: file-descriptor,
+    path: string,
     conflicts: own<conflict-source>,
   }
 
-  record entity-update {
-    before-descriptor: file-descriptor,
-    after-descriptor: file-descriptor,
+  record entities-changed-request {
+    before-path: string,
     before: own<snapshot>,
-    changes: own<entity-change-source>,
+    changes: own<entity-source>,
   }
 
-  record hydrate-request {
-    descriptor: file-descriptor,
+  record restore-request {
     accepted: option<own<snapshot>>,
-    entities: own<entity-change-source>,
+    entities: own<entity-source>,
   }
 
   /// Rebuild an evicted actor directly as the successor of a byte transition.
-  /// Durable entities provide identity. Blob materializations provide
-  /// `before` plus sparse edits; derived materializations provide `after`
-  /// because their predecessor bytes must be rendered from the entities.
-  record cold-successor-request {
-    before-descriptor: file-descriptor,
-    after-descriptor: file-descriptor,
-    before: option<own<snapshot>>,
-    after: option<own<snapshot>>,
-    edits: list<input-splice>,
-    entities: own<entity-change-source>,
+  /// Durable entities provide semantic identity while the accepted blob and
+  /// sparse edits provide byte authority.
+  record cold-file-changed-request {
+    before-path: string,
+    after-path: string,
+    before: own<snapshot>,
+    edits: list<file-edit>,
+    entities: own<entity-source>,
     creates: create-context,
+  }
+
+  /// Every stateful file lifecycle enters through one operation and one
+  /// atomic output. The variant makes completeness explicit without growing
+  /// the exported ABI for each lifecycle case.
+  variant transition-request {
+    open(open-request),
+    file-changed(file-changed-request),
+    entities-changed(entities-changed-request),
+    restore(restore-request),
+    cold-file-changed(cold-file-changed-request),
   }
 
   /// All file transitions use one fused guest entry and one borrowed,
@@ -233,25 +192,6 @@ interface api {
     output: borrow<resolution-sink>,
   ) -> result<_, plugin-error>;
 
-  entities-changed: func(
-    input: entity-update,
-    output: borrow<transition>,
-  ) -> result<_, plugin-error>;
-
-  /// Rebuild one evicted arena from the complete durable entity set. Blob
-  /// plugins also receive their exact accepted bytes; derived plugins render
-  /// those bytes from entities through the transition sink.
-  hydrate: func(
-    input: hydrate-request,
-    output: borrow<transition>,
-  ) -> result<_, plugin-error>;
-
-  /// Cold update fast path: parse/reconcile the successor once without first
-  /// materializing a predecessor document in a separate guest export.
-  cold-successor: func(
-    input: cold-successor-request,
-    output: borrow<transition>,
-  ) -> result<_, plugin-error>;
 }
 
 world plugin {

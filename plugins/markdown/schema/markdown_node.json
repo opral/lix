@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "x-lix-key": "markdown_node_v2",
+  "x-lix-key": "markdown_node",
   "x-lix-primary-key": ["/id"],
   "x-lix-foreign-keys": [
     {
       "properties": ["/parent_id"],
       "references": {
-        "schemaKey": "markdown_node_v2",
+        "schemaKey": "markdown_node",
         "properties": ["/id"]
       }
     }
@@ -52,7 +52,7 @@
     },
     "payload_json": {
       "type": "string",
-      "description": "Canonical JSON text for kind-specific semantic content. It is string-wrapped because packet-v1's production durable profile does not yet admit JSON number nodes."
+      "description": "Canonical JSON text for kind-specific semantic content. It is string-wrapped because the durable entity profile does not admit JSON number nodes."
     },
     "format_json": {
       "type": "string",

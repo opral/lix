@@ -17,24 +17,9 @@ pub enum PluginRuntime {
     WasmComponent,
 }
 
-/// Durable byte-materialization contract for a Component plugin.
-///
-/// `Blob` retains rendered bytes in the binary CAS. `Derived` makes durable
-/// semantic rows authoritative and retains only a byte fingerprint; readers
-/// must re-render and verify it before serving bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginMaterialization {
-    Blob,
-    Derived,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub key: String,
-    pub runtime: PluginRuntime,
-    pub api_version: String,
-    pub materialization: PluginMaterialization,
     #[serde(rename = "match")]
     pub file_match: PluginMatch,
     pub entry: String,
@@ -44,48 +29,50 @@ pub struct PluginManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginMatch {
     pub path_glob: String,
-    #[serde(default)]
-    pub content_type: Option<PluginContentType>,
+    #[serde(default, rename = "content")]
+    pub content: Option<PluginContentMatcher>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PluginContentType {
+pub enum PluginContentMatcher {
     /// A complete UTF-8 payload. Existing format plugins use this stricter
     /// contract because their parsers consume Unicode text.
     Text,
     /// A payload that is not valid UTF-8.
     Binary,
-    /// Git's text heuristic: no NUL byte in the first 8 KiB.
-    ///
-    /// This is intentionally separate from [`Self::Text`]. Git accepts
-    /// non-UTF-8, NUL-free payloads as text, while parsers such as JSON and
-    /// Markdown require valid UTF-8.
-    GitText,
+    /// A bounded, format-neutral byte predicate.
+    PrefixExcludes { byte: u8, bytes: usize },
 }
 
-impl PluginContentType {
-    /// The byte window Git uses to distinguish binary data for its text
-    /// operations. Keep this value local to the Git-compatible matcher so
-    /// UTF-8 format plugins retain their complete-payload contract.
-    pub(crate) const GIT_TEXT_SCAN_BYTES: usize = 8_000;
-
+impl PluginContentMatcher {
     /// Returns whether a payload satisfies this matcher contract.
     ///
-    /// `Text` and `GitText` are intentionally overlapping predicates: valid
-    /// UTF-8 without a NUL byte matches both. The registry resolves that overlap
-    /// by matcher specificity, so a format-specific UTF-8 plugin wins over the
-    /// catch-all Git-compatible passthrough.
     pub(crate) fn matches_bytes(self, bytes: &[u8]) -> bool {
         match self {
             Self::Text => std::str::from_utf8(bytes).is_ok(),
             Self::Binary => std::str::from_utf8(bytes).is_err(),
-            Self::GitText => !bytes
-                .iter()
-                .take(Self::GIT_TEXT_SCAN_BYTES)
-                .any(|byte| *byte == 0),
+            Self::PrefixExcludes {
+                byte,
+                bytes: scan_bytes,
+            } => !bytes.iter().take(scan_bytes).any(|value| *value == byte),
         }
     }
+}
+
+/// Validates the resolved durable ABI. Author manifests do not repeat these
+/// constants; the component package is canonically `lix:plugin@1.0.0`.
+pub(crate) fn validate_runtime_api_version(
+    runtime: PluginRuntime,
+    api_version: &str,
+) -> Result<(), LixError> {
+    if runtime != PluginRuntime::WasmComponent || api_version != WASM_COMPONENT_API_VERSION {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("plugin component must use lix:plugin@{WASM_COMPONENT_API_VERSION}"),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +98,6 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
                 format!("Plugin manifest does not match expected shape: {error}"),
             )
         })?;
-    validate_runtime_api_version(&manifest)?;
     compile_path_glob(&manifest.file_match.path_glob).map_err(|error| {
         LixError::new(
             LixError::CODE_INVALID_PLUGIN,
@@ -132,22 +118,6 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
         manifest,
         normalized_json,
     })
-}
-
-/// Enforces the one supported Component ABI at both archive-install and
-/// durable-registry boundaries. The latter matters because registry snapshots
-/// can outlive the process that originally validated an archive.
-pub(crate) fn validate_runtime_api_version(manifest: &PluginManifest) -> Result<(), LixError> {
-    if manifest.api_version != WASM_COMPONENT_API_VERSION {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            format!(
-                "wasm-component requires api_version '{WASM_COMPONENT_API_VERSION}', got '{}'",
-                manifest.api_version
-            ),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -245,16 +215,13 @@ fn format_validation_errors<'a>(
 mod tests {
     use crate::LixError;
 
-    use super::{PluginContentType, PluginRuntime, glob_matches_path, parse_plugin_manifest_json};
+    use super::{PluginContentMatcher, glob_matches_path, parse_plugin_manifest_json};
 
     #[test]
     fn parses_valid_manifest() {
         let validated = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_json",
-                "runtime":"wasm-component",
-                "api_version":"1.0.0",
-                "materialization":"blob",
                 "match":{"path_glob":"*.json"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
@@ -263,75 +230,64 @@ mod tests {
         .expect("manifest should parse");
 
         assert_eq!(validated.manifest.key, "plugin_json");
-        assert_eq!(validated.manifest.runtime, PluginRuntime::WasmComponent);
         assert_eq!(validated.manifest.entry, "plugin.wasm");
     }
 
     #[test]
-    fn parses_current_manifest() {
-        let validated = parse_plugin_manifest_json(
+    fn rejects_removed_runtime_field() {
+        let error = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_csv",
                 "runtime":"wasm-component",
+                "match":{"path_glob":"*.csv"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/csv_row.json"]
+            }"#,
+        )
+        .expect_err("the hard cut must reject the removed runtime field");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert!(error.message.contains("runtime"));
+    }
+
+    #[test]
+    fn rejects_removed_api_version_field() {
+        let error = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_csv",
                 "api_version":"1.0.0",
-                "materialization":"blob",
                 "match":{"path_glob":"*.csv"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/csv_row.json"]
             }"#,
         )
-        .expect("current manifest should parse");
-
-        assert_eq!(validated.manifest.api_version, "1.0.0");
-    }
-
-    #[test]
-    fn rejects_pre_v1_prototype_manifest_before_instantiation() {
-        let error = parse_plugin_manifest_json(
-            r#"{
-                "key":"plugin_csv",
-                "runtime":"wasm-component",
-                "api_version":"4.0.0",
-                "materialization":"blob",
-                "match":{"path_glob":"*.csv"},
-                "entry":"plugin.wasm",
-                "schemas":["schema/csv_row.json"]
-            }"#,
-        )
-        .expect_err("the v1 hard cut must reject prototype WIT archives");
+        .expect_err("the hard cut must reject the removed api_version field");
 
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
         assert!(error.message.contains("api_version"));
-        assert!(error.message.contains("1.0.0"));
     }
 
     #[test]
-    fn rejects_any_non_v1_manifest() {
+    fn rejects_removed_materialization_field() {
         let error = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_csv",
-                "runtime":"wasm-component",
-                "api_version":"2.1.0",
                 "materialization":"blob",
                 "match":{"path_glob":"*.csv"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/csv_row.json"]
             }"#,
         )
-        .expect_err("the runtime must fence non-v1 components");
+        .expect_err("the hard cut must reject the removed materialization field");
 
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
-        assert!(error.message.contains("api_version"));
-        assert!(error.message.contains("1.0.0"));
+        assert!(error.message.contains("materialization"));
     }
 
     #[test]
     fn rejects_invalid_manifest() {
         let err = parse_plugin_manifest_json(
             r#"{
-                "runtime":"wasm-component",
-                "api_version":"1.0.0",
-                "materialization":"blob",
                 "match":{"path_glob":"*.json"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
@@ -349,9 +305,6 @@ mod tests {
         let error = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_markdown",
-                "runtime":"wasm-component",
-                "api_version":"1.0.0",
-                "materialization":"blob",
                 "match":{"path_glob":"*.{md,mdx"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
@@ -402,14 +355,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_manifest_with_content_type_match_filter() {
+    fn parses_manifest_with_content_match_filter() {
         let validated = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_text",
-                "runtime":"wasm-component",
-                "api_version":"1.0.0",
-                "materialization":"blob",
-                "match":{"path_glob":"**/*", "content_type":"text"},
+                "match":{"path_glob":"**/*", "content":"text"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
             }"#,
@@ -417,8 +367,8 @@ mod tests {
         .expect("manifest should parse");
 
         assert_eq!(
-            validated.manifest.file_match.content_type,
-            Some(PluginContentType::Text)
+            validated.manifest.file_match.content,
+            Some(PluginContentMatcher::Text)
         );
     }
 
@@ -427,9 +377,6 @@ mod tests {
         let err = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_markdown",
-                "runtime":"wasm-component",
-                "api_version":"1.0.0",
-                "materialization":"blob",
                 "match":{"path_glob":"*.{md,mdx}"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"],
@@ -450,9 +397,6 @@ mod tests {
     fn manifest_with(path_glob: &str, schemas: &[String]) -> String {
         serde_json::json!({
             "key": "plugin_bounds",
-            "runtime": "wasm-component",
-            "api_version": "1.0.0",
-            "materialization": "blob",
             "match": { "path_glob": path_glob },
             "entry": "plugin.wasm",
             "schemas": schemas,

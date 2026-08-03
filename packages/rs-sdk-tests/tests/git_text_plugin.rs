@@ -1,13 +1,12 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lix_sdk::{
-    CreateBranchOptions, LixError, MergeBranchOptions, OpenLixOptions, SwitchBranchOptions, Value,
-    open_lix,
+    CreateBranchOptions, MergeBranchOptions, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
 use std::io::{Cursor, Write};
 use std::path::Path;
 
-const PLUGIN_KEY: &str = "plugin_git_text";
+const PLUGIN_KEY: &str = "plugin_text";
 const GIT_TEXT_SCAN_BYTES: u64 = 8_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,7 +106,7 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
 
     let text_file_id = file_id_at_path(&lix, text_path).await;
     assert_plugin_owned(&lix, &text_file_id, true).await;
-    assert_derived_materialization(&lix, &text_file_id, &git_text).await;
+    assert_semantic_rows(&lix, &text_file_id, &git_text).await;
     let text_rows = git_text_rows(&lix, &text_file_id).await;
     assert_eq!(text_rows.len(), 2);
     assert_eq!(render_rows(&text_rows), git_text);
@@ -132,12 +131,12 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
         .expect("empty Git text should write");
     let empty_file_id = file_id_at_path(&lix, empty_path).await;
     assert_plugin_owned(&lix, &empty_file_id, true).await;
-    assert_derived_materialization(&lix, &empty_file_id, b"").await;
+    assert_semantic_rows(&lix, &empty_file_id, b"").await;
     assert!(git_text_rows(&lix, &empty_file_id).await.is_empty());
     assert_eq!(read_file(&lix, empty_path).await, Some(Vec::new()));
 
     // Advance beyond the text write so the history surface must reconstruct
-    // the derived bytes from the semantic snapshot at an earlier commit.
+    // the exact bytes from the semantic snapshot at an earlier commit.
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ('git-text-history-sidecar', 'later')",
         &[],
@@ -178,7 +177,7 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
     assert_eq!(reopened_rows[0].id, text_rows[0].id);
     assert_eq!(reopened_rows[1].id, text_rows[1].id);
     assert_eq!(render_rows(&reopened_rows), reopened_successor);
-    assert_derived_materialization(&reopened, &text_file_id, &reopened_successor).await;
+    assert_semantic_rows(&reopened, &text_file_id, &reopened_successor).await;
 
     // An inserted line receives a fresh durable identity. A following byte
     // edit must reopen from the persisted ID/order mapping rather than derive
@@ -199,9 +198,8 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
     assert_eq!(edited_rows[1].id, inserted_id);
     assert_eq!(render_rows(&edited_rows), edited_insert);
 
-    // Crossing Git's NUL boundary must retire the derived proof and make a
-    // raw successor visible to history rather than treating its tombstone as
-    // a second live materialization.
+    // Crossing Git's NUL boundary must retire semantic ownership and make a
+    // raw successor visible to history.
     let raw_successor = b"now\0binary\n".to_vec();
     write_file(&reopened, text_path, &raw_successor)
         .await
@@ -288,262 +286,7 @@ async fn git_text_plugin_reads_only_a_large_after_range_and_updates_one_line_row
     assert_eq!(after_rows[1], before_rows[1]);
     assert_eq!(render_rows(&after_rows), after);
     assert_eq!(read_file(&lix, path).await, Some(after.clone()));
-    assert_derived_materialization(&lix, &file_id, &after).await;
-    lix.close().await.expect("workspace should close");
-}
-
-#[tokio::test]
-#[ignore = "derived materialization was removed by the API v3 hard cut"]
-async fn git_text_plugin_uninstall_preserves_derived_rendering_authority() {
-    let lix = open_lix(OpenLixOptions::new(lix_sdk::Memory::new()))
-        .await
-        .expect("workspace should open");
-    install_plugin(&lix, &build_plugin_archive())
-        .await
-        .expect("Git text plugin should install");
-
-    let text_path = "/owned.txt";
-    let text = b"still semantic\n".to_vec();
-    write_file(&lix, text_path, &text)
-        .await
-        .expect("text should materialize semantically");
-    let file_id = file_id_at_path(&lix, text_path).await;
-    let archive_path = format!("/.lix/plugins/{PLUGIN_KEY}.lixplugin");
-
-    let error = lix
-        .execute(
-            "DELETE FROM lix_file WHERE path = $1",
-            &[Value::Text(archive_path.clone())],
-        )
-        .await
-        .expect_err("uninstall must not strand a derived file without its renderer");
-    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-    assert!(
-        error
-            .message
-            .contains("cannot uninstall derived-materialization")
-    );
-    assert_derived_materialization(&lix, &file_id, &text).await;
-    assert_eq!(read_file(&lix, text_path).await, Some(text.clone()));
-
-    lix.execute(
-        "DELETE FROM lix_file WHERE path = $1",
-        &[Value::Text(text_path.to_owned())],
-    )
-    .await
-    .expect("deleting the owned file should release its rendering obligation");
-    lix.execute(
-        "DELETE FROM lix_file WHERE path = $1",
-        &[Value::Text(archive_path.clone())],
-    )
-    .await
-    .expect("uninstall should succeed once no derived files remain");
-    assert_eq!(read_file(&lix, &archive_path).await, None);
-
-    let raw_path = "/after-uninstall.txt";
-    let raw = b"no plugin remains\n".to_vec();
-    write_file(&lix, raw_path, &raw)
-        .await
-        .expect("a later text write should remain raw after uninstall");
-    let raw_file_id = file_id_at_path(&lix, raw_path).await;
-    assert_plugin_owned(&lix, &raw_file_id, false).await;
-    assert_raw_blob_materialization(&lix, &raw_file_id).await;
-    assert_eq!(read_file(&lix, raw_path).await, Some(raw));
-    lix.close().await.expect("workspace should close");
-}
-
-#[tokio::test]
-#[ignore = "derived materialization was removed by the API v3 hard cut"]
-async fn git_text_plugin_rejects_path_only_moves_of_derived_files() {
-    let lix = open_lix(OpenLixOptions::new(lix_sdk::Memory::new()))
-        .await
-        .expect("workspace should open");
-    install_plugin(&lix, &build_plugin_archive())
-        .await
-        .expect("Git text plugin should install");
-
-    let old_path = "/old/sub/owned.txt";
-    let bytes = b"path-bound proof\n".to_vec();
-    write_file(&lix, old_path, &bytes)
-        .await
-        .expect("derived text should write");
-    let file_id = file_id_at_path(&lix, old_path).await;
-    assert_derived_materialization(&lix, &file_id, &bytes).await;
-
-    let error = lix
-        .execute(
-            "UPDATE lix_directory SET path = $1 WHERE path = $2",
-            &[
-                Value::Text("/new".to_owned()),
-                Value::Text("/old".to_owned()),
-            ],
-        )
-        .await
-        .expect_err("a directory move must not reinterpret a derived proof");
-    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-    assert!(
-        error
-            .message
-            .contains("cannot move derived-materialization")
-    );
-    assert_eq!(read_file(&lix, old_path).await, Some(bytes.clone()));
-    assert_eq!(read_file(&lix, "/new/sub/owned.txt").await, None);
-    assert_derived_materialization(&lix, &file_id, &bytes).await;
-    lix.close().await.expect("workspace should close");
-}
-
-#[tokio::test]
-#[ignore = "derived materialization was removed by the API v3 hard cut"]
-async fn git_text_plugin_rejects_merging_a_raw_rename_with_derived_materialization() {
-    let lix = open_lix(OpenLixOptions::new(lix_sdk::Memory::new()))
-        .await
-        .expect("workspace should open");
-
-    // Seed the common ancestor, then branch before installing the plugin. The
-    // source deliberately has no plugin registry, so its rename remains raw;
-    // the target's later text write introduces the proof bound to this path.
-    let old_path = "/raw-name.txt";
-    let renamed_path = "/renamed-by-source.txt";
-    write_file(&lix, old_path, b"raw ancestor\n")
-        .await
-        .expect("raw ancestor should write");
-    let main_branch_id = lix
-        .active_branch_id()
-        .await
-        .expect("main branch should resolve");
-    let source = lix
-        .create_branch(CreateBranchOptions {
-            id: Some("01920000-0000-7000-8000-000000000505".to_owned()),
-            name: "Git text raw rename source".to_owned(),
-            from_commit_id: None,
-        })
-        .await
-        .expect("source branch should create");
-    install_plugin(&lix, &build_plugin_archive())
-        .await
-        .expect("Git text plugin should install on the target only");
-
-    // Convert only the target incarnation to semantic materialization.
-    let derived_bytes = b"target semantic successor\n".to_vec();
-    write_file(&lix, old_path, &derived_bytes)
-        .await
-        .expect("target text successor should materialize semantically");
-    let file_id = file_id_at_path(&lix, old_path).await;
-    assert_plugin_owned(&lix, &file_id, true).await;
-    assert_derived_materialization(&lix, &file_id, &derived_bytes).await;
-
-    lix.switch_branch(SwitchBranchOptions {
-        branch_id: source.id.clone(),
-    })
-    .await
-    .expect("source branch should activate");
-    lix.execute(
-        "UPDATE lix_file SET path = $1 WHERE path = $2",
-        &[
-            Value::Text(renamed_path.to_owned()),
-            Value::Text(old_path.to_owned()),
-        ],
-    )
-    .await
-    .expect("a raw source file may be renamed");
-
-    lix.switch_branch(SwitchBranchOptions {
-        branch_id: main_branch_id,
-    })
-    .await
-    .expect("target branch should reactivate");
-    let error = lix
-        .merge_branch(MergeBranchOptions {
-            source_branch_id: source.id,
-        })
-        .await
-        .expect_err(
-            "a source-only raw rename must not rebind target derived semantic bytes to a new path",
-        );
-    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-
-    // Rejection must be atomic: the target proof remains associated with its
-    // original descriptor and no source descriptor leaks into the target.
-    assert_eq!(read_file(&lix, old_path).await, Some(derived_bytes.clone()));
-    assert_eq!(read_file(&lix, renamed_path).await, None);
-    assert_derived_materialization(&lix, &file_id, &derived_bytes).await;
-    lix.close().await.expect("workspace should close");
-}
-
-#[tokio::test]
-#[ignore = "derived materialization was removed by the API v3 hard cut"]
-async fn git_text_plugin_rejects_merging_derived_materialization_into_a_raw_rename() {
-    let lix = open_lix(OpenLixOptions::new(lix_sdk::Memory::new()))
-        .await
-        .expect("workspace should open");
-    let old_path = "/raw-name.txt";
-    let renamed_path = "/renamed-by-target.txt";
-    write_file(&lix, old_path, b"raw ancestor\n")
-        .await
-        .expect("raw ancestor should write");
-
-    let main_branch_id = lix
-        .active_branch_id()
-        .await
-        .expect("main branch should resolve");
-    let source = lix
-        .create_branch(CreateBranchOptions {
-            id: Some("01920000-0000-7000-8000-000000000506".to_owned()),
-            name: "Git text derived source".to_owned(),
-            from_commit_id: None,
-        })
-        .await
-        .expect("source branch should create");
-
-    // The target stays raw and can therefore rename the common descriptor.
-    lix.execute(
-        "UPDATE lix_file SET path = $1 WHERE path = $2",
-        &[
-            Value::Text(renamed_path.to_owned()),
-            Value::Text(old_path.to_owned()),
-        ],
-    )
-    .await
-    .expect("a raw target file may be renamed");
-    let file_id = file_id_at_path(&lix, renamed_path).await;
-
-    lix.switch_branch(SwitchBranchOptions {
-        branch_id: source.id.clone(),
-    })
-    .await
-    .expect("source branch should activate");
-    install_plugin(&lix, &build_plugin_archive())
-        .await
-        .expect("Git text plugin should install on the source only");
-    let derived_bytes = b"source semantic successor\n".to_vec();
-    write_file(&lix, old_path, &derived_bytes)
-        .await
-        .expect("source text successor should materialize semantically");
-    assert_plugin_owned(&lix, &file_id, true).await;
-    assert_derived_materialization(&lix, &file_id, &derived_bytes).await;
-
-    lix.switch_branch(SwitchBranchOptions {
-        branch_id: main_branch_id,
-    })
-    .await
-    .expect("target branch should reactivate");
-    let error = lix
-        .merge_branch(MergeBranchOptions {
-            source_branch_id: source.id,
-        })
-        .await
-        .expect_err(
-            "a source derived proof must not be committed beside a target raw descriptor rename",
-        );
-    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-
-    // The target remains its raw rename; source semantic state and its proof
-    // never reach the commit root.
-    assert_eq!(read_file(&lix, old_path).await, None);
-    assert_eq!(
-        read_file(&lix, renamed_path).await,
-        Some(b"raw ancestor\n".to_vec())
-    );
+    assert_semantic_rows(&lix, &file_id, &after).await;
     lix.close().await.expect("workspace should close");
 }
 
@@ -647,7 +390,7 @@ async fn assert_history_file<StorageImpl>(
             ],
         )
         .await
-        .expect("derived file history should render");
+        .expect("file history should render");
     let rendered = result
         .rows()
         .iter()
@@ -655,7 +398,7 @@ async fn assert_history_file<StorageImpl>(
         .collect::<Vec<_>>();
     assert!(
         rendered.iter().any(|bytes| bytes == expected),
-        "history must reconstruct the exact derived bytes; rendered versions: {}",
+        "history must reconstruct the exact bytes; rendered versions: {}",
         rendered.len(),
     );
 }
@@ -670,7 +413,7 @@ where
     let result = lix
         .execute(
             "SELECT lixcol_entity_pk, id, order_key, content_base64 \
-             FROM git_text_line_v2 WHERE lixcol_file_id = $1",
+             FROM text_line WHERE lixcol_file_id = $1",
             &[Value::Text(file_id.to_owned())],
         )
         .await
@@ -729,17 +472,13 @@ async fn assert_plugin_owned<StorageImpl>(
     assert_eq!(owners.len() == 1, expected);
 }
 
-async fn assert_derived_materialization<StorageImpl>(
+async fn assert_semantic_rows<StorageImpl>(
     lix: &lix_sdk::Lix<StorageImpl>,
     file_id: &str,
     expected: &[u8],
 ) where
     StorageImpl: lix_sdk::Storage + Clone + Send + Sync + 'static,
 {
-    // Materialization references are deliberately internal engine state, not
-    // public SQL tables. Exact semantic rows plus cold file/history reads are
-    // the supported behavioral proof; the RocksDB benchmark inspects the
-    // physical layout through the engine's test-only storage accounting.
     assert_eq!(render_rows(&git_text_rows(lix, file_id).await), expected);
 }
 
@@ -756,7 +495,7 @@ async fn assert_raw_blob_materialization<StorageImpl>(
 }
 
 fn build_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text"));
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_TEXT_plugin_text"));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
             "failed to read bindep-built Git text plugin wasm at {}: {error}",
@@ -772,8 +511,8 @@ fn build_plugin_archive() -> Vec<u8> {
             include_str!("../../../plugins/text/manifest.json").as_bytes(),
         ),
         (
-            "schema/git_text_line_v2.json",
-            include_str!("../../../plugins/text/schema/git_text_line_v2.json").as_bytes(),
+            "schema/text_line.json",
+            include_str!("../../../plugins/text/schema/text_line.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {

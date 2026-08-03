@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn install_plan_preserves_content_type_for_registry_matching() {
+    fn install_plan_preserves_content_for_registry_matching() {
         let archive = plugin_archive(Some("text"));
         let plan = plugin_install_plan_from_archive_path(
             "/.lix/plugins/plugin_test.lixplugin",
@@ -169,16 +169,16 @@ mod tests {
             false,
             false,
         )
-        .expect("content_type is part of the durable matcher contract");
+        .expect("content is part of the durable matcher contract");
 
         assert_eq!(
-            plan.parsed.manifest.file_match.content_type,
-            Some(crate::plugin::PluginContentType::Text)
+            plan.parsed.manifest.file_match.content,
+            Some(crate::plugin::PluginContentMatcher::Text)
         );
     }
 
     #[test]
-    fn bundled_csv_and_markdown_content_type_manifests_install() {
+    fn bundled_csv_and_markdown_content_manifests_install() {
         let cases = [
             ("plugin_csv", "*.{csv,tsv}"),
             ("plugin_markdown", "*.{md,markdown}"),
@@ -195,8 +195,8 @@ mod tests {
             assert_eq!(plan.plugin_key, plugin_key);
             assert_eq!(plan.parsed.manifest.file_match.path_glob, path_glob);
             assert_eq!(
-                plan.parsed.manifest.file_match.content_type,
-                Some(crate::plugin::PluginContentType::Text)
+                plan.parsed.manifest.file_match.content,
+                Some(crate::plugin::PluginContentMatcher::Text)
             );
         }
     }
@@ -237,25 +237,18 @@ mod tests {
         }
     }
 
-    fn plugin_archive(content_type: Option<&str>) -> Vec<u8> {
-        plugin_archive_for("plugin_test", "*.test", content_type)
+    fn plugin_archive(content: Option<&str>) -> Vec<u8> {
+        plugin_archive_for("plugin_test", "*.test", content)
     }
 
-    fn plugin_archive_for(
-        plugin_key: &str,
-        path_glob: &str,
-        content_type: Option<&str>,
-    ) -> Vec<u8> {
-        let content_type = content_type
-            .map(|value| format!(r#", "content_type":"{value}""#))
+    fn plugin_archive_for(plugin_key: &str, path_glob: &str, content: Option<&str>) -> Vec<u8> {
+        let content = content
+            .map(|value| format!(r#", "content":"{value}""#))
             .unwrap_or_default();
         let manifest = format!(
             r#"{{
                 "key":"{plugin_key}",
-                "runtime":"wasm-component",
-                "api_version":"1.0.0",
-                "materialization":"blob",
-                "match":{{"path_glob":"{path_glob}"{content_type}}},
+                "match":{{"path_glob":"{path_glob}"{content}}},
                 "entry":"plugin.wasm",
                 "schemas":["schema/plugin_test_note.json"]
             }}"#

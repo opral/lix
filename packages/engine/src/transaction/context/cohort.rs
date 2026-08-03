@@ -642,7 +642,6 @@ where
             CohortPluginGroup {
                 descriptor: WasmFileDescriptor {
                     path: Some(path.clone()),
-                    media_type: inferred_media_type_for_path(Some(&path)).map(str::to_owned),
                     plugin: WasmPluginSelection {
                         plugin_key: plugin.key().to_owned(),
                         generation: plugin.archive_blob_hash().to_owned(),

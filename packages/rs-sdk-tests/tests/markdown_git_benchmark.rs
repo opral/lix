@@ -921,7 +921,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     lix.execute(
-        "SELECT id, payload_json FROM markdown_node_v2 \
+        "SELECT id, payload_json FROM markdown_node \
          WHERE kind = $1 AND lixcol_file_id = $2 ORDER BY order_key, id",
         &[
             Value::Text(kind.to_owned()),
@@ -952,7 +952,7 @@ async fn update_markdown_node<StorageImpl>(
     for attempt in 0..5 {
         match lix
             .execute(
-                "UPDATE markdown_node_v2 SET payload_json = $1 \
+                "UPDATE markdown_node SET payload_json = $1 \
                  WHERE id = $2 AND lixcol_file_id = $3",
                 &[
                     Value::Text(payload_json.clone()),
@@ -1064,8 +1064,8 @@ fn build_markdown_plugin_archive() -> Vec<u8> {
             include_str!("../../../plugins/markdown/manifest.json").as_bytes(),
         ),
         (
-            "schema/markdown_node_v2.json",
-            include_str!("../../../plugins/markdown/schema/markdown_node_v2.json").as_bytes(),
+            "schema/markdown_node.json",
+            include_str!("../../../plugins/markdown/schema/markdown_node.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {

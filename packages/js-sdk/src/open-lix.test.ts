@@ -765,7 +765,7 @@ test("fs storage imports files through installed WASM plugins", async () => {
 	await storage.importPaths(["note.md"]);
 
 	const nodes = await lix.execute(
-		"SELECT kind FROM markdown_node_v2 ORDER BY kind",
+		"SELECT kind FROM markdown_node ORDER BY kind",
 	);
 	expect(nodes.rows.map((row) => row.get("kind"))).toEqual([
 		"document",
@@ -1142,12 +1142,12 @@ test("SQL plugin archive upsert installs bundled plugin archive schemas", async 
 		 FROM information_schema.tables \
 		 WHERE table_name IN ($1, $2, $3) \
 		 ORDER BY table_name",
-		["csv_v2_row", "csv_v2_table", "markdown_node_v2"],
+		["csv_row", "csv_table", "markdown_node"],
 	);
 	expect(schemas.rows.map((row) => row.get("table_name"))).toEqual([
-		"csv_v2_row",
-		"csv_v2_table",
-		"markdown_node_v2",
+		"csv_row",
+		"csv_table",
+		"markdown_node",
 	]);
 
 	await lix.close();
@@ -1175,11 +1175,11 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 		 FROM information_schema.tables \
 		 WHERE table_name IN ($1, $2) \
 		 ORDER BY table_name",
-		["csv_v2_row", "csv_v2_table"],
+		["csv_row", "csv_table"],
 	);
 	expect(schemas.rows.map((row) => row.get("table_name"))).toEqual([
-		"csv_v2_row",
-		"csv_v2_table",
+		"csv_row",
+		"csv_table",
 	]);
 
 	await lix.close();
@@ -1203,7 +1203,7 @@ test("bundled Markdown plugin executes detect-changes and render", async () => {
 	await writeFile(lix, "/notes.md", new TextEncoder().encode(source));
 
 	const nodes = await lix.execute(
-		"SELECT id, kind FROM markdown_node_v2 ORDER BY kind",
+		"SELECT id, kind FROM markdown_node ORDER BY kind",
 	);
 	expect(nodes.rows.map((row) => row.get("kind"))).toEqual([
 		"document",
@@ -1218,7 +1218,7 @@ test("bundled Markdown plugin executes detect-changes and render", async () => {
 		.find((row) => row.get("kind") === "paragraph")
 		?.get("id");
 	expect(typeof paragraphId).toBe("string");
-	await lix.execute("UPDATE markdown_node_v2 SET payload_json = $1 WHERE id = $2", [
+	await lix.execute("UPDATE markdown_node SET payload_json = $1 WHERE id = $2", [
 		JSON.stringify({ inline: [{ type: "text", value: "Edited paragraph." }] }),
 		paragraphId,
 	]);

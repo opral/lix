@@ -1,22 +1,16 @@
 [package]
-name = "lix_plugin_api"
+name = "lix_plugin_wire"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-description = "Author-facing Rust API for fused Lix Wasm Component plugins"
+description = "Host/guest-neutral wire encoding for Lix plugin entity pages"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 documentation.workspace = true
-readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 
 [lints]
 workspace = true
-
-[dependencies]
-lix_plugin_wire = { workspace = true }
-uuid = { version = "1", features = ["std"] }
-wit-bindgen = "0.57"

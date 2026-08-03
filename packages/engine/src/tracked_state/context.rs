@@ -1223,6 +1223,75 @@ where
         MaterializedTrackedStateExactBatch::new(batch, slots)
     }
 
+    /// Loads certified packet rows for exact identities that are intentionally
+    /// absent from the ordinary tracked root. This is a narrow historical
+    /// fallback for consumers, such as semantic merge, that need the complete
+    /// base snapshot of a host-certified fresh import.
+    pub(crate) async fn load_certified_rows_at_commit(
+        &mut self,
+        commit_id: &str,
+        keys: &[TrackedStateKey],
+    ) -> Result<BTreeMap<TrackedStateKey, crate::live_state::MaterializedLiveStateRow>, LixError>
+    {
+        if keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let exact = keys.iter().cloned().collect::<BTreeSet<_>>();
+        let schema_keys = keys
+            .iter()
+            .map(|key| key.schema_key.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let entity_pks = keys
+            .iter()
+            .map(|key| key.entity_pk.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut file_ids = Vec::new();
+        for key in keys {
+            let filter = match &key.file_id {
+                Some(file_id) => NullableKeyFilter::Value(file_id.clone()),
+                None => NullableKeyFilter::Null,
+            };
+            if !file_ids.contains(&filter) {
+                file_ids.push(filter);
+            }
+        }
+        let rows = crate::live_state::scan_certified_history_rows(
+            &self.store,
+            &BTreeSet::from([CommitId::parse_lix(
+                commit_id,
+                "certified historical fallback commit_id",
+            )?]),
+            &TrackedStateScanRequest {
+                filter: crate::tracked_state::TrackedStateFilter {
+                    schema_keys,
+                    entity_pks,
+                    file_ids,
+                    include_tombstones: true,
+                },
+                read_columns: crate::tracked_state::TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
+                },
+                limit: None,
+            },
+        )
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let key = TrackedStateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                };
+                exact.contains(&key).then_some((key, row))
+            })
+            .collect())
+    }
+
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn load_batch_at_commit(
         &mut self,
@@ -7995,6 +8064,15 @@ mod tests {
         page.extend_from_slice(&1_u16.to_le_bytes());
         page.extend_from_slice(&5_u32.to_le_bytes());
         page.extend_from_slice(b"value");
+        let page = lix_plugin_wire::encode_single_section(
+            lix_plugin_wire::Representation::SchemaRows,
+            lix_plugin_wire::Operation::Create,
+            SCHEMA_KEY,
+            br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
+            1,
+            page,
+        )
+        .expect("test schema-row page");
         let batches = [WasmCertifiedEntityBatch {
             format: 1,
             schema_keys: vec![SCHEMA_KEY.to_owned()],

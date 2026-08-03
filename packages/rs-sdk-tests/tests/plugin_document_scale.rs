@@ -16,7 +16,7 @@ async fn atomic_markdown_import_scales_to_1184_documents() {
         (0..1_184)
             .map(|index| format!("# Document {index}\n\nBody {index}.\n").into_bytes())
             .collect(),
-        "markdown_node_v2",
+        "markdown_node",
     )
     .await;
 }
@@ -30,17 +30,17 @@ async fn atomic_plugin_import_scaling_is_format_independent() {
         (0..17)
             .map(|index| format!("name,value\nrow-{index},{index}\n").into_bytes())
             .collect(),
-        "csv_v2_row",
+        "csv_row",
     )
     .await;
     assert_format_scales(
-        "plugin_git_text",
+        "plugin_text",
         build_git_text_v2_plugin_archive(),
         "txt",
         (0..17)
             .map(|index| format!("line {index}\nsecond line {index}\n").into_bytes())
             .collect(),
-        "git_text_line_v2",
+        "text_line",
     )
     .await;
     assert_format_scales(
@@ -67,7 +67,7 @@ async fn sequential_batches_survive_observation_cache_eviction() {
     let lix = open_lix(OpenLixOptions::default())
         .await
         .expect("document-scale workspace should open");
-    install_plugin(&lix, "plugin_git_text", &build_git_text_v2_plugin_archive()).await;
+    install_plugin(&lix, "plugin_text", &build_git_text_v2_plugin_archive()).await;
 
     lix.execute_batch(&[file_insert_statement(
         "txt",
@@ -227,8 +227,8 @@ fn build_markdown_plugin_archive() -> Vec<u8> {
         Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_plugin_markdown")),
         include_str!("../../../plugins/markdown/manifest.json"),
         &[(
-            "schema/markdown_node_v2.json",
-            include_str!("../../../plugins/markdown/schema/markdown_node_v2.json"),
+            "schema/markdown_node.json",
+            include_str!("../../../plugins/markdown/schema/markdown_node.json"),
         )],
     )
 }
@@ -239,12 +239,12 @@ fn build_csv_plugin_archive() -> Vec<u8> {
         include_str!("../../../plugins/csv/manifest.json"),
         &[
             (
-                "schema/csv_v2_table.json",
-                include_str!("../../../plugins/csv/schema/csv_v2_table.json"),
+                "schema/csv_table.json",
+                include_str!("../../../plugins/csv/schema/csv_table.json"),
             ),
             (
-                "schema/csv_v2_row.json",
-                include_str!("../../../plugins/csv/schema/csv_v2_row.json"),
+                "schema/csv_row.json",
+                include_str!("../../../plugins/csv/schema/csv_row.json"),
             ),
         ],
     )
@@ -252,11 +252,11 @@ fn build_csv_plugin_archive() -> Vec<u8> {
 
 fn build_git_text_v2_plugin_archive() -> Vec<u8> {
     build_plugin_archive(
-        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_plugin_git_text")),
+        Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_TEXT_plugin_text")),
         include_str!("../../../plugins/text/manifest.json"),
         &[(
-            "schema/git_text_line_v2.json",
-            include_str!("../../../plugins/text/schema/git_text_line_v2.json"),
+            "schema/text_line.json",
+            include_str!("../../../plugins/text/schema/text_line.json"),
         )],
     )
 }

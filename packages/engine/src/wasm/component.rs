@@ -155,10 +155,29 @@ impl WasmTransitionLimits {
 pub struct WasmTransitionCounters {
     pub source_read_calls: u64,
     pub source_bytes_read: u64,
+    /// File-byte reads through the immutable snapshot capability.
+    pub file_read_calls: u64,
+    pub file_bytes_read: u64,
+    /// Opaque plugin-state reads through the immutable snapshot capability.
+    pub state_read_calls: u64,
+    pub state_key_bytes: u64,
+    pub state_value_bytes_read: u64,
     pub packet_pages: u64,
     pub packet_records: u64,
+    /// Universal entity pages sent from host to guest.
+    pub entity_input_pages: u64,
+    pub entity_input_records: u64,
+    pub entity_input_wire_bytes: u64,
+    /// Universal entity pages sent from guest to host.
+    pub entity_output_pages: u64,
+    pub entity_output_records: u64,
+    pub entity_output_wire_bytes: u64,
     pub attachment_reads: u64,
     pub attachment_bytes_read: u64,
+    pub entity_input_attachment_reads: u64,
+    pub entity_input_attachment_bytes: u64,
+    pub entity_output_attachment_writes: u64,
+    pub entity_output_attachment_bytes: u64,
     pub component_import_calls: u64,
     /// Exported guest entries. Prototype A requires exactly one for an initial
     /// file transition, independent of page and source-read counts.
@@ -173,7 +192,7 @@ pub struct WasmTransitionCounters {
     /// transport splice provenance keeps this zero.
     pub host_full_diff_bytes_compared: u64,
     /// Bytes examined by host-only content-type classification. A matcher may
-    /// deliberately use a bounded predicate (for example Git's 8 KiB NUL
+    /// deliberately use a bounded predicate (for example the text plugin.s 8 KiB NUL
     /// window), while a UTF-8 parser examines the complete payload. Warm,
     /// provenance-backed edits keep this zero when their invariant proof is
     /// sufficient.
@@ -210,12 +229,49 @@ impl WasmTransitionCounters {
         self.source_bytes_read = self
             .source_bytes_read
             .saturating_add(other.source_bytes_read);
+        self.file_read_calls = self.file_read_calls.saturating_add(other.file_read_calls);
+        self.file_bytes_read = self.file_bytes_read.saturating_add(other.file_bytes_read);
+        self.state_read_calls = self.state_read_calls.saturating_add(other.state_read_calls);
+        self.state_key_bytes = self.state_key_bytes.saturating_add(other.state_key_bytes);
+        self.state_value_bytes_read = self
+            .state_value_bytes_read
+            .saturating_add(other.state_value_bytes_read);
         self.packet_pages = self.packet_pages.saturating_add(other.packet_pages);
         self.packet_records = self.packet_records.saturating_add(other.packet_records);
+        self.entity_input_pages = self
+            .entity_input_pages
+            .saturating_add(other.entity_input_pages);
+        self.entity_input_records = self
+            .entity_input_records
+            .saturating_add(other.entity_input_records);
+        self.entity_input_wire_bytes = self
+            .entity_input_wire_bytes
+            .saturating_add(other.entity_input_wire_bytes);
+        self.entity_output_pages = self
+            .entity_output_pages
+            .saturating_add(other.entity_output_pages);
+        self.entity_output_records = self
+            .entity_output_records
+            .saturating_add(other.entity_output_records);
+        self.entity_output_wire_bytes = self
+            .entity_output_wire_bytes
+            .saturating_add(other.entity_output_wire_bytes);
         self.attachment_reads = self.attachment_reads.saturating_add(other.attachment_reads);
         self.attachment_bytes_read = self
             .attachment_bytes_read
             .saturating_add(other.attachment_bytes_read);
+        self.entity_input_attachment_reads = self
+            .entity_input_attachment_reads
+            .saturating_add(other.entity_input_attachment_reads);
+        self.entity_input_attachment_bytes = self
+            .entity_input_attachment_bytes
+            .saturating_add(other.entity_input_attachment_bytes);
+        self.entity_output_attachment_writes = self
+            .entity_output_attachment_writes
+            .saturating_add(other.entity_output_attachment_writes);
+        self.entity_output_attachment_bytes = self
+            .entity_output_attachment_bytes
+            .saturating_add(other.entity_output_attachment_bytes);
         self.component_import_calls = self
             .component_import_calls
             .saturating_add(other.component_import_calls);
@@ -286,7 +342,6 @@ pub struct WasmPluginSelection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmFileDescriptor {
     pub path: Option<String>,
-    pub media_type: Option<String>,
     pub plugin: WasmPluginSelection,
 }
 
@@ -2090,12 +2145,50 @@ mod tests {
     fn descriptor(generation: &str) -> WasmFileDescriptor {
         WasmFileDescriptor {
             path: Some("data.csv".to_owned()),
-            media_type: Some("text/csv".to_owned()),
             plugin: WasmPluginSelection {
                 plugin_key: "plugin_csv".to_owned(),
                 generation: generation.to_owned(),
             },
         }
+    }
+
+    #[test]
+    fn transition_counter_aggregation_keeps_directional_page_and_source_metrics() {
+        let mut total = WasmTransitionCounters::default();
+        total.accumulate(WasmTransitionCounters {
+            file_read_calls: 2,
+            file_bytes_read: 11,
+            state_read_calls: 3,
+            state_key_bytes: 13,
+            state_value_bytes_read: 17,
+            entity_input_pages: 5,
+            entity_input_records: 19,
+            entity_input_wire_bytes: 23,
+            entity_output_pages: 7,
+            entity_output_records: 29,
+            entity_output_wire_bytes: 31,
+            entity_input_attachment_reads: 37,
+            entity_input_attachment_bytes: 41,
+            entity_output_attachment_writes: 43,
+            entity_output_attachment_bytes: 47,
+            ..WasmTransitionCounters::default()
+        });
+
+        assert_eq!(total.file_read_calls, 2);
+        assert_eq!(total.file_bytes_read, 11);
+        assert_eq!(total.state_read_calls, 3);
+        assert_eq!(total.state_key_bytes, 13);
+        assert_eq!(total.state_value_bytes_read, 17);
+        assert_eq!(total.entity_input_pages, 5);
+        assert_eq!(total.entity_input_records, 19);
+        assert_eq!(total.entity_input_wire_bytes, 23);
+        assert_eq!(total.entity_output_pages, 7);
+        assert_eq!(total.entity_output_records, 29);
+        assert_eq!(total.entity_output_wire_bytes, 31);
+        assert_eq!(total.entity_input_attachment_reads, 37);
+        assert_eq!(total.entity_input_attachment_bytes, 41);
+        assert_eq!(total.entity_output_attachment_writes, 43);
+        assert_eq!(total.entity_output_attachment_bytes, 47);
     }
 
     #[test]
@@ -2533,7 +2626,9 @@ mod tests {
         assert!(wit.starts_with("package lix:plugin@1.0.0;"));
         assert!(wit.contains("resource transition"));
         assert!(wit.contains("apply:"));
-        assert!(wit.contains("entities-changed:"));
+        assert!(wit.contains("entities-changed("));
+        assert!(!wit.contains("resolution-effect"));
+        assert!(!wit.contains("record restore-request {\n    path:"));
         assert!(wit.contains("resolve-conflicts:"));
     }
 }

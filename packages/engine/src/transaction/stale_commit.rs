@@ -1,7 +1,6 @@
 use std::collections::{BTreeSet, HashSet};
 
 use crate::common::SharedStr;
-use crate::filesystem::DERIVED_FILE_REF_SCHEMA_KEY;
 use crate::tracked_state::TrackedStateKeyRef;
 
 use super::staging::PreparedWriteSet;
@@ -91,7 +90,7 @@ pub(super) fn classify_stale_commit<'a>(
         .filter(|&index| {
             !matches!(
                 prepared_writes.state_rows.row(index).schema_key.as_str(),
-                BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
+                BLOB_REF_SCHEMA_KEY
             )
         })
         .collect();

@@ -1,11 +1,8 @@
 {
   "key": "plugin_json",
-  "runtime": "wasm-component",
-  "api_version": "1.0.0",
-  "materialization": "blob",
   "match": {
     "path_glob": "*.json",
-    "content_type": "text"
+    "content": "text"
   },
   "entry": "plugin.wasm",
   "schemas": [

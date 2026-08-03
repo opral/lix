@@ -18,8 +18,8 @@ use crate::entity_pk::EntityPk;
 use crate::live_state::{MaterializedLiveStateExactBatch, MaterializedLiveStateRow};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::{
-    WasmCanonicalJson, WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange,
-    WasmEntityChanges, WasmEntityKey, WasmHostBytes, WasmHostEntityChanges,
+    WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityChanges,
+    WasmEntityKey, WasmHostBytes, WasmHostEntityChanges,
 };
 
 use super::{PluginActorKey, PluginRegistryEntry};
@@ -212,67 +212,30 @@ pub(crate) fn materialize_keyless_creates(
                 "validated keyless creates must own parsed canonical snapshots",
             ));
         };
-        if let Some(key) = resolved_key.take() {
-            if key.schema_key.as_str() != schema_key
-                || key.entity_pk.len() != 1
-                || key.entity_pk[0].as_str() != id
-            {
-                return Err(invalid_id(format!(
-                    "resolved keyless create for schema '{schema_key}' does not match its create context"
-                )));
-            }
-            if canonical.certificate().is_none() {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "resolved keyless create did not retain its schema-validation certificate",
-                ));
-            }
-            *change = WasmEntityChange::Upsert {
-                entity: WasmEntity {
-                    key,
-                    snapshot_content: WasmHostBytes::CanonicalJson(canonical.clone()),
-                },
-                effect: WasmChangeEffect::Content,
-            };
-            continue;
-        }
-        let mut snapshot = canonical.value().as_object().cloned().ok_or_else(|| {
-            invalid_id(format!(
-                "keyless create snapshot for schema '{schema_key}' must be an object"
-            ))
+        let key = resolved_key.take().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "validated keyless create has no schema-resolved primary key",
+            )
         })?;
-        if snapshot.contains_key("id") {
+        if key.schema_key.as_str() != schema_key
+            || key.entity_pk.len() != 1
+            || key.entity_pk[0].as_str() != id
+        {
             return Err(invalid_id(format!(
-                "keyless create snapshot for schema '{schema_key}' must omit its defaulted primary key '/id'"
+                "resolved keyless create for schema '{schema_key}' does not match its create context"
             )));
         }
-        snapshot.insert("id".to_string(), JsonValue::String(id.clone()));
-        let value = JsonValue::Object(snapshot);
-        let normalized = serde_json::to_vec(&value).map_err(|error| {
-            LixError::new(
+        if canonical.certificate().is_none() {
+            return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("failed to encode completed keyless create snapshot: {error}"),
-            )
-        })?;
-        let normalized_len = u32::try_from(normalized.len()).map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "completed keyless create snapshot exceeds u32",
-            )
-        })?;
-        let canonical = WasmCanonicalJson::from_batch_parts(
-            vec![value],
-            normalized,
-            vec![(0, normalized_len)],
-            0,
-            1,
-        )?
-        .pop()
-        .expect("one completed keyless create snapshot was built");
+                "resolved keyless create did not retain its schema-validation certificate",
+            ));
+        }
         *change = WasmEntityChange::Upsert {
             entity: WasmEntity {
-                key: WasmEntityKey::from_owned_parts(schema_key.clone(), vec![id]),
-                snapshot_content: WasmHostBytes::CanonicalJson(canonical),
+                key,
+                snapshot_content: WasmHostBytes::CanonicalJson(canonical.clone()),
             },
             effect: WasmChangeEffect::Content,
         };
@@ -541,7 +504,7 @@ fn invalid_id(message: impl Into<String>) -> LixError {
 mod tests {
     use super::*;
     use crate::plugin::{PluginRegistryEntryInput, PluginRuntime};
-    use crate::wasm::{WasmChangeEffect, WasmEntity, WasmHostBytes};
+    use crate::wasm::{WasmCanonicalJson, WasmChangeEffect, WasmEntity, WasmHostBytes};
 
     fn actor_key() -> PluginActorKey {
         PluginActorKey {
@@ -571,11 +534,11 @@ mod tests {
             runtime: PluginRuntime::WasmComponent,
             api_version: "1.0.0".to_string(),
             path_glob: "*.csv".to_string(),
-            content_type: None,
+            content: None,
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
             create_schema_keys: vec!["csv_row".to_string()],
-            manifest_json: r#"{"key":"plugin_csv","runtime":"wasm-component","api_version":"1.0.0","materialization":"blob","match":{"path_glob":"*.csv"},"entry":"plugin.wasm","schemas":["schema/csv_row.json"]}"#.to_string(),
+            manifest_json: r#"{"entry":"plugin.wasm","key":"plugin_csv","match":{"path_glob":"*.csv"},"schemas":["schema/csv_row.json"]}"#.to_string(),
             archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv"),
             archive_path: "/.lix/plugins/plugin_csv.lixplugin".to_string(),
             archive_blob_hash: "a".repeat(64),
@@ -723,11 +686,10 @@ mod tests {
     }
 
     #[test]
-    fn keyless_create_materializes_the_defaulted_id_once() {
+    fn unresolved_create_is_rejected_before_transaction_staging() {
         let context = BoundCreateContext::bind(mutation_identity(7, 8), &actor_key())
             .expect("valid UUIDv7 seed")
             .creates();
-        let expected_id = context.component(42).unwrap();
         let mut changes = WasmEntityChanges {
             changes: vec![WasmEntityChange::Create {
                 schema_key: "csv_row".to_string(),
@@ -740,23 +702,10 @@ mod tests {
             }],
         };
 
-        materialize_keyless_creates(&mut changes, context).expect("materialize");
-
-        let WasmEntityChange::Upsert { entity, effect } = &changes.changes[0] else {
-            panic!("create must become an upsert before transaction staging");
-        };
-        assert_eq!(entity.key.entity_pk.as_slice(), &[expected_id.clone()]);
-        assert_eq!(*effect, WasmChangeEffect::Content);
-        let WasmHostBytes::CanonicalJson(canonical) = &entity.snapshot_content else {
-            panic!("completed snapshot must stay canonical JSON");
-        };
-        assert_eq!(canonical.value()["id"], expected_id);
-        assert_eq!(
-            canonical.normalized(),
-            format!(
-                r#"{{"cells":["Alice","42"],"id":"{expected_id}","order_key":"4000000000000001"}}"#
-            )
-        );
+        let error = materialize_keyless_creates(&mut changes, context)
+            .expect_err("schema resolution must precede transaction staging");
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("schema-resolved primary key"));
     }
 
     #[test]

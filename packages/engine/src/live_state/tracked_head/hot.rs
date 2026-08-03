@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use crate::wasm::WasmCreateContext;
-use base64::Engine as _;
 use bytes::Bytes;
 use smallvec::SmallVec;
 use tracing::Instrument as _;
@@ -678,7 +677,7 @@ pub(crate) async fn stage_certified_entity_batches(
             );
             for (page_index, page) in batch.pages.iter().enumerate() {
                 let (first_local_ref, last_local_ref) = match batch.format {
-                    1 => certified_csv_page_local_ref_range(page)?,
+                    1 => certified_schema_row_page_local_ref_range(page)?,
                     2 | crate::wasm::HOST_CERTIFIED_PACKET_FORMAT => {
                         certified_packet_page_local_ref_range(page)?.unwrap_or((0, u32::MAX))
                     }
@@ -747,42 +746,52 @@ fn certified_entity_batch_page_key(content_key: &[u8], page_index: u32) -> Stora
     StorageKey(Bytes::from(key))
 }
 
-fn certified_csv_page_local_ref_range(page: &[u8]) -> Result<(u32, u32), LixError> {
-    let mut rows = CertifiedCsvReader {
-        bytes: page,
-        offset: 0,
-    };
+fn certified_schema_row_page_local_ref_range(page: &[u8]) -> Result<(u32, u32), LixError> {
+    let page = lix_plugin_wire::Page::decode(page)
+        .map_err(|error| head_value_error(format!("invalid certified entity page: {error:?}")))?;
+    let section = page.section().map_err(|error| {
+        head_value_error(format!("invalid certified entity-page section: {error:?}"))
+    })?;
+    if section.representation != lix_plugin_wire::Representation::SchemaRows
+        || section.operation != lix_plugin_wire::Operation::Create
+    {
+        return Err(head_value_error(
+            "certified schema-row entity page must contain created rows",
+        ));
+    }
+    let layout = lix_plugin_layout::CompiledLayout::parse(section.layout)
+        .map_err(|error| head_value_error(format!("invalid schema-row layout: {error}")))?;
+    let mut rows = layout
+        .rows(section.payload, section.record_count)
+        .map_err(|error| head_value_error(format!("invalid schema-row payload: {error}")))?;
     let mut first = None;
     let mut last = None;
-    while rows.offset < rows.bytes.len() {
-        let local_ref = rows.u32()?;
-        if last.is_some_and(|previous| previous >= local_ref) {
+    while let Some(local_ref) = rows
+        .validate_next()
+        .map_err(|error| head_value_error(format!("invalid schema row: {error}")))?
+    {
+        let local_ref = u32::try_from(local_ref)
+            .map_err(|_| head_value_error("schema-row local reference exceeds u32"))?;
+        if last.is_some_and(|previous| local_ref != previous + 1) {
             return Err(head_value_error(
-                "certified CSV page local refs are not strictly increasing",
+                "schema-row local references are not contiguous and increasing",
             ));
         }
         first.get_or_insert(local_ref);
         last = Some(local_ref);
-        let _order_rank = rows.u64()?;
-        let _ending = rows.u8()?;
-        let quote_layout_len = rows.u32()? as usize;
-        let _quote_layout = rows.bytes(quote_layout_len)?;
-        let field_count = rows.u16()?;
-        for _ in 0..field_count {
-            let cell_len = rows.u32()? as usize;
-            let _cell = rows.bytes(cell_len)?;
-        }
     }
+    rows.finish()
+        .map_err(|error| head_value_error(format!("invalid schema-row payload: {error}")))?;
     first
         .zip(last)
-        .ok_or_else(|| head_value_error("certified CSV page is empty"))
+        .ok_or_else(|| head_value_error("certified schema-row page is empty"))
 }
 
 /// Returns an ordinal range only when every packet row is a keyless create
 /// and those local references are strictly increasing. A keyed or mixed page
 /// remains conservatively unindexed.
 fn certified_packet_page_local_ref_range(page: &[u8]) -> Result<Option<(u32, u32)>, LixError> {
-    let mut rows = CertifiedCsvReader {
+    let mut rows = CertifiedPacketReader {
         bytes: page,
         offset: 0,
     };
@@ -791,7 +800,7 @@ fn certified_packet_page_local_ref_range(page: &[u8]) -> Result<Option<(u32, u32
     while rows.offset < rows.bytes.len() {
         let record_len = rows.u32()? as usize;
         let record_bytes = rows.bytes(record_len)?;
-        let mut record = CertifiedCsvReader {
+        let mut record = CertifiedPacketReader {
             bytes: record_bytes,
             offset: 0,
         };
@@ -1404,13 +1413,10 @@ fn decode_certified_entity_batch_rows(
         high: input.u64()?,
         low: input.u32()?,
     };
-    // Exact reads from a certified CSV segment should not allocate an
-    // `EntityPk` for every row merely to reject all but one of them. Created
-    // CSV identities encode their parse-local reference in the final four
-    // UUID bytes, so compare that compact value while walking the pages and
-    // materialize an identity only for a selected row.
-    let selected_csv_local_refs =
-        (format == 1 && !request.filter.entity_pks.is_empty()).then(|| {
+    // Exact reads from a generated-id row segment compare compact local
+    // references before materializing an `EntityPk` or snapshot.
+    let selected_schema_row_local_refs = (format == 1 && !request.filter.entity_pks.is_empty())
+        .then(|| {
             let high = creates.high.to_be_bytes();
             let low = creates.low.to_be_bytes();
             request
@@ -1494,98 +1500,62 @@ fn decode_certified_entity_batch_rows(
             }
             continue;
         }
-        let mut rows = CertifiedCsvReader {
-            bytes: page,
-            offset: 0,
-        };
-        while rows.offset < rows.bytes.len() {
-            let local_ref = rows.u32()?;
-            let order_rank = rows.u64()?;
-            let ending = rows.u8()?;
-            let quote_layout_len = rows.u32()? as usize;
-            let quote_layout = rows.bytes(quote_layout_len)?;
-            let field_count = rows.u16()?;
-            let selected = selected_csv_local_refs
+        let entity_page = lix_plugin_wire::Page::decode(page).map_err(|error| {
+            head_value_error(format!("invalid certified entity page: {error:?}"))
+        })?;
+        let section = entity_page.section().map_err(|error| {
+            head_value_error(format!("invalid certified entity-page section: {error:?}"))
+        })?;
+        if section.representation != lix_plugin_wire::Representation::SchemaRows
+            || section.operation != lix_plugin_wire::Operation::Create
+        {
+            return Err(head_value_error(
+                "certified schema-row entity page must contain created rows",
+            ));
+        }
+        let layout = lix_plugin_layout::CompiledLayout::parse(section.layout)
+            .map_err(|error| head_value_error(format!("invalid schema-row layout: {error}")))?;
+        let mut rows = layout
+            .rows(section.payload, section.record_count)
+            .map_err(|error| head_value_error(format!("invalid schema-row payload: {error}")))?;
+        let mut rendered_snapshots = Vec::new();
+        while let Some(rendered) = rows
+            .render_next(&mut rendered_snapshots)
+            .map_err(|error| head_value_error(format!("invalid schema row: {error}")))?
+        {
+            let local_ref = u32::try_from(rendered.local_ref)
+                .map_err(|_| head_value_error("schema-row local reference exceeds u32"))?;
+            decoded_rows = decoded_rows.saturating_add(1);
+            let selected = selected_schema_row_local_refs
                 .as_ref()
                 .is_none_or(|selected| selected.contains(&local_ref));
-            let mut cells =
-                (selected && needs_snapshot).then(|| Vec::with_capacity(field_count as usize));
-            for _ in 0..field_count {
-                let cell_len = rows.u32()? as usize;
-                let cell = std::str::from_utf8(rows.bytes(cell_len)?).map_err(|error| {
-                    head_value_error(format!("certified CSV cell is not UTF-8: {error}"))
-                })?;
-                if let Some(cells) = &mut cells {
-                    cells.push(cell);
-                }
-            }
-            decoded_rows = decoded_rows.saturating_add(1);
             if !selected {
+                rendered_snapshots.clear();
                 continue;
             }
             let id = creates
                 .component_uuid_bytes(u64::from(local_ref))
                 .map_err(|error| head_value_error(error.to_string()))?;
             let entity_pk = EntityPk::uuid_from_bytes(id);
-            let snapshot = cells
-                .map(|cells| {
-                    let mut object = serde_json::Map::new();
-                    object.insert(
-                        "cells".to_owned(),
-                        serde_json::Value::Array(
-                            cells
-                                .into_iter()
-                                .map(|cell| serde_json::Value::String(cell.to_owned()))
-                                .collect(),
-                        ),
-                    );
-                    object.insert(
-                        "id".to_owned(),
-                        serde_json::Value::String(uuid::Uuid::from_bytes(id).to_string()),
-                    );
-                    if !quote_layout.is_empty() || ending != 0 {
-                        let mut layout = serde_json::Map::new();
-                        if !quote_layout.is_empty() {
-                            layout.insert(
-                                "force_quote".to_owned(),
-                                serde_json::Value::String(
-                                    base64::engine::general_purpose::URL_SAFE_NO_PAD
-                                        .encode(quote_layout),
-                                ),
-                            );
-                        }
-                        if ending != 0 {
-                            let terminator = match ending {
-                                1 => "",
-                                2 => "\n",
-                                3 => "\r\n",
-                                4 => "\r",
-                                _ => {
-                                    return Err(head_value_error(
-                                        "certified CSV row has invalid terminator",
-                                    ));
-                                }
-                            };
-                            layout.insert(
-                                "terminator".to_owned(),
-                                serde_json::Value::String(terminator.to_owned()),
-                            );
-                        }
-                        object.insert("layout".to_owned(), serde_json::Value::Object(layout));
-                    }
-                    object.insert(
-                        "order_key".to_owned(),
-                        serde_json::Value::String(format!("{order_rank:016x}")),
-                    );
-                    let json = serde_json::to_vec(&serde_json::Value::Object(object))
-                        .map_err(|error| head_value_error(error.to_string()))?;
+            let snapshot = if needs_snapshot {
+                let json = lix_plugin_layout::insert_generated_id(
+                    &rendered_snapshots[rendered.snapshot],
+                    layout.generated_id_path(),
+                    &uuid::Uuid::from_bytes(id).to_string(),
+                )
+                .map_err(|error| {
+                    head_value_error(format!("invalid generated identity: {error}"))
+                })?;
+                Some(
                     SharedStr::from_utf8(Bytes::from(json))
-                        .map_err(|error| head_value_error(error.to_string()))
-                })
-                .transpose()?;
+                        .map_err(|error| head_value_error(error.to_string()))?,
+                )
+            } else {
+                None
+            };
             builder.push_materialized(
                 entity_pk,
-                schema_keys[0].to_owned(),
+                section.schema_key.to_owned(),
                 Some(file_id.to_owned()),
                 snapshot,
                 None,
@@ -1598,10 +1568,13 @@ fn decode_certified_entity_batch_rows(
                 false,
                 branch_id,
             );
+            rendered_snapshots.clear();
             if limit.is_some_and(|limit| builder.len() >= limit) {
                 return Ok(());
             }
         }
+        rows.finish()
+            .map_err(|error| head_value_error(format!("invalid schema-row payload: {error}")))?;
     }
     if complete_pages && decoded_rows != declared_rows {
         return Err(head_value_error(format!(
@@ -1630,7 +1603,7 @@ fn decode_certified_packet_rows(
     base_ordinal: u64,
     builder: &mut MaterializedLiveStateBatchBuilder,
 ) -> Result<u64, LixError> {
-    let mut input = CertifiedCsvReader {
+    let mut input = CertifiedPacketReader {
         bytes: page,
         offset: 0,
     };
@@ -1638,7 +1611,7 @@ fn decode_certified_packet_rows(
     while input.offset < input.bytes.len() {
         let record_len = input.u32()? as usize;
         let record_bytes = input.bytes(record_len)?;
-        let mut record = CertifiedCsvReader {
+        let mut record = CertifiedPacketReader {
             bytes: record_bytes,
             offset: 0,
         };
@@ -1679,6 +1652,22 @@ fn decode_certified_packet_rows(
                     .map_err(|error| head_value_error(error.to_string()))?;
                 (EntityPk::uuid_from_bytes(id), Some(id))
             }
+            3 => {
+                if record.u32()? != 1 {
+                    return Err(head_value_error(
+                        "resolved certified create must have one generated key component",
+                    ));
+                }
+                let component_len = record.u32()? as usize;
+                let component =
+                    std::str::from_utf8(record.bytes(component_len)?).map_err(|error| {
+                        head_value_error(format!("invalid generated identity: {error}"))
+                    })?;
+                let id = uuid::Uuid::parse_str(component)
+                    .map_err(|error| head_value_error(format!("invalid generated UUID: {error}")))?
+                    .into_bytes();
+                (EntityPk::uuid_from_bytes(id), Some(id))
+            }
             _ => {
                 return Err(head_value_error(
                     "certified packet contains a non-snapshot record",
@@ -1704,21 +1693,10 @@ fn decode_certified_packet_rows(
             continue;
         }
         let snapshot = if needs_snapshot {
-            if let Some(id) = &created_id {
-                let json = insert_created_id_into_canonical_object(
-                    snapshot_bytes,
-                    &uuid::Uuid::from_bytes(*id).to_string(),
-                )?;
-                Some(
-                    SharedStr::from_utf8(Bytes::from(json))
-                        .map_err(|error| head_value_error(error.to_string()))?,
-                )
-            } else {
-                Some(
-                    SharedStr::from_utf8(Bytes::copy_from_slice(snapshot_bytes))
-                        .map_err(|error| head_value_error(error.to_string()))?,
-                )
-            }
+            Some(
+                SharedStr::from_utf8(Bytes::copy_from_slice(snapshot_bytes))
+                    .map_err(|error| head_value_error(error.to_string()))?,
+            )
         } else {
             None
         };
@@ -1775,133 +1753,6 @@ fn certified_keyed_change_id(
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
     ChangeId::new(uuid::Uuid::from_bytes(bytes))
-}
-
-/// Inserts the generated `id` into an already validated canonical JSON object
-/// without materializing its value tree. Keys emitted by serde_json are
-/// lexicographically ordered, so locating the top-level insertion boundary is
-/// sufficient to reproduce the exact canonical snapshot.
-fn insert_created_id_into_canonical_object(snapshot: &[u8], id: &str) -> Result<Vec<u8>, LixError> {
-    if snapshot.first() != Some(&b'{') || snapshot.last() != Some(&b'}') {
-        return Err(head_value_error(
-            "certified create snapshot is not a JSON object",
-        ));
-    }
-    let field = format!("\"id\":\"{id}\"");
-    if snapshot == b"{}" {
-        let mut output = Vec::with_capacity(field.len() + 2);
-        output.push(b'{');
-        output.extend_from_slice(field.as_bytes());
-        output.push(b'}');
-        return Ok(output);
-    }
-
-    let mut entry_start = 1;
-    loop {
-        if snapshot.get(entry_start) != Some(&b'"') {
-            return Err(head_value_error(
-                "certified canonical object has an invalid key",
-            ));
-        }
-        let key_end = json_string_end(snapshot, entry_start)?;
-        let encoded_key = &snapshot[entry_start..key_end];
-        let key = if encoded_key[1..encoded_key.len() - 1].contains(&b'\\') {
-            serde_json::from_slice::<String>(encoded_key)
-                .map_err(|error| head_value_error(format!("invalid canonical key: {error}")))?
-        } else {
-            std::str::from_utf8(&encoded_key[1..encoded_key.len() - 1])
-                .map_err(|error| head_value_error(format!("invalid canonical key: {error}")))?
-                .to_owned()
-        };
-        if key.as_str() >= "id" {
-            if key == "id" {
-                return Err(head_value_error(
-                    "certified keyless create snapshot already contains id",
-                ));
-            }
-            let mut output = Vec::with_capacity(snapshot.len() + field.len() + 1);
-            output.extend_from_slice(&snapshot[..entry_start]);
-            output.extend_from_slice(field.as_bytes());
-            output.push(b',');
-            output.extend_from_slice(&snapshot[entry_start..]);
-            return Ok(output);
-        }
-
-        let colon = snapshot
-            .get(key_end..)
-            .and_then(|tail| tail.iter().position(|byte| *byte == b':'))
-            .map(|offset| key_end + offset)
-            .ok_or_else(|| head_value_error("certified canonical object key has no value"))?;
-        match json_top_level_value_end(snapshot, colon + 1)? {
-            JsonObjectBoundary::Next(next) => entry_start = next,
-            JsonObjectBoundary::End(end) => {
-                let mut output = Vec::with_capacity(snapshot.len() + field.len() + 1);
-                output.extend_from_slice(&snapshot[..end]);
-                output.push(b',');
-                output.extend_from_slice(field.as_bytes());
-                output.extend_from_slice(&snapshot[end..]);
-                return Ok(output);
-            }
-        }
-    }
-}
-
-fn json_string_end(bytes: &[u8], start: usize) -> Result<usize, LixError> {
-    let mut escaped = false;
-    for (offset, byte) in bytes[start + 1..].iter().enumerate() {
-        if escaped {
-            escaped = false;
-        } else if *byte == b'\\' {
-            escaped = true;
-        } else if *byte == b'"' {
-            return Ok(start + offset + 2);
-        }
-    }
-    Err(head_value_error("unterminated canonical JSON string"))
-}
-
-enum JsonObjectBoundary {
-    Next(usize),
-    End(usize),
-}
-
-fn json_top_level_value_end(bytes: &[u8], start: usize) -> Result<JsonObjectBoundary, LixError> {
-    let mut depth = 0_u32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, byte) in bytes[start..].iter().enumerate() {
-        let index = start + offset;
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if *byte == b'\\' {
-                escaped = true;
-            } else if *byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match *byte {
-            b'"' => in_string = true,
-            b'[' | b'{' => {
-                depth = depth
-                    .checked_add(1)
-                    .ok_or_else(|| head_value_error("canonical JSON nesting overflowed"))?;
-            }
-            b']' => {
-                depth = depth
-                    .checked_sub(1)
-                    .ok_or_else(|| head_value_error("invalid canonical JSON array"))?;
-            }
-            b'}' if depth > 0 => depth -= 1,
-            b',' if depth == 0 => return Ok(JsonObjectBoundary::Next(index + 1)),
-            b'}' if depth == 0 => return Ok(JsonObjectBoundary::End(index)),
-            _ => {}
-        }
-    }
-    Err(head_value_error(
-        "canonical JSON object has no closing boundary",
-    ))
 }
 
 struct CertifiedBatchReader<'a> {
@@ -1962,18 +1813,18 @@ impl<'a> CertifiedBatchReader<'a> {
     }
 }
 
-struct CertifiedCsvReader<'a> {
+struct CertifiedPacketReader<'a> {
     bytes: &'a [u8],
     offset: usize,
 }
 
-impl<'a> CertifiedCsvReader<'a> {
+impl<'a> CertifiedPacketReader<'a> {
     fn bytes(&mut self, length: usize) -> Result<&'a [u8], LixError> {
         let end = self
             .offset
             .checked_add(length)
             .filter(|end| *end <= self.bytes.len())
-            .ok_or_else(|| head_value_error("truncated certified CSV page"))?;
+            .ok_or_else(|| head_value_error("truncated certified packet page"))?;
         let value = &self.bytes[self.offset..end];
         self.offset = end;
         Ok(value)
@@ -1983,21 +1834,15 @@ impl<'a> CertifiedCsvReader<'a> {
         Ok(self.bytes(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, LixError> {
-        Ok(u16::from_le_bytes(
-            self.bytes(2)?.try_into().expect("fixed CSV u16 width"),
-        ))
-    }
-
     fn u32(&mut self) -> Result<u32, LixError> {
         Ok(u32::from_le_bytes(
-            self.bytes(4)?.try_into().expect("fixed CSV u32 width"),
+            self.bytes(4)?.try_into().expect("fixed packet u32 width"),
         ))
     }
 
     fn u64(&mut self) -> Result<u64, LixError> {
         Ok(u64::from_le_bytes(
-            self.bytes(8)?.try_into().expect("fixed CSV u64 width"),
+            self.bytes(8)?.try_into().expect("fixed packet u64 width"),
         ))
     }
 }
@@ -11545,30 +11390,6 @@ mod tests {
     }
 
     #[test]
-    fn created_id_is_inserted_without_materializing_canonical_json() {
-        let id = "018f47a2-cafe-7000-8000-000000000001";
-        assert_eq!(
-            insert_created_id_into_canonical_object(b"{}", id).unwrap(),
-            format!(r#"{{"id":"{id}"}}"#).as_bytes()
-        );
-        assert_eq!(
-            insert_created_id_into_canonical_object(
-                br#"{"format":{"nested":"},\\\""},"kind":"paragraph","parent_id":null}"#,
-                id,
-            )
-            .unwrap(),
-            format!(
-                r#"{{"format":{{"nested":"}},\\\""}},"id":"{id}","kind":"paragraph","parent_id":null}}"#
-            )
-            .as_bytes()
-        );
-        assert_eq!(
-            insert_created_id_into_canonical_object(br#"{"alpha":1}"#, id).unwrap(),
-            format!(r#"{{"alpha":1,"id":"{id}"}}"#).as_bytes()
-        );
-    }
-
-    #[test]
     fn create_only_packet_pages_expose_their_local_ref_range() {
         fn create_record(local_ref: u64) -> Vec<u8> {
             let mut record = vec![2];
@@ -11806,6 +11627,15 @@ mod tests {
         page.extend_from_slice(&1_u16.to_le_bytes());
         page.extend_from_slice(&5_u32.to_le_bytes());
         page.extend_from_slice(b"value");
+        let page = lix_plugin_wire::encode_single_section(
+            lix_plugin_wire::Representation::SchemaRows,
+            lix_plugin_wire::Operation::Create,
+            SCHEMA_KEY,
+            br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
+            1,
+            page,
+        )
+        .expect("test schema-row page");
         let batch = WasmCertifiedEntityBatch {
             format: 1,
             schema_keys: vec![SCHEMA_KEY.to_owned()],

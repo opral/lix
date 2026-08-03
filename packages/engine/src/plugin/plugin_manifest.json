@@ -4,9 +4,6 @@
   "additionalProperties": false,
   "required": [
     "key",
-    "runtime",
-    "api_version",
-    "materialization",
     "match",
     "entry",
     "schemas"
@@ -18,18 +15,6 @@
       "maxLength": 128,
       "pattern": "^[a-z][a-z0-9_-]*$"
     },
-    "runtime": {
-      "type": "string",
-      "const": "wasm-component"
-    },
-    "api_version": {
-      "type": "string",
-      "const": "1.0.0"
-    },
-    "materialization": {
-      "type": "string",
-      "enum": ["blob", "derived"]
-    },
     "match": {
       "type": "object",
       "additionalProperties": false,
@@ -40,9 +25,29 @@
           "minLength": 1,
           "maxLength": 1024
         },
-        "content_type": {
-          "type": "string",
-          "enum": ["text", "binary", "git_text"]
+        "content": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": ["text", "binary"]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["prefix_excludes"],
+              "properties": {
+                "prefix_excludes": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["byte", "bytes"],
+                  "properties": {
+                    "byte": { "type": "integer", "minimum": 0, "maximum": 255 },
+                    "bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 }
+                  }
+                }
+              }
+            }
+          ]
         }
       }
     },
