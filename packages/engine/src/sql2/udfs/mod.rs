@@ -18,7 +18,31 @@ pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {
     FunctionProviderHandle::system()
 }
 
+#[cfg(test)]
 pub(crate) fn register_sql2_functions(
+    ctx: &SessionContext,
+    functions: FunctionProviderHandle,
+    active_account_id: String,
+    active_branch_id: Option<String>,
+    active_branch_commit_id: Option<String>,
+) {
+    register_static_sql2_functions(ctx);
+    register_execution_sql2_functions(
+        ctx,
+        functions,
+        active_account_id,
+        active_branch_id,
+        active_branch_commit_id,
+    );
+}
+
+pub(crate) fn register_static_sql2_functions(ctx: &SessionContext) {
+    ctx.register_udf(ScalarUDF::from(lix_json_get::LixJsonGet::new()));
+    ctx.register_udf(ScalarUDF::from(lix_json_get_text::LixJsonGetText::new()));
+    ctx.register_udf(ScalarUDF::from(lix_json::LixJson));
+}
+
+pub(crate) fn register_execution_sql2_functions(
     ctx: &SessionContext,
     functions: FunctionProviderHandle,
     active_account_id: String,
@@ -34,9 +58,6 @@ pub(crate) fn register_sql2_functions(
     ctx.register_udf(ScalarUDF::from(
         lix_active_branch_commit_id::LixActiveBranchCommitId::new(active_branch_commit_id),
     ));
-    ctx.register_udf(ScalarUDF::from(lix_json_get::LixJsonGet::new()));
-    ctx.register_udf(ScalarUDF::from(lix_json_get_text::LixJsonGetText::new()));
-    ctx.register_udf(ScalarUDF::from(lix_json::LixJson));
     ctx.register_udf(ScalarUDF::from(lix_uuid_v7::LixUuidV7 {
         functions: functions.clone(),
     }));

@@ -148,15 +148,6 @@ pub(crate) trait EntitySnapshotReader: Send + Sync {
     ) -> Result<Arc<RecordBatch>, LixError> {
         Ok(batch)
     }
-
-    async fn scan_entity_snapshots_by_string_field(
-        &self,
-        _request: LiveStateScanRequest,
-        _column: &str,
-        _values: &[String],
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        Ok(None)
-    }
 }
 
 pub(crate) struct CurrentEntitySnapshotReader<S> {
@@ -385,21 +376,6 @@ where
             .lock()
             .map_err(|_| entity_columnar_mask_error("entity columnar scan cache poisoned"))?
             .insert_batch(key, projection, batch))
-    }
-
-    async fn scan_entity_snapshots_by_string_field(
-        &self,
-        request: LiveStateScanRequest,
-        column: &str,
-        values: &[String],
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        if !direct_entity_snapshot_request(&request) || !request.filter.entity_pks.is_empty() {
-            return Ok(None);
-        }
-        self.live_state
-            .reader(self.store.clone())
-            .scan_direct_entity_snapshots_by_string_field(&request, column, values)
-            .await
     }
 }
 

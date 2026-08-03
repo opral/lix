@@ -16,10 +16,10 @@ use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value as JsonValue;
 use serde_json::value::RawValue;
 
+use crate::LixError;
 use crate::sql2::catalog::{EntityColumnType, EntitySurfaceSpec};
-use crate::sql2::error::{datafusion_error_to_lix_error, lix_error_to_datafusion_error};
+use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
-use crate::{LixError, Value};
 
 /// A projection decoder for the general entity provider.
 pub(crate) struct EntityProjectionDecoder {
@@ -38,16 +38,6 @@ pub(crate) fn entity_projection_error_to_datafusion_error(error: LixError) -> Da
     } else {
         lix_error_to_datafusion_error(error)
     }
-}
-
-/// Applies the same public SQL error classification as the Arrow provider.
-///
-/// The native public-result route shares this decoder but deliberately skips
-/// Arrow and DataFusion result conversion. Keep decoder failures on the
-/// established public error surface rather than leaking a different internal
-/// error shape solely because this route avoided those allocations.
-pub(crate) fn entity_projection_error_to_lix_error(error: LixError) -> LixError {
-    datafusion_error_to_lix_error(entity_projection_error_to_datafusion_error(error))
 }
 
 #[derive(Clone)]
@@ -113,25 +103,6 @@ impl EntityProjectionDecoder {
             .into_iter()
             .map(EntityProjectionColumn::into_array)
             .collect())
-    }
-
-    /// Decodes a batch directly into the public row values in constructor
-    /// field order. This shares the raw JSON visitor with Arrow projection so
-    /// a strict native public read does not build Arrow arrays only to turn
-    /// them back into owned `Value`s.
-    pub(crate) fn decode_value_rows<'a>(
-        &self,
-        snapshots: impl IntoIterator<Item = Option<&'a [u8]>>,
-    ) -> Result<Vec<Vec<Value>>, LixError> {
-        let snapshots = snapshots.into_iter();
-        let (capacity, _) = snapshots.size_hint();
-        let mut sink = ValueProjectionSink {
-            rows: Vec::with_capacity(capacity),
-        };
-        for snapshot in snapshots {
-            self.decode_into(snapshot, &mut sink)?;
-        }
-        Ok(sink.rows)
     }
 
     fn decode_into<S>(&self, snapshot: Option<&[u8]>, sink: &mut S) -> Result<(), LixError>
@@ -330,31 +301,6 @@ impl EntityProjectionSink for ArrowProjectionSink {
     }
 }
 
-struct ValueProjectionSink {
-    rows: Vec<Vec<Value>>,
-}
-
-impl EntityProjectionSink for ValueProjectionSink {
-    fn begin_row(&mut self, field_count: usize) {
-        self.rows.push(vec![Value::Null; field_count]);
-    }
-
-    fn project_raw(
-        &mut self,
-        decoder: &EntityProjectionDecoder,
-        indices: &[usize],
-        raw: &RawValue,
-    ) -> Result<(), LixError> {
-        for index in indices {
-            let value = public_value_from_raw(raw, &decoder.fields[*index], &decoder.schema_key)?;
-            self.rows
-                .last_mut()
-                .expect("projection sink must start the row first")[*index] = value;
-        }
-        Ok(())
-    }
-}
-
 fn parse_json_value(raw: &RawValue) -> Result<JsonValue, LixError> {
     serde_json::from_str(raw.get()).map_err(snapshot_decode_error)
 }
@@ -386,51 +332,6 @@ fn raw_json_text(raw: &RawValue) -> Option<String> {
         return None;
     }
     Some(json.to_string())
-}
-
-fn public_value_from_raw(
-    raw: &RawValue,
-    field: &EntityProjectionField,
-    schema_key: &str,
-) -> Result<Value, LixError> {
-    match field.column_type {
-        EntityColumnType::String => Ok(raw_string_text(raw)?.map_or(Value::Null, Value::Text)),
-        EntityColumnType::Json => {
-            if raw.get().trim() == "null" {
-                return Ok(Value::Null);
-            }
-            serde_json::from_str(raw.get())
-                .map(Value::Json)
-                .map_err(|error| {
-                    LixError::new(
-                        "LIX_ERROR_INVALID_JSON",
-                        format!(
-                            "column '{}' is marked as JSON but contains invalid JSON: {error}",
-                            field.name
-                        ),
-                    )
-                })
-        }
-        EntityColumnType::Integer => {
-            let value = parse_json_value(raw)?;
-            json_bigint_value(Some(&value), schema_key, &field.name)
-                .map(|value| value.map_or(Value::Null, Value::Integer))
-        }
-        EntityColumnType::Number => {
-            let value = parse_json_value(raw)?;
-            let Some(value) = json_double_value(Some(&value), schema_key, &field.name)? else {
-                return Ok(Value::Null);
-            };
-            if !value.is_finite() {
-                return Err(LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    "SQL query produced a non-finite number",
-                ));
-            }
-            Ok(Value::Real(value))
-        }
-        EntityColumnType::Boolean => Ok(raw_bool(raw).map_or(Value::Null, Value::Boolean)),
-    }
 }
 
 fn snapshot_decode_error(error: serde_json::Error) -> LixError {
@@ -638,64 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_selected_fields_to_public_values_without_arrow_round_trip() {
-        let spec = spec();
-        let decoder = EntityProjectionDecoder::new(
-            &spec,
-            [
-                "text",
-                "json",
-                "integer",
-                "number",
-                "boolean",
-                "coerce_bool",
-                "coerce_object",
-                "null_text",
-                "missing",
-                "text",
-            ],
-        )
-        .expect("decoder should build");
-        let snapshot = TransactionJson::from_value(
-            json!({
-                "text": "line\nquote: \"",
-                "json": {"z": [true, null], "a": "value"},
-                "integer": 7.0,
-                "number": 4.5,
-                "boolean": true,
-                "coerce_bool": false,
-                "coerce_object": {"z": 2, "a": 1},
-                "null_text": null,
-                "ignored": {"nested": [1, 2, 3]}
-            }),
-            "canonical tracked public projection test",
-        )
-        .expect("transaction JSON should normalize");
-
-        let rows = decoder
-            .decode_value_rows([Some(snapshot.normalized().as_bytes()), None, Some(br"[]")])
-            .expect("snapshots should decode");
-        assert_eq!(
-            rows[0],
-            vec![
-                Value::Text("line\nquote: \"".to_string()),
-                Value::Json(json!({"a": "value", "z": [true, null]})),
-                Value::Integer(7),
-                Value::Real(4.5),
-                Value::Boolean(true),
-                Value::Text("false".to_string()),
-                Value::Text(r#"{"a":1,"z":2}"#.to_string()),
-                Value::Null,
-                Value::Null,
-                Value::Text("line\nquote: \"".to_string()),
-            ]
-        );
-        assert_eq!(rows[1], vec![Value::Null; 10]);
-        assert_eq!(rows[2], vec![Value::Null; 10]);
-    }
-
-    #[test]
-    fn public_value_projection_matches_the_existing_arrow_result_contract() {
+    fn arrow_projection_preserves_public_result_contract() {
         let spec = spec();
         let decoder = EntityProjectionDecoder::new(
             &spec,
@@ -733,9 +577,6 @@ mod tests {
             Some(br"[]".as_slice()),
         ];
 
-        let direct_rows = decoder
-            .decode_value_rows(snapshots)
-            .expect("native public values should decode");
         let arrays = decoder
             .decode_arrow_columns(snapshots)
             .expect("Arrow values should decode");
@@ -757,9 +598,8 @@ mod tests {
             .expect("Arrow result values should decode")
             .rows;
 
-        assert_eq!(direct_rows, arrow_rows);
         assert_eq!(
-            direct_rows[0],
+            arrow_rows[0],
             vec![
                 Value::Text("line\nquote: \"".to_string()),
                 Value::Json(json!({"a": "value", "z": [true, null]})),
@@ -773,8 +613,8 @@ mod tests {
                 Value::Text("line\nquote: \"".to_string()),
             ]
         );
-        assert_eq!(direct_rows[1], vec![Value::Null; 10]);
-        assert_eq!(direct_rows[2], vec![Value::Null; 10]);
+        assert_eq!(arrow_rows[1], vec![Value::Null; 10]);
+        assert_eq!(arrow_rows[2], vec![Value::Null; 10]);
     }
 
     #[test]
@@ -790,13 +630,6 @@ mod tests {
         let error = decoder
             .decode_arrow_columns([Some(snapshot.normalized().as_bytes())])
             .expect_err("string must not become a BIGINT");
-        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-        assert!(error.message.contains("projection_test"));
-        assert!(error.message.contains("integer"));
-
-        let error = decoder
-            .decode_value_rows([Some(snapshot.normalized().as_bytes())])
-            .expect_err("string must not become a public BIGINT");
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
         assert!(error.message.contains("projection_test"));
         assert!(error.message.contains("integer"));

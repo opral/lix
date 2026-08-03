@@ -1,4 +1,3 @@
-pub(crate) mod bound_public_read;
 pub(crate) mod bound_public_write;
 pub(crate) mod datafusion;
 pub(crate) mod write;

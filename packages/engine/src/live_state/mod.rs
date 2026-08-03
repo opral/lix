@@ -3,7 +3,6 @@ mod derived;
 mod entity_columnar;
 mod entity_columnar_cache;
 mod entity_decoded_column_cache;
-mod entity_field_index;
 mod reader;
 mod tracked_head;
 mod types;
@@ -16,7 +15,6 @@ pub(crate) use entity_columnar_cache::{
     EntityColumnarArrayBudget, EntityColumnarShadowMaskCache, EntityColumnarShadowMaskKey,
 };
 pub(crate) use entity_decoded_column_cache::EntityDecodedColumnCache;
-pub(crate) use entity_field_index::EntitySnapshotFieldIndexCache;
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;
 #[cfg(test)]

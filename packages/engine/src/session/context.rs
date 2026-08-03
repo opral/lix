@@ -683,6 +683,30 @@ where
         self.active_branch_id
     }
 
+    fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
+        self.sql_planning_cache.datafusion_session()
+    }
+
+    fn datafusion_read_session(&self) -> datafusion::prelude::SessionContext {
+        self.sql_planning_cache.datafusion_read_session()
+    }
+
+    async fn sql_planning_environment(
+        &self,
+    ) -> Result<
+        Option<(
+            Arc<SqlPlanningCache<CatalogFingerprint>>,
+            CatalogFingerprint,
+        )>,
+        LixError,
+    > {
+        let catalog = self.compiled_sql_catalog().await?;
+        Ok(Some((
+            Arc::clone(&self.sql_planning_cache),
+            catalog.fingerprint().clone(),
+        )))
+    }
+
     fn active_account_id(&self) -> &str {
         self.active_account_id
     }

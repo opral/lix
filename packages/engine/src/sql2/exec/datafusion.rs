@@ -11,8 +11,9 @@
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, DFSchemaRef, JoinType, ParamValues, ScalarValue};
+use datafusion::datasource::{empty::EmptyTable, provider_as_source};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, Like, ScalarFunction};
 use datafusion::logical_expr::registry::FunctionRegistry;
@@ -43,6 +44,7 @@ use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
 use crate::{GLOBAL_BRANCH_ID, LixError, LixNotice, SqlQueryResult, Value};
 
+use crate::catalog::CatalogFingerprint;
 use crate::sql2::predicate_typecheck::{
     json_predicate_placeholder_indexes_with_dfschema, validate_json_predicate_expr_with_dfschema,
 };
@@ -55,7 +57,9 @@ use crate::sql2::session::{
     build_transaction_read_session, build_write_session_with_options,
 };
 use crate::sql2::write_normalization::lix_file_content_type_lix_error;
-use crate::sql2::{SqlExecutionContext, SqlWriteExecutionContext};
+use crate::sql2::{
+    CachedReadPlan, SqlExecutionContext, SqlPlanningCache, SqlWriteExecutionContext,
+};
 
 use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan, SqlWriteResult};
 
@@ -77,7 +81,19 @@ pub(crate) struct SessionReadSqlResult {
 /// DataFusion catalog and providers scoped to one immutable storage read.
 pub(crate) struct ReadSqlSession<'ctx> {
     session: SessionContext,
+    planning_environment: Option<(
+        std::sync::Arc<SqlPlanningCache<CatalogFingerprint>>,
+        CatalogFingerprint,
+    )>,
     _context: PhantomData<&'ctx ()>,
+}
+
+impl Drop for ReadSqlSession<'_> {
+    fn drop(&mut self) {
+        if let Some((cache, _)) = &self.planning_environment {
+            cache.recycle_datafusion_read_session(self.session.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -98,14 +114,6 @@ pub(crate) async fn execute_read_statement_from_parsed<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    // The route below recognizes only a small, fully understood subset; every
-    // other read continues through the normal DataFusion path unchanged.
-    if let Some(result) =
-        super::bound_public_read::try_execute_bound_public_read(ctx, sql, &statement, params)
-            .await?
-    {
-        return Ok(result);
-    }
     let session = prepare_read_session(ctx, std::slice::from_ref(&statement)).await?;
     execute_read_statement_in_session_from_parsed(&session, sql, statement, params).await
 }
@@ -117,8 +125,10 @@ pub(crate) async fn prepare_read_session<'ctx, C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
+    let planning_environment = ctx.sql_planning_environment().await?;
     Ok(ReadSqlSession {
         session: build_read_session(ctx, statements).await?,
+        planning_environment,
         _context: PhantomData,
     })
 }
@@ -131,8 +141,10 @@ pub(crate) async fn prepare_read_session_at_head<'ctx, C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
+    let planning_environment = ctx.sql_planning_environment().await?;
     Ok(ReadSqlSession {
         session: build_read_session_at_head(ctx, active_head, statements).await?,
+        planning_environment,
         _context: PhantomData,
     })
 }
@@ -166,12 +178,42 @@ async fn create_logical_plan_in_session_from_parsed(
     let parameter_names = statement_parameter_names(&statement)?;
     let expected_parameter_count = expected_positional_parameter_count(&parameter_names)?;
     validate_parameter_count_values(expected_parameter_count, &parameter_names, params.len())?;
+    let cacheable_statement = !statement_has_table_function(&statement);
+    if cacheable_statement
+        && let Some((cache, catalog)) = &session.planning_environment
+        && let Some(cached) = cache.read_plan(sql, params, catalog)
+    {
+        let plan = rebind_cached_read_plan(&session.session, cached.plan.clone()).await?;
+        return Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
+            session: session.session.clone(),
+            plan,
+            notices: Vec::new(),
+            json_predicate_params: cached.json_predicate_params.clone(),
+            expected_parameter_count: cached.expected_parameter_count,
+        }));
+    }
     bind_table_function_parameters(&mut statement, params)?;
     let plan = create_logical_plan_from_statement(&session.session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     validate_history_anchor_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
+
+    if cacheable_statement
+        && !logical_plan_has_scalar_function(&plan)
+        && let Some((cache, catalog)) = &session.planning_environment
+    {
+        cache.remember_read_plan(
+            sql,
+            params,
+            catalog.clone(),
+            CachedReadPlan {
+                plan: detach_cached_read_plan(plan.clone())?,
+                json_predicate_params: json_predicate_params.clone(),
+                expected_parameter_count,
+            },
+        );
+    }
 
     Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
         session: session.session.clone(),
@@ -182,6 +224,102 @@ async fn create_logical_plan_in_session_from_parsed(
     }))
 }
 
+fn detach_cached_read_plan(plan: LogicalPlan) -> Result<LogicalPlan, LixError> {
+    plan.transform_up(|node| {
+        let LogicalPlan::TableScan(mut scan) = node else {
+            return Ok(Transformed::no(node));
+        };
+        scan.source =
+            provider_as_source(std::sync::Arc::new(EmptyTable::new(scan.source.schema())));
+        Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+    })
+    .map(|transformed| transformed.data)
+    .map_err(datafusion_error_to_lix_error)
+}
+
+async fn rebind_cached_read_plan(
+    session: &SessionContext,
+    plan: LogicalPlan,
+) -> Result<LogicalPlan, LixError> {
+    let mut tables = BTreeSet::new();
+    plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            tables.insert(scan.table_name.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(datafusion_error_to_lix_error)?;
+    let mut providers = BTreeMap::new();
+    for table in tables {
+        let provider = session
+            .table_provider(table.clone())
+            .await
+            .map_err(datafusion_error_to_lix_error)?;
+        providers.insert(table, provider_as_source(provider));
+    }
+    plan.transform_up(|node| {
+        let LogicalPlan::TableScan(mut scan) = node else {
+            return Ok(Transformed::no(node));
+        };
+        scan.source = providers.get(&scan.table_name).cloned().ok_or_else(|| {
+            datafusion::error::DataFusionError::Plan(format!(
+                "cached SQL plan provider '{}' is unavailable",
+                scan.table_name
+            ))
+        })?;
+        Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+    })
+    .map(|transformed| transformed.data)
+    .map_err(datafusion_error_to_lix_error)
+}
+
+fn logical_plan_has_scalar_function(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        for expression in node.expressions() {
+            let _ = expression.apply(|expression| {
+                if matches!(expression, Expr::ScalarFunction(_)) {
+                    found = true;
+                    Ok(TreeNodeRecursion::Stop)
+                } else {
+                    Ok(TreeNodeRecursion::Continue)
+                }
+            });
+            if found {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+fn statement_has_table_function(statement: &DataFusionStatement) -> bool {
+    struct TableFunctionVisitor(bool);
+
+    impl Visitor for TableFunctionVisitor {
+        type Break = ();
+
+        fn pre_visit_table_factor(
+            &mut self,
+            table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            if matches!(table_factor, TableFactor::Table { args: Some(_), .. }) {
+                self.0 = true;
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    let mut visitor = TableFunctionVisitor(false);
+    if let DataFusionStatement::Statement(statement) = statement {
+        let _ = statement.visit(&mut visitor);
+    }
+    visitor.0
+}
+
 pub(crate) async fn execute_transaction_read_statement_from_parsed(
     read_ctx: &impl SqlExecutionContext,
     write_ctx: &mut dyn SqlWriteExecutionContext,
@@ -189,19 +327,22 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
     statement: DataFusionStatement,
     params: &[Value],
 ) -> Result<SqlQueryResult, LixError> {
-    if let Some(result) =
-        super::bound_public_read::try_execute_bound_public_read(read_ctx, sql, &statement, params)
-            .await?
-    {
-        return Ok(result);
-    }
     // Same fence as session reads, with the transaction overlay available
     // during planning/execution but not returned to the caller.
+    let planning_environment = read_ctx.sql_planning_environment().await?;
     let plan = create_transaction_read_logical_plan_from_parsed(
         read_ctx, write_ctx, sql, statement, params,
     )
     .await?;
-    execute_logical_plan(plan, params).await
+    let session = match &plan {
+        SqlLogicalPlan::DataFusion(plan) => plan.session.clone(),
+        _ => unreachable!("transaction reads are planned by DataFusion"),
+    };
+    let result = execute_logical_plan(plan, params).await;
+    if let Some((cache, _)) = planning_environment {
+        cache.recycle_datafusion_read_session(session);
+    }
+    result
 }
 
 async fn create_transaction_read_logical_plan_from_parsed(
@@ -2566,9 +2707,6 @@ mod tests {
         snapshots: Vec<Option<Bytes>>,
         requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
     }
-    struct SchemaEntitySnapshotReader {
-        snapshots: std::collections::BTreeMap<String, Vec<Option<Bytes>>>,
-    }
     struct DummyCommitGraphReader;
     struct DummyBranchRefReader;
     fn test_read_scope(storage: &StorageAdapter<Memory>) -> StorageAdapterReadScope<MemoryRead> {
@@ -3349,46 +3487,6 @@ mod tests {
     }
 
     #[async_trait]
-    impl EntitySnapshotReader for SchemaEntitySnapshotReader {
-        async fn scan_entity_snapshots(
-            &self,
-            request: LiveStateScanRequest,
-        ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-            let [schema_key] = request.filter.schema_keys.as_slice() else {
-                return Ok(None);
-            };
-            Ok(self.snapshots.get(schema_key).cloned())
-        }
-
-        async fn scan_entity_snapshots_by_string_field(
-            &self,
-            request: LiveStateScanRequest,
-            column: &str,
-            values: &[String],
-        ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-            let [schema_key] = request.filter.schema_keys.as_slice() else {
-                return Ok(None);
-            };
-            let Some(snapshots) = self.snapshots.get(schema_key) else {
-                return Ok(None);
-            };
-            let mut matched = Vec::new();
-            for snapshot in snapshots.iter().flatten() {
-                let value: serde_json::Value = serde_json::from_slice(snapshot).unwrap();
-                let value = value
-                    .get(column)
-                    .map(crate::common::json_value_to_string)
-                    .transpose()?
-                    .flatten();
-                if value.as_ref().is_some_and(|value| values.contains(value)) {
-                    matched.push(Some(snapshot.clone()));
-                }
-            }
-            Ok(Some(matched))
-        }
-    }
-
-    #[async_trait]
     impl BlobDataReader for DummyBlobReader {
         async fn load_bytes_many(
             &self,
@@ -3698,7 +3796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_entity_primary_key_read_materializes_public_result() {
+    async fn datafusion_entity_primary_key_read_materializes_public_result() {
         let sql = "SELECT id, value FROM test_state_schema \
                    WHERE id IN ('entity-b', 'entity-a') ORDER BY id";
         let ctx = DummySqlExecutionContext {
@@ -3733,17 +3831,9 @@ mod tests {
                 "additionalProperties": false
             })],
         };
-        let statement = crate::sql2::parse_statement(sql).expect("test SQL should parse");
-
-        let result = super::super::bound_public_read::try_execute_bound_public_read(
-            &ctx,
-            sql,
-            &statement,
-            &[],
-        )
-        .await
-        .expect("native route should execute")
-        .expect("exact public primary-key read should use native route");
+        let result = execute_sql(&ctx, sql, &[])
+            .await
+            .expect("DataFusion primary-key read should execute");
 
         assert_eq!(result.columns, vec!["id", "value"]);
         assert_eq!(
@@ -3762,7 +3852,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_entity_primary_key_read_uses_tracked_snapshot_reader() {
+    async fn datafusion_entity_primary_key_read_uses_registered_provider() {
         let sql = "SELECT id, value FROM test_state_schema \
                    WHERE id IN ('entity-b', 'entity-a', 'entity-b') ORDER BY id";
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -3778,7 +3868,20 @@ mod tests {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(DummyBlobReader),
             live_state: Arc::new(CountingRowsLiveStateReader {
-                rows: Vec::new(),
+                rows: vec![
+                    live_test_state_row(
+                        "entity-b",
+                        "01920000-0000-7000-8000-0000000000a1",
+                        "B",
+                        false,
+                    ),
+                    live_test_state_row(
+                        "entity-a",
+                        "01920000-0000-7000-8000-0000000000a1",
+                        "A",
+                        false,
+                    ),
+                ],
                 scans: Arc::clone(&scans),
             }),
             entity_snapshot_reader: Some(snapshot_reader),
@@ -3794,17 +3897,9 @@ mod tests {
                 "additionalProperties": false
             })],
         };
-        let statement = crate::sql2::parse_statement(sql).expect("test SQL should parse");
-
-        let result = super::super::bound_public_read::try_execute_bound_public_read(
-            &ctx,
-            sql,
-            &statement,
-            &[],
-        )
-        .await
-        .expect("native route should execute")
-        .expect("exact public primary-key read should use native route");
+        let result = execute_sql(&ctx, sql, &[])
+            .await
+            .expect("DataFusion primary-key read should execute");
 
         assert_eq!(
             result.rows,
@@ -3819,23 +3914,16 @@ mod tests {
                 ],
             ]
         );
-        assert_eq!(scans.load(Ordering::SeqCst), 0);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
         let requests = requests.lock().expect("captured snapshot requests lock");
-        let [request] = requests.as_slice() else {
-            panic!("native exact read must issue one snapshot request");
-        };
-        assert_eq!(request.filter.schema_keys, ["test_state_schema"]);
-        assert_eq!(
-            request.filter.entity_pks,
-            [
-                crate::entity_pk::EntityPk::single("entity-a"),
-                crate::entity_pk::EntityPk::single("entity-b"),
-            ]
+        assert!(
+            requests.is_empty(),
+            "DataFusion reads must not invoke the deleted native snapshot route"
         );
     }
 
     #[tokio::test]
-    async fn native_entity_left_join_preserves_matches_and_null_extension() {
+    async fn datafusion_entity_left_join_preserves_matches_and_null_extension() {
         let sql = r#"SELECT "bundle"."id" AS "bundleId",
                          "message"."id" AS "messageId",
                          "variant"."id" AS "variantId",
@@ -3844,35 +3932,30 @@ mod tests {
                     LEFT JOIN "message" ON "message"."bundleId" = "bundle"."id"
                     LEFT JOIN "variant" ON "variant"."messageId" = "message"."id"
                    WHERE "bundle"."id" = $1"#;
-        let snapshot_reader = Arc::new(SchemaEntitySnapshotReader {
-            snapshots: std::collections::BTreeMap::from([
-                (
-                    "bundle".to_string(),
-                    vec![Some(Bytes::from_static(br#"{"id":"b1"}"#))],
-                ),
-                (
-                    "message".to_string(),
-                    vec![
-                        // Stored JSON can violate a registered string type.
-                        // The established SQL projection coerces it to text,
-                        // and native join operands must do the same.
-                        Some(Bytes::from_static(br#"{"id":true,"bundleId":"b1"}"#)),
-                        Some(Bytes::from_static(br#"{"id":"m2","bundleId":"b1"}"#)),
-                    ],
-                ),
-                (
-                    "variant".to_string(),
-                    vec![Some(Bytes::from_static(
-                        br#"{"id":"v1","messageId":true,"pattern":"Hello"}"#,
-                    ))],
-                ),
-            ]),
-        });
+        let row = |schema_key: &str, entity_pk: &str, snapshot: &str| {
+            let mut row = live_entity_row(entity_pk, "01920000-0000-7000-8000-0000000000a1", "");
+            row.schema_key = schema_key.to_string();
+            row.snapshot_content = Some(snapshot.to_string().into());
+            row
+        };
         let ctx = DummySqlExecutionContext {
             active_branch_id: "01920000-0000-7000-8000-0000000000a1",
             blob_reader: Arc::new(DummyBlobReader),
-            live_state: Arc::new(DummyLiveStateReader),
-            entity_snapshot_reader: Some(snapshot_reader),
+            live_state: Arc::new(RowsLiveStateReader {
+                rows: vec![
+                    row("bundle", "b1", r#"{"id":"b1"}"#),
+                    // Stored JSON can violate a registered string type. The
+                    // provider projection retains the established coercion.
+                    row("message", "true", r#"{"id":true,"bundleId":"b1"}"#),
+                    row("message", "m2", r#"{"id":"m2","bundleId":"b1"}"#),
+                    row(
+                        "variant",
+                        "v1",
+                        r#"{"id":"v1","messageId":true,"pattern":"Hello"}"#,
+                    ),
+                ],
+            }),
+            entity_snapshot_reader: None,
             schema_definitions: vec![
                 json!({
                     "x-lix-key": "bundle",
@@ -3907,17 +3990,9 @@ mod tests {
                 }),
             ],
         };
-        let statement = crate::sql2::parse_statement(sql).expect("test SQL should parse");
-
-        let result = super::super::bound_public_read::try_execute_bound_public_read(
-            &ctx,
-            sql,
-            &statement,
-            &[Value::Text("b1".to_string())],
-        )
-        .await
-        .expect("native route should execute")
-        .expect("strict entity join should use native route");
+        let result = execute_sql(&ctx, sql, &[Value::Text("b1".to_string())])
+            .await
+            .expect("DataFusion entity join should execute");
 
         assert_eq!(
             result.columns,

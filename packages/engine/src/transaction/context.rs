@@ -7055,6 +7055,8 @@ where
         let filesystem_path_index_epoch = Arc::clone(&self.filesystem_path_index_epoch);
         let branch_head_control_cache = Arc::clone(&self.branch_head_control_cache);
         let plugin_host = self.plugin_host.clone();
+        let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
+        let sql_catalog_fingerprint = self.sql_catalog_fingerprint().clone();
 
         let read_ctx = TransactionSqlReadExecutionContext {
             active_branch_id,
@@ -7071,6 +7073,8 @@ where
             filesystem_path_index_epoch,
             branch_head_control_cache,
             plugin_host,
+            sql_planning_cache,
+            sql_catalog_fingerprint,
         };
         crate::sql2::execute_transaction_read_statement_from_parsed(
             &read_ctx, self, &sql, statement, &params,
@@ -8013,6 +8017,8 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     filesystem_path_index_epoch: Arc<AtomicUsize>,
     branch_head_control_cache: Arc<BranchHeadControlCache>,
     plugin_host: PluginRuntimeHost,
+    sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
+    sql_catalog_fingerprint: CatalogFingerprint,
 }
 
 #[async_trait]
@@ -8024,6 +8030,29 @@ where
 
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
+    }
+
+    fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
+        self.sql_planning_cache.datafusion_session()
+    }
+
+    fn datafusion_read_session(&self) -> datafusion::prelude::SessionContext {
+        self.sql_planning_cache.datafusion_read_session()
+    }
+
+    async fn sql_planning_environment(
+        &self,
+    ) -> Result<
+        Option<(
+            Arc<SqlPlanningCache<CatalogFingerprint>>,
+            CatalogFingerprint,
+        )>,
+        LixError,
+    > {
+        Ok(Some((
+            Arc::clone(&self.sql_planning_cache),
+            self.sql_catalog_fingerprint.clone(),
+        )))
     }
 
     fn active_account_id(&self) -> &str {
@@ -8508,6 +8537,10 @@ where
 {
     fn active_branch_id(&self) -> &str {
         &self.active_branch_id
+    }
+
+    fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
+        self.sql_planning_cache.datafusion_session()
     }
 
     fn active_account_id(&self) -> &str {
