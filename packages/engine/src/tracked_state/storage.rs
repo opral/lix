@@ -746,13 +746,11 @@ fn fresh_replacement_current_state_part_set(
     };
     let set = crate::tracked_state::types::CurrentStatePartSet {
         scope: anchor.scope.clone(),
-        coverage_anchor_commit_id: *manifest.commit_id.as_uuid().as_bytes(),
         generation_integrity_digest: anchor.generation_integrity_digest,
         state_lineage_digest: anchor.state_lineage_digest,
         directory: anchor.directory.clone(),
     };
-    if set.coverage_anchor_commit_id != *manifest.commit_id.as_uuid().as_bytes()
-        || set.generation_integrity_digest != generation.integrity_digest
+    if set.generation_integrity_digest != generation.integrity_digest
         || set.scope != anchor.scope
         || set.generation_integrity_digest != anchor.generation_integrity_digest
         || set.state_lineage_digest != anchor.state_lineage_digest
@@ -770,8 +768,8 @@ fn fresh_replacement_current_state_part_set(
 }
 
 /// Resolves one exact authenticated serving partition from an immutable
-/// published commit manifest. Absence means the scope is not completely
-/// covered; malformed catalog or coverage authority is an error.
+/// published commit manifest. The sealed content-addressed catalog root binds
+/// every exact-scope entry; absence means the scope is not completely covered.
 pub(crate) async fn load_complete_current_state_part_set_from_published_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &PublishedCommitStateManifest,
@@ -790,11 +788,6 @@ pub(crate) async fn load_complete_current_state_part_set_from_published_manifest
     else {
         return Ok(None);
     };
-    let authority_id = CommitId::new(uuid::Uuid::from_bytes(entry.coverage_anchor_commit_id));
-    let authority = load_published_commit_state_manifest(store, authority_id)
-        .await?
-        .ok_or_else(|| replacement_payload_error("current-state coverage authority is missing"))?;
-    validate_current_state_catalog_entry_against_authority(&entry, &authority)?;
     Ok(Some(entry))
 }
 
@@ -815,9 +808,9 @@ async fn load_complete_current_state_values_encoded_inner(
         return Ok(None);
     };
     if state.replay_debt.depth < MIN_CURRENT_STATE_CATALOG_POINT_READS {
-        // Even the smallest covered lookup reads a catalog node, its coverage
-        // authority, a directory node, and one immutable part. Canonical
-        // replay is cheaper while its bounded manifest interval is shorter.
+        // Even the smallest covered lookup reads a catalog node, a directory
+        // node, and one immutable part. Canonical replay is cheaper while its
+        // bounded manifest interval is shorter.
         return Ok(None);
     }
     let mut scope_keys = BTreeMap::<CommitDeltaReplacementScope, Vec<usize>>::new();
@@ -871,38 +864,6 @@ async fn load_complete_current_state_values_encoded_inner(
     else {
         return Ok(None);
     };
-
-    if validate_publication {
-        let authority_ids = sets
-            .iter()
-            .map(|(set, _)| CommitId::new(uuid::Uuid::from_bytes(set.coverage_anchor_commit_id)))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let authorities = load_commit_state_manifests(store, &authority_ids).await?;
-        let authority_by_id = authority_ids
-            .into_iter()
-            .zip(authorities)
-            .map(|(authority_id, authority)| {
-                authority
-                    .map(|authority| (authority_id, authority))
-                    .ok_or_else(|| {
-                        replacement_payload_error(
-                            "current-state catalog coverage authority is missing",
-                        )
-                    })
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        for (set, _) in &sets {
-            let authority_id = CommitId::new(uuid::Uuid::from_bytes(set.coverage_anchor_commit_id));
-            validate_current_state_catalog_entry_against_authority(
-                set,
-                authority_by_id
-                    .get(&authority_id)
-                    .expect("unique catalog authority was batch loaded"),
-            )?;
-        }
-    }
 
     let mut routed = BTreeMap::<
         (u8, [u8; 16], u32, [u8; 32], u16),
@@ -1074,13 +1035,22 @@ pub(crate) async fn load_complete_current_state_values_from_published_manifest(
 /// original one-manifest read while any catalog hit is authenticated first.
 pub(crate) async fn load_complete_current_state_values_from_replay_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
-    state: &CommitStateManifest,
+    state: &AuthenticatedReplayCommitStateManifest,
     encoded_keys: &[Bytes],
 ) -> Result<Option<Vec<Option<TrackedStateIndexValue>>>, LixError> {
     // `load_point_replay_commit_state` decoded this exact manifest from the
     // immutable semantic-authority seal, including its certified catalog root.
-    // Re-reading mutable manifests and the original coverage anchor would add
-    // three point I/Os without strengthening that authority.
+    // Re-reading the mutable manifest would add point I/O without
+    // strengthening that authority.
+    load_complete_current_state_values_encoded_inner(store, state, encoded_keys, false, true).await
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) async fn load_complete_current_state_values_from_published_replay_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &PublishedCommitStateManifest,
+    encoded_keys: &[Bytes],
+) -> Result<Option<Vec<Option<TrackedStateIndexValue>>>, LixError> {
     load_complete_current_state_values_encoded_inner(store, state, encoded_keys, false, true).await
 }
 
@@ -1137,29 +1107,6 @@ pub(crate) fn validate_current_state_catalog_parent_manifest(
     if root.parent_root_id != expected_parent_root {
         return Err(replacement_payload_error(
             "current-state catalog transition disagrees with its graph parent",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_current_state_catalog_entry_against_authority(
-    set: &crate::tracked_state::types::CurrentStatePartSet,
-    origin: &CommitStateManifest,
-) -> Result<(), LixError> {
-    let anchor = origin
-        .current_state_coverage_anchor
-        .as_ref()
-        .ok_or_else(|| {
-            replacement_payload_error("catalog coverage authority omitted its anchor")
-        })?;
-    if set.coverage_anchor_commit_id != *origin.commit_id.as_uuid().as_bytes()
-        || set.scope != anchor.scope
-        || set.generation_integrity_digest != anchor.generation_integrity_digest
-        || (set.state_lineage_digest == anchor.state_lineage_digest
-            && set.directory != anchor.directory)
-    {
-        return Err(replacement_payload_error(
-            "current-state catalog entry disagrees with its coverage anchor",
         ));
     }
     Ok(())
@@ -2055,7 +2002,13 @@ fn decode_commit_state_semantic_authority(bytes: &[u8]) -> Result<CommitStateMan
             "commit-state semantic authority digest is invalid",
         ));
     }
-    storage_codec::decode("commit-state semantic authority", payload)
+    let manifest = storage_codec::decode("commit-state semantic authority", payload)?;
+    // The immutable seal authenticates bytes, while local validation proves
+    // that those bytes describe a structurally valid serving authority. This
+    // is what lets one-read point replay trust a catalog leaf without loading
+    // the historical complete-replacement manifest that first created it.
+    validate_commit_state_manifest(&manifest)?;
+    Ok(manifest)
 }
 
 fn validate_commit_state_semantic_seal(
@@ -2090,6 +2043,14 @@ pub(crate) struct PublishedCommitStateManifest {
     manifest: CommitStateManifest,
 }
 
+/// One-read immutable semantic authority used by point replay. The wrapper
+/// prevents a freely constructed manifest from claiming authoritative catalog
+/// coverage without passing seal and structural validation.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthenticatedReplayCommitStateManifest {
+    manifest: CommitStateManifest,
+}
+
 /// Same-write-set authority produced only after semantic publication. This lets a
 /// later commit in one atomic transaction consume its parent catalog without
 /// treating a freely constructible manifest as provenance.
@@ -2099,6 +2060,14 @@ pub(crate) struct StagedCommitStateManifest {
 }
 
 impl Deref for PublishedCommitStateManifest {
+    type Target = CommitStateManifest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.manifest
+    }
+}
+
+impl Deref for AuthenticatedReplayCommitStateManifest {
     type Target = CommitStateManifest;
 
     fn deref(&self) -> &Self::Target {
@@ -2332,7 +2301,6 @@ pub(crate) async fn stage_sparse_current_state_part_set(
             .as_bytes();
     let rewritten = crate::tracked_state::types::CurrentStatePartSet {
         scope: parent.scope.clone(),
-        coverage_anchor_commit_id: parent.coverage_anchor_commit_id,
         generation_integrity_digest: parent.generation_integrity_digest,
         state_lineage_digest,
         directory,
@@ -2672,13 +2640,15 @@ pub(crate) async fn load_replay_commit_state_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<CommitStateManifest>, LixError> {
-    load_point_replay_commit_state(store, commit_id).await
+    Ok(load_point_replay_commit_state(store, commit_id)
+        .await?
+        .map(|state| state.manifest))
 }
 
 pub(crate) async fn load_point_replay_commit_state(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
-) -> Result<Option<CommitStateManifest>, LixError> {
+) -> Result<Option<AuthenticatedReplayCommitStateManifest>, LixError> {
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_crud_replay_manifest_load();
     let Some(authority) = get_one(
@@ -2700,7 +2670,9 @@ pub(crate) async fn load_point_replay_commit_state(
             ),
         ));
     }
-    Ok(Some(state))
+    Ok(Some(AuthenticatedReplayCommitStateManifest {
+        manifest: state,
+    }))
 }
 
 /// Bulk-loads commit authorities in request order.
@@ -10332,9 +10304,9 @@ mod tests {
             entity_pk: &alpha[0].entity_pk,
         }));
         assert!(
-            super::load_complete_current_state_values_from_replay_manifest(
+            super::load_complete_current_state_values_from_published_replay_manifest(
                 &read,
-                &published_touching.manifest,
+                &published_touching,
                 std::slice::from_ref(&updated_key),
             )
             .await
@@ -10342,8 +10314,18 @@ mod tests {
             .is_none(),
             "a key authored by the head must retain the cheaper OLTP replay path"
         );
+        let inherited_manifest_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let inherited_seal_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let inherited_read = SealCountingRead {
+            inner: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("inherited catalog read should open"),
+            manifest_requests: std::sync::Arc::clone(&inherited_manifest_requests),
+            seal_requests: std::sync::Arc::clone(&inherited_seal_requests),
+        };
         let updated = super::load_complete_current_state_values_from_published_manifest(
-            &read,
+            &inherited_read,
             &published_touching,
             std::slice::from_ref(&updated_key),
         )
@@ -10359,6 +10341,33 @@ mod tests {
             Some(created_at),
             "ordinary updates must retain the insertion lifecycle timestamp"
         );
+        assert_eq!(inherited_manifest_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(inherited_seal_requests.load(Ordering::Relaxed), 0);
+
+        let replay_state = super::load_point_replay_commit_state(&inherited_read, touching_id)
+            .await
+            .expect("one-read replay authority should authenticate")
+            .expect("sparse replay authority should exist");
+        assert_eq!(inherited_manifest_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(inherited_seal_requests.load(Ordering::Relaxed), 1);
+        inherited_manifest_requests.store(0, Ordering::Relaxed);
+        inherited_seal_requests.store(0, Ordering::Relaxed);
+        let cold_key = Bytes::from(encode_key_ref(TrackedStateKeyRef {
+            schema_key: &alpha[1].schema_key,
+            file_id: alpha[1].file_id.as_deref(),
+            entity_pk: &alpha[1].entity_pk,
+        }));
+        let cold = super::load_complete_current_state_values_from_replay_manifest(
+            &inherited_read,
+            &replay_state,
+            std::slice::from_ref(&cold_key),
+        )
+        .await
+        .expect("authenticated inherited catalog point should resolve")
+        .expect("inherited scope should remain covered");
+        assert!(cold[0].is_some());
+        assert_eq!(inherited_manifest_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(inherited_seal_requests.load(Ordering::Relaxed), 0);
 
         let mut forged_root = parent_root;
         forged_root.parent_root_id = child
@@ -12902,7 +12911,7 @@ mod tests {
             .await
             .expect("point replay should load immutable semantic authority")
             .expect("semantic authority should exist");
-        assert_eq!(point_state, manifest);
+        assert_eq!(&*point_state, &manifest);
         let change_error = scan_change_records_from_commit_deltas(&read)
             .await
             .expect_err("packed change scans must verify semantic authority");
@@ -13130,7 +13139,7 @@ mod tests {
             .await
             .expect("immutable point authority should load")
             .expect("immutable point authority should exist");
-        assert_eq!(point, original);
+        assert_eq!(&*point, &original);
     }
 
     #[test]

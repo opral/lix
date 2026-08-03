@@ -745,45 +745,7 @@ where
     }
 
     let mut directory_roots = BTreeMap::new();
-    let authority_ids = catalog_entries
-        .values()
-        .map(|set| CommitId::new(uuid::Uuid::from_bytes(set.coverage_anchor_commit_id)))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let authority_manifests =
-        crate::tracked_state::load_commit_state_manifests(store, &authority_ids).await?;
-    let authority_by_id = authority_ids
-        .into_iter()
-        .zip(authority_manifests)
-        .map(|(authority_id, manifest)| {
-            manifest
-                .map(|manifest| (authority_id, manifest))
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("live current-state catalog references missing coverage authority '{authority_id}'"),
-                    )
-                })
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
     for set in catalog_entries.values() {
-        let authority = CommitId::new(uuid::Uuid::from_bytes(set.coverage_anchor_commit_id));
-        crate::tracked_state::validate_current_state_catalog_entry_against_authority(
-            set,
-            authority_by_id
-                .get(&authority)
-                .expect("catalog authority was batch loaded"),
-        )?;
-        if !packed.commits.contains_key(&authority) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "live current-state catalog references missing coverage authority '{authority}'"
-                ),
-            ));
-        }
-        retained_authority_commits.insert(authority);
         if let Some(previous) = directory_roots.insert(set.directory.root_id, set.directory.clone())
         {
             if previous != set.directory {
