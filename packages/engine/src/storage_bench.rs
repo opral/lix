@@ -37,8 +37,7 @@ fn stage_bench_commit_deltas(
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
-            current_state_catalog: None,
-            current_state_coverage_anchor: None,
+            current_state_scoped_ranges: None,
             snapshot_root: None,
         },
     )?;
@@ -61,15 +60,10 @@ static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_DELETES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
 static CRUD_COMMIT_STATE_MANIFEST_BYTES: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_DIRECTORY_BYTES: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_DIRECTORY_NODES_LOADED: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_DIRECTORY_DESCRIPTORS_VISITED: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_DIRECTORY_NODES_ENCODED: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_CATALOG_BYTES: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_DIRECTORY_RECOVERIES: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_CATALOG_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_CATALOG_HITS: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_CATALOG_ERRORS: AtomicU64 = AtomicU64::new(0);
+static CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static CRUD_CURRENT_STATE_SCOPED_RANGE_HITS: AtomicU64 = AtomicU64::new(0);
+static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
 static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -201,60 +195,16 @@ pub fn take_crud_commit_state_manifest_bytes() -> u64 {
     CRUD_COMMIT_STATE_MANIFEST_BYTES.swap(0, Ordering::Relaxed)
 }
 
-pub(crate) fn record_crud_current_state_directory_bytes(bytes: usize) {
-    CRUD_CURRENT_STATE_DIRECTORY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+pub(crate) fn record_crud_current_state_scoped_range_fallback() {
+    CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn take_crud_current_state_directory_bytes() -> u64 {
-    CRUD_CURRENT_STATE_DIRECTORY_BYTES.swap(0, Ordering::Relaxed)
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CrudCurrentStateDirectoryAccounting {
-    pub nodes_loaded: u64,
-    pub descriptors_visited: u64,
-    pub nodes_encoded: u64,
-}
-
-pub(crate) fn record_crud_current_state_directory_node_loaded() {
-    CRUD_CURRENT_STATE_DIRECTORY_NODES_LOADED.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_crud_current_state_directory_descriptors_visited(count: usize) {
-    CRUD_CURRENT_STATE_DIRECTORY_DESCRIPTORS_VISITED.fetch_add(count as u64, Ordering::Relaxed);
-}
-
-pub(crate) fn record_crud_current_state_directory_node_encoded() {
-    CRUD_CURRENT_STATE_DIRECTORY_NODES_ENCODED.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn take_crud_current_state_directory_accounting() -> CrudCurrentStateDirectoryAccounting {
-    CrudCurrentStateDirectoryAccounting {
-        nodes_loaded: CRUD_CURRENT_STATE_DIRECTORY_NODES_LOADED.swap(0, Ordering::Relaxed),
-        descriptors_visited: CRUD_CURRENT_STATE_DIRECTORY_DESCRIPTORS_VISITED
-            .swap(0, Ordering::Relaxed),
-        nodes_encoded: CRUD_CURRENT_STATE_DIRECTORY_NODES_ENCODED.swap(0, Ordering::Relaxed),
-    }
-}
-
-pub(crate) fn record_crud_current_state_catalog_bytes(bytes: usize) {
-    CRUD_CURRENT_STATE_CATALOG_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-}
-
-pub fn take_crud_current_state_catalog_bytes() -> u64 {
-    CRUD_CURRENT_STATE_CATALOG_BYTES.swap(0, Ordering::Relaxed)
-}
-
-pub(crate) fn record_crud_current_state_directory_recovery() {
-    CRUD_CURRENT_STATE_DIRECTORY_RECOVERIES.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn take_crud_current_state_directory_recoveries() -> u64 {
-    CRUD_CURRENT_STATE_DIRECTORY_RECOVERIES.swap(0, Ordering::Relaxed)
+pub fn take_crud_current_state_scoped_range_fallbacks() -> u64 {
+    CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS.swap(0, Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CrudCurrentStateCatalogAccounting {
+pub struct CrudCurrentStateScopedRangeAccounting {
     pub attempts: u64,
     pub hits: u64,
     pub errors: u64,
@@ -263,16 +213,16 @@ pub struct CrudCurrentStateCatalogAccounting {
     pub ordered_delta_fallbacks: u64,
 }
 
-pub(crate) fn record_crud_current_state_catalog_attempt() {
-    CRUD_CURRENT_STATE_CATALOG_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_crud_current_state_scoped_range_attempt() {
+    CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_crud_current_state_catalog_hit() {
-    CRUD_CURRENT_STATE_CATALOG_HITS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_crud_current_state_scoped_range_hit() {
+    CRUD_CURRENT_STATE_SCOPED_RANGE_HITS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_crud_current_state_catalog_error() {
-    CRUD_CURRENT_STATE_CATALOG_ERRORS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_crud_current_state_scoped_range_error() {
+    CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_crud_sealed_manifest_load() {
@@ -287,11 +237,11 @@ pub(crate) fn record_crud_ordered_delta_fallback() {
     CRUD_ORDERED_DELTA_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn take_crud_current_state_catalog_accounting() -> CrudCurrentStateCatalogAccounting {
-    CrudCurrentStateCatalogAccounting {
-        attempts: CRUD_CURRENT_STATE_CATALOG_ATTEMPTS.swap(0, Ordering::Relaxed),
-        hits: CRUD_CURRENT_STATE_CATALOG_HITS.swap(0, Ordering::Relaxed),
-        errors: CRUD_CURRENT_STATE_CATALOG_ERRORS.swap(0, Ordering::Relaxed),
+pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScopedRangeAccounting {
+    CrudCurrentStateScopedRangeAccounting {
+        attempts: CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS.swap(0, Ordering::Relaxed),
+        hits: CRUD_CURRENT_STATE_SCOPED_RANGE_HITS.swap(0, Ordering::Relaxed),
+        errors: CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS.swap(0, Ordering::Relaxed),
         sealed_manifest_loads: CRUD_SEALED_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         replay_manifest_loads: CRUD_REPLAY_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
         ordered_delta_fallbacks: CRUD_ORDERED_DELTA_FALLBACKS.swap(0, Ordering::Relaxed),

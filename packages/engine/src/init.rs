@@ -413,8 +413,7 @@ where
                 created_at: plan.commit.created_at,
                 replay_debt: CommitStateReplayDebt::default(),
                 mutations: staged_delta.mutation_inventory().clone(),
-                current_state_catalog: None,
-                current_state_coverage_anchor: None,
+                current_state_scoped_ranges: None,
                 snapshot_root: Some(snapshot_root),
             },
         )?;

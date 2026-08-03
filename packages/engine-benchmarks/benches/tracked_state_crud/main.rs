@@ -994,11 +994,10 @@ fn profile_sql_session_operation(
         };
         maybe_print_profile_rss_phase("after_seed");
         reset_allocation_accounting();
-        let _ = lix_engine::storage_bench::take_crud_current_state_catalog_accounting();
+        let _ = lix_engine::storage_bench::take_crud_current_state_scoped_range_accounting();
         if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
             let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
             let _ = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
-            let _ = lix_engine::storage_bench::take_crud_current_state_directory_bytes();
         }
         let start = Instant::now();
         let result = runtime.block_on(run_sql_session_operation(operation, &fixture));
@@ -1009,15 +1008,9 @@ fn profile_sql_session_operation(
         if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
             let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
             let manifest_bytes = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
-            let directory_bytes =
-                lix_engine::storage_bench::take_crud_current_state_directory_bytes();
             println!(
-                "tracked_state_crud write accounting: staged_puts={} staged_deletes={} staged_value_bytes={} commit_state_manifest_value_bytes={} current_state_directory_value_bytes={}",
-                physical.puts,
-                physical.deletes,
-                physical.written_bytes,
-                manifest_bytes,
-                directory_bytes,
+                "tracked_state_crud write accounting: staged_puts={} staged_deletes={} staged_value_bytes={} commit_state_manifest_value_bytes={}",
+                physical.puts, physical.deletes, physical.written_bytes, manifest_bytes,
             );
         }
     }
@@ -1032,9 +1025,10 @@ fn profile_sql_session_operation(
     };
     print_profile_samples(&profile_layer, operation, read_many_pk_count, samples);
     if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_ROUTE_ACCOUNTING").is_some() {
-        let accounting = lix_engine::storage_bench::take_crud_current_state_catalog_accounting();
+        let accounting =
+            lix_engine::storage_bench::take_crud_current_state_scoped_range_accounting();
         println!(
-            "tracked_state_crud current-state catalog accounting: attempts={} hits={} errors={} sealed_manifest_loads={} replay_manifest_loads={} ordered_delta_fallbacks={}",
+            "tracked_state_crud current-state scoped-range accounting: attempts={} hits={} errors={} sealed_manifest_loads={} replay_manifest_loads={} ordered_delta_fallbacks={}",
             accounting.attempts,
             accounting.hits,
             accounting.errors,
@@ -1071,8 +1065,7 @@ fn profile_sql_session_bound_updates(
         reset_allocation_accounting();
         let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
         let _ = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
-        let _ = lix_engine::storage_bench::take_crud_current_state_directory_bytes();
-        let _ = lix_engine::storage_bench::take_crud_current_state_directory_recoveries();
+        let _ = lix_engine::storage_bench::take_crud_current_state_scoped_range_fallbacks();
         let _ = lix_engine::storage_bench::take_certified_entity_update_value_batch_accounting();
         let start = Instant::now();
         let result = if spread {
@@ -1090,12 +1083,10 @@ fn profile_sql_session_bound_updates(
             lix_engine::storage_bench::take_certified_entity_update_value_batch_accounting();
         let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
         let manifest_bytes = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
-        let directory_bytes = lix_engine::storage_bench::take_crud_current_state_directory_bytes();
-        let serving_metadata_bytes = manifest_bytes + directory_bytes;
-        let directory_recoveries =
-            lix_engine::storage_bench::take_crud_current_state_directory_recoveries();
+        let scoped_range_fallbacks =
+            lix_engine::storage_bench::take_crud_current_state_scoped_range_fallbacks();
         println!(
-            "tracked_state_crud generated update accounting: logical_rows={bound_update_row_count} certificate_attempts={} certificate_hits={} certificate_misses={} certified_rows={} staged_puts={} staged_deletes={} staged_value_bytes={} commit_state_manifest_value_bytes={manifest_bytes} current_state_directory_value_bytes={directory_bytes} encoded_serving_metadata_value_bytes={serving_metadata_bytes} current_state_directory_recoveries={directory_recoveries}",
+            "tracked_state_crud generated update accounting: logical_rows={bound_update_row_count} certificate_attempts={} certificate_hits={} certificate_misses={} certified_rows={} staged_puts={} staged_deletes={} staged_value_bytes={} commit_state_manifest_value_bytes={manifest_bytes} current_state_scoped_range_fallbacks={scoped_range_fallbacks}",
             certificate.attempts,
             certificate.hits,
             certificate.misses,

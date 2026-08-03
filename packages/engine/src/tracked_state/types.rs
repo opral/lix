@@ -298,66 +298,18 @@ pub(crate) struct CurrentStatePartDescriptor {
     pub(crate) uniform_updated_at: LixTimestamp,
 }
 
-/// Content-addressed root of a persistent current-state range directory.
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct CurrentStatePartDirectoryRoot {
-    pub(crate) root_id: [u8; 32],
-    pub(crate) directory_digest: [u8; 32],
-    pub(crate) row_count: u64,
-    pub(crate) part_count: u32,
-    pub(crate) tree_height: u16,
-}
-
-/// One authoritative current-state collection generation.
+/// Manifest-attested root of the unified scope/part serving tree.
 ///
-/// The generation digest binds this rebuildable serving projection to the
-/// historical replacement certificate. Sparse lineage then binds each later
-/// post-image directory root without making that serving directory historical
-/// commit authority.
+/// The generic tree owns only authenticated physical routing. These fields
+/// bind one result root to the graph parent and sealed mutation authority that
+/// produced it, without exposing mutation payload semantics to the tree.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
-pub(crate) struct CurrentStatePartSet {
-    pub(crate) scope: CommitDeltaReplacementScope,
-    pub(crate) generation_integrity_digest: [u8; 32],
-    /// Binds the current post-image to its coverage anchor and every later
-    /// sparse rewrite. For a fresh complete replacement this is derived from
-    /// the replacement certificate and directory root.
-    pub(crate) state_lineage_digest: [u8; 32],
-    pub(crate) directory: CurrentStatePartDirectoryRoot,
-}
-
-/// Content-addressed root of the persistent collection-to-state-part catalog.
-///
-/// One root in each commit manifest replaces an O(collections) copied vector.
-/// Unchanged commits reuse the exact root; updates rewrite only the bounded
-/// radix path for affected collections.
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct CurrentStateCatalogRoot {
-    pub(crate) root_id: [u8; 32],
-    pub(crate) entry_count: u32,
-    /// Root inherited from the sole parent before applying this commit. This
-    /// is serving-layout lineage, not commit-graph ancestry.
+pub(crate) struct CurrentStateScopedRangeRoot {
+    pub(crate) tree: super::scoped_range::ScopedRangeRoot,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) parent_root_id: Option<[u8; 32]>,
-    /// Binds this commit, its sealed mutation inventory, the inherited root,
-    /// and the resulting root. Cross-wiring an ancestor root into a newer
-    /// manifest therefore fails before an authoritative read.
     pub(crate) transition_digest: [u8; 32],
-}
-
-/// Publication-time binding from a complete-replacement mutation certificate
-/// to its serving directory. Descendants authenticate inherited coverage
-/// through their sealed content-addressed catalog root, so readers do not
-/// reload the historical replacement manifest.
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct CurrentStateCoverageAnchor {
-    pub(crate) scope: CommitDeltaReplacementScope,
-    pub(crate) generation_integrity_digest: [u8; 32],
-    pub(crate) state_lineage_digest: [u8; 32],
-    pub(crate) directory: CurrentStatePartDirectoryRoot,
 }
 
 /// Point-addressable immutable mutation inventory owned by one commit.
@@ -440,9 +392,7 @@ pub(crate) struct CommitStateManifest {
     pub(crate) replay_debt: CommitStateReplayDebt,
     pub(crate) mutations: CommitStateMutationInventory,
     #[musli(with = crate::storage_codec::option)]
-    pub(crate) current_state_catalog: Option<Box<CurrentStateCatalogRoot>>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) current_state_coverage_anchor: Option<Box<CurrentStateCoverageAnchor>>,
+    pub(crate) current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_root: Option<TrackedStateCommitRoot>,
 }

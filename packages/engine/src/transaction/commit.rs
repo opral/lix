@@ -5343,7 +5343,7 @@ where
                 && mutations.selected_source_commit_id.is_none()
             {
                 Some(if let Some(parent) = staged_parent {
-                    crate::tracked_state::stage_current_state_catalog_from_staged_parent(
+                    crate::tracked_state::stage_current_state_scoped_ranges_from_staged_parent(
                         read,
                         writes,
                         parent,
@@ -5353,7 +5353,7 @@ where
                     )
                     .await?
                 } else {
-                    crate::tracked_state::stage_current_state_catalog_from_published_parent(
+                    crate::tracked_state::stage_current_state_scoped_ranges_from_published_parent(
                         read,
                         writes,
                         external_parent.as_ref(),
@@ -5366,9 +5366,9 @@ where
             } else {
                 None
             };
-            let (current_state_catalog, current_state_coverage_anchor) = catalog_publication
+            let current_state_scoped_ranges = catalog_publication
                 .as_ref()
-                .map_or((None, None), |publication| publication.parts());
+                .and_then(|publication| publication.root());
             if mutations.replacement_generation.is_some() {
                 mutations.parts.clear();
             }
@@ -5389,8 +5389,7 @@ where
                     CommitStateReplayDebt::default()
                 },
                 mutations,
-                current_state_catalog,
-                current_state_coverage_anchor,
+                current_state_scoped_ranges,
                 snapshot_root,
             };
             let staged_manifest = if let Some(publication) = catalog_publication.as_ref() {
@@ -6228,7 +6227,7 @@ mod tests {
     );
     const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE_ID,
-        "tracked_state.commit_state_manifest.v1",
+        "tracked_state.commit_state_manifest.v4",
     );
     // V11 has no tracked-head marker space. Keep the retired v10 ID here only
     // as a negative test sentinel: normal serving and staging must never read
@@ -6598,8 +6597,7 @@ mod tests {
                     .get(&commit_id)
                     .cloned()
                     .expect("mixed certified inventory should stage"),
-                current_state_catalog: None,
-                current_state_coverage_anchor: None,
+                current_state_scoped_ranges: None,
                 snapshot_root: None,
             },
         )

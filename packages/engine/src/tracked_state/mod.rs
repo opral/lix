@@ -4,12 +4,14 @@ mod codec;
 mod commit_root_rebuild;
 mod context;
 mod current_state_data_part;
-mod current_state_part;
+pub(crate) mod current_state_envelope;
 mod diff;
 mod diff_id;
 mod merge;
 pub(crate) mod replacement_part;
 mod row_materialization;
+mod scoped_current_state;
+pub(crate) mod scoped_range;
 mod storage;
 mod tree;
 mod types;
@@ -25,12 +27,7 @@ pub(crate) use current_state_data_part::{
     CURRENT_STATE_DATA_PART_REFS_SPACE, CURRENT_STATE_DATA_PART_SPACE,
     decode_current_state_data_part_refs,
 };
-pub(crate) use current_state_part::{
-    CURRENT_STATE_CATALOG_SPACE, CURRENT_STATE_PART_DIRECTORY_SPACE,
-    load_current_state_catalog_reachability_many,
-    load_current_state_part_directory_reachability_many,
-    validate_current_state_catalog_transition_root,
-};
+pub(crate) use current_state_envelope::current_state_descriptor_from_scoped_range_part;
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStatePayloadBatch, TrackedStatePayloadRef,
@@ -45,6 +42,7 @@ pub(crate) use row_materialization::{
     MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
     materialize_batch_from_index_entry_refs,
 };
+pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_trees};
 pub(crate) use storage::{
     CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor, CommitDeltaMember,
     CommitDeltaPointReadCache, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
@@ -59,11 +57,12 @@ pub(crate) use storage::{
     stage_addressable_commit_deltas_with_selected_source,
     stage_certified_commit_state_manifest_with_handle, stage_change_locators,
     stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
-    stage_commit_state_manifest_with_handle, stage_current_state_catalog_from_published_parent,
-    stage_current_state_catalog_from_staged_parent, stage_delete_change_locators,
+    stage_commit_state_manifest_with_handle,
+    stage_current_state_scoped_ranges_from_published_parent,
+    stage_current_state_scoped_ranges_from_staged_parent, stage_delete_change_locators,
     stage_delete_commit_delta_inventory_entry, stage_ordered_addressable_commit_deltas,
     stage_ordered_addressable_replacement_parts, stage_ordered_columnar_mutations,
-    validate_current_state_catalog_parent_manifest,
+    validate_current_state_scoped_range_parent_manifest,
 };
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{

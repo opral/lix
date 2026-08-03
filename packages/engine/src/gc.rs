@@ -678,12 +678,11 @@ where
             ));
         }
     }
-    let mut live_catalog_nodes = BTreeSet::<[u8; 32]>::new();
-    let mut live_current_state_directory_nodes = BTreeSet::<[u8; 32]>::new();
+    let mut live_scoped_range_nodes = BTreeSet::<[u8; 32]>::new();
     let mut live_current_state_data_parts = BTreeSet::<[u8; 32]>::new();
     let mut live_current_state_ref_summaries = BTreeMap::<[u8; 32], [u8; 32]>::new();
     let mut live_current_state_payload_hashes = BTreeSet::<[u8; 32]>::new();
-    let mut catalog_roots = BTreeMap::new();
+    let mut scoped_roots = BTreeMap::new();
     let mut live_manifests = BTreeMap::new();
     let live_commit_ids = live_commits.iter().copied().collect::<Vec<_>>();
     let loaded_live_manifests =
@@ -696,16 +695,16 @@ where
             )
         })?;
         live_manifests.insert(commit_id, manifest.clone());
-        let Some(root) = manifest.current_state_catalog.as_ref() else {
+        let Some(root) = manifest.current_state_scoped_ranges.as_ref() else {
             continue;
         };
-        if let Some(previous) = catalog_roots.insert(root.root_id, root.clone()) {
-            if previous.entry_count != root.entry_count {
+        if let Some(previous) = scoped_roots.insert(root.tree.root_id, root.tree.clone()) {
+            if previous != root.tree {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "live current-state catalogs disagree about root '{:?}'",
-                        root.root_id
+                        "live current-state scoped ranges disagree about root '{:?}'",
+                        root.tree.root_id
                     ),
                 ));
             }
@@ -716,93 +715,51 @@ where
             .parent_commit_ids
             .first()
             .and_then(|parent_id| live_manifests.get(parent_id));
-        crate::tracked_state::validate_current_state_catalog_parent_manifest(manifest, parent)?;
-        crate::tracked_state::validate_current_state_catalog_transition_root(
-            store, manifest, parent,
-        )
-        .await?;
+        crate::tracked_state::validate_current_state_scoped_range_parent_manifest(
+            manifest, parent,
+        )?;
     }
 
-    // Catalog roots and immutable directory roots are content addressed and
-    // may be shared by many live commits. Validate each distinct authority and
-    // directory only once; otherwise a long unchanged branch interval turns
-    // GC into O(commits * scopes * directory parts) work.
-    let catalog_root_values = catalog_roots
-        .values()
-        .map(|root| (**root).clone())
-        .collect::<Vec<_>>();
-    let (catalog_nodes, unique_entries) =
-        crate::tracked_state::load_current_state_catalog_reachability_many(
-            store,
-            &catalog_root_values,
-        )
-        .await?;
-    live_catalog_nodes.extend(catalog_nodes);
-    let mut catalog_entries = BTreeMap::new();
-    for set in unique_entries {
-        let identity = storage_codec::encode("GC current-state catalog entry", &set)?;
-        catalog_entries.entry(identity).or_insert(set);
-    }
-
-    let mut directory_roots = BTreeMap::new();
-    for set in catalog_entries.values() {
-        if let Some(previous) = directory_roots.insert(set.directory.root_id, set.directory.clone())
-        {
-            if previous != set.directory {
+    let scoped_roots = scoped_roots.values().cloned().collect::<Vec<_>>();
+    let reachable = crate::tracked_state::validate_scoped_range_trees(store, &scoped_roots).await?;
+    live_scoped_range_nodes.extend(reachable.node_ids);
+    for part in reachable.parts {
+        let descriptor =
+            crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
+        match descriptor.source_kind {
+            0 => {
+                let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+                if !packed.commits.contains_key(&owner) {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "live scoped range references missing immutable-part owner '{owner}'"
+                        ),
+                    ));
+                }
+                retained_authority_commits.insert(owner);
+            }
+            1 => {
+                live_current_state_data_parts.insert(descriptor.content_digest);
+                if let Some(previous) = live_current_state_ref_summaries
+                    .insert(descriptor.content_digest, descriptor.payload_refs_digest)
+                    && previous != descriptor.payload_refs_digest
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "native scoped-range descriptors disagree about payload refs",
+                    ));
+                }
+            }
+            _ => {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "live current-state catalogs disagree about directory root '{:?}'",
-                        set.directory.root_id
-                    ),
+                    "live scoped range contains an unknown part source",
                 ));
             }
         }
     }
-    let directories = directory_roots.values().cloned().collect::<Vec<_>>();
-    let (directory_nodes, descriptor_sets) =
-        crate::tracked_state::load_current_state_part_directory_reachability_many(
-            store,
-            &directories,
-        )
-        .await?;
-    live_current_state_directory_nodes.extend(directory_nodes);
-    for descriptors in descriptor_sets {
-        for descriptor in descriptors {
-            match descriptor.source_kind {
-                0 => {
-                    let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
-                    if !packed.commits.contains_key(&owner) {
-                        return Err(LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "live current-state directory references missing immutable-part owner '{owner}'"
-                            ),
-                        ));
-                    }
-                    retained_authority_commits.insert(owner);
-                }
-                1 => {
-                    live_current_state_data_parts.insert(descriptor.content_digest);
-                    if let Some(previous) = live_current_state_ref_summaries
-                        .insert(descriptor.content_digest, descriptor.payload_refs_digest)
-                        && previous != descriptor.payload_refs_digest
-                    {
-                        return Err(LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            "native current-state descriptors disagree about payload refs",
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "live current-state directory contains an unknown part source",
-                    ));
-                }
-            }
-        }
-    }
+
     let native_keys = live_current_state_ref_summaries
         .keys()
         .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
@@ -999,8 +956,8 @@ where
     stage_sweep_unreachable_content_nodes(
         store,
         writes,
-        crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
-        &live_catalog_nodes,
+        crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
+        &live_scoped_range_nodes,
     )
     .await?;
     stage_sweep_unreachable_content_nodes(
@@ -1008,13 +965,6 @@ where
         writes,
         crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         &live_current_state_data_parts,
-    )
-    .await?;
-    stage_sweep_unreachable_content_nodes(
-        store,
-        writes,
-        crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
-        &live_current_state_directory_nodes,
     )
     .await?;
     stage_sweep_unreachable_content_nodes(
@@ -1336,8 +1286,7 @@ mod tests {
         let dead_id = [2u8; 32];
         let mut writes = storage.new_write_set();
         for space in [
-            crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
-            crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
+            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
@@ -1362,8 +1311,7 @@ mod tests {
         let mut sweep = storage.new_write_set();
         let live = BTreeSet::from([live_id]);
         for space in [
-            crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
-            crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
+            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
@@ -1385,8 +1333,7 @@ mod tests {
             StorageKey(Bytes::copy_from_slice(&dead_id)),
         ];
         for space in [
-            crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
-            crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
+            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
@@ -1709,8 +1656,7 @@ mod tests {
                 bytes: live.tracked_state_rootless_bytes,
             },
             mutations: CommitStateMutationInventory::default(),
-            current_state_catalog: None,
-            current_state_coverage_anchor: None,
+            current_state_scoped_ranges: None,
             snapshot_root: None,
         };
         drifted.generation += 1;
@@ -2464,8 +2410,7 @@ mod tests {
                     bytes: record.tracked_state_rootless_bytes,
                 },
                 mutations,
-                current_state_catalog: None,
-                current_state_coverage_anchor: None,
+                current_state_scoped_ranges: None,
                 snapshot_root: None,
             },
         )
