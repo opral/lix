@@ -964,7 +964,7 @@ mod tests {
         .expect("bounded splice should plan");
         let replacements = (0..plan.leaf_count())
             .map(|leaf| {
-                let mut leaf_parts = plan.leaf_parts(leaf).to_vec();
+                let mut leaf_parts = plan.leaf_parts(leaf).cloned().collect::<Vec<_>>();
                 for part in &mut leaf_parts {
                     if part.first_key == target {
                         part.payload.bytes = b"rewritten".to_vec();

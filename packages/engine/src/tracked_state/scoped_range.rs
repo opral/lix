@@ -8,7 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::mem::size_of;
+use std::ops::Range;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -21,12 +23,12 @@ use crate::{LixError, storage_codec};
 /// Hard-cut namespace: nodes from the former per-scope directory/catalog
 /// formats are neither readable nor hash-compatible with this tree.
 pub(crate) const SCOPED_RANGE_NODE_SPACE: StorageSpace =
-    StorageSpace::immutable(StorageSpaceId(0x0004_0031), "tracked_state.scoped_range.v2");
+    StorageSpace::immutable(StorageSpaceId(0x0004_0032), "tracked_state.scoped_range.v3");
 
-const NODE_RAW_MAGIC: &[u8; 6] = b"LXSR2R";
-const NODE_ZSTD_MAGIC: &[u8; 6] = b"LXSR2Z";
-const NODE_HASH_CONTEXT: &str = "lix scoped current-state range node v2";
-const ROOT_HASH_CONTEXT: &str = "lix scoped current-state range root v2";
+const NODE_RAW_MAGIC: &[u8; 6] = b"LXSR3R";
+const NODE_ZSTD_MAGIC: &[u8; 6] = b"LXSR3Z";
+const NODE_HASH_CONTEXT: &str = "lix scoped current-state range node v3";
+const ROOT_HASH_CONTEXT: &str = "lix scoped current-state range root v3";
 const MAX_NODE_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const FANOUT: usize = 128;
 const MAX_SCOPE_COMPONENT_BYTES: usize = 64 * 1024;
@@ -34,11 +36,9 @@ const MAX_SCOPE_PREFIX_BYTES: usize = 256 * 1024;
 
 /// Canonical length-framed tuple used as the leading component of every
 /// route. Callers cannot construct non-canonical prefixes.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
-#[musli(packed)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ScopedRangePrefix {
-    #[musli(bytes)]
-    encoded: Vec<u8>,
+    encoded: Arc<[u8]>,
 }
 
 impl ScopedRangePrefix {
@@ -69,11 +69,13 @@ impl ScopedRangePrefix {
         if encoded.len() > MAX_SCOPE_PREFIX_BYTES {
             return Err(scoped_range_error("scope prefix exceeds its size bound"));
         }
-        Ok(Self { encoded })
+        Ok(Self {
+            encoded: Arc::from(encoded),
+        })
     }
 
     fn validate(&self) -> Result<(), LixError> {
-        let mut remaining = self.encoded.as_slice();
+        let mut remaining = self.encoded.as_ref();
         let count = take_u32(&mut remaining, "scope omitted its component count")? as usize;
         if count == 0 {
             return Err(scoped_range_error("scope has no components"));
@@ -105,38 +107,32 @@ pub(crate) struct ScopedRangePartPayload {
     pub(crate) bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScopedRangeCoverageMarker {
     pub(crate) scope: ScopedRangePrefix,
     pub(crate) row_count: u64,
     pub(crate) part_count: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScopedRangePart {
     pub(crate) scope: ScopedRangePrefix,
-    #[musli(bytes)]
     pub(crate) first_key: Vec<u8>,
-    #[musli(bytes)]
     pub(crate) last_key: Vec<u8>,
     pub(crate) row_count: u64,
     pub(crate) payload: ScopedRangePartPayload,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ScopedRangeEntry {
     Marker(ScopedRangeCoverageMarker),
     Part(ScopedRangePart),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
-#[musli(packed)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ScopedRangeRoute {
     scope: ScopedRangePrefix,
     kind: u8,
-    #[musli(bytes)]
     key: Vec<u8>,
 }
 
@@ -156,8 +152,7 @@ impl ScopedRangeEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ScopedRangeChild {
     first: ScopedRangeRoute,
     last: ScopedRangeRoute,
@@ -168,12 +163,133 @@ struct ScopedRangeChild {
     level: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ScopedRangeNode {
     level: u16,
     entries: Vec<ScopedRangeEntry>,
     children: Vec<ScopedRangeChild>,
+}
+
+/// Storage-only leaf representation. One scope prefix is encoded per
+/// contiguous run instead of once per marker and part. Runtime entries stay
+/// unchanged, so routing and payload ownership remain independent of this
+/// physical codec.
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredScopedRangeLeafRun {
+    #[musli(bytes)]
+    scope: Vec<u8>,
+    #[musli(with = storage_codec::option)]
+    marker: Option<StoredScopedRangeMarker>,
+    parts: Vec<StoredScopedRangePart>,
+}
+
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredScopedRangeMarker {
+    row_count: u64,
+    part_count: u32,
+}
+
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredScopedRangePart {
+    #[musli(bytes)]
+    first_key: Vec<u8>,
+    #[musli(bytes)]
+    last_key: Vec<u8>,
+    row_count: u64,
+    payload: ScopedRangePartPayload,
+}
+
+#[derive(musli::Encode, musli::Decode)]
+enum StoredScopedRangeNode {
+    Leaf {
+        runs: Vec<StoredScopedRangeLeafRun>,
+    },
+    Internal {
+        level: u16,
+        children: Vec<StoredScopedRangeChild>,
+    },
+}
+
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredScopedRangeRoute {
+    #[musli(bytes)]
+    scope: Vec<u8>,
+    kind: u8,
+    #[musli(bytes)]
+    key: Vec<u8>,
+}
+
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredScopedRangeChild {
+    first: StoredScopedRangeRoute,
+    last: StoredScopedRangeRoute,
+    node_id: [u8; 32],
+    marker_count: u32,
+    part_count: u32,
+    row_count: u64,
+    level: u16,
+}
+
+/// Encode-only view of the v3 node protocol. Staging borrows immutable route,
+/// key, and payload bytes instead of cloning every field into the owned decode
+/// representation before Musli immediately copies them into its output.
+#[derive(musli::Encode)]
+#[musli(packed)]
+struct StoredScopedRangeLeafRunRef<'a> {
+    #[musli(bytes)]
+    scope: &'a [u8],
+    #[musli(with = storage_codec::option)]
+    marker: Option<StoredScopedRangeMarker>,
+    parts: Vec<StoredScopedRangePartRef<'a>>,
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+struct StoredScopedRangePartRef<'a> {
+    #[musli(bytes)]
+    first_key: &'a [u8],
+    #[musli(bytes)]
+    last_key: &'a [u8],
+    row_count: u64,
+    payload: &'a ScopedRangePartPayload,
+}
+
+#[derive(musli::Encode)]
+enum StoredScopedRangeNodeRef<'a> {
+    Leaf {
+        runs: Vec<StoredScopedRangeLeafRunRef<'a>>,
+    },
+    Internal {
+        level: u16,
+        children: Vec<StoredScopedRangeChildRef<'a>>,
+    },
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+struct StoredScopedRangeRouteRef<'a> {
+    #[musli(bytes)]
+    scope: &'a [u8],
+    kind: u8,
+    #[musli(bytes)]
+    key: &'a [u8],
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+struct StoredScopedRangeChildRef<'a> {
+    first: StoredScopedRangeRouteRef<'a>,
+    last: StoredScopedRangeRouteRef<'a>,
+    node_id: [u8; 32],
+    marker_count: u32,
+    part_count: u32,
+    row_count: u64,
+    level: u16,
 }
 
 #[derive(Clone)]
@@ -311,8 +427,7 @@ pub(crate) fn snapshot_staged_scoped_range_nodes(
 #[derive(Debug, Clone)]
 struct ScopedRangeSpliceLeaf {
     node_id: [u8; 32],
-    entries: Vec<ScopedRangeEntry>,
-    parts: Vec<ScopedRangePart>,
+    part_range: Range<usize>,
     key_indices: Vec<usize>,
 }
 
@@ -321,8 +436,19 @@ impl ScopedRangeSplicePlan {
         self.leaves.len()
     }
 
-    pub(crate) fn leaf_parts(&self, index: usize) -> &[ScopedRangePart] {
-        &self.leaves[index].parts
+    pub(crate) fn leaf_parts(
+        &self,
+        index: usize,
+    ) -> impl ExactSizeIterator<Item = &ScopedRangePart> {
+        let leaf = &self.leaves[index];
+        self.nodes[&leaf.node_id].entries[leaf.part_range.clone()]
+            .iter()
+            .map(|entry| match entry {
+                ScopedRangeEntry::Part(part) => part,
+                ScopedRangeEntry::Marker(_) => {
+                    unreachable!("planned part range contains only scoped parts")
+                }
+            })
     }
 
     pub(crate) fn leaf_key_indices(&self, index: usize) -> &[usize] {
@@ -345,6 +471,8 @@ pub(crate) fn stage_scoped_range_tree(
     writes: &mut StorageWriteSet,
     scopes: impl IntoIterator<Item = (ScopedRangeCoverageMarker, Vec<ScopedRangePart>)>,
 ) -> Result<ScopedRangeRoot, LixError> {
+    let mut compressor = crate::compression::ZstdLevel1Compressor::new()
+        .map_err(|error| scoped_range_error(format!("node compressor setup failed: {error}")))?;
     let mut scopes = scopes.into_iter().collect::<Vec<_>>();
     scopes.sort_by(|left, right| left.0.scope.cmp(&right.0.scope));
     if scopes.is_empty() {
@@ -371,6 +499,7 @@ pub(crate) fn stage_scoped_range_tree(
         .map(|chunk| {
             stage_node(
                 writes,
+                &mut compressor,
                 ScopedRangeNode {
                     level: 0,
                     entries: chunk.to_vec(),
@@ -386,6 +515,7 @@ pub(crate) fn stage_scoped_range_tree(
             .map(|chunk| {
                 stage_node(
                     writes,
+                    &mut compressor,
                     ScopedRangeNode {
                         level: chunk[0].child.level + 1,
                         entries: Vec::new(),
@@ -425,6 +555,8 @@ pub(crate) async fn stage_replace_scoped_range(
     marker: ScopedRangeCoverageMarker,
     mut parts: Vec<ScopedRangePart>,
 ) -> Result<ScopedRangeRewrite, LixError> {
+    let mut compressor = crate::compression::ZstdLevel1Compressor::new()
+        .map_err(|error| scoped_range_error(format!("node compressor setup failed: {error}")))?;
     validate_root_digest(root)?;
     parts.sort_by(|left, right| left.first_key.cmp(&right.first_key));
     let mut replacement = Vec::with_capacity(parts.len() + 1);
@@ -440,6 +572,7 @@ pub(crate) async fn stage_replace_scoped_range(
         &marker.scope,
         Some(replacement),
         &mut stats,
+        &mut compressor,
     )
     .await?;
     if level.is_empty() {
@@ -454,6 +587,7 @@ pub(crate) async fn stage_replace_scoped_range(
             .map(|chunk| {
                 let staged = stage_node(
                     writes,
+                    &mut compressor,
                     ScopedRangeNode {
                         level: chunk[0].child.level + 1,
                         entries: Vec::new(),
@@ -627,27 +761,37 @@ pub(crate) async fn plan_scoped_range_part_splice(
         .map(|(node_id, (mut key_indices, _contains_marker))| {
             key_indices.sort_unstable();
             key_indices.dedup();
-            let node = nodes
-                .get(&node_id)
-                .expect("resolved splice leaf remains cached");
-            let parts = node
-                .entries
+            let entries = &nodes[&node_id].entries;
+            let part_start = entries
                 .iter()
-                .filter_map(|entry| match entry {
-                    ScopedRangeEntry::Part(part) if part.scope == *scope => Some(part.clone()),
-                    _ => None,
-                })
-                .collect();
-            ScopedRangeSpliceLeaf {
-                node_id,
-                entries: node.entries.clone(),
-                parts,
-                key_indices,
+                .position(
+                    |entry| matches!(entry, ScopedRangeEntry::Part(part) if part.scope == *scope),
+                )
+                .unwrap_or(entries.len());
+            let part_end = entries
+                .iter()
+                .rposition(
+                    |entry| matches!(entry, ScopedRangeEntry::Part(part) if part.scope == *scope),
+                )
+                .map_or(part_start, |index| index + 1);
+            if entries[part_start..part_end]
+                .iter()
+                .any(|entry| !matches!(entry, ScopedRangeEntry::Part(part) if part.scope == *scope))
+            {
+                return Err(scoped_range_error(
+                    "splice scope parts are not contiguous within one leaf",
+                ));
             }
+            Ok(ScopedRangeSpliceLeaf {
+                node_id,
+                part_range: part_start..part_end,
+                key_indices,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, LixError>>()?;
     leaves.sort_by_key(|leaf| {
-        leaf.entries
+        nodes[&leaf.node_id]
+            .entries
             .first()
             .expect("validated splice leaf is non-empty")
             .route()
@@ -673,6 +817,8 @@ pub(crate) fn stage_scoped_range_part_splice(
     marker: ScopedRangeCoverageMarker,
     replacement_parts: Vec<Vec<ScopedRangePart>>,
 ) -> Result<ScopedRangeRewrite, LixError> {
+    let mut compressor = crate::compression::ZstdLevel1Compressor::new()
+        .map_err(|error| scoped_range_error(format!("node compressor setup failed: {error}")))?;
     if writes.identity() != plan.write_set_id {
         return Err(scoped_range_error(
             "splice plan belongs to another write set",
@@ -683,17 +829,14 @@ pub(crate) fn stage_scoped_range_part_splice(
             "splice marker scope or replacement leaf count is invalid",
         ));
     }
-    let old_parts = plan
-        .leaves
-        .iter()
-        .map(|leaf| leaf.parts.len())
-        .sum::<usize>();
-    let old_rows = plan
-        .leaves
-        .iter()
-        .flat_map(|leaf| &leaf.parts)
-        .map(|part| part.row_count)
-        .sum::<u64>();
+    let (old_parts, old_rows) =
+        (0..plan.leaf_count()).fold((0usize, 0u64), |(part_count, row_count), index| {
+            let parts = plan.leaf_parts(index);
+            (
+                part_count + parts.len(),
+                row_count + parts.map(|part| part.row_count).sum::<u64>(),
+            )
+        });
     let new_parts = replacement_parts.iter().map(Vec::len).sum::<usize>();
     let new_rows = replacement_parts
         .iter()
@@ -740,6 +883,7 @@ pub(crate) fn stage_scoped_range_part_splice(
         &marker,
         &mut replacements,
         &mut stats,
+        &mut compressor,
     )?;
     if !replacements.is_empty() || level.is_empty() {
         return Err(scoped_range_error(
@@ -753,6 +897,7 @@ pub(crate) fn stage_scoped_range_part_splice(
             .map(|chunk| {
                 let staged = stage_node(
                     writes,
+                    &mut compressor,
                     ScopedRangeNode {
                         level: chunk[0].child.level + 1,
                         entries: Vec::new(),
@@ -793,6 +938,7 @@ fn stage_splice_node(
     marker: &ScopedRangeCoverageMarker,
     replacements: &mut BTreeMap<[u8; 32], Vec<ScopedRangePart>>,
     stats: &mut ScopedRangeRewriteStats,
+    compressor: &mut crate::compression::ZstdLevel1Compressor,
 ) -> Result<Vec<StagedNode>, LixError> {
     let node = nodes
         .get(&node_id)
@@ -824,6 +970,7 @@ fn stage_splice_node(
             .map(|chunk| {
                 let staged = stage_node(
                     writes,
+                    compressor,
                     ScopedRangeNode {
                         level: 0,
                         entries: chunk.to_vec(),
@@ -848,6 +995,7 @@ fn stage_splice_node(
                     marker,
                     replacements,
                     stats,
+                    compressor,
                 )?
                 .into_iter()
                 .map(|node| node.child),
@@ -863,6 +1011,7 @@ fn stage_splice_node(
         .map(|chunk| {
             let staged = stage_node(
                 writes,
+                compressor,
                 ScopedRangeNode {
                     level: chunk[0].level + 1,
                     entries: Vec::new(),
@@ -885,6 +1034,7 @@ fn rewrite_scope_node<'a, R: StorageAdapterRead + ?Sized>(
     scope: &'a ScopedRangePrefix,
     replacement: Option<Vec<ScopedRangeEntry>>,
     stats: &'a mut ScopedRangeRewriteStats,
+    compressor: &'a mut crate::compression::ZstdLevel1Compressor,
 ) -> RewriteFuture<'a> {
     Box::pin(async move {
         let staged = staged_node(writes, node_id)?;
@@ -908,6 +1058,7 @@ fn rewrite_scope_node<'a, R: StorageAdapterRead + ?Sized>(
                 .map(|chunk| {
                     let staged = stage_node(
                         writes,
+                        compressor,
                         ScopedRangeNode {
                             level: 0,
                             entries: chunk.to_vec(),
@@ -960,6 +1111,7 @@ fn rewrite_scope_node<'a, R: StorageAdapterRead + ?Sized>(
                             None
                         },
                         stats,
+                        compressor,
                     )
                     .await?
                     .into_iter()
@@ -975,6 +1127,7 @@ fn rewrite_scope_node<'a, R: StorageAdapterRead + ?Sized>(
             .map(|chunk| {
                 let staged = stage_node(
                     writes,
+                    compressor,
                     ScopedRangeNode {
                         level: chunk[0].level + 1,
                         entries: Vec::new(),
@@ -1903,11 +2056,14 @@ async fn collect_route_interval(
     Ok(())
 }
 
-fn stage_node(writes: &mut StorageWriteSet, node: ScopedRangeNode) -> Result<StagedNode, LixError> {
-    validate_node(&node)?;
-    let bytes = encode_node(&node)?;
+fn stage_node(
+    writes: &mut StorageWriteSet,
+    compressor: &mut crate::compression::ZstdLevel1Compressor,
+    node: ScopedRangeNode,
+) -> Result<StagedNode, LixError> {
+    let mut child = validate_node_with_summary(&node)?;
+    let bytes = encode_node_with_compressor(&node, compressor)?;
     let node_id = node_digest(&bytes);
-    let mut child = node_summary_from_validated(&node)?;
     child.node_id = node_id;
     if let Some(existing) = writes.staged_value(SCOPED_RANGE_NODE_SPACE, &node_id) {
         if existing != bytes {
@@ -2037,12 +2193,17 @@ async fn load_authenticated_nodes(
         .collect()
 }
 
-fn encode_node(node: &ScopedRangeNode) -> Result<Bytes, LixError> {
-    let payload = storage_codec::encode("scoped current-state range node", node)?;
+fn encode_node_with_compressor(
+    node: &ScopedRangeNode,
+    compressor: &mut crate::compression::ZstdLevel1Compressor,
+) -> Result<Bytes, LixError> {
+    let stored = stored_node_ref(node)?;
+    let payload = storage_codec::encode("scoped current-state range node", &stored)?;
     if payload.len() > MAX_NODE_DECODED_BYTES {
         return Err(scoped_range_error("node exceeds its decoded size bound"));
     }
-    let compressed = crate::compression::compress_zstd_level_1(&payload)
+    let compressed = compressor
+        .compress(&payload)
         .map_err(|error| scoped_range_error(format!("node compression failed: {error}")))?;
     let compressed_len = NODE_ZSTD_MAGIC.len() + size_of::<u32>() + compressed.len();
     let raw_len = NODE_RAW_MAGIC.len() + payload.len();
@@ -2095,9 +2256,172 @@ fn decode_node(bytes: &[u8]) -> Result<ScopedRangeNode, LixError> {
     if payload.len() > MAX_NODE_DECODED_BYTES {
         return Err(scoped_range_error("node exceeds its decoded size bound"));
     }
-    let node = storage_codec::decode("scoped current-state range node", &payload)?;
+    let stored: StoredScopedRangeNode =
+        storage_codec::decode("scoped current-state range node", &payload)?;
+    let node = runtime_node(stored)?;
     validate_node(&node)?;
     Ok(node)
+}
+
+fn stored_node_ref(node: &ScopedRangeNode) -> Result<StoredScopedRangeNodeRef<'_>, LixError> {
+    if !node.children.is_empty() {
+        return Ok(StoredScopedRangeNodeRef::Internal {
+            level: node.level,
+            children: node.children.iter().map(stored_child_ref).collect(),
+        });
+    }
+    let mut runs = Vec::<StoredScopedRangeLeafRunRef<'_>>::with_capacity(1);
+    for (index, entry) in node.entries.iter().enumerate() {
+        let scope = entry.scope();
+        if runs
+            .last()
+            .is_none_or(|run| run.scope != scope.encoded.as_ref())
+        {
+            let part_capacity = node.entries[index..]
+                .iter()
+                .take_while(|candidate| candidate.scope() == scope)
+                .filter(|candidate| matches!(candidate, ScopedRangeEntry::Part(_)))
+                .count();
+            runs.push(StoredScopedRangeLeafRunRef {
+                scope: scope.encoded.as_ref(),
+                marker: None,
+                parts: Vec::with_capacity(part_capacity),
+            });
+        }
+        let run = runs.last_mut().expect("leaf entry created its scope run");
+        match entry {
+            ScopedRangeEntry::Marker(marker) => {
+                if run.marker.is_some() || !run.parts.is_empty() {
+                    return Err(scoped_range_error(
+                        "leaf scope run has a misplaced or duplicate marker",
+                    ));
+                }
+                run.marker = Some(StoredScopedRangeMarker {
+                    row_count: marker.row_count,
+                    part_count: marker.part_count,
+                });
+            }
+            ScopedRangeEntry::Part(part) => run.parts.push(StoredScopedRangePartRef {
+                first_key: &part.first_key,
+                last_key: &part.last_key,
+                row_count: part.row_count,
+                payload: &part.payload,
+            }),
+        }
+    }
+    Ok(StoredScopedRangeNodeRef::Leaf { runs })
+}
+
+fn runtime_node(stored: StoredScopedRangeNode) -> Result<ScopedRangeNode, LixError> {
+    match stored {
+        StoredScopedRangeNode::Internal { level, children } => {
+            let children = children
+                .into_iter()
+                .map(runtime_child)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ScopedRangeNode {
+                level,
+                entries: Vec::new(),
+                children,
+            })
+        }
+        StoredScopedRangeNode::Leaf { runs } => {
+            if runs.is_empty() {
+                return Err(scoped_range_error("leaf omitted its scope runs"));
+            }
+            let entry_count = runs.iter().try_fold(0usize, |count, run| {
+                count
+                    .checked_add(usize::from(run.marker.is_some()))
+                    .and_then(|count| count.checked_add(run.parts.len()))
+                    .ok_or_else(|| scoped_range_error("leaf entry count overflows"))
+            })?;
+            let mut entries = Vec::with_capacity(entry_count);
+            let mut previous_scope: Option<Arc<[u8]>> = None;
+            for run in runs {
+                let scope = ScopedRangePrefix {
+                    encoded: Arc::from(run.scope),
+                };
+                scope.validate()?;
+                if previous_scope
+                    .as_deref()
+                    .is_some_and(|previous| previous >= scope.encoded.as_ref())
+                {
+                    return Err(scoped_range_error(
+                        "leaf scope runs are duplicate or unordered",
+                    ));
+                }
+                if run.marker.is_none() && run.parts.is_empty() {
+                    return Err(scoped_range_error("leaf contains an empty scope run"));
+                }
+                if let Some(marker) = run.marker {
+                    entries.push(ScopedRangeEntry::Marker(ScopedRangeCoverageMarker {
+                        scope: scope.clone(),
+                        row_count: marker.row_count,
+                        part_count: marker.part_count,
+                    }));
+                }
+                entries.extend(run.parts.into_iter().map(|part| {
+                    ScopedRangeEntry::Part(ScopedRangePart {
+                        scope: scope.clone(),
+                        first_key: part.first_key,
+                        last_key: part.last_key,
+                        row_count: part.row_count,
+                        payload: part.payload,
+                    })
+                }));
+                previous_scope = Some(scope.encoded);
+            }
+            Ok(ScopedRangeNode {
+                level: 0,
+                entries,
+                children: Vec::new(),
+            })
+        }
+    }
+}
+
+fn runtime_route(route: StoredScopedRangeRoute) -> Result<ScopedRangeRoute, LixError> {
+    let scope = ScopedRangePrefix {
+        encoded: Arc::from(route.scope),
+    };
+    scope.validate()?;
+    Ok(ScopedRangeRoute {
+        scope,
+        kind: route.kind,
+        key: route.key,
+    })
+}
+
+fn stored_route_ref(route: &ScopedRangeRoute) -> StoredScopedRangeRouteRef<'_> {
+    StoredScopedRangeRouteRef {
+        scope: route.scope.encoded.as_ref(),
+        kind: route.kind,
+        key: &route.key,
+    }
+}
+
+fn stored_child_ref(child: &ScopedRangeChild) -> StoredScopedRangeChildRef<'_> {
+    StoredScopedRangeChildRef {
+        first: stored_route_ref(&child.first),
+        last: stored_route_ref(&child.last),
+        node_id: child.node_id,
+        marker_count: child.marker_count,
+        part_count: child.part_count,
+        row_count: child.row_count,
+        level: child.level,
+    }
+}
+
+fn runtime_child(child: StoredScopedRangeChild) -> Result<ScopedRangeChild, LixError> {
+    Ok(ScopedRangeChild {
+        first: runtime_route(child.first)?,
+        last: runtime_route(child.last)?,
+        node_id: child.node_id,
+        marker_count: child.marker_count,
+        part_count: child.part_count,
+        row_count: child.row_count,
+        level: child.level,
+    })
 }
 
 fn validate_node(node: &ScopedRangeNode) -> Result<(), LixError> {
@@ -2141,6 +2465,108 @@ fn validate_node(node: &ScopedRangeNode) -> Result<(), LixError> {
         }
     }
     Ok(())
+}
+
+/// Staging needs both validation and the authenticated parent summary. Fold
+/// counts while validating fields so rewritten nodes are not scanned a third
+/// time before publication.
+fn validate_node_with_summary(node: &ScopedRangeNode) -> Result<ScopedRangeChild, LixError> {
+    let is_leaf = node.children.is_empty();
+    if is_leaf == node.entries.is_empty() || node.entries.len().max(node.children.len()) > FANOUT {
+        return Err(scoped_range_error("node shape or fanout is invalid"));
+    }
+    if is_leaf {
+        if node.level != 0
+            || node
+                .entries
+                .windows(2)
+                .any(|pair| compare_entry_routes(&pair[0], &pair[1]).is_ge())
+        {
+            return Err(scoped_range_error("leaf level or entry order is invalid"));
+        }
+        let (marker_count, row_count) = node.entries.iter().try_fold(
+            (0u32, 0u64),
+            |(marker_count, row_count), entry| -> Result<_, LixError> {
+                match entry {
+                    ScopedRangeEntry::Marker(marker) => {
+                        marker.scope.validate()?;
+                        Ok((
+                            marker_count
+                                .checked_add(1)
+                                .ok_or_else(|| scoped_range_error("marker count overflows"))?,
+                            row_count,
+                        ))
+                    }
+                    ScopedRangeEntry::Part(part) => {
+                        validate_part(part)?;
+                        Ok((
+                            marker_count,
+                            row_count
+                                .checked_add(part.row_count)
+                                .ok_or_else(|| scoped_range_error("row count overflows"))?,
+                        ))
+                    }
+                }
+            },
+        )?;
+        let part_count = u32::try_from(node.entries.len())
+            .map_err(|_| scoped_range_error("part count overflows"))?
+            .checked_sub(marker_count)
+            .ok_or_else(|| scoped_range_error("marker count exceeds entry count"))?;
+        Ok(ScopedRangeChild {
+            first: node.entries[0].route(),
+            last: node.entries[node.entries.len() - 1].route(),
+            node_id: [0; 32],
+            marker_count,
+            part_count,
+            row_count,
+            level: 0,
+        })
+    } else {
+        let child_level = node.children[0].level;
+        if node.level
+            != child_level
+                .checked_add(1)
+                .ok_or_else(|| scoped_range_error("node level overflows"))?
+            || node
+                .children
+                .windows(2)
+                .any(|pair| pair[0].last >= pair[1].first)
+        {
+            return Err(scoped_range_error(
+                "internal child levels or ranges are invalid",
+            ));
+        }
+        let (marker_count, part_count, row_count) = node.children.iter().try_fold(
+            (0u32, 0u32, 0u64),
+            |(markers, parts, rows), child| -> Result<_, LixError> {
+                if child.level != child_level || child.first > child.last {
+                    return Err(scoped_range_error(
+                        "internal child levels or ranges are invalid",
+                    ));
+                }
+                Ok((
+                    markers
+                        .checked_add(child.marker_count)
+                        .ok_or_else(|| scoped_range_error("marker count overflows"))?,
+                    parts
+                        .checked_add(child.part_count)
+                        .ok_or_else(|| scoped_range_error("part count overflows"))?,
+                    rows.checked_add(child.row_count)
+                        .ok_or_else(|| scoped_range_error("row count overflows"))?,
+                ))
+            },
+        )?;
+        Ok(ScopedRangeChild {
+            first: node.children[0].first.clone(),
+            last: node.children[node.children.len() - 1].last.clone(),
+            node_id: [0; 32],
+            marker_count,
+            part_count,
+            row_count,
+            level: node.level,
+        })
+    }
 }
 
 fn validate_part(part: &ScopedRangePart) -> Result<(), LixError> {
@@ -2552,6 +2978,118 @@ mod tests {
         )
     }
 
+    #[test]
+    fn scope_run_codec_borrows_bytes_and_shares_decoded_scope_identity() {
+        let (marker, parts) = fixture(scope("run"), FANOUT - 1);
+        let mut entries = Vec::with_capacity(FANOUT);
+        entries.push(ScopedRangeEntry::Marker(marker));
+        entries.extend(parts.into_iter().map(ScopedRangeEntry::Part));
+        let node = ScopedRangeNode {
+            level: 0,
+            entries,
+            children: Vec::new(),
+        };
+
+        let stored = stored_node_ref(&node).unwrap();
+        let StoredScopedRangeNodeRef::Leaf { runs } = &stored else {
+            panic!("leaf encoded as an internal node");
+        };
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].parts.len(), FANOUT - 1);
+
+        let bytes = storage_codec::encode("scoped current-state range node", &stored).unwrap();
+        let owned: StoredScopedRangeNode =
+            storage_codec::decode("scoped current-state range node", &bytes).unwrap();
+        let decoded = runtime_node(owned).unwrap();
+        assert_eq!(decoded, node);
+        let ScopedRangeEntry::Marker(marker) = &decoded.entries[0] else {
+            panic!("decoded run omitted its marker");
+        };
+        let ScopedRangeEntry::Part(part) = &decoded.entries[1] else {
+            panic!("decoded run omitted its first part");
+        };
+        assert!(Arc::ptr_eq(&marker.scope.encoded, &part.scope.encoded));
+    }
+
+    #[test]
+    fn scope_run_codec_rejects_empty_runs() {
+        let stored = StoredScopedRangeNode::Leaf {
+            runs: vec![StoredScopedRangeLeafRun {
+                scope: scope("empty").encoded.to_vec(),
+                marker: None,
+                parts: Vec::new(),
+            }],
+        };
+        assert!(runtime_node(stored).is_err());
+    }
+
+    #[test]
+    fn scope_run_codec_rejects_duplicate_in_leaf_runs() {
+        let duplicate = scope("duplicate").encoded.to_vec();
+        let stored = StoredScopedRangeNode::Leaf {
+            runs: vec![
+                StoredScopedRangeLeafRun {
+                    scope: duplicate.clone(),
+                    marker: Some(StoredScopedRangeMarker {
+                        row_count: 1,
+                        part_count: 1,
+                    }),
+                    parts: Vec::new(),
+                },
+                StoredScopedRangeLeafRun {
+                    scope: duplicate,
+                    marker: None,
+                    parts: vec![StoredScopedRangePart {
+                        first_key: b"a".to_vec(),
+                        last_key: b"z".to_vec(),
+                        row_count: 1,
+                        payload: ScopedRangePartPayload {
+                            version: 1,
+                            bytes: Vec::new(),
+                        },
+                    }],
+                },
+            ],
+        };
+        assert!(runtime_node(stored).is_err());
+    }
+
+    #[test]
+    fn internal_borrowed_codec_matches_owned_protocol() {
+        let children = ["alpha", "beta"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let (marker, parts) = fixture(scope(name), 1);
+                let mut entries = vec![ScopedRangeEntry::Marker(marker)];
+                entries.extend(parts.into_iter().map(ScopedRangeEntry::Part));
+                let mut child = validate_node_with_summary(&ScopedRangeNode {
+                    level: 0,
+                    entries,
+                    children: Vec::new(),
+                })
+                .unwrap();
+                child.node_id = [index as u8 + 1; 32];
+                child
+            })
+            .collect::<Vec<_>>();
+        let node = ScopedRangeNode {
+            level: 1,
+            entries: Vec::new(),
+            children,
+        };
+
+        let stored = stored_node_ref(&node).unwrap();
+        let StoredScopedRangeNodeRef::Internal { children, .. } = &stored else {
+            panic!("internal node encoded as a leaf");
+        };
+        assert_eq!(children.len(), 2);
+        let bytes = storage_codec::encode("scoped current-state range node", &stored).unwrap();
+        let owned: StoredScopedRangeNode =
+            storage_codec::decode("scoped current-state range node", &bytes).unwrap();
+        assert_eq!(runtime_node(owned).unwrap(), node);
+    }
+
     #[tokio::test]
     async fn routes_marker_predecessor_and_intervals_across_leaf_splits() {
         let adapter = StorageAdapter::new(Memory::new());
@@ -2599,7 +3137,7 @@ mod tests {
     #[test]
     fn rejects_noncanonical_scope_and_marker_closure_drift() {
         let invalid = ScopedRangePrefix {
-            encoded: vec![0, 0, 0, 1, 0, 0, 0, 2, 7],
+            encoded: vec![0, 0, 0, 1, 0, 0, 0, 2, 7].into(),
         };
         assert!(invalid.validate().is_err());
         let adapter = StorageAdapter::new(Memory::new());
@@ -2982,7 +3520,7 @@ mod tests {
         );
         let marker = plan.coverage().clone();
         let mut replacement_parts = (0..plan.leaf_count())
-            .map(|index| plan.leaf_parts(index).to_vec())
+            .map(|index| plan.leaf_parts(index).cloned().collect::<Vec<_>>())
             .collect::<Vec<_>>();
         let target_leaf = plan
             .leaves
