@@ -125,6 +125,12 @@ harness = false
 required-features = ["storage-benches"]
 
 [[bench]]
+name = "current_state_scope_sharing"
+path = "benches/current_state_scope_sharing.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "tpch"
 path = "benches/tpch/main.rs"
 harness = false

@@ -668,7 +668,8 @@ mod tests {
                     bytes: 0,
                 },
                 mutations: CommitStateMutationInventory::default(),
-                current_state_part_sets: Vec::new(),
+                current_state_catalog: None,
+                current_state_coverage_anchor: None,
                 snapshot_root: None,
             },
         )
@@ -720,6 +721,12 @@ mod tests {
                 commit_id.as_uuid().as_bytes(),
             )),
         );
+        writes.delete(
+            crate::tracked_state::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
+            StorageKey(bytes::Bytes::copy_from_slice(
+                commit_id.as_uuid().as_bytes(),
+            )),
+        );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -762,7 +769,7 @@ mod tests {
         drop(read);
         manifest.commit_change_id = change_id("different-authority-change");
         let mut writes = storage.new_write_set();
-        stage_commit_state_manifest(&mut writes, &manifest)
+        crate::tracked_state::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
             .expect("drifted but structurally valid authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -1072,7 +1079,8 @@ mod tests {
                     bytes: 0,
                 },
                 mutations: staged.mutation_inventory().clone(),
-                current_state_part_sets: Vec::new(),
+                current_state_catalog: None,
+                current_state_coverage_anchor: None,
                 snapshot_root: None,
             },
         )
@@ -1574,7 +1582,8 @@ mod tests {
                     bytes: record.tracked_state_rootless_bytes,
                 },
                 mutations,
-                current_state_part_sets: Vec::new(),
+                current_state_catalog: None,
+                current_state_coverage_anchor: None,
                 snapshot_root: None,
             },
         )

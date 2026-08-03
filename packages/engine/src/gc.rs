@@ -236,6 +236,51 @@ pub(crate) async fn load_recovery_refs(
     Ok(refs.into_values().collect())
 }
 
+async fn stage_sweep_unreachable_content_nodes(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    space: StorageSpace,
+    live: &BTreeSet<[u8; 32]>,
+) -> Result<(), LixError> {
+    let plan = ScanPlan::prefix(
+        space,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let node_id = <[u8; 32]>::try_from(entry.key.0.as_ref()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "content-addressed space '{}' contains a malformed key",
+                        space.name
+                    ),
+                )
+            })?;
+            if !live.contains(&node_id) {
+                writes.delete(space, entry.key);
+            }
+        }
+        if !page.value.has_more {
+            break;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn load_recovery_ref(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -632,6 +677,146 @@ where
             ));
         }
     }
+    let mut live_catalog_nodes = BTreeSet::<[u8; 32]>::new();
+    let mut live_current_state_directory_nodes = BTreeSet::<[u8; 32]>::new();
+    let mut catalog_roots = BTreeMap::new();
+    let mut live_manifests = BTreeMap::new();
+    let live_commit_ids = live_commits.iter().copied().collect::<Vec<_>>();
+    let loaded_live_manifests =
+        crate::tracked_state::load_commit_state_manifests(store, &live_commit_ids).await?;
+    for (commit_id, manifest) in live_commit_ids.into_iter().zip(loaded_live_manifests) {
+        let manifest = manifest.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("live commit '{commit_id}' has no commit-state authority"),
+            )
+        })?;
+        live_manifests.insert(commit_id, manifest.clone());
+        let Some(root) = manifest.current_state_catalog.as_ref() else {
+            continue;
+        };
+        if let Some(previous) = catalog_roots.insert(root.root_id, root.clone()) {
+            if previous.entry_count != root.entry_count {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "live current-state catalogs disagree about root '{:?}'",
+                        root.root_id
+                    ),
+                ));
+            }
+        }
+    }
+    for manifest in live_manifests.values() {
+        let parent = manifest
+            .parent_commit_ids
+            .first()
+            .and_then(|parent_id| live_manifests.get(parent_id));
+        crate::tracked_state::validate_current_state_catalog_parent_manifest(manifest, parent)?;
+        crate::tracked_state::validate_current_state_catalog_transition_root(
+            store,
+            manifest,
+            parent.and_then(|parent| parent.current_state_catalog.as_deref()),
+        )
+        .await?;
+    }
+
+    // Catalog roots and immutable directory roots are content addressed and
+    // may be shared by many live commits. Validate each distinct authority and
+    // directory only once; otherwise a long unchanged branch interval turns
+    // GC into O(commits * scopes * directory parts) work.
+    let catalog_root_values = catalog_roots
+        .values()
+        .map(|root| (**root).clone())
+        .collect::<Vec<_>>();
+    let (catalog_nodes, unique_entries) =
+        crate::tracked_state::load_current_state_catalog_reachability_many(
+            store,
+            &catalog_root_values,
+        )
+        .await?;
+    live_catalog_nodes.extend(catalog_nodes);
+    let mut catalog_entries = BTreeMap::new();
+    for set in unique_entries {
+        let identity = storage_codec::encode("GC current-state catalog entry", &set)?;
+        catalog_entries.entry(identity).or_insert(set);
+    }
+
+    let mut directory_roots = BTreeMap::new();
+    let authority_ids = catalog_entries
+        .values()
+        .map(|set| CommitId::new(uuid::Uuid::from_bytes(set.coverage_anchor_commit_id)))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let authority_manifests =
+        crate::tracked_state::load_commit_state_manifests(store, &authority_ids).await?;
+    let authority_by_id = authority_ids
+        .into_iter()
+        .zip(authority_manifests)
+        .map(|(authority_id, manifest)| {
+            manifest
+                .map(|manifest| (authority_id, manifest))
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("live current-state catalog references missing coverage authority '{authority_id}'"),
+                    )
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    for set in catalog_entries.values() {
+        let authority = CommitId::new(uuid::Uuid::from_bytes(set.coverage_anchor_commit_id));
+        crate::tracked_state::validate_current_state_catalog_entry_against_authority(
+            set,
+            authority_by_id
+                .get(&authority)
+                .expect("catalog authority was batch loaded"),
+        )?;
+        if !packed.commits.contains_key(&authority) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "live current-state catalog references missing coverage authority '{authority}'"
+                ),
+            ));
+        }
+        retained_authority_commits.insert(authority);
+        if let Some(previous) = directory_roots.insert(set.directory.root_id, set.directory.clone())
+        {
+            if previous != set.directory {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "live current-state catalogs disagree about directory root '{:?}'",
+                        set.directory.root_id
+                    ),
+                ));
+            }
+        }
+    }
+    let directories = directory_roots.values().cloned().collect::<Vec<_>>();
+    let (directory_nodes, descriptor_sets) =
+        crate::tracked_state::load_current_state_part_directory_reachability_many(
+            store,
+            &directories,
+        )
+        .await?;
+    live_current_state_directory_nodes.extend(directory_nodes);
+    for descriptors in descriptor_sets {
+        for descriptor in descriptors {
+            let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+            if !packed.commits.contains_key(&owner) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "live current-state directory references missing immutable-part owner '{owner}'"
+                    ),
+                ));
+            }
+            retained_authority_commits.insert(owner);
+        }
+    }
     if let Some((commit_id, source_commit_id)) = live_commits.iter().find_map(|commit_id| {
         packed
             .commits
@@ -776,22 +961,22 @@ where
         COMMIT_SPACE,
         sweep_commits.iter().map(|commit_id| commit_key(*commit_id)),
     );
+    stage_sweep_unreachable_content_nodes(
+        store,
+        writes,
+        crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
+        &live_catalog_nodes,
+    )
+    .await?;
+    stage_sweep_unreachable_content_nodes(
+        store,
+        writes,
+        crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
+        &live_current_state_directory_nodes,
+    )
+    .await?;
     for commit_id in &sweep_authority_commits {
         if let Some(entry) = packed.commits.get(commit_id) {
-            if let Some(manifest) =
-                crate::tracked_state::load_commit_state_manifest(store, *commit_id).await?
-            {
-                for set in &manifest.current_state_part_sets {
-                    crate::tracked_state::stage_delete_current_state_part_directory(
-                        store,
-                        writes,
-                        &set.directory,
-                        set.owner_commit_id,
-                        set.mutation_directory_digest,
-                    )
-                    .await?;
-                }
-            }
             let schema_keys = entry
                 .members
                 .iter()
@@ -1004,7 +1189,7 @@ mod tests {
     use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
-        StorageKey, StorageReadOptions, StorageSpace, StorageWriteOptions,
+        StorageKey, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
     };
     use crate::tracked_state::{
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
@@ -1093,6 +1278,70 @@ mod tests {
                 .expect("checkpoint GC state should load"),
             expected
         );
+    }
+
+    #[tokio::test]
+    async fn shared_current_state_nodes_are_swept_by_reachability_not_owner() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_id = [1u8; 32];
+        let dead_id = [2u8; 32];
+        let mut writes = storage.new_write_set();
+        for space in [
+            crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
+            crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
+        ] {
+            for node_id in [live_id, dead_id] {
+                writes.put(
+                    space,
+                    StorageKey(Bytes::copy_from_slice(&node_id)),
+                    StorageValue {
+                        bytes: Bytes::from_static(b"node"),
+                    },
+                );
+            }
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("shared-node fixture should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("shared-node read should open");
+        let mut sweep = storage.new_write_set();
+        let live = BTreeSet::from([live_id]);
+        for space in [
+            crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
+            crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
+        ] {
+            super::stage_sweep_unreachable_content_nodes(&read, &mut sweep, space, &live)
+                .await
+                .expect("content-addressed sweep should stage");
+        }
+        drop(read);
+        storage
+            .commit_write_set(sweep, StorageWriteOptions::default())
+            .await
+            .expect("content-addressed sweep should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-sweep read should open");
+        let keys = [
+            StorageKey(Bytes::copy_from_slice(&live_id)),
+            StorageKey(Bytes::copy_from_slice(&dead_id)),
+        ];
+        for space in [
+            crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
+            crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
+        ] {
+            let loaded = PointReadPlan::new(space, &keys)
+                .materialize(&read, StorageGetOptions::default())
+                .await
+                .expect("post-sweep nodes should load");
+            assert!(loaded.value[0].is_some(), "shared live node must survive");
+            assert!(loaded.value[1].is_none(), "unreachable node must be swept");
+        }
     }
 
     #[tokio::test]
@@ -1405,7 +1654,8 @@ mod tests {
                 bytes: live.tracked_state_rootless_bytes,
             },
             mutations: CommitStateMutationInventory::default(),
-            current_state_part_sets: Vec::new(),
+            current_state_catalog: None,
+            current_state_coverage_anchor: None,
             snapshot_root: None,
         };
         drifted.generation += 1;
@@ -2158,7 +2408,8 @@ mod tests {
                     bytes: record.tracked_state_rootless_bytes,
                 },
                 mutations,
-                current_state_part_sets: Vec::new(),
+                current_state_catalog: None,
+                current_state_coverage_anchor: None,
                 snapshot_root: None,
             },
         )

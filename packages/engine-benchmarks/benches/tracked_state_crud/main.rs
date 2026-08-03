@@ -944,6 +944,7 @@ fn profile_sql_session_operation(
         };
         maybe_print_profile_rss_phase("after_seed");
         reset_allocation_accounting();
+        let _ = lix_engine::storage_bench::take_crud_current_state_catalog_accounting();
         let start = Instant::now();
         let result = runtime.block_on(run_sql_session_operation(operation, &fixture));
         samples.push(start.elapsed());
@@ -961,6 +962,18 @@ fn profile_sql_session_operation(
         format!("sql_session/{}", profile.name())
     };
     print_profile_samples(&profile_layer, operation, read_many_pk_count, samples);
+    if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_ROUTE_ACCOUNTING").is_some() {
+        let accounting = lix_engine::storage_bench::take_crud_current_state_catalog_accounting();
+        println!(
+            "tracked_state_crud current-state catalog accounting: attempts={} hits={} errors={} sealed_manifest_loads={} replay_manifest_loads={} ordered_delta_fallbacks={}",
+            accounting.attempts,
+            accounting.hits,
+            accounting.errors,
+            accounting.sealed_manifest_loads,
+            accounting.replay_manifest_loads,
+            accounting.ordered_delta_fallbacks,
+        );
+    }
 }
 
 fn profile_sql_session_bound_updates(

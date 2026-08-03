@@ -988,6 +988,7 @@ struct PointReplayCommit {
     root_id: Option<TrackedStateRootId>,
     rootless: bool,
     replacement_generation: Option<storage::CommitDeltaReplacementGeneration>,
+    state_manifest: Arc<super::CommitStateManifest>,
 }
 
 /// One immutable first-parent interval shared by every cached suffix view.
@@ -3181,6 +3182,42 @@ where
         commit_id: &str,
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+        let requested_commit_id =
+            CommitId::parse_lix(commit_id, "rootless point replay commit id")?;
+        let head = self.load_point_replay_commit(requested_commit_id).await?;
+        let mut encoded = TrackedStateKeyBatchBuilder::with_row_capacity(keys.len());
+        for key in keys {
+            encoded.push(TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+        }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_crud_current_state_catalog_attempt();
+        match storage::load_complete_current_state_values_from_replay_manifest(
+            &self.store,
+            &head.state_manifest,
+            &encoded.finish(),
+        )
+        .await
+        {
+            Ok(Some(values)) => {
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_crud_current_state_catalog_hit();
+                return Ok(values);
+            }
+            Ok(None) => {
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_crud_current_state_directory_recovery();
+            }
+            Err(_) => {
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_crud_current_state_catalog_error();
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_crud_current_state_directory_recovery();
+            }
+        }
         let interval = self.point_replay_interval(commit_id).await?;
         let mut values = if let Some(root_id) = interval.baseline_root.as_ref() {
             self.tree.get_many(&self.store, root_id, keys).await?
@@ -3281,7 +3318,7 @@ where
                 }
             }
         };
-        let manifest = storage::load_commit_state_manifest(&self.store, commit_id)
+        let manifest = storage::load_point_replay_commit_state(&self.store, commit_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -3322,13 +3359,11 @@ where
             ));
         }
         let replacement_generation = if rootless && manifest.mutations.member_count != 0 {
-            storage::load_commit_delta_replay_metadata_with_cache(
-                &self.store,
-                commit_id,
-                Some(&self.commit_delta_point_cache),
-            )
-            .await?
-            .and_then(|metadata| metadata.replacement_generation)
+            storage::seed_commit_delta_point_cache_from_replay_manifest(
+                &manifest,
+                &self.commit_delta_point_cache,
+            )?
+            .replacement_generation
         } else {
             None
         };
@@ -3337,6 +3372,7 @@ where
             root_id,
             rootless,
             replacement_generation,
+            state_manifest: Arc::new(manifest),
         };
         self.point_replay_commits
             .insert(commit_id, replay_commit.clone());
@@ -3375,11 +3411,12 @@ where
                 entity_pk: &key.entity_pk,
             });
         }
-        let values = storage::load_commit_delta_values_encoded_with_cache(
+        let replay_commit = self.load_point_replay_commit(commit_id).await?;
+        let values = storage::load_commit_delta_values_encoded_from_replay_manifest(
             &self.store,
-            commit_id,
+            &replay_commit.state_manifest,
             &encoded_keys.finish(),
-            Some(&self.commit_delta_point_cache),
+            &self.commit_delta_point_cache,
         )
         .await?;
         for ((index, key), value) in missing.into_iter().zip(values) {
@@ -4739,7 +4776,8 @@ mod tests {
                 ),
                 replay_debt: Default::default(),
                 mutations: Default::default(),
-                current_state_part_sets: Vec::new(),
+                current_state_catalog: None,
+                current_state_coverage_anchor: None,
                 snapshot_root: Some(snapshot_root),
             },
         )
@@ -6562,6 +6600,10 @@ mod tests {
                     storage::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
                     commit_root_key(commit_id),
                 );
+                writes.delete(
+                    storage::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
+                    commit_root_key(commit_id),
+                );
             }
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
@@ -6639,7 +6681,7 @@ mod tests {
                     .expect("commit-b root should load")
                     .expect("commit-b root should exist"),
             }];
-            storage::stage_commit_state_manifest(&mut writes, &manifest)
+            storage::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
                 .expect("corrupt cycle authority should stage");
             writes.put(
                 crate::changelog::COMMIT_SPACE,
@@ -8235,8 +8277,11 @@ mod tests {
         .expect("certified commit delta should stage");
         crate::tracked_state::stage_change_locators(&mut writes, &staged.locators);
         authority.mutations = staged.mutation_inventory().clone();
-        crate::tracked_state::stage_commit_state_manifest(&mut writes, &authority)
-            .expect("certified commit-state authority should update atomically");
+        crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
+            &mut writes,
+            &authority,
+        )
+        .expect("certified commit-state authority should update atomically");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -8812,18 +8857,16 @@ mod tests {
             primary_chunk_count: result.chunk_count as u64,
             primary_chunk_bytes: result.chunk_bytes as u64,
         };
-        let mut manifest = storage::load_commit_state_manifest(&read, typed_commit_id)
+        let published = storage::load_published_commit_state_manifest(&read, typed_commit_id)
             .await
             .expect("commit-state authority should load")
             .expect("root fixture should publish commit-state authority");
-        stale_root.parent_roots = manifest
+        stale_root.parent_roots = published
             .snapshot_root
             .as_ref()
             .map(|root| root.parent_roots.clone())
             .unwrap_or_default();
-        manifest.snapshot_root = Some(stale_root);
-        manifest.replay_debt = Default::default();
-        storage::stage_commit_state_manifest(&mut writes, &manifest)
+        storage::stage_commit_state_snapshot_root_update(&mut writes, &published, Some(stale_root))
             .expect("stale authority should encode");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())

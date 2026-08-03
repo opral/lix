@@ -39,7 +39,8 @@ fn stage_bench_commit_deltas(
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
-            current_state_part_sets: Vec::new(),
+            current_state_catalog: None,
+            current_state_coverage_anchor: None,
             snapshot_root: None,
         },
     )?;
@@ -62,6 +63,498 @@ pub struct BenchTrackedFixture<StorageImpl: Storage> {
     rows: Vec<BenchTrackedRow>,
     current_commit_id: Option<String>,
     next_commit_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchCurrentStatePointMode {
+    PersistentCatalog,
+    FirstParentReplay,
+}
+
+#[expect(missing_debug_implementations)]
+pub struct BenchCurrentStatePointFixture<StorageImpl: Storage> {
+    storage: StorageAdapter<StorageImpl>,
+    commits: Vec<CommitId>,
+    current_manifest: CommitStateManifest,
+    encoded_key: bytes::Bytes,
+    catalog_entry_count: usize,
+    catalog_manifest_bytes: u64,
+    replay_manifest_bytes: u64,
+    catalog_staged_encoded_bytes: u64,
+}
+
+pub async fn seed_current_state_point_fixture<StorageImpl>(
+    storage: StorageAdapter<StorageImpl>,
+    replacement_rows: usize,
+    unrelated_sparse_commits: usize,
+    catalog_entry_count: usize,
+) -> BenchCurrentStatePointFixture<StorageImpl>
+where
+    StorageImpl: Storage,
+{
+    assert!(replacement_rows > 0);
+    assert!(catalog_entry_count > 0);
+    let _ = crate::storage_bench::take_crud_current_state_catalog_bytes();
+    let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(11);
+    let updated_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(22);
+    let parent_id = bench_addressable_commit_id("persistent-catalog-parent");
+    let entity_pks = (0..replacement_rows)
+        .map(|index| EntityPk::single(format!("entity-{index:09}")))
+        .collect::<Vec<_>>();
+    let parent_rows = entity_pks
+        .iter()
+        .enumerate()
+        .map(|(index, entity_pk)| TrackedStateCommitDeltaRef {
+            delta: TrackedStateDeltaRef {
+                schema_key: "bench_current_state_alpha",
+                file_id: None,
+                entity_pk,
+                change_id: ChangeId::for_test_label(&format!("catalog-parent-{index}")),
+                commit_id: parent_id,
+                deleted: false,
+                created_at,
+                updated_at,
+            },
+            snapshot: JsonSlotRef::Inline("{}"),
+            metadata: JsonSlotRef::None,
+            origin_key: None,
+            base_coordinate: None,
+            authored: true,
+        })
+        .collect::<Vec<_>>();
+    let scope = super::types::CommitDeltaReplacementScope {
+        schema_key: "bench_current_state_alpha".to_string(),
+        file_id: None,
+    };
+    let generation = super::storage::CommitDeltaReplacementGeneration {
+        scope: scope.clone(),
+        fallback_commit_id: None,
+        lifecycle_summary: super::storage::CommitDeltaLifecycleSummary {
+            scope,
+            ordered_identity_digest: [17; 32],
+            uniform_created_at: created_at,
+        },
+    };
+    let mut writes = storage.new_write_set();
+    let parent_stage = super::storage::stage_ordered_addressable_replacement_parts(
+        &mut writes,
+        parent_rows.iter().copied().map(Ok),
+        &generation,
+    )
+    .expect("stage benchmark replacement parts");
+    let mut parent_mutations = parent_stage.mutation_inventory().clone();
+    let parent_publication = super::storage::stage_current_state_catalog_from_published_parent(
+        &storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open benchmark root read"),
+        &mut writes,
+        None,
+        parent_id,
+        &parent_mutations,
+    )
+    .await
+    .expect("certify benchmark parent catalog");
+    let (parent_catalog, parent_anchor) = parent_publication.parts();
+    parent_mutations.parts.clear();
+    let mut current_manifest = bench_current_state_manifest(
+        parent_id,
+        None,
+        1,
+        parent_mutations,
+        parent_catalog,
+        parent_anchor,
+    );
+    super::storage::stage_certified_commit_state_manifest(
+        &mut writes,
+        &current_manifest,
+        &parent_publication,
+    )
+    .expect("stage benchmark parent manifest");
+    storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await
+        .expect("commit benchmark parent");
+
+    for index in 1..catalog_entry_count {
+        let authority_commit_id = bench_addressable_commit_id(&format!("catalog-scope-{index}"));
+        let schema_key = format!("bench_scope_{index:08}");
+        let file_id = format!("file-{:05}", index % 10_000);
+        let entity_pk = EntityPk::single("entity");
+        let scope = super::types::CommitDeltaReplacementScope {
+            schema_key: schema_key.clone(),
+            file_id: Some(file_id.clone()),
+        };
+        let row = TrackedStateCommitDeltaRef {
+            delta: TrackedStateDeltaRef {
+                schema_key: &schema_key,
+                file_id: Some(&file_id),
+                entity_pk: &entity_pk,
+                change_id: ChangeId::for_test_label(&format!("catalog-scope-change-{index}")),
+                commit_id: authority_commit_id,
+                deleted: false,
+                created_at,
+                updated_at,
+            },
+            snapshot: JsonSlotRef::Inline("{}"),
+            metadata: JsonSlotRef::None,
+            origin_key: None,
+            base_coordinate: None,
+            authored: true,
+        };
+        let generation = super::storage::CommitDeltaReplacementGeneration {
+            scope: scope.clone(),
+            fallback_commit_id: None,
+            lifecycle_summary: super::storage::CommitDeltaLifecycleSummary {
+                scope,
+                ordered_identity_digest: *blake3::hash(schema_key.as_bytes()).as_bytes(),
+                uniform_created_at: created_at,
+            },
+        };
+        let mut authority_writes = storage.new_write_set();
+        let staged = super::storage::stage_ordered_addressable_replacement_parts(
+            &mut authority_writes,
+            std::iter::once(Ok(row)),
+            &generation,
+        )
+        .expect("stage valid benchmark scope replacement");
+        let mut mutations = staged.mutation_inventory().clone();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open benchmark scope parent read");
+        let published_parent =
+            super::storage::load_published_commit_state_manifest(&read, current_manifest.commit_id)
+                .await
+                .expect("load benchmark scope parent authority")
+                .expect("benchmark scope parent authority exists");
+        let publication = super::storage::stage_current_state_catalog_from_published_parent(
+            &read,
+            &mut authority_writes,
+            Some(&published_parent),
+            authority_commit_id,
+            &mutations,
+        )
+        .await
+        .expect("certify benchmark scope catalog");
+        let (catalog, anchor) = publication.parts();
+        mutations.parts.clear();
+        let authority_manifest = bench_current_state_manifest(
+            authority_commit_id,
+            Some(current_manifest.commit_id),
+            u16::try_from(index + 1)
+                .expect("benchmark catalog construction depth fits u16")
+                .min(super::COMMIT_STATE_MAX_REPLAY_DEPTH),
+            mutations,
+            catalog,
+            anchor,
+        );
+        super::storage::stage_certified_commit_state_manifest(
+            &mut authority_writes,
+            &authority_manifest,
+            &publication,
+        )
+        .expect("stage benchmark scope authority");
+        drop(read);
+        storage
+            .commit_write_set(authority_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit benchmark scope authority");
+        current_manifest = authority_manifest;
+    }
+
+    let replay_base_id = if catalog_entry_count == 1 {
+        parent_id
+    } else {
+        let refresh_id = bench_addressable_commit_id("persistent-catalog-alpha-refresh");
+        let refresh_rows = entity_pks
+            .iter()
+            .enumerate()
+            .map(|(index, entity_pk)| TrackedStateCommitDeltaRef {
+                delta: TrackedStateDeltaRef {
+                    schema_key: "bench_current_state_alpha",
+                    file_id: None,
+                    entity_pk,
+                    change_id: ChangeId::for_test_label(&format!("catalog-refresh-{index}")),
+                    commit_id: refresh_id,
+                    deleted: false,
+                    created_at,
+                    updated_at,
+                },
+                snapshot: JsonSlotRef::Inline("{}"),
+                metadata: JsonSlotRef::None,
+                origin_key: None,
+                base_coordinate: None,
+                authored: true,
+            })
+            .collect::<Vec<_>>();
+        let mut refresh_writes = storage.new_write_set();
+        let refresh_stage = super::storage::stage_ordered_addressable_replacement_parts(
+            &mut refresh_writes,
+            refresh_rows.iter().copied().map(Ok),
+            &generation,
+        )
+        .expect("stage benchmark alpha refresh");
+        let mut refresh_mutations = refresh_stage.mutation_inventory().clone();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open benchmark refresh parent read");
+        let published_parent =
+            super::storage::load_published_commit_state_manifest(&read, current_manifest.commit_id)
+                .await
+                .expect("load benchmark refresh parent authority")
+                .expect("benchmark refresh parent authority exists");
+        let publication = super::storage::stage_current_state_catalog_from_published_parent(
+            &read,
+            &mut refresh_writes,
+            Some(&published_parent),
+            refresh_id,
+            &refresh_mutations,
+        )
+        .await
+        .expect("certify benchmark alpha refresh");
+        let (catalog, anchor) = publication.parts();
+        refresh_mutations.parts.clear();
+        let refresh_manifest = bench_current_state_manifest(
+            refresh_id,
+            Some(current_manifest.commit_id),
+            1,
+            refresh_mutations,
+            catalog,
+            anchor,
+        );
+        super::storage::stage_certified_commit_state_manifest(
+            &mut refresh_writes,
+            &refresh_manifest,
+            &publication,
+        )
+        .expect("stage benchmark alpha refresh authority");
+        drop(read);
+        storage
+            .commit_write_set(refresh_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit benchmark alpha refresh");
+        current_manifest = refresh_manifest;
+        refresh_id
+    };
+
+    let mut commits = vec![replay_base_id];
+    let mut catalog_manifest_bytes = 0u64;
+    let mut replay_manifest_bytes = 0u64;
+    let beta_pk = EntityPk::single("unrelated");
+    for index in 0..unrelated_sparse_commits {
+        let commit_id = bench_addressable_commit_id(&format!("catalog-child-{index}"));
+        let present_scope = catalog_entry_count > 1 && index % 4 == 0;
+        let schema_key = if present_scope {
+            format!("bench_scope_{:08}", 1 + index % (catalog_entry_count - 1))
+        } else {
+            "bench_current_state_beta".to_string()
+        };
+        let file_id = present_scope.then(|| {
+            format!(
+                "file-{:05}",
+                (1 + index % (catalog_entry_count - 1)) % 10_000
+            )
+        });
+        let row = TrackedStateCommitDeltaRef {
+            delta: TrackedStateDeltaRef {
+                schema_key: &schema_key,
+                file_id: file_id.as_deref(),
+                entity_pk: &beta_pk,
+                change_id: ChangeId::for_test_label(&format!("catalog-child-change-{index}")),
+                commit_id,
+                deleted: false,
+                created_at,
+                updated_at,
+            },
+            snapshot: JsonSlotRef::Inline("{}"),
+            metadata: JsonSlotRef::None,
+            origin_key: None,
+            base_coordinate: None,
+            authored: true,
+        };
+        let mut writes = storage.new_write_set();
+        let stage = super::storage::stage_ordered_addressable_commit_deltas(
+            &mut writes,
+            std::iter::once(Ok(row)),
+            true,
+            false,
+        )
+        .expect("stage benchmark sparse mutation")
+        .expect("benchmark sparse mutation is addressable");
+        let mut mutations = stage.mutation_inventory().clone();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open benchmark parent read");
+        let published_parent =
+            super::storage::load_published_commit_state_manifest(&read, current_manifest.commit_id)
+                .await
+                .expect("load benchmark sparse parent authority")
+                .expect("benchmark sparse parent authority exists");
+        let publication = super::storage::stage_current_state_catalog_from_published_parent(
+            &read,
+            &mut writes,
+            Some(&published_parent),
+            commit_id,
+            &mut mutations,
+        )
+        .await
+        .expect("reuse benchmark persistent catalog");
+        let (catalog, anchor) = publication.parts();
+        drop(read);
+        current_manifest = bench_current_state_manifest(
+            commit_id,
+            commits.last().copied(),
+            u16::try_from(commits.len() + 1)
+                .expect("benchmark replay depth fits u16")
+                .min(super::COMMIT_STATE_MAX_REPLAY_DEPTH),
+            mutations,
+            catalog,
+            anchor,
+        );
+        catalog_manifest_bytes += u64::try_from(bench_manifest_encoded_len(&current_manifest))
+            .expect("benchmark manifest length fits u64");
+        let mut replay_manifest = current_manifest.clone();
+        replay_manifest.current_state_catalog = None;
+        replay_manifest_bytes += u64::try_from(bench_manifest_encoded_len(&replay_manifest))
+            .expect("benchmark manifest length fits u64");
+        super::storage::stage_certified_commit_state_manifest(
+            &mut writes,
+            &current_manifest,
+            &publication,
+        )
+        .expect("stage benchmark sparse manifest");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit benchmark sparse child");
+        commits.push(commit_id);
+    }
+
+    let target = &entity_pks[replacement_rows / 2];
+    let encoded_key = bytes::Bytes::from(super::codec::encode_key_ref(
+        super::types::TrackedStateKeyRef {
+            schema_key: "bench_current_state_alpha",
+            file_id: None,
+            entity_pk: target,
+        },
+    ));
+    BenchCurrentStatePointFixture {
+        storage,
+        commits,
+        current_manifest,
+        encoded_key,
+        catalog_entry_count,
+        catalog_manifest_bytes,
+        replay_manifest_bytes,
+        catalog_staged_encoded_bytes: crate::storage_bench::take_crud_current_state_catalog_bytes(),
+    }
+}
+
+impl<StorageImpl> BenchCurrentStatePointFixture<StorageImpl>
+where
+    StorageImpl: Storage,
+{
+    pub fn catalog_entry_count(&self) -> usize {
+        self.catalog_entry_count
+    }
+
+    pub fn catalog_manifest_bytes(&self) -> u64 {
+        self.catalog_manifest_bytes
+    }
+
+    pub fn replay_manifest_bytes(&self) -> u64 {
+        self.replay_manifest_bytes
+    }
+
+    pub fn catalog_staged_encoded_bytes(&self) -> u64 {
+        self.catalog_staged_encoded_bytes
+    }
+
+    pub async fn read_point(&self, mode: BenchCurrentStatePointMode) -> usize {
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("begin benchmark current-state point read");
+        match mode {
+            BenchCurrentStatePointMode::PersistentCatalog => {
+                let state = super::storage::load_published_commit_state_manifest(
+                    &read,
+                    self.current_manifest.commit_id,
+                )
+                .await
+                .expect("load benchmark current-state manifest")
+                .expect("benchmark current-state manifest exists");
+                let values =
+                    super::storage::load_complete_current_state_values_from_published_manifest(
+                        &read,
+                        &state,
+                        std::slice::from_ref(&self.encoded_key),
+                    )
+                    .await
+                    .expect("read benchmark current-state catalog")
+                    .expect("benchmark point is covered");
+                usize::from(values[0].is_some())
+            }
+            BenchCurrentStatePointMode::FirstParentReplay => {
+                for commit_id in self.commits.iter().rev() {
+                    let values = super::storage::load_commit_delta_values_encoded_with_cache(
+                        &read,
+                        *commit_id,
+                        std::slice::from_ref(&self.encoded_key),
+                        None,
+                    )
+                    .await
+                    .expect("replay benchmark commit point");
+                    if values[0].is_some() {
+                        return 1;
+                    }
+                }
+                0
+            }
+        }
+    }
+}
+
+fn bench_manifest_encoded_len(manifest: &CommitStateManifest) -> usize {
+    5 + crate::storage_codec::encode("benchmark commit-state manifest", manifest)
+        .expect("encode benchmark commit-state manifest")
+        .len()
+}
+
+fn bench_addressable_commit_id(label: &str) -> CommitId {
+    let labeled = CommitId::for_test_label(label);
+    CommitId::with_change_address_space(*labeled.as_uuid())
+}
+
+fn bench_current_state_manifest(
+    commit_id: CommitId,
+    parent_commit_id: Option<CommitId>,
+    replay_depth: u16,
+    mutations: super::types::CommitStateMutationInventory,
+    current_state_catalog: Option<Box<super::types::CurrentStateCatalogRoot>>,
+    current_state_coverage_anchor: Option<Box<super::types::CurrentStateCoverageAnchor>>,
+) -> CommitStateManifest {
+    CommitStateManifest {
+        commit_id,
+        generation: 0,
+        parent_commit_ids: parent_commit_id.into_iter().collect(),
+        commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:bench-state")),
+        author_account_ids: Vec::new(),
+        created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+        replay_debt: CommitStateReplayDebt {
+            depth: replay_depth,
+            rows: u64::from(mutations.member_count),
+            bytes: u64::from(mutations.member_count),
+        },
+        mutations,
+        current_state_catalog,
+        current_state_coverage_anchor,
+        snapshot_root: None,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

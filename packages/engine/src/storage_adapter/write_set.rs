@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::{
     BufferRange, CommitResult, EncodedMutationBatch, Key, KeyRange, PutBatch, PutEntry, SpaceId,
@@ -11,6 +12,11 @@ use bytes::Bytes;
 use tracing::Instrument as _;
 
 type FastHashBuilder = RandomState;
+static NEXT_STORAGE_WRITE_SET_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_storage_write_set_id() -> u64 {
+    NEXT_STORAGE_WRITE_SET_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 pub trait IntoStorageSpace {
     fn into_storage_space(self) -> StorageSpace;
@@ -71,6 +77,7 @@ impl IntoStorageValue for &[u8] {
 }
 
 pub struct StorageWriteSet {
+    identity: u64,
     groups: Vec<StorageWriteGroup>,
     group_index: HashMap<SpaceId, usize, FastHashBuilder>,
     exclusive_range_deletes: Vec<(StorageSpace, KeyRange)>,
@@ -240,6 +247,7 @@ impl StorageWriteSet {
     /// Creates a canonical write set with capacity hints.
     pub fn with_capacity(_expected_mutations: usize, expected_spaces: usize) -> Self {
         Self {
+            identity: next_storage_write_set_id(),
             groups: Vec::with_capacity(expected_spaces),
             group_index: HashMap::with_capacity_and_hasher(
                 expected_spaces,
@@ -259,6 +267,10 @@ impl StorageWriteSet {
                 .groups
                 .iter()
                 .all(|group| group.puts.is_empty() && group.deletes.is_empty())
+    }
+
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity
     }
 
     /// Conservative encoded-size hint for contiguous backend write batches.
@@ -288,7 +300,7 @@ impl StorageWriteSet {
             })
     }
 
-    #[cfg(any(test, feature = "storage-benches"))]
+    #[cfg(feature = "storage-benches")]
     pub(crate) async fn apply<StorageImpl>(
         self,
         writer: &mut crate::storage_adapter::context::StorageAdapterWriteTransaction<
@@ -589,6 +601,20 @@ impl StorageWriteSet {
             .get(&space.id)
             .and_then(|index| self.groups.get(*index))
             .is_some_and(|group| group.puts.iter().any(|put| group.key_bytes(put.key) == key))
+    }
+
+    /// Returns an exact ordinary staged put value for transaction-local
+    /// immutable read-your-writes. Deferred sources remain final-only.
+    pub(crate) fn staged_value(&self, space: StorageSpace, key: &[u8]) -> Option<Bytes> {
+        let group = self
+            .group_index
+            .get(&space.id)
+            .and_then(|index| self.groups.get(*index))?;
+        let put = group
+            .puts
+            .iter()
+            .find(|put| group.key_bytes(put.key) == key)?;
+        Some(Bytes::copy_from_slice(group.value_bytes(put.value)))
     }
 
     pub fn extend(&mut self, other: Self) {
@@ -983,6 +1009,7 @@ fn validate_sorted_group(group: &StorageWriteGroup) -> Result<(), StorageWriteSe
 impl Default for StorageWriteSet {
     fn default() -> Self {
         Self {
+            identity: next_storage_write_set_id(),
             groups: Vec::new(),
             group_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
             exclusive_range_deletes: Vec::new(),

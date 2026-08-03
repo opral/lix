@@ -283,9 +283,47 @@ pub(crate) struct CurrentStatePartDirectoryRoot {
 #[musli(packed)]
 pub(crate) struct CurrentStatePartSet {
     pub(crate) scope: CommitDeltaReplacementScope,
-    pub(crate) owner_commit_id: [u8; 16],
+    /// Commit whose complete-replacement certificate created this entry.
+    /// Reused catalog entries retain this identity, so readers can validate
+    /// directly against the immutable origin instead of walking ancestry.
+    pub(crate) coverage_anchor_commit_id: [u8; 16],
     pub(crate) generation_integrity_digest: [u8; 32],
-    pub(crate) mutation_directory_digest: [u8; 32],
+    /// Binds the current post-image to its coverage anchor and every later
+    /// sparse rewrite. For a fresh complete replacement this is derived from
+    /// the replacement certificate and directory root.
+    pub(crate) state_lineage_digest: [u8; 32],
+    pub(crate) directory: CurrentStatePartDirectoryRoot,
+}
+
+/// Content-addressed root of the persistent collection-to-state-part catalog.
+///
+/// One root in each commit manifest replaces an O(collections) copied vector.
+/// Unchanged commits reuse the exact root; updates rewrite only the bounded
+/// radix path for affected collections.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CurrentStateCatalogRoot {
+    pub(crate) root_id: [u8; 32],
+    pub(crate) entry_count: u32,
+    /// Root inherited from the sole parent before applying this commit. This
+    /// is serving-layout lineage, not commit-graph ancestry.
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) parent_root_id: Option<[u8; 32]>,
+    /// Binds this commit, its sealed mutation inventory, the inherited root,
+    /// and the resulting root. Cross-wiring an ancestor root into a newer
+    /// manifest therefore fails before an authoritative read.
+    pub(crate) transition_digest: [u8; 32],
+}
+
+/// Historical binding from a complete-replacement mutation certificate to
+/// its optional serving directory. Descendants refer to this immutable anchor
+/// by commit ID, so authoritative misses never trust an unbound catalog leaf.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CurrentStateCoverageAnchor {
+    pub(crate) scope: CommitDeltaReplacementScope,
+    pub(crate) generation_integrity_digest: [u8; 32],
+    pub(crate) state_lineage_digest: [u8; 32],
     pub(crate) directory: CurrentStatePartDirectoryRoot,
 }
 
@@ -358,7 +396,10 @@ pub(crate) struct CommitStateManifest {
     pub(crate) created_at: LixTimestamp,
     pub(crate) replay_debt: CommitStateReplayDebt,
     pub(crate) mutations: CommitStateMutationInventory,
-    pub(crate) current_state_part_sets: Vec<CurrentStatePartSet>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) current_state_catalog: Option<Box<CurrentStateCatalogRoot>>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) current_state_coverage_anchor: Option<Box<CurrentStateCoverageAnchor>>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_root: Option<TrackedStateCommitRoot>,
 }

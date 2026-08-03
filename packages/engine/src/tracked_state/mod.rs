@@ -21,7 +21,10 @@ pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
 };
 pub(crate) use current_state_part::{
-    stage_complete_replacement_current_state_part_set, stage_delete_current_state_part_directory,
+    CURRENT_STATE_CATALOG_SPACE, CURRENT_STATE_PART_DIRECTORY_SPACE,
+    load_current_state_catalog_reachability_many,
+    load_current_state_part_directory_reachability_many,
+    validate_current_state_catalog_transition_root,
 };
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
@@ -45,12 +48,18 @@ pub(crate) use storage::{
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
     load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
     load_commit_state_manifest, load_commit_state_manifests, load_owned_commit_delta_entries,
-    load_owned_commit_delta_entries_one_ordered_ref, scan_change_records_from_commit_deltas,
-    scan_commit_delta_inventory, scan_commit_delta_values, selected_change_selection_fingerprint,
-    stage_addressable_commit_deltas, stage_addressable_commit_deltas_with_selected_source,
-    stage_change_locators, stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
-    stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
-    stage_ordered_addressable_commit_deltas, stage_ordered_addressable_replacement_parts,
+    load_owned_commit_delta_entries_one_ordered_ref, load_published_commit_state_manifest,
+    scan_change_records_from_commit_deltas, scan_commit_delta_inventory, scan_commit_delta_values,
+    selected_change_selection_fingerprint, stage_addressable_commit_deltas,
+    stage_addressable_commit_deltas_with_selected_source,
+    stage_certified_commit_state_manifest_with_handle, stage_change_locators,
+    stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
+    stage_commit_state_manifest_with_handle, stage_current_state_catalog_from_published_parent,
+    stage_current_state_catalog_from_staged_parent, stage_delete_change_locators,
+    stage_delete_commit_delta_inventory_entry, stage_ordered_addressable_commit_deltas,
+    stage_ordered_addressable_replacement_parts,
+    validate_current_state_catalog_entry_against_authority,
+    validate_current_state_catalog_parent_manifest,
 };
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{
@@ -64,7 +73,9 @@ pub(crate) use storage::{
 };
 #[cfg(test)]
 pub(crate) use storage::{
-    load_authoritative_commit_root, load_commit_delta_change_ids, scan_commit_delta_members,
+    TRACKED_STATE_COMMIT_STATE_SEAL_SPACE, load_authoritative_commit_root,
+    load_commit_delta_change_ids, scan_commit_delta_members,
+    stage_resealed_commit_state_manifest_for_test,
 };
 pub(crate) use types::{COMMIT_STATE_MAX_REPLAY_BYTES, COMMIT_STATE_MAX_REPLAY_DEPTH};
 pub(crate) use types::{

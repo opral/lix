@@ -74,7 +74,7 @@ where
     let staged_roots = writer.staged_commit_roots().cloned().collect::<Vec<_>>();
     drop(writer);
     for snapshot_root in staged_roots {
-        let mut manifest = storage::load_commit_state_manifest(rebuilder.store, snapshot_root.commit_id)
+        let manifest = storage::load_published_commit_state_manifest(rebuilder.store, snapshot_root.commit_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -88,8 +88,11 @@ where
         // The rebuilt tree is an optional immutable accelerator. Preserve
         // replay debt: it remains the physical-policy authority projected by
         // the changelog, while readers may serve through this equivalent root.
-        manifest.snapshot_root = Some(snapshot_root);
-        storage::stage_commit_state_manifest(rebuilder.writes, &manifest)?;
+        storage::stage_commit_state_snapshot_root_update(
+            rebuilder.writes,
+            &manifest,
+            Some(snapshot_root),
+        )?;
     }
     Ok(report)
 }

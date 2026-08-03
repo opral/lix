@@ -469,6 +469,8 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
             ))
         })?;
         owner_manifest.mutations = owner_mutations;
+        owner_manifest.current_state_catalog = None;
+        owner_manifest.current_state_coverage_anchor = None;
         crate::tracked_state::stage_commit_state_manifest(writes, &owner_manifest)?;
     }
     let mut root_writer = tracked_state.writer(read, writes);
@@ -557,7 +559,8 @@ fn stage_test_commit_state_manifest(
             created_at: record.created_at,
             replay_debt,
             mutations,
-            current_state_part_sets: Vec::new(),
+            current_state_catalog: None,
+            current_state_coverage_anchor: None,
             snapshot_root,
         },
     )
