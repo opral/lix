@@ -4,7 +4,7 @@ use datafusion::arrow::array::{Array, BooleanArray, LargeStringArray, StringArra
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
-use serde_json::{Value as JsonValue, value::RawValue};
+use serde_json::Value as JsonValue;
 use tracing::Instrument;
 
 use crate::catalog::{SchemaPlanId, TypedJsonScalarRef};
@@ -1403,21 +1403,12 @@ fn append_direct_path_value_replacement_json_text(
 
 /// Appends a `lix_json` parameter in serde_json's stable compact form.
 ///
-/// Public parameters do not carry a canonical-JSON type certificate, but the
-/// common path is already produced by `JSON.stringify` or `serde_json`. A
-/// borrowed `RawValue` validates that input without building a DOM. The small
-/// lexical recognizer then proves that parsing into `Value` and serializing it
-/// would leave every byte unchanged: object keys are ordered, strings use the
-/// serializer's preferred escapes, and numbers are exact in-range integers.
-/// Inputs outside that deliberately narrow proof retain the canonical DOM
-/// fallback and therefore preserve existing SQL semantics.
+/// Public parameters do not carry a canonical-JSON type certificate. The
+/// streaming recognizer proves already-canonical input in one allocation-free
+/// scan. Noncanonical object order is reparsed into sorted compact bytes,
+/// without the former redundant serde validation scan. Inputs outside this
+/// deliberately narrow scalar grammar retain the canonical DOM fallback.
 fn append_canonical_json_parameter(normalized: &mut Vec<u8>, raw: &str) -> Result<(), LixError> {
-    serde_json::from_str::<&RawValue>(raw).map_err(|error| {
-        LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            format!("lix_json argument is not valid JSON: {error}"),
-        )
-    })?;
     if CanonicalJsonText::recognizes(raw) {
         normalized.extend_from_slice(raw.as_bytes());
         return Ok(());
@@ -1444,13 +1435,18 @@ fn append_canonical_json_parameter(normalized: &mut Vec<u8>, raw: &str) -> Resul
 struct CanonicalJsonText<'a> {
     bytes: &'a [u8],
     position: usize,
+    remaining_depth: u8,
 }
 
 impl<'a> CanonicalJsonText<'a> {
+    // serde_json's default recursion limit rejects the 128th nested container.
+    const MAX_DEPTH: u8 = 127;
+
     fn recognizes(raw: &'a str) -> bool {
         let mut parser = Self {
             bytes: raw.as_bytes(),
             position: 0,
+            remaining_depth: Self::MAX_DEPTH,
         };
         parser.value() && parser.position == parser.bytes.len()
     }
@@ -1459,6 +1455,7 @@ impl<'a> CanonicalJsonText<'a> {
         let mut parser = Self {
             bytes: raw.as_bytes(),
             position: 0,
+            remaining_depth: Self::MAX_DEPTH,
         };
         parser.write_value(output) && parser.position == parser.bytes.len()
     }
@@ -1469,8 +1466,8 @@ impl<'a> CanonicalJsonText<'a> {
             Some(b't') => self.literal(b"true"),
             Some(b'f') => self.literal(b"false"),
             Some(b'"') => self.string(false).is_some(),
-            Some(b'[') => self.array(),
-            Some(b'{') => self.object(),
+            Some(b'[') => self.with_container_depth(Self::array),
+            Some(b'{') => self.with_container_depth(Self::object),
             Some(b'-' | b'0'..=b'9') => self.integer(),
             _ => false,
         }
@@ -1540,6 +1537,10 @@ impl<'a> CanonicalJsonText<'a> {
     }
 
     fn write_array(&mut self, output: &mut Vec<u8>) -> bool {
+        self.with_container_depth(|parser| parser.write_array_inner(output))
+    }
+
+    fn write_array_inner(&mut self, output: &mut Vec<u8>) -> bool {
         self.position += 1;
         output.push(b'[');
         if self.take(b']') {
@@ -1566,6 +1567,10 @@ impl<'a> CanonicalJsonText<'a> {
     }
 
     fn write_object(&mut self, output: &mut Vec<u8>) -> bool {
+        self.with_container_depth(|parser| parser.write_object_inner(output))
+    }
+
+    fn write_object_inner(&mut self, output: &mut Vec<u8>) -> bool {
         self.position += 1;
         if self.take(b'}') {
             output.extend_from_slice(b"{}");
@@ -1607,6 +1612,7 @@ impl<'a> CanonicalJsonText<'a> {
             let mut value_parser = Self {
                 bytes: value,
                 position: 0,
+                remaining_depth: self.remaining_depth,
             };
             if !value_parser.write_value(output) || value_parser.position != value.len() {
                 return false;
@@ -1630,6 +1636,10 @@ impl<'a> CanonicalJsonText<'a> {
     }
 
     fn skip_array(&mut self) -> bool {
+        self.with_container_depth(Self::skip_array_inner)
+    }
+
+    fn skip_array_inner(&mut self) -> bool {
         self.position += 1;
         if self.take(b']') {
             return true;
@@ -1648,6 +1658,10 @@ impl<'a> CanonicalJsonText<'a> {
     }
 
     fn skip_object(&mut self) -> bool {
+        self.with_container_depth(Self::skip_object_inner)
+    }
+
+    fn skip_object_inner(&mut self) -> bool {
         self.position += 1;
         if self.take(b'}') {
             return true;
@@ -1663,6 +1677,16 @@ impl<'a> CanonicalJsonText<'a> {
                 return false;
             }
         }
+    }
+
+    fn with_container_depth(&mut self, parse: impl FnOnce(&mut Self) -> bool) -> bool {
+        let Some(remaining_depth) = self.remaining_depth.checked_sub(1) else {
+            return false;
+        };
+        self.remaining_depth = remaining_depth;
+        let result = parse(self);
+        self.remaining_depth = self.remaining_depth.saturating_add(1);
+        result
     }
 
     fn string(&mut self, reject_escapes: bool) -> Option<&'a [u8]> {
@@ -1691,6 +1715,7 @@ impl<'a> CanonicalJsonText<'a> {
                         _ => return None,
                     }
                 }
+                0x00..=0x1f => return None,
                 _ => self.position += 1,
             }
         }
@@ -2800,6 +2825,36 @@ impl PreparedPathValueReplacementProgram {
         };
         Ok(primary_key)
     }
+
+    pub(crate) fn primary_key_text<'a>(
+        &self,
+        params: &'a [impl AsRef<str>],
+    ) -> Result<&'a str, LixError> {
+        params
+            .get(self.primary_key_param_index)
+            .map(AsRef::as_ref)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "prepared path replacement primary key text is missing",
+                )
+            })
+    }
+
+    pub(crate) fn replacement_value_text<'a>(
+        &self,
+        params: &'a [impl AsRef<str>],
+    ) -> Result<&'a str, LixError> {
+        params
+            .get(self.value_param_index)
+            .map(AsRef::as_ref)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "prepared path replacement value text is missing",
+                )
+            })
+    }
 }
 
 pub(crate) fn prepare_path_value_replacement_program_from_logical(
@@ -2973,6 +3028,14 @@ pub(crate) fn append_path_value_replacement_snapshot(
             ));
         }
     };
+    append_path_value_replacement_snapshot_text(primary_key, replacement_value, normalized)
+}
+
+pub(crate) fn append_path_value_replacement_snapshot_text(
+    primary_key: &str,
+    replacement_value: Option<&str>,
+    normalized: &mut Vec<u8>,
+) -> Result<(usize, usize), LixError> {
     let start = normalized.len();
     normalized.extend_from_slice(b"{\"path\":");
     if let Err(error) = append_canonical_json_string(normalized, primary_key) {
@@ -6882,7 +6945,7 @@ mod primary_key_route_tests {
     }
 
     #[test]
-    fn recognizes_only_json_text_unchanged_by_serde_value_roundtrip() {
+    fn streaming_json_canonicalizer_matches_serde_for_supported_text() {
         let canonical = [
             "null",
             "true",
@@ -6896,12 +6959,10 @@ mod primary_key_route_tests {
             r#"{"a":1,"b":{"c":"value"},"z":null}"#,
         ];
         for raw in canonical {
-            assert!(
-                CanonicalJsonText::recognizes(raw),
-                "expected {raw} to route"
-            );
+            let mut actual = Vec::new();
+            assert!(CanonicalJsonText::append_normalized(raw, &mut actual));
             let parsed: JsonValue = serde_json::from_str(raw).unwrap();
-            assert_eq!(serde_json::to_string(&parsed).unwrap(), raw);
+            assert_eq!(actual, serde_json::to_vec(&parsed).unwrap());
         }
 
         for raw in [
@@ -6911,21 +6972,54 @@ mod primary_key_route_tests {
             "1.0",
             "1e2",
             "18446744073709551616",
+            "\"literal\ncontrol\"",
             r#""unicode \u0061""#,
             r#""escaped\/slash""#,
-            r#"{"b":1,"a":2}"#,
             r#"{"a":1,"a":2}"#,
             r#"{"escaped\u0061":1}"#,
         ] {
-            assert!(
-                !CanonicalJsonText::recognizes(raw),
-                "expected {raw} to retain DOM canonicalization"
-            );
+            let mut actual = Vec::new();
+            assert!(!CanonicalJsonText::append_normalized(raw, &mut actual));
         }
     }
 
     #[test]
-    fn canonical_json_parameter_fallback_preserves_existing_normalization() {
+    fn streaming_json_recursion_limit_matches_serde_and_wide_canonical_objects_stay_direct() {
+        for depth in [127, 128, 129] {
+            let raw = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+            assert_eq!(
+                CanonicalJsonText::recognizes(&raw),
+                serde_json::from_str::<JsonValue>(&raw).is_ok(),
+                "recognizer depth mismatch at {depth}"
+            );
+        }
+
+        let wide = format!(
+            "{{{}}}",
+            (0..16)
+                .map(|index| format!("\"k{index:02}\":{index}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(CanonicalJsonText::recognizes(&wide));
+        let mut actual = Vec::new();
+        append_canonical_json_parameter(&mut actual, &wide).unwrap();
+        assert_eq!(actual, wide.as_bytes());
+
+        let too_deep = format!(
+            "{}0{}",
+            "[".repeat(usize::from(CanonicalJsonText::MAX_DEPTH) + 1),
+            "]".repeat(usize::from(CanonicalJsonText::MAX_DEPTH) + 1)
+        );
+        assert!(!CanonicalJsonText::append_normalized(
+            &too_deep,
+            &mut Vec::new()
+        ));
+        assert!(append_canonical_json_parameter(&mut Vec::new(), &too_deep).is_err());
+    }
+
+    #[test]
+    fn canonical_json_parameter_preserves_existing_normalization() {
         for raw in [
             " { \"b\" : 1, \"a\" : 2 } ",
             r#"{"value":1.0,"escaped":"\u0061"}"#,

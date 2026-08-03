@@ -6485,48 +6485,107 @@ where
             .is_some_and(|(cached_sql, _)| cached_sql.as_ref() == sql)
     }
 
-    pub(crate) fn prepared_literal_mutation_parameter_count(&self, sql: &str) -> Option<usize> {
+    pub(crate) fn prepared_literal_mutation_shape(&self) -> Option<(&str, usize)> {
         let (shape, program) = self.prepared_mutation_program.as_ref()?;
-        self.sql_planning_cache
-            .update_literal_shape_matches(sql, shape)
-            .then(|| program.parameter_count())
+        Some((shape, program.parameter_count()))
     }
 
-    pub(crate) async fn flush_cached_prepared_mutation_barrier(
+    /// Appends one shape-certified literal UPDATE without constructing public
+    /// `Value` DTOs. The explicit transaction has already admitted this plan;
+    /// borrowed literal slices flow directly into identity and snapshot
+    /// columns. Non-packed or dependent state returns to the generic path.
+    pub(crate) async fn try_execute_cached_literal_prepared_mutation(
         &mut self,
         next_origin_key: Option<&str>,
-        params: &[Value],
-    ) -> Result<(), LixError> {
-        let cached_sql = self
-            .prepared_mutation_program
-            .as_ref()
-            .map(|(sql, _)| Arc::clone(sql))
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "cached mutation barrier has no prepared mutation program",
-                )
-            })?;
-        self.flush_prepared_mutation_barrier(&cached_sql, next_origin_key, params)
-            .await
-    }
-
-    pub(crate) async fn try_execute_cached_prepared_mutation(
-        &mut self,
-        params: &[Value],
+        params: &[impl AsRef<str>],
     ) -> Result<Option<crate::sql2::SqlWriteResult>, LixError> {
-        let cached_sql = self
-            .prepared_mutation_program
+        if let Some(error) = &self.mutation_journal_terminal_error {
+            return Err(error.clone());
+        }
+        let Some((_, program)) = self.prepared_mutation_program.as_ref() else {
+            return Ok(None);
+        };
+        let program = Arc::clone(program);
+        let primary_key = program.primary_key_text(params)?;
+        let replacement_value = program.replacement_value_text(params)?;
+        let entity_pk = EntityPk::single(primary_key.to_owned());
+
+        let same_origin = self
+            .mutation_journal
             .as_ref()
-            .map(|(sql, _)| Arc::clone(sql))
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "cached mutation execution has no prepared mutation program",
-                )
-            })?;
-        self.try_execute_prepared_mutation(&cached_sql, params)
-            .await
+            .is_none_or(|journal| journal.origin_key.as_deref() == next_origin_key);
+        let ordered_append = same_origin
+            && self
+                .mutation_journal
+                .as_ref()
+                .and_then(TransactionMutationJournal::last_entity_pk)
+                .is_none_or(|last| last < &entity_pk);
+        let chunk_has_capacity = self
+            .mutation_journal
+            .as_ref()
+            .is_none_or(|journal| journal.entity_pks.len() < 4_096);
+        if !same_origin || !ordered_append || !chunk_has_capacity {
+            self.flush_mutation_journal().await?;
+        }
+        if !same_origin || !ordered_append {
+            self.lower_provisional_mutations_to_prepared().await?;
+            self.prepared_mutation_overlay_empty = false;
+        }
+
+        if !matches!(
+            self.prepared_mutation_membership,
+            PreparedMutationMembership::Packed(_)
+        ) {
+            return Ok(None);
+        }
+        if !self.prepared_mutation_overlay_empty {
+            if self.staged_writes.staged_identity_may_affect(
+                &self.active_branch_id,
+                &program.schema_key,
+                None,
+                &entity_pk,
+            )? {
+                return Ok(None);
+            }
+            self.prepared_mutation_overlay_empty = !self.staged_writes.has_staged_state_rows()?;
+        }
+        let PreparedMutationMembership::Packed(membership) = &mut self.prepared_mutation_membership
+        else {
+            unreachable!("packed literal mutation membership was checked above")
+        };
+        match membership.contains(&entity_pk)? {
+            Some(false) => return Ok(Some(crate::sql2::SqlWriteResult::affected(0))),
+            Some(true) => {}
+            None => return Ok(None),
+        }
+
+        let origin_key = next_origin_key.map(SharedStr::from);
+        let functions = self.functions.clone();
+        let (journal_slot, timestamp_slot) = (
+            &mut self.mutation_journal,
+            &mut self.prepared_mutation_timestamp,
+        );
+        let journal = journal_slot.get_or_insert_with(|| TransactionMutationJournal {
+            program: Arc::clone(&program),
+            origin_key: origin_key.clone(),
+            entity_pks: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
+            snapshot_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
+            snapshot_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
+            timestamp: None,
+        });
+        debug_assert!(Arc::ptr_eq(&journal.program, &program));
+        debug_assert_eq!(journal.origin_key, origin_key);
+        let snapshot_offset = crate::sql2::append_path_value_replacement_snapshot_text(
+            primary_key,
+            Some(replacement_value),
+            &mut journal.snapshot_arena,
+        )?;
+        let timestamp = *timestamp_slot.get_or_insert_with(|| functions.call_timestamp());
+        journal.entity_pks.push(entity_pk);
+        journal.snapshot_offsets.push(snapshot_offset);
+        let journal_timestamp = journal.timestamp.get_or_insert(timestamp);
+        debug_assert_eq!(*journal_timestamp, timestamp);
+        Ok(Some(crate::sql2::SqlWriteResult::affected(1)))
     }
 
     pub(crate) fn remember_prepared_mutation(
