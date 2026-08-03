@@ -47,6 +47,9 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE: &str =
 pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE: &str = "tracked_state.change_locator.v2";
 pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE: &str =
     "tracked_state.commit_state_manifest.v1";
+pub(crate) const TRACKED_STATE_COMMIT_STATE_SEAL_NAMESPACE: &str =
+    "tracked_state.commit_state_semantic_authority.v1";
+const MIN_CURRENT_STATE_CATALOG_POINT_READS: u16 = 4;
 pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0001),
     TRACKED_STATE_TREE_CHUNK_NAMESPACE,
@@ -72,6 +75,10 @@ pub(crate) const TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE: StorageSpace = Stora
     StorageSpaceId(0x0004_002b),
     TRACKED_STATE_COMMIT_STATE_MANIFEST_NAMESPACE,
 );
+pub(crate) const TRACKED_STATE_COMMIT_STATE_SEAL_SPACE: StorageSpace = StorageSpace::immutable(
+    StorageSpaceId(0x0004_002e),
+    TRACKED_STATE_COMMIT_STATE_SEAL_NAMESPACE,
+);
 
 const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
 const GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
@@ -81,7 +88,8 @@ const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
 // replacements authoritative through their immutable part manifest. The
 // payload-less certified-reference encoding is intentionally rejected.
 const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD14";
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS2";
+const COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC: &[u8] = b"LXSA1";
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS3";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
 #[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
@@ -615,6 +623,60 @@ fn commit_delta_manifest_from_commit_state(manifest: &CommitStateManifest) -> Co
     commit_delta_manifest_from_inventory(&manifest.mutations)
 }
 
+/// Returns the exact collection scopes touched by a sealed mutation inventory.
+/// `None` means bounds or implicit cascades may affect another scope, in which
+/// case an inherited serving catalog must be discarded fail-closed.
+pub(crate) fn commit_state_inventory_exact_touched_scopes(
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+) -> Result<Option<Vec<CommitDeltaReplacementScope>>, LixError> {
+    if inventory.selected_source_commit_id.is_some() {
+        return Ok(None);
+    }
+    if inventory.member_count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    if !inventory.replacement_part_digests.is_empty() {
+        return Ok(inventory.single_partition.clone().map(|scope| vec![scope]));
+    }
+
+    let mut scopes = BTreeSet::new();
+    for part in &inventory.parts {
+        let first = decode_key(&part.first_key)?;
+        let last = decode_key(&part.last_key)?;
+        if first.schema_key != last.schema_key || first.file_id != last.file_id {
+            return Ok(None);
+        }
+        if first.schema_key == "lix_file_descriptor" {
+            return Ok(None);
+        }
+        scopes.insert(CommitDeltaReplacementScope {
+            schema_key: first.schema_key,
+            file_id: first.file_id,
+        });
+    }
+    if !inventory.inline_part.is_empty() {
+        let leaf = decode_commit_delta_segment(&inventory.inline_part, None, commit_id)?;
+        let mut has_cascade = false;
+        visit_commit_delta_leaf(&leaf, commit_id, |_, encoded_key, _| {
+            let key = decode_key(encoded_key)?;
+            if key.schema_key == "lix_file_descriptor" {
+                has_cascade = true;
+            } else {
+                scopes.insert(CommitDeltaReplacementScope {
+                    schema_key: key.schema_key,
+                    file_id: key.file_id,
+                });
+            }
+            Ok(())
+        })?;
+        if has_cascade {
+            return Ok(None);
+        }
+    }
+    Ok(Some(scopes.into_iter().collect()))
+}
+
 async fn expanded_commit_delta_manifest_from_commit_state(
     store: &(impl StorageAdapterRead + ?Sized),
     manifest: &CommitStateManifest,
@@ -623,7 +685,8 @@ async fn expanded_commit_delta_manifest_from_commit_state(
     if manifest.mutations.replacement_part_digests.is_empty() {
         return Ok(expanded);
     }
-    let descriptors = match manifest.current_state_part_sets.first() {
+    let fresh_set = fresh_replacement_current_state_part_set(manifest)?;
+    let descriptors = match fresh_set.as_ref() {
         Some(set) => match super::current_state_part::load_current_state_part_descriptors(
             store,
             &set.directory,
@@ -668,6 +731,316 @@ async fn expanded_commit_delta_manifest_from_commit_state(
         None => recover_replacement_segment_bounds(store, manifest).await?,
     };
     Ok(expanded)
+}
+
+fn fresh_replacement_current_state_part_set(
+    manifest: &CommitStateManifest,
+) -> Result<Option<crate::tracked_state::types::CurrentStatePartSet>, LixError> {
+    let (Some(_root), Some(generation), Some(authority), Some(anchor)) = (
+        manifest.current_state_catalog.as_ref(),
+        manifest.mutations.replacement_generation.as_ref(),
+        manifest.mutations.replacement_parts.as_ref(),
+        manifest.current_state_coverage_anchor.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    let set = crate::tracked_state::types::CurrentStatePartSet {
+        scope: anchor.scope.clone(),
+        coverage_anchor_commit_id: *manifest.commit_id.as_uuid().as_bytes(),
+        generation_integrity_digest: anchor.generation_integrity_digest,
+        state_lineage_digest: anchor.state_lineage_digest,
+        directory: anchor.directory.clone(),
+    };
+    if set.coverage_anchor_commit_id != *manifest.commit_id.as_uuid().as_bytes()
+        || set.generation_integrity_digest != generation.integrity_digest
+        || set.scope != anchor.scope
+        || set.generation_integrity_digest != anchor.generation_integrity_digest
+        || set.state_lineage_digest != anchor.state_lineage_digest
+        || set.directory != anchor.directory
+        || set.directory.descriptor_digest != authority.directory_digest
+        || set.directory.row_count != u64::from(manifest.mutations.member_count)
+        || set.directory.part_count as usize != manifest.mutations.part_count()
+        || set.directory.root_id == [0; 32]
+        || set.directory.tree_height == 0
+    {
+        return Err(replacement_payload_error(
+            "current-state catalog entry disagrees with its replacement authority",
+        ));
+    }
+    Ok(Some(set))
+}
+
+/// Resolves a point batch from authoritative complete collection entries in
+/// the persistent catalog. `None` means at least one scope is uncovered and
+/// canonical first-parent replay remains responsible for the whole batch.
+async fn load_complete_current_state_values_encoded_inner(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &CommitStateManifest,
+    encoded_keys: &[Bytes],
+    validate_publication: bool,
+) -> Result<Option<Vec<Option<TrackedStateIndexValue>>>, LixError> {
+    if encoded_keys.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(root) = state.current_state_catalog.as_ref() else {
+        return Ok(None);
+    };
+    if state.replay_debt.depth < MIN_CURRENT_STATE_CATALOG_POINT_READS {
+        // Even the smallest covered lookup reads a catalog node, its coverage
+        // authority, a directory node, and one immutable part. Canonical
+        // replay is cheaper while its bounded manifest interval is shorter.
+        return Ok(None);
+    }
+    let mut scope_keys = BTreeMap::<CommitDeltaReplacementScope, Vec<usize>>::new();
+    for (index, encoded_key) in encoded_keys.iter().enumerate() {
+        let key = decode_key_shared(encoded_key.clone())?;
+        scope_keys
+            .entry(CommitDeltaReplacementScope {
+                schema_key: key.schema_key.to_string(),
+                file_id: key.file_id.map(|file_id| file_id.to_string()),
+            })
+            .or_default()
+            .push(index);
+    }
+    let Some(touched_scopes) =
+        commit_state_inventory_exact_touched_scopes(state.commit_id, &state.mutations)?
+    else {
+        return Ok(None);
+    };
+    if scope_keys
+        .keys()
+        .any(|scope| touched_scopes.binary_search(scope).is_ok())
+    {
+        return Ok(None);
+    }
+    if state
+        .current_state_coverage_anchor
+        .as_ref()
+        .is_some_and(|anchor| scope_keys.keys().all(|scope| scope == &anchor.scope))
+    {
+        // The current manifest's complete-replacement authority already has a
+        // direct bounded-part route for this scope. Prefer it over resolving
+        // the same directory through the inherited-serving catalog.
+        return Ok(None);
+    }
+
+    let scoped_keys = scope_keys.into_iter().collect::<Vec<_>>();
+    let scopes = scoped_keys
+        .iter()
+        .map(|(scope, _)| scope.clone())
+        .collect::<Vec<_>>();
+    let loaded_sets = super::current_state_part::load_current_state_catalog_entries_for_scopes(
+        store, root, &scopes,
+    )
+    .await?;
+    if validate_publication {
+        validate_current_state_catalog_requested_scopes(store, state, &scopes, &loaded_sets)
+            .await?;
+    }
+    let Some(sets) = loaded_sets
+        .into_iter()
+        .zip(scoped_keys)
+        .map(|(set, (_, key_indices))| set.map(|set| (set, key_indices)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+
+    if validate_publication {
+        let authority_ids = sets
+            .iter()
+            .map(|(set, _)| CommitId::new(uuid::Uuid::from_bytes(set.coverage_anchor_commit_id)))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let authorities = load_commit_state_manifests(store, &authority_ids).await?;
+        let authority_by_id = authority_ids
+            .into_iter()
+            .zip(authorities)
+            .map(|(authority_id, authority)| {
+                authority
+                    .map(|authority| (authority_id, authority))
+                    .ok_or_else(|| {
+                        replacement_payload_error(
+                            "current-state catalog coverage authority is missing",
+                        )
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        for (set, _) in &sets {
+            let authority_id = CommitId::new(uuid::Uuid::from_bytes(set.coverage_anchor_commit_id));
+            validate_current_state_catalog_entry_against_authority(
+                set,
+                authority_by_id
+                    .get(&authority_id)
+                    .expect("unique catalog authority was batch loaded"),
+            )?;
+        }
+    }
+
+    let mut routed = BTreeMap::<([u8; 16], u32), (CurrentStatePartDescriptor, Vec<usize>)>::new();
+    let mut values = vec![None; encoded_keys.len()];
+    let directory_keys = sets
+        .iter()
+        .map(|(_, key_indices)| {
+            key_indices
+                .iter()
+                .map(|&index| encoded_keys[index].clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let directory_requests = sets
+        .iter()
+        .zip(&directory_keys)
+        .map(|((set, _), keys)| (&set.directory, keys.as_slice()))
+        .collect::<Vec<_>>();
+    let directory_routes =
+        super::current_state_part::route_current_state_part_sets(store, &directory_requests)
+            .await?;
+    for ((_, key_indices), routes) in sets.into_iter().zip(directory_routes) {
+        for (output_index, descriptor) in key_indices.into_iter().zip(routes) {
+            let Some(descriptor) = descriptor else {
+                continue;
+            };
+            routed
+                .entry((descriptor.owner_commit_id, descriptor.part_index))
+                .or_insert_with(|| (descriptor, Vec::new()))
+                .1
+                .push(output_index);
+        }
+    }
+
+    let storage_keys = routed
+        .values()
+        .map(|(descriptor, _)| {
+            let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+            let mut key = commit_delta_segment_key(owner, descriptor.part_index as usize)?;
+            key.extend_from_slice(&descriptor.content_digest);
+            Ok(StorageKey(Bytes::from(key)))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let loaded = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    for ((_, (descriptor, output_indices)), value) in routed.into_iter().zip(loaded.value) {
+        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+            replacement_payload_error("current-state directory references a missing part")
+        })?;
+        let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+        let bounds = CommitDeltaSegmentBounds {
+            first_key: descriptor.first_key,
+            last_key: descriptor.last_key,
+            replacement_part: Some(StoredReplacementPart {
+                content_digest: descriptor.content_digest,
+                owner_commit_id: descriptor.owner_commit_id,
+                first_address: descriptor.part_index.saturating_mul(
+                    u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                        .expect("replacement row bound fits u32"),
+                ),
+                uniform_created_at: descriptor.uniform_created_at,
+                uniform_updated_at: descriptor.uniform_updated_at,
+            }),
+        };
+        let leaf = decode_commit_delta_segment(&bytes, Some(&bounds), owner)?;
+        for output_index in output_indices {
+            values[output_index] =
+                find_commit_delta_value(&leaf, &encoded_keys[output_index], owner)?;
+        }
+    }
+    Ok(Some(values))
+}
+
+#[cfg(test)]
+pub(crate) async fn load_complete_current_state_values_encoded(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &CommitStateManifest,
+    encoded_keys: &[Bytes],
+) -> Result<Option<Vec<Option<TrackedStateIndexValue>>>, LixError> {
+    load_complete_current_state_values_encoded_inner(store, state, encoded_keys, true).await
+}
+
+/// Uses a manifest returned by [`load_commit_state_manifest`] or
+/// [`load_commit_state_manifests`]. The opaque handle proves that the mutable
+/// manifest matched its immutable semantic authority in the caller's coherent
+/// read.
+#[cfg(feature = "storage-benches")]
+pub(crate) async fn load_complete_current_state_values_from_published_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &PublishedCommitStateManifest,
+    encoded_keys: &[Bytes],
+) -> Result<Option<Vec<Option<TrackedStateIndexValue>>>, LixError> {
+    load_complete_current_state_values_encoded_inner(store, &state.manifest, encoded_keys, false)
+        .await
+}
+
+/// Tries the serving catalog from a one-read replay manifest. The inner cost
+/// gates run before publication validation, so shallow OLTP replay retains its
+/// original one-manifest read while any catalog hit is authenticated first.
+pub(crate) async fn load_complete_current_state_values_from_replay_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &CommitStateManifest,
+    encoded_keys: &[Bytes],
+) -> Result<Option<Vec<Option<TrackedStateIndexValue>>>, LixError> {
+    load_complete_current_state_values_encoded_inner(store, state, encoded_keys, true).await
+}
+
+pub(crate) async fn validate_current_state_catalog_requested_scopes(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &CommitStateManifest,
+    _scopes: &[CommitDeltaReplacementScope],
+    _current_entries: &[Option<crate::tracked_state::types::CurrentStatePartSet>],
+) -> Result<(), LixError> {
+    if load_commit_state_manifest(store, state.commit_id)
+        .await?
+        .as_ref()
+        != Some(state)
+    {
+        return Err(replacement_payload_error(
+            "current-state catalog was not loaded from its immutable commit authority",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_current_state_catalog_parent_manifest(
+    state: &CommitStateManifest,
+    parent: Option<&CommitStateManifest>,
+) -> Result<(), LixError> {
+    let Some(root) = state.current_state_catalog.as_ref() else {
+        return Ok(());
+    };
+    let expected_parent_root = parent
+        .and_then(|parent| parent.current_state_catalog.as_ref())
+        .map(|parent| parent.root_id);
+    if root.parent_root_id != expected_parent_root {
+        return Err(replacement_payload_error(
+            "current-state catalog transition disagrees with its graph parent",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_current_state_catalog_entry_against_authority(
+    set: &crate::tracked_state::types::CurrentStatePartSet,
+    origin: &CommitStateManifest,
+) -> Result<(), LixError> {
+    let anchor = origin
+        .current_state_coverage_anchor
+        .as_ref()
+        .ok_or_else(|| {
+            replacement_payload_error("catalog coverage authority omitted its anchor")
+        })?;
+    if set.coverage_anchor_commit_id != *origin.commit_id.as_uuid().as_bytes()
+        || set.scope != anchor.scope
+        || set.generation_integrity_digest != anchor.generation_integrity_digest
+        || set.state_lineage_digest != anchor.state_lineage_digest
+        || set.directory != anchor.directory
+    {
+        return Err(replacement_payload_error(
+            "current-state catalog entry disagrees with its coverage anchor",
+        ));
+    }
+    Ok(())
 }
 
 async fn recover_replacement_segment_bounds(
@@ -1471,6 +1844,138 @@ fn commit_state_manifest_key(commit_id: CommitId) -> Vec<u8> {
     commit_id.as_uuid().as_bytes().to_vec()
 }
 
+fn commit_state_semantic_seal(manifest: &CommitStateManifest) -> Result<Vec<u8>, LixError> {
+    // Retain the root published with the commit so one-read point replay can
+    // stop at its original baseline. A later rebuilt root may change only the
+    // mutable manifest; semantic comparison intentionally ignores that field.
+    let payload = storage_codec::encode("commit-state semantic authority", manifest)?;
+    let digest = blake3::Hasher::new_derive_key("lix.commit-state.semantic-authority.v1")
+        .update(&payload)
+        .finalize();
+    let mut encoded = Vec::with_capacity(
+        COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC.len() + TRACKED_STATE_HASH_BYTES + payload.len(),
+    );
+    encoded.extend_from_slice(COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC);
+    encoded.extend_from_slice(digest.as_bytes());
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
+
+fn decode_commit_state_semantic_authority(bytes: &[u8]) -> Result<CommitStateManifest, LixError> {
+    let payload = bytes
+        .strip_prefix(COMMIT_STATE_SEMANTIC_AUTHORITY_MAGIC)
+        .ok_or_else(|| {
+            replacement_payload_error("commit-state semantic authority has an unsupported format")
+        })?;
+    let (expected_digest, payload) = payload
+        .split_at_checked(TRACKED_STATE_HASH_BYTES)
+        .ok_or_else(|| replacement_payload_error("commit-state semantic authority is truncated"))?;
+    let actual_digest = blake3::Hasher::new_derive_key("lix.commit-state.semantic-authority.v1")
+        .update(payload)
+        .finalize();
+    if expected_digest != actual_digest.as_bytes() {
+        return Err(replacement_payload_error(
+            "commit-state semantic authority digest is invalid",
+        ));
+    }
+    storage_codec::decode("commit-state semantic authority", payload)
+}
+
+fn validate_commit_state_semantic_seal(
+    manifest: &CommitStateManifest,
+    seal: &[u8],
+) -> Result<(), LixError> {
+    let authority = decode_commit_state_semantic_authority(seal)?;
+    validate_commit_state_semantic_projection(manifest, &authority)
+}
+
+fn validate_commit_state_semantic_projection(
+    manifest: &CommitStateManifest,
+    authority: &CommitStateManifest,
+) -> Result<(), LixError> {
+    let mut manifest_semantics = manifest.clone();
+    manifest_semantics.snapshot_root = None;
+    let mut authority_semantics = authority.clone();
+    authority_semantics.snapshot_root = None;
+    if authority_semantics != manifest_semantics {
+        return Err(replacement_payload_error(
+            "commit-state manifest disagrees with its immutable semantic authority",
+        ));
+    }
+    Ok(())
+}
+
+/// Commit authority loaded from the mutable manifest plane after its
+/// immutable semantic authority was verified. Only this opaque handle may bypass
+/// publication-time catalog re-derivation.
+#[derive(Clone, Debug)]
+pub(crate) struct PublishedCommitStateManifest {
+    manifest: CommitStateManifest,
+}
+
+/// Same-write-set authority produced only after semantic publication. This lets a
+/// later commit in one atomic transaction consume its parent catalog without
+/// treating a freely constructible manifest as provenance.
+pub(crate) struct StagedCommitStateManifest {
+    manifest: CommitStateManifest,
+    write_set_id: u64,
+}
+
+impl Deref for PublishedCommitStateManifest {
+    type Target = CommitStateManifest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.manifest
+    }
+}
+
+impl Deref for StagedCommitStateManifest {
+    type Target = CommitStateManifest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.manifest
+    }
+}
+
+pub(crate) async fn stage_current_state_catalog_from_published_parent(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    parent: Option<&PublishedCommitStateManifest>,
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+) -> Result<super::current_state_part::CertifiedCurrentStateCatalogPublication, LixError> {
+    super::current_state_part::stage_current_state_catalog(
+        store,
+        writes,
+        parent.map(|parent| &parent.manifest),
+        commit_id,
+        inventory,
+    )
+    .await
+}
+
+pub(crate) async fn stage_current_state_catalog_from_staged_parent(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    parent: &StagedCommitStateManifest,
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+) -> Result<super::current_state_part::CertifiedCurrentStateCatalogPublication, LixError> {
+    if parent.write_set_id != writes.identity() {
+        return Err(replacement_payload_error(
+            "staged catalog parent belongs to a different storage write set",
+        ));
+    }
+    super::current_state_part::stage_current_state_catalog(
+        store,
+        writes,
+        Some(&parent.manifest),
+        commit_id,
+        inventory,
+    )
+    .await
+}
+
 fn commit_delta_segment_key(
     commit_id: CommitId,
     segment_index: usize,
@@ -1503,15 +2008,35 @@ pub(crate) async fn load_commit_state_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<CommitStateManifest>, LixError> {
-    let Some(bytes) = get_one(
-        store,
-        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
-        commit_state_manifest_key(commit_id),
-    )
-    .await?
-    else {
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_crud_sealed_manifest_load();
+    let key = StorageKey(Bytes::from(commit_state_manifest_key(commit_id)));
+    let requests = [
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            keys: std::slice::from_ref(&key),
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
+            keys: std::slice::from_ref(&key),
+            opts: StorageGetOptions::default(),
+        },
+    ];
+    let mut values = exact_get_many(store, &requests).await?.values.into_iter();
+    let manifest_bytes = values.next().flatten().and_then(full_value_bytes);
+    let seal = values.next().flatten().and_then(full_value_bytes);
+    let Some(bytes) = manifest_bytes else {
+        if seal.is_some() {
+            return Err(replacement_payload_error(
+                "commit-state semantic authority has no mutable manifest",
+            ));
+        }
         return Ok(None);
     };
+    let seal = seal.ok_or_else(|| {
+        replacement_payload_error("commit-state manifest omitted its immutable semantic authority")
+    })?;
     let manifest = decode_commit_state_manifest(&bytes)?;
     if manifest.commit_id != commit_id {
         return Err(LixError::new(
@@ -1522,7 +2047,53 @@ pub(crate) async fn load_commit_state_manifest(
             ),
         ));
     }
+    validate_commit_state_semantic_seal(&manifest, &seal)?;
     Ok(Some(manifest))
+}
+
+pub(crate) async fn load_published_commit_state_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<PublishedCommitStateManifest>, LixError> {
+    Ok(load_commit_state_manifest(store, commit_id)
+        .await?
+        .map(|manifest| PublishedCommitStateManifest { manifest }))
+}
+
+/// Loads the replay projection after verifying immutable semantic authority.
+pub(crate) async fn load_replay_commit_state_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<CommitStateManifest>, LixError> {
+    load_point_replay_commit_state(store, commit_id).await
+}
+
+pub(crate) async fn load_point_replay_commit_state(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<CommitStateManifest>, LixError> {
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_crud_replay_manifest_load();
+    let Some(authority) = get_one(
+        store,
+        TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
+        commit_state_manifest_key(commit_id),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let state = decode_commit_state_semantic_authority(&authority)?;
+    if state.commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state semantic authority key for commit '{commit_id}' contains authority for commit '{}'",
+                state.commit_id
+            ),
+        ));
+    }
+    Ok(Some(state))
 }
 
 /// Bulk-loads commit authorities in request order.
@@ -1534,17 +2105,41 @@ pub(crate) async fn load_commit_state_manifests(
         .iter()
         .map(|commit_id| StorageKey(Bytes::from(commit_state_manifest_key(*commit_id))))
         .collect::<Vec<_>>();
-    let values = PointReadPlan::new(TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE, &keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?;
+    let requests = [
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+            keys: &keys,
+            opts: StorageGetOptions::default(),
+        },
+        StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
+            keys: &keys,
+            opts: StorageGetOptions::default(),
+        },
+    ];
+    let mut values = exact_get_many(store, &requests).await?.values.into_iter();
+    let manifests = values.by_ref().take(keys.len()).collect::<Vec<_>>();
+    let seals = values.collect::<Vec<_>>();
     commit_ids
         .iter()
         .copied()
-        .zip(values.value)
-        .map(|(commit_id, value)| {
-            let Some(bytes) = value.and_then(full_value_bytes) else {
+        .zip(manifests.into_iter().zip(seals))
+        .map(|(commit_id, (manifest_value, seal_value))| {
+            let manifest_bytes = manifest_value.and_then(full_value_bytes);
+            let seal = seal_value.and_then(full_value_bytes);
+            let Some(bytes) = manifest_bytes else {
+                if seal.is_some() {
+                    return Err(replacement_payload_error(
+                        "commit-state semantic authority has no mutable manifest",
+                    ));
+                }
                 return Ok(None);
             };
+            let seal = seal.ok_or_else(|| {
+                replacement_payload_error(
+                    "commit-state manifest omitted its immutable semantic authority",
+                )
+            })?;
             let manifest = decode_commit_state_manifest(&bytes)?;
             if manifest.commit_id != commit_id {
                 return Err(LixError::new(
@@ -1555,6 +2150,7 @@ pub(crate) async fn load_commit_state_manifests(
                     ),
                 ));
             }
+            validate_commit_state_semantic_seal(&manifest, &seal)?;
             Ok(Some(manifest))
         })
         .collect()
@@ -1611,13 +2207,112 @@ async fn load_commit_delta_manifests(
 /// optional snapshot metadata are final. Publishing a partially populated
 /// manifest and patching it later would make an intermediate representation
 /// authoritative to read-your-writes consumers.
-pub(crate) fn stage_commit_state_manifest(
+fn stage_commit_state_manifest_bytes(
     writes: &mut StorageWriteSet,
     manifest: &CommitStateManifest,
 ) -> Result<(), LixError> {
     let encoded = encode_commit_state_manifest(manifest)?;
+    let seal = commit_state_semantic_seal(manifest)?;
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_crud_commit_state_manifest_bytes(encoded.len());
+    writes.put(
+        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        key(commit_state_manifest_key(manifest.commit_id)),
+        value(encoded),
+    );
+    writes.put(
+        TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
+        key(commit_state_manifest_key(manifest.commit_id)),
+        value(seal.to_vec()),
+    );
+    Ok(())
+}
+
+/// Stages authority that carries no serving catalog. Catalog-bearing
+/// authorities require the opaque canonical transition proof returned by
+/// `stage_current_state_catalog`.
+pub(crate) fn stage_commit_state_manifest(
+    writes: &mut StorageWriteSet,
+    manifest: &CommitStateManifest,
+) -> Result<(), LixError> {
+    if manifest.current_state_catalog.is_some() || manifest.current_state_coverage_anchor.is_some()
+    {
+        return Err(replacement_payload_error(
+            "current-state catalogs require canonical publication certification",
+        ));
+    }
+    stage_commit_state_manifest_bytes(writes, manifest)
+}
+
+pub(crate) fn stage_commit_state_manifest_with_handle(
+    writes: &mut StorageWriteSet,
+    manifest: &CommitStateManifest,
+) -> Result<StagedCommitStateManifest, LixError> {
+    stage_commit_state_manifest(writes, manifest)?;
+    Ok(StagedCommitStateManifest {
+        manifest: manifest.clone(),
+        write_set_id: writes.identity(),
+    })
+}
+
+/// Publishes a catalog only when the exact opaque proof from its canonical
+/// staging transition accompanies the manifest.
+pub(crate) fn stage_certified_commit_state_manifest(
+    writes: &mut StorageWriteSet,
+    manifest: &CommitStateManifest,
+    publication: &super::current_state_part::CertifiedCurrentStateCatalogPublication,
+) -> Result<(), LixError> {
+    if writes.identity() != publication.write_set_id() {
+        return Err(replacement_payload_error(
+            "catalog publication proof belongs to a different storage write set",
+        ));
+    }
+    let (root, anchor) = publication.parts();
+    let declared_parent_id = match manifest.parent_commit_ids.as_slice() {
+        [] => None,
+        [parent_id] => Some(*parent_id),
+        _ => {
+            return Err(replacement_payload_error(
+                "certified current-state catalogs cannot have multiple graph parents",
+            ));
+        }
+    };
+    if declared_parent_id != publication.parent_commit_id() {
+        return Err(replacement_payload_error(
+            "commit manifest graph parent disagrees with its catalog publication proof",
+        ));
+    }
+    if manifest.current_state_catalog != root || manifest.current_state_coverage_anchor != anchor {
+        return Err(replacement_payload_error(
+            "commit manifest disagrees with its canonical catalog publication proof",
+        ));
+    }
+    stage_commit_state_manifest_bytes(writes, manifest)
+}
+
+pub(crate) fn stage_certified_commit_state_manifest_with_handle(
+    writes: &mut StorageWriteSet,
+    manifest: &CommitStateManifest,
+    publication: &super::current_state_part::CertifiedCurrentStateCatalogPublication,
+) -> Result<StagedCommitStateManifest, LixError> {
+    stage_certified_commit_state_manifest(writes, manifest, publication)?;
+    Ok(StagedCommitStateManifest {
+        manifest: manifest.clone(),
+        write_set_id: writes.identity(),
+    })
+}
+
+/// Updates only the rebuildable snapshot accelerator of an already sealed
+/// authority. All semantic fields come from the opaque published handle and
+/// therefore retain the exact same immutable authority.
+pub(crate) fn stage_commit_state_snapshot_root_update(
+    writes: &mut StorageWriteSet,
+    published: &PublishedCommitStateManifest,
+    snapshot_root: Option<TrackedStateCommitRoot>,
+) -> Result<(), LixError> {
+    let mut manifest = published.manifest.clone();
+    manifest.snapshot_root = snapshot_root;
+    let encoded = encode_commit_state_manifest(&manifest)?;
     writes.put(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
         key(commit_state_manifest_key(manifest.commit_id)),
@@ -1641,6 +2336,32 @@ pub(crate) fn stage_unchecked_commit_state_manifest_for_test(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
         key(commit_state_manifest_key(manifest.commit_id)),
         value(encoded),
+    );
+    Ok(())
+}
+
+/// Replaces both mutable manifest bytes and the normally immutable seal for a
+/// corruption/test-fixture scenario. Production code cannot compile a call to
+/// this bypass.
+#[cfg(test)]
+pub(crate) fn stage_resealed_commit_state_manifest_for_test(
+    writes: &mut StorageWriteSet,
+    manifest: &CommitStateManifest,
+) -> Result<(), LixError> {
+    let encoded = encode_commit_state_manifest(manifest)?;
+    let seal = commit_state_semantic_seal(manifest)?;
+    writes.put(
+        TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        key(commit_state_manifest_key(manifest.commit_id)),
+        value(encoded),
+    );
+    writes.put(
+        StorageSpace::mutable(
+            TRACKED_STATE_COMMIT_STATE_SEAL_SPACE.id,
+            TRACKED_STATE_COMMIT_STATE_SEAL_NAMESPACE,
+        ),
+        key(commit_state_manifest_key(manifest.commit_id)),
+        value(seal.to_vec()),
     );
     Ok(())
 }
@@ -2234,13 +2955,13 @@ fn stored_replacement_generation(
     stored
 }
 
-fn replacement_generation_integrity_digest(
+pub(crate) fn replacement_generation_integrity_digest(
     generation: &StoredCommitDeltaReplacementGeneration,
     lifecycle_summary: &CommitDeltaLifecycleSummary,
     replacement_parts: &StoredReplacementPartsAuthority,
 ) -> [u8; 32] {
     let mut digest =
-        blake3::Hasher::new_derive_key("lix tracked-state replacement generation certificate v1");
+        blake3::Hasher::new_derive_key("lix tracked-state replacement generation certificate v2");
     digest.update(&generation.owner_commit_id);
     digest.update(&(generation.scope.schema_key.len() as u64).to_be_bytes());
     digest.update(generation.scope.schema_key.as_bytes());
@@ -3368,7 +4089,7 @@ pub(crate) async fn load_commit_delta_values_encoded_with_cache(
     let manifest = match cached_manifest {
         Some(manifest) => manifest,
         None => {
-            let Some(state) = load_commit_state_manifest(store, commit_id).await? else {
+            let Some(state) = load_replay_commit_state_manifest(store, commit_id).await? else {
                 return Ok(vec![None; encoded_keys.len()]);
             };
             if !state.mutations.replacement_part_digests.is_empty() {
@@ -3392,7 +4113,7 @@ pub(crate) async fn load_commit_delta_values_encoded_with_cache(
         return load_local_commit_delta_values_encoded(store, commit_id, encoded_keys, &manifest)
             .await;
     };
-    if load_commit_state_manifest(store, source_commit_id)
+    if load_replay_commit_state_manifest(store, source_commit_id)
         .await?
         .is_none()
     {
@@ -3429,6 +4150,39 @@ pub(crate) async fn load_commit_delta_values_encoded_with_cache(
     Ok(values)
 }
 
+/// Replays deltas from the one-read manifest already validated against the
+/// changelog projection. Compact replacements route directly through their
+/// immutable parts; ordinary manifests seed and reuse the point cache.
+pub(crate) async fn load_commit_delta_values_encoded_from_replay_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &CommitStateManifest,
+    encoded_keys: &[Bytes],
+    point_cache: &CommitDeltaPointReadCache,
+) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+    if !state.mutations.replacement_part_digests.is_empty() {
+        return load_compact_replacement_values_encoded(
+            store,
+            state.commit_id,
+            encoded_keys,
+            state,
+        )
+        .await;
+    }
+    if point_cache.manifest(state.commit_id)?.is_none() {
+        point_cache.remember_manifest(
+            state.commit_id,
+            Arc::new(commit_delta_manifest_from_commit_state(state)),
+        )?;
+    }
+    load_commit_delta_values_encoded_with_cache(
+        store,
+        state.commit_id,
+        encoded_keys,
+        Some(point_cache),
+    )
+    .await
+}
+
 async fn load_compact_replacement_values_encoded(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
@@ -3438,7 +4192,7 @@ async fn load_compact_replacement_values_encoded(
     if encoded_keys.is_empty() {
         return Ok(Vec::new());
     }
-    let Some(set) = state.current_state_part_sets.first() else {
+    let Some(set) = fresh_replacement_current_state_part_set(state)? else {
         let expanded = expanded_commit_delta_manifest_from_commit_state(store, state).await?;
         return load_local_commit_delta_values_encoded(store, commit_id, encoded_keys, &expanded)
             .await;
@@ -3483,12 +4237,22 @@ async fn load_compact_replacement_values_encoded(
         let Some(descriptor) = descriptor else {
             continue;
         };
+        let part_index = descriptor.part_index as usize;
         let expected_digest = state
             .mutations
             .replacement_part_digests
-            .get(descriptor.part_index as usize)
+            .get(part_index)
+            .copied()
+            .or_else(|| {
+                state
+                    .mutations
+                    .parts
+                    .get(part_index)
+                    .and_then(|part| part.replacement_part.as_ref())
+                    .map(|part| part.content_digest)
+            })
             .ok_or_else(|| replacement_payload_error("directory part index is out of bounds"))?;
-        if descriptor.content_digest != *expected_digest
+        if descriptor.content_digest != expected_digest
             || state
                 .mutations
                 .direct_part_row_counts
@@ -3979,6 +4743,8 @@ pub(crate) async fn load_owned_commit_delta_entries_one_ordered_ref(
             return Ok(output);
         }
     }
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_crud_ordered_delta_fallback();
     let requests = keys
         .iter()
         .map(|key| {
@@ -4132,6 +4898,206 @@ async fn load_local_owned_commit_delta_entries(
     Ok(output)
 }
 
+async fn load_compact_replacement_entries_one_ordered(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    keys: &[TrackedStateKeyRef<'_>],
+    state: &CommitStateManifest,
+) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
+    let Some(set) = fresh_replacement_current_state_part_set(state)? else {
+        return Err(replacement_payload_error(
+            "compact replacement omitted its direct current-state route",
+        ));
+    };
+    let generation = state
+        .mutations
+        .replacement_generation
+        .as_ref()
+        .ok_or_else(|| replacement_payload_error("compact state omitted its generation"))?;
+    let lifecycle =
+        state.mutations.lifecycle_summary.as_ref().ok_or_else(|| {
+            replacement_payload_error("compact state omitted lifecycle authority")
+        })?;
+    let authority = state
+        .mutations
+        .replacement_parts
+        .as_ref()
+        .ok_or_else(|| replacement_payload_error("compact state omitted part authority"))?;
+    let encoded_keys = keys
+        .iter()
+        .map(|&key| Bytes::from(encode_key_ref(key)))
+        .collect::<Vec<_>>();
+    let routes =
+        super::current_state_part::route_current_state_parts(store, &set.directory, &encoded_keys)
+            .await?;
+    let mut grouped = BTreeMap::<u32, (CurrentStatePartDescriptor, Vec<usize>)>::new();
+    for (output_index, descriptor) in routes.into_iter().enumerate() {
+        let Some(descriptor) = descriptor else {
+            continue;
+        };
+        let expected_digest = state
+            .mutations
+            .replacement_part_digests
+            .get(descriptor.part_index as usize)
+            .ok_or_else(|| replacement_payload_error("directory part index is out of bounds"))?;
+        if descriptor.content_digest != *expected_digest
+            || state
+                .mutations
+                .direct_part_row_counts
+                .get(descriptor.part_index as usize)
+                != Some(&descriptor.row_count)
+            || descriptor.owner_commit_id != generation.owner_commit_id
+            || descriptor.uniform_created_at != lifecycle.uniform_created_at
+            || descriptor.uniform_updated_at != authority.uniform_updated_at
+        {
+            return Err(replacement_payload_error(
+                "directory descriptor disagrees with compact mutation authority",
+            ));
+        }
+        grouped
+            .entry(descriptor.part_index)
+            .or_insert_with(|| (descriptor, Vec::new()))
+            .1
+            .push(output_index);
+    }
+    let storage_keys = grouped
+        .values()
+        .map(|(descriptor, _)| {
+            let mut key = commit_delta_segment_key(commit_id, descriptor.part_index as usize)?;
+            key.extend_from_slice(&descriptor.content_digest);
+            Ok(StorageKey(Bytes::from(key)))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let loaded = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+    for ((_, (descriptor, output_indices)), value) in grouped.into_iter().zip(loaded.value) {
+        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+            replacement_payload_error("directory references a missing immutable state part")
+        })?;
+        let bounds = CommitDeltaSegmentBounds {
+            first_key: descriptor.first_key,
+            last_key: descriptor.last_key,
+            replacement_part: Some(StoredReplacementPart {
+                content_digest: descriptor.content_digest,
+                owner_commit_id: descriptor.owner_commit_id,
+                first_address: descriptor.part_index.saturating_mul(
+                    u32::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+                        .expect("replacement row bound fits u32"),
+                ),
+                uniform_created_at: descriptor.uniform_created_at,
+                uniform_updated_at: descriptor.uniform_updated_at,
+            }),
+        };
+        let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(&bounds))?;
+        for output_index in output_indices {
+            output[output_index] = find_loaded_commit_delta_entry(
+                &leaf,
+                &payloads,
+                &encoded_keys[output_index],
+                commit_id,
+            )?;
+        }
+    }
+    hydrate_selected_loaded_entries(store, &mut output).await?;
+    Ok(output)
+}
+
+async fn load_inventory_part_entries_one_ordered(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    keys: &[TrackedStateKeyRef<'_>],
+    state: &CommitStateManifest,
+) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
+    let inventory = &state.mutations;
+    if !inventory_parts_support_direct_route(inventory) {
+        return Err(replacement_payload_error(
+            "ordered mutation inventory has invalid part bounds",
+        ));
+    }
+    let mut encoded_keys = Vec::new();
+    let mut grouped = BTreeMap::<usize, Vec<(usize, Range<usize>)>>::new();
+    for (output_index, &key) in keys.iter().enumerate() {
+        let encoded = encode_key_ref_into(&mut encoded_keys, key);
+        let key_bytes = &encoded_keys[encoded.clone()];
+        let mut lower = 0usize;
+        let mut upper = inventory.parts.len();
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            if inventory.parts[middle].first_key.as_slice() <= key_bytes {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        let Some(part_index) = lower.checked_sub(1) else {
+            continue;
+        };
+        if key_bytes <= inventory.parts[part_index].last_key.as_slice() {
+            grouped
+                .entry(part_index)
+                .or_default()
+                .push((output_index, encoded));
+        }
+    }
+    let storage_keys = grouped
+        .keys()
+        .map(|&part_index| {
+            let bounds = &inventory.parts[part_index];
+            commit_delta_segment_key_for_bounds(
+                commit_id,
+                part_index,
+                &CommitDeltaSegmentBounds {
+                    first_key: bounds.first_key.clone(),
+                    last_key: bounds.last_key.clone(),
+                    replacement_part: bounds.replacement_part.clone(),
+                },
+            )
+            .map(|key| StorageKey(Bytes::from(key)))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let loaded = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
+    for ((part_index, requests), value) in grouped.into_iter().zip(loaded.value) {
+        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+            replacement_payload_error("mutation inventory references a missing immutable part")
+        })?;
+        let part = &inventory.parts[part_index];
+        let bounds = CommitDeltaSegmentBounds {
+            first_key: part.first_key.clone(),
+            last_key: part.last_key.clone(),
+            replacement_part: part.replacement_part.clone(),
+        };
+        let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(&bounds))?;
+        for (output_index, encoded) in requests {
+            output[output_index] = find_loaded_commit_delta_entry(
+                &leaf,
+                &payloads,
+                &encoded_keys[encoded],
+                commit_id,
+            )?;
+        }
+    }
+    Ok(output)
+}
+
+fn inventory_parts_support_direct_route(inventory: &CommitStateMutationInventory) -> bool {
+    !(inventory.selected_source_commit_id.is_some()
+        || !inventory.inline_part.is_empty()
+        || inventory.parts.is_empty()
+        || inventory.parts.len() != inventory.direct_part_row_counts.len()
+        || inventory.parts.iter().any(|part| {
+            part.first_key.is_empty() || part.last_key.is_empty() || part.first_key > part.last_key
+        })
+        || inventory
+            .parts
+            .windows(2)
+            .any(|pair| pair[0].last_key >= pair[1].first_key))
+}
+
 /// Fast path for one physical owner and an already ordered exact-key batch.
 ///
 /// Dense current-state replacement reads naturally have this shape. Route the
@@ -4150,9 +5116,39 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
     {
         Some(manifest) => PointReadCommitDeltaManifest::Cached(manifest),
         None => {
-            let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
+            let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
                 return Ok((0..keys.len()).map(|_| None).collect());
             };
+            if state.mutations.replacement_generation.is_some()
+                && state.current_state_coverage_anchor.is_some()
+            {
+                let output =
+                    load_compact_replacement_entries_one_ordered(store, commit_id, keys, &state)
+                        .await?;
+                remember_expanded_point_manifest(store, &state, point_cache).await?;
+                return Ok(output);
+            }
+            if keys.len() <= DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS
+                && inventory_parts_support_direct_route(&state.mutations)
+            {
+                let output =
+                    load_inventory_part_entries_one_ordered(store, commit_id, keys, &state).await?;
+                remember_expanded_point_manifest(store, &state, point_cache).await?;
+                return Ok(output);
+            }
+            let manifest = expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
+            validate_commit_delta_manifest(&manifest)?;
+            if manifest
+                .replacement_generation
+                .as_ref()
+                .is_some_and(|generation| {
+                    generation.owner_commit_id != *commit_id.as_uuid().as_bytes()
+                })
+            {
+                return Err(replacement_payload_error(
+                    "replacement generation does not belong to its commit",
+                ));
+            }
             match point_cache {
                 Some(cache) => {
                     let manifest = Arc::new(manifest);
@@ -4460,6 +5456,19 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
     }
     hydrate_selected_loaded_entries(store, &mut output).await?;
     Ok(output)
+}
+
+async fn remember_expanded_point_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &CommitStateManifest,
+    point_cache: Option<&CommitDeltaPointReadCache>,
+) -> Result<(), LixError> {
+    let Some(point_cache) = point_cache else {
+        return Ok(());
+    };
+    let manifest = expanded_commit_delta_manifest_from_commit_state(store, state).await?;
+    validate_commit_delta_manifest(&manifest)?;
+    point_cache.remember_manifest(state.commit_id, Arc::new(manifest))
 }
 
 async fn hydrate_selected_loaded_entries(
@@ -4780,7 +5789,19 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                 },
             )
             .await?;
-        for entry in &page.value.entries {
+        let seal_keys = page
+            .value
+            .entries
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect::<Vec<_>>();
+        let seal_request = [StorageGetManyRequest {
+            space: TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
+            keys: &seal_keys,
+            opts: StorageGetOptions::default(),
+        }];
+        let seals = exact_get_many(store, &seal_request).await?.values;
+        for (entry, seal) in page.value.entries.iter().zip(seals) {
             if entry.key.0.len() != 16 {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -4798,6 +5819,12 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     "tracked_state commit-state scan key and manifest commit disagree",
                 ));
             }
+            let seal = seal.and_then(full_value_bytes).ok_or_else(|| {
+                replacement_payload_error(
+                    "commit-state scan found a manifest without its immutable semantic authority",
+                )
+            })?;
+            validate_commit_state_semantic_seal(&state, &seal)?;
             let manifest = expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
             let members =
                 load_commit_delta_members_from_manifest(store, commit_id, &manifest, &[]).await?;
@@ -5082,11 +6109,23 @@ async fn scan_commit_delta_plane(
 ) -> Result<CommitDeltaPlane, LixError> {
     let commit_state_rows =
         scan_full_space(store, TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE).await?;
+    let commit_state_seals = scan_full_space(store, TRACKED_STATE_COMMIT_STATE_SEAL_SPACE).await?;
     let segment_rows = scan_full_space(store, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE).await?;
+
+    if commit_state_rows.len() != commit_state_seals.len()
+        || commit_state_rows
+            .iter()
+            .zip(&commit_state_seals)
+            .any(|((manifest_key, _), (seal_key, _))| manifest_key != seal_key)
+    {
+        return Err(replacement_payload_error(
+            "commit-state inventory found an orphan manifest or semantic authority",
+        ));
+    }
 
     let mut manifests = BTreeMap::<CommitId, CommitDeltaManifest>::new();
     let mut authorities = BTreeMap::<CommitId, CommitStateTopologyProjection>::new();
-    for (key, bytes) in commit_state_rows {
+    for ((key, bytes), (_, seal)) in commit_state_rows.into_iter().zip(commit_state_seals) {
         if key.0.len() != 16 {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -5103,6 +6142,7 @@ async fn scan_commit_delta_plane(
                 ),
             ));
         }
+        validate_commit_state_semantic_seal(&manifest, &seal)?;
         authorities.insert(
             commit_id,
             CommitStateTopologyProjection {
@@ -5224,6 +6264,10 @@ pub(crate) fn stage_delete_commit_delta_inventory_entry(
 ) -> Result<(), LixError> {
     writes.delete(
         TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        key(commit_state_manifest_key(commit_id)),
+    );
+    writes.delete(
+        TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
         key(commit_state_manifest_key(commit_id)),
     );
     for segment_key in &entry.physical_segment_keys {
@@ -5481,9 +6525,28 @@ pub(crate) async fn load_commit_delta_replay_metadata_with_cache(
     {
         return Ok(Some(commit_delta_replay_metadata(&manifest)));
     }
-    Ok(load_commit_state_manifest(store, commit_id)
+    Ok(load_replay_commit_state_manifest(store, commit_id)
         .await?
         .map(|manifest| commit_delta_replay_metadata_from_inventory(&manifest.mutations)))
+}
+
+/// Seeds the snapshot-local delta cache from the seal-verified replay manifest
+/// already read by point traversal, avoiding a second authority read.
+pub(crate) fn seed_commit_delta_point_cache_from_replay_manifest(
+    state: &CommitStateManifest,
+    point_cache: &CommitDeltaPointReadCache,
+) -> Result<CommitDeltaReplayMetadata, LixError> {
+    if let Some(manifest) = point_cache.manifest(state.commit_id)? {
+        return Ok(commit_delta_replay_metadata(&manifest));
+    }
+    let metadata = commit_delta_replay_metadata_from_inventory(&state.mutations);
+    if state.mutations.replacement_part_digests.is_empty() {
+        point_cache.remember_manifest(
+            state.commit_id,
+            Arc::new(commit_delta_manifest_from_commit_state(state)),
+        )?;
+    }
+    Ok(metadata)
 }
 
 fn commit_delta_replay_metadata(manifest: &CommitDeltaManifest) -> CommitDeltaReplayMetadata {
@@ -5532,7 +6595,7 @@ async fn load_commit_delta_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<CommitDeltaManifest>, LixError> {
-    let Some(state) = load_commit_state_manifest(store, commit_id).await? else {
+    let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
         return Ok(None);
     };
     let manifest = expanded_commit_delta_manifest_from_commit_state(store, &state).await?;
@@ -6874,6 +7937,7 @@ pub(crate) struct TrackedStateStagedRead<'a, S: ?Sized> {
     store: &'a S,
     chunks: &'a TrackedStateChunkOverlay,
     commit_states: HashMap<Vec<u8>, Bytes>,
+    commit_state_seals: HashMap<Vec<u8>, Bytes>,
 }
 
 impl<'a, S> TrackedStateStagedRead<'a, S>
@@ -6885,6 +7949,7 @@ where
             store,
             chunks,
             commit_states: HashMap::new(),
+            commit_state_seals: HashMap::new(),
         }
     }
 
@@ -6893,12 +7958,22 @@ where
         chunks: &'a TrackedStateChunkOverlay,
         manifests: impl IntoIterator<Item = CommitStateManifest>,
     ) -> Result<Self, LixError> {
+        let manifests = manifests.into_iter().collect::<Vec<_>>();
         let commit_states = manifests
-            .into_iter()
+            .iter()
             .map(|manifest| {
                 Ok((
                     commit_state_manifest_key(manifest.commit_id),
-                    Bytes::from(encode_commit_state_manifest(&manifest)?),
+                    Bytes::from(encode_commit_state_manifest(manifest)?),
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, LixError>>()?;
+        let commit_state_seals = manifests
+            .iter()
+            .map(|manifest| {
+                Ok((
+                    commit_state_manifest_key(manifest.commit_id),
+                    Bytes::copy_from_slice(&commit_state_semantic_seal(manifest)?),
                 ))
             })
             .collect::<Result<HashMap<_, _>, LixError>>()?;
@@ -6906,6 +7981,7 @@ where
             store,
             chunks,
             commit_states,
+            commit_state_seals,
         })
     }
 
@@ -6916,6 +7992,9 @@ where
         }
         if space == TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id {
             return self.commit_states.get(key.0.as_ref()).cloned();
+        }
+        if space == TRACKED_STATE_COMMIT_STATE_SEAL_SPACE.id {
+            return self.commit_state_seals.get(key.0.as_ref()).cloned();
         }
         None
     }
@@ -6988,6 +8067,13 @@ fn encode_commit_state_manifest(manifest: &CommitStateManifest) -> Result<Vec<u8
 }
 
 fn decode_commit_state_manifest(bytes: &[u8]) -> Result<CommitStateManifest, LixError> {
+    decode_commit_state_manifest_with_catalog_attestation(bytes, true)
+}
+
+fn decode_commit_state_manifest_with_catalog_attestation(
+    bytes: &[u8],
+    validate_catalog_attestation: bool,
+) -> Result<CommitStateManifest, LixError> {
     let Some(payload) = bytes.strip_prefix(COMMIT_STATE_MANIFEST_FORMAT_MAGIC) else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -6995,11 +8081,18 @@ fn decode_commit_state_manifest(bytes: &[u8]) -> Result<CommitStateManifest, Lix
         ));
     };
     let manifest = storage_codec::decode("tracked_state commit_state_manifest", payload)?;
-    validate_commit_state_manifest(&manifest)?;
+    validate_commit_state_manifest_inner(&manifest, validate_catalog_attestation)?;
     Ok(manifest)
 }
 
 fn validate_commit_state_manifest(manifest: &CommitStateManifest) -> Result<(), LixError> {
+    validate_commit_state_manifest_inner(manifest, true)
+}
+
+fn validate_commit_state_manifest_inner(
+    manifest: &CommitStateManifest,
+    validate_catalog_attestation: bool,
+) -> Result<(), LixError> {
     let mut parents = BTreeSet::new();
     for parent in &manifest.parent_commit_ids {
         if *parent == manifest.commit_id || !parents.insert(*parent) {
@@ -7057,60 +8150,78 @@ fn validate_commit_state_manifest(manifest: &CommitStateManifest) -> Result<(), 
     }
 
     validate_commit_state_mutation_inventory(manifest.commit_id, &manifest.mutations)?;
-    validate_current_state_part_sets(manifest)
+    validate_current_state_catalog(manifest, validate_catalog_attestation)
 }
 
-fn validate_current_state_part_sets(manifest: &CommitStateManifest) -> Result<(), LixError> {
-    if manifest.current_state_part_sets.is_empty() {
-        return Ok(());
-    }
-    // The first publication slice covers the one certified replacement scope
-    // carried by the current mutation inventory. Sparse commits will publish
-    // multiple structurally shared scopes in the subsequent range-rewrite cut.
-    if manifest.current_state_part_sets.len() != 1 {
+fn validate_current_state_catalog(
+    manifest: &CommitStateManifest,
+    validate_catalog_attestation: bool,
+) -> Result<(), LixError> {
+    if manifest.current_state_catalog.as_ref().is_some_and(|root| {
+        root.root_id == [0; 32]
+            || root.entry_count == 0
+            || root.transition_digest == [0; 32]
+            || manifest.parent_commit_ids.len() > 1
+            || manifest.mutations.selected_source_commit_id.is_some()
+    }) {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "tracked_state commit_state_manifest has multiple current-state part sets before sparse range rewrite",
+            "tracked_state commit_state_manifest has an invalid current-state catalog root",
         ));
     }
-    let set = &manifest.current_state_part_sets[0];
-    let generation = manifest
-        .mutations
-        .replacement_generation
-        .as_ref()
-        .ok_or_else(|| {
-            LixError::new(
+    if validate_catalog_attestation && let Some(root) = manifest.current_state_catalog.as_ref() {
+        let expected = super::current_state_part::current_state_catalog_transition_digest(
+            manifest.commit_id,
+            root.parent_root_id,
+            &manifest.mutations,
+            root.root_id,
+            root.entry_count,
+        )?;
+        if root.transition_digest != expected
+            || (manifest.parent_commit_ids.is_empty() && root.parent_root_id.is_some())
+        {
+            return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "tracked_state current-state part set has no replacement-generation authority",
-            )
-        })?;
-    let authority = manifest
-        .mutations
-        .replacement_parts
-        .as_ref()
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state current-state part set has no immutable-part authority",
-            )
-        })?;
-    if set.scope != generation.scope
-        || set.owner_commit_id != *manifest.commit_id.as_uuid().as_bytes()
-        || set.owner_commit_id != generation.owner_commit_id
-        || set.generation_integrity_digest != generation.integrity_digest
-        || set.mutation_directory_digest != authority.directory_digest
-        || set.directory.descriptor_digest != authority.directory_digest
-        || set.directory.root_id == [0; 32]
-        || set.directory.descriptor_digest == [0; 32]
-        || set.directory.part_count == 0
-        || set.directory.row_count != u64::from(manifest.mutations.member_count)
-        || set.directory.part_count as usize != manifest.mutations.part_count()
-        || set.directory.tree_height == 0
+                "tracked_state current-state catalog transition is not bound to this commit",
+            ));
+        }
+    }
+    if manifest.current_state_catalog.is_none() && manifest.current_state_coverage_anchor.is_some()
     {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "tracked_state current-state part set disagrees with its replacement authority",
+            "tracked_state commit_state_manifest has a coverage anchor without a catalog",
         ));
+    }
+    if let Some(anchor) = manifest.current_state_coverage_anchor.as_ref() {
+        let (Some(generation), Some(authority)) = (
+            manifest.mutations.replacement_generation.as_ref(),
+            manifest.mutations.replacement_parts.as_ref(),
+        ) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state current-state coverage anchor has no replacement authority",
+            ));
+        };
+        if anchor.scope != generation.scope
+            || anchor.generation_integrity_digest != generation.integrity_digest
+            || anchor.directory.descriptor_digest != authority.directory_digest
+            || anchor.directory.row_count != u64::from(manifest.mutations.member_count)
+            || anchor.directory.part_count as usize != manifest.mutations.part_count()
+            || anchor.directory.root_id == [0; 32]
+            || anchor.directory.tree_height == 0
+            || anchor.state_lineage_digest
+                != super::current_state_part::fresh_current_state_lineage_digest(
+                    manifest.commit_id,
+                    generation.integrity_digest,
+                    &anchor.directory,
+                )
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state current-state coverage anchor disagrees with replacement authority",
+            ));
+        }
     }
     Ok(())
 }
@@ -7260,7 +8371,9 @@ fn validate_compact_replacement_inventory(
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::future::Future;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
 
@@ -7282,7 +8395,7 @@ mod tests {
         HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE,
     };
     use crate::storage_adapter::{
-        Memory, StorageAdapter, StorageKey, StorageReadOptions, StorageWriteOptions,
+        Memory, StorageAdapter, StorageKey, StorageReadOptions, StorageSpace, StorageWriteOptions,
         StorageWriteSet,
     };
     use crate::tracked_state::codec::{
@@ -7290,8 +8403,8 @@ mod tests {
         encode_key_ref, encode_value_ref, hash_bytes,
     };
     use crate::tracked_state::current_state_part::{
-        CURRENT_STATE_PART_DIRECTORY_SPACE, route_current_state_part,
-        stage_complete_replacement_current_state_part_set,
+        CURRENT_STATE_PART_DIRECTORY_SPACE, load_current_state_catalog_entry,
+        route_current_state_part, stage_fresh_current_state_catalog,
     };
     use crate::tracked_state::types::{
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
@@ -7318,6 +8431,48 @@ mod tests {
         stage_delete_commit_delta_inventory_entry, value,
     };
 
+    struct SealCountingRead<R> {
+        inner: R,
+        manifest_requests: std::sync::Arc<AtomicUsize>,
+        seal_requests: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl<R> crate::storage_adapter::StorageAdapterRead for SealCountingRead<R>
+    where
+        R: crate::storage_adapter::StorageAdapterRead,
+    {
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+
+        fn get_many(
+            &self,
+            requests: &[crate::storage::GetManyRequest<'_>],
+        ) -> impl Future<
+            Output = Result<crate::storage::GetManyResult, crate::storage::StorageError>,
+        > + Send {
+            for request in requests {
+                if request.space == super::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE {
+                    self.manifest_requests.fetch_add(1, Ordering::Relaxed);
+                }
+                if request.space == super::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE {
+                    self.seal_requests.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            self.inner.get_many(requests)
+        }
+
+        fn scan(
+            &self,
+            space: StorageSpace,
+            range: crate::storage::KeyRange,
+            opts: crate::storage::ScanOptions,
+        ) -> impl Future<Output = Result<crate::storage::ScanChunk, crate::storage::StorageError>> + Send
+        {
+            self.inner.scan(space, range, opts)
+        }
+    }
+
     fn fixture_commit_state_manifest(
         commit_id: CommitId,
         mutations: CommitStateMutationInventory,
@@ -7335,7 +8490,8 @@ mod tests {
                 bytes: u64::from(mutations.member_count),
             },
             mutations,
-            current_state_part_sets: Vec::new(),
+            current_state_catalog: None,
+            current_state_coverage_anchor: None,
             snapshot_root: None,
         }
     }
@@ -7347,15 +8503,16 @@ mod tests {
     ) -> Result<(), LixError> {
         let mut compact_mutations = mutations.clone();
         let mut manifest = fixture_commit_state_manifest(commit_id, compact_mutations.clone());
-        manifest.current_state_part_sets =
-            stage_complete_replacement_current_state_part_set(writes, commit_id, mutations)?
-                .into_iter()
-                .collect();
-        if !manifest.current_state_part_sets.is_empty() {
+        let publication =
+            stage_fresh_current_state_catalog(writes, commit_id, &mut compact_mutations)?;
+        let (catalog, anchor) = publication.parts();
+        manifest.current_state_catalog = catalog;
+        manifest.current_state_coverage_anchor = anchor;
+        if manifest.current_state_catalog.is_some() {
             compact_mutations.parts.clear();
             manifest.mutations = compact_mutations;
         }
-        stage_commit_state_manifest(writes, &manifest)
+        super::stage_certified_commit_state_manifest(writes, &manifest, &publication)
     }
 
     fn stage_commit_deltas(
@@ -8091,10 +9248,21 @@ mod tests {
             .await
             .expect("replacement authority should load")
             .expect("replacement authority should exist");
-        let state_set = authority
-            .current_state_part_sets
-            .first()
-            .expect("replacement should publish a current-state part set");
+        let state_set = load_current_state_catalog_entry(
+            &read,
+            authority
+                .current_state_catalog
+                .as_ref()
+                .expect("replacement should publish a current-state catalog"),
+            &authority
+                .current_state_coverage_anchor
+                .as_ref()
+                .expect("replacement should publish a coverage anchor")
+                .scope,
+        )
+        .await
+        .expect("replacement catalog should load")
+        .expect("replacement should publish a current-state part set");
         let directory_root = state_set.directory.clone();
         assert_eq!(state_set.directory.part_count, 3);
         let route_key = fixtures[777].key();
@@ -8169,6 +9337,257 @@ mod tests {
                 .await
                 .expect("historical authority should survive directory loss")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_catalog_reuses_untouched_scope_and_invalidates_touched_scope() {
+        let storage = StorageAdapter::new(Memory::new());
+        let parent_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_2000_0000_7000_8000_0000_0000_0000,
+        ));
+        let child_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_2000_0000_7000_8000_0001_0000_0000,
+        ));
+        let created_at = LixTimestamp::from_unix_millis_utc_lossy(11);
+        let updated_at = LixTimestamp::from_unix_millis_utc_lossy(22);
+        let alpha = (0..3)
+            .map(|index| CommitDeltaFixture {
+                schema_key: "alpha".to_string(),
+                file_id: None,
+                entity_pk: EntityPk::single(format!("entity-{index}")),
+                change_id: ChangeId::for_test_label(&format!("catalog-alpha-{index}")),
+                deleted: false,
+                created_at,
+                updated_at,
+            })
+            .collect::<Vec<_>>();
+        let mut parent_deltas = commit_delta_refs(parent_id, &alpha);
+        for delta in &mut parent_deltas {
+            delta.snapshot = crate::json_store::JsonSlotRef::Inline("{}");
+        }
+        let scope = super::CommitDeltaReplacementScope {
+            schema_key: "alpha".to_string(),
+            file_id: None,
+        };
+        let generation = super::CommitDeltaReplacementGeneration {
+            scope: scope.clone(),
+            fallback_commit_id: None,
+            lifecycle_summary: super::CommitDeltaLifecycleSummary {
+                scope: scope.clone(),
+                ordered_identity_digest: [7; 32],
+                uniform_created_at: created_at,
+            },
+        };
+        let mut writes = storage.new_write_set();
+        let parent_stage = super::stage_ordered_addressable_replacement_parts(
+            &mut writes,
+            parent_deltas.iter().copied().map(Ok),
+            &generation,
+        )
+        .expect("parent replacement should stage");
+        stage_fixture_manifest(&mut writes, parent_id, parent_stage.mutation_inventory())
+            .expect("parent manifest should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("parent replacement should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("parent read should open");
+        let parent = super::load_published_commit_state_manifest(&read, parent_id)
+            .await
+            .expect("parent manifest should load")
+            .expect("parent manifest should exist");
+        let parent_root = parent
+            .current_state_catalog
+            .clone()
+            .expect("parent should publish a catalog");
+        let beta = CommitDeltaFixture {
+            schema_key: "beta".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::single("other"),
+            change_id: ChangeId::for_test_label("catalog-beta-child"),
+            deleted: false,
+            created_at,
+            updated_at,
+        };
+        let child_deltas = commit_delta_refs(child_id, std::slice::from_ref(&beta));
+        let mut child_writes = storage.new_write_set();
+        let child_stage = super::stage_ordered_addressable_commit_deltas(
+            &mut child_writes,
+            child_deltas.iter().copied().map(Ok),
+            true,
+            false,
+        )
+        .expect("child mutation should stage")
+        .expect("child mutation should be addressable");
+        let mut child_inventory = child_stage.mutation_inventory().clone();
+        let child_publication = super::stage_current_state_catalog_from_published_parent(
+            &read,
+            &mut child_writes,
+            Some(&parent),
+            child_id,
+            &mut child_inventory,
+        )
+        .await
+        .expect("child catalog should path-copy");
+        let (child_catalog, child_anchor) = child_publication.parts();
+        let child_catalog = child_catalog.expect("child should retain inherited catalog");
+        assert_eq!(child_catalog.root_id, parent_root.root_id);
+        assert_eq!(child_catalog.parent_root_id, Some(parent_root.root_id));
+        assert!(child_anchor.is_none());
+        let mut child = fixture_commit_state_manifest(child_id, child_inventory);
+        child.parent_commit_ids = vec![parent_id];
+        child.replay_debt.depth = super::MIN_CURRENT_STATE_CATALOG_POINT_READS;
+        child.current_state_catalog = Some(child_catalog);
+        let mut cross_wired_child = child.clone();
+        cross_wired_child.parent_commit_ids = vec![CommitId::for_test_label("foreign-parent")];
+        assert!(
+            super::stage_certified_commit_state_manifest(
+                &mut child_writes,
+                &cross_wired_child,
+                &child_publication,
+            )
+            .is_err(),
+            "catalog proof must bind the exact graph parent commit"
+        );
+        let mut foreign_writes = storage.new_write_set();
+        assert!(
+            super::stage_certified_commit_state_manifest(
+                &mut foreign_writes,
+                &child,
+                &child_publication,
+            )
+            .is_err(),
+            "catalog proof must bind the write set containing its physical nodes"
+        );
+        super::stage_certified_commit_state_manifest(&mut child_writes, &child, &child_publication)
+            .expect("child manifest should stage");
+        drop(read);
+        storage
+            .commit_write_set(child_writes, StorageWriteOptions::default())
+            .await
+            .expect("child should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("child read should open");
+        let child = super::load_published_commit_state_manifest(&read, child_id)
+            .await
+            .expect("child manifest should load")
+            .expect("child manifest should exist");
+        let mut encoded = TrackedStateKeyBatchBuilder::with_row_capacity(2);
+        for key in [
+            alpha[1].key(),
+            TrackedStateKey {
+                schema_key: "alpha".to_string(),
+                file_id: None,
+                entity_pk: EntityPk::single("missing"),
+            },
+        ] {
+            encoded.push(TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+        }
+        let resolved =
+            super::load_complete_current_state_values_encoded(&read, &child, &encoded.finish())
+                .await
+                .expect("catalog points should resolve")
+                .expect("alpha is covered");
+        assert!(resolved[0].is_some());
+        assert!(resolved[1].is_none(), "covered miss must be authoritative");
+
+        let mut forged = (*child).clone();
+        forged.current_state_catalog = Some(parent_root.clone());
+        let mut forged_writes = storage.new_write_set();
+        assert!(
+            stage_commit_state_manifest(&mut forged_writes, &forged).is_err(),
+            "an ancestor catalog root must not be cross-wired into a descendant manifest"
+        );
+
+        let touching_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0199_2000_0000_7000_8000_0002_0000_0000,
+        ));
+        let touching_deltas = commit_delta_refs(touching_id, std::slice::from_ref(&alpha[0]));
+        let mut touching_writes = storage.new_write_set();
+        let touching_stage = super::stage_ordered_addressable_commit_deltas(
+            &mut touching_writes,
+            touching_deltas.iter().copied().map(Ok),
+            true,
+            false,
+        )
+        .expect("same-scope mutation should stage")
+        .expect("same-scope mutation should be addressable");
+        let mut touching_inventory = touching_stage.mutation_inventory().clone();
+        let touching_publication = super::stage_current_state_catalog_from_published_parent(
+            &read,
+            &mut touching_writes,
+            Some(&child),
+            touching_id,
+            &mut touching_inventory,
+        )
+        .await
+        .expect("same-scope invalidation should succeed");
+        let (touching_catalog, _) = touching_publication.parts();
+        assert!(touching_catalog.is_none(), "touched scope must be removed");
+
+        let mut forged_root = parent_root;
+        forged_root.parent_root_id = child
+            .current_state_catalog
+            .as_ref()
+            .map(|root| root.root_id);
+        forged_root.transition_digest =
+            crate::tracked_state::current_state_part::current_state_catalog_transition_digest(
+                touching_id,
+                forged_root.parent_root_id,
+                &touching_inventory,
+                forged_root.root_id,
+                forged_root.entry_count,
+            )
+            .expect("forged transition digest should compute");
+        let mut forged_touching = fixture_commit_state_manifest(touching_id, touching_inventory);
+        forged_touching.parent_commit_ids = vec![child_id];
+        forged_touching.current_state_catalog = Some(forged_root);
+        let mut forged_writes = storage.new_write_set();
+        assert!(
+            stage_commit_state_manifest(&mut forged_writes, &forged_touching).is_err(),
+            "catalog authority cannot bypass canonical publication certification"
+        );
+        assert!(
+            super::stage_certified_commit_state_manifest(
+                &mut forged_writes,
+                &forged_touching,
+                &touching_publication,
+            )
+            .is_err(),
+            "the canonical touched-scope proof must reject a stale catalog root"
+        );
+        let forged_entry = load_current_state_catalog_entry(
+            &read,
+            forged_touching
+                .current_state_catalog
+                .as_ref()
+                .expect("forged catalog exists"),
+            &scope,
+        )
+        .await
+        .expect("forged stale scope should be structurally readable");
+        assert!(forged_entry.is_some());
+        assert!(
+            crate::tracked_state::current_state_part::validate_current_state_catalog_transition_root(
+                &read,
+                &forged_touching,
+                child.current_state_catalog.as_deref(),
+            )
+            .await
+            .is_err(),
+            "recomputed attestation must not authorize a stale touched scope"
         );
     }
 
@@ -9011,8 +10430,8 @@ mod tests {
         stage_commit_deltas(&mut writes, &deltas).expect("packed deltas should stage");
         assert_eq!(
             writes.stats().staged_puts,
-            4,
-            "generic history keeps 300 compact rows in three read-friendly segments plus its commit-state authority"
+            5,
+            "generic history keeps 300 compact rows in three read-friendly segments plus its commit-state authority and immutable seal"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -9207,8 +10626,8 @@ mod tests {
             .expect("individually valid rows should split below the sidecar limit");
         assert_eq!(
             writes.stats().staged_puts,
-            3,
-            "the oversized four-row candidate should become two segments plus its commit-state authority"
+            4,
+            "the oversized four-row candidate should become two segments plus its commit-state authority and immutable seal"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -10001,6 +11420,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shallow_point_replay_reads_one_immutable_semantic_authority() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("one-read-shallow-point-replay");
+        let fixture = packed_commit_delta_fixtures()
+            .into_iter()
+            .next()
+            .expect("fixture should contain one row");
+        let delta = commit_delta_ref(
+            commit_id,
+            &fixture,
+            crate::json_store::JsonSlotRef::None,
+            crate::json_store::JsonSlotRef::None,
+            None,
+        );
+        let mut writes = storage.new_write_set();
+        stage_commit_deltas(&mut writes, &[delta]).expect("ordinary delta should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("ordinary delta should commit");
+
+        let manifest_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let seal_requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let read = SealCountingRead {
+            inner: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("point read should open"),
+            manifest_requests: std::sync::Arc::clone(&manifest_requests),
+            seal_requests: std::sync::Arc::clone(&seal_requests),
+        };
+        let state = super::load_replay_commit_state_manifest(&read, commit_id)
+            .await
+            .expect("replay manifest should load")
+            .expect("replay manifest should exist");
+        let cache = super::CommitDeltaPointReadCache::default();
+        super::seed_commit_delta_point_cache_from_replay_manifest(&state, &cache)
+            .expect("replay manifest should seed the point cache");
+        let encoded_key = Bytes::from(encode_key_ref(TrackedStateKeyRef {
+            schema_key: &fixture.schema_key,
+            file_id: fixture.file_id.as_deref(),
+            entity_pk: &fixture.entity_pk,
+        }));
+        let values = super::load_commit_delta_values_encoded_with_cache(
+            &read,
+            commit_id,
+            &[encoded_key],
+            Some(&cache),
+        )
+        .await
+        .expect("cached shallow point replay should load");
+        assert_eq!(values, vec![Some(fixture.value(commit_id))]);
+        assert_eq!(manifest_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(seal_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn single_segment_commit_delta_stays_inline() {
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = CommitId::for_test_label("inline-packed-delta-commit");
@@ -10019,8 +11495,8 @@ mod tests {
         stage_commit_deltas(&mut writes, &[delta]).expect("inline delta should stage");
         assert_eq!(
             writes.stats().staged_puts,
-            1,
-            "a one-segment commit should remain inline in its commit-state authority"
+            2,
+            "a one-segment commit should remain inline in its commit-state authority plus immutable seal"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -10061,8 +11537,8 @@ mod tests {
         .expect("inline delta should stage for deletion");
         assert_eq!(
             deletes.stats().staged_deletes,
-            1,
-            "GC should delete the inline commit-state authority"
+            2,
+            "GC should delete the inline commit-state authority and immutable seal"
         );
     }
 
@@ -10201,7 +11677,7 @@ mod tests {
                 .get(&commit_id)
                 .expect("packed commit should be inventoried")
                 .segment_count
-                + 1,
+                + 2,
         )
         .expect("test segment count fits u64");
         assert_eq!(deletes.stats().staged_deletes, expected_deletes);
@@ -10254,7 +11730,7 @@ mod tests {
         let inline_deltas = commit_delta_refs(inline_commit_id, &fixtures[..128]);
         stage_commit_deltas(&mut inline_writes, &inline_deltas)
             .expect("128 generic deltas should fit the history read boundary");
-        assert_eq!(inline_writes.stats().staged_puts, 1);
+        assert_eq!(inline_writes.stats().staged_puts, 2);
         storage
             .commit_write_set(inline_writes, StorageWriteOptions::default())
             .await
@@ -10264,7 +11740,7 @@ mod tests {
         let indexed_deltas = commit_delta_refs(indexed_commit_id, &fixtures);
         stage_commit_deltas(&mut indexed_writes, &indexed_deltas)
             .expect("129 generic deltas should use indexed segments");
-        assert_eq!(indexed_writes.stats().staged_puts, 3);
+        assert_eq!(indexed_writes.stats().staged_puts, 4);
         storage
             .commit_write_set(indexed_writes, StorageWriteOptions::default())
             .await
@@ -10439,7 +11915,8 @@ mod tests {
                 inline_part: encode_commit_delta_segment(&[entry]),
                 parts: Vec::new(),
             },
-            current_state_part_sets: Vec::new(),
+            current_state_catalog: None,
+            current_state_coverage_anchor: None,
             snapshot_root: None,
         }
     }
@@ -10474,6 +11951,134 @@ mod tests {
                 .await
                 .expect("manifest should load"),
             Some(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_authority_is_the_point_source_and_guards_manifest_scans() {
+        let storage = StorageAdapter::new(Memory::new());
+        let manifest = commit_state_manifest_fixture();
+        let mut writes = storage.new_write_set();
+        stage_commit_state_manifest(&mut writes, &manifest).expect("authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("authority should commit");
+
+        let mut forged = manifest.clone();
+        forged.generation += 1;
+        let mut writes = storage.new_write_set();
+        super::stage_unchecked_commit_state_manifest_for_test(&mut writes, &forged)
+            .expect("mutable manifest corruption should stage without replacing authority");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("mutable manifest corruption should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt read should open");
+        let point_state = super::load_point_replay_commit_state(&read, manifest.commit_id)
+            .await
+            .expect("point replay should load immutable semantic authority")
+            .expect("semantic authority should exist");
+        assert_eq!(point_state, manifest);
+        let change_error = scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect_err("packed change scans must verify semantic authority");
+        assert!(change_error.message.contains("semantic authority"));
+        let inventory_error = scan_commit_delta_inventory(&read)
+            .await
+            .expect_err("GC inventory must verify semantic authority");
+        assert!(inventory_error.message.contains("semantic authority"));
+
+        let mut corrupted_authority =
+            super::commit_state_semantic_seal(&manifest).expect("semantic authority should encode");
+        *corrupted_authority
+            .last_mut()
+            .expect("semantic authority should not be empty") ^= 0xff;
+        let mut writes = storage.new_write_set();
+        writes.put(
+            StorageSpace::mutable(
+                super::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE.id,
+                super::TRACKED_STATE_COMMIT_STATE_SEAL_NAMESPACE,
+            ),
+            key(super::commit_state_manifest_key(manifest.commit_id)),
+            value(corrupted_authority),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("authority corruption should commit through the test-only mutable alias");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("corrupt authority read should open");
+        let error = super::load_point_replay_commit_state(&read, manifest.commit_id)
+            .await
+            .expect_err("point replay must reject corrupt immutable authority bytes");
+        assert!(error.message.contains("authority digest"));
+    }
+
+    #[tokio::test]
+    async fn gc_inventory_rejects_missing_and_orphan_semantic_authority() {
+        let missing_storage = StorageAdapter::new(Memory::new());
+        let manifest = commit_state_manifest_fixture();
+        let mut writes = missing_storage.new_write_set();
+        stage_commit_state_manifest(&mut writes, &manifest).expect("authority should stage");
+        missing_storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("authority should commit");
+        let mut deletes = missing_storage.new_write_set();
+        deletes.delete(
+            super::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
+            key(super::commit_state_manifest_key(manifest.commit_id)),
+        );
+        missing_storage
+            .commit_write_set(deletes, StorageWriteOptions::default())
+            .await
+            .expect("seal deletion should commit");
+        let read = missing_storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("missing-seal read should open");
+        let error = scan_commit_delta_inventory(&read)
+            .await
+            .expect_err("GC inventory must reject a missing seal");
+        assert!(
+            error
+                .message
+                .contains("orphan manifest or semantic authority")
+        );
+
+        let orphan_storage = StorageAdapter::new(Memory::new());
+        let mut writes = orphan_storage.new_write_set();
+        writes.put(
+            super::TRACKED_STATE_COMMIT_STATE_SEAL_SPACE,
+            key(super::commit_state_manifest_key(manifest.commit_id)),
+            value(
+                super::commit_state_semantic_seal(&manifest)
+                    .unwrap()
+                    .to_vec(),
+            ),
+        );
+        orphan_storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("orphan seal should commit");
+        let read = orphan_storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("orphan-seal read should open");
+        let error = scan_commit_delta_inventory(&read)
+            .await
+            .expect_err("GC inventory must reject an orphan seal");
+        assert!(
+            error
+                .message
+                .contains("orphan manifest or semantic authority")
         );
     }
 
@@ -10522,7 +12127,7 @@ mod tests {
             bytes: 64,
         };
         let mut writes = storage.new_write_set();
-        stage_commit_state_manifest(&mut writes, &manifest)
+        super::stage_resealed_commit_state_manifest_for_test(&mut writes, &manifest)
             .expect("rootless authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -10539,6 +12144,74 @@ mod tests {
                 .is_none(),
             "a stale derived root must not override rootless authority"
         );
+    }
+
+    #[tokio::test]
+    async fn rootless_rebuild_updates_only_the_mutable_snapshot_accelerator() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut original = commit_state_manifest_fixture();
+        original.snapshot_root = None;
+        original.replay_debt = CommitStateReplayDebt {
+            depth: 1,
+            rows: 1,
+            bytes: 64,
+        };
+        let mut writes = storage.new_write_set();
+        stage_commit_state_manifest(&mut writes, &original)
+            .expect("rootless authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("rootless authority should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("published authority read should open");
+        let published = super::load_published_commit_state_manifest(&read, original.commit_id)
+            .await
+            .expect("published authority should load")
+            .expect("published authority should exist");
+        let rebuilt = TrackedStateCommitRoot {
+            commit_id: original.commit_id,
+            root_id: TrackedStateRootId::new([9; 32]),
+            parent_roots: vec![crate::tracked_state::types::TrackedStateCommitRootParent {
+                commit_id: original.parent_commit_ids[0],
+                root_id: TrackedStateRootId::new([8; 32]),
+            }],
+            changed_key_count: 1,
+            row_count_estimate: 1,
+            tree_height: 1,
+            primary_chunk_count: 1,
+            primary_chunk_bytes: 64,
+        };
+        let mut writes = storage.new_write_set();
+        super::stage_commit_state_snapshot_root_update(
+            &mut writes,
+            &published,
+            Some(rebuilt.clone()),
+        )
+        .expect("snapshot accelerator update should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("snapshot rebuild must not rewrite immutable authority");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rebuilt authority read should open");
+        let loaded = load_commit_state_manifest(&read, original.commit_id)
+            .await
+            .expect("rebuilt manifest should load")
+            .expect("rebuilt manifest should exist");
+        assert_eq!(loaded.snapshot_root, Some(rebuilt));
+        let point = super::load_point_replay_commit_state(&read, original.commit_id)
+            .await
+            .expect("immutable point authority should load")
+            .expect("immutable point authority should exist");
+        assert_eq!(point, original);
     }
 
     #[test]

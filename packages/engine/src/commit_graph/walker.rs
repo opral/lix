@@ -250,7 +250,6 @@ mod tests {
     use crate::storage_adapter::{Memory, StorageKey, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::{
         CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
-        stage_commit_state_manifest,
     };
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
@@ -1056,7 +1055,7 @@ mod tests {
         writes: &mut crate::storage_adapter::StorageWriteSet,
         record: &CommitRecord,
     ) -> Result<(), LixError> {
-        stage_commit_state_manifest(
+        crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
             writes,
             &CommitStateManifest {
                 commit_id: record.commit_id,
@@ -1071,7 +1070,8 @@ mod tests {
                     bytes: record.tracked_state_rootless_bytes,
                 },
                 mutations: CommitStateMutationInventory::default(),
-                current_state_part_sets: Vec::new(),
+                current_state_catalog: None,
+                current_state_coverage_anchor: None,
                 snapshot_root: None,
             },
         )

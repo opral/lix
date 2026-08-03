@@ -30,6 +30,8 @@ use crate::live_state::{
     stage_tracked_working_diff_epoch,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
+#[cfg(test)]
+use crate::tracked_state::stage_commit_state_manifest;
 use crate::tracked_state::{
     CommitDeltaReplacementGeneration, CommitDeltaReplacementScope, CommitStateManifest,
     CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
@@ -37,7 +39,7 @@ use crate::tracked_state::{
     TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
     TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
     encode_key_ref, load_commit_delta_change_records, load_commit_delta_replay_metadata,
-    stage_addressable_commit_deltas, stage_change_locators, stage_commit_state_manifest,
+    stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
 use crate::transaction::staging::{
@@ -50,6 +52,7 @@ use crate::transaction::types::{
     StagedCommitChangeRefs,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::sync::Arc;
 use tracing::Instrument as _;
 
@@ -538,7 +541,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         }
     }
 
-    let staged_delta_index = stage_tracked_commit_delta_index(
+    let staged_delta_index = Box::pin(stage_tracked_commit_delta_index(
         read,
         &mut writes,
         &mut state_rows,
@@ -552,7 +555,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &insert_selection,
         &replacement_generations,
         &ordered_replacements,
-    )
+    ))
     .await?;
 
     let mut rootless_ordered_commits = select_new_rootless_ordered_commits(
@@ -570,28 +573,32 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .collect::<BTreeSet<_>>();
     let mut durable_root_rebuild_parents = BTreeSet::new();
     let mut staged_root_rebuild_commits = BTreeSet::new();
+    let mut external_parent_manifests = BTreeMap::new();
 
-    let staged_commits = stage_changelog_commits(
-        read,
-        &mut writes,
-        &state_rows,
-        &branch_head_changes,
-        &engine_rows,
-        &[],
-        &mut rootless_ordered_commits,
-        &replacement_generation_commits,
-        &mut durable_root_rebuild_parents,
-        &mut staged_root_rebuild_commits,
-        &row_index.tracked_row_indices_by_commit,
-        &commit_rows,
-        &certified_packet_root_rows,
-        &staged_delta_index.inventories,
-        &ordered_replacements,
+    let staged_commits = Box::pin(
+        stage_changelog_commits(
+            read,
+            &mut writes,
+            &state_rows,
+            &branch_head_changes,
+            &engine_rows,
+            &[],
+            &mut rootless_ordered_commits,
+            &replacement_generation_commits,
+            &mut durable_root_rebuild_parents,
+            &mut staged_root_rebuild_commits,
+            &row_index.tracked_row_indices_by_commit,
+            &commit_rows,
+            &certified_packet_root_rows,
+            &staged_delta_index.inventories,
+            &ordered_replacements,
+            &mut external_parent_manifests,
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.materialization.changelog"
+        )),
     )
-    .instrument(tracing::debug_span!(
-        target: "lix_perf",
-        "lix.perf.materialization.changelog"
-    ))
     .await?;
 
     ensure_explicit_branch_ref_targets_exist(read, &explicit_branch_targets, &staged_commits)
@@ -633,34 +640,39 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     )
     .await?;
 
-    let staged_snapshot_roots = stage_tracked_roots(
-        tracked_state,
-        read,
-        &mut writes,
-        &state_rows,
-        &row_index.tracked_row_indices_by_commit,
-        &tracked_roots,
-        &rootless_ordered_commits,
-        &durable_root_rebuild_parents,
-        &staged_root_rebuild_commits,
-        &staged_commits,
-        &insert_selection,
-        &certified_packet_root_rows,
-        &certified_replacement_markers,
+    let staged_snapshot_roots = Box::pin(
+        stage_tracked_roots(
+            tracked_state,
+            read,
+            &mut writes,
+            &state_rows,
+            &row_index.tracked_row_indices_by_commit,
+            &tracked_roots,
+            &rootless_ordered_commits,
+            &durable_root_rebuild_parents,
+            &staged_root_rebuild_commits,
+            &staged_commits,
+            &insert_selection,
+            &certified_packet_root_rows,
+            &certified_replacement_markers,
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.materialization.tracked_roots"
+        )),
     )
-    .instrument(tracing::debug_span!(
-        target: "lix_perf",
-        "lix.perf.materialization.tracked_roots"
-    ))
     .await?;
     stage_commit_state_manifests(
+        read,
         &mut writes,
         &commit_rows,
         &staged_delta_index.inventories,
         &rootless_ordered_commits,
         &staged_commits,
         &staged_snapshot_roots,
-    )?;
+        &external_parent_manifests,
+    )
+    .await?;
     // HOT publication has adapter-specific checkpoint, packed-base, and
     // point-row futures. Keep their combined async state out of the parent
     // commit future so an inactive bulk branch cannot inflate every ordinary
@@ -1074,6 +1086,7 @@ async fn stage_changelog_commits(
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
     mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
+    external_parent_manifests: &mut BTreeMap<CommitId, CommitStateManifest>,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
     let staged_commit_ids = commit_rows
@@ -1118,6 +1131,7 @@ async fn stage_changelog_commits(
                     format!("commit '{commit_id}' has no commit-state authority"),
                 )
             })?;
+        external_parent_manifests.insert(*commit_id, manifest.clone());
         // Replay debt is the durable layout authority. A rootless commit may
         // later gain an immutable snapshot accelerator without changing its
         // changelog topology projection.
@@ -5016,54 +5030,116 @@ async fn stage_tracked_roots(
         .collect())
 }
 
-fn stage_commit_state_manifests(
-    writes: &mut StorageWriteSet,
-    commit_rows: &[FinalizedCommitRow],
-    mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
-    rootless_commit_ids: &BTreeSet<CommitId>,
-    staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
-    snapshot_roots: &BTreeMap<CommitId, TrackedStateCommitRoot>,
-) -> Result<(), LixError> {
-    for commit in commit_rows {
-        let staged = staged_commits.get(&commit.commit_id).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "commit '{}' has no staged topology projection for commit-state publication",
-                    commit.commit_id
-                ),
-            )
-        })?;
-        let record = &staged.record;
-        let rootless = rootless_commit_ids.contains(&commit.commit_id);
-        let snapshot_root = snapshot_roots.get(&commit.commit_id).cloned();
-        if rootless == snapshot_root.is_some() {
+fn stage_commit_state_manifests<'a, S>(
+    read: &'a S,
+    writes: &'a mut StorageWriteSet,
+    commit_rows: &'a [FinalizedCommitRow],
+    mutation_inventories: &'a BTreeMap<CommitId, CommitStateMutationInventory>,
+    rootless_commit_ids: &'a BTreeSet<CommitId>,
+    staged_commits: &'a BTreeMap<CommitId, StagedChangelogCommit>,
+    snapshot_roots: &'a BTreeMap<CommitId, TrackedStateCommitRoot>,
+    external_parent_manifests: &'a BTreeMap<CommitId, CommitStateManifest>,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
+where
+    S: StorageAdapterRead + ?Sized + 'a,
+{
+    Box::pin(async move {
+        let mut published_manifests = BTreeMap::new();
+        if staged_commits.len() != commit_rows.len()
+            || commit_rows
+                .iter()
+                .any(|commit| !staged_commits.contains_key(&commit.commit_id))
+        {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "commit '{}' has inconsistent mutation-journal and snapshot-root publication",
-                    commit.commit_id
-                ),
+                "commit-state publication is missing a staged topology projection",
             ));
         }
-        let mut mutations = mutation_inventories
-            .get(&commit.commit_id)
-            .cloned()
-            .unwrap_or_default();
-        let current_state_part_sets: Vec<_> =
-            crate::tracked_state::stage_complete_replacement_current_state_part_set(
-                writes,
-                record.commit_id,
-                &mutations,
-            )?
-            .into_iter()
-            .collect();
-        if !current_state_part_sets.is_empty() {
-            mutations.parts.clear();
-        }
-        stage_commit_state_manifest(
-            writes,
-            &CommitStateManifest {
+        let mut publication_order = staged_commits.values().collect::<Vec<_>>();
+        publication_order
+            .sort_unstable_by_key(|staged| (staged.record.generation, staged.record.commit_id));
+        for staged in publication_order {
+            let record = &staged.record;
+            let rootless = rootless_commit_ids.contains(&record.commit_id);
+            let snapshot_root = snapshot_roots.get(&record.commit_id).cloned();
+            if rootless == snapshot_root.is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "commit '{}' has inconsistent mutation-journal and snapshot-root publication",
+                        record.commit_id
+                    ),
+                ));
+            }
+            let mut mutations = mutation_inventories
+                .get(&record.commit_id)
+                .cloned()
+                .unwrap_or_default();
+            let first_parent =
+                (record.parent_commit_ids.len() == 1).then(|| record.parent_commit_ids[0]);
+            let staged_parent =
+                first_parent.and_then(|parent_id| published_manifests.get(&parent_id));
+            let external_parent = if staged_parent.is_none() {
+                match first_parent {
+                    Some(parent_id) => {
+                        let published = crate::tracked_state::load_published_commit_state_manifest(
+                            read, parent_id,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "commit '{}' has no published parent authority",
+                                    record.commit_id
+                                ),
+                            )
+                        })?;
+                        if external_parent_manifests.get(&parent_id) != Some(&*published) {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "published parent authority changed during commit staging",
+                            ));
+                        }
+                        Some(published)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let catalog_publication = if record.parent_commit_ids.len() <= 1
+                && mutations.selected_source_commit_id.is_none()
+            {
+                Some(if let Some(parent) = staged_parent {
+                    crate::tracked_state::stage_current_state_catalog_from_staged_parent(
+                        read,
+                        writes,
+                        parent,
+                        record.commit_id,
+                        &mutations,
+                    )
+                    .await?
+                } else {
+                    crate::tracked_state::stage_current_state_catalog_from_published_parent(
+                        read,
+                        writes,
+                        external_parent.as_ref(),
+                        record.commit_id,
+                        &mutations,
+                    )
+                    .await?
+                })
+            } else {
+                None
+            };
+            let (current_state_catalog, current_state_coverage_anchor) = catalog_publication
+                .as_ref()
+                .map_or((None, None), |publication| publication.parts());
+            if mutations.replacement_generation.is_some() {
+                mutations.parts.clear();
+            }
+            let manifest = CommitStateManifest {
                 commit_id: record.commit_id,
                 generation: record.generation,
                 parent_commit_ids: record.parent_commit_ids.clone(),
@@ -5080,12 +5156,23 @@ fn stage_commit_state_manifests(
                     CommitStateReplayDebt::default()
                 },
                 mutations,
-                current_state_part_sets,
+                current_state_catalog,
+                current_state_coverage_anchor,
                 snapshot_root,
-            },
-        )?;
-    }
-    Ok(())
+            };
+            let staged_manifest = if let Some(publication) = catalog_publication.as_ref() {
+                crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
+                    writes,
+                    &manifest,
+                    publication,
+                )?
+            } else {
+                crate::tracked_state::stage_commit_state_manifest_with_handle(writes, &manifest)?
+            };
+            published_manifests.insert(record.commit_id, staged_manifest);
+        }
+        Ok(())
+    })
 }
 
 /// Every current-protocol commit is a root fence.
@@ -6095,7 +6182,8 @@ mod tests {
                     .get(&commit_id)
                     .cloned()
                     .expect("mixed certified inventory should stage"),
-                current_state_part_sets: Vec::new(),
+                current_state_catalog: None,
+                current_state_coverage_anchor: None,
                 snapshot_root: None,
             },
         )
@@ -7972,7 +8060,8 @@ mod tests {
         let mut rootless_commit_ids = BTreeSet::from([CommitId::for_test_label("parent-commit")]);
         let mut durable_root_rebuild_parents = BTreeSet::new();
         let mut staged_root_rebuild_commits = BTreeSet::new();
-        stage_changelog_commits(
+        let mut external_parent_manifests = BTreeMap::new();
+        let staged = stage_changelog_commits(
             &mut read,
             &mut writes,
             &prepared_rows![parent_row, child_row],
@@ -7991,9 +8080,26 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &mut external_parent_manifests,
         )
         .await
         .expect("child-before-parent input should still stage parent first");
+        let mutation_inventories = commits
+            .iter()
+            .map(|commit| (commit.commit_id, CommitStateMutationInventory::default()))
+            .collect::<BTreeMap<_, _>>();
+        stage_commit_state_manifests(
+            &read,
+            &mut writes,
+            &commits,
+            &mutation_inventories,
+            &rootless_commit_ids,
+            &staged,
+            &BTreeMap::new(),
+            &external_parent_manifests,
+        )
+        .await
+        .expect("child-before-parent manifests should publish parent authority first");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -8088,6 +8194,7 @@ mod tests {
         let mut rootless_commit_ids = BTreeSet::from([commit_ids[0]]);
         let mut durable_root_rebuild_parents = BTreeSet::new();
         let mut staged_root_rebuild_commits = BTreeSet::new();
+        let mut external_parent_manifests = BTreeMap::new();
 
         let staged = stage_changelog_commits(
             &mut read,
@@ -8105,6 +8212,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &mut external_parent_manifests,
         )
         .await
         .expect("depth fence should close a fully staged interval");
