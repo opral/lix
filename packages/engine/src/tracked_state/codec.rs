@@ -490,6 +490,24 @@ pub(crate) fn encode_key_ref_into(out: &mut Vec<u8>, key: TrackedStateKeyRef<'_>
     start..out.len()
 }
 
+/// Encodes the dominant one-component string identity without constructing
+/// an owned `EntityPk`. Typed SQL ingress has already certified this physical
+/// identity shape, so membership probes can stay borrowed until journal seal.
+pub(crate) fn encode_single_string_key_ref_into(
+    out: &mut Vec<u8>,
+    schema_key: &str,
+    file_id: Option<&str>,
+    entity_pk: &str,
+) -> Range<usize> {
+    let start = out.len();
+    write_key_string(out, schema_key, KEY_PART_FINAL);
+    write_file_id(out, file_id);
+    out.push(ENTITY_PK_CODEC_V1);
+    out.push(ENTITY_PK_STRING);
+    write_key_bytes(out, entity_pk.as_bytes(), KEY_PART_FINAL);
+    start..out.len()
+}
+
 pub(crate) fn encode_schema_key_prefix(schema_key: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(schema_key.len() + 2);
     write_key_string(&mut out, schema_key, KEY_PART_FINAL);
@@ -2339,6 +2357,20 @@ mod tests {
                 entity_pk: EntityPk::single("entity"),
             }
         );
+    }
+
+    #[test]
+    fn borrowed_single_string_key_encoding_matches_owned_entity_pk() {
+        for value in ["entity", "nul\0escaped", "café"] {
+            let expected = encode_key(&TrackedStateKey {
+                schema_key: "schema".to_string(),
+                file_id: None,
+                entity_pk: EntityPk::single(value),
+            });
+            let mut actual = Vec::new();
+            let encoded = encode_single_string_key_ref_into(&mut actual, "schema", None, value);
+            assert_eq!(&actual[encoded], expected.as_slice());
+        }
     }
 
     #[test]

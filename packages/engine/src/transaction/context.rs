@@ -540,7 +540,8 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
 struct TransactionMutationJournal {
     program: Arc<crate::sql2::PreparedPathValueReplacementProgram>,
     origin_key: Option<SharedStr>,
-    entity_pks: Vec<EntityPk>,
+    identity_arena: Vec<u8>,
+    identity_offsets: Vec<(usize, usize)>,
     snapshot_arena: Vec<u8>,
     snapshot_offsets: Vec<(usize, usize)>,
     timestamp: Option<LixTimestamp>,
@@ -556,8 +557,23 @@ enum PreparedMutationMembership {
 }
 
 impl TransactionMutationJournal {
-    fn last_entity_pk(&self) -> Option<&EntityPk> {
-        self.entity_pks.last()
+    fn len(&self) -> usize {
+        self.identity_offsets.len()
+    }
+
+    fn last_identity(&self) -> Option<&str> {
+        let &(start, end) = self.identity_offsets.last()?;
+        Some(
+            std::str::from_utf8(&self.identity_arena[start..end])
+                .expect("transaction journal identities are appended from str"),
+        )
+    }
+
+    fn append_identity(&mut self, identity: &str) {
+        let start = self.identity_arena.len();
+        self.identity_arena.extend_from_slice(identity.as_bytes());
+        self.identity_offsets
+            .push((start, self.identity_arena.len()));
     }
 }
 
@@ -6374,12 +6390,12 @@ where
             return Ok(None);
         }
         let program = Arc::clone(program);
-        let entity_pk = EntityPk::single(program.primary_key(params)?.to_owned());
+        let primary_key = program.primary_key(params)?;
         if self
             .mutation_journal
             .as_ref()
-            .and_then(TransactionMutationJournal::last_entity_pk)
-            .is_some_and(|last| last >= &entity_pk)
+            .and_then(TransactionMutationJournal::last_identity)
+            .is_some_and(|last| last >= primary_key)
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -6403,6 +6419,7 @@ where
             };
         }
         if !self.prepared_mutation_overlay_empty {
+            let entity_pk = EntityPk::single(primary_key.to_owned());
             if self.staged_writes.staged_identity_may_affect(
                 &self.active_branch_id,
                 &program.schema_key,
@@ -6418,7 +6435,9 @@ where
             self.prepared_mutation_overlay_empty = !self.staged_writes.has_staged_state_rows()?;
         }
         let cached_membership = match &mut self.prepared_mutation_membership {
-            PreparedMutationMembership::Packed(membership) => membership.contains(&entity_pk)?,
+            PreparedMutationMembership::Packed(membership) => {
+                membership.contains_single_string(primary_key)?
+            }
             PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
                 None
             }
@@ -6438,7 +6457,7 @@ where
         debug_assert!(
             fallback_row
                 .as_ref()
-                .is_none_or(|row| row.entity_pk == entity_pk)
+                .is_none_or(|row| row.entity_pk.as_single_string().ok() == Some(primary_key))
         );
         let origin_key = self.origin_key.clone();
         let functions = self.functions.clone();
@@ -6449,7 +6468,8 @@ where
         let journal = journal_slot.get_or_insert_with(|| TransactionMutationJournal {
             program: Arc::clone(&program),
             origin_key: origin_key.clone(),
-            entity_pks: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
+            identity_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
+            identity_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
             snapshot_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
             snapshot_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
             timestamp: None,
@@ -6466,13 +6486,13 @@ where
             }
             None => crate::sql2::append_path_value_replacement_snapshot(
                 &program,
-                program.primary_key(params)?,
+                primary_key,
                 params,
                 &mut journal.snapshot_arena,
             )?,
         };
         let timestamp = *timestamp_slot.get_or_insert_with(|| functions.call_timestamp());
-        journal.entity_pks.push(entity_pk);
+        journal.append_identity(primary_key);
         journal.snapshot_offsets.push(snapshot_offset);
         let journal_timestamp = journal.timestamp.get_or_insert(timestamp);
         debug_assert_eq!(*journal_timestamp, timestamp);
@@ -6508,7 +6528,6 @@ where
         let program = Arc::clone(program);
         let primary_key = program.primary_key_text(params)?;
         let replacement_value = program.replacement_value_text(params)?;
-        let entity_pk = EntityPk::single(primary_key.to_owned());
 
         let same_origin = self
             .mutation_journal
@@ -6518,12 +6537,12 @@ where
             && self
                 .mutation_journal
                 .as_ref()
-                .and_then(TransactionMutationJournal::last_entity_pk)
-                .is_none_or(|last| last < &entity_pk);
+                .and_then(TransactionMutationJournal::last_identity)
+                .is_none_or(|last| last < primary_key);
         let chunk_has_capacity = self
             .mutation_journal
             .as_ref()
-            .is_none_or(|journal| journal.entity_pks.len() < 4_096);
+            .is_none_or(|journal| journal.len() < 4_096);
         if !same_origin || !ordered_append || !chunk_has_capacity {
             self.flush_mutation_journal().await?;
         }
@@ -6539,6 +6558,7 @@ where
             return Ok(None);
         }
         if !self.prepared_mutation_overlay_empty {
+            let entity_pk = EntityPk::single(primary_key.to_owned());
             if self.staged_writes.staged_identity_may_affect(
                 &self.active_branch_id,
                 &program.schema_key,
@@ -6553,7 +6573,7 @@ where
         else {
             unreachable!("packed literal mutation membership was checked above")
         };
-        match membership.contains(&entity_pk)? {
+        match membership.contains_single_string(primary_key)? {
             Some(false) => return Ok(Some(crate::sql2::SqlWriteResult::affected(0))),
             Some(true) => {}
             None => return Ok(None),
@@ -6568,7 +6588,8 @@ where
         let journal = journal_slot.get_or_insert_with(|| TransactionMutationJournal {
             program: Arc::clone(&program),
             origin_key: origin_key.clone(),
-            entity_pks: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
+            identity_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
+            identity_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
             snapshot_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
             snapshot_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
             timestamp: None,
@@ -6581,7 +6602,7 @@ where
             &mut journal.snapshot_arena,
         )?;
         let timestamp = *timestamp_slot.get_or_insert_with(|| functions.call_timestamp());
-        journal.entity_pks.push(entity_pk);
+        journal.append_identity(primary_key);
         journal.snapshot_offsets.push(snapshot_offset);
         let journal_timestamp = journal.timestamp.get_or_insert(timestamp);
         debug_assert_eq!(*journal_timestamp, timestamp);
@@ -6741,12 +6762,11 @@ where
             self.prepared_mutation_program
                 .as_ref()
                 .and_then(|(_, program)| program.primary_key(params).ok())
-                .map(EntityPk::single)
                 .is_none_or(|entity_pk| {
                     self.mutation_journal
                         .as_ref()
-                        .and_then(TransactionMutationJournal::last_entity_pk)
-                        .is_none_or(|last| last < &entity_pk)
+                        .and_then(TransactionMutationJournal::last_identity)
+                        .is_none_or(|last| last < entity_pk)
                 })
         } else {
             false
@@ -6754,7 +6774,7 @@ where
         let chunk_has_capacity = self
             .mutation_journal
             .as_ref()
-            .is_none_or(|journal| journal.entity_pks.len() < 4_096);
+            .is_none_or(|journal| journal.len() < 4_096);
         if !same_program || !same_origin || !ordered_append || !chunk_has_capacity {
             self.flush_mutation_journal().await?;
         }
@@ -6786,13 +6806,13 @@ where
         let Some(journal) = self.mutation_journal.take() else {
             return Ok(());
         };
-        if journal.entity_pks.is_empty() {
+        if journal.identity_offsets.is_empty() {
             return Ok(());
         }
         self.ensure_plugin_generation_read_guard().await;
         #[cfg(feature = "storage-benches")]
         {
-            let row_count = journal.entity_pks.len();
+            let row_count = journal.len();
             crate::storage_bench::record_transaction_rows_staged(row_count);
             crate::storage_bench::record_transaction_untracked_rows(0);
         }
@@ -6802,12 +6822,13 @@ where
                 "non-empty transaction mutation journal has no lifecycle timestamp",
             )
         })?;
-        let chunk = ImmutableMutationJournalChunk::try_new(
+        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
             journal.program.schema_plan_id,
             journal.program.schema_key.as_str().into(),
             self.active_branch_id.clone().into(),
             journal.origin_key,
-            journal.entity_pks,
+            journal.identity_arena,
+            journal.identity_offsets,
             journal.snapshot_arena,
             journal.snapshot_offsets,
             None,
@@ -6907,7 +6928,7 @@ where
         &mut self,
         mut chunk: ImmutableMutationJournalChunk,
     ) -> Result<ImmutableMutationJournalChunk, LixError> {
-        let entity_pks = Arc::clone(chunk.entity_pks());
+        let entity_pks = chunk.materialized_entity_pks();
         let request = LiveStateExactBatchRequest {
             rows: entity_pks
                 .iter()

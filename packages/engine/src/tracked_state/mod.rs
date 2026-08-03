@@ -13,7 +13,7 @@ mod storage;
 mod tree;
 mod types;
 
-pub(crate) use codec::{encode_key_ref, encode_key_ref_into};
+pub(crate) use codec::{encode_key_ref, encode_single_string_key_ref_into};
 pub(crate) use commit_root_rebuild::{
     load_rebuild_plans_to_nearest_available_root, stage_rebuild_plan_with_writer,
 };
@@ -38,8 +38,8 @@ pub(crate) use row_materialization::{
     materialize_batch_from_index_entry_refs,
 };
 pub(crate) use storage::{
-    CommitDeltaChangeLocator, CommitDeltaMember, CommitDeltaPointReadCache,
-    CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
+    CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor, CommitDeltaMember,
+    CommitDeltaPointReadCache, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
     OrderedAddressableCommitDeltaStage, commit_delta_contains_schema, direct_change_locator,
     load_change_record_by_id, load_commit_delta_change_records,
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
@@ -72,6 +72,7 @@ pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateBaseCoordinate, TrackedStateCommitDeltaRef,
     TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateIndexValue,
     TrackedStateReadColumns, TrackedStateRootMutationRef, TrackedStateScanRequest,
+    TrackedStateSingleStringReplacementRef,
 };
 pub(crate) use types::{TrackedStateKey, TrackedStateKeyRef};
 #[cfg(feature = "storage-benches")]

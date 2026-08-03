@@ -928,6 +928,7 @@ fn profile_sql_session_operation(
 ) {
     let mut samples = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
+        maybe_print_profile_rss_phase("before_seed");
         let fixture = if operation.needs_seed() {
             runtime.block_on(sql_session::seeded_fixture_with_read_many_pk_count(
                 profile,
@@ -941,10 +942,14 @@ fn profile_sql_session_operation(
                 read_many_pk_count,
             ))
         };
+        maybe_print_profile_rss_phase("after_seed");
+        reset_allocation_accounting();
         let start = Instant::now();
         let result = runtime.block_on(run_sql_session_operation(operation, &fixture));
         samples.push(start.elapsed());
         black_box(result);
+        maybe_print_profile_rss_phase("after_operation");
+        print_allocation_accounting("operation");
     }
     let profile_layer = if matches!(operation, TransactionBenchOp::ReadAll) {
         format!(

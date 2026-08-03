@@ -1986,7 +1986,7 @@ impl HotStateTransactionCache {
 
 pub(crate) struct PackedIdentityMembership {
     cache: Arc<HotStateTransactionCache>,
-    commit_id: CommitId,
+    cursor: crate::tracked_state::CommitDeltaLiveMembershipCursor,
     schema_key: String,
     live_count: u64,
     ordered_identity_digest: [u8; 32],
@@ -1994,19 +1994,19 @@ pub(crate) struct PackedIdentityMembership {
 }
 
 impl PackedIdentityMembership {
-    pub(crate) fn contains(&mut self, entity_pk: &EntityPk) -> Result<Option<bool>, LixError> {
+    pub(crate) fn contains_single_string(
+        &mut self,
+        entity_pk: &str,
+    ) -> Result<Option<bool>, LixError> {
         self.encoded_key.clear();
-        let encoded = crate::tracked_state::encode_key_ref_into(
+        let encoded = crate::tracked_state::encode_single_string_key_ref_into(
             &mut self.encoded_key,
-            TrackedStateKeyRef {
-                schema_key: &self.schema_key,
-                file_id: None,
-                entity_pk,
-            },
+            &self.schema_key,
+            None,
+            entity_pk,
         );
-        self.cache
-            .commit_delta_points
-            .cached_live_member(self.commit_id, &self.encoded_key[encoded])
+        self.cursor
+            .cached_live_member(&self.cache.commit_delta_points, &self.encoded_key[encoded])
     }
 
     pub(crate) fn complete_generation(&self) -> (u64, [u8; 32]) {
@@ -4024,9 +4024,12 @@ where
         if !certified.is_empty() {
             return Ok(None);
         }
+        let cursor = cache
+            .commit_delta_points
+            .live_membership_cursor(base_ref.commit_id);
         Ok(Some(PackedIdentityMembership {
             cache: Arc::clone(cache),
-            commit_id: base_ref.commit_id,
+            cursor,
             schema_key: schema_key.to_owned(),
             live_count: collection.live_count,
             ordered_identity_digest,

@@ -81,6 +81,23 @@ pub(crate) struct TrackedStateCommitDeltaRef<'a> {
     pub(crate) authored: bool,
 }
 
+/// Typed complete-replacement member produced directly by the transaction
+/// journal's dominant one-column string identity lane. Invalid mutation
+/// states (delete, selected-source payload, origin override) are deliberately
+/// unrepresentable, so immutable replacement parts can be sealed without
+/// constructing an `EntityPk` per row.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrackedStateSingleStringReplacementRef<'a> {
+    pub(crate) schema_key: &'a str,
+    pub(crate) file_id: Option<&'a str>,
+    pub(crate) entity_pk: &'a str,
+    pub(crate) commit_id: CommitId,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
+    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+}
+
 /// One ordered tracked-root mutation with its insert-collision contract.
 ///
 /// Bulk commit assembly keeps this zero-copy form until it has compared the

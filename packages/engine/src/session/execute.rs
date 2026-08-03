@@ -2558,7 +2558,8 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
-        Box::pin(self.execute_with_options_inner(sql, params, ExecuteOptions::default())).await
+        self.execute_with_options_inner(sql, params, ExecuteOptions::default())
+            .await
     }
 
     async fn execute_with_options_inner(

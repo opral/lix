@@ -433,6 +433,21 @@ fn decode_update_string_literals_for_shape<'a>(
         return None;
     }
 
+    // The entity UPDATE lane has exactly two string parameters. Once its
+    // normalized shape is certified, compare the three static SQL spans and
+    // scan only the two quoted values. The generic state machine below is
+    // retained for wider mutation programs, but rerunning it over every byte
+    // of one million homogeneous statements is unnecessary.
+    if parameter_count == 2
+        && let Some((prefix, remainder)) = normalized_shape.split_once("$1")
+        && let Some((middle, suffix)) = remainder.split_once("$2")
+        && !prefix.contains('$')
+        && !middle.contains('$')
+        && !suffix.contains('$')
+    {
+        return decode_two_update_string_literals(sql, prefix, middle, suffix, escape_scratch);
+    }
+
     let bytes = sql.as_bytes();
     let shape = normalized_shape.as_bytes();
     let mut cursor = 0;
@@ -536,6 +551,81 @@ fn decode_update_string_literals_for_shape<'a>(
     }
     Some(
         decoded
+            .into_iter()
+            .map(|value| match value {
+                DecodedUpdateLiteral::Borrowed(value) => Cow::Borrowed(value),
+                DecodedUpdateLiteral::Escaped(index) => {
+                    Cow::Owned(std::mem::take(&mut escape_scratch[index]))
+                }
+            })
+            .collect(),
+    )
+}
+
+fn decode_two_update_string_literals<'a>(
+    sql: &'a str,
+    prefix: &str,
+    middle: &str,
+    suffix: &str,
+    escape_scratch: &mut [String],
+) -> Option<SmallVec<[Cow<'a, str>; 4]>> {
+    fn decode_one<'a>(
+        sql: &'a str,
+        cursor: &mut usize,
+        scratch: &mut String,
+        scratch_index: usize,
+    ) -> Option<DecodedUpdateLiteral<'a>> {
+        let bytes = sql.as_bytes();
+        if bytes.get(*cursor) != Some(&b'\'') {
+            return None;
+        }
+        *cursor += 1;
+        let value_start = *cursor;
+        let mut segment_start = *cursor;
+        let mut escaped = false;
+        loop {
+            let quote = bytes[*cursor..]
+                .iter()
+                .position(|byte| *byte == b'\'')
+                .map(|offset| *cursor + offset)?;
+            if bytes.get(quote + 1) == Some(&b'\'') {
+                if !escaped {
+                    scratch.clear();
+                    scratch.reserve(quote.saturating_sub(value_start).saturating_add(1));
+                    escaped = true;
+                }
+                scratch.push_str(&sql[segment_start..quote]);
+                scratch.push('\'');
+                *cursor = quote + 2;
+                segment_start = *cursor;
+                continue;
+            }
+            *cursor = quote + 1;
+            return if escaped {
+                scratch.push_str(&sql[segment_start..quote]);
+                Some(DecodedUpdateLiteral::Escaped(scratch_index))
+            } else {
+                Some(DecodedUpdateLiteral::Borrowed(&sql[value_start..quote]))
+            };
+        }
+    }
+
+    let bytes = sql.as_bytes();
+    if !bytes.starts_with(prefix.as_bytes()) {
+        return None;
+    }
+    let mut cursor = prefix.len();
+    let first = decode_one(sql, &mut cursor, &mut escape_scratch[0], 0)?;
+    if !bytes[cursor..].starts_with(middle.as_bytes()) {
+        return None;
+    }
+    cursor += middle.len();
+    let second = decode_one(sql, &mut cursor, &mut escape_scratch[1], 1)?;
+    if bytes.get(cursor..) != Some(suffix.as_bytes()) {
+        return None;
+    }
+    Some(
+        [first, second]
             .into_iter()
             .map(|value| match value {
                 DecodedUpdateLiteral::Borrowed(value) => Cow::Borrowed(value),
