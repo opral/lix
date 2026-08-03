@@ -16,7 +16,13 @@ fn plugin_v1_wit_is_valid_and_has_no_guest_document_resource() {
     assert!(wit.contains("apply: func("));
     assert!(wit.contains("output: borrow<transition>"));
     assert!(wit.contains("resolve-conflicts: func("));
-    assert!(wit.contains("entities-changed: func("));
+    assert!(wit.contains("variant transition-request"));
+    assert!(wit.contains("open(open-request)"));
+    assert!(wit.contains("file-changed(file-changed-request)"));
+    assert!(wit.contains("entities-changed(entities-changed-request)"));
+    assert!(wit.contains("restore(restore-request)"));
+    assert!(wit.contains("cold-file-changed(cold-file-changed-request)"));
+    assert!(!wit.contains("path: option<string>"));
     assert!(!wit.contains("resource document"));
     assert!(!wit.contains("resource change-cursor"));
 }
