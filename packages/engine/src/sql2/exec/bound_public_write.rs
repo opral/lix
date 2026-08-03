@@ -3965,7 +3965,6 @@ fn bound_entity_pks_from_primary_key_predicate(
                 return None;
             };
             spec.visible_column(column_name)
-                .filter(|column| column.column_type == EntityColumnType::String)
                 .map(|column| column.name.as_str())
         })
         .collect::<Option<Vec<_>>>()?;
@@ -4042,9 +4041,10 @@ impl BoundPrimaryKeyAnalyzer<'_> {
                 if !self.primary_key_columns.contains(&column.name.as_str()) {
                     return None;
                 }
+                let component_type = self.primary_key_component_type(&column.name)?;
                 let values = values
                     .iter()
-                    .map(|value| bound_primary_key_string(value, self.params))
+                    .map(|value| bound_primary_key_external(value, self.params, component_type))
                     .collect::<Option<std::collections::BTreeSet<_>>>()?;
                 if values.is_empty() {
                     return None;
@@ -4072,13 +4072,25 @@ impl BoundPrimaryKeyAnalyzer<'_> {
         if !self.primary_key_columns.contains(&column.name.as_str()) {
             return None;
         }
-        let value = bound_primary_key_string(value_expr, self.params)?;
+        let component_type = self.primary_key_component_type(&column.name)?;
+        let value = bound_primary_key_external(value_expr, self.params, component_type)?;
         Some(BoundPrimaryKeyConstraint::Parts(
             std::collections::BTreeMap::from([(
                 column.name.clone(),
                 std::collections::BTreeSet::from([value]),
             )]),
         ))
+    }
+
+    fn primary_key_component_type(
+        &self,
+        column: &str,
+    ) -> Option<crate::entity_pk::EntityPkComponentType> {
+        self.primary_key_columns
+            .iter()
+            .position(|candidate| *candidate == column)
+            .and_then(|index| self.primary_key_component_types.get(index))
+            .copied()
     }
 }
 
@@ -4152,14 +4164,32 @@ impl BoundPrimaryKeyConstraint {
     }
 }
 
-fn bound_primary_key_string(expr: &BoundExpr, params: &[Value]) -> Option<String> {
-    match expr {
-        BoundExpr::Literal(BoundLiteral::Text(value)) => Some(value.clone()),
-        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
-            Some(Value::Text(value)) => Some(value.clone()),
+fn bound_primary_key_external(
+    expr: &BoundExpr,
+    params: &[Value],
+    component_type: crate::entity_pk::EntityPkComponentType,
+) -> Option<String> {
+    use crate::entity_pk::EntityPkComponentType;
+
+    match component_type {
+        EntityPkComponentType::Integer => match expr {
+            BoundExpr::Literal(BoundLiteral::Integer(value)) => Some(value.to_string()),
+            BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+                Some(Value::Integer(value)) => Some(value.to_string()),
+                _ => None,
+            },
             _ => None,
         },
-        _ => None,
+        EntityPkComponentType::String
+        | EntityPkComponentType::Uuid
+        | EntityPkComponentType::Bytes => match expr {
+            BoundExpr::Literal(BoundLiteral::Text(value)) => Some(value.clone()),
+            BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+                Some(Value::Text(value)) => Some(value.clone()),
+                _ => None,
+            },
+            _ => None,
+        },
     }
 }
 
@@ -7341,6 +7371,60 @@ mod primary_key_route_tests {
                 EntityPk::single("from-param"),
                 EntityPk::single("literal"),
             ])
+        );
+    }
+
+    #[test]
+    fn routes_typed_integer_primary_key_literals_and_parameters() {
+        let component_types = [crate::entity_pk::EntityPkComponentType::Integer];
+        let analyzer = BoundPrimaryKeyAnalyzer {
+            primary_key_columns: vec!["id"],
+            primary_key_component_types: &component_types,
+            params: &[Value::Integer(42)],
+        };
+        let predicate = BoundPredicate::In {
+            expr: column("id"),
+            values: vec![
+                BoundExpr::Literal(BoundLiteral::Integer(7)),
+                BoundExpr::Param(BoundParamRef { index: 1 }),
+            ],
+        };
+        let expected = ["7", "42"]
+            .into_iter()
+            .map(|value| {
+                EntityPk::from_external_parts(vec![value.to_string()], &component_types)
+                    .expect("integer identity should encode")
+            })
+            .collect();
+
+        assert_eq!(
+            analyzer
+                .analyze_conjunctive_constraint(&predicate)
+                .expect("typed integer predicate should route")
+                .into_entity_pks(
+                    &analyzer.primary_key_columns,
+                    analyzer.primary_key_component_types,
+                )
+                .expect("typed integer predicate should be complete"),
+            expected
+        );
+    }
+
+    #[test]
+    fn integer_primary_key_rejects_text_parameter_pushdown() {
+        let analyzer = BoundPrimaryKeyAnalyzer {
+            primary_key_columns: vec!["id"],
+            primary_key_component_types: &[crate::entity_pk::EntityPkComponentType::Integer],
+            params: &[Value::Text("42".to_string())],
+        };
+
+        assert!(
+            analyzer
+                .analyze_conjunctive_constraint(&equals(
+                    column("id"),
+                    BoundExpr::Param(BoundParamRef { index: 1 }),
+                ))
+                .is_none()
         );
     }
 
