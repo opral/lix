@@ -6,6 +6,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::sql2::catalog::PublicCatalog;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, Value};
+use datafusion::catalog::{
+    CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList,
+    MemorySchemaProvider,
+};
+use datafusion::execution::session_state::SessionState;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use lru::LruCache;
 use smallvec::SmallVec;
@@ -13,6 +21,35 @@ use smallvec::SmallVec;
 const PARSED_STATEMENT_CAPACITY: usize = 256;
 const PUBLIC_CATALOG_CAPACITY: usize = 16;
 const WRITE_PLAN_CAPACITY: usize = 256;
+const READ_PLAN_CAPACITY: usize = 256;
+const READ_SESSION_CAPACITY: usize = 16;
+const READ_PLANNER_CONTRACT: u32 = 1;
+
+#[derive(Clone)]
+pub(crate) struct CachedReadPlan {
+    pub(crate) plan: LogicalPlan,
+    pub(crate) json_predicate_params: std::collections::BTreeSet<usize>,
+    pub(crate) expected_parameter_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ParameterType {
+    Null,
+    Boolean,
+    Integer,
+    Real,
+    Text,
+    Json,
+    Blob,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ReadPlanCacheKey<CatalogKey> {
+    sql: Arc<str>,
+    parameter_types: SmallVec<[ParameterType; 4]>,
+    catalog: CatalogKey,
+    planner_contract: u32,
+}
 
 /// One conservative auto-parameterization of a literal UPDATE statement.
 ///
@@ -30,12 +67,16 @@ pub(crate) struct AutoParameterizedUpdate {
 ///
 /// Parsed statements depend only on the exact SQL text. Bound write plans also
 /// depend on the visible catalog and active branch because binding resolves
-/// public surfaces and injects branch scope. DataFusion plans deliberately do
-/// not belong here: they capture providers tied to one storage snapshot.
+/// public surfaces and injects branch scope. Cached DataFusion read plans are
+/// stripped of snapshot-bound providers and rebound to the current read
+/// session before execution.
 pub(crate) struct SqlPlanningCache<CatalogKey> {
+    datafusion_state: SessionState,
+    read_sessions: Mutex<Vec<SessionContext>>,
     parsed_statements: Mutex<LruCache<Arc<str>, Arc<DataFusionStatement>>>,
     public_catalogs: Mutex<LruCache<CatalogKey, Arc<PublicCatalog>>>,
     write_plans: Mutex<LruCache<WritePlanCacheKey<CatalogKey>, Arc<LogicalWritePlan>>>,
+    read_plans: Mutex<LruCache<ReadPlanCacheKey<CatalogKey>, Arc<CachedReadPlan>>>,
 }
 
 impl<CatalogKey> std::fmt::Debug for SqlPlanningCache<CatalogKey> {
@@ -58,10 +99,13 @@ where
     CatalogKey: Clone + Eq + Hash,
 {
     fn default() -> Self {
-        Self::with_capacities(
+        let session = super::session::new_sql_session_context();
+        Self::with_state_and_capacities(
+            session.state(),
             PARSED_STATEMENT_CAPACITY,
             PUBLIC_CATALOG_CAPACITY,
             WRITE_PLAN_CAPACITY,
+            READ_PLAN_CAPACITY,
         )
     }
 }
@@ -70,6 +114,95 @@ impl<CatalogKey> SqlPlanningCache<CatalogKey>
 where
     CatalogKey: Clone + Eq + Hash,
 {
+    pub(crate) fn datafusion_session(&self) -> SessionContext {
+        let catalogs = Arc::new(MemoryCatalogProviderList::new());
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        catalog
+            .register_schema("public", Arc::new(MemorySchemaProvider::new()))
+            .expect("fresh DataFusion catalog accepts the public schema");
+        catalogs.register_catalog("datafusion".to_string(), catalog);
+        let state = SessionStateBuilder::new_from_existing(self.datafusion_state.clone())
+            .with_catalog_list(catalogs)
+            .build();
+        SessionContext::new_with_state(state)
+    }
+
+    pub(crate) fn datafusion_read_session(&self) -> SessionContext {
+        lock_or_recover(&self.read_sessions)
+            .pop()
+            .unwrap_or_else(|| self.datafusion_session())
+    }
+
+    pub(crate) fn recycle_datafusion_read_session(&self, session: SessionContext) {
+        if let Some(catalog) = session.catalog("datafusion")
+            && let Some(public) = catalog.schema("public")
+        {
+            for table in public.table_names() {
+                let _ = session.deregister_table(datafusion::common::TableReference::full(
+                    "datafusion",
+                    "public",
+                    table,
+                ));
+            }
+        }
+        let state = session.state();
+        let execution_scalar_functions = state
+            .scalar_functions()
+            .keys()
+            .filter(|name| !self.datafusion_state.scalar_functions().contains_key(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let execution_table_functions = state
+            .table_functions()
+            .keys()
+            .filter(|name| !self.datafusion_state.table_functions().contains_key(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(state);
+        for name in execution_scalar_functions {
+            session.deregister_udf(&name);
+        }
+        for name in execution_table_functions {
+            session.deregister_udtf(&name);
+        }
+
+        let mut sessions = lock_or_recover(&self.read_sessions);
+        if sessions.len() < READ_SESSION_CAPACITY {
+            sessions.push(session);
+        }
+    }
+
+    pub(crate) fn read_plan(
+        &self,
+        sql: &str,
+        params: &[Value],
+        catalog: &CatalogKey,
+    ) -> Option<Arc<CachedReadPlan>> {
+        let key = ReadPlanCacheKey::new(sql, params, catalog.clone());
+        lock_or_recover(&self.read_plans).get(&key).cloned()
+    }
+
+    pub(crate) fn remember_read_plan(
+        &self,
+        sql: &str,
+        params: &[Value],
+        catalog: CatalogKey,
+        plan: CachedReadPlan,
+    ) {
+        let key = ReadPlanCacheKey::new(sql, params, catalog);
+        lock_or_recover(&self.read_plans).put(key, Arc::new(plan));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_plan_count(&self) -> usize {
+        lock_or_recover(&self.read_plans).len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_read_plans(&self) {
+        lock_or_recover(&self.read_plans).clear();
+    }
+
     /// Parses exact SQL once and returns an owned clone of the cached AST.
     ///
     /// Parse failures are intentionally not cached. Two concurrent cold calls
@@ -205,15 +338,61 @@ where
         lock_or_recover(&self.write_plans).put(key, Arc::new(plan.clone()));
     }
 
+    #[cfg(test)]
     fn with_capacities(
         parsed_statement_capacity: usize,
         public_catalog_capacity: usize,
         write_plan_capacity: usize,
     ) -> Self {
+        let session = super::session::new_sql_session_context();
+        Self::with_state_and_capacities(
+            session.state(),
+            parsed_statement_capacity,
+            public_catalog_capacity,
+            write_plan_capacity,
+            parsed_statement_capacity,
+        )
+    }
+
+    fn with_state_and_capacities(
+        datafusion_state: SessionState,
+        parsed_statement_capacity: usize,
+        public_catalog_capacity: usize,
+        write_plan_capacity: usize,
+        read_plan_capacity: usize,
+    ) -> Self {
         Self {
+            datafusion_state,
+            read_sessions: Mutex::new(Vec::new()),
             parsed_statements: Mutex::new(LruCache::new(non_zero(parsed_statement_capacity))),
             public_catalogs: Mutex::new(LruCache::new(non_zero(public_catalog_capacity))),
             write_plans: Mutex::new(LruCache::new(non_zero(write_plan_capacity))),
+            read_plans: Mutex::new(LruCache::new(non_zero(read_plan_capacity))),
+        }
+    }
+}
+
+impl<CatalogKey> ReadPlanCacheKey<CatalogKey> {
+    fn new(sql: &str, params: &[Value], catalog: CatalogKey) -> Self {
+        Self {
+            sql: Arc::from(sql),
+            parameter_types: params.iter().map(ParameterType::from).collect(),
+            catalog,
+            planner_contract: READ_PLANNER_CONTRACT,
+        }
+    }
+}
+
+impl From<&Value> for ParameterType {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Boolean(_) => Self::Boolean,
+            Value::Integer(_) => Self::Integer,
+            Value::Real(_) => Self::Real,
+            Value::Text(_) => Self::Text,
+            Value::Json(_) => Self::Json,
+            Value::Blob(_) => Self::Blob,
         }
     }
 }
@@ -708,8 +887,13 @@ fn decode_update_string_literals_with<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
     use crate::sql2::bind_statement;
     use crate::sql2::plan::branch_scope::BranchScope;
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::datasource::empty::EmptyTable;
+    use datafusion::logical_expr::LogicalPlanBuilder;
     use serde_json::json;
 
     fn test_cache(capacity: usize) -> SqlPlanningCache<String> {
@@ -741,6 +925,60 @@ mod tests {
         let statements = lock_or_recover(&cache.parsed_statements);
         assert_eq!(statements.len(), 2);
         assert!(!statements.contains(sql));
+    }
+
+    #[test]
+    fn read_plan_keys_include_parameter_type_and_catalog_and_are_bounded() {
+        let cache = test_cache(2);
+        let plan = || CachedReadPlan {
+            plan: LogicalPlanBuilder::empty(false).build().unwrap(),
+            json_predicate_params: BTreeSet::new(),
+            expected_parameter_count: 1,
+        };
+
+        cache.remember_read_plan("SELECT $1", &[Value::Integer(1)], "a".into(), plan());
+        assert!(
+            cache
+                .read_plan("SELECT $1", &[Value::Integer(2)], &"a".into())
+                .is_some()
+        );
+        assert!(
+            cache
+                .read_plan("SELECT $1", &[Value::Text("2".into())], &"a".into())
+                .is_none()
+        );
+        assert!(
+            cache
+                .read_plan("SELECT $1", &[Value::Integer(2)], &"b".into())
+                .is_none()
+        );
+
+        cache.remember_read_plan("SELECT 2", &[], "a".into(), plan());
+        cache.remember_read_plan("SELECT 3", &[], "a".into(), plan());
+        assert_eq!(cache.read_plan_count(), 2);
+        assert!(
+            cache
+                .read_plan("SELECT $1", &[Value::Integer(1)], &"a".into())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recycled_read_sessions_drop_snapshot_bound_tables() {
+        let cache = test_cache(2);
+        let session = cache.datafusion_read_session();
+        let session_id = session.session_id();
+        session
+            .register_table(
+                "snapshot_table",
+                Arc::new(EmptyTable::new(Arc::new(Schema::empty()))),
+            )
+            .unwrap();
+
+        cache.recycle_datafusion_read_session(session);
+        let recycled = cache.datafusion_read_session();
+        assert_eq!(recycled.session_id(), session_id);
+        assert!(!recycled.table_exist("snapshot_table").unwrap());
     }
 
     #[test]

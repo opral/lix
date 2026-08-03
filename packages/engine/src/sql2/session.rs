@@ -9,7 +9,7 @@ use crate::branch::{BranchHead, BranchRefReader};
 
 use super::branch_ref::CachingBranchRefReader;
 use super::providers;
-use super::udfs::register_sql2_functions;
+use super::udfs::{register_execution_sql2_functions, register_static_sql2_functions};
 use super::{SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext};
 
 pub(crate) async fn build_read_session<C>(
@@ -41,7 +41,7 @@ async fn build_read_session_with_active_head<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let session = new_sql_session_context();
+    let session = ctx.datafusion_read_session();
     let branch_ref: Arc<dyn BranchRefReader> = match active_head.as_ref() {
         Some(head) => {
             if head.branch_id != ctx.active_branch_id() {
@@ -64,7 +64,7 @@ where
             .await?
             .map(|head| head.commit_id.to_string()),
     };
-    register_sql2_functions(
+    register_execution_sql2_functions(
         &session,
         ctx.functions(),
         ctx.active_account_id().to_string(),
@@ -93,14 +93,14 @@ pub(crate) async fn build_transaction_read_session<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let session = new_sql_session_context();
+    let session = read_ctx.datafusion_read_session();
     let read_branch_ref: Arc<dyn BranchRefReader> =
         Arc::new(CachingBranchRefReader::new(read_ctx.branch_ref()));
     let active_branch_commit_id = read_branch_ref
         .load_head(read_ctx.active_branch_id())
         .await?
         .map(|head| head.commit_id.to_string());
-    register_sql2_functions(
+    register_execution_sql2_functions(
         &session,
         read_ctx.functions(),
         read_ctx.active_account_id().to_string(),
@@ -139,7 +139,7 @@ pub(crate) async fn build_write_session_with_options(
     options: SqlWriteSessionOptions,
     provider_selection: &providers::ProviderSelection,
 ) -> Result<SessionContext, LixError> {
-    let session = new_sql_session_context();
+    let session = ctx.datafusion_session();
     let write_ctx = SqlWriteContext::new(ctx)
         .with_explicit_insert_columns(options.explicit_insert_columns.clone());
     let active_branch_id = write_ctx.active_branch_id();
@@ -157,7 +157,7 @@ pub(crate) async fn build_write_session_with_options(
                     "active branch",
                 )
             })?;
-    register_sql2_functions(
+    register_execution_sql2_functions(
         &session,
         write_ctx.functions(),
         write_ctx.active_account_id().to_string(),
@@ -194,5 +194,7 @@ pub(crate) fn new_sql_session_context() -> SessionContext {
     let state = SessionStateBuilder::new_from_existing(base_state)
         .with_physical_optimizer_rules(physical_optimizers)
         .build();
-    SessionContext::new_with_state(state)
+    let session = SessionContext::new_with_state(state);
+    register_static_sql2_functions(&session);
+    session
 }

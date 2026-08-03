@@ -96,6 +96,23 @@ pub(crate) trait SqlExecutionContext: Sync {
     type ReadStore: StorageAdapterRead + Clone + Send + Sync + 'static;
 
     fn active_branch_id(&self) -> &str;
+    fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
+        super::session::new_sql_session_context()
+    }
+    fn datafusion_read_session(&self) -> datafusion::prelude::SessionContext {
+        self.datafusion_session()
+    }
+    async fn sql_planning_environment(
+        &self,
+    ) -> Result<
+        Option<(
+            Arc<super::SqlPlanningCache<crate::catalog::CatalogFingerprint>>,
+            crate::catalog::CatalogFingerprint,
+        )>,
+        LixError,
+    > {
+        Ok(None)
+    }
     fn active_account_id(&self) -> &str {
         crate::ANONYMOUS_ACCOUNT_ID
     }
@@ -152,6 +169,9 @@ pub(crate) trait SqlExecutionContext: Sync {
 #[async_trait]
 pub(crate) trait SqlWriteExecutionContext: Send {
     fn active_branch_id(&self) -> &str;
+    fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
+        super::session::new_sql_session_context()
+    }
     fn active_account_id(&self) -> &str {
         crate::ANONYMOUS_ACCOUNT_ID
     }

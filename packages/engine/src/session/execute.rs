@@ -10093,4 +10093,127 @@ mod tests {
             "tx-origin"
         );
     }
+
+    #[tokio::test]
+    async fn reusable_read_plans_rebind_snapshots_concurrently_and_invalidate_on_catalog_change() {
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized storage should create engine");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("first workspace session should open");
+        let concurrent = engine
+            .open_workspace_session()
+            .await
+            .expect("second workspace session should open");
+        let schema = serde_json::json!({
+            "x-lix-key": "read_plan_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "revision": { "type": "integer" }
+            },
+            "required": ["id", "revision"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("register reusable-plan schema");
+        session
+            .execute(
+                "INSERT INTO read_plan_probe (id, revision) VALUES ('a', 1), ('b', 2)",
+                &[],
+            )
+            .await
+            .expect("seed reusable-plan rows");
+
+        let sql = "SELECT revision FROM read_plan_probe WHERE id = $1 AND revision >= 0";
+        let before = session.sql_planning_cache.read_plan_count();
+        let first = session
+            .execute(sql, &[Value::Text("a".to_string())])
+            .await
+            .expect("cold reusable plan should execute");
+        assert_eq!(first.rows()[0].get::<i64>("revision").unwrap(), 1);
+        assert_eq!(session.sql_planning_cache.read_plan_count(), before + 1);
+
+        let left_params = [Value::Text("a".to_string())];
+        let right_params = [Value::Text("b".to_string())];
+        let (left, right) = tokio::join!(
+            session.execute(sql, &left_params),
+            concurrent.execute(sql, &right_params),
+        );
+        assert_eq!(
+            left.expect("first concurrent cache hit").rows()[0]
+                .get::<i64>("revision")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            right.expect("second concurrent cache hit").rows()[0]
+                .get::<i64>("revision")
+                .unwrap(),
+            2
+        );
+        assert_eq!(session.sql_planning_cache.read_plan_count(), before + 1);
+
+        session
+            .execute(
+                "INSERT INTO read_plan_probe (id, revision) VALUES ('c', 3)",
+                &[],
+            )
+            .await
+            .expect("commit ordinary data revision");
+        let revised = session
+            .execute(sql, &[Value::Text("c".to_string())])
+            .await
+            .expect("cached plan should bind the revised snapshot");
+        assert_eq!(revised.rows()[0].get::<i64>("revision").unwrap(), 3);
+        assert_eq!(session.sql_planning_cache.read_plan_count(), before + 1);
+
+        let added_schema = serde_json::json!({
+            "x-lix-key": "read_plan_catalog_revision",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(added_schema.to_string())],
+            )
+            .await
+            .expect("change the SQL catalog");
+        session
+            .execute(sql, &[Value::Text("c".to_string())])
+            .await
+            .expect("catalog change should compile a new plan");
+        assert_eq!(session.sql_planning_cache.read_plan_count(), before + 2);
+
+        let cached = session
+            .execute(sql, &[Value::Text("c".to_string())])
+            .await
+            .expect("cached differential query");
+        session.sql_planning_cache.clear_read_plans();
+        let uncached = session
+            .execute(sql, &[Value::Text("c".to_string())])
+            .await
+            .expect("uncached DataFusion differential query");
+        assert_eq!(
+            cached.rows()[0].values(),
+            uncached.rows()[0].values(),
+            "cached templates must match a fresh DataFusion plan"
+        );
+    }
 }

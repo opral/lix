@@ -58,9 +58,11 @@ default = ["default_wasm_runtime"]
 checkpoint_backends = [
   "dep:lix_rocksdb_storage",
   "dep:lix_slatedb_storage",
+  "lix_engine/storage-benches",
   "dep:tracing",
   "dep:tracing-subscriber",
 ]
+slatedb_benches = ["dep:lix_slatedb_storage", "lix_engine/storage-benches"]
 default_wasm_runtime = [
   "dep:blake3",
   "dep:lru",
@@ -97,6 +99,12 @@ name = "profile_checkpoint_scale"
 path = "benches/profile_checkpoint_scale.rs"
 harness = false
 required-features = ["checkpoint_backends"]
+
+[[bench]]
+name = "profile_sql_point_queries"
+path = "benches/profile_sql_point_queries.rs"
+harness = false
+required-features = ["slatedb_benches"]
 
 [[example]]
 name = "profile_fs_open"

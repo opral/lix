@@ -964,7 +964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_public_fast_path_preserves_canonical_primary_key_order() {
+    async fn tracked_entity_provider_preserves_canonical_primary_key_order() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -980,9 +980,8 @@ mod tests {
 
         // These values exercise the order-preserving tracked-head codec's
         // edge cases: empty strings, embedded NULs, control bytes, and UTF-8.
-        // The no-LIMIT single-PK query below is the native public-result
-        // shape; the two-key ORDER BY forces the ordinary SQL executor and is
-        // the semantic control.
+        // Compare equivalent orderings to exercise provider projection and
+        // DataFusion ordering over the tracked-head primary-key codec.
         let paths = ["", "\0", "a", "a\0", "a\u{1}", "z", "é"];
         for (index, path) in paths.iter().enumerate() {
             assert_eq!(
@@ -1001,10 +1000,10 @@ mod tests {
             );
         }
 
-        let native_shape = session
+        let primary_order = session
             .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
             .await
-            .expect("native public tracked read should execute");
+            .expect("tracked read should execute");
         let generic_control = session
             .execute(
                 "SELECT path, value FROM json_pointer ORDER BY path, path",
@@ -1012,7 +1011,7 @@ mod tests {
             )
             .await
             .expect("generic ordering control should execute");
-        let native_values = native_shape
+        let primary_values = primary_order
             .rows()
             .iter()
             .map(|row| row.values().to_vec())
@@ -1023,11 +1022,11 @@ mod tests {
             .map(|row| row.values().to_vec())
             .collect::<Vec<_>>();
         assert_eq!(
-            native_values, generic_values,
-            "the direct result must retain the normal SQL order and values"
+            primary_values, generic_values,
+            "equivalent DataFusion orderings must retain the same values"
         );
         assert_eq!(
-            native_shape
+            primary_order
                 .rows()
                 .iter()
                 .map(|row| row.get::<String>("path").expect("tracked row path"))
