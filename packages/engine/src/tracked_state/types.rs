@@ -292,10 +292,6 @@ pub(crate) struct CurrentStatePartDirectoryRoot {
 #[musli(packed)]
 pub(crate) struct CurrentStatePartSet {
     pub(crate) scope: CommitDeltaReplacementScope,
-    /// Commit whose complete-replacement certificate created this entry.
-    /// Reused catalog entries retain this identity, so readers can validate
-    /// directly against the immutable origin instead of walking ancestry.
-    pub(crate) coverage_anchor_commit_id: [u8; 16],
     pub(crate) generation_integrity_digest: [u8; 32],
     /// Binds the current post-image to its coverage anchor and every later
     /// sparse rewrite. For a fresh complete replacement this is derived from
@@ -324,9 +320,10 @@ pub(crate) struct CurrentStateCatalogRoot {
     pub(crate) transition_digest: [u8; 32],
 }
 
-/// Historical binding from a complete-replacement mutation certificate to
-/// its optional serving directory. Descendants refer to this immutable anchor
-/// by commit ID, so authoritative misses never trust an unbound catalog leaf.
+/// Publication-time binding from a complete-replacement mutation certificate
+/// to its serving directory. Descendants authenticate inherited coverage
+/// through their sealed content-addressed catalog root, so readers do not
+/// reload the historical replacement manifest.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CurrentStateCoverageAnchor {

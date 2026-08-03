@@ -28,7 +28,7 @@ pub(crate) const CURRENT_STATE_PART_DIRECTORY_SPACE: StorageSpace = StorageSpace
 );
 pub(crate) const CURRENT_STATE_CATALOG_SPACE: StorageSpace = StorageSpace::immutable(
     StorageSpaceId(0x0004_002d),
-    "tracked_state.current_state_catalog.v1",
+    "tracked_state.current_state_catalog.v2",
 );
 
 const DIRECTORY_NODE_RAW_MAGIC: &[u8; 6] = b"LXC2DR";
@@ -36,8 +36,8 @@ const DIRECTORY_NODE_ZSTD_MAGIC: &[u8; 6] = b"LXC2DZ";
 const DIRECTORY_NODE_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const DIRECTORY_FANOUT: usize = 128;
 const DIRECTORY_HASH_CONTEXT: &str = "lix current-state part directory node v2";
-const CATALOG_NODE_MAGIC: &[u8; 6] = b"LXCSCR";
-const CATALOG_HASH_CONTEXT: &str = "lix current-state catalog node v1";
+const CATALOG_NODE_MAGIC: &[u8; 6] = b"LXCSC2";
+const CATALOG_HASH_CONTEXT: &str = "lix current-state catalog node v2";
 const CURRENT_STATE_LINEAGE_CONTEXT: &str = "lix current-state lineage v2";
 const CATALOG_TRANSITION_CONTEXT: &str = "lix current-state catalog transition v1";
 const CATALOG_LEAF_MAX_ENTRIES: usize = 128;
@@ -103,7 +103,6 @@ pub(crate) fn stage_complete_replacement_current_state_part_set(
         fresh_current_state_lineage_digest(commit_id, generation.integrity_digest, &directory);
     Ok(Some(CurrentStatePartSet {
         scope: generation.scope.clone(),
-        coverage_anchor_commit_id: *commit_id.as_uuid().as_bytes(),
         generation_integrity_digest: generation.integrity_digest,
         state_lineage_digest,
         directory,
@@ -368,7 +367,6 @@ pub(crate) async fn validate_current_state_catalog_transition_root(
             .as_ref()
             .map(|anchor| CurrentStatePartSet {
                 scope: anchor.scope.clone(),
-                coverage_anchor_commit_id: *state.commit_id.as_uuid().as_bytes(),
                 generation_integrity_digest: anchor.generation_integrity_digest,
                 state_lineage_digest: anchor.state_lineage_digest,
                 directory: anchor.directory.clone(),
@@ -1593,7 +1591,6 @@ fn validate_catalog_node(node: &CatalogNode) -> Result<(), LixError> {
                 && entry.directory.part_count > 0
                 && entry.directory.tree_height > 0;
             entry.scope.schema_key.is_empty()
-                || entry.coverage_anchor_commit_id == [0; 16]
                 || entry.generation_integrity_digest == [0; 32]
                 || entry.state_lineage_digest == [0; 32]
                 || !(valid_empty_directory || valid_nonempty_directory)
@@ -3111,7 +3108,6 @@ mod tests {
                 schema_key: format!("schema-{index:05}"),
                 file_id: Some(format!("file-{:03}", index % 100)),
             },
-            coverage_anchor_commit_id: [1; 16],
             generation_integrity_digest: [2; 32],
             state_lineage_digest: [3; 32],
             directory: CurrentStatePartDirectoryRoot {

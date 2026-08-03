@@ -670,7 +670,7 @@ where
                     )
                     .await
                 } else {
-                    super::storage::load_complete_current_state_values_from_replay_manifest(
+                    super::storage::load_complete_current_state_values_from_published_replay_manifest(
                         &read,
                         &state,
                         std::slice::from_ref(&self.encoded_key),

@@ -62,9 +62,7 @@ pub(crate) use storage::{
     stage_commit_state_manifest_with_handle, stage_current_state_catalog_from_published_parent,
     stage_current_state_catalog_from_staged_parent, stage_delete_change_locators,
     stage_delete_commit_delta_inventory_entry, stage_ordered_addressable_commit_deltas,
-    stage_ordered_addressable_replacement_parts,
-    validate_current_state_catalog_entry_against_authority,
-    validate_current_state_catalog_parent_manifest,
+    stage_ordered_addressable_replacement_parts, validate_current_state_catalog_parent_manifest,
 };
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{

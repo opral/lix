@@ -988,7 +988,7 @@ struct PointReplayCommit {
     root_id: Option<TrackedStateRootId>,
     rootless: bool,
     replacement_generation: Option<storage::CommitDeltaReplacementGeneration>,
-    state_manifest: Arc<super::CommitStateManifest>,
+    state_manifest: Arc<storage::AuthenticatedReplayCommitStateManifest>,
 }
 
 /// One immutable first-parent interval shared by every cached suffix view.
