@@ -124,6 +124,7 @@ where
             .as_ref()
             .is_some_and(SessionWriteAccess::serializes_collaboration_writes);
         let operation_guard = self.begin_session_commit_operation()?;
+        self.transaction_mut()?.flush_prepared_mutations().await?;
         let transaction = self
             .transaction
             .take()

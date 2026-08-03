@@ -114,10 +114,11 @@ use crate::transaction::stale_commit::{
     StaleCommitPlan, StalePluginReconciliationPlan, classify_stale_commit,
 };
 use crate::transaction::types::{
-    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, PreparedRowFacts,
-    PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
-    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileData, TransactionJson,
-    TransactionWrite, TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
+    CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
+    CertifiedRawWriteBatchPreparation, PreparedRowFacts, PreparedStateBatch,
+    PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef, StagedCommitChangeBatch,
+    StagedCommitChangeBatchBuilder, TransactionFileData, TransactionJson, TransactionWrite,
+    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteOutcome, TransactionWriteRow, canonicalize_transaction_json_batch,
     stage_json_from_value,
 };
@@ -483,6 +484,16 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// to SQL planning only after commit opens a new transaction snapshot.
     sql_schema_snapshot: Arc<CatalogSnapshot>,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
+    prepared_mutation_program: Option<(
+        Arc<str>,
+        Arc<crate::sql2::PreparedPathValueReplacementProgram>,
+    )>,
+    prepared_mutation_membership: PreparedMutationMembership,
+    /// One logical timestamp for a homogeneous columnar mutation generation.
+    /// Immutable replacement parts require their post-image rows to share the
+    /// same lifecycle boundary, so sealing must not preserve per-call clocks.
+    prepared_mutation_timestamp: Option<LixTimestamp>,
+    mutation_journal: Option<TransactionMutationJournal>,
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
@@ -516,6 +527,27 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
     plugin_generation_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     plugin_generation_upgrade_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+struct TransactionMutationJournal {
+    program: Arc<crate::sql2::PreparedPathValueReplacementProgram>,
+    origin_key: Option<SharedStr>,
+    entity_pks: Vec<EntityPk>,
+    snapshot_arena: Vec<u8>,
+    snapshot_offsets: Vec<(usize, usize)>,
+    timestamp: Option<LixTimestamp>,
+}
+
+enum PreparedMutationMembership {
+    Unprepared,
+    Unavailable,
+    Packed(crate::live_state::PackedIdentityMembership),
+}
+
+impl TransactionMutationJournal {
+    fn last_entity_pk(&self) -> Option<&EntityPk> {
+        self.entity_pks.last()
+    }
 }
 
 /// One already-resolved tracked-state transition. The expected side is
@@ -1326,6 +1358,10 @@ where
                 schema_resolver,
                 sql_schema_snapshot: sql_schema_catalog,
                 sql_planning_cache,
+                prepared_mutation_program: None,
+                prepared_mutation_membership: PreparedMutationMembership::Unprepared,
+                prepared_mutation_timestamp: None,
+                mutation_journal: None,
                 staged_writes,
                 filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
                 filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
@@ -6284,6 +6320,264 @@ where
             &plan,
         );
         Ok(crate::sql2::create_write_logical_plan_from_template(plan))
+    }
+
+    pub(crate) async fn try_execute_prepared_mutation(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<crate::sql2::SqlWriteResult>, LixError> {
+        let Some((cached_sql, program)) = self.prepared_mutation_program.as_ref() else {
+            return Ok(None);
+        };
+        if cached_sql.as_ref() != sql {
+            return Ok(None);
+        }
+        let program = Arc::clone(program);
+        let entity_pk = EntityPk::single(program.primary_key(params)?.to_owned());
+        if self
+            .mutation_journal
+            .as_ref()
+            .and_then(TransactionMutationJournal::last_entity_pk)
+            .is_some_and(|last| last >= &entity_pk)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "prepared mutation order barrier was not flushed before statement checkpoint",
+            ));
+        }
+        if matches!(
+            self.prepared_mutation_membership,
+            PreparedMutationMembership::Unprepared
+        ) {
+            let read = self.opening_read();
+            let base = self
+                .live_state
+                .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
+            self.prepared_mutation_membership = match base
+                .prepare_packed_identity_membership(&self.active_branch_id, &program.schema_key)
+                .await?
+            {
+                Some(membership) => PreparedMutationMembership::Packed(membership),
+                None => PreparedMutationMembership::Unavailable,
+            };
+        }
+        let cached_membership = match &mut self.prepared_mutation_membership {
+            PreparedMutationMembership::Packed(membership) => membership.contains(&entity_pk)?,
+            PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
+                None
+            }
+        };
+        let fallback_row = match cached_membership {
+            Some(false) => return Ok(Some(crate::sql2::SqlWriteResult::affected(0))),
+            Some(true) => None,
+            None => {
+                let Some(row) =
+                    crate::sql2::prepare_path_value_replacement_row(self, &program, params).await?
+                else {
+                    return Ok(Some(crate::sql2::SqlWriteResult::affected(0)));
+                };
+                Some(row)
+            }
+        };
+        debug_assert!(
+            fallback_row
+                .as_ref()
+                .is_none_or(|row| row.entity_pk == entity_pk)
+        );
+        let origin_key = self.origin_key.clone();
+        let functions = self.functions.clone();
+        let (journal_slot, timestamp_slot) = (
+            &mut self.mutation_journal,
+            &mut self.prepared_mutation_timestamp,
+        );
+        let journal = journal_slot.get_or_insert_with(|| TransactionMutationJournal {
+            program: Arc::clone(&program),
+            origin_key: origin_key.clone(),
+            entity_pks: Vec::with_capacity(4_096),
+            snapshot_arena: Vec::with_capacity(4_096 * 64),
+            snapshot_offsets: Vec::with_capacity(4_096),
+            timestamp: None,
+        });
+        debug_assert!(Arc::ptr_eq(&journal.program, &program));
+        debug_assert_eq!(journal.origin_key, origin_key);
+        let snapshot_offset = match fallback_row {
+            Some(row) => {
+                let start = journal.snapshot_arena.len();
+                journal
+                    .snapshot_arena
+                    .extend_from_slice(row.snapshot.normalized().as_bytes());
+                (start, journal.snapshot_arena.len())
+            }
+            None => crate::sql2::append_path_value_replacement_snapshot(
+                &program,
+                program.primary_key(params)?,
+                params,
+                &mut journal.snapshot_arena,
+            )?,
+        };
+        let timestamp = *timestamp_slot.get_or_insert_with(|| functions.call_timestamp());
+        journal.entity_pks.push(entity_pk);
+        journal.snapshot_offsets.push(snapshot_offset);
+        let journal_timestamp = journal.timestamp.get_or_insert(timestamp);
+        debug_assert_eq!(*journal_timestamp, timestamp);
+        Ok(Some(crate::sql2::SqlWriteResult::affected(1)))
+    }
+
+    pub(crate) fn prepared_mutation_matches(&self, sql: &str) -> bool {
+        self.prepared_mutation_program
+            .as_ref()
+            .is_some_and(|(cached_sql, _)| cached_sql.as_ref() == sql)
+    }
+
+    pub(crate) fn remember_prepared_mutation(
+        &mut self,
+        sql: &str,
+        plan: &crate::sql2::SqlLogicalPlan,
+    ) -> Result<(), LixError> {
+        let domain = Domain::schema_catalog(self.active_branch_id.clone(), false);
+        if self
+            .staged_writes
+            .has_staged_schema_catalog_change(&domain)?
+        {
+            self.prepared_mutation_program = None;
+            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
+            self.prepared_mutation_timestamp = None;
+            return Ok(());
+        }
+        self.prepared_mutation_program =
+            crate::sql2::prepare_path_value_replacement_program(self, plan)
+                .map(|program| (Arc::<str>::from(sql), Arc::new(program)));
+        self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
+        self.prepared_mutation_timestamp = None;
+        Ok(())
+    }
+
+    pub(crate) async fn flush_prepared_mutations(&mut self) -> Result<(), LixError> {
+        let complete_generation = match (
+            &self.prepared_mutation_program,
+            &self.prepared_mutation_membership,
+        ) {
+            (Some((_, program)), PreparedMutationMembership::Packed(membership)) => Some((
+                program.schema_key.clone(),
+                self.active_branch_id.clone(),
+                membership.complete_generation(),
+            )),
+            (
+                _,
+                PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable,
+            )
+            | (None, PreparedMutationMembership::Packed(_)) => None,
+        };
+        self.flush_mutation_journal().await?;
+        if let Some((schema_key, branch_id, (live_count, ordered_identity_digest))) =
+            complete_generation
+        {
+            self.staged_writes.certify_complete_collection_replacement(
+                schema_key.as_str(),
+                &branch_id,
+                live_count,
+                ordered_identity_digest,
+            )?;
+        }
+        self.prepared_mutation_program = None;
+        self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
+        self.prepared_mutation_timestamp = None;
+        Ok(())
+    }
+
+    pub(crate) async fn flush_prepared_mutation_barrier(
+        &mut self,
+        next_sql: &str,
+        next_origin_key: Option<&str>,
+        params: &[Value],
+    ) -> Result<(), LixError> {
+        let same_program = self
+            .prepared_mutation_program
+            .as_ref()
+            .is_some_and(|(sql, _)| sql.as_ref() == next_sql);
+        let same_origin = self
+            .mutation_journal
+            .as_ref()
+            .is_none_or(|journal| journal.origin_key.as_deref() == next_origin_key);
+        let ordered_append = if same_program
+            && same_origin
+            && self
+                .mutation_journal
+                .as_ref()
+                .is_none_or(|journal| journal.entity_pks.len() < 4_096)
+        {
+            self.prepared_mutation_program
+                .as_ref()
+                .and_then(|(_, program)| program.primary_key(params).ok())
+                .map(EntityPk::single)
+                .is_none_or(|entity_pk| {
+                    self.mutation_journal
+                        .as_ref()
+                        .and_then(TransactionMutationJournal::last_entity_pk)
+                        .is_none_or(|last| last < &entity_pk)
+                })
+        } else {
+            false
+        };
+        if !same_program || !same_origin || !ordered_append {
+            self.flush_mutation_journal().await?;
+        }
+        if !same_program {
+            self.prepared_mutation_program = None;
+            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
+            self.prepared_mutation_timestamp = None;
+        }
+        Ok(())
+    }
+
+    async fn flush_mutation_journal(&mut self) -> Result<(), LixError> {
+        let Some(journal) = self.mutation_journal.take() else {
+            return Ok(());
+        };
+        if journal.entity_pks.is_empty() {
+            return Ok(());
+        }
+        self.ensure_plugin_generation_read_guard().await;
+        #[cfg(feature = "storage-benches")]
+        {
+            let row_count = journal.entity_pks.len();
+            crate::storage_bench::record_transaction_rows_staged(row_count);
+            crate::storage_bench::record_transaction_untracked_rows(0);
+        }
+        let rows = CertifiedParameterReplacementBatch::new(
+            journal.entity_pks,
+            TransactionJson::from_certified_row_content_arena(
+                journal.snapshot_arena,
+                journal.snapshot_offsets,
+            )?,
+            journal.program.schema_key.as_str().into(),
+            self.active_branch_id.clone().into(),
+            CertifiedRawWriteBatchPreparation {
+                schema_plan_id: journal.program.schema_plan_id,
+                facts: PreparedRowFacts {
+                    row_content_validated: true,
+                    requires_transaction_validation: false,
+                },
+                tracked_keys_strictly_ordered: true,
+                complete_collection_replacement: None,
+            },
+        )?
+        .into_dense_prepared(
+            journal.origin_key.as_ref(),
+            journal.timestamp.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "non-empty transaction mutation journal has no lifecycle timestamp",
+                )
+            })?,
+        )?;
+        self.staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows,
+            })?;
+        Ok(())
     }
 
     /// Returns this transaction's prepared runtime functions.

@@ -95,6 +95,38 @@ pub(crate) enum SqlLogicalPlan {
     Write(SqlWriteLogicalPlan),
 }
 
+pub(crate) fn prepare_path_value_replacement_program(
+    ctx: &dyn crate::sql2::SqlWriteExecutionContext,
+    plan: &SqlLogicalPlan,
+) -> Option<bound_public_write::PreparedPathValueReplacementProgram> {
+    let SqlLogicalPlan::Write(write) = plan else {
+        return None;
+    };
+    bound_public_write::prepare_path_value_replacement_program_from_logical(ctx, &write.plan)
+}
+
+pub(crate) async fn prepare_path_value_replacement_row(
+    ctx: &mut dyn crate::sql2::SqlWriteExecutionContext,
+    program: &bound_public_write::PreparedPathValueReplacementProgram,
+    params: &[crate::Value],
+) -> Result<Option<bound_public_write::PreparedPathValueReplacementRow>, crate::LixError> {
+    bound_public_write::prepare_path_value_replacement_row(ctx, program, params).await
+}
+
+pub(crate) fn append_path_value_replacement_snapshot(
+    program: &bound_public_write::PreparedPathValueReplacementProgram,
+    primary_key: &str,
+    params: &[crate::Value],
+    normalized: &mut Vec<u8>,
+) -> Result<(usize, usize), crate::LixError> {
+    bound_public_write::append_path_value_replacement_snapshot(
+        program,
+        primary_key,
+        params,
+        normalized,
+    )
+}
+
 #[cfg(test)]
 pub(crate) use bound_public_write::{
     take_certified_entity_insert_batch_executions,
