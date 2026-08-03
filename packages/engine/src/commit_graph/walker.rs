@@ -364,7 +364,7 @@ mod tests {
                 tracked_state_rootless_rows: 0,
                 tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label("mismatched-key-change"),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
             })
             .expect("mismatched commit should encode"),
@@ -407,7 +407,7 @@ mod tests {
                 tracked_state_rootless_rows: 0,
                 tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label(&format!("{label}-change")),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
             };
             writes.put(
@@ -701,7 +701,7 @@ mod tests {
             tracked_state_rootless_rows: 0,
             tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label("commit-child-change"),
-            author_account_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
         };
         writes.put(
@@ -1031,7 +1031,7 @@ mod tests {
                 tracked_state_rootless_rows: 0,
                 tracked_state_rootless_bytes: 0,
                 change_id: change.change.id,
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
             });
             generations.insert(typed_commit_id, generation);
@@ -1062,7 +1062,7 @@ mod tests {
                 generation: record.generation,
                 parent_commit_ids: record.parent_commit_ids.clone(),
                 commit_change_id: record.change_id,
-                author_account_ids: record.author_account_ids.clone(),
+                account_id: record.account_id.clone(),
                 created_at: record.created_at,
                 replay_debt: CommitStateReplayDebt {
                     depth: record.tracked_state_rootless_depth,
@@ -1087,6 +1087,7 @@ mod tests {
         TestCommitChange {
             change: CommitGraphChange {
                 id: ChangeId::for_test_label(change_id),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single(commit_id),
                 schema_key: "lix_commit".to_string(),
                 file_id: None,

@@ -31,7 +31,7 @@ fn stage_bench_commit_deltas(
             generation: 0,
             parent_commit_ids: Vec::new(),
             commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:bench-commit")),
-            author_account_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
             replay_debt: CommitStateReplayDebt {
                 depth: 1,
@@ -186,6 +186,7 @@ where
         &mut writes,
         None,
         parent_id,
+        crate::ANONYMOUS_ACCOUNT_ID,
         &parent_mutations,
     )
     .await
@@ -268,6 +269,7 @@ where
             &mut authority_writes,
             Some(&published_parent),
             authority_commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
             &mutations,
         )
         .await
@@ -345,6 +347,7 @@ where
             &mut refresh_writes,
             Some(&published_parent),
             refresh_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
             &refresh_mutations,
         )
         .await
@@ -456,6 +459,7 @@ where
             &mut writes,
             Some(&published_parent),
             commit_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
             &mut mutations,
         )
         .await
@@ -828,7 +832,7 @@ fn bench_current_state_manifest(
         generation: 0,
         parent_commit_ids: parent_commit_id.into_iter().collect(),
         commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:bench-state")),
-        author_account_ids: Vec::new(),
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
         replay_debt: CommitStateReplayDebt {
             depth: replay_depth,

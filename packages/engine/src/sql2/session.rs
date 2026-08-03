@@ -67,6 +67,7 @@ where
     register_sql2_functions(
         &session,
         ctx.functions(),
+        ctx.active_account_id().to_string(),
         Some(ctx.active_branch_id().to_string()),
         active_branch_commit_id.clone(),
     );
@@ -102,6 +103,7 @@ where
     register_sql2_functions(
         &session,
         read_ctx.functions(),
+        read_ctx.active_account_id().to_string(),
         Some(read_ctx.active_branch_id().to_string()),
         active_branch_commit_id.clone(),
     );
@@ -158,6 +160,7 @@ pub(crate) async fn build_write_session_with_options(
     register_sql2_functions(
         &session,
         write_ctx.functions(),
+        write_ctx.active_account_id().to_string(),
         Some(active_branch_id),
         Some(active_branch_commit_id.commit_id.to_string()),
     );

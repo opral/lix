@@ -2816,7 +2816,7 @@ mod tests {
                 tracked_state_rootless_rows: 0,
                 tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label(&commit_change_id),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
             };
             records.insert(record.commit_id, record.clone());
@@ -2853,7 +2853,7 @@ mod tests {
                     generation: record.generation,
                     parent_commit_ids: record.parent_commit_ids.clone(),
                     commit_change_id: record.change_id,
-                    author_account_ids: record.author_account_ids.clone(),
+                    account_id: record.account_id.clone(),
                     created_at: record.created_at,
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: Default::default(),
@@ -3058,7 +3058,7 @@ mod tests {
                 tracked_state_rootless_rows: 0,
                 tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label(&format!("{commit_id}:change")),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
             });
         }
@@ -3077,7 +3077,7 @@ mod tests {
                     generation: record.generation,
                     parent_commit_ids: record.parent_commit_ids,
                     commit_change_id: record.change_id,
-                    author_account_ids: record.author_account_ids,
+                    account_id: record.account_id,
                     created_at: record.created_at,
                     replay_debt: CommitStateReplayDebt {
                         depth: record.tracked_state_rootless_depth,
@@ -3243,7 +3243,7 @@ mod tests {
                 tracked_state_rootless_rows: 0,
                 tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label(&commit_change_id),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: commit_created_at,
             };
             let mut append = ChangelogAppend::default();
@@ -3299,7 +3299,7 @@ mod tests {
                     generation: record.generation,
                     parent_commit_ids: record.parent_commit_ids,
                     commit_change_id: record.change_id,
-                    author_account_ids: record.author_account_ids,
+                    account_id: record.account_id,
                     created_at: record.created_at,
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations: mutation_inventory,

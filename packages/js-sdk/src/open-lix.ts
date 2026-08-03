@@ -4,6 +4,7 @@ import {
 } from "./errors.js";
 import type { LixBinding } from "./binding-types.js";
 import {
+	ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
 	ACTIVE_BRANCH_CLIENT_STATE_KEY,
 	openClientState,
 	openStoredClientState,
@@ -124,19 +125,29 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 		const restoredBranchId = clientState.get<string>(
 			ACTIVE_BRANCH_CLIENT_STATE_KEY,
 		);
+		const restoredAccountId = clientState.get<string>(
+			ACTIVE_ACCOUNT_CLIENT_STATE_KEY,
+		);
 		let remoteBinding: LixBinding | undefined;
 		try {
 			try {
 				remoteBinding = await openRemoteLixBinding(options.server, {
 					initialActiveBranchId: restoredBranchId,
+					initialActiveAccountId: restoredAccountId,
 				});
 			} catch (error) {
 				if (!restoredBranchId || !isBranchNotFoundError(error)) throw error;
-				remoteBinding = await openRemoteLixBinding(options.server);
+				remoteBinding = await openRemoteLixBinding(options.server, {
+					initialActiveAccountId: restoredAccountId,
+				});
 			}
 			const activeBranchId = await remoteBinding.activeBranchId();
+			const activeAccountId = await remoteBinding.activeAccountId();
 			if (activeBranchId !== restoredBranchId) {
 				await clientState.set(ACTIVE_BRANCH_CLIENT_STATE_KEY, activeBranchId);
+			}
+			if (activeAccountId !== restoredAccountId) {
+				await clientState.set(ACTIVE_ACCOUNT_CLIENT_STATE_KEY, activeAccountId);
 			}
 			return new Lix(remoteBinding, clientState);
 		} catch (error) {

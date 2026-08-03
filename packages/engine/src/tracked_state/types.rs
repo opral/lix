@@ -400,8 +400,7 @@ pub(crate) struct CommitStateManifest {
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
     pub(crate) commit_change_id: ChangeId,
-    #[musli(with = crate::storage_codec::id_string_seq)]
-    pub(crate) author_account_ids: Vec<String>,
+    pub(crate) account_id: String,
     pub(crate) created_at: LixTimestamp,
     pub(crate) replay_debt: CommitStateReplayDebt,
     pub(crate) mutations: CommitStateMutationInventory,

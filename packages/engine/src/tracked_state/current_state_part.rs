@@ -246,6 +246,7 @@ pub(super) async fn stage_current_state_catalog(
     writes: &mut StorageWriteSet,
     parent: Option<&CommitStateManifest>,
     commit_id: CommitId,
+    account_id: &str,
     inventory: &CommitStateMutationInventory,
 ) -> Result<CertifiedCurrentStateCatalogPublication, LixError> {
     let replacement =
@@ -293,6 +294,7 @@ pub(super) async fn stage_current_state_catalog(
                         writes,
                         &parent_entry,
                         commit_id,
+                        account_id,
                         inventory,
                     )
                     .await?
@@ -350,6 +352,7 @@ pub(crate) async fn validate_current_state_catalog_transition_root(
             &mut writes,
             parent,
             state.commit_id,
+            &state.account_id,
             &state.mutations,
         )
         .await?;

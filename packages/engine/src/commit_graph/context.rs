@@ -370,6 +370,7 @@ where
 fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphChange {
     CommitGraphChange {
         id: change.change_id,
+        account_id: change.account_id,
         entity_pk: change.entity_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
@@ -404,7 +405,7 @@ fn commit_graph_node_from_authority(
         || record.generation != manifest.generation
         || record.parent_commit_ids != manifest.parent_commit_ids
         || record.change_id != manifest.commit_change_id
-        || record.author_account_ids != manifest.author_account_ids
+        || record.account_id != manifest.account_id
         || record.created_at != manifest.created_at
         || record.tracked_state_rootless != manifest_rootless
         || record.tracked_state_rootless_depth != manifest.replay_debt.depth
@@ -421,6 +422,7 @@ fn commit_graph_node_from_authority(
     Ok(Some(CommitGraphNode {
         commit_id: manifest.commit_id,
         change_id: manifest.commit_change_id,
+        account_id: manifest.account_id,
         generation: manifest.generation,
         parent_commit_ids: manifest.parent_commit_ids,
         created_at: manifest.created_at,
@@ -497,6 +499,7 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
         .expect("lix_commit snapshot serialization should not fail");
     CommitGraphChange {
         id: node.change_id,
+        account_id: node.account_id.clone(),
         entity_pk: EntityPk::uuid_from_canonical(&node.commit_id.to_string())
             .expect("commit IDs are canonical UUIDs"),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
@@ -660,7 +663,7 @@ mod tests {
                 generation: 0,
                 parent_commit_ids: Vec::new(),
                 commit_change_id: change_id("retained-payload-authority-change"),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
                 replay_debt: CommitStateReplayDebt {
                     depth: 1,
@@ -1003,7 +1006,7 @@ mod tests {
                     tracked_state_rootless_rows: 3,
                     tracked_state_rootless_bytes: 0,
                     change_id: change_id("selected-tombstone-commit-change"),
-                    author_account_ids: Vec::new(),
+                    account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at,
                 }],
             })
@@ -1071,7 +1074,7 @@ mod tests {
                 generation: 0,
                 parent_commit_ids: Vec::new(),
                 commit_change_id: change_id("selected-tombstone-commit-change"),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at,
                 replay_debt: CommitStateReplayDebt {
                     depth: 1,
@@ -1384,6 +1387,7 @@ mod tests {
             Self {
                 change: CommitGraphChange {
                     id: ChangeId::for_test_label(change_id),
+                    account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     entity_pk: crate::entity_pk::EntityPk::single(commit_id),
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                     file_id: None,
@@ -1414,6 +1418,7 @@ mod tests {
             Self {
                 change: CommitGraphChange {
                     id: ChangeId::for_test_label(change_id),
+                    account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
                     schema_key: schema_key.to_string(),
                     file_id: file_id.map(str::to_string),
@@ -1510,7 +1515,7 @@ mod tests {
                     .expect("test member count should fit u64"),
                 tracked_state_rootless_bytes: 0,
                 change_id: change.change.id,
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
             });
             commit_members.push((commit_id, members));
@@ -1574,7 +1579,7 @@ mod tests {
                 generation: record.generation,
                 parent_commit_ids: record.parent_commit_ids.clone(),
                 commit_change_id: record.change_id,
-                author_account_ids: record.author_account_ids.clone(),
+                account_id: record.account_id.clone(),
                 created_at: record.created_at,
                 replay_debt: CommitStateReplayDebt {
                     depth: record.tracked_state_rootless_depth,
@@ -1602,7 +1607,7 @@ mod tests {
             tracked_state_rootless_rows: 0,
             tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label(&change_id),
-            author_account_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
         });
     }
@@ -1611,6 +1616,7 @@ mod tests {
         ChangeRecord {
             format_version: 1,
             change_id: change.change.id,
+            account_id: change.change.account_id.clone(),
             entity_pk: change.change.entity_pk.clone(),
             schema_key: change.change.schema_key.clone(),
             file_id: change.change.file_id.clone(),
@@ -1639,6 +1645,7 @@ mod tests {
         crate::commit_graph::CommitGraphNode {
             commit_id,
             change_id: ChangeId::for_test_label(&format!("{commit_label}-change")),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             generation: 0,
             parent_commit_ids: parent_commit_ids
                 .iter()

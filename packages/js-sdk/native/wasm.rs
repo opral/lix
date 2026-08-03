@@ -169,6 +169,11 @@ impl WasmLix {
         self.inner.active_branch_id().await.map_err(lix_error_to_js)
     }
 
+    #[wasm_bindgen(js_name = activeAccountId)]
+    pub async fn active_account_id(&self) -> Result<String, JsValue> {
+        Ok(self.inner.active_account_id().to_string())
+    }
+
     #[wasm_bindgen(js_name = clientStateEntries)]
     pub async fn client_state_entries(&self) -> Result<JsValue, JsValue> {
         let entries = self

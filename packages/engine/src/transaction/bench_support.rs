@@ -295,6 +295,7 @@ where
             &SessionMode::Pinned {
                 branch_id: Arc::new(std::sync::RwLock::new(BENCH_BRANCH_ID.to_string())),
             },
+            crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             self.storage.clone(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
@@ -530,6 +531,7 @@ async fn seed_visible_schema_rows<StorageImpl>(
                 .map(|(_, entity_pk, snapshot, change_id)| ChangeRecord {
                     format_version: 2,
                     change_id: *change_id,
+                    account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     entity_pk: entity_pk.clone(),
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,

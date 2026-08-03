@@ -59,7 +59,7 @@ mod remote_read_bench;
 /// Stable URL prefix owned by the Lix server protocol.
 pub const PROTOCOL_PATH: &str = "/lix/v1";
 /// Current wire protocol version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Header carrying the opaque server-issued session capability.
 pub const SESSION_ID_HEADER: &str = "lix-session-id";
 /// Standard request identity for replay-safe SQL mutations.
@@ -131,6 +131,20 @@ impl TrustedIdempotencyScope {
 
     fn into_inner(self) -> String {
         self.0
+    }
+}
+
+/// Host-authenticated account expected to own the remote session.
+///
+/// Like [`TrustedIdempotencyScope`], this is in-process metadata rather than
+/// an HTTP header so a caller cannot bind a stolen session to itself.
+#[derive(Clone, Debug)]
+pub struct TrustedActiveAccountId(String);
+
+impl TrustedActiveAccountId {
+    /// Creates an account binding after the host has authenticated the caller.
+    pub fn new(value: String) -> Self {
+        Self(value)
     }
 }
 
@@ -1288,6 +1302,7 @@ where
     async fn create_session(
         &self,
         initial_active_branch_id: Option<String>,
+        initial_active_account_id: Option<String>,
         durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
     ) -> Result<SessionLease<S>, ApiError> {
         let pending_open = self.reserve_session_open()?;
@@ -1307,7 +1322,14 @@ where
         // Validate and open the pinned child before evicting any idle session.
         // A stale client branch preference therefore cannot consume capacity or
         // evict another client.
-        let child = match self.inner.root.open_session(active_branch_id).await {
+        let active_account_id =
+            initial_active_account_id.unwrap_or_else(|| lix_sdk::ANONYMOUS_ACCOUNT_ID.to_string());
+        let child = match self
+            .inner
+            .root
+            .open_session_with_account(active_branch_id, active_account_id)
+            .await
+        {
             Ok(child) => child,
             Err(error) => {
                 if let Some(notifier) = &durable_terminal_storage_notifier {
@@ -1571,6 +1593,7 @@ where
     let lease = state
         .lease(&session_id, durable_terminal_storage_notifier)
         .await?;
+    validate_trusted_active_account(&lease, request.extensions().get()).await?;
     request.extensions_mut().insert(lease);
     Ok(next.run(request).await)
 }
@@ -1592,6 +1615,7 @@ async fn handshake<S>(
     Query(request): Query<HandshakeRequest>,
     headers: HeaderMap,
     notifier: Option<Extension<DurableTerminalStorageNotifier>>,
+    trusted_account: Option<Extension<TrustedActiveAccountId>>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1599,14 +1623,20 @@ where
     let durable_terminal_storage_notifier = notifier.map(|Extension(notifier)| notifier);
     let lease = match optional_session_id(&headers)? {
         Some(session_id) => {
-            if request.active_branch_id.is_some() {
+            if request.active_branch_id.is_some() || request.active_account_id.is_some() {
                 return Err(ApiError::bad_request(
-                    "activeBranchId is only allowed when creating a session",
+                    "activeBranchId and activeAccountId are only allowed when creating a session",
                 ));
             }
-            state
+            let lease = state
                 .lease(&session_id, durable_terminal_storage_notifier.clone())
-                .await?
+                .await?;
+            validate_trusted_active_account(
+                &lease,
+                trusted_account.as_ref().map(|Extension(account)| account),
+            )
+            .await?;
+            lease
         }
         None => {
             let active_branch_id = match request.active_branch_id {
@@ -1620,20 +1650,42 @@ where
                 }
                 None => None,
             };
+            let active_account_id = match trusted_account {
+                Some(Extension(account)) => Some(account.0),
+                None => match request.active_account_id {
+                    Some(active_account_id) if !active_account_id.trim().is_empty() => {
+                        Some(active_account_id)
+                    }
+                    Some(_) => {
+                        return Err(ApiError::bad_request(
+                            "activeAccountId must be a non-empty string",
+                        ));
+                    }
+                    None => None,
+                },
+            };
             state
                 .server
-                .create_session(active_branch_id, durable_terminal_storage_notifier)
+                .create_session(
+                    active_branch_id,
+                    active_account_id,
+                    durable_terminal_storage_notifier,
+                )
                 .await?
         }
     };
     let active_branch_id = lease
         .run_cancellable_read(|lix| async move { lix.active_branch_id().await })
         .await?;
+    let active_account_id = lease
+        .run_cancellable_read(|lix| async move { Ok(lix.active_account_id().to_string()) })
+        .await?;
     Ok((
         [(CACHE_CONTROL, "no-store")],
         Json(HandshakeResponse {
             protocol_version: PROTOCOL_VERSION,
             active_branch_id,
+            active_account_id,
             session_id: lease.session_id.clone(),
             capabilities: ProtocolCapabilities {
                 binary_file_upsert: true,
@@ -1647,13 +1699,39 @@ where
 async fn delete_session<S>(
     State(state): State<HandlerState<S>>,
     headers: HeaderMap,
+    trusted_account: Option<Extension<TrustedActiveAccountId>>,
 ) -> Result<StatusCode, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let session_id = required_session_id(&headers)?;
+    if let Some(Extension(account)) = trusted_account {
+        let lease = state.server.lease(&session_id, None).await?;
+        validate_trusted_active_account(&lease, Some(&account)).await?;
+        drop(lease);
+    }
     state.server.delete_session(&session_id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn validate_trusted_active_account<S>(
+    lease: &SessionLease<S>,
+    trusted_account: Option<&TrustedActiveAccountId>,
+) -> Result<(), ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let Some(trusted_account) = trusted_account else {
+        return Ok(());
+    };
+    let active_account_id = lease
+        .run_cancellable_read(|lix| async move { Ok(lix.active_account_id().to_string()) })
+        .await?;
+    if active_account_id == trusted_account.0 {
+        Ok(())
+    } else {
+        Err(ApiError::account_mismatch())
+    }
 }
 
 async fn execute<S>(
@@ -2837,6 +2915,18 @@ impl ApiError {
         }
     }
 
+    fn account_mismatch() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            body: ErrorEnvelope::from_parts(
+                "LIX_ERROR_PROTOCOL_ACCOUNT_MISMATCH",
+                "The authenticated account does not own this Lix session.",
+                None,
+                None,
+            ),
+        }
+    }
+
     fn session_required() -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -3129,6 +3219,7 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
 #[serde(rename_all = "camelCase")]
 struct HandshakeRequest {
     active_branch_id: Option<String>,
+    active_account_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3136,6 +3227,7 @@ struct HandshakeRequest {
 struct HandshakeResponse {
     protocol_version: u32,
     active_branch_id: String,
+    active_account_id: String,
     session_id: String,
     capabilities: ProtocolCapabilities,
 }
@@ -4473,7 +4565,7 @@ mod tests {
         let server = LixProtocolServer::new(root);
         let router = handler(server.clone());
         let lease = server
-            .create_session(None, None)
+            .create_session(None, None, None)
             .await
             .expect("session lease");
         let session_id = lease.session_id.clone();
@@ -4580,7 +4672,7 @@ mod tests {
         );
         let server = LixProtocolServer::new(root);
         let lease = server
-            .create_session(None, None)
+            .create_session(None, None, None)
             .await
             .expect("session lease");
         let (terminal_sender, terminal_signal) = TerminalStorageStreamSignal::new();
@@ -5892,6 +5984,7 @@ mod tests {
         let app = app().await;
         let (session_id, first) = new_session(&app.router).await;
         assert_eq!(first["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(first["activeAccountId"], lix_sdk::ANONYMOUS_ACCOUNT_ID);
         assert!(first["capabilities"].get("requestBlobSplice").is_none());
         assert_eq!(first["capabilities"]["binaryFileUpsert"], true);
         assert_eq!(first["capabilities"]["binaryFileUpsertBatch"], true);
@@ -5908,6 +6001,51 @@ mod tests {
         let resumed = response_json(resumed).await;
         assert_eq!(resumed["sessionId"], session_id);
         assert_eq!(resumed["activeBranchId"], first["activeBranchId"]);
+    }
+
+    #[tokio::test]
+    async fn trusted_account_binding_overrides_creation_and_rejects_cross_account_resume() {
+        let app = app().await;
+        let mut create = Request::builder()
+            .uri(format!(
+                "/lix/v1?activeAccountId={}",
+                lix_sdk::ANONYMOUS_ACCOUNT_ID
+            ))
+            .body(Body::empty())
+            .expect("trusted handshake request");
+        create.extensions_mut().insert(TrustedActiveAccountId::new(
+            lix_sdk::SYSTEM_ACCOUNT_ID.to_string(),
+        ));
+        let response = app
+            .router
+            .clone()
+            .oneshot(create)
+            .await
+            .expect("trusted handshake response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["activeAccountId"], lix_sdk::SYSTEM_ACCOUNT_ID);
+        let session_id = body["sessionId"].as_str().expect("session id");
+
+        let mut resume = Request::builder()
+            .uri("/lix/v1")
+            .header(SESSION_ID_HEADER, session_id)
+            .body(Body::empty())
+            .expect("cross-account resume request");
+        resume.extensions_mut().insert(TrustedActiveAccountId::new(
+            lix_sdk::ANONYMOUS_ACCOUNT_ID.to_string(),
+        ));
+        let response = app
+            .router
+            .clone()
+            .oneshot(resume)
+            .await
+            .expect("cross-account resume response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            error_code(response).await,
+            "LIX_ERROR_PROTOCOL_ACCOUNT_MISMATCH"
+        );
     }
 
     #[tokio::test]
@@ -9061,7 +9199,7 @@ mod tests {
         .await;
         let first = app
             .server
-            .create_session(None, None)
+            .create_session(None, None, None)
             .await
             .expect("open first session");
         let first_session_id = first.session_id.clone();
@@ -9081,7 +9219,7 @@ mod tests {
             .expect("active branch");
         let server = app.server.clone();
         let replacement =
-            tokio::spawn(async move { server.create_session(Some(branch_id), None).await });
+            tokio::spawn(async move { server.create_session(Some(branch_id), None, None).await });
 
         loop {
             let replaced = {
@@ -9183,7 +9321,7 @@ mod tests {
             let branch_id = branch_id.clone();
             tasks.spawn(async move {
                 server
-                    .create_session(Some(branch_id), None)
+                    .create_session(Some(branch_id), None, None)
                     .await
                     .expect("open protocol session")
             });
@@ -9428,7 +9566,7 @@ mod tests {
         .expect("protocol server");
         let router = handler(server.clone());
         let lease = server
-            .create_session(None, None)
+            .create_session(None, None, None)
             .await
             .expect("session lease");
         let session_id = lease.session_id.clone();
@@ -9489,7 +9627,7 @@ mod tests {
         let server = LixProtocolServer::new(root);
         let router = handler(server.clone());
         let lease = server
-            .create_session(None, None)
+            .create_session(None, None, None)
             .await
             .expect("session lease");
         let session_id = lease.session_id.clone();
@@ -9532,7 +9670,7 @@ mod tests {
         let server = LixProtocolServer::new(root);
         let router = handler(server.clone());
         let lease = server
-            .create_session(None, None)
+            .create_session(None, None, None)
             .await
             .expect("session lease");
         let session_id = lease.session_id.clone();
@@ -9590,7 +9728,7 @@ mod tests {
         .expect("protocol server");
         let router = handler(server.clone());
         let lease = server
-            .create_session(None, None)
+            .create_session(None, None, None)
             .await
             .expect("session lease");
         let session_id = lease.session_id.clone();

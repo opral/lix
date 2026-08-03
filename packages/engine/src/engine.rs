@@ -227,8 +227,20 @@ where
         &self,
         active_branch_id: impl Into<String>,
     ) -> Result<SessionContext<StorageImpl>, LixError> {
+        self.open_session_with_account(active_branch_id, crate::ANONYMOUS_ACCOUNT_ID)
+            .await
+    }
+
+    pub async fn open_session_with_account(
+        &self,
+        active_branch_id: impl Into<String>,
+        active_account_id: impl Into<String>,
+    ) -> Result<SessionContext<StorageImpl>, LixError> {
+        let active_account_id = active_account_id.into();
+        self.validate_active_account(&active_account_id).await?;
         SessionContext::open(
             active_branch_id.into(),
+            active_account_id,
             self.storage(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
@@ -248,7 +260,18 @@ where
     }
 
     pub async fn open_workspace_session(&self) -> Result<SessionContext<StorageImpl>, LixError> {
+        self.open_workspace_session_with_account(crate::ANONYMOUS_ACCOUNT_ID)
+            .await
+    }
+
+    pub async fn open_workspace_session_with_account(
+        &self,
+        active_account_id: impl Into<String>,
+    ) -> Result<SessionContext<StorageImpl>, LixError> {
+        let active_account_id = active_account_id.into();
+        self.validate_active_account(&active_account_id).await?;
         SessionContext::open_workspace(
+            active_account_id,
             self.storage(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
@@ -337,6 +360,55 @@ where
             .await
             .map(|_| ())
             .map_err(LixError::from)
+    }
+
+    async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {
+        let account_pk = EntityPk::uuid_from_canonical(account_id).map_err(|_| {
+            LixError::new(
+                "LIX_INVALID_ACCOUNT_ID",
+                format!("active account id '{account_id}' is not a canonical UUID"),
+            )
+        })?;
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let row = self
+            .live_state
+            .reader(read)
+            .load_row(&LiveStateRowRequest {
+                schema_key: "lix_account".to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                entity_pk: account_pk,
+                file_id: NullableKeyFilter::Null,
+            })
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ACCOUNT_NOT_FOUND",
+                    format!("active account '{account_id}' does not exist"),
+                )
+            })?;
+        let snapshot = row.snapshot_content.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("account '{account_id}' has no snapshot"),
+            )
+        })?;
+        let value: serde_json::Value = serde_json::from_str(&snapshot).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("account '{account_id}' has invalid JSON: {error}"),
+            )
+        })?;
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("active") {
+            return Err(LixError::new(
+                "LIX_ACCOUNT_DISABLED",
+                format!("active account '{account_id}' is disabled"),
+            ));
+        }
+        Ok(())
     }
 }
 

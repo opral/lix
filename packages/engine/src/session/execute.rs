@@ -1731,6 +1731,7 @@ where
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
+                    active_account_id: self.active_account_id(),
                     read_store,
                     live_state: Arc::clone(&self.live_state),
                     binary_cas: Arc::clone(&self.binary_cas),
@@ -1881,6 +1882,7 @@ where
                 }
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
+                    active_account_id: self.active_account_id(),
                     read_store,
                     live_state: Arc::clone(&self.live_state),
                     binary_cas: Arc::clone(&self.binary_cas),
@@ -2169,6 +2171,7 @@ where
         };
         let ctx = SessionSqlExecutionContext {
             active_branch_id: &active_branch_id,
+            active_account_id: self.active_account_id(),
             read_store: read_store.clone(),
             live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),

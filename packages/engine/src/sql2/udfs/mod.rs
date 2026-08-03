@@ -1,4 +1,5 @@
 mod common;
+mod lix_active_account_id;
 mod lix_active_branch_commit_id;
 mod lix_active_branch_id;
 mod lix_json;
@@ -20,9 +21,13 @@ pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {
 pub(crate) fn register_sql2_functions(
     ctx: &SessionContext,
     functions: FunctionProviderHandle,
+    active_account_id: String,
     active_branch_id: Option<String>,
     active_branch_commit_id: Option<String>,
 ) {
+    ctx.register_udf(ScalarUDF::from(
+        lix_active_account_id::LixActiveAccountId::new(active_account_id),
+    ));
     ctx.register_udf(ScalarUDF::from(
         lix_active_branch_id::LixActiveBranchId::new(active_branch_id),
     ));
@@ -47,7 +52,13 @@ pub(super) mod test_support {
 
     pub(super) async fn single_text(sql: &str) -> Option<String> {
         let ctx = SessionContext::new();
-        register_sql2_functions(&ctx, system_sql2_function_provider(), None, None);
+        register_sql2_functions(
+            &ctx,
+            system_sql2_function_provider(),
+            crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            None,
+            None,
+        );
         let batches = ctx
             .sql(sql)
             .await

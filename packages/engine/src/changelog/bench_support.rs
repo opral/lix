@@ -238,7 +238,7 @@ pub fn append_ordered_commits(
             tracked_state_rootless_rows: 0,
             tracked_state_rootless_bytes: 0,
             change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
-            author_account_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
                 "2026-05-20T00:00:00Z",
@@ -265,7 +265,7 @@ pub fn append_ordered_linear_commits(commit_count: usize) -> Result<BenchAppend,
             tracked_state_rootless_rows: 0,
             tracked_state_rootless_bytes: 0,
             change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
-            author_account_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
                 "2026-05-20T00:00:00Z",
@@ -605,6 +605,7 @@ fn direct_append_with_shape(
             append.changes.push(ChangeRecord {
                 format_version: 1,
                 change_id: typed_change_id,
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 schema_key: "message".to_string(),
                 entity_pk: entity_pk.clone(),
                 file_id: None,
@@ -630,7 +631,7 @@ fn direct_append_with_shape(
             tracked_state_rootless_rows: 0,
             tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label(&commit_change_id),
-            author_account_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
                 "2026-05-20T00:00:00Z",

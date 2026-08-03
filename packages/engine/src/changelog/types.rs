@@ -333,8 +333,7 @@ pub(crate) struct CommitRecord {
     /// Conservative encoded/payload work estimate for the same interval.
     pub(crate) tracked_state_rootless_bytes: u64,
     pub(crate) change_id: ChangeId,
-    #[musli(with = crate::storage_codec::id_string_seq)]
-    pub(crate) author_account_ids: Vec<String>,
+    pub(crate) account_id: String,
     pub(crate) created_at: LixTimestamp,
 }
 
@@ -370,6 +369,7 @@ pub(crate) struct CommitScanBatch {
 pub(crate) struct ChangeRecord {
     pub(crate) format_version: u32,
     pub(crate) change_id: ChangeId,
+    pub(crate) account_id: String,
     pub(crate) schema_key: String,
     pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: Option<String>,
@@ -383,6 +383,7 @@ pub(crate) struct ChangeRecord {
 #[musli(packed)]
 pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) format_version: u32,
+    pub(crate) account_id: &'a str,
     pub(crate) schema_key: &'a str,
     pub(crate) entity_pk: &'a EntityPk,
     #[musli(with = crate::storage_codec::option_id_string)]
@@ -407,6 +408,7 @@ pub(crate) struct ChangeRecordRef<'a> {
 pub(crate) struct TransactionChangeRecordRef<'a> {
     pub(crate) change_id: ChangeId,
     pub(crate) format_version: u32,
+    pub(crate) account_id: &'a str,
     pub(crate) schema_key: &'a str,
     pub(crate) entity_pk: &'a EntityPk,
     pub(crate) file_id: Option<&'a str>,
@@ -421,6 +423,7 @@ impl<'a> From<&'a ChangeRecord> for TransactionChangeRecordRef<'a> {
         Self {
             change_id: record.change_id,
             format_version: record.format_version,
+            account_id: &record.account_id,
             schema_key: &record.schema_key,
             entity_pk: &record.entity_pk,
             file_id: record.file_id.as_deref(),
@@ -447,6 +450,7 @@ pub(crate) struct TransactionChangelogAppend<'a> {
 #[musli(packed)]
 pub(crate) struct ChangeRecordView<'a> {
     pub(crate) format_version: u32,
+    pub(crate) account_id: &'a str,
     pub(crate) schema_key: &'a str,
     pub(crate) entity_pk: EntityPk,
     #[musli(with = crate::storage_codec::option_id_string)]

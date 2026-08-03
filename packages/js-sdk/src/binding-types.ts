@@ -53,6 +53,7 @@ export type LixBinding = {
 	observe(sql: string, params: BindingParam[]): Promise<ObserveEventsBinding>;
 	beginTransaction(): Promise<LixTransactionBinding>;
 	activeBranchId(): Promise<string>;
+	activeAccountId(): Promise<string>;
 	clientStateEntries?(): Promise<Array<{ key: string; value: JsonValue }>>;
 	clientStateGet?(key: string): Promise<JsonValue | undefined>;
 	clientStateSet?(key: string, value: JsonValue): Promise<void>;

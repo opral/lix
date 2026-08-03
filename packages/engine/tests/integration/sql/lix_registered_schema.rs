@@ -412,13 +412,11 @@ simulation_test!(
 
         for schema_key in [
             "lix_account",
-            "lix_active_account",
             "lix_binary_blob_ref",
             "lix_branch_descriptor",
             "lix_branch_ref",
             "lix_change",
             "lix_checkpoint_marker",
-            "lix_change_author",
             "lix_commit",
             "lix_commit_edge",
             "lix_directory_descriptor",

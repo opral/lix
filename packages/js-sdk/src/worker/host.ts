@@ -123,6 +123,8 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 			}
 			case "activeBranchId":
 				return requiredLix().activeBranchId();
+			case "activeAccountId":
+				return requiredLix().activeAccountId();
 			case "clientState.entries":
 				return requiredClientStateMethod("clientStateEntries")();
 			case "clientState.get":

@@ -497,7 +497,7 @@ pub(crate) struct CommitStateTopologyProjection {
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
     pub(crate) commit_change_id: crate::changelog::ChangeId,
-    pub(crate) author_account_ids: Vec<String>,
+    pub(crate) account_id: String,
     pub(crate) created_at: crate::common::LixTimestamp,
     pub(crate) replay_debt: crate::tracked_state::types::CommitStateReplayDebt,
 }
@@ -522,6 +522,7 @@ struct CommitDeltaPlane {
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 struct CommitDeltaManifest {
+    account_id: String,
     /// Complete selected state borrowed from one ordinary source commit.
     /// Local inline/external segments are a disjoint authored overlay.
     #[musli(with = storage_codec::option)]
@@ -620,7 +621,9 @@ fn commit_state_inventory_from_delta_manifest(
 }
 
 fn commit_delta_manifest_from_commit_state(manifest: &CommitStateManifest) -> CommitDeltaManifest {
-    commit_delta_manifest_from_inventory(&manifest.mutations)
+    let mut delta = commit_delta_manifest_from_inventory(&manifest.mutations);
+    delta.account_id.clone_from(&manifest.account_id);
+    delta
 }
 
 /// Returns the exact collection scopes touched by a sealed mutation inventory.
@@ -1232,6 +1235,7 @@ fn commit_delta_manifest_from_inventory(
                 ),
         });
     CommitDeltaManifest {
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         selected_source_commit_id: inventory.selected_source_commit_id,
         member_count: inventory.member_count,
         selection_fingerprint: inventory.selection_fingerprint,
@@ -2088,6 +2092,7 @@ pub(crate) async fn stage_current_state_catalog_from_published_parent(
     writes: &mut StorageWriteSet,
     parent: Option<&PublishedCommitStateManifest>,
     commit_id: CommitId,
+    account_id: &str,
     inventory: &CommitStateMutationInventory,
 ) -> Result<super::current_state_part::CertifiedCurrentStateCatalogPublication, LixError> {
     super::current_state_part::stage_current_state_catalog(
@@ -2095,6 +2100,7 @@ pub(crate) async fn stage_current_state_catalog_from_published_parent(
         writes,
         parent.map(|parent| &parent.manifest),
         commit_id,
+        account_id,
         inventory,
     )
     .await
@@ -2105,6 +2111,7 @@ pub(crate) async fn stage_current_state_catalog_from_staged_parent(
     writes: &mut StorageWriteSet,
     parent: &StagedCommitStateManifest,
     commit_id: CommitId,
+    account_id: &str,
     inventory: &CommitStateMutationInventory,
 ) -> Result<super::current_state_part::CertifiedCurrentStateCatalogPublication, LixError> {
     if parent.write_set_id != writes.identity() {
@@ -2117,6 +2124,7 @@ pub(crate) async fn stage_current_state_catalog_from_staged_parent(
         writes,
         Some(&parent.manifest),
         commit_id,
+        account_id,
         inventory,
     )
     .await
@@ -2131,6 +2139,7 @@ pub(crate) async fn stage_sparse_current_state_part_set(
     writes: &mut StorageWriteSet,
     parent: &crate::tracked_state::types::CurrentStatePartSet,
     commit_id: CommitId,
+    account_id: &str,
     inventory: &CommitStateMutationInventory,
 ) -> Result<Option<crate::tracked_state::types::CurrentStatePartSet>, LixError> {
     use crate::tracked_state::current_state_data_part::{
@@ -2139,7 +2148,9 @@ pub(crate) async fn stage_sparse_current_state_part_set(
     };
 
     let staged_segments = staged_commit_delta_segment_bytes(writes, commit_id, inventory)?;
-    let members = staged_commit_delta_members(store, commit_id, inventory, staged_segments).await?;
+    let members =
+        staged_commit_delta_members(store, commit_id, account_id, inventory, staged_segments)
+            .await?;
     if members.iter().any(|member| {
         member.key.schema_key == parent.scope.schema_key
             && member.key.file_id == parent.scope.file_id
@@ -2512,13 +2523,14 @@ fn staged_commit_delta_segment_bytes(
 async fn staged_commit_delta_members(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
+    account_id: &str,
     inventory: &CommitStateMutationInventory,
     staged_segments: Vec<Option<Bytes>>,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     let manifest = commit_delta_manifest_from_inventory(inventory);
     let mut members = Vec::with_capacity(inventory.member_count as usize);
     if let Some(inline) = manifest.inline_segment() {
-        collect_strict_commit_delta_members(inline, None, commit_id, 0, &mut members)?;
+        collect_strict_commit_delta_members(inline, None, commit_id, 0, account_id, &mut members)?;
     } else {
         for ((segment_index, bounds), staged) in
             manifest.segments.iter().enumerate().zip(staged_segments)
@@ -2543,6 +2555,7 @@ async fn staged_commit_delta_members(
                 Some(bounds),
                 commit_id,
                 u32::try_from(segment_index).expect("segment index fits u32"),
+                account_id,
                 &mut members,
             )?;
         }
@@ -3055,6 +3068,7 @@ where
     let mut pending = VecDeque::with_capacity(COMMIT_DELTA_SEGMENT_MAX_ROWS);
     let mut first_segment = None::<(CommitDeltaSegmentBounds, Vec<u8>)>;
     let mut manifest = CommitDeltaManifest {
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         selected_source_commit_id: None,
         member_count: u32::try_from(row_count).map_err(|_| {
             LixError::new(
@@ -3402,6 +3416,7 @@ where
         uniform_updated_at,
     };
     let mut manifest = CommitDeltaManifest {
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         selected_source_commit_id: None,
         member_count: u32::try_from(row_count).expect("replacement row count was bounded"),
         selection_fingerprint: [0; 32],
@@ -3843,6 +3858,7 @@ fn stage_commit_deltas_inner(
             .pop()
             .expect("non-empty commit delta has one encoded segment");
         let manifest = CommitDeltaManifest {
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             selected_source_commit_id: selected_source_commit_id
                 .map(|commit_id| *commit_id.as_uuid().as_bytes()),
             member_count,
@@ -3868,6 +3884,7 @@ fn stage_commit_deltas_inner(
     }
     writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, segment_count, 0);
     let mut manifest = CommitDeltaManifest {
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         selected_source_commit_id: selected_source_commit_id
             .map(|commit_id| *commit_id.as_uuid().as_bytes()),
         member_count,
@@ -4328,7 +4345,10 @@ async fn load_change_records_at_locators(
         for locator_index in locator_indices {
             let locator = locators[locator_index];
             loaded[locator_index] = Some(decode_change_at_locator_from_decoded(
-                &leaf, &payloads, locator,
+                &leaf,
+                &payloads,
+                locator,
+                &manifest.account_id,
             )?);
         }
     }
@@ -4349,15 +4369,17 @@ fn decode_change_at_locator(
     segment: &[u8],
     bounds: Option<&CommitDeltaSegmentBounds>,
     locator: CommitDeltaChangeLocator,
+    account_id: &str,
 ) -> Result<LoadedCommitDeltaEntry, LixError> {
     let (leaf, payloads) = decode_commit_delta_with_payloads(segment, bounds)?;
-    decode_change_at_locator_from_decoded(&leaf, &payloads, locator)
+    decode_change_at_locator_from_decoded(&leaf, &payloads, locator, account_id)
 }
 
 fn decode_change_at_locator_from_decoded<S>(
     leaf: &DecodedLeafNodeRef,
     payloads: &CommitDeltaPayloadIndex<S>,
     locator: CommitDeltaChangeLocator,
+    account_id: &str,
 ) -> Result<LoadedCommitDeltaEntry, LixError>
 where
     S: AsRef<[u8]>,
@@ -4401,6 +4423,7 @@ where
     Ok(LoadedCommitDeltaEntry {
         value,
         change_record: crate::changelog::ChangeRecord {
+            account_id: account_id.to_string(),
             format_version: 2,
             change_id,
             schema_key: key.schema_key,
@@ -4505,7 +4528,7 @@ async fn try_load_change_record_at_locator_in_manifest(
         (segment, Some(bounds))
     };
     Ok(Some(
-        decode_change_at_locator(&segment, bounds, locator)?.change_record,
+        decode_change_at_locator(&segment, bounds, locator, &manifest.account_id)?.change_record,
     ))
 }
 
@@ -5116,7 +5139,14 @@ async fn load_commit_delta_members_from_manifest(
         .collect::<BTreeSet<_>>();
     let mut members = Vec::new();
     if let Some(inline_segment) = manifest.inline_segment() {
-        collect_strict_commit_delta_members(inline_segment, None, commit_id, 0, &mut members)?;
+        collect_strict_commit_delta_members(
+            inline_segment,
+            None,
+            commit_id,
+            0,
+            &manifest.account_id,
+            &mut members,
+        )?;
     } else {
         let segment_indices = commit_delta_segments_for_schemas(manifest, &requested_schemas);
         let segment_keys = segment_indices
@@ -5147,6 +5177,7 @@ async fn load_commit_delta_members_from_manifest(
                 Some(&manifest.segments[segment_index]),
                 commit_id,
                 u32::try_from(segment_index).expect("segment index fits u32"),
+                &manifest.account_id,
                 &mut members,
             )?;
         }
@@ -5191,6 +5222,7 @@ async fn hydrate_selected_members(
         member.change.snapshot = change_record.snapshot;
         member.change.metadata = change_record.metadata;
         member.change.origin_key = change_record.origin_key;
+        member.change.account_id = change_record.account_id;
     }
     Ok(())
 }
@@ -5397,8 +5429,13 @@ async fn load_local_owned_commit_delta_entries(
             let (leaf, payloads) = decode_commit_delta_with_payloads(inline_segment, None)?;
             for &request_index in request_indices {
                 let encoded_key = encoded_commit_delta_lookup_key(&requests[request_index].1);
-                output[request_index] =
-                    find_loaded_commit_delta_entry(&leaf, &payloads, &encoded_key, commit_id)?;
+                output[request_index] = find_loaded_commit_delta_entry(
+                    &leaf,
+                    &payloads,
+                    &encoded_key,
+                    commit_id,
+                    &manifest.account_id,
+                )?;
             }
             continue;
         }
@@ -5469,8 +5506,13 @@ async fn load_local_owned_commit_delta_entries(
             .remove(&(commit_id, segment_index))
             .expect("read segment came from the routed lookup set");
         for (request_index, encoded_key) in lookups {
-            output[request_index] =
-                find_loaded_commit_delta_entry(&leaf, &payloads, &encoded_key, commit_id)?;
+            output[request_index] = find_loaded_commit_delta_entry(
+                &leaf,
+                &payloads,
+                &encoded_key,
+                commit_id,
+                &manifest.account_id,
+            )?;
         }
     }
     hydrate_selected_loaded_entries(store, &mut output).await?;
@@ -5576,6 +5618,7 @@ async fn load_compact_replacement_entries_one_ordered(
                 &payloads,
                 &encoded_keys[output_index],
                 commit_id,
+                &state.account_id,
             )?;
         }
     }
@@ -5657,6 +5700,7 @@ async fn load_inventory_part_entries_one_ordered(
                 &payloads,
                 &encoded_keys[encoded],
                 commit_id,
+                &state.account_id,
             )?;
         }
     }
@@ -5756,6 +5800,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                                 &payloads,
                                 &encoded_key,
                                 commit_id,
+                                &manifest.account_id,
                             )?;
                         }
                         hydrate_selected_loaded_entries(store, &mut output).await?;
@@ -5773,6 +5818,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                     &decoded.payloads,
                     &encoded_key,
                     commit_id,
+                    &manifest.account_id,
                 )?;
             }
             hydrate_selected_loaded_entries(store, &mut output).await?;
@@ -5787,6 +5833,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                         &decoded.payloads,
                         &encoded_key,
                         commit_id,
+                        &manifest.account_id,
                     )?;
                 }
                 hydrate_selected_loaded_entries(store, &mut output).await?;
@@ -5795,8 +5842,13 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
             let (leaf, payloads) = decode_commit_delta_with_payloads(inline_segment, None)?;
             for (request_index, &key) in keys.iter().enumerate() {
                 let encoded_key = encode_key_ref(key);
-                output[request_index] =
-                    find_loaded_commit_delta_entry(&leaf, &payloads, &encoded_key, commit_id)?;
+                output[request_index] = find_loaded_commit_delta_entry(
+                    &leaf,
+                    &payloads,
+                    &encoded_key,
+                    commit_id,
+                    &manifest.account_id,
+                )?;
             }
             hydrate_selected_loaded_entries(store, &mut output).await?;
             return Ok(output);
@@ -5804,8 +5856,13 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
         let (leaf, payloads) = decode_commit_delta_with_payloads(inline_segment, None)?;
         for (request_index, &key) in keys.iter().enumerate() {
             let encoded_key = encode_key_ref(key);
-            output[request_index] =
-                find_loaded_commit_delta_entry(&leaf, &payloads, &encoded_key, commit_id)?;
+            output[request_index] = find_loaded_commit_delta_entry(
+                &leaf,
+                &payloads,
+                &encoded_key,
+                commit_id,
+                &manifest.account_id,
+            )?;
         }
         hydrate_selected_loaded_entries(store, &mut output).await?;
         return Ok(output);
@@ -5903,6 +5960,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                                 &payloads,
                                 &encoded_keys[encoded_key],
                                 commit_id,
+                                &manifest.account_id,
                             )?;
                         }
                         continue;
@@ -5924,6 +5982,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                     &decoded.payloads,
                     &encoded_keys[encoded_key],
                     commit_id,
+                    &manifest.account_id,
                 )?;
             }
         }
@@ -5982,6 +6041,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                         &payloads,
                         &encoded_keys[encoded_key],
                         commit_id,
+                        &manifest.account_id,
                     )?;
                 }
                 continue;
@@ -5998,6 +6058,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
                     payloads,
                     &encoded_keys[encoded_key],
                     commit_id,
+                    &manifest.account_id,
                 )?;
             }
             continue;
@@ -6027,7 +6088,11 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
             };
             if leaf_key == encoded_key {
                 output[request_index] = Some(load_commit_delta_entry_at_index(
-                    &leaf, &payloads, leaf_index, commit_id,
+                    &leaf,
+                    &payloads,
+                    leaf_index,
+                    commit_id,
+                    &manifest.account_id,
                 )?);
                 leaf_index += 1;
             }
@@ -6088,6 +6153,7 @@ async fn hydrate_selected_loaded_entries(
         entry.change_record.snapshot = change_record.snapshot;
         entry.change_record.metadata = change_record.metadata;
         entry.change_record.origin_key = change_record.origin_key;
+        entry.change_record.account_id = change_record.account_id;
         entry.selected_ref = false;
     }
     Ok(())
@@ -6571,7 +6637,14 @@ pub(crate) async fn scan_commit_delta_inventory(
                     ),
                 ));
             }
-            collect_strict_commit_delta_members(inline_segment, None, commit_id, 0, &mut members)?;
+            collect_strict_commit_delta_members(
+                inline_segment,
+                None,
+                commit_id,
+                0,
+                &manifest.account_id,
+                &mut members,
+            )?;
         } else {
             validate_physical_commit_delta_segments(
                 commit_id,
@@ -6585,6 +6658,7 @@ pub(crate) async fn scan_commit_delta_inventory(
                     Some(bounds),
                     commit_id,
                     u32::try_from(segment_index).expect("segment index fits u32"),
+                    &manifest.account_id,
                     &mut members,
                 )?;
             }
@@ -6728,7 +6802,7 @@ async fn scan_commit_delta_plane(
                 generation: manifest.generation,
                 parent_commit_ids: manifest.parent_commit_ids.clone(),
                 commit_change_id: manifest.commit_change_id,
-                author_account_ids: manifest.author_account_ids.clone(),
+                account_id: manifest.account_id.clone(),
                 created_at: manifest.created_at,
                 replay_debt: manifest.replay_debt,
             },
@@ -6919,6 +6993,7 @@ fn collect_strict_commit_delta_members(
     expected_bounds: Option<&CommitDeltaSegmentBounds>,
     expected_commit_id: CommitId,
     segment_index: u32,
+    account_id: &str,
     members: &mut Vec<CommitDeltaMember>,
 ) -> Result<(), LixError> {
     let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
@@ -6970,6 +7045,7 @@ fn collect_strict_commit_delta_members(
                 ),
             };
         let change = crate::changelog::ChangeRecord {
+            account_id: account_id.to_string(),
             format_version: 2,
             change_id: value.change_id,
             schema_key: key.schema_key.clone(),
@@ -8318,6 +8394,7 @@ fn find_loaded_commit_delta_entry<S>(
     payloads: &CommitDeltaPayloadIndex<S>,
     target_key: &[u8],
     expected_commit_id: CommitId,
+    account_id: &str,
 ) -> Result<Option<LoadedCommitDeltaEntry>, LixError>
 where
     S: AsRef<[u8]>,
@@ -8330,6 +8407,7 @@ where
         payloads,
         index,
         expected_commit_id,
+        account_id,
     )?))
 }
 
@@ -8338,6 +8416,7 @@ fn load_commit_delta_entry_at_index<S>(
     payloads: &CommitDeltaPayloadIndex<S>,
     index: usize,
     expected_commit_id: CommitId,
+    account_id: &str,
 ) -> Result<LoadedCommitDeltaEntry, LixError>
 where
     S: AsRef<[u8]>,
@@ -8381,6 +8460,7 @@ where
         ),
     };
     let change_record = crate::changelog::ChangeRecord {
+        account_id: account_id.to_string(),
         format_version: 2,
         change_id: value.change_id,
         schema_key: key.schema_key,
@@ -9060,7 +9140,7 @@ mod tests {
             generation: 0,
             parent_commit_ids: Vec::new(),
             commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:commit")),
-            author_account_ids: Vec::new(),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
             replay_debt: CommitStateReplayDebt {
                 depth: 1,
@@ -10041,6 +10121,7 @@ mod tests {
             &mut selected_writes,
             Some(&parent),
             selected_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
             selected_stage.mutation_inventory(),
         )
         .await
@@ -10074,6 +10155,7 @@ mod tests {
             &mut child_writes,
             Some(&parent),
             child_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
             &mut child_inventory,
         )
         .await
@@ -10176,6 +10258,7 @@ mod tests {
             &mut touching_writes,
             Some(&child),
             touching_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
             &mut touching_inventory,
         )
         .await
@@ -10222,6 +10305,7 @@ mod tests {
             &mut touching_writes,
             &staged_touching,
             staged_child_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
             &staged_child_inventory,
         )
         .await
@@ -10266,6 +10350,7 @@ mod tests {
             &mut touching_writes,
             &staged_staged_child,
             absent_delete_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
             &absent_delete_inventory,
         )
         .await
@@ -10457,6 +10542,7 @@ mod tests {
             &mut sparse_writes,
             Some(&published_touching),
             insert_delete_id,
+            crate::ANONYMOUS_ACCOUNT_ID,
             &mut sparse_inventory,
         )
         .await
@@ -11616,6 +11702,7 @@ mod tests {
         segment.pop();
         let mut writes = storage.new_write_set();
         let delta_manifest = CommitDeltaManifest {
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             selected_source_commit_id: None,
             member_count: 1,
             selection_fingerprint: [0; 32],
@@ -12516,6 +12603,7 @@ mod tests {
 
         let mut writes = storage.new_write_set();
         let delta_manifest = CommitDeltaManifest {
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             selected_source_commit_id: None,
             member_count: 2,
             selection_fingerprint: [0; 32],
@@ -12820,7 +12908,7 @@ mod tests {
             generation: 7,
             parent_commit_ids: vec![CommitId::for_test_label("manifest-parent")],
             commit_change_id: ChangeId::for_test_label("manifest-commit-change"),
-            author_account_ids: vec!["account-a".to_string()],
+            account_id: "account-a".to_string(),
             created_at: timestamp,
             replay_debt: CommitStateReplayDebt {
                 depth: 2,

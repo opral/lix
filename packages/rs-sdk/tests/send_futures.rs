@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use lix_sdk::{ExecuteBatchStatement, Lix, OpenLixOptions, open_lix};
 
 fn assert_send<T: Send>(_: T) {}

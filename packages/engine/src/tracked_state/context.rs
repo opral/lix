@@ -3477,7 +3477,7 @@ where
         if manifest.generation != record.generation
             || manifest.parent_commit_ids != record.parent_commit_ids
             || manifest.commit_change_id != record.change_id
-            || manifest.author_account_ids != record.author_account_ids
+            || manifest.account_id != record.account_id
             || manifest.created_at != record.created_at
         {
             return Err(LixError::new(
@@ -4985,7 +4985,7 @@ mod tests {
                     "{}:snapshot-authority",
                     snapshot_root.commit_id
                 )),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "snapshot authority created_at",
                     "1970-01-01T00:00:00.000Z",
@@ -6914,7 +6914,7 @@ mod tests {
                     tracked_state_rootless_rows: 0,
                     tracked_state_rootless_bytes: 0,
                     change_id: ChangeId::for_test_label("commit-a:commit"),
-                    author_account_ids: Vec::new(),
+                    account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at: crate::common::LixTimestamp::expect_parse(
                         "created_at",
                         "1970-01-01T00:00:00.000Z",

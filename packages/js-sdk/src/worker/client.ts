@@ -184,6 +184,7 @@ function workerBinding(client: LixWorkerClient): LixBinding {
 			return workerTransactionBinding(request, transactionId);
 		},
 		activeBranchId: () => request({ kind: "activeBranchId" }),
+		activeAccountId: () => request({ kind: "activeAccountId" }),
 		clientStateEntries: () => request({ kind: "clientState.entries" }),
 		clientStateGet: (key) => request({ kind: "clientState.get", key }),
 		clientStateSet: (key, value) =>
@@ -263,6 +264,7 @@ function persistentSnapshotBinding(
 			};
 		},
 		activeBranchId: () => binding.activeBranchId(),
+		activeAccountId: () => binding.activeAccountId(),
 		clientStateEntries: () => {
 			const method = binding.clientStateEntries;
 			if (!method) return Promise.reject(clientStateUnsupportedError());

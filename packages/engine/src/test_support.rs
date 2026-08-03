@@ -99,6 +99,7 @@ pub(crate) async fn seed_branch_head_with_rows(
                 changes: vec![ChangeRecord {
                     format_version: 2,
                     change_id: branch_ref_change_id,
+                    account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     entity_pk: branch_ref_entity_pk.clone(),
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
@@ -555,7 +556,7 @@ fn stage_test_commit_state_manifest(
             generation: record.generation,
             parent_commit_ids: record.parent_commit_ids.clone(),
             commit_change_id: record.change_id,
-            author_account_ids: record.author_account_ids.clone(),
+            account_id: record.account_id.clone(),
             created_at: record.created_at,
             replay_debt,
             mutations,
@@ -739,7 +740,7 @@ async fn stage_test_changelog_commit(
         tracked_state_rootless_rows,
         tracked_state_rootless_bytes,
         change_id: typed_commit_change_id,
-        author_account_ids: Vec::new(),
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         created_at,
     };
     append.commits.push(record.clone());
@@ -819,6 +820,7 @@ pub(crate) fn tracked_change_from_materialized(
     Ok(ChangeRecord {
         format_version: 1,
         change_id: row.change_id,
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),

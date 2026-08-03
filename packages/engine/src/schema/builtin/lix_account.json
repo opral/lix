@@ -12,11 +12,21 @@
     },
     "name": {
       "type": "string"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["human", "agent", "service", "system", "anonymous"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "disabled"]
     }
   },
   "required": [
     "id",
-    "name"
+    "name",
+    "kind",
+    "status"
   ],
   "additionalProperties": false
 }

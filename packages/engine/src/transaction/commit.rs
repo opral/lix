@@ -5,6 +5,7 @@
 )]
 
 use crate::LixError;
+use crate::NullableKeyFilter;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{
     BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControl, BranchHeadControlContext,
@@ -12,9 +13,9 @@ use crate::branch::{
     stage_branch_head_control, stage_delete_branch_head_control,
 };
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangeRecordProjection, ChangelogContext, ChangelogReader,
-    ChangelogWriter, CommitId, CommitLoadRequest as ChangelogCommitLoadRequest, CommitRecord,
-    TransactionChangeRecordRef, TransactionChangelogAppend,
+    ChangeId, ChangeRecord, ChangeRecordProjection, ChangeScanRequest, ChangelogContext,
+    ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest as ChangelogCommitLoadRequest,
+    CommitRecord, CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
 };
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::common::LixTimestamp;
@@ -25,9 +26,9 @@ use crate::json_store::{
     JSON_INLINE_MAX_BYTES, JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
 };
 use crate::live_state::{
-    HotTrackedSnapshot, MaterializedLiveStateRow, TrackedHeadContext, TrackedWorkingDiffEpoch,
-    WorkingDiffIndexCoverage, stage_delete_tracked_working_diff_epoch,
-    stage_tracked_working_diff_epoch,
+    HotTrackedSnapshot, LiveStateContext, LiveStateRowRequest, MaterializedLiveStateRow,
+    TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
+    stage_delete_tracked_working_diff_epoch, stage_tracked_working_diff_epoch,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 #[cfg(test)]
@@ -150,6 +151,7 @@ pub(crate) async fn commit_prepared_writes(
         &tracked_state,
         None,
         runtime_functions,
+        crate::ANONYMOUS_ACCOUNT_ID,
         &commit_parent_heads,
         read,
         prepared_writes,
@@ -164,10 +166,23 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     tracked_state: &TrackedStateContext,
     entity_schema_catalog: Option<&crate::catalog::CatalogSnapshot>,
     runtime_functions: Option<&FunctionContext>,
+    active_account_id: &str,
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     read: &mut impl StorageAdapterRead,
     prepared_writes: PreparedWriteSet,
 ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
+    Box::pin(validate_active_account_and_account_rows(
+        read,
+        &prepared_writes,
+        active_account_id,
+    ))
+    .await?;
+    Box::pin(validate_account_deletions(
+        read,
+        &prepared_writes,
+        active_account_id,
+    ))
+    .await?;
     let certified_fresh_plugin_file_id =
         crate::transaction::validation::fresh_plugin_file_import_certificate(&prepared_writes)
             .is_some()
@@ -489,7 +504,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let branch_head_changes = tracked_roots
         .iter()
         .filter(|root| root.publish_head)
-        .map(branch_ref_change_record)
+        .map(|root| branch_ref_change_record(root, active_account_id))
         .collect::<Result<Vec<_>, _>>()?;
     // Every commit publishes an immutable, structurally shared tracked-state
     // root. Historical diff, merge, and point reads can therefore traverse
@@ -509,6 +524,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             highest_seen,
             timestamp,
             change_id,
+            active_account_id,
         )?);
     }
     retain_untracked_rows_not_superseded_by_engine(
@@ -601,6 +617,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             &staged_delta_index.inventories,
             &ordered_replacements,
             &mut external_parent_manifests,
+            active_account_id,
         )
         .instrument(tracing::debug_span!(
             target: "lix_perf",
@@ -745,6 +762,15 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &mut root_backed_branch_publications,
     )
     .await?;
+    if !published_branch_controls.contains_key(crate::GLOBAL_BRANCH_ID) {
+        let global = branch_control_observations
+            .get(crate::GLOBAL_BRANCH_ID)
+            .expect("global branch control is always observed");
+        preconditions.push(branch_head_control_precondition(
+            crate::GLOBAL_BRANCH_ID,
+            global.raw_token.clone(),
+        )?);
+    }
     let commit_created_at = commit_rows
         .iter()
         .map(|commit| (commit.commit_id, commit.created_at))
@@ -1095,6 +1121,7 @@ async fn stage_changelog_commits(
     mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
     external_parent_manifests: &mut BTreeMap<CommitId, CommitStateManifest>,
+    active_account_id: &str,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
     let staged_commit_ids = commit_rows
@@ -1147,7 +1174,7 @@ async fn stage_changelog_commits(
         if manifest.generation != record.generation
             || manifest.parent_commit_ids != record.parent_commit_ids
             || manifest.commit_change_id != record.change_id
-            || manifest.author_account_ids != record.author_account_ids
+            || manifest.account_id != record.account_id
             || manifest.created_at != record.created_at
             || manifest_rootless != record.tracked_state_rootless
             || manifest.replay_debt.depth != record.tracked_state_rootless_depth
@@ -1352,7 +1379,7 @@ async fn stage_changelog_commits(
         // ledger fact must remain available to `lix_change` and GC even
         // though it is not a commit member.
         .filter(|row| row.untracked && row.schema_key == BRANCH_REF_SCHEMA_KEY)
-        .map(transaction_change_record_from_state_row)
+        .map(|row| transaction_change_record_from_state_row(row, active_account_id))
         .chain(
             branch_head_changes
                 .iter()
@@ -1392,7 +1419,7 @@ async fn stage_changelog_commits(
             tracked_state_rootless_rows: rootless_rows[&commit_row.commit_id],
             tracked_state_rootless_bytes: rootless_bytes[&commit_row.commit_id],
             change_id: commit_row.change_id,
-            author_account_ids: Vec::new(),
+            account_id: active_account_id.to_string(),
             created_at: commit_row.created_at,
         };
         commits.push(record.clone());
@@ -1471,9 +1498,10 @@ fn validate_selected_change_refs(
     Ok(())
 }
 
-fn transaction_change_record_from_state_row(
-    row: PreparedStateRowRef<'_>,
-) -> Result<TransactionChangeRecordRef<'_>, LixError> {
+fn transaction_change_record_from_state_row<'a>(
+    row: PreparedStateRowRef<'a>,
+    active_account_id: &'a str,
+) -> Result<TransactionChangeRecordRef<'a>, LixError> {
     let Some(change_id) = row.change_id.as_ref() else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -1483,6 +1511,7 @@ fn transaction_change_record_from_state_row(
     Ok(TransactionChangeRecordRef {
         format_version: 2,
         change_id: *change_id,
+        account_id: active_account_id,
         entity_pk: row.entity_pk,
         schema_key: row.schema_key,
         file_id: row.file_id.map(crate::common::SharedStr::as_str),
@@ -1511,7 +1540,10 @@ struct EngineCurrentRow {
 /// advance. The current-state control owns current visibility; this fact
 /// keeps the existing `lix_change` contract without reintroducing a mutable
 /// current row.
-fn branch_ref_change_record(root: &PendingTrackedRoot) -> Result<ChangeRecord, LixError> {
+fn branch_ref_change_record(
+    root: &PendingTrackedRoot,
+    active_account_id: &str,
+) -> Result<ChangeRecord, LixError> {
     let snapshot = serde_json::to_string(&serde_json::json!({
         "id": root.branch_id,
         "commit_id": root.commit_id.to_string(),
@@ -1535,6 +1567,7 @@ fn branch_ref_change_record(root: &PendingTrackedRoot) -> Result<ChangeRecord, L
     Ok(ChangeRecord {
         format_version: 2,
         change_id: root.ref_change_id,
+        account_id: active_account_id.to_string(),
         schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
         entity_pk: EntityPk::uuid_from_canonical(&root.branch_id).map_err(|error| {
             LixError::new(
@@ -1554,6 +1587,7 @@ fn deterministic_sequence_current_row(
     highest_seen: i64,
     timestamp: LixTimestamp,
     change_id: ChangeId,
+    active_account_id: &str,
 ) -> Result<EngineCurrentRow, LixError> {
     let entity_pk = EntityPk::single(crate::functions::DETERMINISTIC_SEQUENCE_KEY);
     let snapshot = serde_json::to_string(&serde_json::json!({
@@ -1571,6 +1605,7 @@ fn deterministic_sequence_current_row(
         change: ChangeRecord {
             format_version: 2,
             change_id,
+            account_id: active_account_id.to_string(),
             schema_key: "lix_key_value".to_string(),
             entity_pk,
             file_id: None,
@@ -4888,6 +4923,10 @@ async fn observe_branch_head_controls(
         }
     }
     branch_ids.extend(engine_rows.iter().map(|row| row.branch_id.clone()));
+    // Every authored change references a global account. Observing and later
+    // fencing this control serializes account deletion/disable with writes on
+    // otherwise independent branches.
+    branch_ids.insert(crate::GLOBAL_BRANCH_ID.to_string());
     let branch_ids = branch_ids.into_iter().collect::<Vec<_>>();
     let observations = BranchHeadControlContext::new()
         .reader(read)
@@ -5166,6 +5205,7 @@ where
                         writes,
                         parent,
                         record.commit_id,
+                        &record.account_id,
                         &mutations,
                     )
                     .await?
@@ -5175,6 +5215,7 @@ where
                         writes,
                         external_parent.as_ref(),
                         record.commit_id,
+                        &record.account_id,
                         &mutations,
                     )
                     .await?
@@ -5193,7 +5234,7 @@ where
                 generation: record.generation,
                 parent_commit_ids: record.parent_commit_ids.clone(),
                 commit_change_id: record.change_id,
-                author_account_ids: record.author_account_ids.clone(),
+                account_id: record.account_id.clone(),
                 created_at: record.created_at,
                 replay_debt: if rootless {
                     CommitStateReplayDebt {
@@ -5563,6 +5604,188 @@ fn merge_parent_commit_ids(mut base: Vec<CommitId>, extra: Vec<CommitId>) -> Vec
         }
     }
     base
+}
+
+async fn validate_active_account_and_account_rows(
+    read: &mut impl StorageAdapterRead,
+    prepared_writes: &PreparedWriteSet,
+    active_account_id: &str,
+) -> Result<(), LixError> {
+    let account_pk = EntityPk::uuid_from_canonical(active_account_id).map_err(|_| {
+        LixError::new(
+            "LIX_INVALID_ACCOUNT_ID",
+            format!("active account id '{active_account_id}' is not a canonical UUID"),
+        )
+    })?;
+    let account = LiveStateContext::new(
+        TrackedStateContext::new(),
+        crate::commit_graph::CommitGraphContext::new(),
+    )
+    .reader(&*read)
+    .load_row(&LiveStateRowRequest {
+        schema_key: "lix_account".to_string(),
+        branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
+        entity_pk: account_pk,
+        file_id: NullableKeyFilter::Null,
+    })
+    .await?;
+    if let Some(account) = account {
+        let account_snapshot = account.snapshot_content.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("account '{active_account_id}' has no snapshot"),
+            )
+        })?;
+        let account_value: serde_json::Value =
+            serde_json::from_str(&account_snapshot).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("account '{active_account_id}' has invalid JSON: {error}"),
+                )
+            })?;
+        if account_value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            != Some("active")
+        {
+            return Err(LixError::new(
+                "LIX_ACCOUNT_DISABLED",
+                format!("active account '{active_account_id}' is disabled"),
+            ));
+        }
+    } else if crate::init::repository_protocol_status(&*read).await?
+        == crate::init::RepositoryProtocolStatus::Current
+    {
+        return Err(LixError::new(
+            "LIX_ACCOUNT_NOT_FOUND",
+            format!("active account '{active_account_id}' does not exist"),
+        ));
+    }
+
+    for row in prepared_writes
+        .state_rows
+        .iter()
+        .filter(|row| row.schema_key.as_str() == "lix_account")
+    {
+        if row.branch_id.as_str() != crate::GLOBAL_BRANCH_ID || !row.global || row.file_id.is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "lix_account rows must be global",
+            ));
+        }
+        let id = row.entity_pk.as_single_string_owned()?;
+        let expected_kind = if id == crate::SYSTEM_ACCOUNT_ID {
+            Some("system")
+        } else if id == crate::ANONYMOUS_ACCOUNT_ID {
+            Some("anonymous")
+        } else {
+            None
+        };
+        let Some(expected_kind) = expected_kind else {
+            continue;
+        };
+        let Some(snapshot) = row.snapshot else {
+            continue;
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(snapshot.normalized()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("built-in account '{id}' has invalid JSON: {error}"),
+                )
+            })?;
+        if value.get("kind").and_then(serde_json::Value::as_str) != Some(expected_kind)
+            || value.get("status").and_then(serde_json::Value::as_str) != Some("active")
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "built-in account '{id}' must retain kind '{expected_kind}' and active status"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_account_deletions(
+    read: &mut impl StorageAdapterRead,
+    prepared_writes: &PreparedWriteSet,
+    active_account_id: &str,
+) -> Result<(), LixError> {
+    let deleted_accounts = prepared_writes
+        .state_rows
+        .iter()
+        .filter(|row| row.schema_key.as_str() == "lix_account" && row.snapshot.is_none())
+        .map(|row| row.entity_pk.as_single_string_owned())
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if deleted_accounts.is_empty() {
+        return Ok(());
+    }
+    if deleted_accounts.contains(crate::SYSTEM_ACCOUNT_ID)
+        || deleted_accounts.contains(crate::ANONYMOUS_ACCOUNT_ID)
+    {
+        return Err(LixError::new(
+            "LIX_FOREIGN_KEY_VIOLATION",
+            "the built-in system and anonymous accounts cannot be deleted",
+        ));
+    }
+    if deleted_accounts.contains(active_account_id) {
+        return Err(account_has_changes_error(active_account_id));
+    }
+
+    for change in crate::tracked_state::scan_change_records_from_commit_deltas(&*read).await? {
+        if deleted_accounts.contains(&change.account_id) {
+            return Err(account_has_changes_error(&change.account_id));
+        }
+    }
+
+    let mut reader = ChangelogContext::new().reader(&*read);
+    let mut start_after = None::<String>;
+    loop {
+        let batch = reader
+            .scan_changes(ChangeScanRequest {
+                start_after: start_after.as_deref(),
+                limit: Some(1_024),
+            })
+            .await?;
+        for change in batch.entries {
+            if deleted_accounts.contains(&change.account_id) {
+                return Err(account_has_changes_error(&change.account_id));
+            }
+        }
+        let Some(next) = batch.next_start_after else {
+            break;
+        };
+        start_after = Some(next.to_string());
+    }
+    let mut start_after = None::<String>;
+    loop {
+        let batch = reader
+            .scan_commits(CommitScanRequest {
+                start_after: start_after.as_deref(),
+                limit: Some(1_024),
+            })
+            .await?;
+        for commit in batch.entries {
+            if deleted_accounts.contains(&commit.account_id) {
+                return Err(account_has_changes_error(&commit.account_id));
+            }
+        }
+        let Some(next) = batch.next_start_after else {
+            break;
+        };
+        start_after = Some(next.to_string());
+    }
+    Ok(())
+}
+
+fn account_has_changes_error(account_id: &str) -> LixError {
+    LixError::new(
+        "LIX_FOREIGN_KEY_VIOLATION",
+        format!("account '{account_id}' cannot be deleted because changes are attributed to it"),
+    )
 }
 
 #[cfg(test)]
@@ -6219,7 +6442,7 @@ mod tests {
                 generation: 0,
                 parent_commit_ids: Vec::new(),
                 commit_change_id: change_id("mixed-certified-commit"),
-                author_account_ids: Vec::new(),
+                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
                 replay_debt: CommitStateReplayDebt {
                     depth: 1,
@@ -7669,8 +7892,8 @@ mod tests {
 
         assert_eq!(
             counts.branch_control_get_many_calls.load(Ordering::Relaxed),
-            2,
-            "serial tracked-head staging must read the control once for the parent and once for its CAS publication"
+            3,
+            "serial tracked-head staging reads the local control for parent/publication plus the global account fence"
         );
         assert_eq!(
             counts.v10_marker_get_many_calls.load(Ordering::Relaxed),
@@ -8130,6 +8353,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &mut external_parent_manifests,
+            crate::ANONYMOUS_ACCOUNT_ID,
         )
         .await
         .expect("child-before-parent input should still stage parent first");
@@ -8262,6 +8486,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &mut external_parent_manifests,
+            crate::ANONYMOUS_ACCOUNT_ID,
         )
         .await
         .expect("depth fence should close a fully staged interval");
