@@ -696,12 +696,19 @@ where
     }
 
     async fn read_point_by_replay(&self, read: &(impl StorageAdapterRead + ?Sized)) -> usize {
+        let point_cache = super::storage::CommitDeltaPointReadCache::default();
         for commit_id in self.commits.iter().rev() {
-            let values = super::storage::load_commit_delta_values_encoded_with_cache(
+            let Some(state) = super::storage::load_point_replay_commit_state(read, *commit_id)
+                .await
+                .expect("load benchmark replay authority")
+            else {
+                continue;
+            };
+            let values = super::storage::load_commit_delta_values_encoded_from_replay_manifest(
                 read,
-                *commit_id,
+                &state,
                 std::slice::from_ref(&self.encoded_key),
-                None,
+                &point_cache,
             )
             .await
             .expect("replay benchmark commit point");

@@ -1514,6 +1514,38 @@ where
         )
     }
 
+    async fn load_commit_delta_values_for_encoded_queries(
+        &self,
+        state: &storage::AuthenticatedReplayCommitStateManifest,
+        encoded_keys: Vec<Bytes>,
+    ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+        let request_count = encoded_keys.len();
+        let mut ordered = encoded_keys.into_iter().enumerate().collect::<Vec<_>>();
+        ordered.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+        let mut canonical = Vec::with_capacity(ordered.len());
+        let mut canonical_ordinal_by_request = vec![0usize; request_count];
+        for (request_index, encoded_key) in ordered {
+            if canonical
+                .last()
+                .is_none_or(|previous: &Bytes| previous != &encoded_key)
+            {
+                canonical.push(encoded_key);
+            }
+            canonical_ordinal_by_request[request_index] = canonical.len() - 1;
+        }
+        let values = storage::load_commit_delta_values_encoded_from_replay_manifest(
+            &self.store,
+            state,
+            &canonical,
+            &self.commit_delta_point_cache,
+        )
+        .await?;
+        Ok(canonical_ordinal_by_request
+            .into_iter()
+            .map(|ordinal| values[ordinal].clone())
+            .collect())
+    }
+
     async fn validate_tree_diff_batch_against_delta_index(
         &self,
         batch: &TrackedStateTreeDiffBatch,
@@ -1524,6 +1556,7 @@ where
             by_commit.entry(row.commit_id()).or_default().push(row);
         }
         for (commit_id, commit_rows) in by_commit {
+            let state = storage::load_point_replay_commit_state(&self.store, commit_id).await?;
             let mut encoded_keys =
                 TrackedStateKeyBatchBuilder::with_row_capacity(commit_rows.len());
             for row in &commit_rows {
@@ -1533,13 +1566,13 @@ where
                     entity_pk: row.entity_pk(),
                 });
             }
-            let loaded = storage::load_commit_delta_values_encoded_with_cache(
-                &self.store,
-                commit_id,
-                &encoded_keys.finish(),
-                Some(&self.commit_delta_point_cache),
-            )
-            .await?;
+            let loaded = match state.as_ref() {
+                Some(state) => {
+                    self.load_commit_delta_values_for_encoded_queries(state, encoded_keys.finish())
+                        .await?
+                }
+                None => vec![None; commit_rows.len()],
+            };
             let mut fallback_rows = Vec::new();
             let mut fallback_keys =
                 TrackedStateKeyBatchBuilder::with_row_capacity(commit_rows.len());
@@ -1557,13 +1590,13 @@ where
                     fallback_rows.push(index);
                 }
             }
-            let fallback_values = storage::load_commit_delta_values_encoded_with_cache(
-                &self.store,
-                commit_id,
-                &fallback_keys.finish(),
-                Some(&self.commit_delta_point_cache),
-            )
-            .await?;
+            let fallback_values = match state.as_ref() {
+                Some(state) => {
+                    self.load_commit_delta_values_for_encoded_queries(state, fallback_keys.finish())
+                        .await?
+                }
+                None => vec![None; fallback_rows.len()],
+            };
             let mut fallbacks = vec![None; commit_rows.len()];
             for (index, value) in fallback_rows.into_iter().zip(fallback_values) {
                 fallbacks[index] = value;
@@ -3193,6 +3226,28 @@ where
             key_file_id_ordinals.push(file_id_ordinal);
         }
         let file_ids = file_id_dictionary.into_file_ids();
+        let mut file_id_order = (0..file_ids.len()).collect::<Vec<_>>();
+        file_id_order.sort_unstable_by(|left, right| {
+            file_ids[*left].as_str().cmp(file_ids[*right].as_str())
+        });
+        let mut canonical_ordinal_by_original = vec![0u32; file_ids.len()];
+        let mut canonical_file_ids = Vec::with_capacity(file_ids.len());
+        for original_ordinal in file_id_order {
+            canonical_ordinal_by_original[original_ordinal] =
+                u32::try_from(canonical_file_ids.len()).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked-state batch replay file dictionary exceeds u32",
+                    )
+                })?;
+            canonical_file_ids.push(file_ids[original_ordinal].clone());
+        }
+        for ordinal in &mut key_file_id_ordinals {
+            if *ordinal != u32::MAX {
+                *ordinal = canonical_ordinal_by_original[*ordinal as usize];
+            }
+        }
+        let file_ids = canonical_file_ids;
 
         // Encode each file descriptor key once for the whole replay. Every
         // commit selects shared slices from this arena instead of rebuilding
@@ -3225,18 +3280,18 @@ where
         let mut cascades = vec![None; file_ids.len()];
         for &current_commit_id in interval.commits().iter().rev() {
             let replay_commit = self.load_point_replay_commit(current_commit_id).await?;
-            let deltas = storage::load_commit_delta_values_encoded_with_cache(
+            let deltas = storage::load_commit_delta_values_encoded_from_replay_manifest(
                 &self.store,
-                current_commit_id,
+                &replay_commit.state_manifest,
                 keys,
-                Some(&self.commit_delta_point_cache),
+                &self.commit_delta_point_cache,
             )
             .await?;
-            let descriptor_deltas = storage::load_commit_delta_values_encoded_with_cache(
+            let descriptor_deltas = storage::load_commit_delta_values_encoded_from_replay_manifest(
                 &self.store,
-                current_commit_id,
+                &replay_commit.state_manifest,
                 &descriptor_keys,
-                Some(&self.commit_delta_point_cache),
+                &self.commit_delta_point_cache,
             )
             .await?;
             for (file_id_ordinal, value) in descriptor_deltas.into_iter().enumerate() {
@@ -3541,17 +3596,22 @@ where
         if missing.is_empty() {
             return Ok(output);
         }
-        let missing_keys = missing
-            .iter()
-            .map(|(_, key)| key.clone())
-            .collect::<Vec<_>>();
-        let mut encoded_keys = TrackedStateKeyBatchBuilder::with_row_capacity(missing_keys.len());
-        for key in &missing_keys {
-            encoded_keys.push(TrackedStateKeyRef {
-                schema_key: &key.schema_key,
-                file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
-            });
+        missing.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+        let mut encoded_keys = TrackedStateKeyBatchBuilder::with_row_capacity(missing.len());
+        let mut query_ordinals = Vec::with_capacity(missing.len());
+        let mut previous_key = None::<&TrackedStateKey>;
+        let mut unique_key_count = 0usize;
+        for (_, key) in &missing {
+            if previous_key != Some(key) {
+                encoded_keys.push(TrackedStateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                });
+                previous_key = Some(key);
+                unique_key_count += 1;
+            }
+            query_ordinals.push(unique_key_count - 1);
         }
         let replay_commit = self.load_point_replay_commit(commit_id).await?;
         let values = storage::load_commit_delta_values_encoded_from_replay_manifest(
@@ -3561,7 +3621,8 @@ where
             &self.commit_delta_point_cache,
         )
         .await?;
-        for ((index, key), value) in missing.into_iter().zip(values) {
+        for ((index, key), query_ordinal) in missing.into_iter().zip(query_ordinals) {
+            let value = values[query_ordinal].clone();
             self.commit_delta_value_cache
                 .insert((commit_id, key), value.clone());
             output[index] = value;
@@ -3579,11 +3640,24 @@ where
         commit_id: CommitId,
         schema_keys: &[String],
     ) -> Result<storage::DecodedCommitDeltaBatch, LixError> {
-        storage::scan_commit_delta_values_with_cache(
+        let replay_commit = self.load_point_replay_commit(commit_id).await?;
+        let source_manifest = match replay_commit
+            .state_manifest
+            .mutations
+            .selected_source_commit_id()
+        {
+            Some(source_commit_id) => Some(
+                self.load_point_replay_commit(source_commit_id)
+                    .await?
+                    .state_manifest,
+            ),
+            None => None,
+        };
+        storage::scan_commit_delta_values_from_authenticated_states(
             &self.store,
-            commit_id,
+            &replay_commit.state_manifest,
+            source_manifest.as_deref(),
             schema_keys,
-            Some(&self.commit_delta_point_cache),
         )
         .await
     }
