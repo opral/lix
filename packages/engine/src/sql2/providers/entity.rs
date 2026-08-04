@@ -307,6 +307,7 @@ impl EntitySpec {
         .map_err(lix_error_to_datafusion_error)?;
         apply_exact_branch_id_filter(&mut request, exact_branch_ids);
         apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
+        apply_exact_untracked_filter(&mut request, filters);
         Ok((projected_schema, request, row_filters))
     }
 
@@ -521,6 +522,10 @@ impl TableSpec for EntitySpec {
         let row_filter_analyzer = EntityRowFilterAnalyzer::new(&self.spec);
         if ExactBranchIdFilterAnalyzer.supports(filter) || primary_key_analyzer.supports(filter) {
             TableProviderFilterPushDown::Exact
+        } else if exact_untracked_constraint(filter) != ExactUntrackedConstraint::Unconstrained {
+            // The physical lane can be pruned exactly, while DataFusion keeps
+            // the expression as a residual for mixed conjuncts.
+            TableProviderFilterPushDown::Inexact
         } else if row_filter_analyzer.supports(filter) {
             // Retain a DataFusion residual even when the row-shaped fallback
             // also evaluates the predicate. Immutable columnar layouts use
@@ -1667,6 +1672,94 @@ fn apply_exact_entity_pk_filters(
         request.filter.entity_pks = entity_pks;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactUntrackedConstraint {
+    Unconstrained,
+    Value(bool),
+    Empty,
+}
+
+fn apply_exact_untracked_filter(request: &mut LiveStateScanRequest, filters: &[Expr]) {
+    let constraint = filters.iter().fold(
+        ExactUntrackedConstraint::Unconstrained,
+        |current, filter| {
+            combine_untracked_constraints(current, exact_untracked_constraint(filter))
+        },
+    );
+    match constraint {
+        ExactUntrackedConstraint::Unconstrained => {}
+        ExactUntrackedConstraint::Value(value) => request.filter.untracked = Some(value),
+        ExactUntrackedConstraint::Empty => request.filter.rows = LiveStateRowFilter::None,
+    }
+}
+
+fn exact_untracked_constraint(expr: &Expr) -> ExactUntrackedConstraint {
+    match expr {
+        Expr::Column(column) if column.name == "lixcol_untracked" => {
+            ExactUntrackedConstraint::Value(true)
+        }
+        Expr::Alias(alias) => exact_untracked_constraint(&alias.expr),
+        Expr::Not(inner) | Expr::IsFalse(inner) | Expr::IsNotTrue(inner) => {
+            invert_untracked_constraint(exact_untracked_constraint(inner))
+        }
+        Expr::IsTrue(inner) | Expr::IsNotFalse(inner) => exact_untracked_constraint(inner),
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => combine_untracked_constraints(
+            exact_untracked_constraint(&binary.left),
+            exact_untracked_constraint(&binary.right),
+        ),
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            untracked_column_literal(&binary.left, &binary.right)
+                .or_else(|| untracked_column_literal(&binary.right, &binary.left))
+                .map_or(
+                    ExactUntrackedConstraint::Unconstrained,
+                    ExactUntrackedConstraint::Value,
+                )
+        }
+        _ => ExactUntrackedConstraint::Unconstrained,
+    }
+}
+
+fn invert_untracked_constraint(constraint: ExactUntrackedConstraint) -> ExactUntrackedConstraint {
+    match constraint {
+        ExactUntrackedConstraint::Unconstrained => ExactUntrackedConstraint::Unconstrained,
+        ExactUntrackedConstraint::Value(value) => ExactUntrackedConstraint::Value(!value),
+        ExactUntrackedConstraint::Empty => ExactUntrackedConstraint::Empty,
+    }
+}
+
+fn combine_untracked_constraints(
+    left: ExactUntrackedConstraint,
+    right: ExactUntrackedConstraint,
+) -> ExactUntrackedConstraint {
+    match (left, right) {
+        (ExactUntrackedConstraint::Empty, _) | (_, ExactUntrackedConstraint::Empty) => {
+            ExactUntrackedConstraint::Empty
+        }
+        (ExactUntrackedConstraint::Unconstrained, value)
+        | (value, ExactUntrackedConstraint::Unconstrained) => value,
+        (ExactUntrackedConstraint::Value(left), ExactUntrackedConstraint::Value(right)) => {
+            if left == right {
+                ExactUntrackedConstraint::Value(left)
+            } else {
+                ExactUntrackedConstraint::Empty
+            }
+        }
+    }
+}
+
+fn untracked_column_literal(column: &Expr, literal: &Expr) -> Option<bool> {
+    let Expr::Column(column) = column else {
+        return None;
+    };
+    if column.name != "lixcol_untracked" {
+        return None;
+    }
+    let Expr::Literal(ScalarValue::Boolean(Some(value)), _) = literal else {
+        return None;
+    };
+    Some(*value)
 }
 
 fn exact_branch_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>> {
@@ -3561,6 +3654,53 @@ mod tests {
             Operator::Eq,
             Box::new(string_literal(value)),
         ))
+    }
+
+    fn bool_eq_filter(column_name: &str, value: bool) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(column(column_name)),
+            Operator::Eq,
+            Box::new(Expr::Literal(ScalarValue::Boolean(Some(value)), None)),
+        ))
+    }
+
+    #[test]
+    fn untracked_filter_pushdown_extracts_conjuncts_and_conflicts() {
+        let untracked = bool_eq_filter("lixcol_untracked", true);
+        let key = eq_filter("id", "row-1");
+        let conjunct = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(key),
+            Operator::And,
+            Box::new(untracked.clone()),
+        ));
+        assert_eq!(
+            super::exact_untracked_constraint(&conjunct),
+            super::ExactUntrackedConstraint::Value(true)
+        );
+        assert_eq!(
+            super::combine_untracked_constraints(
+                super::exact_untracked_constraint(&untracked),
+                super::exact_untracked_constraint(&bool_eq_filter("lixcol_untracked", false)),
+            ),
+            super::ExactUntrackedConstraint::Empty
+        );
+        let bare = Expr::Column(Column::from_name("lixcol_untracked"));
+        assert_eq!(
+            super::exact_untracked_constraint(&bare),
+            super::ExactUntrackedConstraint::Value(true)
+        );
+        assert_eq!(
+            super::exact_untracked_constraint(&Expr::Not(Box::new(bare.clone()))),
+            super::ExactUntrackedConstraint::Value(false)
+        );
+        assert_eq!(
+            super::exact_untracked_constraint(&Expr::IsFalse(Box::new(bare.clone()))),
+            super::ExactUntrackedConstraint::Value(false)
+        );
+        assert_eq!(
+            super::exact_untracked_constraint(&Expr::IsTrue(Box::new(bare))),
+            super::ExactUntrackedConstraint::Value(true)
+        );
     }
 
     #[test]

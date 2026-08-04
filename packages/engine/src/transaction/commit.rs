@@ -95,6 +95,103 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static ROOTLESS_REPLACEMENT_GENERATION_PUBLICATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static FINAL_LANE_COLLISION_SCHEMA_CHECKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static FINAL_LANE_COLLISION_CANDIDATE_KEYS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static FINAL_LANE_COLLISION_EXACT_OWNER_PROBE_KEYS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static FINAL_LANE_COLLISION_TRACKED_SET_ROWS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FinalLaneCollisionReadProfile {
+    pub(crate) schema_checks: usize,
+    pub(crate) candidate_keys: usize,
+    pub(crate) exact_owner_probe_keys: usize,
+    pub(crate) tracked_set_rows: usize,
+}
+
+#[cfg(all(feature = "storage-benches", not(test)))]
+static FINAL_LANE_COLLISION_SCHEMA_CHECKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static FINAL_LANE_COLLISION_CANDIDATE_KEYS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static FINAL_LANE_COLLISION_EXACT_OWNER_PROBE_KEYS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(feature = "storage-benches", not(test)))]
+static FINAL_LANE_COLLISION_TRACKED_SET_ROWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn record_final_lane_collision_profile(
+    schema_checks: usize,
+    candidate_keys: usize,
+    exact_owner_probe_keys: usize,
+    tracked_set_rows: usize,
+) {
+    FINAL_LANE_COLLISION_SCHEMA_CHECKS.with(|value| {
+        value.set(value.get().saturating_add(schema_checks));
+    });
+    FINAL_LANE_COLLISION_CANDIDATE_KEYS.with(|value| {
+        value.set(value.get().saturating_add(candidate_keys));
+    });
+    FINAL_LANE_COLLISION_EXACT_OWNER_PROBE_KEYS.with(|value| {
+        value.set(value.get().saturating_add(exact_owner_probe_keys));
+    });
+    FINAL_LANE_COLLISION_TRACKED_SET_ROWS.with(|value| {
+        value.set(value.get().saturating_add(tracked_set_rows));
+    });
+}
+
+#[cfg(all(feature = "storage-benches", not(test)))]
+fn record_final_lane_collision_profile(
+    schema_checks: usize,
+    candidate_keys: usize,
+    exact_owner_probe_keys: usize,
+    tracked_set_rows: usize,
+) {
+    FINAL_LANE_COLLISION_SCHEMA_CHECKS
+        .fetch_add(schema_checks, std::sync::atomic::Ordering::Relaxed);
+    FINAL_LANE_COLLISION_CANDIDATE_KEYS
+        .fetch_add(candidate_keys, std::sync::atomic::Ordering::Relaxed);
+    FINAL_LANE_COLLISION_EXACT_OWNER_PROBE_KEYS
+        .fetch_add(exact_owner_probe_keys, std::sync::atomic::Ordering::Relaxed);
+    FINAL_LANE_COLLISION_TRACKED_SET_ROWS
+        .fetch_add(tracked_set_rows, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+#[allow(dead_code)]
+pub(crate) fn take_final_lane_collision_read_profile() -> FinalLaneCollisionReadProfile {
+    #[cfg(test)]
+    {
+        return FinalLaneCollisionReadProfile {
+            schema_checks: FINAL_LANE_COLLISION_SCHEMA_CHECKS.with(|value| value.replace(0)),
+            candidate_keys: FINAL_LANE_COLLISION_CANDIDATE_KEYS.with(|value| value.replace(0)),
+            exact_owner_probe_keys: FINAL_LANE_COLLISION_EXACT_OWNER_PROBE_KEYS
+                .with(|value| value.replace(0)),
+            tracked_set_rows: FINAL_LANE_COLLISION_TRACKED_SET_ROWS.with(|value| value.replace(0)),
+        };
+    }
+    #[cfg(all(feature = "storage-benches", not(test)))]
+    {
+        FinalLaneCollisionReadProfile {
+            schema_checks: FINAL_LANE_COLLISION_SCHEMA_CHECKS
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+            candidate_keys: FINAL_LANE_COLLISION_CANDIDATE_KEYS
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+            exact_owner_probe_keys: FINAL_LANE_COLLISION_EXACT_OWNER_PROBE_KEYS
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+            tracked_set_rows: FINAL_LANE_COLLISION_TRACKED_SET_ROWS
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -137,8 +234,8 @@ pub(crate) fn take_direct_journal_replacement_publications(schema_key: &str) -> 
         .unwrap_or_default()
 }
 
-/// Commits prepared transaction rows into tracked history and unified current
-/// live state.
+/// Commits prepared transaction rows into tracked history and current live
+/// state.
 ///
 /// Providers decode DataFusion DML into a hydrated `PreparedStateBatch`. Tracked
 /// rows become changelog facts, commit members, immutable history roots, and
@@ -763,7 +860,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &staged_hot_heads.controls,
         &staged_hot_heads.tracked_snapshots,
         &state_rows,
-        &engine_rows,
         &explicit_branch_targets,
         &insert_selection,
         &prepared_writes.checkpoint_publications,
@@ -3369,6 +3465,82 @@ async fn stage_tracked_head(
         "lix.perf.materialization.tracked_head.lifecycle"
     ))
     .await?;
+    // Validate the complete tracked/untracked final lane before the first
+    // untracked write is staged.  The read is the transaction opening
+    // snapshot; pending rows are overlaid in their final order so an atomic
+    // tracked<->untracked replacement is legal while a live/live collision is
+    // rejected in either direction.
+    let collision_branches = state_rows
+        .iter()
+        .map(|row| row.branch_id.as_str())
+        .chain(engine_rows.iter().map(|row| row.branch_id.as_str()))
+        .chain(
+            tracked_roots
+                .iter()
+                .filter(|root| root.publish_head)
+                .map(|root| root.branch_id.as_str()),
+        )
+        .collect::<BTreeSet<_>>();
+    for branch_id in collision_branches {
+        let selected_change_batches = tracked_roots
+            .iter()
+            .find(|root| root.publish_head && root.branch_id == branch_id)
+            .and_then(|root| staged_commits.get(&root.commit_id))
+            .map(|staged| staged.selected_change_batches.as_slice())
+            .unwrap_or_default();
+        reject_final_lane_tracked_untracked_collisions(
+            read,
+            branch_id,
+            observations
+                .get(branch_id)
+                .and_then(|observation| observation.control),
+            selected_change_batches,
+            state_rows,
+            engine_rows,
+        )
+        .await?;
+    }
+    // History-free rows have one branch-stable physical owner. Stage them
+    // before tracked publication so no commit/generation path can absorb or
+    // copy them into HOT state.
+    let untracked_branches = state_rows
+        .iter()
+        .filter(|row| {
+            (row.untracked && row.schema_key != BRANCH_REF_SCHEMA_KEY)
+                || (row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && row.snapshot.is_none())
+        })
+        .map(|row| row.branch_id.as_str())
+        .chain(engine_rows.iter().map(|row| row.branch_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    for branch_id in untracked_branches {
+        let selected_rows = state_rows
+            .iter()
+            .enumerate()
+            .filter(|row| {
+                row.1.branch_id == branch_id
+                    && ((row.1.untracked && row.1.schema_key != BRANCH_REF_SCHEMA_KEY)
+                        || (row.1.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+                            && row.1.snapshot.is_none()))
+            })
+            .collect::<Vec<_>>();
+        let mut deltas = selected_rows
+            .iter()
+            .map(|(_, row)| current_state_delta_from_state_row(*row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut known_absent = selected_rows
+            .iter()
+            .map(|(row_index, row)| row.untracked && insert_selection.contains(*row_index))
+            .collect::<Vec<_>>();
+        deltas.extend(
+            engine_rows
+                .iter()
+                .filter(|row| row.branch_id == branch_id)
+                .map(current_state_delta_from_engine_row),
+        );
+        known_absent.resize(deltas.len(), false);
+        crate::live_state::stage_untracked_deltas(read, writes, branch_id, &deltas, &known_absent)
+            .await?;
+    }
     let explicit_branches = explicit_branch_targets
         .keys()
         .map(String::as_str)
@@ -3559,18 +3731,6 @@ async fn stage_tracked_head(
             _ => None,
         };
 
-        if !staged.selected_change_batches.is_empty() {
-            reject_selected_tracked_refs_with_untracked_rows(
-                read,
-                &root.branch_id,
-                parent_control,
-                &staged.selected_change_batches,
-                state_rows,
-                engine_rows,
-            )
-            .await?;
-        }
-
         if let Some(final_tracked) = tracked_snapshots.get(&root.commit_id).cloned() {
             let generation =
                 lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
@@ -3582,9 +3742,7 @@ async fn stage_tracked_head(
                     &root.branch_id,
                     generation,
                     final_tracked,
-                    parent_control.map(|control| control.generation),
                     &[],
-                    &untracked_deltas,
                     &owned_absence_guards,
                     checkpoint_commit_id,
                     &mut coverage,
@@ -3592,8 +3750,15 @@ async fn stage_tracked_head(
                 .await?;
             let mut control =
                 normal_branch_head_control(root, parent_control, generation, checkpoint_commit_id)?;
-            control.reset_schema_presence();
-            control.note_schemas(schema_keys.iter().map(String::as_str));
+            // Dedicated history-free rows survive generation rotation. Keep
+            // the predecessor bloom conservatively: stale positives are safe,
+            // while resetting it would hide untouched untracked schemas.
+            control.note_schemas(
+                schema_keys
+                    .iter()
+                    .map(String::as_str)
+                    .chain(untracked_deltas.iter().map(|delta| delta.schema_key)),
+            );
             tracked_snapshots.insert(root.commit_id, final_tracked);
             insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
             continue;
@@ -3990,8 +4155,11 @@ async fn stage_tracked_head(
         let packed_guards_match = packed_current_base_candidate
             && !absence_guards.is_empty()
             && packed_current_base_guards_match(&tracked_deltas, &absence_guards);
-        let mut deltas = tracked_deltas.clone();
-        deltas.extend_from_slice(&untracked_deltas);
+        // Only tracked deltas may enter the generation-scoped HOT plane.
+        // History-free rows were staged in the authoritative untracked plane
+        // above and must not be copied into tracked serving state or bloom
+        // metadata.
+        let deltas = tracked_deltas.clone();
         // Every absence guard above is derived from one of these exact
         // transaction deltas. The fresh-file certificate likewise proves its
         // complete file-scoped namespace absent. The branch-control CAS
@@ -4140,7 +4308,6 @@ async fn stage_tracked_head(
                         &BTreeSet::new(),
                         None,
                         None,
-                        None,
                         &mut coverage,
                     )
                     .instrument(tracing::debug_span!(
@@ -4179,7 +4346,6 @@ async fn stage_tracked_head(
                     &deltas,
                     &absence_guards,
                     None,
-                    None,
                     working_diff_capture_checkpoint_commit_id,
                     &mut coverage,
                     certified_fresh_plugin_file_id,
@@ -4198,7 +4364,6 @@ async fn stage_tracked_head(
                 &deltas,
                 &durable_predecessors,
                 &owned_absence_guards,
-                None,
                 None,
                 working_diff_capture_checkpoint_commit_id,
                 &mut coverage,
@@ -4276,41 +4441,6 @@ async fn stage_tracked_head(
                 .filter(|row| row.branch_id == branch_id)
                 .map(current_state_delta_from_engine_row),
         );
-        let absence_guards =
-            tracked_head_absence_guards(state_rows, insert_selection, branch_id, None);
-        let mut coverage = WorkingDiffIndexCoverage::default();
-        let mut writer = tracked_head.writer(read, writes);
-        if absence_guards.is_empty() {
-            let no_absence_guards = BTreeSet::new();
-            writer
-                .stage_current_state_with_working_diff(
-                    branch_id,
-                    Some(control.generation),
-                    control.head_commit_id,
-                    &deltas,
-                    &no_absence_guards,
-                    None,
-                    None,
-                    None,
-                    &mut coverage,
-                )
-                .await?;
-        } else {
-            writer
-                .stage_validated_insert_current_state_with_working_diff(
-                    branch_id,
-                    Some(control.generation),
-                    control.head_commit_id,
-                    &deltas,
-                    &absence_guards,
-                    None,
-                    None,
-                    None,
-                    &mut coverage,
-                    None,
-                )
-                .await?;
-        }
         let mut control = control.next_current_state_revision()?;
         control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
         insert_direct_branch_control(&mut controls, branch_id, control)?;
@@ -4396,14 +4526,27 @@ fn packed_current_base_guards_match(
     delta_identities == guard_identities
 }
 
-/// A selected historical change becomes visible through a newly materialized
-/// hot generation while that publication retains the branch's untracked
-/// members. The two retention modes must never own the same logical identity.
+fn final_lane_untracked_probe_candidates(
+    untracked_pending: &BTreeMap<TrackedStateKey, bool>,
+    tracked_pending: &BTreeMap<TrackedStateKey, bool>,
+) -> Vec<TrackedStateKey> {
+    untracked_pending
+        .iter()
+        .filter(|(_, live)| **live)
+        .filter(|(identity, _)| !tracked_pending.contains_key(*identity))
+        .map(|(identity, _)| identity.clone())
+        .collect()
+}
+
+/// Validates the final tracked/untracked identity ownership for one branch
+/// before any current-state write is staged.
 ///
-/// This is a merge/checkpoint lifecycle fence, not a normal CRUD-path check.
-/// Point-loading only the selected identities keeps large untracked workspaces
-/// out of the publication cost.
-async fn reject_selected_tracked_refs_with_untracked_rows(
+/// Both planes are checked against the same opening read. Pending rows are
+/// applied as final values, so a same-batch tombstone can make an atomic
+/// ownership transition legal, while two live owners fail closed. Exact-owner
+/// reads intentionally do not project the global branch into a local branch:
+/// local shadowing of global state is a supported identity.
+async fn reject_final_lane_tracked_untracked_collisions(
     read: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     control: Option<BranchHeadControl>,
@@ -4411,60 +4554,197 @@ async fn reject_selected_tracked_refs_with_untracked_rows(
     state_rows: &PreparedStateBatch,
     engine_rows: &[EngineCurrentRow],
 ) -> Result<(), LixError> {
-    let selected_identities = selected_changes(selected_change_batches)
-        .map(|change_ref| TrackedStateKey {
-            schema_key: change_ref.schema_key().to_owned(),
-            file_id: change_ref.file_id().map(str::to_owned),
-            entity_pk: change_ref.entity_pk().clone(),
-        })
-        .collect::<BTreeSet<_>>();
-    if selected_identities.is_empty() {
-        return Ok(());
+    let mut tracked_pending = BTreeMap::<TrackedStateKey, bool>::new();
+    let mut untracked_pending = BTreeMap::<TrackedStateKey, bool>::new();
+    for row in state_rows
+        .iter()
+        .filter(|row| row.branch_id == branch_id && row.schema_key != BRANCH_REF_SCHEMA_KEY)
+    {
+        let identity = TrackedStateKey {
+            schema_key: row.schema_key.to_string(),
+            file_id: row.file_id.map(ToString::to_string),
+            entity_pk: row.entity_pk.clone(),
+        };
+        if row.untracked {
+            untracked_pending.insert(identity, row.snapshot.is_some());
+        } else {
+            tracked_pending.insert(identity, row.snapshot.is_some());
+        }
+    }
+    for row in engine_rows.iter().filter(|row| row.branch_id == branch_id) {
+        let identity = TrackedStateKey {
+            schema_key: row.change.schema_key.clone(),
+            file_id: row.change.file_id.clone(),
+            entity_pk: row.change.entity_pk.clone(),
+        };
+        untracked_pending.insert(
+            identity,
+            row.change.snapshot != crate::json_store::JsonSlot::None,
+        );
+    }
+    for change_ref in selected_changes(selected_change_batches) {
+        tracked_pending.insert(
+            TrackedStateKey {
+                schema_key: change_ref.schema_key().to_owned(),
+                file_id: change_ref.file_id().map(str::to_owned),
+                entity_pk: change_ref.entity_pk().clone(),
+            },
+            !change_ref.deleted,
+        );
     }
 
-    let selected_keys = selected_identities.iter().cloned().collect::<Vec<_>>();
-    let mut untracked_identities = if let Some(control) = control {
-        TrackedHeadContext::new()
-            .reader(read)
-            .load_projected_live_rows(
-                branch_id,
-                control,
-                &selected_keys,
-                &ChangeRecordProjection {
-                    snapshot_content: false,
-                    metadata: false,
-                },
-            )
-            .await?
-            .into_iter()
-            .flatten()
-            .filter(|row| row.untracked)
-            .map(|row| TrackedStateKey {
-                schema_key: row.schema_key,
-                file_id: row.file_id,
-                entity_pk: row.entity_pk,
-            })
-            .collect()
-    } else {
-        BTreeSet::new()
-    };
+    for (identity, tracked_live) in &tracked_pending {
+        if *tracked_live && untracked_pending.get(identity) == Some(&true) {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "tracked/untracked identity collision in one batch on branch '{branch_id}' for schema '{}' entity_pk {:?}",
+                    identity.schema_key, identity.entity_pk,
+                ),
+            ));
+        }
+    }
 
-    apply_pending_untracked_identities(
-        &mut untracked_identities,
-        branch_id,
-        state_rows,
-        engine_rows,
-    );
-
-    let Some(identity) = selected_identities
+    // Forward proof: every pending tracked live identity must either have a
+    // pending untracked delete or be absent from the exact branch owner.
+    let persisted_untracked_keys = tracked_pending
         .iter()
-        .find(|identity| untracked_identities.contains(*identity))
-    else {
+        .filter(|(_, live)| **live)
+        .filter(|(identity, _)| !untracked_pending.contains_key(*identity))
+        .map(|(identity, _)| identity.clone())
+        .collect::<Vec<_>>();
+    if !persisted_untracked_keys.is_empty() {
+        let request = crate::live_state::LiveStateExactBatchRequest {
+            rows: persisted_untracked_keys
+                .iter()
+                .map(|identity| crate::live_state::LiveStateExactRowRequest {
+                    schema_key: identity.schema_key.clone(),
+                    branch_id: branch_id.to_owned(),
+                    entity_pk: identity.entity_pk.clone(),
+                    file_id: identity.file_id.clone(),
+                })
+                .collect(),
+            untracked: Some(true),
+            ..crate::live_state::LiveStateExactBatchRequest::default()
+        };
+        let visible = [branch_id.to_owned()].into_iter().collect();
+        let existing =
+            crate::live_state::load_untracked_exact_owner_batch(read, &request, &visible)
+                .await?
+                .into_rows();
+        if let Some((identity, _)) = persisted_untracked_keys
+            .iter()
+            .zip(existing)
+            .find(|(_, row)| row.is_some())
+        {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "tracked/untracked identity collision on branch '{branch_id}' for schema '{}' entity_pk {:?}; delete the untracked row first",
+                    identity.schema_key, identity.entity_pk,
+                ),
+            ));
+        }
+    }
+
+    // Reverse proof: every pending untracked live identity must either have a
+    // pending tracked tombstone or be absent from the exact tracked owner.
+    // Read the tracked authority once per candidate schema and materialize a
+    // set of live identities. This is a coherent set proof over all tracked
+    // sources (HOT, packed, root, and certified); it avoids one point probe
+    // per untracked mutation without introducing an index or a second mutable
+    // authority. Any malformed tracked source fails closed before staging.
+    let Some(control) = control else {
         return Ok(());
     };
-    Err(selected_tracked_ref_untracked_collision_error(
-        branch_id, identity,
-    ))
+    let probe_candidates =
+        final_lane_untracked_probe_candidates(&untracked_pending, &tracked_pending);
+    let candidate_schemas = probe_candidates
+        .iter()
+        .map(|identity| identity.schema_key.clone())
+        .collect::<BTreeSet<_>>();
+    let schema_check_count = candidate_schemas.len();
+    let tracked_head = TrackedHeadContext::new().reader(read);
+    let mut tracked_live_identities = BTreeSet::new();
+    let mut tracked_set_rows = 0usize;
+    for schema_key in &candidate_schemas {
+        let rows = tracked_head
+            .scan_live_batch(
+                branch_id,
+                control,
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![schema_key.clone()],
+                        include_tombstones: false,
+                        ..TrackedStateFilter::default()
+                    },
+                    // Collision validation only needs the physical identity and
+                    // revision/deletion fields.  An empty projection means
+                    // `ChangeRecordProjection::full()`, which would hydrate
+                    // snapshot/metadata JSON for every tracked row in the
+                    // schema scan and turn an untracked-only write into a
+                    // payload read amplification path.
+                    read_columns: TrackedStateReadColumns {
+                        columns: vec!["entity_pk".to_owned()],
+                    },
+                    limit: None,
+                },
+            )
+            .await?;
+        tracked_set_rows = tracked_set_rows.saturating_add(rows.len());
+        tracing::debug!(
+            target: "lix_perf",
+            phase = "final_lane_collision",
+            branch = branch_id,
+            schema = schema_key,
+            tracked_rows = rows.len(),
+            "tracked collision identity set scan"
+        );
+        for row in rows.iter() {
+            if row.untracked() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked collision scan returned an untracked row",
+                ));
+            }
+            tracked_live_identities.insert(TrackedStateKey {
+                schema_key: row.schema_key().to_owned(),
+                file_id: row.file_id().map(ToOwned::to_owned),
+                entity_pk: row.entity_pk().clone(),
+            });
+        }
+    }
+    let candidate_key_count = probe_candidates.len();
+    let tracked_collision = probe_candidates
+        .into_iter()
+        .find(|identity| tracked_live_identities.contains(identity));
+    #[cfg(any(test, feature = "storage-benches"))]
+    record_final_lane_collision_profile(
+        schema_check_count,
+        candidate_key_count,
+        0,
+        tracked_set_rows,
+    );
+    tracing::debug!(
+        target: "lix_perf",
+        phase = "final_lane_collision",
+        branch = branch_id,
+        candidate_keys = candidate_key_count,
+        schema_checks = schema_check_count,
+        tracked_set_rows,
+        exact_owner_probe_keys = 0,
+        "tracked/untracked collision read frontier"
+    );
+    if let Some(identity) = tracked_collision {
+        return Err(LixError::new(
+            LixError::CODE_UNIQUE,
+            format!(
+                "tracked/untracked identity collision on branch '{branch_id}' for schema '{}' entity_pk {:?}; delete the tracked row first",
+                identity.schema_key, identity.entity_pk,
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Applies the transaction's history-free mutations to an identity set.
@@ -4504,27 +4784,6 @@ fn apply_pending_untracked_identities(
             identities.insert(identity);
         }
     }
-}
-
-fn selected_tracked_ref_untracked_collision_error(
-    branch_id: &str,
-    identity: &TrackedStateKey,
-) -> LixError {
-    LixError::new(
-        LixError::CODE_MERGE_CONFLICT,
-        format!(
-            "cannot publish selected tracked change on branch '{branch_id}': it conflicts with an untracked current row for schema '{}' entity_pk {:?}",
-            identity.schema_key, identity.entity_pk
-        ),
-    )
-    .with_hint("Resolve the tracked and untracked identity conflict before retrying.")
-    .with_details(serde_json::json!({
-        "kind": "trackedUntrackedIdentityCollision",
-        "branchId": branch_id,
-        "schemaKey": &identity.schema_key,
-        "entityPk": &identity.entity_pk,
-        "fileId": &identity.file_id,
-    }))
 }
 
 /// A checkpoint cleans exactly its selected interval changes in the current
@@ -4665,8 +4924,6 @@ async fn stage_root_backed_branch_publication(
     branch_id: &str,
     head_commit_id: CommitId,
     target: &ExplicitBranchHeadTarget,
-    state_rows: &PreparedStateBatch,
-    engine_rows: &[EngineCurrentRow],
 ) -> Result<BranchHeadControl, LixError> {
     let generation = lifecycle_generation(branch_id, head_commit_id, target.ref_change_id);
     let tracked_head = TrackedHeadContext::new();
@@ -4675,7 +4932,7 @@ async fn stage_root_backed_branch_publication(
         generation,
         head_commit_id,
     );
-    let mut control = BranchHeadControl {
+    let control = BranchHeadControl {
         head_commit_id,
         generation,
         current_state_revision: 0,
@@ -4687,39 +4944,6 @@ async fn stage_root_backed_branch_publication(
         // conservative until immutable roots carry schema summaries.
         schema_presence_bloom: [u64::MAX; 4],
     };
-    let untracked_deltas = state_rows
-        .iter()
-        .filter(|row| {
-            row.untracked
-                && row.branch_id.as_str() == branch_id
-                && row.schema_key != BRANCH_REF_SCHEMA_KEY
-        })
-        .map(current_state_delta_from_state_row)
-        .chain(
-            engine_rows
-                .iter()
-                .filter(|row| row.branch_id == branch_id)
-                .map(|row| Ok(current_state_delta_from_engine_row(row))),
-        )
-        .collect::<Result<Vec<_>, _>>()?;
-    if !untracked_deltas.is_empty() {
-        let mut coverage = WorkingDiffIndexCoverage::default();
-        let (_, schemas) = tracked_head
-            .writer(read, writes)
-            .stage_complete_current_state_with_working_diff(
-                branch_id,
-                generation,
-                HotTrackedSnapshot::default(),
-                None,
-                &[],
-                &untracked_deltas,
-                &BTreeSet::new(),
-                None,
-                &mut coverage,
-            )
-            .await?;
-        control.note_schemas(schemas.iter().map(String::as_str));
-    }
     Ok(control)
 }
 
@@ -4730,7 +4954,6 @@ async fn stage_branch_head_control_publications(
     normal_controls: &BTreeMap<String, BranchHeadControl>,
     tracked_snapshots: &BTreeMap<CommitId, HotTrackedSnapshot>,
     state_rows: &PreparedStateBatch,
-    engine_rows: &[EngineCurrentRow],
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
     insert_selection: &PreparedInsertSelection,
     checkpoint_publications: &[crate::gc::CheckpointPublication],
@@ -4774,8 +4997,6 @@ async fn stage_branch_head_control_publications(
                         branch_id,
                         head_commit_id,
                         target,
-                        state_rows,
-                        engine_rows,
                     ))
                     .await?;
                     root_backed_branch_publications.insert(branch_id.clone());
@@ -4788,21 +5009,6 @@ async fn stage_branch_head_control_publications(
                             load_persisted_lifecycle_tracked_snapshot(read, head_commit_id).await?;
                         HotTrackedSnapshot::from_materialized_rows(rows.into_values().collect())?
                     };
-                    let mut untracked_deltas = state_rows
-                        .iter()
-                        .filter(|row| {
-                            row.untracked
-                                && row.branch_id.as_str() == branch_id
-                                && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                        })
-                        .map(current_state_delta_from_state_row)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    untracked_deltas.extend(
-                        engine_rows
-                            .iter()
-                            .filter(|row| row.branch_id == *branch_id)
-                            .map(current_state_delta_from_engine_row),
-                    );
                     let absence_guards = if insert_selection.is_empty() {
                         BTreeSet::new()
                     } else {
@@ -4832,9 +5038,7 @@ async fn stage_branch_head_control_publications(
                             &branch_id,
                             generation,
                             tracked,
-                            existing.map(|control| control.generation),
                             &[],
-                            &untracked_deltas,
                             &absence_guards,
                             None,
                             &mut coverage,
@@ -5148,7 +5352,6 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
 ) -> Result<(), LixError> {
-    let current_state = TrackedHeadContext::new().reader(read);
     for (branch_id, target) in explicit_branch_targets {
         let Some(existing) = observations
             .get(branch_id)
@@ -5162,28 +5365,32 @@ async fn reject_explicit_branch_ref_lifecycle_with_untracked_rows(
         if !destructive {
             continue;
         }
-        let mut untracked_identities = current_state
-            .scan_live_rows(
-                branch_id,
-                existing,
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter {
-                        include_tombstones: true,
-                        ..TrackedStateFilter::default()
-                    },
-                    read_columns: TrackedStateReadColumns::default(),
-                    limit: None,
+        let mut untracked_identities = crate::live_state::scan_untracked_batch(
+            read,
+            &crate::live_state::LiveStateScanRequest {
+                filter: crate::live_state::LiveStateFilter {
+                    branch_ids: vec![branch_id.clone()],
+                    untracked: Some(true),
+                    include_tombstones: true,
+                    ..crate::live_state::LiveStateFilter::default()
                 },
-            )
-            .await?
-            .into_iter()
-            .filter(|row| row.untracked)
-            .map(|row| TrackedStateKey {
-                schema_key: row.schema_key,
-                entity_pk: row.entity_pk,
-                file_id: row.file_id,
-            })
-            .collect();
+                ..crate::live_state::LiveStateScanRequest::default()
+            },
+            std::slice::from_ref(branch_id),
+        )
+        .await?
+        .into_rows()
+        .into_iter()
+        // The scan scope includes the global fallback for visibility, but a
+        // destructive lifecycle decision is owner-local. Global rows remain
+        // valid after deleting or repointing this branch.
+        .filter(|row| row.branch_id.as_ref() == branch_id)
+        .map(|row| TrackedStateKey {
+            schema_key: row.schema_key,
+            entity_pk: row.entity_pk,
+            file_id: row.file_id,
+        })
+        .collect();
         apply_pending_untracked_identities(
             &mut untracked_identities,
             branch_id,
@@ -6630,6 +6837,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn final_lane_collision_frontier_is_unique_and_schema_bounded_at_ten_thousand() {
+        let mut untracked_pending = BTreeMap::new();
+        for ordinal in 0..10_000 {
+            untracked_pending.insert(
+                TrackedStateKey {
+                    schema_key: "untracked_only".to_owned(),
+                    file_id: None,
+                    entity_pk: EntityPk::single(format!("row-{ordinal:05}")),
+                },
+                true,
+            );
+        }
+        let tracked_pending = BTreeMap::new();
+        let candidates =
+            final_lane_untracked_probe_candidates(&untracked_pending, &tracked_pending);
+        assert_eq!(candidates.len(), 10_000);
+        assert_eq!(
+            candidates.iter().collect::<BTreeSet<_>>().len(),
+            candidates.len(),
+            "the final-lane frontier must not duplicate physical owner probes"
+        );
+
+        let absent_tracked_schemas: BTreeSet<String> = BTreeSet::new();
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|identity| absent_tracked_schemas.contains(&identity.schema_key))
+                .count(),
+            0,
+            "a schema-proven tracked absence removes all N exact owner probes"
+        );
+
+        let present_tracked_schemas = BTreeSet::from(["untracked_only".to_owned()]);
+        let exact_probe_keys = candidates
+            .iter()
+            .filter(|identity| present_tracked_schemas.contains(&identity.schema_key))
+            .count();
+        assert_eq!(
+            exact_probe_keys,
+            candidates.len(),
+            "a positive schema proof retains one exact owner probe per unique identity"
+        );
+        assert!(
+            exact_probe_keys <= candidates.len(),
+            "collision validation must never issue a duplicate O(N) probe frontier"
+        );
+    }
+
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             TrackedStateContext::new(),
@@ -7171,6 +7427,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_branch_ref_delete_ignores_global_untracked_rows() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+        let branch_id = "01960000-0000-7000-8000-000000000004";
+        crate::test_support::seed_global_branch_head(storage.clone()).await;
+        crate::test_support::seed_branch_head(storage.clone(), branch_id, "branch-ref-head").await;
+
+        let mut seed_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("global untracked read should open");
+        let (seed_writes, seed_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            None,
+            &mut seed_read,
+            PreparedWriteSet {
+                insert_selection: PreparedInsertSelection::new(),
+                state_rows: prepared_rows![untracked_global_row("global-member")],
+                commit_change_refs_by_branch: BTreeMap::new(),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
+                file_content_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("global untracked row should stage");
+        storage
+            .commit_write_set(
+                seed_writes,
+                StorageWriteOptions {
+                    preconditions: seed_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("global untracked row should commit");
+
+        let mut branch_ref_delete = untracked_global_row("delete-global-safe-branch-ref");
+        branch_ref_delete.entity_pk = EntityPk::single(branch_id);
+        branch_ref_delete.schema_key = BRANCH_REF_SCHEMA_KEY.into();
+        branch_ref_delete.snapshot = None;
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch-ref delete read should open");
+        commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            None,
+            &mut read,
+            PreparedWriteSet {
+                insert_selection: PreparedInsertSelection::new(),
+                state_rows: prepared_rows![branch_ref_delete],
+                commit_change_refs_by_branch: BTreeMap::new(),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
+                file_content_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("global rows must not block local branch deletion");
+    }
+
+    #[tokio::test]
     async fn direct_branch_ref_delete_requires_final_untracked_state_to_be_empty() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
@@ -7214,6 +7540,15 @@ mod tests {
             )
             .await
             .expect("local untracked row should persist");
+        let collision_profile = take_final_lane_collision_read_profile();
+        assert_eq!(
+            collision_profile.exact_owner_probe_keys, 0,
+            "the final-lane proof must not issue per-identity owner reads"
+        );
+        assert!(
+            collision_profile.candidate_keys >= 1,
+            "a live untracked write must record its unique collision frontier"
+        );
 
         let mut branch_ref_delete = untracked_global_row("delete-persisted-branch-ref");
         branch_ref_delete.entity_pk = EntityPk::single(branch_id);

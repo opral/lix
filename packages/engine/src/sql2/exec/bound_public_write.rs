@@ -58,6 +58,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static CERTIFIED_UNTRACKED_REPLACEMENT_BATCH_EXECUTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -88,6 +90,11 @@ pub(crate) fn take_certified_generation_identity_replacements() -> usize {
 #[cfg(test)]
 pub(crate) fn take_certified_single_path_value_replacements() -> usize {
     CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| executions.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_certified_untracked_replacement_batch_executions() -> usize {
+    CERTIFIED_UNTRACKED_REPLACEMENT_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
 }
 
 #[cfg(test)]
@@ -590,6 +597,7 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
         &spec,
         scan_entity_pks,
         direct_replacement.is_some(),
+        bound_untracked_from_predicate(&plan.bound.predicate, &[]),
     )
     .await?;
     if direct_replacement.is_some()
@@ -799,22 +807,14 @@ async fn try_execute_direct_path_value_replacement_batch(
     {
         return Ok(None);
     }
-    let Some(schema_catalog) = ctx.schema_catalog_snapshot() else {
-        return Ok(None);
-    };
-    let Some((schema_plan_id, schema_plan)) = schema_catalog.plan_for_key(&spec.schema_key) else {
-        return Ok(None);
-    };
-    if !schema_plan.accepts_canonical_certificate() {
-        return Ok(None);
-    }
-
     let row_count = parameter_batch.num_rows();
+    let explicitly_untracked =
+        bound_untracked_from_predicate(&plan.bound.predicate, &[]) == Some(true);
     let mut primary_key_arena = Vec::new();
     let mut primary_key_offsets = Vec::with_capacity(row_count);
     let mut previous_row = None;
     let mut primary_keys_strictly_ordered = true;
-    let mut parameter_identity_hasher = blake3::Hasher::new();
+    let mut parameter_identity_hasher = (!explicitly_untracked).then(blake3::Hasher::new);
     for statement_index in 0..row_count {
         let DirectParameterValue::String(primary_key) =
             parameter_batch.value(primary_key_param_index, statement_index)
@@ -830,14 +830,36 @@ async fn try_execute_direct_path_value_replacement_batch(
             primary_keys_strictly_ordered &= previous < primary_key;
         }
         previous_row = Some(statement_index);
-        parameter_identity_hasher.update(&(primary_key.len() as u64).to_le_bytes());
-        parameter_identity_hasher.update(primary_key.as_bytes());
+        if let Some(hasher) = &mut parameter_identity_hasher {
+            hasher.update(&(primary_key.len() as u64).to_le_bytes());
+            hasher.update(primary_key.as_bytes());
+        }
         let start = primary_key_arena.len();
         primary_key_arena.extend_from_slice(primary_key.as_bytes());
         primary_key_offsets.push((start, primary_key_arena.len()));
     }
-    let parameter_identity_digest = *parameter_identity_hasher.finalize().as_bytes();
+    let parameter_identity_digest =
+        parameter_identity_hasher.map(|hasher| *hasher.finalize().as_bytes());
     let active_branch_id = ctx.active_branch_id().to_owned();
+    // Explicit untracked batches use only generic row normalization. They do
+    // not require tracked schema certificates, typed journals, or collection
+    // generation digests. Keep that admission decision before any tracked-only
+    // catalog lookup.
+    let schema_plan = if explicitly_untracked {
+        None
+    } else {
+        let Some(schema_catalog) = ctx.schema_catalog_snapshot() else {
+            return Ok(None);
+        };
+        let Some((schema_plan_id, schema_plan)) = schema_catalog.plan_for_key(&spec.schema_key)
+        else {
+            return Ok(None);
+        };
+        if !schema_plan.accepts_canonical_certificate() {
+            return Ok(None);
+        }
+        Some((schema_plan_id, true))
+    };
     let scope = crate::collection_generation::CollectionScopeRef {
         schema_key: &spec.schema_key,
         file_id: None,
@@ -845,27 +867,35 @@ async fn try_execute_direct_path_value_replacement_batch(
     // Generation controls describe committed HOT state. Any staged member can
     // change the effective identity set, so it must force the overlay-aware
     // candidate scan instead of certifying the committed digest.
-    let has_staged_collection_rows = ctx.has_staged_collection_rows(&active_branch_id, scope)?;
-    let collection_generation = ctx
-        .load_collection_generation(&active_branch_id, scope)
-        .await?;
+    let (has_staged_collection_rows, collection_generation) = if explicitly_untracked {
+        (false, None)
+    } else {
+        (
+            ctx.has_staged_collection_rows(&active_branch_id, scope)?,
+            ctx.load_collection_generation(&active_branch_id, scope)
+                .await?,
+        )
+    };
     let certified_ordered_generation = primary_keys_strictly_ordered
         && !has_staged_collection_rows
         && collection_generation.is_some_and(|generation| {
             generation.live_count == row_count as u64
-                && generation.ordered_identity_digest == Some(parameter_identity_digest)
+                && generation.ordered_identity_digest == parameter_identity_digest
         });
-    let typed_journal_admitted = if certified_ordered_generation {
-        ctx.can_stage_typed_mutation_journal_replace(
-            &spec.schema_key,
-            row_count as u64,
-            parameter_identity_digest,
-        )
-        .await?
-    } else {
-        false
-    };
+    let typed_journal_admitted =
+        if schema_plan.is_some_and(|(_, accepts)| accepts) && certified_ordered_generation {
+            ctx.can_stage_typed_mutation_journal_replace(
+                &spec.schema_key,
+                row_count as u64,
+                parameter_identity_digest.expect("tracked typed journal admission has a digest"),
+            )
+            .await?
+        } else {
+            false
+        };
     if typed_journal_admitted {
+        let (schema_plan_id, _) =
+            schema_plan.expect("tracked typed journal admission carries a schema plan");
         let mut snapshots = Vec::with_capacity(
             primary_key_arena
                 .len()
@@ -904,7 +934,7 @@ async fn try_execute_direct_path_value_replacement_batch(
             primary_key_offsets,
             snapshots,
             snapshot_offsets,
-            parameter_identity_digest,
+            parameter_identity_digest.expect("tracked typed journal carries a digest"),
         )?;
         ctx.stage_typed_mutation_journal_replace(journal)
             .instrument(tracing::debug_span!(
@@ -978,11 +1008,15 @@ async fn try_execute_direct_path_value_replacement_batch(
         .as_deref()
         .unwrap_or(entity_pks.as_slice());
     let unique_row_count = unique_entity_pks.len();
-    let ordered_identity_digest =
-        crate::collection_generation::ordered_single_string_identity_digest(
-            unique_entity_pks.iter(),
-        );
-    let certified_generation_identity = !has_staged_collection_rows
+    let ordered_identity_digest = (!explicitly_untracked)
+        .then(|| {
+            crate::collection_generation::ordered_single_string_identity_digest(
+                unique_entity_pks.iter(),
+            )
+        })
+        .flatten();
+    let certified_generation_identity = !explicitly_untracked
+        && !has_staged_collection_rows
         && collection_generation.is_some_and(|generation| {
             generation.live_count == unique_row_count as u64
                 && generation.ordered_identity_digest.is_some()
@@ -996,26 +1030,51 @@ async fn try_execute_direct_path_value_replacement_batch(
     }
     let candidates = if certified_generation_identity {
         MaterializedLiveStateBatch::default()
+    } else if explicitly_untracked {
+        // The untracked plane has no tracked collection certificate. Its
+        // generic proof is one schema-prefix batch probe (not one scan per
+        // entity); the authoritative physical rows still decide file
+        // isolation and missing-row semantics.
+        scan_entity_candidates_for_pks(
+            ctx,
+            plan,
+            &spec,
+            unique_entity_pks.to_vec(),
+            true,
+            Some(true),
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.entity_update_value_batch.untracked_schema_batch_probe",
+            row_count,
+            unique_row_count
+        ))
+        .await?
     } else {
-        let candidates =
-            scan_entity_candidates_for_pks(ctx, plan, &spec, unique_entity_pks.to_vec(), true)
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.entity_update_value_batch.candidate_scan",
-                    row_count,
-                    unique_row_count
-                ))
-                .await?;
-        if candidates.iter().any(|candidate| {
-            candidate.untracked()
-                || candidate.global()
-                || candidate.file_id().is_some()
-                || candidate.metadata().is_some()
-        }) {
-            return Ok(None);
-        }
-        candidates
+        scan_entity_candidates_for_pks(
+            ctx,
+            plan,
+            &spec,
+            unique_entity_pks.to_vec(),
+            true,
+            bound_untracked_from_predicate(&plan.bound.predicate, &[]),
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.entity_update_value_batch.candidate_scan",
+            row_count,
+            unique_row_count
+        ))
+        .await?
     };
+    if candidates.iter().any(|candidate| {
+        candidate.untracked() != explicitly_untracked
+            || candidate.global()
+            || candidate.file_id().is_some()
+            || (!explicitly_untracked && candidate.metadata().is_some())
+    }) {
+        return Ok(None);
+    }
     // Sorting identities changes expression evaluation order. Once this route
     // is fully certified, validate JSON arguments for live rows in original
     // statement order so a later replacement cannot hide an earlier error.
@@ -1063,29 +1122,37 @@ async fn try_execute_direct_path_value_replacement_batch(
             }
         }
     }
-    let replaces_complete_collection = certified_generation_identity
-        || (candidates.len() == unique_row_count
-            && collection_generation
-                .is_some_and(|generation| generation.live_count == unique_row_count as u64));
+    let replaces_complete_collection = !explicitly_untracked
+        && (certified_generation_identity
+            || (candidates.len() == unique_row_count
+                && collection_generation
+                    .is_some_and(|generation| generation.live_count == unique_row_count as u64)));
 
-    let (estimated_row_bytes, replacement_identity_replay_bytes) = unique_entity_pks
+    let estimated_row_bytes = unique_entity_pks
         .iter()
-        .try_fold((0_usize, 0_usize), |(estimated, replay), entity_pk| {
-            Some((
-                estimated.checked_add(
-                    entity_pk
-                        .as_single_string()
-                        .map_or(32, |path| path.len().saturating_add(32)),
-                )?,
-                replay.checked_add(
-                    spec.schema_key
-                        .len()
-                        .checked_add(entity_pk.estimated_heap_bytes())?
-                        .checked_add(128)?,
-                )?,
-            ))
+        .try_fold(0_usize, |estimated, entity_pk| {
+            estimated.checked_add(
+                entity_pk
+                    .as_single_string()
+                    .map_or(32, |path| path.len().saturating_add(32)),
+            )
         })
-        .ok_or_else(|| LixError::unknown("certified replacement byte accounting overflowed"))?;
+        .ok_or_else(|| LixError::unknown("replacement byte accounting overflowed"))?;
+    let replacement_identity_replay_bytes = if explicitly_untracked {
+        0_u64
+    } else {
+        unique_entity_pks
+            .iter()
+            .try_fold(0_u64, |replay, entity_pk| {
+                let bytes = spec
+                    .schema_key
+                    .len()
+                    .checked_add(entity_pk.estimated_heap_bytes())?
+                    .checked_add(128)?;
+                replay.checked_add(u64::try_from(bytes).ok()?)
+            })
+            .ok_or_else(|| LixError::unknown("certified replacement byte accounting overflowed"))?
+    };
     let mut normalized = Vec::with_capacity(estimated_row_bytes);
     let replacement_capacity = if certified_generation_identity {
         unique_row_count
@@ -1094,6 +1161,8 @@ async fn try_execute_direct_path_value_replacement_batch(
     };
     let mut snapshot_offsets = Vec::with_capacity(replacement_capacity);
     let mut replacement_entity_pks = Vec::with_capacity(replacement_capacity);
+    let mut replacement_candidate_indices =
+        explicitly_untracked.then(|| Vec::with_capacity(replacement_capacity));
     let mut affected_by_statement =
         (!certified_generation_identity).then(|| vec![0_u64; row_count]);
     let mut candidate_index = 0;
@@ -1149,6 +1218,9 @@ async fn try_execute_direct_path_value_replacement_batch(
         normalized.push(b'}');
         snapshot_offsets.push((start, normalized.len()));
         replacement_entity_pks.push(entity_pk.clone());
+        if let Some(candidate_indices) = &mut replacement_candidate_indices {
+            candidate_indices.push(candidate_index);
+        }
         if let Some(ordinals) = &sorted_statement_ordinals {
             for &affected_statement in &ordinals[first_statement_index..=last_statement_index] {
                 if let Some(affected_by_statement) = &mut affected_by_statement {
@@ -1166,38 +1238,61 @@ async fn try_execute_direct_path_value_replacement_batch(
         let normalized_len = normalized.len();
         let snapshots =
             TransactionJson::from_certified_row_content_arena(normalized, snapshot_offsets)?;
-        let rows = CertifiedParameterReplacementBatch::new(
-            replacement_entity_pks,
-            snapshots,
-            spec.schema_key.as_str().into(),
-            active_branch_id.into(),
-            CertifiedRawWriteBatchPreparation {
-                schema_plan_id,
-                facts: PreparedRowFacts {
-                    row_content_validated: true,
-                    requires_transaction_validation: false,
-                },
-                tracked_keys_strictly_ordered: true,
-                complete_collection_replacement: replaces_complete_collection
-                    .then(|| {
-                        Some(CompleteCollectionReplacementProof {
-                            ordered_identity_digest: ordered_identity_digest?,
-                            replay_bytes: u64::try_from(
-                                replacement_identity_replay_bytes.checked_add(normalized_len)?,
-                            )
-                            .ok()?,
+        if let Some(candidate_indices) = replacement_candidate_indices {
+            let mut rows = RawWriteBatch::with_capacity(candidate_indices.len());
+            for (candidate_index, snapshot) in candidate_indices.into_iter().zip(snapshots) {
+                append_direct_path_value_replacement_prepared_row(
+                    &mut rows,
+                    &spec,
+                    EntityLiveRowRef::from(candidates.row(candidate_index)),
+                    snapshot,
+                )?;
+            }
+            stage_rows(ctx, TransactionWriteMode::Replace, rows)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.entity_update_value_batch.stage_untracked_rows",
+                    row_count
+                ))
+                .await?;
+            #[cfg(test)]
+            CERTIFIED_UNTRACKED_REPLACEMENT_BATCH_EXECUTIONS.with(|executions| {
+                executions.set(executions.get().saturating_add(1));
+            });
+        } else {
+            let (schema_plan_id, _) =
+                schema_plan.expect("tracked certified replacement carries a schema plan");
+            let rows = CertifiedParameterReplacementBatch::new(
+                replacement_entity_pks,
+                snapshots,
+                spec.schema_key.as_str().into(),
+                active_branch_id.into(),
+                CertifiedRawWriteBatchPreparation {
+                    schema_plan_id,
+                    facts: PreparedRowFacts {
+                        row_content_validated: true,
+                        requires_transaction_validation: false,
+                    },
+                    tracked_keys_strictly_ordered: true,
+                    complete_collection_replacement: replaces_complete_collection
+                        .then(|| {
+                            Some(CompleteCollectionReplacementProof {
+                                ordered_identity_digest: ordered_identity_digest?,
+                                replay_bytes: replacement_identity_replay_bytes
+                                    .checked_add(u64::try_from(normalized_len).ok()?)?,
+                            })
                         })
-                    })
-                    .flatten(),
-            },
-        )?;
-        ctx.stage_certified_parameter_batch_replace(rows)
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.entity_update_value_batch.stage_rows",
-                row_count
-            ))
-            .await?;
+                        .flatten(),
+                },
+            )?;
+            ctx.stage_certified_parameter_batch_replace(rows)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.entity_update_value_batch.stage_rows",
+                    row_count
+                ))
+                .await?;
+        }
     }
 
     #[cfg(test)]
@@ -1908,13 +2003,40 @@ fn bound_single_text_primary_key_param(
     };
     spec.visible_column(primary_key_column)
         .filter(|column| column.column_type == EntityColumnType::String)?;
+    if let BoundPredicate::And(predicates) = predicate {
+        let [first, second] = predicates.as_slice() else {
+            return None;
+        };
+        let first_primary_key = bound_text_primary_key_eq_param(primary_key_column, first);
+        let second_primary_key = bound_text_primary_key_eq_param(primary_key_column, second);
+        return match (first_primary_key, second_primary_key) {
+            (Some(param), None) if bound_literal_untracked_eq(second).is_some() => Some(param),
+            (None, Some(param)) if bound_literal_untracked_eq(first).is_some() => Some(param),
+            _ => None,
+        };
+    }
+    bound_text_primary_key_eq_param(primary_key_column, predicate)
+}
+
+fn bound_literal_untracked_eq(predicate: &BoundPredicate) -> Option<bool> {
+    let BoundPredicate::Eq(left, right) = predicate else {
+        return None;
+    };
+    bound_untracked_column_value(left, right, &[])
+        .or_else(|| bound_untracked_column_value(right, left, &[]))
+}
+
+fn bound_text_primary_key_eq_param(
+    primary_key_column: &str,
+    predicate: &BoundPredicate,
+) -> Option<usize> {
     let BoundPredicate::Eq(left, right) = predicate else {
         return None;
     };
     match (left, right) {
         (BoundExpr::Column(column), BoundExpr::Param(param))
         | (BoundExpr::Param(param), BoundExpr::Column(column))
-            if column.name == *primary_key_column =>
+            if column.name == primary_key_column =>
         {
             param.index.checked_sub(1)
         }
@@ -2878,6 +3000,13 @@ async fn try_execute_direct_path_value_replacement(
     spec: &EntitySurfaceSpec,
     params: &[Value],
 ) -> Result<Option<SqlWriteResult>, LixError> {
+    // The certified replacement program writes ordinary tracked rows. Avoid
+    // probing the mixed-retention serving path when the predicate already
+    // proves this is an untracked replacement; the canonical entity route
+    // below can point-read the dedicated physical plane directly.
+    if bound_untracked_from_predicate(&plan.bound.predicate, params) == Some(true) {
+        return Ok(None);
+    }
     let Some(program) = prepare_path_value_replacement_program(ctx, plan, spec) else {
         return Ok(None);
     };
@@ -2973,7 +3102,8 @@ pub(crate) fn prepare_path_value_replacement_program(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
 ) -> Option<PreparedPathValueReplacementProgram> {
-    if spec.has_inter_row_constraints
+    if bound_untracked_from_predicate(&plan.bound.predicate, &[]) == Some(true)
+        || spec.has_inter_row_constraints
         || !matches!(plan.bound.input, BoundWriteInput::None)
         || plan.bound.conflict.is_some()
         || plan.bound.returning.is_some()
@@ -3922,7 +4052,55 @@ async fn scan_entity_candidates(
         }
         request.filter.entity_pks = entity_pks;
     }
+    request.filter.untracked = bound_untracked_from_predicate(&plan.bound.predicate, params);
     ctx.scan_live_state_batch(&request).await
+}
+
+fn bound_untracked_from_predicate(predicate: &BoundPredicate, params: &[Value]) -> Option<bool> {
+    match predicate {
+        BoundPredicate::And(predicates) => {
+            let mut constraint = None;
+            for predicate in predicates {
+                let Some(value) = bound_untracked_from_predicate(predicate, params) else {
+                    continue;
+                };
+                if constraint.is_some_and(|existing| existing != value) {
+                    return None;
+                }
+                constraint = Some(value);
+            }
+            constraint
+        }
+        BoundPredicate::Eq(left, right) => bound_untracked_column_value(left, right, params)
+            .or_else(|| bound_untracked_column_value(right, left, params)),
+        _ => None,
+    }
+}
+
+fn bound_untracked_column_value(
+    column: &BoundExpr,
+    value: &BoundExpr,
+    params: &[Value],
+) -> Option<bool> {
+    let BoundExpr::Column(column) = column else {
+        return None;
+    };
+    if column.name != "lixcol_untracked" {
+        return None;
+    }
+    bound_untracked_bool_value(value, params)
+}
+
+fn bound_untracked_bool_value(value: &BoundExpr, params: &[Value]) -> Option<bool> {
+    match value {
+        BoundExpr::Literal(BoundLiteral::Bool(value)) => Some(*value),
+        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+            Some(Value::Boolean(value)) => Some(*value),
+            _ => None,
+        },
+        BoundExpr::Cast { expr, .. } => bound_untracked_bool_value(expr, params),
+        _ => None,
+    }
 }
 
 async fn scan_entity_candidates_for_pks(
@@ -3931,12 +4109,14 @@ async fn scan_entity_candidates_for_pks(
     spec: &EntitySurfaceSpec,
     entity_pks: Vec<EntityPk>,
     metadata_only: bool,
+    untracked: Option<bool>,
 ) -> Result<MaterializedLiveStateBatch, LixError> {
     ctx.scan_live_state_batch(&LiveStateScanRequest {
         filter: LiveStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
             entity_pks,
             branch_ids: scan_branch_ids(&plan.bound.branch_scope)?,
+            untracked,
             include_tombstones: false,
             ..LiveStateFilter::default()
         },
@@ -7207,6 +7387,25 @@ mod primary_key_route_tests {
             TYPED_CERTIFIED_INSERT_MIN_ROWS - 1
         ));
         assert!(use_typed_certified_insert(TYPED_CERTIFIED_INSERT_MIN_ROWS));
+    }
+
+    #[test]
+    fn bound_untracked_constraint_uses_one_based_parameter_indexes() {
+        let predicate = BoundPredicate::Eq(
+            BoundExpr::Column(BoundColumnRef {
+                table: "json_pointer".to_string(),
+                column_id: 9,
+                name: "lixcol_untracked".to_string(),
+            }),
+            BoundExpr::Param(BoundParamRef { index: 1 }),
+        );
+        assert_eq!(
+            bound_untracked_from_predicate(
+                &predicate,
+                &[Value::Boolean(true), Value::Boolean(false)]
+            ),
+            Some(true)
+        );
     }
 
     #[test]

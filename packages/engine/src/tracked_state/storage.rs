@@ -16405,6 +16405,7 @@ mod tests {
             COMMIT_CHANGE_ID_SPACE,
             CHECKPOINT_RECOVERY_REF_SPACE,
             CHECKPOINT_GC_STATE_SPACE,
+            crate::live_state::UNTRACKED_ROW_SPACE,
         ];
         let mut seen = BTreeMap::new();
         for space in spaces {

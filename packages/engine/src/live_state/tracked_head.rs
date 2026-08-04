@@ -1,11 +1,9 @@
-//! Unified, materialized live state for one branch head.
+//! Materialized tracked state for one branch head.
 //!
-//! The V21 hot state has one authoritative file-first row per full identity
-//! plus one conservative file-membership marker per schema. Each row is tagged
-//! `tracked` or `untracked`: tracked mutations also enter history, while
-//! untracked mutations exist only in this serving plane. Normal reads consult
-//! this single row index rather than merging a tracked snapshot with an
-//! untracked overlay.
+//! The V22 HOT state has one authoritative file-first row per tracked identity
+//! plus one conservative file-membership marker per schema. History-free
+//! untracked rows live exclusively in the branch-stable untracked plane and
+//! never enter this generation-scoped tracked representation.
 
 mod hot;
 
@@ -46,7 +44,6 @@ use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
-    JsonStoreWriter,
 };
 use crate::live_state::{
     MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
@@ -225,7 +222,6 @@ impl HeadIdentity {
 struct HeadValue {
     change_id: Option<ChangeId>,
     commit_id: Option<CommitId>,
-    untracked: bool,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
@@ -240,7 +236,6 @@ impl HeadValue {
         HeadValueRef {
             change_id: self.change_id,
             commit_id: self.commit_id,
-            untracked: self.untracked,
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -256,7 +251,6 @@ impl HeadValue {
 struct HeadValueRef<'a> {
     change_id: Option<ChangeId>,
     commit_id: Option<CommitId>,
-    untracked: bool,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
@@ -318,12 +312,11 @@ impl<'a> TrackedHeadDeltaRef<'a> {
     }
 }
 
-/// One mutation of the authoritative current serving state.
+/// One logical current-state mutation before tracked and untracked lanes split.
 ///
-/// `tracked` mutations have both IDs and may create tombstones. `untracked`
-/// mutations have neither ID; deletion removes the member physically. This
-/// is deliberately the single write representation for the hot state plane,
-/// so callers never stage a separate untracked overlay.
+/// Only tracked mutations may cross the HOT writer boundary. The `untracked`
+/// classifier remains here so transaction publication can lower those rows
+/// into the separate branch-stable untracked plane.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CurrentStateDeltaRef<'a> {
     pub(crate) schema_key: &'a str,
@@ -379,7 +372,6 @@ impl<'a> CurrentStateDeltaRef<'a> {
         HeadValueRef {
             change_id: self.change_id,
             commit_id: self.commit_id,
-            untracked: self.untracked,
             deleted: self.deleted,
             created_at,
             updated_at: self.updated_at,
@@ -399,19 +391,15 @@ impl<'a> CurrentStateDeltaRef<'a> {
     }
 
     fn validate(self) -> Result<(), LixError> {
-        match (self.untracked, self.change_id, self.commit_id, self.deleted) {
-            (false, Some(_), Some(_), _) | (true, None, None, false | true) => Ok(()),
-            (false, _, _, _) => Err(head_value_error(
+        match (self.untracked, self.change_id, self.commit_id) {
+            (false, Some(_), Some(_)) => Ok(()),
+            (false, _, _) => Err(head_value_error(
                 "tracked current-state mutation must carry change_id and commit_id",
             )),
-            (true, _, _, _) => Err(head_value_error(
-                "untracked current-state mutation must not carry change_id or commit_id",
+            (true, _, _) => Err(head_value_error(
+                "untracked current-state mutation crossed the tracked HOT boundary",
             )),
         }
-    }
-
-    fn physically_deletes(self) -> bool {
-        self.untracked && self.deleted
     }
 }
 
@@ -462,23 +450,15 @@ impl TrackedHeadContext {
         hot::HotStateWriter { store, writes }
     }
 
-    /// Reclaims derived current-state generations that no durable branch
-    /// control can select and returns their history-free payload refs. Both
-    /// the authoritative hot rows and their key-only file membership index are
-    /// generation-scoped, so the control is the one ownership root for both
-    /// spaces. The caller compares the returned refs with its complete live
-    /// payload set before staging physical JSON deletion.
-    ///
-    /// A non-current control still owns its generation. Its tracked portion
-    /// may use historical replay, but that same generation preserves the
-    /// branch's history-free untracked members until a fresh complete serving
-    /// generation is published.
+    /// Reclaims derived tracked generations that no durable branch control can
+    /// select. Untracked rows are branch-stable and are not owned or decoded by
+    /// this generation-scoped sweep.
     pub(crate) async fn stage_collect_stale_current_state_generations<S>(
         &self,
         store: &S,
         writes: &mut StorageWriteSet,
         controls: &[(String, BranchHeadControl)],
-    ) -> Result<Vec<JsonRef>, LixError>
+    ) -> Result<(), LixError>
     where
         S: StorageAdapterRead + ?Sized,
     {
@@ -506,29 +486,6 @@ fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixE
             delta.schema_key, delta.entity_pk, delta.file_id
         ),
     )
-}
-
-fn collect_retired_untracked_json_refs(
-    existing: HeadValueView<'_>,
-    delta: &CurrentStateDeltaRef<'_>,
-    retired: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
-) {
-    debug_assert!(existing.untracked);
-    if !delta.untracked {
-        return;
-    }
-    for old_slot in [existing.snapshot, existing.metadata] {
-        let HeadSlotView::Ref(old_ref) = old_slot else {
-            continue;
-        };
-        let retained_by_successor = !delta.physically_deletes()
-            && [delta.snapshot, delta.metadata].into_iter().any(
-                |new_slot| matches!(new_slot, JsonSlotRef::Ref(new_ref) if new_ref == &old_ref),
-            );
-        if !retained_by_successor {
-            retired.insert(*old_ref.as_hash_array());
-        }
-    }
 }
 
 fn reject_guarded_live_member(
@@ -577,48 +534,6 @@ fn reject_borrowed_guarded_live_member(
         return Err(tracked_head_duplicate_insert_error_ref(
             delta.schema_key,
             delta.entity_pk,
-        ));
-    }
-    Ok(())
-}
-
-/// Retention is an identity property, not a mutable value column. An UPDATE
-/// is planned against the current row and therefore preserves it; an INSERT
-/// finding an existing identity is rejected by `absence_guards` above. This
-/// additional fence makes an accidental tracked↔untracked promotion fail
-/// closed even on an internal write path that did not originate in SQL.
-fn reject_retention_change(
-    delta: &CurrentStateDeltaRef<'_>,
-    existing: HeadValueView<'_>,
-) -> Result<(), LixError> {
-    // A tracked tombstone is still the durable identity owner. Letting an
-    // untracked member overwrite it would erase the tracked checkpoint
-    // baseline and make a later diff silently miss the removal. Retention is
-    // therefore immutable while any physical member exists; untracked delete
-    // removes its member entirely, after which a new tracked insert is a new
-    // identity and cannot affect historical diff state.
-    if existing.untracked != delta.untracked {
-        if existing.untracked {
-            return Err(LixError::new(
-                LixError::CODE_UNIQUE,
-                format!(
-                    "cannot insert tracked row in schema '{}' entity_pk {:?}: a canonical untracked row already exists; delete it first",
-                    delta.schema_key, delta.entity_pk,
-                ),
-            ));
-        }
-        return Err(LixError::new(
-            LixError::CODE_UNIQUE,
-            format!(
-                "cannot change retention for existing current-state row in schema '{}' entity_pk {:?}; delete it before inserting it as {}",
-                delta.schema_key,
-                delta.entity_pk,
-                if delta.untracked {
-                    "untracked"
-                } else {
-                    "tracked"
-                },
-            ),
         ));
     }
     Ok(())
@@ -1316,8 +1231,8 @@ fn working_diff_error(message: &str) -> LixError {
 /// every row before it was copied into a live-state row.
 ///
 /// ```text
-///  0      format version (8)
-///  1      deleted + untracked + snapshot/metadata kinds + diff baseline kind
+///  0      format version (9)
+///  1      deleted + snapshot/metadata kinds + diff baseline kind
 ///  2..18  change UUID
 /// 18..34  commit UUID
 /// 34..42  created_at packed timestamp (big endian)
@@ -1334,13 +1249,13 @@ fn working_diff_error(message: &str) -> LixError {
 /// Persisting fingerprints only while a row is dirty keeps repeated diff
 /// classification independent of payload size without taxing checkpointed
 /// current state.
-const HEAD_VALUE_VERSION: u8 = 8;
+const HEAD_VALUE_VERSION: u8 = 9;
 const HEAD_VALUE_HEADER_BYTES: usize = 59;
 const COLUMNAR_BASE_COORDINATE_BYTES: usize = 16 + 4 + 4;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
 const HEAD_VALUE_SNAPSHOT_SHIFT: u8 = 1;
 const HEAD_VALUE_METADATA_SHIFT: u8 = 3;
-const HEAD_VALUE_UNTRACKED: u8 = 0b0010_0000;
+const HEAD_VALUE_RESERVED: u8 = 0b0010_0000;
 const HEAD_VALUE_WORKING_DIFF_SHIFT: u8 = 6;
 const HEAD_VALUE_SLOT_MASK: u8 = 0b11;
 const HEAD_VALUE_WORKING_DIFF_MASK: u8 = 0b11;
@@ -1367,7 +1282,6 @@ enum HeadSlotView<'a> {
 struct HeadValueView<'a> {
     change_id: Option<ChangeId>,
     commit_id: Option<CommitId>,
-    untracked: bool,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
@@ -1388,7 +1302,6 @@ impl CertifiedCurrentStatePredecessor {
             Self::Packed(value) => Ok(HeadValueView {
                 change_id: Some(value.change_id),
                 commit_id: Some(value.commit_id),
-                untracked: false,
                 deleted: value.deleted,
                 created_at: value.created_at,
                 updated_at: value.updated_at,
@@ -1536,7 +1449,6 @@ impl<'a> From<HeadSlotView<'a>> for HeadSlotEncode<'a> {
 struct HeadValueEncode<'a> {
     change_id: Option<ChangeId>,
     commit_id: Option<CommitId>,
-    untracked: bool,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
@@ -1561,7 +1473,6 @@ fn append_head_value(
         HeadValueEncode {
             change_id: value.change_id,
             commit_id: value.commit_id,
-            untracked: value.untracked,
             deleted: value.deleted,
             created_at: value.created_at,
             updated_at: value.updated_at,
@@ -1580,7 +1491,6 @@ fn reencode_head_value_with_baseline(
     encode_head_value_parts(HeadValueEncode {
         change_id: value.change_id,
         commit_id: value.commit_id,
-        untracked: value.untracked,
         deleted: value.deleted,
         created_at: value.created_at,
         updated_at: value.updated_at,
@@ -1612,37 +1522,9 @@ fn append_head_value_parts(
             "deleted current-state rows must not carry JSON payloads",
         ));
     }
-    match (
-        value.untracked,
-        value.change_id,
-        value.commit_id,
-        value.deleted,
-    ) {
-        (false, Some(_), Some(_), _) | (true, None, None, false) => {}
-        (true, _, _, true) => {
-            return Err(head_value_error(
-                "untracked current-state rows must be deleted physically",
-            ));
-        }
-        (false, _, _, _) => {
-            return Err(head_value_error(
-                "tracked current-state rows must carry change_id and commit_id",
-            ));
-        }
-        (true, _, _, false) => {
-            return Err(head_value_error(
-                "untracked current-state rows must not carry change_id or commit_id",
-            ));
-        }
-    }
-    if value.untracked && value.working_diff_baseline != WorkingDiffBaseline::Disabled {
+    if value.change_id.is_none() || value.commit_id.is_none() {
         return Err(head_value_error(
-            "untracked current-state rows must not carry a working-diff baseline",
-        ));
-    }
-    if value.untracked && value.columnar_base_coordinate.is_some() {
-        return Err(head_value_error(
-            "untracked current-state rows must not carry an columnar base coordinate",
+            "tracked current-state rows must carry change_id and commit_id",
         ));
     }
     if value
@@ -1679,9 +1561,6 @@ fn append_head_value_parts(
     bytes.reserve(capacity);
     bytes.push(HEAD_VALUE_VERSION);
     let mut flags = if value.deleted { HEAD_VALUE_DELETED } else { 0 };
-    if value.untracked {
-        flags |= HEAD_VALUE_UNTRACKED;
-    }
     flags |= snapshot_kind << HEAD_VALUE_SNAPSHOT_SHIFT;
     flags |= metadata_kind << HEAD_VALUE_METADATA_SHIFT;
     flags |= encode_working_diff_baseline_tag(value.working_diff_baseline)
@@ -1693,12 +1572,12 @@ fn append_head_value_parts(
     bytes.extend_from_slice(&value.updated_at.packed().to_be_bytes());
     bytes.extend_from_slice(
         &u32::try_from(snapshot_len)
-            .map_err(|_| head_value_error("snapshot payload exceeds v8 u32 limit"))?
+            .map_err(|_| head_value_error("snapshot payload exceeds v9 u32 limit"))?
             .to_be_bytes(),
     );
     bytes.extend_from_slice(
         &u32::try_from(metadata_len)
-            .map_err(|_| head_value_error("metadata payload exceeds v8 u32 limit"))?
+            .map_err(|_| head_value_error("metadata payload exceeds v9 u32 limit"))?
             .to_be_bytes(),
     );
     bytes.push(u8::from(value.columnar_base_coordinate.is_some()));
@@ -1779,7 +1658,7 @@ fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
 
 fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     if bytes.len() < HEAD_VALUE_HEADER_BYTES {
-        return Err(head_value_error("row is shorter than the v8 fixed header"));
+        return Err(head_value_error("row is shorter than the v9 fixed header"));
     }
     if bytes[0] != HEAD_VALUE_VERSION {
         return Err(head_value_error(&format!(
@@ -1788,6 +1667,9 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         )));
     }
     let flags = bytes[1];
+    if flags & HEAD_VALUE_RESERVED != 0 {
+        return Err(head_value_error("row uses reserved v9 flags"));
+    }
     let snapshot_kind = (flags >> HEAD_VALUE_SNAPSHOT_SHIFT) & HEAD_VALUE_SLOT_MASK;
     let metadata_kind = (flags >> HEAD_VALUE_METADATA_SHIFT) & HEAD_VALUE_SLOT_MASK;
     let change_uuid = uuid_from_head_bytes(&bytes[2..18], "change id")?;
@@ -1811,6 +1693,11 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     let metadata_end = snapshot_end
         .checked_add(metadata_len)
         .ok_or_else(|| head_value_error("metadata payload length overflow"))?;
+    if snapshot_end > bytes.len() || metadata_end > bytes.len() {
+        return Err(head_value_error(
+            "row payload lengths exceed the persisted v9 value",
+        ));
+    }
     let snapshot = decode_slot(
         snapshot_kind,
         &bytes[HEAD_VALUE_HEADER_BYTES..snapshot_end],
@@ -1872,49 +1759,21 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         ));
     }
     let deleted = flags & HEAD_VALUE_DELETED != 0;
-    let untracked = flags & HEAD_VALUE_UNTRACKED != 0;
     if deleted && (snapshot != HeadSlotView::None || metadata != HeadSlotView::None) {
         return Err(head_value_error(
             "deleted current-state rows must not carry JSON payloads",
         ));
     }
-    let (change_id, commit_id) = if untracked {
-        if deleted {
-            return Err(head_value_error(
-                "untracked current-state rows must be deleted physically",
-            ));
-        }
-        if change_uuid != uuid::Uuid::nil() || commit_uuid != uuid::Uuid::nil() {
-            return Err(head_value_error(
-                "untracked current-state rows must use nil change and commit ids",
-            ));
-        }
-        if working_diff_baseline != WorkingDiffBaseline::Disabled {
-            return Err(head_value_error(
-                "untracked current-state rows must not carry a working-diff baseline",
-            ));
-        }
-        if columnar_base_coordinate.is_some() {
-            return Err(head_value_error(
-                "untracked current-state rows must not carry an columnar base coordinate",
-            ));
-        }
-        (None, None)
-    } else {
-        if change_uuid == uuid::Uuid::nil() || commit_uuid == uuid::Uuid::nil() {
-            return Err(head_value_error(
-                "tracked current-state rows must use non-nil change and commit ids",
-            ));
-        }
-        (
-            Some(ChangeId::new(change_uuid)),
-            Some(CommitId::new(commit_uuid)),
-        )
-    };
+    if change_uuid == uuid::Uuid::nil() || commit_uuid == uuid::Uuid::nil() {
+        return Err(head_value_error(
+            "tracked current-state rows must use non-nil change and commit ids",
+        ));
+    }
+    let change_id = Some(ChangeId::new(change_uuid));
+    let commit_id = Some(CommitId::new(commit_uuid));
     Ok(HeadValueView {
         change_id,
         commit_id,
-        untracked,
         deleted,
         created_at,
         updated_at,
@@ -1944,7 +1803,7 @@ fn take_head_bytes<'a>(
 fn uuid_from_head_bytes(bytes: &[u8], field: &str) -> Result<uuid::Uuid, LixError> {
     let bytes: [u8; UUID_BYTES] = bytes.try_into().map_err(|_| {
         head_value_error(&format!(
-            "{field} must have {UUID_BYTES} bytes in the v8 header"
+            "{field} must have {UUID_BYTES} bytes in the v9 header"
         ))
     })?;
     Ok(uuid::Uuid::from_bytes(bytes))
@@ -2163,7 +2022,7 @@ where
             global,
             value.change_id,
             effective_hot_commit_id(value, active_checkpoint_commit_id),
-            value.untracked,
+            false,
             branch_id,
         );
         if let Some(coordinate) = value.columnar_base_coordinate {
@@ -2263,7 +2122,6 @@ mod tests {
         HeadValue {
             change_id: Some(ChangeId::for_test_label(change)),
             commit_id: Some(commit_id),
-            untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
@@ -2391,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_value_codec_roundtrips_clean_inline_ref_and_base_coordinate() {
+    fn v9_value_codec_roundtrips_clean_inline_ref_and_base_coordinate() {
         let snapshot_ref = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
         let columnar_base_coordinate = ColumnarBaseCoordinate {
             base_commit_id: CommitId::for_test_label("columnar-base"),
@@ -2401,7 +2259,6 @@ mod tests {
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("change")),
             commit_id: Some(CommitId::for_test_label("commit")),
-            untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
@@ -2411,7 +2268,7 @@ mod tests {
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
 
-        let bytes = encode_head_value(&value).expect("encode v8 row");
+        let bytes = encode_head_value(&value).expect("encode v9 row");
         assert_eq!(bytes[0], HEAD_VALUE_VERSION);
         assert_eq!(
             bytes.len(),
@@ -2420,7 +2277,7 @@ mod tests {
                 + JSON_REF_BYTES
                 + COLUMNAR_BASE_COORDINATE_BYTES
         );
-        let decoded = decode_head_value(&bytes).expect("decode v8 row");
+        let decoded = decode_head_value(&bytes).expect("decode v9 row");
         assert_eq!(decoded.change_id, value.change_id);
         assert_eq!(decoded.commit_id, value.commit_id);
         assert_eq!(decoded.created_at, value.created_at);
@@ -2437,11 +2294,28 @@ mod tests {
     }
 
     #[test]
+    fn v9_value_codec_rejects_payload_lengths_beyond_the_buffer() {
+        let value = HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("length-change")),
+            commit_id: Some(CommitId::for_test_label("length-commit")),
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-02T00:00:00Z"),
+            snapshot: JsonSlotRef::None,
+            metadata: JsonSlotRef::None,
+            columnar_base_coordinate: None,
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
+        };
+        let mut bytes = encode_head_value(&value).expect("encode v9 row");
+        bytes[50..54].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_head_value(&bytes).is_err());
+    }
+
+    #[test]
     fn materialized_inline_fields_share_the_head_value_buffer() {
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("shared-fields-change")),
             commit_id: Some(CommitId::for_test_label("shared-fields-commit")),
-            untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
@@ -2450,8 +2324,8 @@ mod tests {
             columnar_base_coordinate: None,
             working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
-        let bytes = Bytes::from(encode_head_value(&value).expect("encode v8 row"));
-        let decoded = decode_head_value(&bytes).expect("decode v8 row");
+        let bytes = Bytes::from(encode_head_value(&value).expect("encode v9 row"));
+        let decoded = decode_head_value(&bytes).expect("decode v9 row");
         let mut json_refs = Vec::new();
         let mut deferred = Vec::new();
         let snapshot = materialize_live_slot(
@@ -2483,7 +2357,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_value_codec_embeds_a_checkpoint_owned_tracked_first_before_baseline() {
+    fn v9_value_codec_embeds_a_checkpoint_owned_tracked_first_before_baseline() {
         let checkpoint_commit_id = CommitId::for_test_label("baseline-checkpoint");
         let baseline = WorkingDiffVersion {
             change_id: ChangeId::for_test_label("before-change"),
@@ -2503,7 +2377,6 @@ mod tests {
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("current-change")),
             commit_id: Some(CommitId::for_test_label("current-commit")),
-            untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
@@ -2516,7 +2389,7 @@ mod tests {
             },
         };
 
-        let bytes = encode_head_value(&value).expect("encode v8 row with baseline");
+        let bytes = encode_head_value(&value).expect("encode v9 row with baseline");
         assert_eq!(
             bytes.len(),
             HEAD_VALUE_HEADER_BYTES
@@ -2525,7 +2398,7 @@ mod tests {
                 + WORKING_DIFF_CHECKPOINT_BYTES
                 + WORKING_DIFF_VERSION_BYTES
         );
-        let decoded = decode_head_value(&bytes).expect("decode v8 row with baseline");
+        let decoded = decode_head_value(&bytes).expect("decode v9 row with baseline");
         assert_eq!(
             decoded.working_diff_baseline,
             WorkingDiffBaseline::BeforePresent {
@@ -3553,7 +3426,6 @@ mod tests {
             &HeadValue {
                 change_id: Some(ChangeId::for_test_label("change")),
                 commit_id: Some(head),
-                untracked: false,
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-02T00:00:00Z"),
@@ -3569,7 +3441,6 @@ mod tests {
             &HeadValue {
                 change_id: Some(ChangeId::for_test_label("deleted-change")),
                 commit_id: Some(head),
-                untracked: false,
                 deleted: true,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-02T00:00:00Z"),
@@ -3722,7 +3593,6 @@ mod tests {
                 &HeadValue {
                     change_id: Some(ChangeId::for_test_label(entity)),
                     commit_id: Some(head),
-                    untracked: false,
                     deleted: false,
                     created_at: ts("2026-01-01T00:00:00Z"),
                     updated_at: ts("2026-01-01T00:00:00Z"),
@@ -4055,18 +3925,19 @@ mod tests {
             .expect("open control-gated exact file read");
         let rows = TrackedHeadContext::new()
             .reader(read)
-            .load_projected_live_rows(
+            .load_projected_live_batch_refs(
                 branch_id,
                 control,
-                &[TrackedStateKey {
-                    schema_key: "schema".to_string(),
-                    entity_pk: EntityPk::single("row"),
-                    file_id: Some("01920000-0000-7000-8000-0000000000b2".to_string()),
+                &[TrackedStateKeyRef {
+                    schema_key: "schema",
+                    entity_pk: &EntityPk::single("row"),
+                    file_id: Some("01920000-0000-7000-8000-0000000000b2"),
                 }],
                 &ChangeRecordProjection::full(),
             )
             .await
-            .expect("control-bound exact file read should execute");
+            .expect("control-bound exact file read should execute")
+            .into_rows();
         assert_eq!(rows.len(), 1);
         let row = rows[0]
             .as_ref()
@@ -4164,7 +4035,6 @@ mod tests {
         let value = HeadValue {
             change_id: Some(ChangeId::for_test_label("change")),
             commit_id: Some(head),
-            untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:01Z"),
@@ -5065,125 +4935,6 @@ mod tests {
                 .next()
                 .flatten();
             assert!(value.is_none(), "malformed auxiliary key must be reclaimed");
-        }
-    }
-
-    #[tokio::test]
-    async fn current_state_gc_keeps_only_control_bound_untracked_generations() {
-        let storage = StorageAdapter::new(Memory::new());
-        let branch_id = "main";
-        let active_generation = CommitId::for_test_label("active-current-generation");
-        let stale_generation = CommitId::for_test_label("stale-current-generation");
-        let active_snapshot = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
-        let stale_snapshot = JsonRef::from_hash_bytes([9; JSON_REF_BYTES]);
-        let timestamp = ts("2026-01-01T00:00:00Z");
-        let active_identity = HeadIdentity {
-            branch_id: branch_id.to_string(),
-            generation: active_generation,
-            schema_key: "schema".to_string(),
-            entity_pk: EntityPk::single("active-row"),
-            file_id: Some("active-file".to_string()),
-        };
-        let stale_identity = HeadIdentity {
-            branch_id: branch_id.to_string(),
-            generation: stale_generation,
-            schema_key: "schema".to_string(),
-            entity_pk: EntityPk::single("stale-row"),
-            file_id: Some("stale-file".to_string()),
-        };
-        let active_control = BranchHeadControl {
-            head_commit_id: active_generation,
-            generation: active_generation,
-            current_state_revision: 0,
-            schema_presence_bloom: [u64::MAX; 4],
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label("active-current-ref"),
-        };
-        let controls = vec![(branch_id.to_string(), active_control)];
-
-        let untracked = |snapshot| HeadValue {
-            change_id: None,
-            commit_id: None,
-            untracked: true,
-            deleted: false,
-            created_at: timestamp,
-            updated_at: timestamp,
-            snapshot: JsonSlot::Ref(snapshot),
-            metadata: JsonSlot::None,
-            columnar_base_coordinate: None,
-        };
-        let mut writes = StorageWriteSet::new();
-        stage_put(&mut writes, &active_identity, &untracked(active_snapshot))
-            .expect("stage active untracked hot row");
-        stage_put(&mut writes, &stale_identity, &untracked(stale_snapshot))
-            .expect("stage stale untracked hot row");
-        stage_branch_head_control(&mut writes, branch_id, active_control)
-            .expect("stage active branch control");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit current-state GC fixture");
-
-        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("open current-state GC read"),
-        );
-        let rooted = TrackedHeadContext::new()
-            .reader(read.clone())
-            .untracked_json_refs(&controls)
-            .await
-            .expect("discover active untracked payload roots");
-        assert_eq!(rooted, vec![active_snapshot]);
-
-        let mut gc_writes = StorageWriteSet::new();
-        let stale_refs = TrackedHeadContext::new()
-            .stage_collect_stale_current_state_generations(&read, &mut gc_writes, &controls)
-            .await
-            .expect("stage stale current-state cleanup");
-        assert_eq!(stale_refs, vec![stale_snapshot]);
-        drop(read);
-        storage
-            .commit_write_set(gc_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit stale current-state cleanup");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open current-state GC verification read");
-        for (label, space) in [
-            ("primary hot row", HOT_ROW_SPACE),
-            ("file-schema hot markers", HOT_FILE_SPACE),
-        ] {
-            let entries = ScanPlan::prefix(
-                space,
-                StoragePrefix {
-                    bytes: Bytes::new(),
-                },
-            )
-            .collect(&read, StorageScanOptions::default())
-            .await
-            .expect("scan current-state hot storage")
-            .value
-            .entries;
-            assert_eq!(entries.len(), 1, "only active {label} survives GC");
-            let encoded =
-                full_value_bytes(entries.into_iter().next().expect("one hot value").value)
-                    .expect("hot value is present");
-            if space == HOT_FILE_SPACE {
-                assert!(encoded.is_empty(), "file-schema markers remain key-only");
-                continue;
-            }
-            let value = decode_head_value(&encoded).expect("active hot value decodes");
-            assert!(value.untracked, "active hot value remains untracked");
-            match value.snapshot {
-                HeadSlotView::Ref(snapshot) => assert_eq!(snapshot, active_snapshot),
-                _ => panic!("active hot value must retain its JSON reference"),
-            }
         }
     }
 }

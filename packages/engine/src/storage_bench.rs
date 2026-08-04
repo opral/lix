@@ -1456,6 +1456,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
     &[
         crate::init::REPOSITORY_PROTOCOL_SPACE,
         crate::branch::BRANCH_HEAD_CONTROL_SPACE,
+        crate::live_state::UNTRACKED_ROW_SPACE,
         crate::live_state::HOT_ROW_SPACE,
         crate::live_state::HOT_FILE_SPACE,
         crate::live_state::HOT_DIFF_SPACE,
@@ -1599,6 +1600,22 @@ mod tests {
     use crate::storage_adapter::{
         Memory, StorageAdapter, StorageKey, StorageValue, StorageWriteOptions,
     };
+
+    #[test]
+    fn layout_space_catalog_has_unique_ids_and_includes_untracked_rows() {
+        let catalog = super::layout_space_catalog();
+        let mut ids = std::collections::BTreeSet::new();
+        for (id, name) in &catalog {
+            assert!(
+                ids.insert(*id),
+                "duplicate storage space id {id:#x} ({name})"
+            );
+        }
+        assert!(catalog.iter().any(|(id, name)| {
+            *id == crate::live_state::UNTRACKED_ROW_SPACE.id.0
+                && *name == crate::live_state::UNTRACKED_ROW_SPACE.name
+        }));
+    }
 
     #[tokio::test]
     async fn checkpoint_commit_scan_baseline_matches_materialized_records_across_pages() {

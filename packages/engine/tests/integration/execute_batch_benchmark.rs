@@ -34,14 +34,20 @@ struct CountingRead {
 struct StorageCounters {
     begin_reads: AtomicU64,
     get_many_calls: AtomicU64,
+    get_keys: AtomicU64,
     scan_calls: AtomicU64,
+    scan_entries: AtomicU64,
+    scan_bytes: AtomicU64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct CounterSnapshot {
     begin_reads: u64,
     get_many_calls: u64,
+    get_keys: u64,
     scan_calls: u64,
+    scan_entries: u64,
+    scan_bytes: u64,
 }
 
 struct BenchStatement {
@@ -61,7 +67,10 @@ impl CountingStorage {
         CounterSnapshot {
             begin_reads: self.counters.begin_reads.load(Ordering::Relaxed),
             get_many_calls: self.counters.get_many_calls.load(Ordering::Relaxed),
+            get_keys: self.counters.get_keys.load(Ordering::Relaxed),
             scan_calls: self.counters.scan_calls.load(Ordering::Relaxed),
+            scan_entries: self.counters.scan_entries.load(Ordering::Relaxed),
+            scan_bytes: self.counters.scan_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -95,6 +104,13 @@ impl StorageRead for CountingRead {
         requests: &[GetManyRequest<'_>],
     ) -> Result<GetManyResult, StorageError> {
         self.counters.get_many_calls.fetch_add(1, Ordering::Relaxed);
+        self.counters.get_keys.fetch_add(
+            requests
+                .iter()
+                .map(|request| request.keys.len() as u64)
+                .sum(),
+            Ordering::Relaxed,
+        );
         self.inner.get_many(requests).await
     }
 
@@ -105,7 +121,25 @@ impl StorageRead for CountingRead {
         options: ScanOptions,
     ) -> Result<ScanChunk, StorageError> {
         self.counters.scan_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.scan(space, range, options).await
+        let result = self.inner.scan(space, range, options).await?;
+        self.counters
+            .scan_entries
+            .fetch_add(result.entries.len() as u64, Ordering::Relaxed);
+        self.counters.scan_bytes.fetch_add(
+            result
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry.key.0.len()
+                        + match &entry.value {
+                            lix_engine::storage::ProjectedValue::KeyOnly => 0,
+                            lix_engine::storage::ProjectedValue::FullValue(value) => value.len(),
+                        }
+                })
+                .sum::<usize>() as u64,
+            Ordering::Relaxed,
+        );
+        Ok(result)
     }
 }
 
@@ -114,9 +148,122 @@ impl CounterSnapshot {
         Self {
             begin_reads: self.begin_reads - before.begin_reads,
             get_many_calls: self.get_many_calls - before.get_many_calls,
+            get_keys: self.get_keys - before.get_keys,
             scan_calls: self.scan_calls - before.scan_calls,
+            scan_entries: self.scan_entries - before.scan_entries,
+            scan_bytes: self.scan_bytes - before.scan_bytes,
         }
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn staged_untracked_writes_reuse_the_transaction_opening_read() {
+    let storage = CountingStorage::new();
+    Engine::initialize(storage.clone()).await.unwrap();
+    let engine = Engine::new(storage.clone()).await.unwrap();
+    let session = engine.open_workspace_session().await.unwrap();
+
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"opening_read_note\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
+             false,\
+             true\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO opening_read_note (id, text, lixcol_untracked) \
+             VALUES ('note-1', 'before-1', true), ('note-2', 'before-2', true)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let mut transaction = session.begin_transaction().await.unwrap();
+    let before = storage.snapshot();
+    for (id, text) in [("note-1", "after-1"), ("note-2", "after-2")] {
+        let result = transaction
+            .execute(
+                "UPDATE opening_read_note SET text = $1 \
+                 WHERE id = $2 AND lixcol_untracked = true",
+                &[Value::Text(text.to_string()), Value::Text(id.to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_affected(), 1);
+    }
+    let staged = storage.snapshot().delta(before);
+
+    assert_eq!(
+        staged.begin_reads, 0,
+        "staging against a transaction must not open per-statement storage snapshots"
+    );
+    transaction.commit().await.unwrap();
+
+    let rows = session
+        .execute("SELECT id, text FROM opening_read_note ORDER BY id", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "note-1");
+    assert_eq!(rows.rows()[0].get::<String>("text").unwrap(), "after-1");
+    assert_eq!(rows.rows()[1].get::<String>("id").unwrap(), "note-2");
+    assert_eq!(rows.rows()[1].get::<String>("text").unwrap(), "after-2");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ten_thousand_untracked_update_has_one_unique_owner_probe_frontier() {
+    const ROWS: usize = 10_000;
+    const CHUNK: usize = 500;
+    let storage = CountingStorage::new();
+    Engine::initialize(storage.clone()).await.unwrap();
+    let engine = Engine::new(storage.clone()).await.unwrap();
+    let session = engine.open_workspace_session().await.unwrap();
+
+    for start in (0..ROWS).step_by(CHUNK) {
+        let end = (start + CHUNK).min(ROWS);
+        let mut sql =
+            String::from("INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ");
+        for ordinal in start..end {
+            if ordinal != start {
+                sql.push(',');
+            }
+            sql.push_str(&format!("('phase-row-{ordinal:05}', 'before', true)"));
+        }
+        let result = session.execute(&sql, &[]).await.unwrap();
+        assert_eq!(result.rows_affected(), (end - start) as u64);
+    }
+
+    let mut transaction = session.begin_transaction().await.unwrap();
+    let before = storage.snapshot();
+    let result = transaction
+        .execute(
+            "UPDATE lix_key_value SET value = 'after' WHERE lixcol_untracked = true",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_affected(), (ROWS + 1) as u64);
+    transaction.commit().await.unwrap();
+    let delta = storage.snapshot().delta(before);
+
+    eprintln!(
+        "untracked_10k_phase get_many_calls={} get_keys={} scan_calls={} scan_entries={} scan_bytes={}",
+        delta.get_many_calls,
+        delta.get_keys,
+        delta.scan_calls,
+        delta.scan_entries,
+        delta.scan_bytes
+    );
+    assert!(
+        delta.get_keys <= ROWS as u64 + 512,
+        "the 10K update must not issue a duplicate O(N) tracked-owner point-read frontier: {delta:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -182,18 +329,20 @@ async fn run_case(
         let delta = storage.snapshot().delta(before);
         counters.begin_reads += delta.begin_reads;
         counters.get_many_calls += delta.get_many_calls;
+        counters.get_keys += delta.get_keys;
         counters.scan_calls += delta.scan_calls;
     }
     durations.sort_unstable();
 
     println!(
-        "execute_batch_bench workload={workload} files={} statements={} rounds={rounds} warmups={warmups} p50_ns={} p95_ns={} begin_reads_per_op={} get_many_calls_per_op={} scan_calls_per_op={}",
+        "execute_batch_bench workload={workload} files={} statements={} rounds={rounds} warmups={warmups} p50_ns={} p95_ns={} begin_reads_per_op={} get_many_calls_per_op={} get_keys_per_op={} scan_calls_per_op={}",
         parse_usize_env(FILE_COUNT_ENV, 10_000),
         statements.len(),
         percentile(&durations, 50).as_nanos(),
         percentile(&durations, 95).as_nanos(),
         format_per_operation(counters.begin_reads, rounds),
         format_per_operation(counters.get_many_calls, rounds),
+        format_per_operation(counters.get_keys, rounds),
         format_per_operation(counters.scan_calls, rounds),
     );
 }

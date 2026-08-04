@@ -163,7 +163,6 @@ pub(crate) async fn seed_branch_head_with_rows(
             &BTreeSet::new(),
             None,
             None,
-            None,
             &mut working_diff_coverage,
         )
         .await
