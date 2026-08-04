@@ -96,7 +96,7 @@ impl LiveStateStringDictionary {
 /// provider adaptation. Identity strings are dictionary encoded once per
 /// batch; payloads retain their existing shared storage buffers. Consumers
 /// operate on [`MaterializedLiveStateRowRef`] views and only construct the
-/// legacy owned DTO at an API boundary that still requires it.
+/// owned DTO at an API boundary that requires ownership.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MaterializedLiveStateBatch {
     singleton: Option<Box<MaterializedLiveStateSingleton>>,

@@ -68,7 +68,7 @@ struct MaterializedTrackedStateDescriptor {
 /// Identity strings are dictionary encoded into one immutable byte arena,
 /// fixed row metadata occupies one contiguous descriptor column, timestamps
 /// and ids stay typed, and JSON slots retain their existing shared buffers.
-/// The legacy owned row is constructed only by an explicit terminal adapter.
+/// The owned row is constructed only by an explicit terminal adapter.
 #[derive(Debug, Default)]
 pub(crate) struct MaterializedTrackedStateBatch {
     strings: TrackedStateStringDictionary,
@@ -230,7 +230,7 @@ impl<'a> MaterializedTrackedStateRowRef<'a> {
         self.descriptor().commit_id
     }
 
-    /// Converts into the legacy DTO only at a terminal compatibility boundary.
+    /// Converts into the owned DTO only at a terminal API boundary.
     pub(crate) fn to_owned(self) -> MaterializedTrackedStateRow {
         MaterializedTrackedStateRow {
             entity_pk: self.entity_pk().clone(),

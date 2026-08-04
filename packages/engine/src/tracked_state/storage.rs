@@ -433,6 +433,10 @@ struct CommitDeltaPlane {
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 struct CommitDeltaManifest {
+    /// Ephemeral projection of the owning commit-state authority. Account
+    /// provenance is stored once in `CommitStateManifest`, not duplicated in
+    /// the compact event leaves.
+    account_id: String,
     /// Complete selected state borrowed from one ordinary source commit.
     /// Local inline/external segments are a disjoint authored overlay.
     #[musli(with = storage_codec::option)]
@@ -523,7 +527,9 @@ fn commit_state_inventory_from_delta_manifest(
 }
 
 fn commit_delta_manifest_from_commit_state(manifest: &CommitStateManifest) -> CommitDeltaManifest {
-    commit_delta_manifest_from_inventory(&manifest.mutations)
+    let mut delta = commit_delta_manifest_from_inventory(&manifest.mutations);
+    delta.account_id.clone_from(&manifest.account_id);
+    delta
 }
 
 /// Derives exact state-tree routing from the transaction-local mutation plan.
@@ -569,21 +575,13 @@ pub(crate) fn commit_delta_members_touched_scopes(
 }
 
 async fn expanded_commit_delta_manifest_from_commit_state(
-    store: &(impl StorageAdapterRead + ?Sized),
+    _store: &(impl StorageAdapterRead + ?Sized),
     manifest: &CommitStateManifest,
 ) -> Result<CommitDeltaManifest, LixError> {
-    let mut expanded = commit_delta_manifest_from_commit_state(manifest);
-    if manifest.mutations.replacement_part_digests.is_empty()
-        || !manifest.mutations.parts.is_empty()
-    {
-        return Ok(expanded);
-    }
-    // Authored-event parts and current-state Arrow leaves intentionally have
-    // independent physical identities. History reconstructs its compact
-    // mutation bounds from the mutation sidecar, never by reverse-converting
-    // the authoritative state leaves.
-    expanded.segments = recover_replacement_segment_bounds(store, manifest).await?;
-    Ok(expanded)
+    // The hard-cut manifest always carries exact event-part bounds. Arrow
+    // leaves and compact provenance parts have independent identities; there
+    // is no legacy bounds-recovery path.
+    Ok(commit_delta_manifest_from_commit_state(manifest))
 }
 
 /// Resolves exact identities directly to their authoritative Arrow rows,
@@ -1098,19 +1096,11 @@ pub(crate) fn validate_current_state_catalog_parent_manifest(
     Ok(())
 }
 
-async fn recover_replacement_segment_bounds(
-    _store: &(impl StorageAdapterRead + ?Sized),
-    _manifest: &CommitStateManifest,
-) -> Result<Vec<CommitDeltaSegmentBounds>, LixError> {
-    Err(replacement_payload_error(
-        "compact replacement inventories are not part of the Arrow-native repository format; recreate the repository",
-    ))
-}
-
 fn commit_delta_manifest_from_inventory(
     inventory: &CommitStateMutationInventory,
 ) -> CommitDeltaManifest {
     CommitDeltaManifest {
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         selected_source_commit_id: inventory.selected_source_commit_id,
         member_count: inventory.member_count,
         selection_fingerprint: inventory.selection_fingerprint,
@@ -2110,7 +2100,14 @@ async fn staged_commit_delta_members(
     let manifest = commit_delta_manifest_from_inventory(inventory);
     let mut members = Vec::with_capacity(inventory.member_count as usize);
     if let Some(inline) = manifest.inline_segment() {
-        collect_strict_commit_delta_members(inline, None, commit_id, 0, &mut members)?;
+        collect_strict_commit_delta_members(
+            inline,
+            None,
+            commit_id,
+            0,
+            &manifest.account_id,
+            &mut members,
+        )?;
     } else {
         for ((segment_index, bounds), staged) in
             manifest.segments.iter().enumerate().zip(staged_segments)
@@ -2135,6 +2132,7 @@ async fn staged_commit_delta_members(
                 Some(bounds),
                 commit_id,
                 u32::try_from(segment_index).expect("segment index fits u32"),
+                &manifest.account_id,
                 &mut members,
             )?;
         }
@@ -2734,6 +2732,7 @@ where
     let mut pending = VecDeque::with_capacity(COMMIT_DELTA_SEGMENT_MAX_ROWS);
     let mut first_segment = None::<(CommitDeltaSegmentBounds, Vec<u8>)>;
     let mut manifest = CommitDeltaManifest {
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         selected_source_commit_id: None,
         member_count: u32::try_from(row_count).map_err(|_| {
             LixError::new(
@@ -3147,6 +3146,7 @@ where
         uniform_updated_at,
     };
     let mut manifest = CommitDeltaManifest {
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         selected_source_commit_id: None,
         member_count: u32::try_from(row_count).expect("replacement row count was bounded"),
         selection_fingerprint: [0; 32],
@@ -3577,6 +3577,7 @@ fn stage_commit_deltas_inner(
             .pop()
             .expect("non-empty commit delta has one encoded segment");
         let manifest = CommitDeltaManifest {
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             selected_source_commit_id: selected_source_commit_id
                 .map(|commit_id| *commit_id.as_uuid().as_bytes()),
             member_count,
@@ -3602,6 +3603,7 @@ fn stage_commit_deltas_inner(
     }
     writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, segment_count, 0);
     let mut manifest = CommitDeltaManifest {
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         selected_source_commit_id: selected_source_commit_id
             .map(|commit_id| *commit_id.as_uuid().as_bytes()),
         member_count,
@@ -3975,7 +3977,10 @@ async fn load_change_entries_at_locators(
         for locator_index in locator_indices {
             let locator = locators[locator_index];
             loaded[locator_index] = Some(decode_change_at_locator_from_decoded(
-                &leaf, &payloads, locator,
+                &leaf,
+                &payloads,
+                locator,
+                &manifest.account_id,
             )?);
         }
     }
@@ -3997,10 +4002,10 @@ async fn load_change_entries_at_locators(
 /// Direct ids derive their compact event coordinate. Explicit ids use their
 /// locator row. Neither path opens an Arrow payload leaf, so callers selecting
 /// state cannot accidentally source a post-image from event storage.
-pub(crate) async fn load_change_origin_keys_by_ids(
+async fn load_change_provenance_by_ids(
     store: &(impl StorageAdapterRead + ?Sized),
     change_ids: &[crate::changelog::ChangeId],
-) -> Result<Vec<Option<String>>, LixError> {
+) -> Result<Vec<(String, Option<String>)>, LixError> {
     if change_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -4030,7 +4035,23 @@ pub(crate) async fn load_change_origin_keys_by_ids(
     Ok(load_change_entries_at_locators(store, &locators)
         .await?
         .into_iter()
-        .map(|entry| entry.change_record.origin_key)
+        .map(|entry| {
+            (
+                entry.change_record.account_id,
+                entry.change_record.origin_key,
+            )
+        })
+        .collect())
+}
+
+pub(crate) async fn load_change_origin_keys_by_ids(
+    store: &(impl StorageAdapterRead + ?Sized),
+    change_ids: &[crate::changelog::ChangeId],
+) -> Result<Vec<Option<String>>, LixError> {
+    Ok(load_change_provenance_by_ids(store, change_ids)
+        .await?
+        .into_iter()
+        .map(|(_, origin_key)| origin_key)
         .collect())
 }
 
@@ -4038,15 +4059,17 @@ fn decode_change_at_locator(
     segment: &[u8],
     bounds: Option<&CommitDeltaSegmentBounds>,
     locator: CommitDeltaChangeLocator,
+    account_id: &str,
 ) -> Result<LoadedCommitDeltaEntry, LixError> {
     let (leaf, payloads) = decode_commit_delta_with_payloads(segment, bounds)?;
-    decode_change_at_locator_from_decoded(&leaf, &payloads, locator)
+    decode_change_at_locator_from_decoded(&leaf, &payloads, locator, account_id)
 }
 
 fn decode_change_at_locator_from_decoded<S>(
     leaf: &DecodedLeafNodeRef,
     payloads: &CommitDeltaPayloadIndex<S>,
     locator: CommitDeltaChangeLocator,
+    account_id: &str,
 ) -> Result<LoadedCommitDeltaEntry, LixError>
 where
     S: AsRef<[u8]>,
@@ -4086,7 +4109,7 @@ where
         change_record: crate::changelog::ChangeRecord {
             format_version: 2,
             change_id,
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            account_id: account_id.to_string(),
             schema_key: key.schema_key,
             entity_pk: key.entity_pk,
             file_id: key.file_id,
@@ -4187,7 +4210,7 @@ async fn try_load_change_record_at_locator_in_manifest(
         (segment, Some(bounds))
     };
     Ok(Some(
-        decode_change_at_locator(&segment, bounds, locator)?.change_record,
+        decode_change_at_locator(&segment, bounds, locator, &manifest.account_id)?.change_record,
     ))
 }
 
@@ -4445,7 +4468,14 @@ async fn load_commit_delta_members_from_manifest(
         .collect::<BTreeSet<_>>();
     let mut members = Vec::new();
     if let Some(inline_segment) = manifest.inline_segment() {
-        collect_strict_commit_delta_members(inline_segment, None, commit_id, 0, &mut members)?;
+        collect_strict_commit_delta_members(
+            inline_segment,
+            None,
+            commit_id,
+            0,
+            &manifest.account_id,
+            &mut members,
+        )?;
     } else {
         let segment_indices = commit_delta_segments_for_schemas(manifest, &requested_schemas);
         let segment_keys = segment_indices
@@ -4476,6 +4506,7 @@ async fn load_commit_delta_members_from_manifest(
                 Some(&manifest.segments[segment_index]),
                 commit_id,
                 u32::try_from(segment_index).expect("segment index fits u32"),
+                &manifest.account_id,
                 &mut members,
             )?;
         }
@@ -4575,9 +4606,10 @@ async fn hydrate_selected_members(
         .iter()
         .map(|(_, change_id)| *change_id)
         .collect::<Vec<_>>();
-    let origins = load_change_origin_keys_by_ids(store, &change_ids).await?;
-    for ((index, _), origin_key) in selected.into_iter().zip(origins) {
+    let provenance = load_change_provenance_by_ids(store, &change_ids).await?;
+    for ((index, _), (account_id, origin_key)) in selected.into_iter().zip(provenance) {
         let member = &mut members[index];
+        member.change.account_id = account_id;
         member.change.origin_key = origin_key;
     }
     Ok(())
@@ -5063,7 +5095,14 @@ pub(crate) async fn scan_commit_delta_inventory(
                     ),
                 ));
             }
-            collect_strict_commit_delta_members(inline_segment, None, commit_id, 0, &mut members)?;
+            collect_strict_commit_delta_members(
+                inline_segment,
+                None,
+                commit_id,
+                0,
+                &manifest.account_id,
+                &mut members,
+            )?;
         } else {
             validate_physical_commit_delta_segments(
                 commit_id,
@@ -5077,6 +5116,7 @@ pub(crate) async fn scan_commit_delta_inventory(
                     Some(bounds),
                     commit_id,
                     u32::try_from(segment_index).expect("segment index fits u32"),
+                    &manifest.account_id,
                     &mut members,
                 )?;
             }
@@ -5410,6 +5450,7 @@ fn collect_strict_commit_delta_members(
     expected_bounds: Option<&CommitDeltaSegmentBounds>,
     expected_commit_id: CommitId,
     segment_index: u32,
+    account_id: &str,
     members: &mut Vec<CommitDeltaMember>,
 ) -> Result<(), LixError> {
     let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
@@ -5463,7 +5504,7 @@ fn collect_strict_commit_delta_members(
         let change = crate::changelog::ChangeRecord {
             format_version: 2,
             change_id: value.change_id,
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            account_id: account_id.to_string(),
             schema_key: key.schema_key.clone(),
             entity_pk: key.entity_pk.clone(),
             file_id: key.file_id.clone(),
@@ -6867,8 +6908,23 @@ mod tests {
         commit_id: CommitId,
         mutations: &CommitStateMutationInventory,
     ) -> Result<(), LixError> {
+        stage_fixture_manifest_with_account(
+            writes,
+            commit_id,
+            mutations,
+            crate::ANONYMOUS_ACCOUNT_ID,
+        )
+    }
+
+    fn stage_fixture_manifest_with_account(
+        writes: &mut StorageWriteSet,
+        commit_id: CommitId,
+        mutations: &CommitStateMutationInventory,
+        account_id: &str,
+    ) -> Result<(), LixError> {
         let mut compact_mutations = mutations.clone();
         let mut manifest = fixture_commit_state_manifest(commit_id, compact_mutations.clone());
+        manifest.account_id = account_id.to_string();
         let publication =
             stage_fresh_current_state_catalog(writes, commit_id, &mut compact_mutations)?;
         manifest.current_state_catalog = publication.root();
@@ -6895,27 +6951,6 @@ mod tests {
         addressable: &[bool],
     ) -> Result<super::AddressableCommitDeltaStage, LixError> {
         let staged = super::stage_addressable_commit_deltas(writes, deltas, addressable)?;
-        let commit_id = deltas
-            .first()
-            .map(|delta| delta.delta.commit_id)
-            .unwrap_or_default();
-        let mutations = fixture_addressable_inventory(&staged);
-        stage_fixture_manifest(writes, commit_id, &mutations)?;
-        Ok(staged)
-    }
-
-    fn stage_addressable_commit_deltas_with_selected_source(
-        writes: &mut StorageWriteSet,
-        deltas: &[TrackedStateCommitDeltaRef<'_>],
-        addressable: &[bool],
-        selected_source_commit_id: CommitId,
-    ) -> Result<super::AddressableCommitDeltaStage, LixError> {
-        let staged = super::stage_addressable_commit_deltas_with_selected_source(
-            writes,
-            deltas,
-            addressable,
-            selected_source_commit_id,
-        )?;
         let commit_id = deltas
             .first()
             .map(|delta| delta.delta.commit_id)
@@ -7145,6 +7180,62 @@ mod tests {
                 .is_none()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn commit_state_account_is_authoritative_for_direct_and_inventory_history_reads() {
+        const ACCOUNT_ID: &str = "01960000-0000-7000-8000-0000000000a1";
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_a001_0000_0000,
+        ));
+        let fixtures = vec![
+            packed_commit_delta_fixtures()
+                .into_iter()
+                .find(|fixture| fixture.deleted)
+                .expect("deleted provenance fixture should exist"),
+        ];
+        let deltas = commit_delta_refs(commit_id, &fixtures);
+        let mut writes = storage.new_write_set();
+        let staged =
+            super::stage_addressable_commit_deltas(&mut writes, &deltas, &vec![true; deltas.len()])
+                .expect("account-attributed direct deltas should stage");
+        let mutations = fixture_addressable_inventory(&staged);
+        stage_fixture_manifest_with_account(&mut writes, commit_id, &mutations, ACCOUNT_ID)
+            .expect("account-attributed commit authority should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("account-attributed history should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("account-attributed history read should open");
+        let change_id = staged.assigned_change_ids[0];
+        let loaded = load_change_record_by_id(&read, change_id)
+            .await
+            .expect("direct account-attributed history should load")
+            .expect("direct account-attributed change should exist");
+        assert_eq!(loaded.account_id, ACCOUNT_ID);
+
+        let inventory = scan_commit_delta_inventory(&read)
+            .await
+            .expect("account-attributed inventory should scan");
+        assert!(
+            inventory.commits[&commit_id]
+                .members
+                .iter()
+                .all(|member| member.change.account_id == ACCOUNT_ID)
+        );
+        let canonical = scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect("canonical account-attributed history should scan");
+        assert!(
+            canonical
+                .iter()
+                .all(|change| change.account_id == ACCOUNT_ID)
+        );
     }
 
     #[tokio::test]
@@ -8273,6 +8364,8 @@ mod tests {
 
     #[tokio::test]
     async fn selected_source_alias_preserves_identity_scan_and_manifest_authority() {
+        const SOURCE_ACCOUNT_ID: &str = "01960000-0000-7000-8000-0000000000a2";
+        const ALIAS_ACCOUNT_ID: &str = "01960000-0000-7000-8000-0000000000a3";
         let storage = StorageAdapter::new(Memory::new());
         let source_commit = CommitId::with_change_address_space(uuid::Uuid::from_u128(
             0x0192_0000_0000_7000_8000_7777_0000_0000,
@@ -8282,15 +8375,25 @@ mod tests {
             .into_iter()
             .take(3)
             .collect::<Vec<_>>();
+        for fixture in &mut fixtures {
+            fixture.deleted = true;
+        }
 
         let mut writes = storage.new_write_set();
         let source_deltas = commit_delta_refs(source_commit, &fixtures[..2]);
-        let source_stage = stage_addressable_commit_deltas(
+        let source_stage = super::stage_addressable_commit_deltas(
             &mut writes,
             &source_deltas,
             &vec![true; source_deltas.len()],
         )
         .expect("source commit should stage direct addresses");
+        stage_fixture_manifest_with_account(
+            &mut writes,
+            source_commit,
+            &fixture_addressable_inventory(&source_stage),
+            SOURCE_ACCOUNT_ID,
+        )
+        .expect("source account authority should stage");
         drop(source_deltas);
         for (fixture, change_id) in fixtures[..2]
             .iter_mut()
@@ -8300,13 +8403,20 @@ mod tests {
         }
 
         let overlay = commit_delta_refs(alias_commit, &fixtures[2..]);
-        stage_addressable_commit_deltas_with_selected_source(
+        let alias_stage = super::stage_addressable_commit_deltas_with_selected_source(
             &mut writes,
             &overlay,
             &[false],
             source_commit,
         )
         .expect("source alias should stage one disjoint local overlay");
+        stage_fixture_manifest_with_account(
+            &mut writes,
+            alias_commit,
+            &fixture_addressable_inventory(&alias_stage),
+            ALIAS_ACCOUNT_ID,
+        )
+        .expect("alias account authority should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -8341,6 +8451,18 @@ mod tests {
             .await
             .expect("alias identity misses should scan");
         assert!(missing.iter().all(Option::is_none));
+
+        let members = load_commit_delta_members_with_payloads(&read, alias_commit)
+            .await
+            .expect("account-attributed alias members should load");
+        assert_eq!(members.len(), 3);
+        assert!(members.iter().all(|member| {
+            if member.key.entity_pk == fixtures[2].entity_pk {
+                member.change.account_id == ALIAS_ACCOUNT_ID
+            } else {
+                member.change.account_id == SOURCE_ACCOUNT_ID
+            }
+        }));
 
         let manifest = load_commit_state_manifest(&read, alias_commit)
             .await
@@ -8637,6 +8759,7 @@ mod tests {
         segment.pop();
         let mut writes = storage.new_write_set();
         let delta_manifest = CommitDeltaManifest {
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             selected_source_commit_id: None,
             member_count: 1,
             selection_fingerprint: [0; 32],
@@ -9356,6 +9479,7 @@ mod tests {
 
         let mut writes = storage.new_write_set();
         let delta_manifest = CommitDeltaManifest {
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             selected_source_commit_id: None,
             member_count: 2,
             selection_fingerprint: [0; 32],
