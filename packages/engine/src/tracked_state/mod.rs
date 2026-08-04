@@ -47,10 +47,11 @@ pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_tre
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use storage::stage_commit_state_manifest;
 pub(crate) use storage::{
-    CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor, CommitDeltaMember,
-    CommitDeltaPointReadCache, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
-    OrderedAddressableCommitDeltaStage, commit_delta_contains_schema, direct_change_locator,
-    load_change_record_by_id, load_commit_delta_change_records,
+    CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitDeltaLiveMembershipCursor,
+    CommitDeltaMember, CommitDeltaPointReadCache, CommitDeltaReplacementGeneration,
+    CommitDeltaReplacementScope, OrderedAddressableCommitDeltaStage, PublishedCommitStateManifest,
+    StagedCommitStateManifest, certify_topology_touched_scope_filter, commit_delta_contains_schema,
+    direct_change_locator, load_change_record_by_id, load_commit_delta_change_records,
     load_commit_delta_members_with_payloads, load_commit_delta_members_with_payloads_for_schemas,
     load_commit_delta_replay_metadata, load_commit_delta_selection_certificate,
     load_commit_state_manifest, load_commit_state_manifests, load_owned_commit_delta_entries,

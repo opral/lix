@@ -1120,7 +1120,10 @@ async fn stage_changelog_commits(
     certified_packet_root_rows: &BTreeMap<CommitId, Vec<MaterializedLiveStateRow>>,
     mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
-    external_parent_manifests: &mut BTreeMap<CommitId, CommitStateManifest>,
+    external_parent_manifests: &mut BTreeMap<
+        CommitId,
+        crate::tracked_state::PublishedCommitStateManifest,
+    >,
     active_account_id: &str,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
@@ -1158,15 +1161,16 @@ async fn stage_changelog_commits(
                 format!("commit '{commit_id}' has a missing parent"),
             )
         })?;
-        let manifest = crate::tracked_state::load_commit_state_manifest(read, *commit_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("commit '{commit_id}' has no commit-state authority"),
-                )
-            })?;
-        external_parent_manifests.insert(*commit_id, manifest.clone());
+        let published =
+            crate::tracked_state::load_published_commit_state_manifest(read, *commit_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("commit '{commit_id}' has no commit-state authority"),
+                    )
+                })?;
+        let manifest = &*published;
         // Replay debt is the durable layout authority. A rootless commit may
         // later gain an immutable snapshot accelerator without changing its
         // changelog topology projection.
@@ -1192,6 +1196,7 @@ async fn stage_changelog_commits(
         rootless_depths.insert(*commit_id, manifest.replay_debt.depth);
         rootless_rows.insert(*commit_id, manifest.replay_debt.rows);
         rootless_bytes.insert(*commit_id, manifest.replay_debt.bytes);
+        external_parent_manifests.insert(*commit_id, published);
     }
     let mut staged_parent_count = BTreeMap::<CommitId, usize>::new();
     let mut children = BTreeMap::<CommitId, Vec<CommitId>>::new();
@@ -5269,13 +5274,17 @@ fn stage_commit_state_manifests<'a, S>(
     rootless_commit_ids: &'a BTreeSet<CommitId>,
     staged_commits: &'a BTreeMap<CommitId, StagedChangelogCommit>,
     snapshot_roots: &'a BTreeMap<CommitId, TrackedStateCommitRoot>,
-    external_parent_manifests: &'a BTreeMap<CommitId, CommitStateManifest>,
+    external_parent_manifests: &'a BTreeMap<
+        CommitId,
+        crate::tracked_state::PublishedCommitStateManifest,
+    >,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
 where
     S: StorageAdapterRead + ?Sized + 'a,
 {
     Box::pin(async move {
-        let mut published_manifests = BTreeMap::new();
+        let mut published_manifests =
+            BTreeMap::<CommitId, crate::tracked_state::StagedCommitStateManifest>::new();
         if staged_commits.len() != commit_rows.len()
             || commit_rows
                 .iter()
@@ -5313,11 +5322,7 @@ where
             let external_parent = if staged_parent.is_none() {
                 match first_parent {
                     Some(parent_id) => {
-                        let published = crate::tracked_state::load_published_commit_state_manifest(
-                            read, parent_id,
-                        )
-                        .await?
-                        .ok_or_else(|| {
+                        Some(external_parent_manifests.get(&parent_id).ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_INTERNAL_ERROR,
                                 format!(
@@ -5325,14 +5330,7 @@ where
                                     record.commit_id
                                 ),
                             )
-                        })?;
-                        if external_parent_manifests.get(&parent_id) != Some(&*published) {
-                            return Err(LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                "published parent authority changed during commit staging",
-                            ));
-                        }
-                        Some(published)
+                        })?)
                     }
                     None => None,
                 }
@@ -5356,7 +5354,7 @@ where
                     crate::tracked_state::stage_current_state_scoped_ranges_from_published_parent(
                         read,
                         writes,
-                        external_parent.as_ref(),
+                        external_parent,
                         record.commit_id,
                         &record.account_id,
                         &mutations,
@@ -5364,7 +5362,80 @@ where
                     .await?
                 })
             } else {
-                None
+                let topology_parents = record
+                    .parent_commit_ids
+                    .iter()
+                    .map(|parent_id| {
+                        published_manifests
+                            .get(parent_id)
+                            .map(crate::tracked_state::CertifiedCommitStateTopologyParent::Staged)
+                            .or_else(|| {
+                                external_parent_manifests.get(parent_id).map(
+                                    crate::tracked_state::CertifiedCommitStateTopologyParent::Published,
+                                )
+                            })
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!(
+                                        "commit '{}' has no certified topology parent '{}'",
+                                        record.commit_id, parent_id
+                                    ),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let selected_source_id = mutations.selected_source_commit_id();
+                let loaded_selected_source = if let Some(source_id) = selected_source_id
+                    && !published_manifests.contains_key(&source_id)
+                    && !external_parent_manifests.contains_key(&source_id)
+                {
+                    Some(
+                        crate::tracked_state::load_published_commit_state_manifest(read, source_id)
+                            .await?
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!(
+                                        "commit '{}' has no published selected-source authority '{}'",
+                                        record.commit_id, source_id
+                                    ),
+                                )
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                let selected_source = selected_source_id
+                    .map(|source_id| {
+                        published_manifests
+                            .get(&source_id)
+                            .map(crate::tracked_state::CertifiedCommitStateTopologyParent::Staged)
+                            .or_else(|| {
+                                external_parent_manifests.get(&source_id).map(
+                                    crate::tracked_state::CertifiedCommitStateTopologyParent::Published,
+                                )
+                            })
+                            .or_else(|| {
+                                loaded_selected_source.as_ref().map(
+                                    crate::tracked_state::CertifiedCommitStateTopologyParent::Published,
+                                )
+                            })
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    "selected-source authority disappeared during commit staging",
+                                )
+                            })
+                    })
+                    .transpose()?;
+                Some(crate::tracked_state::certify_topology_touched_scope_filter(
+                    writes,
+                    &topology_parents,
+                    selected_source,
+                    record.commit_id,
+                    &mutations,
+                )?)
             };
             let current_state_scoped_ranges = catalog_publication
                 .as_ref()
