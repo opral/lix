@@ -1614,7 +1614,6 @@ impl CommitDeltaLiveMembershipCursor {
         encoded_key: &[u8],
     ) -> Result<Option<bool>, LixError> {
         if !self.initialized {
-            self.initialized = true;
             let state = match cache.authority(self.commit_id)? {
                 Some(state) => state,
                 None => {
@@ -1656,6 +1655,12 @@ impl CommitDeltaLiveMembershipCursor {
                 self.segment = Some(decoded);
                 self.segment_index = Some(0);
             }
+            // Mark the cursor initialized only after an authenticated
+            // membership authority has selected a serving mode. Unsupported,
+            // rootless, and missing authorities return `None` above; leaving
+            // the cursor uninitialized prevents a later call from entering
+            // the scan loop with no segment.
+            self.initialized = true;
         }
 
         if let Some(root) = self.bounded_root.clone() {
@@ -15951,6 +15956,32 @@ mod tests {
         assert_eq!(manifest_requests.load(Ordering::Relaxed), 1);
         assert_eq!(inventory_requests.load(Ordering::Relaxed), 1);
         assert!(directory_requests.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[tokio::test]
+    async fn live_membership_cursor_retries_missing_authority_without_poisoning_itself() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("missing-authority read should open");
+        let cache = super::CommitDeltaPointReadCache::default();
+        let commit_id = CommitId::for_test_label("missing-membership-authority");
+        let mut cursor = cache.live_membership_cursor(commit_id);
+        let encoded = encode_key_ref(TrackedStateKeyRef {
+            schema_key: "missing-membership",
+            file_id: None,
+            entity_pk: &EntityPk::single("row"),
+        });
+        for _ in 0..2 {
+            assert_eq!(
+                cursor
+                    .live_member(&read, &cache, &encoded)
+                    .await
+                    .expect("missing authority must fail closed without panic"),
+                None
+            );
+        }
     }
 
     #[tokio::test]
