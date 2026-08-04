@@ -125,7 +125,7 @@ function RfcIndexPage() {
   const { rfcs } = Route.useLoaderData();
 
   return (
-    <div className="flex min-h-screen flex-col bg-white text-slate-900">
+    <div className="flex min-h-screen flex-col bg-paper text-ink">
       <Header />
       <main className="flex-1">
         <div className="mx-auto max-w-4xl px-6 py-16">

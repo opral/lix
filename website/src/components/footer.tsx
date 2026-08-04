@@ -1,64 +1,52 @@
-import { getGithubStars } from "../github-stars-cache";
+import type { HeaderWidth } from "./header";
+
+const widthClass: Record<HeaderWidth, string> = {
+  narrow: "max-w-[1100px]",
+  wide: "max-w-[1376px]",
+};
 
 const footerLinks = [
-  { href: "/docs", label: "Docs", emoji: "📘" },
-  { href: "/blog", label: "Blog", emoji: "📝" },
-  { href: "/rfc", label: "RFCs", emoji: "📄" },
+  { href: "https://github.com/opral/lix", label: "GitHub" },
+  { href: "https://x.com/lixCCS", label: "X" },
+  { href: "https://discord.gg/gdMPPWy57R", label: "Discord" },
 ];
 
-export function Footer() {
-  const githubStars = getGithubStars("opral/lix");
-
-  const formatStars = (count: number) => {
-    if (count >= 1000) {
-      return `${(count / 1000).toFixed(1).replace(/\.0$/, "")}k`;
-    }
-    return count.toString();
-  };
-
+/**
+ * Site footer with attribution and social links.
+ *
+ * @example
+ * <Footer width="narrow" />
+ */
+export function Footer({ width = "wide" }: { width?: HeaderWidth }) {
   return (
-    <footer className="bg-white">
-      <div className="border-t border-gray-200">
-        <div className="flex flex-col gap-3 px-6 py-10 sm:flex-row sm:justify-center sm:gap-8">
-          {footerLinks.map((link) => (
+    <footer className="border-t border-line">
+      <div
+        className={`mx-auto flex w-full flex-wrap items-center justify-between gap-6 px-8 py-7 ${widthClass[width]}`}
+      >
+        <span className="text-[13.5px] text-ink-faint">
+          Lix is built by{" "}
+          <a
+            href="https://opral.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-ink-muted underline decoration-[#DDDBD3] underline-offset-[3px] transition-colors hover:text-cyan-deep"
+          >
+            Opral
+          </a>
+          .
+        </span>
+        <div className="flex gap-6">
+          {footerLinks.map(({ href, label }) => (
             <a
-              key={link.href}
-              href={link.href}
-              className="inline-flex items-center justify-center gap-2 text-sm font-medium text-gray-500 transition-colors hover:text-gray-900"
+              key={label}
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[13.5px] text-ink-muted transition-colors hover:text-cyan-deep"
             >
-              <span aria-hidden>{link.emoji}</span>
-              {link.label}
+              {label}
             </a>
           ))}
-          <a
-            href="https://discord.gg/gdMPPWy57R"
-            className="inline-flex items-center justify-center gap-2 text-sm font-medium text-gray-500 transition-colors hover:text-gray-900"
-          >
-            <span aria-hidden>💬</span>
-            Discord
-            <img
-              src="https://img.shields.io/discord/897438559458430986?label=%20&color=f3f4f6&style=flat-square"
-              alt="Discord online members"
-              className="h-4"
-            />
-          </a>
-          <a
-            href="https://github.com/opral/lix"
-            className="inline-flex items-center justify-center gap-2 text-sm font-medium text-gray-500 transition-colors hover:text-gray-900"
-            title={
-              githubStars
-                ? `${githubStars.toLocaleString()} GitHub stars`
-                : "Star us on GitHub"
-            }
-          >
-            <span aria-hidden>⭐</span>
-            Star on GitHub
-            {githubStars !== null && (
-              <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-semibold text-gray-600">
-                {formatStars(githubStars)}
-              </span>
-            )}
-          </a>
         </div>
       </div>
     </footer>

@@ -55,7 +55,7 @@ export const Route = createFileRoute("/plugins/")({
 
 function PluginsComingSoonPage() {
   return (
-    <div className="min-h-screen bg-white text-slate-900">
+    <div className="min-h-screen bg-paper text-ink">
       <Header />
       <main className="mx-auto flex min-h-[60vh] w-full max-w-3xl flex-col justify-center px-6 py-24 text-center">
         <p className="text-sm font-medium uppercase tracking-wide text-[#0891B2]">

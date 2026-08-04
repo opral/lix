@@ -15,3 +15,5 @@ todos.json
 content/plugins/*.md
 !content/plugins/index.md
 *.gen.*
+# Committed on purpose: refreshed weekly by .github/workflows/update-download-stats.yml
+!src/npm-downloads.gen.json

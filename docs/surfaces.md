@@ -1,5 +1,5 @@
 ---
-description: The application-oriented SQL surfaces in Lix: typed entities, files, directories, schema discovery, and workspace activity.
+description: "The application-oriented SQL surfaces in Lix: typed entities, files, directories, schema discovery, and workspace activity."
 ---
 
 # SQL Surfaces
