@@ -498,6 +498,26 @@ mod tests {
         StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
     };
 
+    async fn space_row_count(storage: &Memory, space: StorageSpace) -> usize {
+        let adapter = StorageAdapter::new(storage.clone());
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("space inventory read should open");
+        ScanPlan::prefix(
+            space,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            },
+        )
+        .collect(&read, StorageScanOptions::default())
+        .await
+        .expect("space inventory should scan")
+        .value
+        .entries
+        .len()
+    }
+
     async fn register_json_pointer_schema_in_scope(session: &SessionContext<Memory>, global: bool) {
         let schema = json!({
             "x-lix-key": "json_pointer",
@@ -737,6 +757,30 @@ mod tests {
 
         let Err(error) = Engine::new(storage).await else {
             panic!("V21 repositories must fail closed before hot rows are decoded");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
+    async fn predecessor_v57_unified_untracked_protocol_is_rejected() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let adapter = StorageAdapter::new(storage.clone());
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            &b"immutable-physical-commit-state.v57"[..],
+        );
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("V57 protocol marker should commit");
+
+        let Err(error) = Engine::new(storage).await else {
+            panic!("V57 repositories must fail closed before unified HOT rows are decoded");
         };
         assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
     }
@@ -1093,7 +1137,7 @@ mod tests {
         Engine::initialize(storage.clone())
             .await
             .expect("engine should initialize");
-        let engine = Engine::new(storage)
+        let engine = Engine::new(storage.clone())
             .await
             .expect("initialized engine should open");
         let session = engine
@@ -1109,6 +1153,10 @@ mod tests {
             )
             .await
             .expect("write tracked entity row");
+        let hot_rows_before_untracked =
+            space_row_count(&storage, crate::live_state::HOT_ROW_SPACE).await;
+        let untracked_rows_before =
+            space_row_count(&storage, crate::live_state::UNTRACKED_ROW_SPACE).await;
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
@@ -1117,6 +1165,16 @@ mod tests {
             )
             .await
             .expect("write untracked entity row");
+        assert_eq!(
+            space_row_count(&storage, crate::live_state::HOT_ROW_SPACE).await,
+            hot_rows_before_untracked,
+            "untracked writes must not mutate generation-scoped HOT rows"
+        );
+        assert_eq!(
+            space_row_count(&storage, crate::live_state::UNTRACKED_ROW_SPACE).await,
+            untracked_rows_before + 1,
+            "untracked writes must add one branch-stable physical row"
+        );
 
         let rows = session
             .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
@@ -1404,6 +1462,51 @@ mod tests {
                 .map(|row| row.get::<String>("path").expect("row path"))
                 .collect::<Vec<_>>(),
             ["/after-checkpoint", "/checkpointed", "/workspace"]
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_preserves_untracked_only_schema_presence() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/survives-checkpoint', lix_json('{\"owner\":\"workspace\"}'), true)",
+                &[],
+            )
+            .await
+            .expect("insert branch-local untracked row");
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should rotate the tracked generation");
+
+        let row = session
+            .execute(
+                "SELECT value FROM json_pointer \
+                 WHERE path = '/survives-checkpoint' AND lixcol_untracked = true",
+                &[],
+            )
+            .await
+            .expect("constrained read should retain untracked schema presence");
+        assert_eq!(row.rows().len(), 1);
+        assert_eq!(
+            row.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("workspace JSON value"),
+            json!({"owner": "workspace"})
         );
     }
 

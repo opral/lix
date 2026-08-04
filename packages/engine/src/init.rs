@@ -42,13 +42,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V57 makes commit-state manifests immutable physical authority. Semantic
-/// commit facts remain owned exclusively by `changelog.commit`, while the
-/// rebuildable snapshot-root projection lives in its own mutable space.
+/// V58 separates history-free rows from the generation-scoped tracked HOT
+/// plane. It is an intentional hard cut: repositories with unified V57 rows
+/// are rejected instead of migrated or dual-read.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"immutable-physical-commit-state.v57";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"physical-untracked-state.v58";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -452,24 +452,40 @@ where
             .collect::<Vec<_>>();
         let tracked_head = TrackedHeadContext::new();
         let absence_guards = std::collections::BTreeSet::default();
+        let init_untracked_snapshots = plan
+            .untracked_rows
+            .iter()
+            .map(|row| crate::json_store::JsonSlot::from_json(&row.snapshot_content))
+            .collect::<Vec<_>>();
+        let init_untracked_deltas = plan
+            .untracked_rows
+            .iter()
+            .zip(&init_untracked_snapshots)
+            .map(|(row, snapshot)| CurrentStateDeltaRef {
+                schema_key: &row.schema_key,
+                file_id: None,
+                entity_pk: &row.entity_pk,
+                change_id: None,
+                commit_id: None,
+                untracked: true,
+                deleted: false,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                snapshot: snapshot.as_ref_slot(),
+                metadata: crate::json_store::JsonSlotRef::None,
+                columnar_base_coordinate: None,
+            })
+            .collect::<Vec<_>>();
+        let init_untracked_known_absent = vec![true; init_untracked_deltas.len()];
+        crate::live_state::stage_untracked_deltas(
+            &read,
+            &mut writes,
+            GLOBAL_BRANCH_ID,
+            &init_untracked_deltas,
+            &init_untracked_known_absent,
+        )
+        .await?;
         for branch in &plan.branch_controls {
-            let mut head_deltas = tracked_head_deltas.clone();
-            if branch.branch_id == GLOBAL_BRANCH_ID {
-                head_deltas.extend(plan.untracked_rows.iter().map(|row| CurrentStateDeltaRef {
-                    schema_key: &row.schema_key,
-                    file_id: None,
-                    entity_pk: &row.entity_pk,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: true,
-                    deleted: false,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                    snapshot: crate::json_store::JsonSlotRef::Inline(&row.snapshot_content),
-                    metadata: crate::json_store::JsonSlotRef::None,
-                    columnar_base_coordinate: None,
-                }));
-            }
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
             tracked_head
                 .writer(&read, &mut writes)
@@ -477,7 +493,7 @@ where
                     &branch.branch_id,
                     None,
                     plan.commit.id,
-                    &head_deltas,
+                    &tracked_head_deltas,
                     &absence_guards,
                     None,
                     None,
@@ -495,7 +511,18 @@ where
                 },
             )?;
             let mut control = branch.control;
-            control.note_schemas(head_deltas.iter().map(|delta| delta.schema_key));
+            control.note_schemas(
+                tracked_head_deltas
+                    .iter()
+                    .map(|delta| delta.schema_key)
+                    .chain(
+                        (branch.branch_id == GLOBAL_BRANCH_ID)
+                            .then_some(init_untracked_deltas.iter())
+                            .into_iter()
+                            .flatten()
+                            .map(|delta| delta.schema_key),
+                    ),
+            );
             stage_branch_head_control(&mut writes, &branch.branch_id, control)?;
         }
     }

@@ -2878,6 +2878,13 @@ async fn try_execute_direct_path_value_replacement(
     spec: &EntitySurfaceSpec,
     params: &[Value],
 ) -> Result<Option<SqlWriteResult>, LixError> {
+    // The certified replacement program writes ordinary tracked rows. Avoid
+    // probing the mixed-retention serving path when the predicate already
+    // proves this is an untracked replacement; the canonical entity route
+    // below can point-read the dedicated physical plane directly.
+    if bound_untracked_from_predicate(&plan.bound.predicate, params) == Some(true) {
+        return Ok(None);
+    }
     let Some(program) = prepare_path_value_replacement_program(ctx, plan, spec) else {
         return Ok(None);
     };
@@ -3922,7 +3929,55 @@ async fn scan_entity_candidates(
         }
         request.filter.entity_pks = entity_pks;
     }
+    request.filter.untracked = bound_untracked_from_predicate(&plan.bound.predicate, params);
     ctx.scan_live_state_batch(&request).await
+}
+
+fn bound_untracked_from_predicate(predicate: &BoundPredicate, params: &[Value]) -> Option<bool> {
+    match predicate {
+        BoundPredicate::And(predicates) => {
+            let mut constraint = None;
+            for predicate in predicates {
+                let Some(value) = bound_untracked_from_predicate(predicate, params) else {
+                    continue;
+                };
+                if constraint.is_some_and(|existing| existing != value) {
+                    return None;
+                }
+                constraint = Some(value);
+            }
+            constraint
+        }
+        BoundPredicate::Eq(left, right) => bound_untracked_column_value(left, right, params)
+            .or_else(|| bound_untracked_column_value(right, left, params)),
+        _ => None,
+    }
+}
+
+fn bound_untracked_column_value(
+    column: &BoundExpr,
+    value: &BoundExpr,
+    params: &[Value],
+) -> Option<bool> {
+    let BoundExpr::Column(column) = column else {
+        return None;
+    };
+    if column.name != "lixcol_untracked" {
+        return None;
+    }
+    bound_untracked_bool_value(value, params)
+}
+
+fn bound_untracked_bool_value(value: &BoundExpr, params: &[Value]) -> Option<bool> {
+    match value {
+        BoundExpr::Literal(BoundLiteral::Bool(value)) => Some(*value),
+        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+            Some(Value::Boolean(value)) => Some(*value),
+            _ => None,
+        },
+        BoundExpr::Cast { expr, .. } => bound_untracked_bool_value(expr, params),
+        _ => None,
+    }
 }
 
 async fn scan_entity_candidates_for_pks(
@@ -7207,6 +7262,25 @@ mod primary_key_route_tests {
             TYPED_CERTIFIED_INSERT_MIN_ROWS - 1
         ));
         assert!(use_typed_certified_insert(TYPED_CERTIFIED_INSERT_MIN_ROWS));
+    }
+
+    #[test]
+    fn bound_untracked_constraint_uses_one_based_parameter_indexes() {
+        let predicate = BoundPredicate::Eq(
+            BoundExpr::Column(BoundColumnRef {
+                table: "json_pointer".to_string(),
+                column_id: 9,
+                name: "lixcol_untracked".to_string(),
+            }),
+            BoundExpr::Param(BoundParamRef { index: 1 }),
+        );
+        assert_eq!(
+            bound_untracked_from_predicate(
+                &predicate,
+                &[Value::Boolean(true), Value::Boolean(false)]
+            ),
+            Some(true)
+        );
     }
 
     #[test]

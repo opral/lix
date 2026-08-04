@@ -4128,6 +4128,7 @@ where
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn scan_live_rows(
         &self,
         branch_id: &str,
@@ -5191,17 +5192,17 @@ where
         load_tracked_working_diff_epoch(&self.store, branch_id).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn untracked_json_refs(
         &self,
         controls: &[(String, BranchHeadControl)],
     ) -> Result<Vec<JsonRef>, LixError> {
         let mut refs = BTreeSet::new();
         for (branch_id, control) in controls {
-            let scope = hot_scope_prefix(branch_id, control.generation);
             let plan = ScanPlan::prefix(
                 HOT_ROW_SPACE,
                 StoragePrefix {
-                    bytes: Bytes::from(scope),
+                    bytes: Bytes::from(hot_scope_prefix(branch_id, control.generation)),
                 },
             );
             let mut resume_after = None;
@@ -5218,8 +5219,7 @@ where
                 resume_after = page.value.entries.last().map(|entry| entry.key.clone());
                 for entry in page.value.entries {
                     let bytes = full_value_bytes(entry.value)?;
-                    let value = decode_head_value(&bytes)?;
-                    collect_hot_untracked_refs(value, &mut refs);
+                    collect_hot_untracked_refs(decode_head_value(&bytes)?, &mut refs);
                 }
                 if !page.value.has_more || resume_after.is_none() {
                     break;
@@ -6708,48 +6708,24 @@ where
 
     /// Publishes a complete replacement generation for a lifecycle event.
     ///
-    /// The supplied snapshot is the target commit's tracked portion.  Any
-    /// branch-local untracked rows are copied from the previous generation,
-    /// then this transaction's untracked mutations are applied before its
-    /// tracked mutations.  That order admits the one legitimate mixed case:
-    /// deleting an untracked row and selecting a tracked row with the same
-    /// identity in the same atomic publication.  Every other retention
-    /// collision fails before the new control can become visible.
+    /// The supplied snapshot is the target commit's complete tracked portion.
+    /// History-free rows have a separate branch-stable physical owner and are
+    /// deliberately absent from every replacement generation.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stage_complete_current_state_with_working_diff(
         &mut self,
         branch_id: &str,
         generation: CommitId,
         parent_tracked: HotTrackedSnapshot,
-        preserved_untracked_generation: Option<CommitId>,
         tracked_deltas: &[CurrentStateDeltaRef<'_>],
-        untracked_deltas: &[CurrentStateDeltaRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(HotTrackedSnapshot, BTreeSet<String>), LixError> {
         let mut rows = parent_tracked.rows;
-        let mut untracked_rows = match preserved_untracked_generation {
-            Some(previous_generation) => {
-                load_hot_untracked_generation(self.store, branch_id, previous_generation).await?
-            }
-            None => BTreeMap::new(),
-        };
-
-        let sorted_untracked = sorted_lifecycle_hot_deltas(untracked_deltas, true)?;
         let sorted_tracked = sorted_lifecycle_hot_deltas(tracked_deltas, false)?;
-        reject_lifecycle_retention_collisions(&sorted_untracked, &sorted_tracked)?;
 
         let mut retired_untracked_json_refs = BTreeSet::new();
-        for delta in &sorted_untracked {
-            apply_complete_hot_snapshot_delta(
-                &mut untracked_rows,
-                delta,
-                absence_guards,
-                &mut retired_untracked_json_refs,
-            )?;
-        }
-        merge_final_untracked_rows(&mut rows, untracked_rows)?;
         for delta in &sorted_tracked {
             apply_complete_hot_snapshot_delta(
                 &mut rows,
@@ -7160,76 +7136,6 @@ fn next_columnar_base_coordinate(
         .and_then(|value| value.columnar_base_coordinate)))
 }
 
-async fn load_hot_untracked_generation(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    generation: CommitId,
-) -> Result<HotRowMap, LixError> {
-    let filter = TrackedStateFilter {
-        include_tombstones: true,
-        ..TrackedStateFilter::default()
-    };
-    let HotScanEntries::Decoded(entries) =
-        hot_scan_entries(store, branch_id, generation, &filter, None, None)
-            .await?
-            .expect("unbounded HOT scan cannot exhaust a byte budget")
-    else {
-        unreachable!("an unconstrained HOT scan cannot select the finite point-read route");
-    };
-    let mut rows = BTreeMap::new();
-    for (identity, bytes) in entries {
-        let value = decode_head_value(bytes.as_ref())?;
-        if !value.untracked {
-            continue;
-        }
-        if value.deleted {
-            return Err(head_value_error(
-                "untracked hot row must be physically removed rather than tombstoned",
-            ));
-        }
-        match rows.entry(identity.into_row_identity()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(bytes);
-            }
-            std::collections::btree_map::Entry::Occupied(entry) => {
-                let identity = entry.key();
-                return Err(LixError::new(
-                    LixError::CODE_UNIQUE,
-                    format!(
-                        "hot generation contains duplicate untracked identity in schema '{}' entity_pk {:?}",
-                        identity.schema_key, identity.entity_pk
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(rows)
-}
-
-fn merge_final_untracked_rows(
-    rows: &mut HotRowMap,
-    untracked_rows: HotRowMap,
-) -> Result<(), LixError> {
-    for (identity, bytes) in untracked_rows {
-        match rows.entry(identity) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(bytes);
-            }
-            std::collections::btree_map::Entry::Occupied(entry) => {
-                let identity = entry.key();
-                return Err(LixError::new(
-                    LixError::CODE_UNIQUE,
-                    format!(
-                        "cannot materialize tracked and untracked hot rows with the same identity in schema '{}' entity_pk {:?}",
-                        identity.schema_key, identity.entity_pk
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn sorted_lifecycle_hot_deltas<'a>(
     deltas: &'a [CurrentStateDeltaRef<'a>],
     expect_untracked: bool,
@@ -7253,28 +7159,6 @@ fn sorted_lifecycle_hot_deltas<'a>(
         }
     }
     Ok(sorted)
-}
-
-fn reject_lifecycle_retention_collisions(
-    untracked: &[&CurrentStateDeltaRef<'_>],
-    tracked: &[&CurrentStateDeltaRef<'_>],
-) -> Result<(), LixError> {
-    let mut untracked_index = 0;
-    let mut tracked_index = 0;
-    while untracked_index < untracked.len() && tracked_index < tracked.len() {
-        match compare_hot_deltas(untracked[untracked_index], tracked[tracked_index]) {
-            Ordering::Less => untracked_index += 1,
-            Ordering::Greater => tracked_index += 1,
-            Ordering::Equal => {
-                if !untracked[untracked_index].physically_deletes() {
-                    return Err(current_state_duplicate_delta_error(tracked[tracked_index]));
-                }
-                untracked_index += 1;
-                tracked_index += 1;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8368,17 +8252,6 @@ impl HotScanString {
         }
     }
 
-    fn into_string(self, key: &Bytes) -> String {
-        match self {
-            Self::Borrowed(range) => {
-                let range = range.start as usize..range.end as usize;
-                // SAFETY: the decoder validated this exact range.
-                unsafe { std::str::from_utf8_unchecked(&key[range]) }.to_owned()
-            }
-            Self::Owned(value) => value,
-        }
-    }
-
     #[cfg(test)]
     fn owns_fallback_buffer(&self) -> bool {
         matches!(self, Self::Owned(_))
@@ -8409,20 +8282,6 @@ impl HotScanIdentity {
                     NullableKeyFilter::Null => self.file_id().is_none(),
                     NullableKeyFilter::Value(value) => self.file_id() == Some(value.as_str()),
                 }))
-    }
-
-    fn into_row_identity(self) -> HeadRowIdentity {
-        let Self {
-            key,
-            schema_key,
-            entity_pk,
-            file_id,
-        } = self;
-        HeadRowIdentity {
-            schema_key: schema_key.into_string(&key),
-            entity_pk,
-            file_id: file_id.map(|file_id| file_id.into_string(&key)),
-        }
     }
 
     #[cfg(test)]
