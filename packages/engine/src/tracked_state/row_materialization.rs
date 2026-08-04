@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::mem::size_of;
 use std::ops::Range;
@@ -7,15 +7,18 @@ use ahash::RandomState;
 use bytes::Bytes;
 
 use crate::LixError;
-use crate::changelog::{
-    ChangeId, ChangeRecordProjection, CommitId, MaterializedChangePayload,
-    materialize_known_change_payloads,
-};
+use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
+use crate::json_store::{
+    JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonStoreContext,
+};
 use crate::storage_adapter::StorageAdapterRead;
+use crate::tracked_state::CurrentStateDataRow;
 use crate::tracked_state::MaterializedTrackedStateRow;
-use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};
+#[cfg(test)]
+use crate::tracked_state::types::TrackedStateKeyRef;
+use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey};
 
 #[derive(Debug, Default)]
 struct TrackedStateStringDictionary {
@@ -92,6 +95,7 @@ impl MaterializedTrackedStateBatch {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_rows(self) -> Vec<MaterializedTrackedStateRow> {
         self.iter()
             .map(MaterializedTrackedStateRowRef::to_owned)
@@ -557,6 +561,7 @@ impl MaterializedTrackedStateBatchBuilder {
         self.strings.intern(value.as_str())
     }
 
+    #[cfg(test)]
     fn intern_str(&mut self, value: &str) -> u32 {
         self.strings.intern(value)
     }
@@ -584,6 +589,7 @@ impl MaterializedTrackedStateBatchBuilder {
         });
     }
 
+    #[cfg(test)]
     fn push_ref(
         &mut self,
         key: TrackedStateKeyRef<'_>,
@@ -615,213 +621,132 @@ impl MaterializedTrackedStateBatchBuilder {
     }
 }
 
-async fn materialize_index_payloads<'a, S>(
-    store: &S,
-    entries: impl Iterator<Item = (TrackedStateKeyRef<'a>, &'a TrackedStateIndexValue)>,
-    projection: ChangeRecordProjection,
-) -> Result<HashMap<ChangeId, MaterializedChangePayload>, LixError>
-where
-    S: StorageAdapterRead,
-{
-    let mut by_commit = BTreeMap::<CommitId, Vec<(TrackedStateKey, ChangeId, LixTimestamp)>>::new();
-    for (key, value) in entries.filter(|(_, value)| !value.deleted) {
-        by_commit.entry(value.commit_id).or_default().push((
-            TrackedStateKey {
-                schema_key: key.schema_key.to_owned(),
-                file_id: key.file_id.map(str::to_owned),
-                entity_pk: key.entity_pk.clone(),
-            },
-            value.change_id,
-            value.updated_at,
-        ));
-    }
-
-    let mut records = Vec::new();
-    for (commit_id, expected) in by_commit {
-        let keys = expected
-            .iter()
-            .map(|(key, _, _)| key.clone())
-            .collect::<Vec<_>>();
-        let loaded =
-            super::storage::load_commit_delta_change_records(store, commit_id, &keys).await?;
-        for ((key, change_id, updated_at), record) in expected.into_iter().zip(loaded) {
-            let record = record.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked-state row references change '{change_id}' that is missing from owning commit '{commit_id}'"
-                    ),
-                )
-            })?;
-            if record.change_id != change_id
-                || record.schema_key != key.schema_key
-                || record.file_id != key.file_id
-                || record.entity_pk != key.entity_pk
-                || record.snapshot.is_none()
-                || record.created_at != updated_at
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked-state row '{change_id}' does not match its authoritative payload in commit '{commit_id}'"
-                    ),
-                ));
-            }
-            records.push(record);
-        }
-    }
-    materialize_known_change_payloads(store, records.into_iter(), projection).await
+enum ArrowMaterializedJsonSlot {
+    None,
+    Inline(Box<str>),
+    Loaded(usize),
 }
 
-/// Materializes tracked-state index entries into one typed batch.
-///
-/// Every tracked index value carries its payload-owning commit. Hydration
-/// routes exact identities to those packed deltas and retains the decoded
-/// records through JSON materialization; there is no global changelog
-/// fallback.
-pub(crate) async fn materialize_batch_from_index_entries<S>(
-    store: &S,
-    entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
-    materialization: &ChangeRecordProjection,
-) -> Result<MaterializedTrackedStateBatch, LixError>
-where
-    S: StorageAdapterRead,
-{
-    let dictionary_entry_capacity = entries
-        .iter()
-        .map(|(key, _)| 1 + usize::from(key.file_id.is_some()))
-        .sum();
-    let mut rows = MaterializedTrackedStateBatchBuilder::with_capacities(
-        entries.len(),
-        dictionary_entry_capacity,
-        0,
-    );
-    if !materialization.snapshot_content && !materialization.metadata {
-        for (key, value) in entries {
-            rows.push(key, value, None, None);
+fn plan_arrow_json_slot(
+    include: bool,
+    slot: JsonSlot,
+    json_refs: &mut Vec<JsonRef>,
+) -> ArrowMaterializedJsonSlot {
+    if !include {
+        return ArrowMaterializedJsonSlot::None;
+    }
+    match slot {
+        JsonSlot::None => ArrowMaterializedJsonSlot::None,
+        JsonSlot::Inline(json) => ArrowMaterializedJsonSlot::Inline(json),
+        JsonSlot::Ref(json_ref) => {
+            let index = json_refs.len();
+            json_refs.push(json_ref);
+            ArrowMaterializedJsonSlot::Loaded(index)
         }
-        return Ok(rows.finish());
     }
-
-    let payloads = materialize_index_payloads(
-        store,
-        entries.iter().map(|(key, value)| {
-            (
-                TrackedStateKeyRef {
-                    schema_key: &key.schema_key,
-                    file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
-                },
-                value,
-            )
-        }),
-        *materialization,
-    )
-    .await?;
-
-    for (key, value) in entries {
-        let (snapshot_content, metadata) = if value.deleted {
-            (None, None)
-        } else {
-            shared_payload_fields(
-                &payloads,
-                TrackedStateKeyRef {
-                    schema_key: key.schema_key.as_str(),
-                    file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
-                },
-                value.change_id,
-            )?
-        };
-        rows.push(key, value, snapshot_content, metadata);
-    }
-    Ok(rows.finish())
 }
 
-/// Borrowed-key counterpart for exact historical reads.
-///
-/// The caller retains one compact key-reference column through the async
-/// lookup. Identity strings are copied only when first inserted into the
-/// materialized batch dictionary, never once per requested row.
-pub(crate) async fn materialize_batch_from_index_entry_refs<'a, S>(
-    store: &S,
-    entries: Vec<(TrackedStateKeyRef<'a>, TrackedStateIndexValue)>,
-    materialization: &ChangeRecordProjection,
-) -> Result<MaterializedTrackedStateBatch, LixError>
-where
-    S: StorageAdapterRead,
-{
-    let dictionary_entry_capacity = entries
-        .iter()
-        .map(|(key, _)| 1 + usize::from(key.file_id.is_some()))
-        .sum();
-    let mut rows = MaterializedTrackedStateBatchBuilder::with_capacities(
-        entries.len(),
-        dictionary_entry_capacity,
-        0,
-    );
-    if !materialization.snapshot_content && !materialization.metadata {
-        for (key, value) in entries {
-            rows.push_ref(key, value, None, None);
+fn finish_arrow_json_slot(
+    slot: ArrowMaterializedJsonSlot,
+    json_refs: &[JsonRef],
+    json_values: &mut [Option<Bytes>],
+) -> Result<Option<SharedStr>, LixError> {
+    let index = match slot {
+        ArrowMaterializedJsonSlot::None => return Ok(None),
+        ArrowMaterializedJsonSlot::Inline(json) => {
+            return Ok(Some(SharedStr::from(json.into_string())));
         }
-        return Ok(rows.finish());
-    }
-
-    let payloads = materialize_index_payloads(
-        store,
-        entries.iter().map(|(key, value)| (*key, value)),
-        *materialization,
-    )
-    .await?;
-
-    for (key, value) in entries {
-        let (snapshot_content, metadata) = if value.deleted {
-            (None, None)
-        } else {
-            shared_payload_fields(&payloads, key, value.change_id)?
-        };
-        rows.push_ref(key, value, snapshot_content, metadata);
-    }
-    Ok(rows.finish())
-}
-
-/// Returns cheap views of the materialized payload retained by the batch map.
-///
-/// A change can back multiple tracked-state rows during historical reads.
-/// `SharedStr` lets every use retain the same immutable JSON-store buffer
-/// without a use-count map or a new owned string allocation per repeated row.
-fn shared_payload_fields(
-    payloads: &HashMap<ChangeId, MaterializedChangePayload>,
-    key: TrackedStateKeyRef<'_>,
-    change_id: ChangeId,
-) -> Result<(Option<SharedStr>, Option<SharedStr>), LixError> {
-    let payload = payloads.get(&change_id).ok_or_else(|| {
+        ArrowMaterializedJsonSlot::Loaded(index) => index,
+    };
+    let json_ref = json_refs.get(index).ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked-state row references ChangeRecord '{change_id}' that was not materialized"
-            ),
+            "Arrow state materialization lost a JSON ref index",
         )
     })?;
-    if let Some(identity) = payload.identity.as_ref()
-        && (identity.schema_key != key.schema_key
-            || identity.entity_pk != *key.entity_pk
-            || identity.file_id.as_deref() != key.file_id)
-    {
-        return Err(LixError::new(
+    let bytes = json_values
+        .get_mut(index)
+        .and_then(Option::take)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "Arrow state references missing JSON payload '{}'",
+                    json_ref.to_hex()
+                ),
+            )
+        })?;
+    SharedStr::from_utf8(bytes).map(Some).map_err(|error| {
+        LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked-state row identity does not match referenced ChangeRecord '{change_id}'"
-            ),
-        ));
+            format!("Arrow state JSON payload is not UTF-8: {error}"),
+        )
+    })
+}
+
+/// Terminal public-snapshot adapter from authoritative Arrow rows.
+///
+/// Identity, lifecycle, and inline payloads are consumed from the leaf itself;
+/// only content-addressed large JSON blobs require an auxiliary store read.
+pub(crate) async fn materialize_batch_from_arrow_rows<S>(
+    store: &S,
+    arrow_rows: Vec<CurrentStateDataRow>,
+    projection: &ChangeRecordProjection,
+) -> Result<MaterializedTrackedStateBatch, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let dictionary_entry_capacity = arrow_rows.len().saturating_mul(2);
+    let mut rows = MaterializedTrackedStateBatchBuilder::with_capacities(
+        arrow_rows.len(),
+        dictionary_entry_capacity,
+        0,
+    );
+    let mut json_refs = Vec::new();
+    let mut planned = Vec::with_capacity(arrow_rows.len());
+    for row in arrow_rows {
+        let key = crate::tracked_state::codec::decode_key(&row.encoded_key)?;
+        let deleted = row.value.deleted;
+        let snapshot = plan_arrow_json_slot(
+            projection.snapshot_content && !deleted,
+            row.snapshot,
+            &mut json_refs,
+        );
+        let metadata = plan_arrow_json_slot(
+            projection.metadata && !deleted,
+            row.metadata,
+            &mut json_refs,
+        );
+        planned.push((key, row.value, snapshot, metadata));
     }
-    Ok((payload.snapshot_content.clone(), payload.metadata.clone()))
+    let mut json_values = if json_refs.is_empty() {
+        Vec::new()
+    } else {
+        JsonStoreContext::new()
+            .load_bytes_many(
+                store,
+                JsonLoadRequestRef {
+                    refs: &json_refs,
+                    scope: JsonReadScopeRef::OutOfBand,
+                },
+            )
+            .await?
+            .into_values()
+    };
+    for (key, value, snapshot, metadata) in planned {
+        rows.push(
+            key,
+            value,
+            finish_arrow_json_slot(snapshot, &json_refs, &mut json_values)?,
+            finish_arrow_json_slot(metadata, &json_refs, &mut json_values)?,
+        );
+    }
+    Ok(rows.finish())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::changelog::MaterializedChangeIdentity;
     use crate::entity_pk::{EntityPk, EntityPkComponent};
 
     fn integer_entity_pk(value: i64) -> EntityPk {
@@ -981,81 +906,6 @@ mod tests {
                 .snapshot_content()
                 .expect("first payload")
                 .shares_buffer_with(duplicate.snapshot_content().expect("duplicate payload"))
-        );
-    }
-
-    fn fixture(
-        schema_key: &str,
-    ) -> (
-        ChangeId,
-        TrackedStateKey,
-        HashMap<ChangeId, MaterializedChangePayload>,
-        SharedStr,
-    ) {
-        let change_id = ChangeId::new(uuid::Uuid::from_bytes([7; 16]));
-        let key = TrackedStateKey {
-            schema_key: schema_key.to_owned(),
-            file_id: Some("file.md".to_owned()),
-            entity_pk: EntityPk::single("entity"),
-        };
-        let snapshot = SharedStr::from(r#"{"id":"entity"}"#.to_owned());
-        let payload = MaterializedChangePayload {
-            identity: Some(MaterializedChangeIdentity {
-                schema_key: "message".to_owned(),
-                entity_pk: EntityPk::single("entity"),
-                file_id: Some("file.md".to_owned()),
-            }),
-            snapshot_content: Some(snapshot.clone()),
-            metadata: None,
-        };
-        (
-            change_id,
-            key,
-            HashMap::from([(change_id, payload)]),
-            snapshot,
-        )
-    }
-
-    #[test]
-    fn repeated_payload_uses_share_the_materialized_json_buffer() {
-        let (change_id, key, payloads, source) = fixture("message");
-
-        let key_ref = TrackedStateKeyRef {
-            schema_key: key.schema_key.as_str(),
-            file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
-        };
-        let first = shared_payload_fields(&payloads, key_ref, change_id)
-            .expect("first payload use")
-            .0
-            .expect("snapshot");
-        let second = shared_payload_fields(&payloads, key_ref, change_id)
-            .expect("second payload use")
-            .0
-            .expect("snapshot");
-
-        assert!(source.shares_buffer_with(&first));
-        assert!(first.shares_buffer_with(&second));
-    }
-
-    #[test]
-    fn payload_identity_mismatch_is_rejected() {
-        let (change_id, key, payloads, _) = fixture("wrong-schema");
-
-        let error = shared_payload_fields(
-            &payloads,
-            TrackedStateKeyRef {
-                schema_key: key.schema_key.as_str(),
-                file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
-            },
-            change_id,
-        )
-        .expect_err("mismatched identity must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("identity does not match referenced ChangeRecord")
         );
     }
 }

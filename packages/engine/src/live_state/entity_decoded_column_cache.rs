@@ -12,14 +12,14 @@ use datafusion::arrow::array::{Array, ArrayRef};
 use tokio::sync::watch;
 
 use crate::LixError;
-use crate::columnar_row_group::{RowGroupManifest, RowGroupSetId};
+use crate::columnar_row_group::{ArrowStateSetId, RowGroupManifest};
 
 const DECODED_COLUMN_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 const DECODED_COLUMN_CACHE_MAX_ENTRIES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct DecodedColumnKey {
-    row_groups: RowGroupSetId,
+    row_groups: ArrowStateSetId,
     manifest_digest: [u8; 32],
     group_index: usize,
     column_index: usize,
@@ -117,7 +117,7 @@ impl EntityDecodedColumnCache {
     pub(crate) async fn load_projection<S>(
         &self,
         store: &S,
-        id: RowGroupSetId,
+        id: ArrowStateSetId,
         manifest_digest: [u8; 32],
         manifest: &RowGroupManifest,
         group_index: usize,
@@ -148,7 +148,7 @@ impl EntityDecodedColumnCache {
 
     async fn load_projection_with<F, Fut>(
         &self,
-        id: RowGroupSetId,
+        id: ArrowStateSetId,
         manifest_digest: [u8; 32],
         group_index: usize,
         projection: &[usize],
@@ -421,16 +421,16 @@ mod tests {
             vec![array(10), array(20), array(30)],
         )
         .expect("row-group batch");
-        let encoded = crate::columnar_row_group::encode_row_group_set(
+        let encoded = crate::columnar_row_group::encode_row_group_set_preserving_batches(
             "decoded-cache-storage-test",
             schema,
             &[batch],
         )
         .expect("encode row group");
-        let id = RowGroupSetId::new(*b"decoded-cache-01");
+        let id = encoded.id();
         let adapter = StorageAdapter::new(Memory::new());
         let mut writes = adapter.new_write_set();
-        crate::columnar_row_group::stage_row_group_set(&mut writes, id, &encoded)
+        crate::columnar_row_group::stage_row_group_set(&mut writes, &encoded)
             .expect("stage row group");
         adapter
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -479,10 +479,16 @@ mod tests {
         let cache = EntityDecodedColumnCache::default();
         let loads = AtomicUsize::new(0);
         let arrays = cache
-            .load_projection_with(RowGroupSetId::new([16; 16]), [17; 32], 0, &[], |_columns| {
-                loads.fetch_add(1, Ordering::SeqCst);
-                std::future::ready(Ok(Vec::new()))
-            })
+            .load_projection_with(
+                ArrowStateSetId::from_digest([16; 32]),
+                [17; 32],
+                0,
+                &[],
+                |_columns| {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Ok(Vec::new()))
+                },
+            )
             .await
             .expect("empty projection");
         assert!(arrays.is_empty());
@@ -494,23 +500,35 @@ mod tests {
         let cache = EntityDecodedColumnCache::default();
         let loads = Arc::new(Mutex::new(Vec::<Vec<usize>>::new()));
         let first = cache
-            .load_projection_with(RowGroupSetId::new([1; 16]), [2; 32], 3, &[2, 0], {
-                let loads = Arc::clone(&loads);
-                move |columns| {
-                    loads.lock().expect("loads lock").push(columns.clone());
-                    std::future::ready(Ok(loaded(columns)))
-                }
-            })
+            .load_projection_with(
+                ArrowStateSetId::from_digest([1; 32]),
+                [2; 32],
+                3,
+                &[2, 0],
+                {
+                    let loads = Arc::clone(&loads);
+                    move |columns| {
+                        loads.lock().expect("loads lock").push(columns.clone());
+                        std::future::ready(Ok(loaded(columns)))
+                    }
+                },
+            )
             .await
             .expect("first projection");
         let second = cache
-            .load_projection_with(RowGroupSetId::new([1; 16]), [2; 32], 3, &[0, 1, 2], {
-                let loads = Arc::clone(&loads);
-                move |columns| {
-                    loads.lock().expect("loads lock").push(columns.clone());
-                    std::future::ready(Ok(loaded(columns)))
-                }
-            })
+            .load_projection_with(
+                ArrowStateSetId::from_digest([1; 32]),
+                [2; 32],
+                3,
+                &[0, 1, 2],
+                {
+                    let loads = Arc::clone(&loads);
+                    move |columns| {
+                        loads.lock().expect("loads lock").push(columns.clone());
+                        std::future::ready(Ok(loaded(columns)))
+                    }
+                },
+            )
             .await
             .expect("overlapping projection");
 
@@ -551,7 +569,7 @@ mod tests {
             async move {
                 cache
                     .load_projection_with(
-                        RowGroupSetId::new([3; 16]),
+                        ArrowStateSetId::from_digest([3; 32]),
                         [4; 32],
                         0,
                         &[0, 1],
@@ -578,7 +596,7 @@ mod tests {
             async move {
                 cache
                     .load_projection_with(
-                        RowGroupSetId::new([3; 16]),
+                        ArrowStateSetId::from_digest([3; 32]),
                         [4; 32],
                         0,
                         &[1, 2],
@@ -614,7 +632,7 @@ mod tests {
             async move {
                 cache
                     .load_projection_with(
-                        RowGroupSetId::new([5; 16]),
+                        ArrowStateSetId::from_digest([5; 32]),
                         [6; 32],
                         0,
                         &[0],
@@ -638,7 +656,7 @@ mod tests {
             async move {
                 cache
                     .load_projection_with(
-                        RowGroupSetId::new([5; 16]),
+                        ArrowStateSetId::from_digest([5; 32]),
                         [6; 32],
                         0,
                         &[0],
@@ -669,7 +687,7 @@ mod tests {
             async move {
                 cache
                     .load_projection_with(
-                        RowGroupSetId::new([7; 16]),
+                        ArrowStateSetId::from_digest([7; 32]),
                         [8; 32],
                         0,
                         &[0],
@@ -693,7 +711,7 @@ mod tests {
             async move {
                 cache
                     .load_projection_with(
-                        RowGroupSetId::new([7; 16]),
+                        ArrowStateSetId::from_digest([7; 32]),
                         [8; 32],
                         0,
                         &[0],
@@ -719,13 +737,19 @@ mod tests {
         let entry_loads = Arc::new(AtomicUsize::new(0));
         for projection in [&[0, 1][..], &[2][..], &[0][..]] {
             entry_cache
-                .load_projection_with(RowGroupSetId::new([7; 16]), [8; 32], 0, projection, {
-                    let loads = Arc::clone(&entry_loads);
-                    move |columns| {
-                        loads.fetch_add(columns.len(), Ordering::SeqCst);
-                        std::future::ready(Ok(loaded(columns)))
-                    }
-                })
+                .load_projection_with(
+                    ArrowStateSetId::from_digest([7; 32]),
+                    [8; 32],
+                    0,
+                    projection,
+                    {
+                        let loads = Arc::clone(&entry_loads);
+                        move |columns| {
+                            loads.fetch_add(columns.len(), Ordering::SeqCst);
+                            std::future::ready(Ok(loaded(columns)))
+                        }
+                    },
+                )
                 .await
                 .expect("entry-bounded load");
         }
@@ -734,7 +758,7 @@ mod tests {
         let byte_cache = EntityDecodedColumnCache::with_limits(bytes, 8);
         byte_cache
             .load_projection_with(
-                RowGroupSetId::new([9; 16]),
+                ArrowStateSetId::from_digest([9; 32]),
                 [10; 32],
                 0,
                 &[0, 1],
@@ -748,7 +772,7 @@ mod tests {
         let oversize_loads = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
             oversize
-                .load_projection_with(RowGroupSetId::new([11; 16]), [12; 32], 0, &[0], {
+                .load_projection_with(ArrowStateSetId::from_digest([11; 32]), [12; 32], 0, &[0], {
                     let loads = Arc::clone(&oversize_loads);
                     move |columns| {
                         loads.fetch_add(1, Ordering::SeqCst);
@@ -765,7 +789,7 @@ mod tests {
         let digest_loads = Arc::new(AtomicUsize::new(0));
         for digest in [[13; 32], [14; 32]] {
             digest_cache
-                .load_projection_with(RowGroupSetId::new([15; 16]), digest, 0, &[0], {
+                .load_projection_with(ArrowStateSetId::from_digest([15; 32]), digest, 0, &[0], {
                     let loads = Arc::clone(&digest_loads);
                     move |columns| {
                         loads.fetch_add(1, Ordering::SeqCst);
@@ -787,7 +811,7 @@ mod tests {
             Arc::clone(&budget),
         );
         let shadow = crate::live_state::EntityColumnarShadowMaskKey {
-            row_groups: RowGroupSetId::new([18; 16]),
+            row_groups: ArrowStateSetId::from_digest([18; 32]),
             branch_id: Arc::from("main"),
             head_commit_id: crate::changelog::CommitId::for_test_label(
                 "shared-columnar-budget-head",
@@ -810,7 +834,7 @@ mod tests {
         let decoded_loads = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
             decoded
-                .load_projection_with(RowGroupSetId::new([18; 16]), [20; 32], 0, &[1], {
+                .load_projection_with(ArrowStateSetId::from_digest([18; 32]), [20; 32], 0, &[1], {
                     let loads = Arc::clone(&decoded_loads);
                     let resident_array = Arc::clone(&resident_array);
                     move |columns| {
@@ -843,7 +867,7 @@ mod tests {
             );
             exact.insert_batch(
                 crate::live_state::EntityColumnarShadowMaskKey {
-                    row_groups: RowGroupSetId::new([21; 16]),
+                    row_groups: ArrowStateSetId::from_digest([21; 32]),
                     branch_id: Arc::from("main"),
                     head_commit_id: crate::changelog::CommitId::for_test_label(
                         "released-columnar-budget-head",
@@ -867,7 +891,7 @@ mod tests {
         let loads = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
             decoded
-                .load_projection_with(RowGroupSetId::new([21; 16]), [23; 32], 0, &[0], {
+                .load_projection_with(ArrowStateSetId::from_digest([21; 32]), [23; 32], 0, &[0], {
                     let loads = Arc::clone(&loads);
                     move |columns| {
                         loads.fetch_add(1, Ordering::SeqCst);

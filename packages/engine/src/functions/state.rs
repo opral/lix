@@ -92,10 +92,9 @@ pub(crate) async fn stage_sequence(
         [NormalizedJsonRef::from(&snapshot)],
     )?;
     let snapshot_slot = JsonSlot::from_json(snapshot.as_str());
-    let mut working_diff_coverage = crate::live_state::WorkingDiffIndexCoverage::default();
     TrackedHeadContext::new()
         .writer(read, writes)
-        .stage_current_state_with_working_diff(
+        .stage_current_state(
             GLOBAL_BRANCH_ID,
             Some(control.generation),
             control.head_commit_id,
@@ -116,8 +115,6 @@ pub(crate) async fn stage_sequence(
             &std::collections::BTreeSet::new(),
             None,
             None,
-            None,
-            &mut working_diff_coverage,
         )
         .await?;
     // The hot-state mutation is fenced by an actual control-byte
@@ -391,10 +388,9 @@ mod tests {
             .expect("global control should load")
             .expect("global control should exist");
         let snapshot = JsonSlot::from_json(&snapshot_content);
-        let mut working_diff_coverage = crate::live_state::WorkingDiffIndexCoverage::default();
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_current_state_with_working_diff(
+            .stage_current_state(
                 GLOBAL_BRANCH_ID,
                 Some(control.generation),
                 control.head_commit_id,
@@ -415,8 +411,6 @@ mod tests {
                 &std::collections::BTreeSet::new(),
                 None,
                 None,
-                None,
-                &mut working_diff_coverage,
             )
             .await
             .expect("test key-value current row should stage");

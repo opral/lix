@@ -15,7 +15,7 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
     CurrentStateDeltaRef, LiveStateContext, LiveStateFilter, LiveStateProjection,
-    LiveStateRowRequest, LiveStateScanRequest, TrackedHeadContext, WorkingDiffIndexCoverage,
+    LiveStateRowRequest, LiveStateScanRequest, TrackedHeadContext,
 };
 use crate::session::SessionMode;
 use crate::storage_adapter::Storage;
@@ -376,10 +376,9 @@ where
         .expect("global branch control should load")
         .expect("global branch control should exist");
     let snapshot = crate::json_store::JsonSlot::from_json(&snapshot_content);
-    let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
     TrackedHeadContext::new()
         .writer(&read, &mut writes)
-        .stage_current_state_with_working_diff(
+        .stage_current_state(
             GLOBAL_BRANCH_ID,
             Some(control.generation),
             control.head_commit_id,
@@ -400,8 +399,6 @@ where
             &BTreeSet::new(),
             None,
             None,
-            None,
-            &mut working_diff_coverage,
         )
         .await
         .expect("deterministic mode current row should stage");

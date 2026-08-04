@@ -282,7 +282,6 @@ impl WorkingDiffRoute {
                         .collect(),
                     include_tombstones: true,
                 },
-                retain_payloads: false,
             },
             contradictory,
         })

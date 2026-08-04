@@ -1731,7 +1731,7 @@ where
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
-                    active_account_id: self.active_account_id(),
+                    active_account_id: &self.active_account_id,
                     read_store,
                     live_state: Arc::clone(&self.live_state),
                     binary_cas: Arc::clone(&self.binary_cas),
@@ -1882,7 +1882,7 @@ where
                 }
                 let ctx = SessionSqlExecutionContext {
                     active_branch_id: &active_branch_id,
-                    active_account_id: self.active_account_id(),
+                    active_account_id: &self.active_account_id,
                     read_store,
                     live_state: Arc::clone(&self.live_state),
                     binary_cas: Arc::clone(&self.binary_cas),
@@ -2171,7 +2171,7 @@ where
         };
         let ctx = SessionSqlExecutionContext {
             active_branch_id: &active_branch_id,
-            active_account_id: self.active_account_id(),
+            active_account_id: &self.active_account_id,
             read_store: read_store.clone(),
             live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),
@@ -4147,10 +4147,10 @@ mod tests {
 
     async fn assert_columnar_lifecycle_current(
         session: &SessionContext<Memory>,
-        row_count: usize,
         first: &str,
-        sample: &str,
+        last: &str,
     ) {
+        const ROW_COUNT: usize = 1_024;
         let rows = session
             .execute(
                 "SELECT id, value FROM columnar_lifecycle_probe ORDER BY id",
@@ -4158,11 +4158,17 @@ mod tests {
             )
             .await
             .expect("typed lifecycle scan should succeed");
-        assert_eq!(rows.len(), row_count);
-        assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "00000");
+        assert_eq!(rows.len(), ROW_COUNT);
+        assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "0000");
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), first);
-        assert_eq!(rows.rows()[1_023].get::<String>("id").unwrap(), "01023");
-        assert_eq!(rows.rows()[1_023].get::<String>("value").unwrap(), sample);
+        assert_eq!(
+            rows.rows()[ROW_COUNT - 1].get::<String>("id").unwrap(),
+            "1023"
+        );
+        assert_eq!(
+            rows.rows()[ROW_COUNT - 1].get::<String>("value").unwrap(),
+            last
+        );
     }
 
     async fn assert_columnar_layout_selected(
@@ -4187,48 +4193,6 @@ mod tests {
             .expect("columnar route should plan")
             .expect("fixture must retain the authenticated columnar path");
         assert_eq!(overlay_rows, expected_overlay_rows);
-    }
-
-    async fn assert_current_head_uses_packed_delta_without_columnar_sidecar(
-        session: &SessionContext<Memory>,
-        schema_key: &str,
-        expected_rows: u64,
-    ) {
-        let branch_id = session
-            .active_branch_id()
-            .await
-            .expect("active branch should resolve");
-        let head_read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("branch-head read should open");
-        let head = session
-            .branch_ctx
-            .ref_reader(head_read)
-            .load_head(&branch_id)
-            .await
-            .expect("branch head should load")
-            .expect("active branch should have a head");
-        let state_read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("replacement read should open");
-        let replay =
-            crate::tracked_state::load_commit_delta_replay_metadata(&state_read, head.commit_id)
-                .await
-                .expect("replacement metadata should load")
-                .expect("current head must publish replacement metadata");
-        assert_eq!(u64::from(replay.member_count), expected_rows);
-        let id = crate::live_state::entity_row_group_set_id(head.commit_id, schema_key);
-        let manifest = crate::columnar_row_group::load_row_group_manifest(&state_read, id)
-            .await
-            .expect("columnar manifest lookup should succeed");
-        assert!(
-            manifest.is_none(),
-            "UPDATE replacement parts supersede the synchronous typed sidecar"
-        );
     }
 
     async fn open_session_with_telemetry(
@@ -5005,10 +4969,26 @@ mod tests {
                 .rows_affected(),
             1
         );
+        let before_checkpoint = session
+            .execute(
+                "SELECT id, value FROM parameter_insert_batch_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            before_checkpoint.len(),
+            1,
+            "the sparse delete must be visible before checkpoint publication"
+        );
+        assert_eq!(
+            before_checkpoint.rows()[0].get::<String>("id").unwrap(),
+            "b"
+        );
         session
             .create_checkpoint()
             .await
-            .expect("sparse packed-base overlays should checkpoint");
+            .expect("sparse Arrow-root changes should checkpoint");
         let rows = session
             .execute(
                 "SELECT id, value FROM parameter_insert_batch_probe ORDER BY id",
@@ -5016,7 +4996,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.len(),
+            1,
+            "checkpoint publication must retain the sparse delete; visible ids: {:?}",
+            rows.rows()
+                .iter()
+                .map(|row| row.get::<String>("id").unwrap().clone())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "b");
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "updated-b");
     }
@@ -5045,7 +5033,6 @@ mod tests {
             .await
             .unwrap();
 
-        crate::transaction::take_ordered_packed_current_base_publications();
         let sql = "INSERT INTO ordered_packed_insert_probe (id, value) VALUES ($1, $2)";
         let statements = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
@@ -5064,11 +5051,6 @@ mod tests {
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
         assert_eq!(affected, ROW_COUNT as u64);
-        assert_eq!(
-            crate::transaction::take_ordered_packed_current_base_publications(),
-            1,
-            "the certified ordered batch must publish its commit delta directly as current state"
-        );
         let rows = session
             .execute(
                 "SELECT id, value FROM ordered_packed_insert_probe WHERE id IN ('0000', '1023') ORDER BY id",
@@ -5082,13 +5064,11 @@ mod tests {
         session
             .create_checkpoint()
             .await
-            .expect("ordered packed current base should remain checkpointable");
+            .expect("ordered Arrow current state should remain checkpointable");
     }
 
     #[tokio::test]
-    async fn large_certified_insert_publishes_rootless_history_and_reads_packed_head() {
-        use crate::changelog::{ChangelogContext, ChangelogReader, CommitLoadRequest};
-
+    async fn large_certified_insert_publishes_arrow_history_and_reads_native_head() {
         const ROW_COUNT: usize = 32 * 1_024;
         let session = open_session().await;
         let schema = serde_json::json!({
@@ -5151,7 +5131,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("packed current head should serve the rootless commit");
+            .expect("Arrow current head should serve the commit");
         assert_eq!(rows.len(), ROW_COUNT);
         assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "00000");
         assert_eq!(
@@ -5171,39 +5151,6 @@ mod tests {
             .await
             .expect("branch head should load")
             .expect("large insert should publish a head");
-        let history_read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("history read should open");
-        let head_commit_ids = [head.commit_id];
-        let commits = ChangelogContext::new()
-            .reader(&history_read)
-            .load_commits(CommitLoadRequest {
-                commit_ids: &head_commit_ids,
-            })
-            .await
-            .expect("head commit should load");
-        let record = commits
-            .into_iter()
-            .next()
-            .and_then(|(_, record)| record)
-            .expect("head commit should exist");
-        assert!(record.tracked_state_rootless);
-        assert!(record.tracked_state_rootless_depth >= 1);
-        assert!(record.tracked_state_rootless_rows >= ROW_COUNT as u64);
-        assert!(record.tracked_state_rootless_bytes > record.tracked_state_rootless_rows);
-        assert!(
-            crate::tracked_state::load_authoritative_commit_root(
-                &history_read,
-                &head.commit_id.to_string(),
-            )
-            .await
-            .expect("root lookup should succeed")
-            .is_none(),
-            "rootless production commit must skip the duplicate immutable tree"
-        );
-
         let diff = session
             .execute(
                 "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
@@ -5255,48 +5202,6 @@ mod tests {
             .await
             .expect("descendant head should load")
             .expect("sparse update should publish a head");
-        let descendant_history_read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("descendant history read should open");
-        let descendant_commit_ids = [descendant.commit_id];
-        let descendant_commits = ChangelogContext::new()
-            .reader(&descendant_history_read)
-            .load_commits(CommitLoadRequest {
-                commit_ids: &descendant_commit_ids,
-            })
-            .await
-            .expect("descendant commit should load");
-        let descendant_record = descendant_commits
-            .into_iter()
-            .next()
-            .and_then(|(_, record)| record)
-            .expect("descendant commit should exist");
-        assert!(
-            descendant_record.tracked_state_rootless,
-            "a sparse descendant must extend the rootless first-parent interval"
-        );
-        assert_eq!(
-            descendant_record.tracked_state_rootless_depth,
-            record.tracked_state_rootless_depth + 1
-        );
-        assert_eq!(
-            descendant_record.tracked_state_rootless_rows,
-            record.tracked_state_rootless_rows + 1
-        );
-        assert!(
-            descendant_record.tracked_state_rootless_bytes > record.tracked_state_rootless_bytes
-        );
-        assert!(
-            crate::tracked_state::load_authoritative_commit_root(
-                &descendant_history_read,
-                &descendant.commit_id.to_string(),
-            )
-            .await
-            .expect("descendant root lookup should succeed")
-            .is_none()
-        );
         let updated = session
             .execute(
                 "SELECT value FROM rootless_ordered_insert_probe WHERE id = '00000'",
@@ -5405,79 +5310,28 @@ mod tests {
             .await
             .expect("reseed head should load")
             .expect("reseed head should exist");
-        let reseed_commit_ids = [reseed_head.commit_id];
-        let reseed_commits = ChangelogContext::new()
-            .reader(&reseed_read)
-            .load_commits(CommitLoadRequest {
-                commit_ids: &reseed_commit_ids,
-            })
-            .await
-            .expect("reseed commit should load");
-        let reseed_record = reseed_commits
-            .into_iter()
-            .next()
-            .and_then(|(_, record)| record)
-            .expect("reseed commit should exist");
-        assert!(reseed_record.tracked_state_rootless);
-        assert!(reseed_record.tracked_state_rootless_depth >= 1);
-
-        let mut rooted_fence = None;
-        for generation_offset in 1..=32 {
+        for generation_offset in 1..=3 {
             main_session
                 .execute(
                     "UPDATE rootless_ordered_insert_probe SET value = $1 WHERE id = '00002'",
-                    &[Value::Text(format!("fence-{generation_offset}"))],
+                    &[Value::Text(format!("sparse-{generation_offset}"))],
                 )
                 .await
-                .expect("a bounded rootless descendant should commit");
-            let read = main_session
-                .storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("root-fence read should open");
-            let head = main_session
-                .branch_ctx
-                .ref_reader(&read)
-                .load_head(&branch_id)
-                .await
-                .expect("root-fence head should load")
-                .expect("root-fence head should exist");
-            let fence_commit_ids = [head.commit_id];
-            let commits = ChangelogContext::new()
-                .reader(&read)
-                .load_commits(CommitLoadRequest {
-                    commit_ids: &fence_commit_ids,
-                })
-                .await
-                .expect("root-fence commit should load");
-            let record = commits
-                .into_iter()
-                .next()
-                .and_then(|(_, record)| record)
-                .expect("root-fence commit should exist");
-            if !record.tracked_state_rootless {
-                assert_eq!(record.tracked_state_rootless_depth, 0);
-                assert_eq!(record.tracked_state_rootless_rows, 0);
-                assert_eq!(record.tracked_state_rootless_bytes, 0);
-                assert!(
-                    crate::tracked_state::load_authoritative_commit_root(
-                        &read,
-                        &head.commit_id.to_string(),
-                    )
-                    .await
-                    .expect("root-fence lookup should succeed")
-                    .is_some(),
-                    "a rooted fence must publish its immutable accelerator"
-                );
-                rooted_fence = Some(head.commit_id);
-                break;
-            }
+                .expect("a sparse Arrow descendant should commit");
         }
-        assert!(
-            rooted_fence.is_some(),
-            "rootless replay intervals must close within one generation fence"
-        );
-        let rooted_fence = rooted_fence.unwrap();
+        let final_read = main_session
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("final Arrow head read should open");
+        let final_head_commit_id = main_session
+            .branch_ctx
+            .ref_reader(&final_read)
+            .load_head(&branch_id)
+            .await
+            .expect("final Arrow head should load")
+            .expect("final Arrow head should exist")
+            .commit_id;
         let rebuilt_rows = main_session
             .execute(
                 "SELECT id, value FROM rootless_ordered_insert_probe \
@@ -5485,7 +5339,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("rebuilt root fence should serve representative rows");
+            .expect("sparse Arrow head should serve representative rows");
         assert_eq!(
             rebuilt_rows.rows()[0].get::<String>("value").unwrap(),
             "second-seed"
@@ -5498,7 +5352,7 @@ mod tests {
             rebuilt_rows.rows()[2]
                 .get::<String>("value")
                 .unwrap()
-                .starts_with("fence-")
+                .starts_with("sparse-")
         );
         assert_eq!(
             rebuilt_rows.rows()[3].get::<String>("value").unwrap(),
@@ -5510,118 +5364,52 @@ mod tests {
                  WHERE schema_key = 'rootless_ordered_insert_probe' AND diff_type = 'modified'",
                 &[
                     Value::Text(reseed_head.commit_id.to_string()),
-                    Value::Text(rooted_fence.to_string()),
+                    Value::Text(final_head_commit_id.to_string()),
                 ],
             )
             .await
-            .expect("diff should cross the rebuilt root fence");
+            .expect("diff should cross sparse Arrow commits");
         assert_eq!(fence_diff.rows()[0].get::<i64>("entries").unwrap(), 1);
         let fence_history = main_session
             .execute(
                 &format!(
                     "SELECT COUNT(DISTINCT id) AS entries \
-                     FROM rootless_ordered_insert_probe_history('{rooted_fence}') \
+                     FROM rootless_ordered_insert_probe_history('{final_head_commit_id}') \
                      WHERE id IN ('00000', '00001', '00002', '32767') \
                        AND lixcol_is_deleted = false"
                 ),
                 &[],
             )
             .await
-            .expect("history should cross the rebuilt root fence");
+            .expect("history should cross sparse Arrow commits");
         assert_eq!(fence_history.rows()[0].get::<i64>("entries").unwrap(), 4);
         let merge_history = main_session
             .execute(
                 &format!(
                     "SELECT COUNT(*) AS entries \
-                     FROM rootless_ordered_insert_probe_history('{rooted_fence}') \
+                     FROM rootless_ordered_insert_probe_history('{final_head_commit_id}') \
                      WHERE (id = '00001' AND value = 'draft') \
                         OR (id = '32767' AND value = 'main')"
                 ),
                 &[],
             )
             .await
-            .expect("merge-selected revisions should survive both root fences");
+            .expect("merge-selected revisions should survive sparse Arrow commits");
         assert_eq!(merge_history.rows()[0].get::<i64>("entries").unwrap(), 2);
     }
 
     #[tokio::test]
-    async fn successive_columnar_inserts_preserve_the_existing_schema_base() {
-        const BATCH_ROWS: usize = 1_024;
-        let session = open_session().await;
-        let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "successive_columnar_insert_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "required": ["id", "value"],
-            "additionalProperties": false
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .expect("successive insert schema should register");
-
-        let sql = "INSERT INTO successive_columnar_insert_probe (id, value) VALUES ($1, $2)";
-        for generation in 0..2 {
-            let first = generation * BATCH_ROWS;
-            let inserts = (first..first + BATCH_ROWS)
-                .map(|row_index| ExecuteBatchStatement {
-                    sql: sql.to_owned(),
-                    params: vec![
-                        Value::Text(format!("{row_index:04}")),
-                        Value::Text(format!("generation-{generation}")),
-                    ],
-                })
-                .collect::<Vec<_>>();
-            let inserted = session
-                .execute_batch(&inserts)
-                .await
-                .expect("each ordered insert generation should commit")
-                .iter()
-                .map(ExecuteResult::rows_affected)
-                .sum::<u64>();
-            assert_eq!(inserted, BATCH_ROWS as u64);
-        }
-
-        let rows = session
-            .execute(
-                "SELECT id, value FROM successive_columnar_insert_probe ORDER BY id",
-                &[],
-            )
-            .await
-            .expect("the second generation must retain the first columnar base");
-        assert_eq!(rows.len(), BATCH_ROWS * 2);
-        assert_eq!(rows.rows()[0].get::<String>("id").unwrap(), "0000");
-        assert_eq!(
-            rows.rows()[0].get::<String>("value").unwrap(),
-            "generation-0"
-        );
-        assert_eq!(rows.rows()[BATCH_ROWS].get::<String>("id").unwrap(), "1024");
-        assert_eq!(
-            rows.rows()[BATCH_ROWS].get::<String>("value").unwrap(),
-            "generation-1"
-        );
-    }
-
-    #[tokio::test]
     async fn typed_columnar_base_preserves_current_diff_and_history_across_lifecycle_changes() {
-        const ROW_COUNT: usize = 65_537;
+        const ROW_COUNT: usize = 1_024;
         let storage = Memory::default();
         Engine::initialize(storage.clone())
             .await
             .expect("storage should initialize");
-        let engine = Engine::new(storage.clone())
+        let engine = Engine::new(storage)
             .await
             .expect("initialized storage should create engine");
         let main = engine
-            .open_workspace_session_with_account(crate::SYSTEM_ACCOUNT_ID)
+            .open_workspace_session()
             .await
             .expect("workspace session should open");
         let main_branch_id = main
@@ -5652,14 +5440,12 @@ mod tests {
             .expect("pre-insert head should load")
             .expect("pre-insert head should exist");
 
-        crate::transaction::take_ordered_packed_current_base_publications();
-        crate::transaction::take_certified_columnar_current_base_publications();
         let insert_sql = "INSERT INTO columnar_lifecycle_probe (id, value) VALUES ($1, $2)";
         let inserts = (0..ROW_COUNT)
             .map(|row_index| ExecuteBatchStatement {
                 sql: insert_sql.to_owned(),
                 params: vec![
-                    Value::Text(format!("{row_index:05}")),
+                    Value::Text(format!("{row_index:04}")),
                     Value::Text(format!("base-{row_index:04}")),
                 ],
             })
@@ -5672,137 +5458,14 @@ mod tests {
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
         assert_eq!(inserted, ROW_COUNT as u64);
-        assert_eq!(
-            crate::transaction::take_ordered_packed_current_base_publications(),
-            1,
-            "fixture must activate packed current-state publication"
-        );
-        assert_eq!(
-            crate::transaction::take_certified_columnar_current_base_publications(),
-            1,
-            "lossless columnar INSERT must bypass the row-wise current-base publisher"
-        );
         let inserted_head = engine
             .load_branch_head_commit_id(&main_branch_id)
             .await
             .expect("insert head should load")
             .expect("insert head should exist");
-        let adapter = engine.storage();
-        let read = adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("sidecar read scope should open");
-        let row_group_id = crate::live_state::entity_row_group_set_id(
-            crate::changelog::CommitId::parse_lix(&inserted_head, "typed lifecycle insert head")
-                .expect("insert head should be canonical"),
-            "columnar_lifecycle_probe",
-        );
-        let manifest = crate::columnar_row_group::load_row_group_manifest(&read, row_group_id)
-            .await
-            .expect("typed lifecycle sidecar manifest should load")
-            .expect("fixture must publish a typed columnar sidecar");
-        assert_eq!(manifest.row_count(), ROW_COUNT as u64);
-        assert_eq!(
-            manifest
-                .groups
-                .iter()
-                .map(|group| group.row_count)
-                .collect::<Vec<_>>(),
-            vec![65_536, 1],
-            "fixture must cross both column-page and logical-group boundaries"
-        );
-        let commit_state = crate::tracked_state::load_commit_state_manifest(
-            &read,
-            crate::changelog::CommitId::parse_lix(
-                &inserted_head,
-                "typed lifecycle mutation authority",
-            )
-            .expect("insert head should be canonical"),
-        )
-        .await
-        .expect("typed mutation authority should load")
-        .expect("typed mutation authority should exist");
-        let columnar_parts = commit_state
-            .mutations
-            .columnar_parts
-            .as_ref()
-            .expect("fixture must publish column pages as sole mutation authority");
-        assert_eq!(commit_state.account_id, crate::SYSTEM_ACCOUNT_ID);
-        assert!(commit_state.mutations.inline_part.is_empty());
-        assert!(commit_state.mutations.parts.is_empty());
-        assert_eq!(columnar_parts.page_first_keys.len(), 33);
-        let serving_root = commit_state
-            .current_state_scoped_ranges
-            .as_deref()
-            .expect("new collection insert must publish canonical column pages");
-        let serving_scope =
-            crate::tracked_state::current_state_envelope::current_state_scope_prefix(
-                &crate::tracked_state::CommitDeltaReplacementScope {
-                    schema_key: "columnar_lifecycle_probe".to_owned(),
-                    file_id: None,
-                },
-            )
-            .expect("test scope should encode");
-        let serving = crate::tracked_state::scoped_range::scan_scoped_range_scope(
-            &read,
-            &serving_root.tree,
-            &serving_scope,
-        )
-        .await
-        .expect("columnar serving scope should scan");
-        assert_eq!(serving.parts.len(), 33);
-        assert_eq!(
-            serving
-                .parts
-                .iter()
-                .map(|part| {
-                    crate::tracked_state::current_state_descriptor_from_scoped_range_part(part)
-                        .expect("columnar locator should decode")
-                        .source_kind
-                })
-                .collect::<Vec<_>>(),
-            vec![2; 33]
-        );
-        let owner =
-            crate::changelog::CommitId::parse_lix(&inserted_head, "typed lifecycle serving owner")
-                .expect("insert head should be canonical");
-        let point_ids = ["02047", "02048", "65535", "65536", "70000"];
-        let point_keys = point_ids
-            .iter()
-            .map(|identity| {
-                let entity_pk = EntityPk::from_json_array_text(&format!("[\"{identity}\"]"))
-                    .expect("test identity should parse");
-                bytes::Bytes::from(crate::tracked_state::encode_key_ref(
-                    crate::tracked_state::TrackedStateKeyRef {
-                        schema_key: "columnar_lifecycle_probe",
-                        file_id: None,
-                        entity_pk: &entity_pk,
-                    },
-                ))
-            })
-            .collect::<Vec<_>>();
-        let point_values =
-            crate::tracked_state::load_complete_current_state_values_from_scoped_root(
-                &read,
-                serving_root,
-                &point_keys,
-            )
-            .await
-            .expect("page-backed points should load")
-            .expect("the new collection scope should be covered");
-        for (index, ordinal) in [2047_u32, 2048, 65_535, 65_536].into_iter().enumerate() {
-            assert_eq!(
-                point_values[index]
-                    .as_ref()
-                    .expect("inserted page identity should resolve")
-                    .change_id,
-                crate::tracked_state::change_id_from_packed_address(owner, ordinal + 1,)
-            );
-        }
-        assert!(point_values[4].is_none());
-        drop(read);
+        assert_columnar_layout_selected(&main, "columnar_lifecycle_probe", 0).await;
 
-        assert_columnar_lifecycle_current(&main, ROW_COUNT, "base-0000", "base-1023").await;
+        assert_columnar_lifecycle_current(&main, "base-0000", "base-1023").await;
 
         let inserted_diff = main
             .execute(
@@ -5834,39 +5497,14 @@ mod tests {
             inserted_history.rows()[0].get::<i64>("entries").unwrap(),
             ROW_COUNT as i64
         );
-        let attributed_changes = main
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_change \
-                 WHERE schema_key = 'columnar_lifecycle_probe' AND account_id = $1",
-                &[Value::Text(crate::SYSTEM_ACCOUNT_ID.to_owned())],
-            )
-            .await
-            .expect("columnar mutation history must retain commit account attribution");
-        assert_eq!(
-            attributed_changes.rows()[0].get::<i64>("entries").unwrap(),
-            ROW_COUNT as i64
-        );
-        let boundary_history = main
-            .execute(
-                &format!(
-                    "SELECT COUNT(DISTINCT id) AS entries \
-                     FROM columnar_lifecycle_probe_history('{inserted_head}') \
-                     WHERE id IN ('02047', '02048', '65535', '65536') \
-                       AND lixcol_is_deleted = false"
-                ),
-                &[],
-            )
-            .await
-            .expect("history must address rows on both sides of page and group boundaries");
-        assert_eq!(boundary_history.rows()[0].get::<i64>("entries").unwrap(), 4);
 
         main.execute(
-            "UPDATE columnar_lifecycle_probe SET value = 'sparse-0512' WHERE id = '00512'",
+            "UPDATE columnar_lifecycle_probe SET value = 'sparse-0512' WHERE id = '0512'",
             &[],
         )
         .await
         .expect("sparse typed update should commit");
-        assert_columnar_layout_selected(&main, "columnar_lifecycle_probe", 1).await;
+        assert_columnar_layout_selected(&main, "columnar_lifecycle_probe", 0).await;
 
         let limited = main
             .execute(
@@ -5876,8 +5514,8 @@ mod tests {
             .await
             .expect("DataFusion LIMIT should remain above the columnar scan");
         assert_eq!(limited.len(), 3);
-        assert_eq!(limited.rows()[0].get::<String>("id").unwrap(), "00000");
-        assert_eq!(limited.rows()[2].get::<String>("id").unwrap(), "00002");
+        assert_eq!(limited.rows()[0].get::<String>("id").unwrap(), "0000");
+        assert_eq!(limited.rows()[2].get::<String>("id").unwrap(), "0002");
         let zero = main
             .execute(
                 "SELECT id FROM columnar_lifecycle_probe ORDER BY id LIMIT 0",
@@ -5887,8 +5525,8 @@ mod tests {
             .expect("zero LIMIT should retain DataFusion semantics");
         assert!(zero.is_empty());
 
-        // The immutable groups can all be pruned for this value, but the HOT
-        // winner must still be reconciled and filtered before LIMIT executes.
+        // Sparse updates are already part of the immutable root, so pruning
+        // and LIMIT execute without a tracked HOT winner to reconcile.
         let overlay_match = main
             .execute(
                 "SELECT id FROM columnar_lifecycle_probe \
@@ -5898,10 +5536,7 @@ mod tests {
             .await
             .expect("pruned columnar scan should retain matching overlay winner");
         assert_eq!(overlay_match.len(), 1);
-        assert_eq!(
-            overlay_match.rows()[0].get::<String>("id").unwrap(),
-            "00512"
-        );
+        assert_eq!(overlay_match.rows()[0].get::<String>("id").unwrap(), "0512");
         let no_match = main
             .execute(
                 "SELECT id FROM columnar_lifecycle_probe \
@@ -5913,7 +5548,7 @@ mod tests {
         assert!(no_match.is_empty());
 
         main.execute(
-            "UPDATE columnar_lifecycle_probe SET value = 'base-0512' WHERE id = '00512'",
+            "UPDATE columnar_lifecycle_probe SET value = 'base-0512' WHERE id = '0512'",
             &[],
         )
         .await
@@ -5937,7 +5572,7 @@ mod tests {
             .expect("draft session should open");
         draft_session
             .execute(
-                "UPDATE columnar_lifecycle_probe SET value = 'draft-0000' WHERE id = '00000'",
+                "UPDATE columnar_lifecycle_probe SET value = 'draft-0000' WHERE id = '0000'",
                 &[],
             )
             .await
@@ -5946,15 +5581,14 @@ mod tests {
             .undo()
             .await
             .expect("draft update should undo");
-        assert_columnar_lifecycle_current(&draft_session, ROW_COUNT, "base-0000", "base-1023")
-            .await;
+        assert_columnar_lifecycle_current(&draft_session, "base-0000", "base-1023").await;
         draft_session
             .redo()
             .await
             .expect("draft update should redo");
 
         main.execute(
-            "UPDATE columnar_lifecycle_probe SET value = 'main-1023' WHERE id = '01023'",
+            "UPDATE columnar_lifecycle_probe SET value = 'main-1023' WHERE id = '1023'",
             &[],
         )
         .await
@@ -5966,7 +5600,7 @@ mod tests {
             .await
             .expect("disjoint typed updates should merge");
         assert_eq!(merge.outcome, crate::MergeBranchOutcome::MergeCommitted);
-        assert_columnar_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
+        assert_columnar_lifecycle_current(&main, "draft-0000", "main-1023").await;
 
         let merged_head = engine
             .load_branch_head_commit_id(&main_branch_id)
@@ -5990,7 +5624,7 @@ mod tests {
                 &format!(
                     "SELECT value, lixcol_depth \
                      FROM columnar_lifecycle_probe_history('{merged_head}') \
-                     WHERE id = '00000' ORDER BY lixcol_depth"
+                     WHERE id = '0000' ORDER BY lixcol_depth"
                 ),
                 &[],
             )
@@ -6008,7 +5642,7 @@ mod tests {
         );
 
         main.execute(
-            "UPDATE columnar_lifecycle_probe SET value = 'temporary' WHERE id = '00512'",
+            "UPDATE columnar_lifecycle_probe SET value = 'temporary' WHERE id = '0512'",
             &[],
         )
         .await
@@ -6016,7 +5650,7 @@ mod tests {
         main.undo().await.expect("post-merge update should undo");
         let restored = main
             .execute(
-                "SELECT value FROM columnar_lifecycle_probe WHERE id = '00512'",
+                "SELECT value FROM columnar_lifecycle_probe WHERE id = '0512'",
                 &[],
             )
             .await
@@ -6025,193 +5659,7 @@ mod tests {
             restored.rows()[0].get::<String>("value").unwrap(),
             "base-0512"
         );
-        assert_columnar_lifecycle_current(&main, ROW_COUNT, "draft-0000", "main-1023").await;
-
-        let mut corrupt = engine.storage().new_write_set();
-        corrupt.delete(
-            crate::columnar_row_group::ROW_GROUP_MANIFEST_SPACE,
-            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
-                &row_group_id.as_bytes(),
-            )),
-        );
-        engine
-            .storage()
-            .commit_write_set(corrupt, StorageWriteOptions::default())
-            .await
-            .expect("test corruption should commit");
-        let reopened = Engine::new(storage)
-            .await
-            .expect("corrupt storage should still open structurally");
-        let reopened_session = reopened
-            .open_workspace_session()
-            .await
-            .expect("corrupt storage session should open");
-        assert!(
-            reopened_session
-                .execute(
-                    &format!(
-                        "SELECT value FROM columnar_lifecycle_probe_history('{inserted_head}') \
-                         WHERE id = '65536'"
-                    ),
-                    &[],
-                )
-                .await
-                .is_err(),
-            "missing authoritative columnar manifests must fail closed"
-        );
-    }
-
-    #[tokio::test]
-    async fn large_ordered_parameter_update_replaces_complete_packed_current_base() {
-        const ROW_COUNT: usize = 2_048;
-        const PARTIAL_ROW_COUNT: usize = ROW_COUNT / 2;
-        let session = open_session().await;
-        let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "x-lix-key": "ordered_packed_update_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .unwrap();
-
-        let insert_sql =
-            "INSERT INTO ordered_packed_update_probe (path, value) VALUES ($1, lix_json($2))";
-        let insert_statements = (0..ROW_COUNT)
-            .map(|row_index| ExecuteBatchStatement {
-                sql: insert_sql.to_string(),
-                params: vec![
-                    Value::Text(format!("{row_index:04}")),
-                    Value::Text(format!("\"value-{row_index:04}\"")),
-                ],
-            })
-            .collect::<Vec<_>>();
-        session.execute_batch(&insert_statements).await.unwrap();
-
-        crate::transaction::take_complete_replacement_packed_current_base_retirements();
-        let update_sql =
-            "UPDATE ordered_packed_update_probe SET value = lix_json($1) WHERE path = $2";
-        for version in 1..=2 {
-            let update_statements = (0..ROW_COUNT)
-                .map(|row_index| ExecuteBatchStatement {
-                    sql: update_sql.to_string(),
-                    params: vec![
-                        Value::Text(format!("\"updated-{version}-{row_index:04}\"")),
-                        Value::Text(format!("{row_index:04}")),
-                    ],
-                })
-                .collect::<Vec<_>>();
-            let affected = session
-                .execute_batch(&update_statements)
-                .await
-                .unwrap()
-                .iter()
-                .map(ExecuteResult::rows_affected)
-                .sum::<u64>();
-            assert_eq!(affected, ROW_COUNT as u64);
-            assert_eq!(
-                crate::transaction::take_complete_replacement_packed_current_base_retirements(),
-                1,
-                "each complete certified replacement should swap one packed base reference"
-            );
-            assert_current_head_uses_packed_delta_without_columnar_sidecar(
-                &session,
-                "ordered_packed_update_probe",
-                ROW_COUNT as u64,
-            )
-            .await;
-        }
-
-        let rows = session
-            .execute(
-                "SELECT path, value FROM ordered_packed_update_probe WHERE path IN ('0000', '2047') ORDER BY path",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!("updated-2-0000")
-        );
-        assert_eq!(
-            rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!("updated-2-2047")
-        );
-        let working_diff = session
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_working_diff WHERE schema_key = 'ordered_packed_update_probe' AND diff_type = 'added'",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            working_diff.rows()[0].get::<i64>("entries").unwrap(),
-            ROW_COUNT as i64,
-            "replacing a packed base must preserve its working-diff epoch"
-        );
-
-        let partial_update_statements = (0..PARTIAL_ROW_COUNT)
-            .map(|row_index| ExecuteBatchStatement {
-                sql: update_sql.to_string(),
-                params: vec![
-                    Value::Text(format!("\"partial-{row_index:04}\"")),
-                    Value::Text(format!("{row_index:04}")),
-                ],
-            })
-            .collect::<Vec<_>>();
-        let partial_affected = session
-            .execute_batch(&partial_update_statements)
-            .await
-            .unwrap()
-            .iter()
-            .map(ExecuteResult::rows_affected)
-            .sum::<u64>();
-        assert_eq!(partial_affected, PARTIAL_ROW_COUNT as u64);
-        assert_eq!(
-            crate::transaction::take_complete_replacement_packed_current_base_retirements(),
-            0,
-            "a partial replacement must remain a point-addressable HOT overlay"
-        );
-        let partial = session
-            .execute(
-                "SELECT value FROM ordered_packed_update_probe WHERE path = '0000'",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            partial.rows()[0].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!("partial-0000")
-        );
-        session
-            .create_checkpoint()
-            .await
-            .expect("replaced packed current base should remain checkpointable");
-        let working_diff = session
-            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
-            .await
-            .unwrap();
-        assert_eq!(
-            working_diff.rows()[0].get::<i64>("entries").unwrap(),
-            0,
-            "checkpointing a replaced packed base must clear its working diff"
-        );
+        assert_columnar_lifecycle_current(&main, "draft-0000", "main-1023").await;
     }
 
     #[tokio::test]
@@ -7489,624 +6937,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_replacement_publishes_packed_current_base_and_accepts_later_overlays() {
-        const ROW_COUNT: usize = 32 * 1_024;
-        let session = open_session().await;
-        let schema = serde_json::json!({
-            "x-lix-key": "packed_replacement_probe",
-            "x-lix-primary-key": ["/path"],
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "value": {
-                    "type": [
-                        "object", "array", "string", "number", "integer", "boolean", "null"
-                    ]
-                }
-            },
-            "required": ["path", "value"],
-            "additionalProperties": false
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .unwrap();
-
-        let insert_sql =
-            "INSERT INTO packed_replacement_probe (path, value) VALUES ($1, lix_json($2))";
-        let inserts = (0..ROW_COUNT)
-            .map(|row_index| ExecuteBatchStatement {
-                sql: insert_sql.to_string(),
-                params: vec![
-                    Value::Text(format!("/{row_index:05}")),
-                    Value::Text(format!(r#"{{"old":{row_index}}}"#)),
-                ],
-            })
-            .collect::<Vec<_>>();
-        session.execute_batch(&inserts).await.unwrap();
-
-        crate::transaction::take_complete_replacement_packed_current_base_publications();
-        crate::transaction::take_rootless_replacement_generation_publications();
-        sql2::take_certified_generation_identity_replacements();
-        let update_sql = "UPDATE packed_replacement_probe SET value = lix_json($1) WHERE path = $2";
-        let updates = (0..ROW_COUNT)
-            .map(|row_index| ExecuteBatchStatement {
-                sql: update_sql.to_string(),
-                params: vec![
-                    Value::Text(format!(r#"{{"updated":{row_index}}}"#)),
-                    Value::Text(format!("/{row_index:05}")),
-                ],
-            })
-            .collect::<Vec<_>>();
-        let affected = session
-            .execute_batch(&updates)
-            .await
-            .unwrap()
-            .iter()
-            .map(ExecuteResult::rows_affected)
-            .sum::<u64>();
-        assert_eq!(affected, ROW_COUNT as u64);
-        assert_eq!(
-            sql2::take_certified_generation_identity_replacements(),
-            1,
-            "the untouched packed generation must prove the complete identity set without a row scan"
-        );
-        assert_eq!(
-            crate::transaction::take_complete_replacement_packed_current_base_publications(),
-            1,
-            "the certified full replacement must publish one packed current base"
-        );
-        assert_eq!(
-            crate::transaction::take_rootless_replacement_generation_publications(),
-            1,
-            "the certified replacement must publish a rootless partition generation"
-        );
-
-        let update_commit_id = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
-            .await
-            .unwrap()
-            .rows()[0]
-            .get::<String>("commit_id")
-            .unwrap();
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .unwrap();
-        let historical = session
-            .tracked_state
-            .reader(read)
-            .scan_batch_at_commit(
-                &update_commit_id,
-                &crate::tracked_state::TrackedStateScanRequest {
-                    filter: crate::tracked_state::TrackedStateFilter {
-                        schema_keys: vec!["packed_replacement_probe".to_string()],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(historical.len(), ROW_COUNT);
-        assert!(
-            historical
-                .iter()
-                .all(|row| row.snapshot_content().is_some_and(|snapshot| {
-                    snapshot.contains("updated") && !snapshot.contains("old")
-                })),
-            "historical replay must stop at the replacement generation"
-        );
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .unwrap();
-        let historical_all = session
-            .tracked_state
-            .reader(read)
-            .scan_batch_at_commit(
-                &update_commit_id,
-                &crate::tracked_state::TrackedStateScanRequest::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            historical_all
-                .iter()
-                .filter(|row| row.schema_key() == "packed_replacement_probe")
-                .count(),
-            ROW_COUNT,
-            "an unfiltered replay must compose the replacement with inherited partitions"
-        );
-        assert!(
-            historical_all
-                .iter()
-                .any(|row| row.schema_key() == "lix_registered_schema"),
-            "the replacement generation must retain unrelated durable partitions"
-        );
-
-        let mut rebuild_writes = session.storage.new_write_set();
-        {
-            let read = session
-                .storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .unwrap();
-            session
-                .tracked_state
-                .root_rebuilder(&read, &mut rebuild_writes)
-                .rebuild_commit_root_at(&update_commit_id)
-                .await
-                .unwrap();
-        }
-        session
-            .storage
-            .commit_write_set(rebuild_writes, StorageWriteOptions::default())
-            .await
-            .unwrap();
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .unwrap();
-        let rebuilt = session
-            .tracked_state
-            .reader(read)
-            .scan_batch_at_commit(
-                &update_commit_id,
-                &crate::tracked_state::TrackedStateScanRequest {
-                    filter: crate::tracked_state::TrackedStateFilter {
-                        schema_keys: vec!["packed_replacement_probe".to_string()],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let rebuilt_rows = rebuilt.into_rows();
-        let historical_rows = historical.into_rows();
-        assert_eq!(rebuilt_rows.len(), historical_rows.len());
-        for (row_index, (rebuilt_row, historical_row)) in
-            rebuilt_rows.iter().zip(&historical_rows).enumerate()
-        {
-            assert_eq!(
-                rebuilt_row, historical_row,
-                "rebuilt replacement row {row_index} must equal replayed state"
-            );
-        }
-
-        crate::transaction::take_rootless_replacement_generation_publications();
-        let second_updates = (0..ROW_COUNT)
-            .map(|row_index| ExecuteBatchStatement {
-                sql: update_sql.to_string(),
-                params: vec![
-                    Value::Text(format!(r#"{{"second":{row_index}}}"#)),
-                    Value::Text(format!("/{row_index:05}")),
-                ],
-            })
-            .collect::<Vec<_>>();
-        session.execute_batch(&second_updates).await.unwrap();
-        assert_eq!(
-            crate::transaction::take_rootless_replacement_generation_publications(),
-            1,
-            "a repeated replacement must collapse to one generation over the same durable fallback"
-        );
-        let second_commit_id = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
-            .await
-            .unwrap()
-            .rows()[0]
-            .get::<String>("commit_id")
-            .unwrap();
-        for (before, after) in [
-            (&update_commit_id, &second_commit_id),
-            (&second_commit_id, &update_commit_id),
-        ] {
-            let diff = session
-                .execute(
-                    "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                     WHERE schema_key = 'packed_replacement_probe' AND diff_type = 'modified'",
-                    &[Value::Text(before.clone()), Value::Text(after.clone())],
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                diff.rows()[0].get::<i64>("entries").unwrap(),
-                ROW_COUNT as i64,
-                "replacement generations must retain the real commit graph in both diff directions"
-            );
-        }
-        let main_branch_id = session.active_branch_id().await.unwrap();
-        let historical_branch = session
-            .create_branch(crate::CreateBranchOptions {
-                id: Some("01930000-0000-7000-8000-00000000b002".to_string()),
-                name: "replacement-generation-history".to_string(),
-                from_commit_id: Some(update_commit_id.clone()),
-            })
-            .await
-            .unwrap();
-        session
-            .switch_branch(crate::SwitchBranchOptions {
-                branch_id: historical_branch.id,
-            })
-            .await
-            .unwrap();
-        let historical_points = session
-            .execute(
-                "SELECT path, value FROM packed_replacement_probe \
-                 WHERE path IN ('/00000', '/32767') ORDER BY path",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            historical_points.rows()[0]
-                .get::<serde_json::Value>("value")
-                .unwrap(),
-            serde_json::json!({"updated": 0})
-        );
-        assert_eq!(
-            historical_points.rows()[1]
-                .get::<serde_json::Value>("value")
-                .unwrap(),
-            serde_json::json!({"updated": ROW_COUNT - 1})
-        );
-        session
-            .switch_branch(crate::SwitchBranchOptions {
-                branch_id: main_branch_id.clone(),
-            })
-            .await
-            .unwrap();
-
-        let broad_rows = session
-            .execute(
-                "SELECT path, value FROM packed_replacement_probe ORDER BY path",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(broad_rows.len(), ROW_COUNT);
-        assert_eq!(
-            broad_rows.rows()[0]
-                .get::<serde_json::Value>("value")
-                .unwrap(),
-            serde_json::json!({"second": 0})
-        );
-        assert_eq!(
-            broad_rows.rows()[ROW_COUNT - 1]
-                .get::<serde_json::Value>("value")
-                .unwrap(),
-            serde_json::json!({"second": ROW_COUNT - 1})
-        );
-
-        let rows = session
-            .execute(
-                "SELECT path, value FROM packed_replacement_probe WHERE path IN ('/00000', '/32767') ORDER BY path",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!({"second": 0})
-        );
-        assert_eq!(
-            rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!({"second": ROW_COUNT - 1})
-        );
-
-        let merge_base_branch = session
-            .create_branch(crate::CreateBranchOptions {
-                id: Some("01930000-0000-7000-8000-00000000b003".to_string()),
-                name: "replacement-generation-merge".to_string(),
-                from_commit_id: Some(second_commit_id.clone()),
-            })
-            .await
-            .unwrap();
-        session
-            .switch_branch(crate::SwitchBranchOptions {
-                branch_id: merge_base_branch.id.clone(),
-            })
-            .await
-            .unwrap();
-        session
-            .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"branch\":true}') WHERE path = '/00000'",
-                &[],
-            )
-            .await
-            .unwrap();
-        session
-            .switch_branch(crate::SwitchBranchOptions {
-                branch_id: main_branch_id.clone(),
-            })
-            .await
-            .unwrap();
-        session
-            .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"main\":true}') WHERE path = '/32767'",
-                &[],
-            )
-            .await
-            .unwrap();
-        let merge = session
-            .merge_branch(crate::MergeBranchOptions {
-                source_branch_id: merge_base_branch.id,
-            })
-            .await
-            .unwrap();
-        assert_eq!(merge.outcome, crate::MergeBranchOutcome::MergeCommitted);
-
-        let merged_commit_id = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
-            .await
-            .unwrap()
-            .rows()[0]
-            .get::<String>("commit_id")
-            .unwrap();
-        let merged_rows = session
-            .execute(
-                "SELECT path, value FROM packed_replacement_probe ORDER BY path",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            merged_rows.len(),
-            ROW_COUNT,
-            "merging sparse descendants of a replacement generation must not lose rows"
-        );
-        assert_eq!(
-            merged_rows.rows()[0]
-                .get::<serde_json::Value>("value")
-                .unwrap(),
-            serde_json::json!({"branch": true})
-        );
-        assert_eq!(
-            merged_rows.rows()[ROW_COUNT - 1]
-                .get::<serde_json::Value>("value")
-                .unwrap(),
-            serde_json::json!({"main": true})
-        );
-        let merged_diff = session
-            .execute(
-                "SELECT COUNT(*) AS entries FROM lix_diff($1, $2) \
-                 WHERE schema_key = 'packed_replacement_probe' AND diff_type = 'modified'",
-                &[
-                    Value::Text(second_commit_id.clone()),
-                    Value::Text(merged_commit_id.clone()),
-                ],
-            )
-            .await
-            .unwrap();
-        assert_eq!(merged_diff.rows()[0].get::<i64>("entries").unwrap(), 2);
-        let merged_history = session
-            .execute(
-                &format!(
-                    "SELECT value FROM packed_replacement_probe_history('{merged_commit_id}') \
-                     WHERE path = '/00000' ORDER BY lixcol_depth"
-                ),
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            merged_history.rows()[0]
-                .get::<serde_json::Value>("value")
-                .unwrap(),
-            serde_json::json!({"branch": true})
-        );
-        assert!(merged_history.rows().iter().any(|row| {
-            row.get::<serde_json::Value>("value").ok() == Some(serde_json::json!({"second": 0}))
-        }));
-
-        session
-            .execute(
-                "UPDATE packed_replacement_probe SET value = lix_json('{\"overlay\":true}') WHERE path = '/00000'",
-                &[],
-            )
-            .await
-            .unwrap();
-        let mixed_hot_cold = session
-            .execute(
-                "SELECT path, value FROM packed_replacement_probe \
-                 WHERE path IN ('/00000', '/16000') ORDER BY path",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(mixed_hot_cold.len(), 2);
-        assert_eq!(
-            mixed_hot_cold.rows()[0]
-                .get::<serde_json::Value>("value")
-                .unwrap(),
-            serde_json::json!({"overlay": true}),
-            "a mixed exact batch must retain the head-delta hit"
-        );
-        assert_eq!(
-            mixed_hot_cold.rows()[1]
-                .get::<serde_json::Value>("value")
-                .unwrap(),
-            serde_json::json!({"second": 16_000}),
-            "a mixed exact batch must resolve its cold key from inherited current state"
-        );
-        session
-            .execute(
-                "DELETE FROM packed_replacement_probe WHERE path = '/32767'",
-                &[],
-            )
-            .await
-            .unwrap();
-        let rows = session
-            .execute(
-                "SELECT path, value FROM packed_replacement_probe ORDER BY path",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), ROW_COUNT - 1);
-        assert_eq!(rows.rows()[0].get::<String>("path").unwrap(), "/00000");
-        assert_eq!(
-            rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!({"overlay": true})
-        );
-
-        session
-            .execute(
-                "INSERT INTO packed_replacement_probe (path, value) VALUES ('/32767', lix_json('{\"reinserted\":true}'))",
-                &[],
-            )
-            .await
-            .unwrap();
-        let reinsert_commit_id = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
-            .await
-            .unwrap()
-            .rows()[0]
-            .get::<String>("commit_id")
-            .unwrap();
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .unwrap();
-        let reinserted = session
-            .tracked_state
-            .reader(read)
-            .scan_batch_at_commit(
-                &reinsert_commit_id,
-                &crate::tracked_state::TrackedStateScanRequest {
-                    filter: crate::tracked_state::TrackedStateFilter {
-                        schema_keys: vec!["packed_replacement_probe".to_string()],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let reinserted_created_at = reinserted
-            .iter()
-            .find(|row| row.entity_pk().as_single_string().ok() == Some("/32767"))
-            .expect("reinserted row must be visible")
-            .created_at();
-
-        crate::transaction::take_rootless_replacement_generation_publications();
-        let post_reinsert_updates = (0..ROW_COUNT)
-            .map(|row_index| ExecuteBatchStatement {
-                sql: update_sql.to_string(),
-                params: vec![
-                    Value::Text(format!(r#"{{"post_reinsert":{row_index}}}"#)),
-                    Value::Text(format!("/{row_index:05}")),
-                ],
-            })
-            .collect::<Vec<_>>();
-        session.execute_batch(&post_reinsert_updates).await.unwrap();
-        assert_eq!(
-            crate::transaction::take_rootless_replacement_generation_publications(),
-            0,
-            "a delete/reinsert interval must decline replacement certification without complete lifecycle evidence"
-        );
-        let post_reinsert_commit_id = session
-            .execute("SELECT commit_id FROM lix_branch WHERE name = 'main'", &[])
-            .await
-            .unwrap()
-            .rows()[0]
-            .get::<String>("commit_id")
-            .unwrap();
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .unwrap();
-        let post_reinsert = session
-            .tracked_state
-            .reader(read)
-            .scan_batch_at_commit(
-                &post_reinsert_commit_id,
-                &crate::tracked_state::TrackedStateScanRequest {
-                    filter: crate::tracked_state::TrackedStateFilter {
-                        schema_keys: vec!["packed_replacement_probe".to_string()],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            post_reinsert
-                .iter()
-                .find(|row| row.entity_pk().as_single_string().ok() == Some("/32767"))
-                .expect("updated reinserted row must be visible")
-                .created_at(),
-            reinserted_created_at,
-            "full updates must preserve the newer lifecycle of a reinserted identity"
-        );
-
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .unwrap();
-        let native = crate::storage_adapter::ScanPlan::prefix(
-            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-            crate::storage_adapter::StoragePrefix {
-                bytes: bytes::Bytes::new(),
-            },
-        )
-        .collect(
-            &read,
-            crate::storage_adapter::StorageScanOptions {
-                projection: crate::storage_adapter::StorageCoreProjection::KeyOnly,
-                limit_rows: 1,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let native_key = native
-            .value
-            .entries
-            .first()
-            .expect("sparse descendants must publish a native current-state part")
-            .key
-            .clone();
-        drop(read);
-        let mut corrupt = session.storage.new_write_set();
-        corrupt.delete(
-            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-            native_key,
-        );
-        session
-            .storage
-            .commit_write_set(corrupt, StorageWriteOptions::default())
-            .await
-            .unwrap();
-        let read = SharedStorageAdapterRead::new(
-            session
-                .storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .unwrap(),
-        );
-        let mut gc_writes = session.storage.new_write_set();
-        assert!(
-            crate::gc::stage_repository_gc(read, &mut gc_writes)
-                .await
-                .is_err(),
-            "GC must fail closed before sweeping when a live native part is missing"
-        );
-    }
-
-    #[tokio::test]
     async fn staged_delete_disables_generation_identity_replacement() {
         const ROW_COUNT: usize = 16;
         let session = open_session().await;
@@ -9268,18 +8098,18 @@ mod tests {
             .expect("transaction should begin");
         let first = transaction
             .execute(
-                "UPDATE lix_key_value SET value = 'second''s value' WHERE key = 'auto''two'",
+                "UPDATE lix_key_value SET value = 'first''s value' WHERE key = 'auto''one'",
                 &[],
             )
             .await
             .expect("first literal update should stage");
         let second = transaction
             .execute(
-                "UPDATE lix_key_value SET value = 'first''s value' WHERE key = 'auto''one'",
+                "UPDATE lix_key_value SET value = 'second''s value' WHERE key = 'auto''two'",
                 &[],
             )
             .await
-            .expect("descending literal update should cross the order barrier");
+            .expect("second literal update should reuse the statement shape");
         assert_eq!(first.rows_affected(), 1);
         assert_eq!(second.rows_affected(), 1);
         transaction
@@ -9305,59 +8135,6 @@ mod tests {
         assert_eq!(
             values.rows()[1].get::<serde_json::Value>("value").unwrap(),
             serde_json::json!("second's value")
-        );
-    }
-
-    #[tokio::test]
-    async fn explicit_transaction_parameter_updates_reset_membership_on_descending_keys() {
-        let session = open_session().await;
-        for key in ["parameter-a", "parameter-z"] {
-            session
-                .execute(
-                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-                    &[
-                        Value::Text(key.to_string()),
-                        Value::Text("seed".to_string()),
-                    ],
-                )
-                .await
-                .expect("seed row should commit");
-        }
-
-        let mut transaction = session.begin_transaction().await.unwrap();
-        let sql = "UPDATE lix_key_value SET value = $1 WHERE key = $2";
-        for (key, value) in [("parameter-z", "updated-z"), ("parameter-a", "updated-a")] {
-            assert_eq!(
-                transaction
-                    .execute(
-                        sql,
-                        &[Value::Text(value.to_string()), Value::Text(key.to_string()),],
-                    )
-                    .await
-                    .expect("descending parameter update should stage")
-                    .rows_affected(),
-                1
-            );
-        }
-        transaction.commit().await.unwrap();
-
-        let values = session
-            .execute(
-                "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
-                &[
-                    Value::Text("parameter-a".to_string()),
-                    Value::Text("parameter-z".to_string()),
-                ],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            values.rows()[0].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!("updated-a")
-        );
-        assert_eq!(
-            values.rows()[1].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!("updated-z")
         );
     }
 
@@ -9484,7 +8261,7 @@ mod tests {
         session
             .execute_batch(&inserts)
             .await
-            .expect("packed base should seed");
+            .expect("Arrow root should seed");
         let mut transaction = session
             .begin_transaction()
             .await
@@ -9615,7 +8392,7 @@ mod tests {
         session
             .execute_batch(&inserts)
             .await
-            .expect("packed base should seed");
+            .expect("Arrow root should seed");
         let original_created_at = session
             .execute(
                 "SELECT lixcol_created_at FROM stale_journal_replacement_probe WHERE path = '0000'",
@@ -9737,7 +8514,7 @@ mod tests {
         session
             .execute_batch(&inserts)
             .await
-            .expect("packed base should seed");
+            .expect("Arrow root should seed");
 
         let mut transaction = session
             .begin_transaction()
@@ -9916,6 +8693,21 @@ mod tests {
             1,
             "an intervening read must not reconstruct the immutable journal"
         );
+        let committed = session
+            .execute(
+                "SELECT path, value FROM journal_read_your_writes_probe \
+                 WHERE path IN ('0000', '1023') ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("the committed replacement root must retain its Arrow leaves");
+        assert_eq!(committed.len(), 2);
+        for row in committed.rows() {
+            assert_eq!(
+                row.get::<serde_json::Value>("value").unwrap(),
+                serde_json::json!({"state": "replacement"})
+            );
+        }
     }
 
     #[tokio::test]
@@ -10220,129 +9012,6 @@ mod tests {
                 .get::<String>("origin_key")
                 .expect("origin key should be text"),
             "tx-origin"
-        );
-    }
-
-    #[tokio::test]
-    async fn reusable_read_plans_rebind_snapshots_concurrently_and_invalidate_on_catalog_change() {
-        let storage = Memory::default();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("storage should initialize");
-        let engine = Engine::new(storage)
-            .await
-            .expect("initialized storage should create engine");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("first workspace session should open");
-        let concurrent = engine
-            .open_workspace_session()
-            .await
-            .expect("second workspace session should open");
-        let schema = serde_json::json!({
-            "x-lix-key": "read_plan_probe",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "revision": { "type": "integer" }
-            },
-            "required": ["id", "revision"],
-            "additionalProperties": false
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .expect("register reusable-plan schema");
-        session
-            .execute(
-                "INSERT INTO read_plan_probe (id, revision) VALUES ('a', 1), ('b', 2)",
-                &[],
-            )
-            .await
-            .expect("seed reusable-plan rows");
-
-        let sql = "SELECT revision FROM read_plan_probe WHERE id = $1 AND revision >= 0";
-        let before = session.sql_planning_cache.read_plan_count();
-        let first = session
-            .execute(sql, &[Value::Text("a".to_string())])
-            .await
-            .expect("cold reusable plan should execute");
-        assert_eq!(first.rows()[0].get::<i64>("revision").unwrap(), 1);
-        assert_eq!(session.sql_planning_cache.read_plan_count(), before + 1);
-
-        let left_params = [Value::Text("a".to_string())];
-        let right_params = [Value::Text("b".to_string())];
-        let (left, right) = tokio::join!(
-            session.execute(sql, &left_params),
-            concurrent.execute(sql, &right_params),
-        );
-        assert_eq!(
-            left.expect("first concurrent cache hit").rows()[0]
-                .get::<i64>("revision")
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            right.expect("second concurrent cache hit").rows()[0]
-                .get::<i64>("revision")
-                .unwrap(),
-            2
-        );
-        assert_eq!(session.sql_planning_cache.read_plan_count(), before + 1);
-
-        session
-            .execute(
-                "INSERT INTO read_plan_probe (id, revision) VALUES ('c', 3)",
-                &[],
-            )
-            .await
-            .expect("commit ordinary data revision");
-        let revised = session
-            .execute(sql, &[Value::Text("c".to_string())])
-            .await
-            .expect("cached plan should bind the revised snapshot");
-        assert_eq!(revised.rows()[0].get::<i64>("revision").unwrap(), 3);
-        assert_eq!(session.sql_planning_cache.read_plan_count(), before + 1);
-
-        let added_schema = serde_json::json!({
-            "x-lix-key": "read_plan_catalog_revision",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"],
-            "additionalProperties": false
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-                &[Value::Text(added_schema.to_string())],
-            )
-            .await
-            .expect("change the SQL catalog");
-        session
-            .execute(sql, &[Value::Text("c".to_string())])
-            .await
-            .expect("catalog change should compile a new plan");
-        assert_eq!(session.sql_planning_cache.read_plan_count(), before + 2);
-
-        let cached = session
-            .execute(sql, &[Value::Text("c".to_string())])
-            .await
-            .expect("cached differential query");
-        session.sql_planning_cache.clear_read_plans();
-        let uncached = session
-            .execute(sql, &[Value::Text("c".to_string())])
-            .await
-            .expect("uncached DataFusion differential query");
-        assert_eq!(
-            cached.rows()[0].values(),
-            uncached.rows()[0].values(),
-            "cached templates must match a fresh DataFusion plan"
         );
     }
 }

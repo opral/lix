@@ -2,12 +2,8 @@
 //!
 //! This module owns a generic physical format. It deliberately knows nothing
 //! about SQL plans, current-state visibility, or commit publication. Callers
-//! provide a stable 16-byte owner and publish the returned immutable writes
-//! inside their own atomic visibility transaction.
-
-// This intentionally lands before its publication/read-path integration. Its
-// crate-private API is exercised by the codec and storage tests below.
-#![allow(dead_code)]
+//! seal deterministic content-addressed sets and publish the returned
+//! immutable writes inside their own atomic visibility transaction.
 
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -15,26 +11,20 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array,
 };
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
-use datafusion::arrow::compute::{concat, concat_batches};
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::LixError;
 use crate::storage_adapter::{
-    BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, StorageAdapterRead,
-    StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace, StorageSpaceId,
-    StorageValue, StorageWriteSet,
+    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
+    StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
 };
 
 pub(crate) const ROW_GROUP_MAX_ROWS: usize = 64 * 1024;
-/// Independently compressed point-read unit inside a scan-oriented row group.
-pub(crate) const ROW_GROUP_PAGE_ROWS: usize = 2 * 1024;
-/// Backpressure budget expressed in projected physical column pages. Wider
-/// projections therefore use smaller coordinate batches automatically.
-const ROW_GROUP_POINT_READ_MAX_COLUMN_PAGES: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RowGroupRowLocation {
@@ -50,44 +40,53 @@ pub(crate) const ROW_GROUP_COLUMN_SPACE: StorageSpace = StorageSpace::immutable(
     "entity.columnar_row_group_column.v1",
 );
 
-const MANIFEST_MAGIC: &[u8; 8] = b"LXRGM004";
+const MANIFEST_MAGIC: &[u8; 8] = b"LXRGM003";
 const COLUMN_MAGIC: &[u8; 8] = b"LXRGC001";
 const COMPRESSED_MAGIC: &[u8; 8] = b"LXRGZ001";
 const BLAKE3_DIGEST_LEN: usize = 32;
 const MAX_DECODED_COLUMN_BYTES: usize = 256 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct RowGroupSetId([u8; 16]);
+/// Content identity of one immutable Arrow state set.
+///
+/// The old sidecar layout derived this address from `(commit, schema)`. That
+/// made the Arrow bytes disposable and forced readers to rediscover them
+/// through commit metadata. Native state carries this digest explicitly.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, musli::Encode, musli::Decode,
+)]
+#[musli(transparent)]
+pub(crate) struct ArrowStateSetId(#[musli(bytes)] [u8; BLAKE3_DIGEST_LEN]);
 
-impl RowGroupSetId {
-    pub(crate) const fn new(bytes: [u8; 16]) -> Self {
+impl ArrowStateSetId {
+    pub(crate) const fn from_digest(bytes: [u8; BLAKE3_DIGEST_LEN]) -> Self {
         Self(bytes)
     }
 
-    pub(crate) const fn as_bytes(self) -> [u8; 16] {
+    pub(crate) const fn as_bytes(self) -> [u8; BLAKE3_DIGEST_LEN] {
         self.0
+    }
+
+    fn from_manifest_bytes(manifest: &[u8]) -> Self {
+        Self(
+            *blake3::Hasher::new_derive_key("lix arrow state set v1")
+                .update(manifest)
+                .finalize()
+                .as_bytes(),
+        )
     }
 
     fn manifest_key(self) -> StorageKey {
         StorageKey(Bytes::copy_from_slice(&self.0))
     }
 
-    fn column_key(
-        self,
-        group_index: usize,
-        page_index: usize,
-        column_index: usize,
-    ) -> Result<StorageKey, LixError> {
+    fn column_key(self, group_index: usize, column_index: usize) -> Result<StorageKey, LixError> {
         let group_index = u32::try_from(group_index)
             .map_err(|_| row_group_error("row-group index exceeds u32"))?;
         let column_index = u16::try_from(column_index)
             .map_err(|_| row_group_error("row-group column index exceeds u16"))?;
-        let page_index = u16::try_from(page_index)
-            .map_err(|_| row_group_error("row-group page index exceeds u16"))?;
-        let mut key = Vec::with_capacity(24);
+        let mut key = Vec::with_capacity(BLAKE3_DIGEST_LEN + 6);
         key.extend_from_slice(&self.0);
         key.extend_from_slice(&group_index.to_be_bytes());
-        key.extend_from_slice(&page_index.to_be_bytes());
         key.extend_from_slice(&column_index.to_be_bytes());
         Ok(StorageKey(Bytes::from(key)))
     }
@@ -100,6 +99,8 @@ pub(crate) enum RowGroupDataType {
     Int64 = 2,
     Float64 = 3,
     Boolean = 4,
+    Binary = 5,
+    UInt64 = 6,
 }
 
 impl RowGroupDataType {
@@ -109,6 +110,8 @@ impl RowGroupDataType {
             DataType::Int64 => Ok(Self::Int64),
             DataType::Float64 => Ok(Self::Float64),
             DataType::Boolean => Ok(Self::Boolean),
+            DataType::Binary => Ok(Self::Binary),
+            DataType::UInt64 => Ok(Self::UInt64),
             other => Err(row_group_error(format!(
                 "unsupported row-group Arrow type {other}"
             ))),
@@ -121,6 +124,8 @@ impl RowGroupDataType {
             Self::Int64 => DataType::Int64,
             Self::Float64 => DataType::Float64,
             Self::Boolean => DataType::Boolean,
+            Self::Binary => DataType::Binary,
+            Self::UInt64 => DataType::UInt64,
         }
     }
 
@@ -130,6 +135,8 @@ impl RowGroupDataType {
             2 => Ok(Self::Int64),
             3 => Ok(Self::Float64),
             4 => Ok(Self::Boolean),
+            5 => Ok(Self::Binary),
+            6 => Ok(Self::UInt64),
             _ => Err(row_group_error(
                 "row-group manifest has an unknown column type",
             )),
@@ -140,6 +147,8 @@ impl RowGroupDataType {
 #[derive(Clone, Debug)]
 pub(crate) enum RowGroupScalar {
     String(String),
+    Binary(Vec<u8>),
+    UInt64(u64),
     Int64(i64),
     Float64(f64),
     Boolean(bool),
@@ -149,6 +158,8 @@ impl PartialEq for RowGroupScalar {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::String(left), Self::String(right)) => left == right,
+            (Self::Binary(left), Self::Binary(right)) => left == right,
+            (Self::UInt64(left), Self::UInt64(right)) => left == right,
             (Self::Int64(left), Self::Int64(right)) => left == right,
             // Statistics are physical metadata. Bit equality makes NaNs and
             // signed zero round-trip without weakening corruption checks.
@@ -171,7 +182,7 @@ pub(crate) struct RowGroupColumnStatistics {
 pub(crate) struct RowGroupStatistics {
     pub(crate) row_count: u32,
     pub(crate) columns: Vec<RowGroupColumnStatistics>,
-    column_page_digests: Vec<Vec<[u8; BLAKE3_DIGEST_LEN]>>,
+    column_digests: Vec<[u8; BLAKE3_DIGEST_LEN]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,7 +199,6 @@ pub(crate) struct RowGroupManifest {
     pub(crate) metadata: HashMap<String, String>,
     pub(crate) fields: Vec<RowGroupField>,
     pub(crate) groups: Vec<RowGroupStatistics>,
-    pub(crate) encoded_digest: [u8; BLAKE3_DIGEST_LEN],
 }
 
 impl RowGroupManifest {
@@ -196,12 +206,10 @@ impl RowGroupManifest {
     /// column digest. Decoded-column caches use this in addition to the set
     /// identifier so corrupted or replaced manifests can never alias.
     pub(crate) fn content_digest(&self) -> Result<[u8; BLAKE3_DIGEST_LEN], LixError> {
-        if self.encoded_digest != [0; BLAKE3_DIGEST_LEN] {
-            return Ok(self.encoded_digest);
-        }
         Ok(*blake3::hash(&encode_manifest(self)?).as_bytes())
     }
 
+    #[cfg(test)]
     pub(crate) fn row_count(&self) -> u64 {
         self.groups
             .iter()
@@ -236,10 +244,12 @@ impl RowGroupManifest {
         fn scalar_bytes(value: &Option<RowGroupScalar>) -> usize {
             match value {
                 Some(RowGroupScalar::String(value)) => value.capacity(),
+                Some(RowGroupScalar::Binary(value)) => value.capacity(),
                 Some(
                     RowGroupScalar::Int64(_)
                     | RowGroupScalar::Float64(_)
-                    | RowGroupScalar::Boolean(_),
+                    | RowGroupScalar::Boolean(_)
+                    | RowGroupScalar::UInt64(_),
                 )
                 | None => 0,
             }
@@ -279,21 +289,9 @@ impl RowGroupManifest {
                             .saturating_mul(size_of::<RowGroupColumnStatistics>())
                             .saturating_add(
                                 group
-                                    .column_page_digests
+                                    .column_digests
                                     .capacity()
-                                    .saturating_mul(size_of::<Vec<[u8; BLAKE3_DIGEST_LEN]>>())
-                                    .saturating_add(
-                                        group
-                                            .column_page_digests
-                                            .iter()
-                                            .map(|digests| {
-                                                digests.capacity().saturating_mul(size_of::<
-                                                    [u8; BLAKE3_DIGEST_LEN],
-                                                >(
-                                                ))
-                                            })
-                                            .sum(),
-                                    ),
+                                    .saturating_mul(size_of::<[u8; BLAKE3_DIGEST_LEN]>()),
                             )
                             .saturating_add(
                                 group
@@ -312,26 +310,69 @@ impl RowGroupManifest {
     }
 }
 
+/// Reorders one physical group's statistics into a caller-selected common
+/// field sequence. Persistent Arrow leaves may lift different uniform system
+/// columns into manifest metadata; their typed entity columns remain directly
+/// composable once statistics follow the shared field names.
+pub(crate) fn remap_row_group_statistics(
+    manifest: &RowGroupManifest,
+    group_index: usize,
+    field_names: &[String],
+) -> Result<RowGroupStatistics, LixError> {
+    let group = manifest
+        .groups
+        .get(group_index)
+        .ok_or_else(|| row_group_error("row-group statistics index is out of bounds"))?;
+    let indices = field_names
+        .iter()
+        .map(|name| {
+            manifest
+                .fields
+                .iter()
+                .position(|field| field.name == *name)
+                .ok_or_else(|| row_group_error(format!("row-group omitted shared field '{name}'")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RowGroupStatistics {
+        row_count: group.row_count,
+        columns: indices
+            .iter()
+            .map(|&index| group.columns[index].clone())
+            .collect(),
+        column_digests: indices
+            .iter()
+            .map(|&index| group.column_digests[index])
+            .collect(),
+    })
+}
+
 #[derive(Clone, Debug)]
 struct EncodedColumn {
     group_index: usize,
-    page_index: usize,
     column_index: usize,
-    value: BufferRange,
+    bytes: Bytes,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct EncodedRowGroupSet {
+    id: ArrowStateSetId,
     pub(crate) manifest: RowGroupManifest,
     manifest_bytes: Bytes,
     columns: Vec<EncodedColumn>,
-    column_values: Bytes,
 }
 
 impl EncodedRowGroupSet {
-    fn column_bytes(&self, column: &EncodedColumn) -> &[u8] {
-        let start = column.value.offset();
-        &self.column_values[start..start + column.value.len()]
+    pub(crate) const fn id(&self) -> ArrowStateSetId {
+        self.id
+    }
+
+    pub(crate) fn physical_bytes(&self) -> usize {
+        self.manifest_bytes.len().saturating_add(
+            self.columns
+                .iter()
+                .map(|column| column.bytes.len())
+                .sum::<usize>(),
+        )
     }
 }
 
@@ -341,12 +382,44 @@ pub(crate) struct LoadedRowGroupSet {
     pub(crate) batches: Vec<RecordBatch>,
 }
 
-pub(crate) fn encode_row_group_set(
-    namespace: impl Into<String>,
-    schema: SchemaRef,
-    batches: &[RecordBatch],
-) -> Result<EncodedRowGroupSet, LixError> {
-    encode_row_group_set_impl(namespace.into(), schema, batches, false)
+/// Decodes a transaction-owned Arrow set without publishing it. Sparse state
+/// splicing uses this for mutation input so only the reconciled authoritative
+/// leaf is staged in persistent storage.
+pub(crate) fn decode_encoded_row_group_set(
+    encoded: &EncodedRowGroupSet,
+    projection: &[usize],
+) -> Result<LoadedRowGroupSet, LixError> {
+    let manifest = encoded.manifest.clone();
+    validate_projection(&manifest, projection)?;
+    let mut batches = Vec::with_capacity(manifest.groups.len());
+    for (group_index, group) in manifest.groups.iter().enumerate() {
+        let mut arrays = Vec::with_capacity(projection.len());
+        for &column_index in projection {
+            let column = encoded
+                .columns
+                .iter()
+                .find(|column| {
+                    column.group_index == group_index && column.column_index == column_index
+                })
+                .ok_or_else(|| {
+                    row_group_error(format!(
+                        "encoded row-group {group_index} column {column_index} is missing"
+                    ))
+                })?;
+            let field = &manifest.fields[column_index];
+            arrays.push(decode_verified_column(
+                &column.bytes,
+                group.column_digests[column_index],
+                field.data_type,
+                group.row_count as usize,
+            )?);
+        }
+        batches.push(
+            RecordBatch::try_new(projected_schema(&manifest, projection), arrays)
+                .map_err(|error| row_group_error(error.to_string()))?,
+        );
+    }
+    Ok(LoadedRowGroupSet { manifest, batches })
 }
 
 pub(crate) fn encode_row_group_set_preserving_batches(
@@ -385,94 +458,90 @@ fn encode_row_group_set_impl(
     let row_groups = partition_batches(&schema, batches, preserve_batch_boundaries)?;
     let mut groups = Vec::with_capacity(row_groups.len());
     let mut columns = Vec::with_capacity(row_groups.len().saturating_mul(fields.len()));
-    let mut column_values = Vec::new();
     for (group_index, batch) in row_groups.iter().enumerate() {
         let row_count = u32::try_from(batch.num_rows())
             .map_err(|_| row_group_error("row-group row count exceeds u32"))?;
         let mut statistics = Vec::with_capacity(fields.len());
-        let mut column_page_digests = Vec::with_capacity(fields.len());
+        let mut column_digests = Vec::with_capacity(fields.len());
         for (column_index, (array, field)) in batch.columns().iter().zip(&fields).enumerate() {
             let stats = column_statistics(array, field.data_type)?;
+            let encoded = encode_column(array, field.data_type)?;
             statistics.push(stats);
-            let mut page_digests = Vec::with_capacity(array.len().div_ceil(ROW_GROUP_PAGE_ROWS));
-            for (page_index, offset) in (0..array.len()).step_by(ROW_GROUP_PAGE_ROWS).enumerate() {
-                let page = array.slice(offset, ROW_GROUP_PAGE_ROWS.min(array.len() - offset));
-                let encoded = encode_column(&page, field.data_type)?;
-                page_digests.push(*blake3::hash(&encoded).as_bytes());
-                let value = BufferRange::new(column_values.len(), encoded.len());
-                column_values.extend_from_slice(&encoded);
-                columns.push(EncodedColumn {
-                    group_index,
-                    page_index,
-                    column_index,
-                    value,
-                });
-            }
-            column_page_digests.push(page_digests);
+            column_digests.push(*blake3::hash(&encoded).as_bytes());
+            columns.push(EncodedColumn {
+                group_index,
+                column_index,
+                bytes: Bytes::from(encoded),
+            });
         }
         groups.push(RowGroupStatistics {
             row_count,
             columns: statistics,
-            column_page_digests,
+            column_digests,
         });
     }
-    let mut manifest = RowGroupManifest {
+    let manifest = RowGroupManifest {
         namespace,
         metadata: schema.metadata().clone(),
         fields,
         groups,
-        encoded_digest: [0; BLAKE3_DIGEST_LEN],
     };
     let manifest_bytes = Bytes::from(encode_manifest(&manifest)?);
-    manifest.encoded_digest = *blake3::hash(&manifest_bytes).as_bytes();
+    let id = ArrowStateSetId::from_manifest_bytes(&manifest_bytes);
     Ok(EncodedRowGroupSet {
+        id,
         manifest,
         manifest_bytes,
         columns,
-        column_values: Bytes::from(column_values),
     })
 }
 
 pub(crate) fn stage_row_group_set(
     writes: &mut StorageWriteSet,
-    id: RowGroupSetId,
     encoded: &EncodedRowGroupSet,
-) -> Result<(), LixError> {
+) -> Result<ArrowStateSetId, LixError> {
+    let id = encoded.id;
     writes.reserve_space(ROW_GROUP_MANIFEST_SPACE, 1, 0);
-    let mut key_bytes = Vec::with_capacity(encoded.columns.len().saturating_mul(24));
-    let mut puts = Vec::with_capacity(encoded.columns.len());
+    writes.reserve_space(ROW_GROUP_COLUMN_SPACE, encoded.columns.len(), 0);
     for column in &encoded.columns {
-        let key = id.column_key(column.group_index, column.page_index, column.column_index)?;
-        let key_range = BufferRange::new(key_bytes.len(), key.0.len());
-        key_bytes.extend_from_slice(&key.0);
-        puts.push(EncodedPut {
-            key: key_range,
-            value: column.value,
-        });
+        let key = id.column_key(column.group_index, column.column_index)?;
+        if let Some(staged) = writes.staged_value(ROW_GROUP_COLUMN_SPACE, key.0.as_ref()) {
+            if staged != column.bytes {
+                return Err(row_group_error(
+                    "content-addressed row-group column was staged with different bytes",
+                ));
+            }
+        } else {
+            writes.put(
+                ROW_GROUP_COLUMN_SPACE,
+                key,
+                StorageValue {
+                    bytes: column.bytes.clone(),
+                },
+            );
+        }
     }
-    writes.stage_encoded_batch(
-        ROW_GROUP_COLUMN_SPACE,
-        EncodedMutationBatch::try_new(
-            Bytes::from(key_bytes),
-            encoded.column_values.clone(),
-            puts,
-            Vec::new(),
-        )
-        .map_err(|error| row_group_error(error.to_string()))?,
-    );
-    writes.put(
-        ROW_GROUP_MANIFEST_SPACE,
-        id.manifest_key(),
-        StorageValue {
-            bytes: encoded.manifest_bytes.clone(),
-        },
-    );
-    Ok(())
+    if let Some(staged) = writes.staged_value(ROW_GROUP_MANIFEST_SPACE, &id.0) {
+        if staged != encoded.manifest_bytes {
+            return Err(row_group_error(
+                "content-addressed row-group manifest was staged with different bytes",
+            ));
+        }
+    } else {
+        writes.put(
+            ROW_GROUP_MANIFEST_SPACE,
+            id.manifest_key(),
+            StorageValue {
+                bytes: encoded.manifest_bytes.clone(),
+            },
+        );
+    }
+    Ok(id)
 }
 
 pub(crate) async fn load_row_group_manifest(
     store: &(impl StorageAdapterRead + ?Sized),
-    id: RowGroupSetId,
+    id: ArrowStateSetId,
 ) -> Result<Option<RowGroupManifest>, LixError> {
     let result = PointReadPlan::new(ROW_GROUP_MANIFEST_SPACE, &[id.manifest_key()])
         .materialize(store, StorageGetOptions::default())
@@ -483,21 +552,92 @@ pub(crate) async fn load_row_group_manifest(
     let StorageProjectedValue::FullValue(bytes) = value else {
         return Err(row_group_error("row-group manifest read omitted its value"));
     };
+    if ArrowStateSetId::from_manifest_bytes(&bytes) != id {
+        return Err(row_group_error(
+            "row-group manifest does not match its content address",
+        ));
+    }
     decode_manifest(&bytes).map(Some)
 }
 
-/// Loads an immutable manifest through the transaction-local write overlay.
-/// Row-group publication and current-state publication share one atomic write
-/// set, so a serving descriptor must validate the exact bytes being staged
-/// without requiring an intermediate storage commit.
-pub(crate) fn load_staged_row_group_manifest(
-    writes: &StorageWriteSet,
-    id: RowGroupSetId,
+pub(crate) async fn load_row_group_manifest_with_staged(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    id: ArrowStateSetId,
 ) -> Result<Option<RowGroupManifest>, LixError> {
-    if let Some(bytes) = writes.staged_value(ROW_GROUP_MANIFEST_SPACE, id.as_bytes().as_slice()) {
+    if let Some(bytes) = writes.staged_value(ROW_GROUP_MANIFEST_SPACE, &id.0) {
+        if ArrowStateSetId::from_manifest_bytes(&bytes) != id {
+            return Err(row_group_error(
+                "staged row-group manifest does not match its content address",
+            ));
+        }
         return decode_manifest(&bytes).map(Some);
     }
-    Ok(None)
+    load_row_group_manifest(store, id).await
+}
+
+pub(crate) async fn load_row_group_batch_with_staged(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    id: ArrowStateSetId,
+    group_index: usize,
+    projection: &[usize],
+) -> Result<Option<LoadedRowGroupSet>, LixError> {
+    let manifest = if let Some(bytes) = writes.staged_value(ROW_GROUP_MANIFEST_SPACE, &id.0) {
+        if ArrowStateSetId::from_manifest_bytes(&bytes) != id {
+            return Err(row_group_error(
+                "staged row-group manifest does not match its content address",
+            ));
+        }
+        decode_manifest(&bytes)?
+    } else {
+        let Some(manifest) = load_row_group_manifest(store, id).await? else {
+            return Ok(None);
+        };
+        manifest
+    };
+    validate_projection(&manifest, projection)?;
+    let group = manifest.groups.get(group_index).ok_or_else(|| {
+        row_group_error(format!(
+            "row-group index {group_index} is outside {} groups",
+            manifest.groups.len()
+        ))
+    })?;
+    let mut arrays = Vec::with_capacity(projection.len());
+    for &column_index in projection {
+        let column_key = id.column_key(group_index, column_index)?;
+        let bytes = if let Some(bytes) =
+            writes.staged_value(ROW_GROUP_COLUMN_SPACE, column_key.0.as_ref())
+        {
+            bytes
+        } else {
+            let result = PointReadPlan::new(ROW_GROUP_COLUMN_SPACE, &[column_key])
+                .materialize(store, StorageGetOptions::default())
+                .await?;
+            let value = result.value.into_iter().next().flatten().ok_or_else(|| {
+                row_group_error(format!(
+                    "row-group {group_index} column {column_index} is missing"
+                ))
+            })?;
+            let StorageProjectedValue::FullValue(bytes) = value else {
+                return Err(row_group_error("row-group column read omitted its value"));
+            };
+            bytes
+        };
+        let field = &manifest.fields[column_index];
+        arrays.push(decode_verified_column(
+            &bytes,
+            group.column_digests[column_index],
+            field.data_type,
+            group.row_count as usize,
+        )?);
+    }
+    let batch = RecordBatch::try_new(projected_schema(&manifest, projection), arrays)
+        .map_err(|error| row_group_error(error.to_string()))?;
+    Ok(Some(LoadedRowGroupSet {
+        manifest,
+        batches: vec![batch],
+    }))
 }
 
 /// Stages deletion of one immutable set and every addressed column. The
@@ -506,40 +646,21 @@ pub(crate) fn load_staged_row_group_manifest(
 pub(crate) async fn stage_delete_row_group_set(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
-    id: RowGroupSetId,
+    id: ArrowStateSetId,
 ) -> Result<(), LixError> {
     let Some(manifest) = load_row_group_manifest(store, id).await? else {
         return Ok(());
     };
     writes.delete(ROW_GROUP_MANIFEST_SPACE, id.manifest_key());
     for group_index in 0..manifest.groups.len() {
-        let page_count =
-            (manifest.groups[group_index].row_count as usize).div_ceil(ROW_GROUP_PAGE_ROWS);
-        for page_index in 0..page_count {
-            for column_index in 0..manifest.fields.len() {
-                writes.delete(
-                    ROW_GROUP_COLUMN_SPACE,
-                    id.column_key(group_index, page_index, column_index)?,
-                );
-            }
+        for column_index in 0..manifest.fields.len() {
+            writes.delete(
+                ROW_GROUP_COLUMN_SPACE,
+                id.column_key(group_index, column_index)?,
+            );
         }
     }
     Ok(())
-}
-
-pub(crate) async fn load_row_group_set(
-    store: &(impl StorageAdapterRead + ?Sized),
-    id: RowGroupSetId,
-    projection: &[usize],
-) -> Result<Option<LoadedRowGroupSet>, LixError> {
-    let Some(manifest) = load_row_group_manifest(store, id).await? else {
-        return Ok(None);
-    };
-    let mut batches = Vec::with_capacity(manifest.groups.len());
-    for group_index in 0..manifest.groups.len() {
-        batches.push(load_row_group_batch(store, id, &manifest, group_index, projection).await?);
-    }
-    Ok(Some(LoadedRowGroupSet { manifest, batches }))
 }
 
 /// Loads exactly one row group and only its projected columns.
@@ -549,7 +670,7 @@ pub(crate) async fn load_row_group_set(
 /// issues any column reads.
 pub(crate) async fn load_row_group_batch(
     store: &(impl StorageAdapterRead + ?Sized),
-    id: RowGroupSetId,
+    id: ArrowStateSetId,
     manifest: &RowGroupManifest,
     group_index: usize,
     projection: &[usize],
@@ -580,7 +701,7 @@ pub(crate) async fn load_row_group_batch(
 /// The returned arrays follow `projection` order and retain no storage bytes.
 pub(crate) async fn load_row_group_columns(
     store: &(impl StorageAdapterRead + ?Sized),
-    id: RowGroupSetId,
+    id: ArrowStateSetId,
     manifest: &RowGroupManifest,
     group_index: usize,
     projection: &[usize],
@@ -595,13 +716,9 @@ pub(crate) async fn load_row_group_columns(
     if projection.is_empty() {
         return Ok(Vec::new());
     }
-    let page_count = (group.row_count as usize).div_ceil(ROW_GROUP_PAGE_ROWS);
     let keys = projection
         .iter()
-        .flat_map(|&column_index| {
-            (0..page_count)
-                .map(move |page_index| id.column_key(group_index, page_index, column_index))
-        })
+        .map(|&column_index| id.column_key(group_index, column_index))
         .collect::<Result<Vec<_>, _>>()?;
     let values = PointReadPlan::from_unique_keys(ROW_GROUP_COLUMN_SPACE, keys)
         .materialize(store, StorageGetOptions::default())
@@ -610,28 +727,22 @@ pub(crate) async fn load_row_group_columns(
     let mut values = values.into_iter();
     let mut arrays = Vec::with_capacity(projection.len());
     for &column_index in projection {
+        let value = values.next().flatten().ok_or_else(|| {
+            row_group_error(format!(
+                "row-group {group_index} column {column_index} is missing"
+            ))
+        })?;
+        let StorageProjectedValue::FullValue(bytes) = value else {
+            return Err(row_group_error("row-group column read omitted its value"));
+        };
         let field = &manifest.fields[column_index];
-        let mut pages = Vec::with_capacity(page_count);
-        for page_index in 0..page_count {
-            let value = values.next().flatten().ok_or_else(|| {
-                row_group_error(format!(
-                    "row-group {group_index} page {page_index} column {column_index} is missing"
-                ))
-            })?;
-            let StorageProjectedValue::FullValue(bytes) = value else {
-                return Err(row_group_error("row-group column read omitted its value"));
-            };
-            let page_rows = ROW_GROUP_PAGE_ROWS
-                .min(group.row_count as usize - page_index.saturating_mul(ROW_GROUP_PAGE_ROWS));
-            pages.push(decode_verified_column(
-                &bytes,
-                group.column_page_digests[column_index][page_index],
-                field.data_type,
-                page_rows,
-            )?);
-        }
-        let page_refs = pages.iter().map(|page| page.as_ref()).collect::<Vec<_>>();
-        arrays.push(concat(&page_refs).map_err(|error| row_group_error(error.to_string()))?);
+        let array = decode_verified_column(
+            &bytes,
+            group.column_digests[column_index],
+            field.data_type,
+            group.row_count as usize,
+        )?;
+        arrays.push(array);
     }
     if values.next().is_some() {
         return Err(row_group_error(
@@ -639,195 +750,6 @@ pub(crate) async fn load_row_group_columns(
         ));
     }
     Ok(arrays)
-}
-
-/// Loads one independently compressed page from one logical scan group.
-pub(crate) async fn load_row_group_page(
-    store: &(impl StorageAdapterRead + ?Sized),
-    id: RowGroupSetId,
-    manifest: &RowGroupManifest,
-    group_index: usize,
-    page_index: usize,
-    projection: &[usize],
-) -> Result<RecordBatch, LixError> {
-    load_row_group_pages(
-        store,
-        id,
-        manifest,
-        &[(group_index, page_index)],
-        projection,
-    )
-    .await?
-    .pop()
-    .ok_or_else(|| row_group_error("row-group page read returned no batch"))
-}
-
-/// Loads multiple pages from one immutable set in one backend point-read
-/// batch. Caller order and duplicate coordinates are preserved.
-pub(crate) async fn load_row_group_pages(
-    store: &(impl StorageAdapterRead + ?Sized),
-    id: RowGroupSetId,
-    manifest: &RowGroupManifest,
-    pages: &[(usize, usize)],
-    projection: &[usize],
-) -> Result<Vec<RecordBatch>, LixError> {
-    let mut batches = Vec::with_capacity(pages.len());
-    visit_row_group_pages(store, id, manifest, pages, projection, |_, batch| {
-        batches.push(batch);
-        Ok(())
-    })
-    .await?;
-    Ok(batches)
-}
-
-/// Visits requested pages in caller order while bounding compressed and
-/// decoded working state. A page batch is dropped before the next physical
-/// read unless the caller deliberately retains it. A projection wider than
-/// the budget still reads one indivisible coordinate at a time; the budget
-/// limits physical working state rather than imposing a query-size policy.
-pub(crate) async fn visit_row_group_pages(
-    store: &(impl StorageAdapterRead + ?Sized),
-    id: RowGroupSetId,
-    manifest: &RowGroupManifest,
-    pages: &[(usize, usize)],
-    projection: &[usize],
-    mut visit: impl FnMut((usize, usize), RecordBatch) -> Result<(), LixError>,
-) -> Result<crate::storage_adapter::StorageReadStats, LixError> {
-    validate_projection(manifest, projection)?;
-    let mut stats = crate::storage_adapter::StorageReadStats::default();
-    let coordinates_per_batch = if projection.is_empty() {
-        ROW_GROUP_POINT_READ_MAX_COLUMN_PAGES
-    } else {
-        (ROW_GROUP_POINT_READ_MAX_COLUMN_PAGES / projection.len()).max(1)
-    };
-    for coordinate_batch in pages.chunks(coordinates_per_batch) {
-        let mut page_row_counts = Vec::with_capacity(coordinate_batch.len());
-        let mut keys = Vec::with_capacity(coordinate_batch.len().saturating_mul(projection.len()));
-        for &(group_index, page_index) in coordinate_batch {
-            let group = manifest.groups.get(group_index).ok_or_else(|| {
-                row_group_error(format!(
-                    "row-group index {group_index} is outside the manifest"
-                ))
-            })?;
-            let page_count = (group.row_count as usize).div_ceil(ROW_GROUP_PAGE_ROWS);
-            if page_index >= page_count {
-                return Err(row_group_error(format!(
-                    "row-group page index {page_index} is outside {page_count} pages"
-                )));
-            }
-            page_row_counts
-                .push(ROW_GROUP_PAGE_ROWS.min(
-                    group.row_count as usize - page_index.saturating_mul(ROW_GROUP_PAGE_ROWS),
-                ));
-            for &column_index in projection {
-                keys.push(id.column_key(group_index, page_index, column_index)?);
-            }
-        }
-        let loaded = PointReadPlan::new(ROW_GROUP_COLUMN_SPACE, &keys)
-            .materialize(store, StorageGetOptions::default())
-            .await?;
-        stats.add(loaded.stats);
-        let mut values = loaded.value.into_iter();
-        for (&(group_index, page_index), page_rows) in coordinate_batch.iter().zip(page_row_counts)
-        {
-            if projection.is_empty() {
-                visit(
-                    (group_index, page_index),
-                    RecordBatch::try_new_with_options(
-                        projected_schema(manifest, projection),
-                        Vec::new(),
-                        &RecordBatchOptions::new().with_row_count(Some(page_rows)),
-                    )
-                    .map_err(|error| row_group_error(error.to_string()))?,
-                )?;
-                continue;
-            }
-            let group = &manifest.groups[group_index];
-            let mut arrays = Vec::with_capacity(projection.len());
-            for &column_index in projection {
-                let bytes = values
-                    .next()
-                    .flatten()
-                    .and_then(|value| match value {
-                        StorageProjectedValue::FullValue(bytes) => Some(bytes),
-                        StorageProjectedValue::KeyOnly => None,
-                    })
-                    .ok_or_else(|| {
-                        row_group_error(format!(
-                            "row-group {group_index} page {page_index} column {column_index} is missing"
-                        ))
-                    })?;
-                arrays.push(decode_verified_column(
-                    &bytes,
-                    group.column_page_digests[column_index][page_index],
-                    manifest.fields[column_index].data_type,
-                    page_rows,
-                )?);
-            }
-            visit(
-                (group_index, page_index),
-                RecordBatch::try_new(projected_schema(manifest, projection), arrays)
-                    .map_err(|error| row_group_error(error.to_string()))?,
-            )?;
-        }
-        if values.next().is_some() {
-            return Err(row_group_error(
-                "row-group page read returned excess column values",
-            ));
-        }
-    }
-    Ok(stats)
-}
-
-/// Loads one page through ordinary storage plus the current atomic write set.
-/// Only columns absent from the overlay are issued as physical point reads.
-pub(crate) fn load_staged_row_group_page(
-    writes: &StorageWriteSet,
-    id: RowGroupSetId,
-    manifest: &RowGroupManifest,
-    group_index: usize,
-    page_index: usize,
-    projection: &[usize],
-) -> Result<RecordBatch, LixError> {
-    validate_projection(manifest, projection)?;
-    let group = manifest.groups.get(group_index).ok_or_else(|| {
-        row_group_error(format!(
-            "row-group index {group_index} is outside the manifest"
-        ))
-    })?;
-    let page_count = (group.row_count as usize).div_ceil(ROW_GROUP_PAGE_ROWS);
-    if page_index >= page_count {
-        return Err(row_group_error(format!(
-            "row-group page index {page_index} is outside {page_count} pages"
-        )));
-    }
-    let page_rows = ROW_GROUP_PAGE_ROWS
-        .min(group.row_count as usize - page_index.saturating_mul(ROW_GROUP_PAGE_ROWS));
-    let keys = projection
-        .iter()
-        .map(|&column_index| id.column_key(group_index, page_index, column_index))
-        .collect::<Result<Vec<_>, _>>()?;
-    let values = keys
-        .iter()
-        .map(|key| writes.staged_value(ROW_GROUP_COLUMN_SPACE, key.0.as_ref()))
-        .collect::<Vec<_>>();
-    let mut arrays = Vec::with_capacity(projection.len());
-    for ((&column_index, bytes), key) in projection.iter().zip(values).zip(keys) {
-        let bytes = bytes.ok_or_else(|| {
-            row_group_error(format!(
-                "row-group {group_index} page {page_index} column {column_index} is missing at {:?}",
-                key.0
-            ))
-        })?;
-        arrays.push(decode_verified_column(
-            &bytes,
-            group.column_page_digests[column_index][page_index],
-            manifest.fields[column_index].data_type,
-            page_rows,
-        )?);
-    }
-    RecordBatch::try_new(projected_schema(manifest, projection), arrays)
-        .map_err(|error| row_group_error(error.to_string()))
 }
 
 pub(crate) fn row_group_projected_schema(
@@ -967,11 +889,46 @@ fn encode_column(array: &ArrayRef, data_type: RowGroupDataType) -> Result<Vec<u8
             }
             raw.extend_from_slice(&data);
         }
+        RowGroupDataType::Binary => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| row_group_error("row-group Binary column downcast failed"))?;
+            let mut data = Vec::new();
+            let mut offsets = Vec::with_capacity(values.len() + 1);
+            offsets.push(0_i32);
+            for index in 0..values.len() {
+                if values.is_valid(index) {
+                    data.extend_from_slice(values.value(index));
+                }
+                offsets.push(i32::try_from(data.len()).map_err(|_| {
+                    row_group_error("row-group Binary data exceeds Arrow i32 offsets")
+                })?);
+            }
+            raw.extend_from_slice(
+                &u32::try_from(data.len())
+                    .map_err(|_| row_group_error("row-group Binary data exceeds u32"))?
+                    .to_le_bytes(),
+            );
+            for offset in offsets {
+                raw.extend_from_slice(&offset.to_le_bytes());
+            }
+            raw.extend_from_slice(&data);
+        }
         RowGroupDataType::Int64 => {
             let values = array
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| row_group_error("row-group Int64 column downcast failed"))?;
+            for index in 0..values.len() {
+                raw.extend_from_slice(&values.value(index).to_le_bytes());
+            }
+        }
+        RowGroupDataType::UInt64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| row_group_error("row-group UInt64 column downcast failed"))?;
             for index in 0..values.len() {
                 raw.extend_from_slice(&values.value(index).to_le_bytes());
             }
@@ -1063,12 +1020,48 @@ fn decode_column(
                 .map_err(|error| row_group_error(error.to_string()))?,
             )
         }
+        RowGroupDataType::Binary => {
+            let data_len = cursor.u32_le()? as usize;
+            let offset_count = row_count
+                .checked_add(1)
+                .ok_or_else(|| row_group_error("row-group Binary offset count overflow"))?;
+            let mut offsets = Vec::with_capacity(offset_count);
+            for _ in 0..offset_count {
+                offsets.push(cursor.i32_le()?);
+            }
+            if offsets.first() != Some(&0)
+                || offsets.windows(2).any(|window| window[0] > window[1])
+                || offsets
+                    .last()
+                    .copied()
+                    .and_then(|value| usize::try_from(value).ok())
+                    != Some(data_len)
+            {
+                return Err(row_group_error("row-group Binary offsets are invalid"));
+            }
+            let data = cursor.bytes(data_len)?.to_vec();
+            Arc::new(
+                BinaryArray::try_new(
+                    OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                    Buffer::from(data),
+                    nulls,
+                )
+                .map_err(|error| row_group_error(error.to_string()))?,
+            )
+        }
         RowGroupDataType::Int64 => {
             let mut values = Vec::with_capacity(row_count);
             for _ in 0..row_count {
                 values.push(cursor.i64_le()?);
             }
             Arc::new(Int64Array::new(ScalarBuffer::from(values), nulls))
+        }
+        RowGroupDataType::UInt64 => {
+            let mut values = Vec::with_capacity(row_count);
+            for _ in 0..row_count {
+                values.push(cursor.u64_le()?);
+            }
+            Arc::new(UInt64Array::new(ScalarBuffer::from(values), nulls))
         }
         RowGroupDataType::Float64 => {
             let mut values = Vec::with_capacity(row_count);
@@ -1171,6 +1164,35 @@ fn column_statistics(
                 None,
             )
         }
+        RowGroupDataType::Binary => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| row_group_error("row-group Binary statistics downcast failed"))?;
+            let mut observed = values.iter().flatten();
+            let Some(first) = observed.next() else {
+                return Ok(RowGroupColumnStatistics {
+                    null_count,
+                    min: None,
+                    max: None,
+                    sum: None,
+                });
+            };
+            let (mut min, mut max) = (first, first);
+            for value in observed {
+                if value < min {
+                    min = value;
+                }
+                if value > max {
+                    max = value;
+                }
+            }
+            (
+                Some(RowGroupScalar::Binary(min.to_vec())),
+                Some(RowGroupScalar::Binary(max.to_vec())),
+                None,
+            )
+        }
         RowGroupDataType::Int64 => {
             let values = array
                 .as_any()
@@ -1195,6 +1217,32 @@ fn column_statistics(
                 Some(RowGroupScalar::Int64(min)),
                 Some(RowGroupScalar::Int64(max)),
                 sum.map(RowGroupScalar::Int64),
+            )
+        }
+        RowGroupDataType::UInt64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| row_group_error("row-group UInt64 statistics downcast failed"))?;
+            let mut observed = values.iter().flatten();
+            let Some(first) = observed.next() else {
+                return Ok(RowGroupColumnStatistics {
+                    null_count,
+                    min: None,
+                    max: None,
+                    sum: None,
+                });
+            };
+            let (mut min, mut max, mut sum) = (first, first, Some(first));
+            for value in observed {
+                min = min.min(value);
+                max = max.max(value);
+                sum = sum.and_then(|sum| sum.checked_add(value));
+            }
+            (
+                Some(RowGroupScalar::UInt64(min)),
+                Some(RowGroupScalar::UInt64(max)),
+                sum.map(RowGroupScalar::UInt64),
             )
         }
         RowGroupDataType::Float64 => {
@@ -1283,7 +1331,7 @@ pub(crate) fn exact_record_batch_statistics(
         .collect::<Result<Vec<_>, LixError>>()?;
     Ok(RowGroupStatistics {
         row_count,
-        column_page_digests: vec![Vec::new(); columns.len()],
+        column_digests: vec![[0; BLAKE3_DIGEST_LEN]; columns.len()],
         columns,
     })
 }
@@ -1343,26 +1391,18 @@ fn encode_manifest(manifest: &RowGroupManifest) -> Result<Vec<u8>, LixError> {
                 "manifest statistics width does not match its schema",
             ));
         }
-        if group.column_page_digests.len() != manifest.fields.len() {
+        if group.column_digests.len() != manifest.fields.len() {
             return Err(row_group_error(
                 "manifest column digest width does not match its schema",
             ));
         }
-        let page_count = (group.row_count as usize).div_ceil(ROW_GROUP_PAGE_ROWS);
-        for ((stats, page_digests), field) in group
+        for ((stats, digest), field) in group
             .columns
             .iter()
-            .zip(&group.column_page_digests)
+            .zip(&group.column_digests)
             .zip(&manifest.fields)
         {
-            if page_digests.len() != page_count {
-                return Err(row_group_error(
-                    "manifest column page digest count disagrees with its row count",
-                ));
-            }
-            for digest in page_digests {
-                output.extend_from_slice(digest);
-            }
+            output.extend_from_slice(digest);
             output.extend_from_slice(&stats.null_count.to_le_bytes());
             put_optional_scalar(&mut output, stats.min.as_ref(), field.data_type)?;
             put_optional_scalar(&mut output, stats.max.as_ref(), field.data_type)?;
@@ -1388,10 +1428,7 @@ fn decode_manifest(encoded: &[u8]) -> Result<RowGroupManifest, LixError> {
     let namespace = cursor.string()?;
     let metadata = cursor.metadata()?;
     let field_count = cursor.u16_le()? as usize;
-    // Counts are encoded inside storage-controlled bytes. Do not turn a forged,
-    // self-checksummed count into an unbounded allocation before the decoder has
-    // established that the corresponding entries actually exist.
-    let mut fields = Vec::with_capacity(field_count.min(1_024));
+    let mut fields = Vec::with_capacity(field_count);
     for _ in 0..field_count {
         let name = cursor.string()?;
         let data_type = RowGroupDataType::decode(cursor.u8()?)?;
@@ -1408,7 +1445,7 @@ fn decode_manifest(encoded: &[u8]) -> Result<RowGroupManifest, LixError> {
         });
     }
     let group_count = cursor.u32_le()? as usize;
-    let mut groups = Vec::with_capacity(group_count.min(1_024));
+    let mut groups = Vec::with_capacity(group_count);
     for _ in 0..group_count {
         let row_count = cursor.u32_le()?;
         if row_count == 0 || row_count as usize > ROW_GROUP_MAX_ROWS {
@@ -1417,17 +1454,10 @@ fn decode_manifest(encoded: &[u8]) -> Result<RowGroupManifest, LixError> {
             ));
         }
         let mut columns = Vec::with_capacity(field_count);
-        let page_count = (row_count as usize).div_ceil(ROW_GROUP_PAGE_ROWS);
-        let mut column_page_digests = Vec::with_capacity(field_count);
+        let mut column_digests = Vec::with_capacity(field_count);
         for field in &fields {
-            let mut page_digests = Vec::with_capacity(page_count);
-            for _ in 0..page_count {
-                page_digests.push(
-                    <[u8; BLAKE3_DIGEST_LEN]>::try_from(cursor.bytes(BLAKE3_DIGEST_LEN)?).map_err(
-                        |_| row_group_error("row-group column digest has an invalid length"),
-                    )?,
-                );
-            }
+            let digest = <[u8; BLAKE3_DIGEST_LEN]>::try_from(cursor.bytes(BLAKE3_DIGEST_LEN)?)
+                .map_err(|_| row_group_error("row-group column digest has an invalid length"))?;
             let null_count = cursor.u32_le()?;
             if null_count > row_count {
                 return Err(row_group_error(
@@ -1448,12 +1478,12 @@ fn decode_manifest(encoded: &[u8]) -> Result<RowGroupManifest, LixError> {
                 max,
                 sum,
             });
-            column_page_digests.push(page_digests);
+            column_digests.push(digest);
         }
         groups.push(RowGroupStatistics {
             row_count,
             columns,
-            column_page_digests,
+            column_digests,
         });
     }
     if !cursor.is_empty() {
@@ -1464,7 +1494,6 @@ fn decode_manifest(encoded: &[u8]) -> Result<RowGroupManifest, LixError> {
         metadata,
         fields,
         groups,
-        encoded_digest: *blake3::hash(encoded).as_bytes(),
     })
 }
 
@@ -1480,7 +1509,14 @@ fn put_optional_scalar(
     output.push(1);
     match (expected, scalar) {
         (RowGroupDataType::String, RowGroupScalar::String(value)) => put_string(output, value)?,
+        (RowGroupDataType::Binary, RowGroupScalar::Binary(value)) => {
+            put_u32_len(output, value.len(), "binary statistic length")?;
+            output.extend_from_slice(value);
+        }
         (RowGroupDataType::Int64, RowGroupScalar::Int64(value)) => {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        (RowGroupDataType::UInt64, RowGroupScalar::UInt64(value)) => {
             output.extend_from_slice(&value.to_le_bytes());
         }
         (RowGroupDataType::Float64, RowGroupScalar::Float64(value)) => {
@@ -1619,7 +1655,12 @@ impl<'a> Cursor<'a> {
             0 => Ok(None),
             1 => Ok(Some(match data_type {
                 RowGroupDataType::String => RowGroupScalar::String(self.string()?),
+                RowGroupDataType::Binary => {
+                    let len = self.u32_le()? as usize;
+                    RowGroupScalar::Binary(self.bytes(len)?.to_vec())
+                }
                 RowGroupDataType::Int64 => RowGroupScalar::Int64(self.i64_le()?),
+                RowGroupDataType::UInt64 => RowGroupScalar::UInt64(self.u64_le()?),
                 RowGroupDataType::Float64 => {
                     RowGroupScalar::Float64(f64::from_bits(self.u64_le()?))
                 }
@@ -1642,6 +1683,13 @@ fn row_group_error(message: impl Into<String>) -> LixError {
 mod tests {
     use super::*;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+
+    fn encode_fixture(
+        schema: SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<EncodedRowGroupSet, LixError> {
+        encode_row_group_set_impl("fixture".to_owned(), schema, batches, false)
+    }
 
     fn fixture(rows: usize) -> (SchemaRef, Vec<RecordBatch>) {
         let mut schema_metadata = HashMap::new();
@@ -1694,8 +1742,7 @@ mod tests {
     fn typed_codec_round_trips_multiple_groups_and_statistics() {
         let rows = ROW_GROUP_MAX_ROWS + 9;
         let (schema, batches) = fixture(rows);
-        let encoded = encode_row_group_set("fixture", Arc::clone(&schema), &batches)
-            .expect("encode row groups");
+        let encoded = encode_fixture(Arc::clone(&schema), &batches).expect("encode row groups");
         assert_eq!(encoded.manifest.groups.len(), 2);
         assert_eq!(
             encoded.manifest.groups[0].row_count as usize,
@@ -1718,16 +1765,11 @@ mod tests {
         for column in &encoded.columns {
             let group = &encoded.manifest.groups[column.group_index];
             let field = &encoded.manifest.fields[column.column_index];
-            let page_rows = ROW_GROUP_PAGE_ROWS.min(
-                group.row_count as usize - column.page_index.saturating_mul(ROW_GROUP_PAGE_ROWS),
-            );
-            let column_bytes = encoded.column_bytes(column);
-            let decoded =
-                decode_column(column_bytes, field.data_type, page_rows).expect("decode column");
-            assert_eq!(decoded.len(), page_rows);
+            let decoded = decode_column(&column.bytes, field.data_type, group.row_count as usize)
+                .expect("decode column");
             assert_eq!(
-                *blake3::hash(column_bytes).as_bytes(),
-                group.column_page_digests[column.column_index][column.page_index]
+                column_statistics(&decoded, field.data_type).expect("decoded stats"),
+                group.columns[column.column_index]
             );
         }
     }
@@ -1736,11 +1778,11 @@ mod tests {
     async fn storage_load_projects_columns_and_preserves_metadata() {
         let rows = ROW_GROUP_MAX_ROWS + 3;
         let (schema, batches) = fixture(rows);
-        let encoded = encode_row_group_set("fixture", schema, &batches).expect("encode");
+        let encoded = encode_fixture(schema, &batches).expect("encode");
         let adapter = StorageAdapter::new(Memory::new());
-        let id = RowGroupSetId::new(*b"row-group-set-01");
+        let id = encoded.id();
         let mut writes = adapter.new_write_set();
-        stage_row_group_set(&mut writes, id, &encoded).expect("stage");
+        stage_row_group_set(&mut writes, &encoded).expect("stage");
         adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -1749,108 +1791,38 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read");
-        let loaded = load_row_group_set(&read, id, &[3, 0])
+        let manifest = load_row_group_manifest(&read, id)
             .await
             .expect("load")
             .expect("present");
-        assert_eq!(loaded.manifest.namespace, "fixture");
-        assert_eq!(loaded.batches.len(), 2);
+        let mut batches = Vec::with_capacity(manifest.groups.len());
+        for group_index in 0..manifest.groups.len() {
+            batches.push(
+                load_row_group_batch(&read, id, &manifest, group_index, &[3, 0])
+                    .await
+                    .expect("load projected group"),
+            );
+        }
+        assert_eq!(manifest.namespace, "fixture");
+        assert_eq!(batches.len(), 2);
         assert_eq!(
-            loaded
-                .batches
-                .iter()
-                .map(RecordBatch::num_rows)
-                .sum::<usize>(),
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
             rows
         );
-        assert_eq!(loaded.batches[0].schema().field(0).name(), "enabled");
-        assert_eq!(loaded.batches[0].schema().field(1).name(), "name");
+        assert_eq!(batches[0].schema().field(0).name(), "enabled");
+        assert_eq!(batches[0].schema().field(1).name(), "name");
         assert_eq!(
-            loaded.batches[0]
-                .schema()
-                .field(1)
-                .metadata()
-                .get("semantic"),
+            batches[0].schema().field(1).metadata().get("semantic"),
             Some(&"identity".to_string())
         );
-        let last = load_row_group_batch(&read, id, &loaded.manifest, 1, &[0])
+        let last = load_row_group_batch(&read, id, &manifest, 1, &[0])
             .await
             .expect("load one projected group");
         assert_eq!(last.num_rows(), 3);
         assert_eq!(last.num_columns(), 1);
         assert_eq!(last.schema().field(0).name(), "name");
-        let pages =
-            load_row_group_pages(&read, id, &loaded.manifest, &[(0, 0), (0, 1), (0, 0)], &[1])
-                .await
-                .expect("load projected pages in one batch");
-        assert_eq!(
-            pages.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
-            vec![
-                ROW_GROUP_PAGE_ROWS,
-                ROW_GROUP_PAGE_ROWS,
-                ROW_GROUP_PAGE_ROWS
-            ]
-        );
-        assert_eq!(pages[0], pages[2], "duplicate coordinates preserve order");
-        let all_page_coordinates = (0..loaded.manifest.groups.len())
-            .flat_map(|group_index| {
-                let page_count = (loaded.manifest.groups[group_index].row_count as usize)
-                    .div_ceil(ROW_GROUP_PAGE_ROWS);
-                (0..page_count).map(move |page_index| (group_index, page_index))
-            })
-            .collect::<Vec<_>>();
         assert!(
-            all_page_coordinates.len() > ROW_GROUP_POINT_READ_MAX_COLUMN_PAGES,
-            "fixture must cross the physical page backpressure boundary"
-        );
-        let mut visited = Vec::new();
-        let visit_stats = visit_row_group_pages(
-            &read,
-            id,
-            &loaded.manifest,
-            &all_page_coordinates,
-            &[0],
-            |coordinate, batch| {
-                visited.push((coordinate, batch.num_rows()));
-                Ok(())
-            },
-        )
-        .await
-        .expect("visit pages across the backpressure boundary");
-        assert_eq!(
-            visited
-                .iter()
-                .map(|(coordinate, _)| *coordinate)
-                .collect::<Vec<_>>(),
-            all_page_coordinates
-        );
-        assert_eq!(
-            visit_stats.storage_calls, 2,
-            "33 projected pages must collapse from 33 calls to two bounded batches"
-        );
-        let full_projection = (0..loaded.manifest.fields.len()).collect::<Vec<_>>();
-        let full_stats = visit_row_group_pages(
-            &read,
-            id,
-            &loaded.manifest,
-            &all_page_coordinates,
-            &full_projection,
-            |_, _| Ok(()),
-        )
-        .await
-        .expect("visit fully projected pages with bounded batching");
-        let coordinates_per_batch =
-            (ROW_GROUP_POINT_READ_MAX_COLUMN_PAGES / full_projection.len()).max(1);
-        assert_eq!(
-            full_stats.storage_calls,
-            all_page_coordinates.len().div_ceil(coordinates_per_batch) as u64
-        );
-        assert!(
-            full_stats.storage_calls < all_page_coordinates.len() as u64,
-            "full-page hydration must issue fewer calls than one request per page"
-        );
-        assert!(
-            load_row_group_manifest(&read, RowGroupSetId::new([9; 16]))
+            load_row_group_manifest(&read, ArrowStateSetId::from_digest([9; 32]))
                 .await
                 .expect("missing read")
                 .is_none()
@@ -1860,11 +1832,11 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_delete_removes_manifest_and_columns() {
         let (schema, batches) = fixture(ROW_GROUP_MAX_ROWS + 3);
-        let encoded = encode_row_group_set("fixture", schema, &batches).expect("encode");
+        let encoded = encode_fixture(schema, &batches).expect("encode");
         let adapter = StorageAdapter::new(Memory::new());
-        let id = RowGroupSetId::new(*b"row-group-set-03");
+        let id = encoded.id();
         let mut writes = adapter.new_write_set();
-        stage_row_group_set(&mut writes, id, &encoded).expect("stage");
+        stage_row_group_set(&mut writes, &encoded).expect("stage");
         adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -1898,7 +1870,7 @@ mod tests {
             .columns
             .iter()
             .map(|column| {
-                id.column_key(column.group_index, column.page_index, column.column_index)
+                id.column_key(column.group_index, column.column_index)
                     .expect("key")
             })
             .collect::<Vec<_>>();
@@ -1916,7 +1888,7 @@ mod tests {
     #[test]
     fn corrupt_values_fail_closed() {
         let (schema, batches) = fixture(32);
-        let encoded = encode_row_group_set("fixture", schema, &batches).expect("encode");
+        let encoded = encode_fixture(schema, &batches).expect("encode");
 
         let mut bad_manifest = encoded.manifest_bytes.to_vec();
         bad_manifest[0] ^= 0xff;
@@ -1927,7 +1899,7 @@ mod tests {
         bad_manifest_checksum[checksum_index] ^= 0xff;
         assert!(decode_manifest(&bad_manifest_checksum).is_err());
 
-        let mut truncated = encoded.column_bytes(&encoded.columns[0]).to_vec();
+        let mut truncated = encoded.columns[0].bytes.to_vec();
         truncated.truncate(truncated.len() / 2);
         assert!(decode_column(&truncated, RowGroupDataType::String, 32).is_err());
 
@@ -1935,21 +1907,12 @@ mod tests {
         oversized.extend_from_slice(&u32::MAX.to_le_bytes());
         oversized.extend_from_slice(b"not-zstd");
         assert!(decode_column(&oversized, RowGroupDataType::String, 32).is_err());
-
-        let mut forged_count = Vec::from(MANIFEST_MAGIC);
-        forged_count.extend_from_slice(&0_u32.to_le_bytes()); // namespace
-        forged_count.extend_from_slice(&0_u16.to_le_bytes()); // metadata
-        forged_count.extend_from_slice(&0_u16.to_le_bytes()); // fields
-        forged_count.extend_from_slice(&u32::MAX.to_le_bytes()); // groups
-        let checksum = blake3::hash(&forged_count);
-        forged_count.extend_from_slice(checksum.as_bytes());
-        assert!(decode_manifest(&forged_count).is_err());
     }
 
     #[test]
     fn manifest_stat_corruption_fails_closed() {
         let (schema, batches) = fixture(32);
-        let encoded = encode_row_group_set("fixture", schema, &batches).expect("encode");
+        let encoded = encode_fixture(schema, &batches).expect("encode");
 
         // The final byte before the checksum is part of the final column's
         // persisted statistics. The checksum rejects the modified statistic
@@ -1963,18 +1926,17 @@ mod tests {
     #[tokio::test]
     async fn column_byte_corruption_fails_closed_during_load() {
         let (schema, batches) = fixture(32);
-        let mut encoded = encode_row_group_set("fixture", schema, &batches).expect("encode");
+        let mut encoded = encode_fixture(schema, &batches).expect("encode");
 
-        let corrupt_range = encoded.columns[0].value;
-        let mut column_values = encoded.column_values.to_vec();
-        let corrupt_index = corrupt_range.offset() + corrupt_range.len() - 1;
-        column_values[corrupt_index] ^= 0xff;
-        encoded.column_values = Bytes::from(column_values);
+        let mut corrupt_column = encoded.columns[0].bytes.to_vec();
+        let corrupt_index = corrupt_column.len() - 1;
+        corrupt_column[corrupt_index] ^= 0xff;
+        encoded.columns[0].bytes = Bytes::from(corrupt_column);
 
         let adapter = StorageAdapter::new(Memory::new());
-        let id = RowGroupSetId::new(*b"row-group-set-02");
+        let id = encoded.id();
         let mut writes = adapter.new_write_set();
-        stage_row_group_set(&mut writes, id, &encoded).expect("stage corrupt column");
+        stage_row_group_set(&mut writes, &encoded).expect("stage corrupt column");
         adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -2002,10 +1964,10 @@ mod tests {
             false,
         )]));
         let batch = RecordBatch::new_empty(Arc::clone(&schema));
-        assert!(encode_row_group_set("fixture", schema, &[batch]).is_err());
+        assert!(encode_fixture(schema, &[batch]).is_err());
 
         let (schema, batches) = fixture(1);
-        let encoded = encode_row_group_set("fixture", schema, &batches).expect("encode");
+        let encoded = encode_fixture(schema, &batches).expect("encode");
         assert!(validate_projection(&encoded.manifest, &[0, 0]).is_err());
         assert!(validate_projection(&encoded.manifest, &[4]).is_err());
     }

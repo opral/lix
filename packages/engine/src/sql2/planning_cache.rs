@@ -208,11 +208,6 @@ where
         lock_or_recover(&self.read_plans).len()
     }
 
-    #[cfg(test)]
-    pub(crate) fn clear_read_plans(&self) {
-        lock_or_recover(&self.read_plans).clear();
-    }
-
     /// Parses exact SQL once and returns an owned clone of the cached AST.
     ///
     /// Parse failures are intentionally not cached. Two concurrent cold calls

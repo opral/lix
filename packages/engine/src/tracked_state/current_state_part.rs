@@ -1,0 +1,3076 @@
+//! Persistent range directory for immutable committed current-state parts.
+//!
+//! Mutation inventory retains authored-event semantics. This content-addressed
+//! tree is the authoritative committed post-image consumed by state readers.
+
+use std::mem::size_of;
+
+use bytes::Bytes;
+
+use crate::changelog::CommitId;
+use crate::storage_adapter::{
+    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
+    StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+};
+use crate::tracked_state::storage::CommitDeltaMember;
+use crate::tracked_state::types::{
+    CommitDeltaReplacementScope, CommitStateManifest, CommitStateMutationInventory,
+    CurrentStateCatalogRoot, CurrentStatePartDescriptor, CurrentStatePartDirectoryRoot,
+    CurrentStatePartSet,
+};
+use crate::{LixError, storage_codec};
+
+pub(crate) const CURRENT_STATE_PART_DIRECTORY_SPACE: StorageSpace = StorageSpace::immutable(
+    StorageSpaceId(0x0004_002c),
+    "tracked_state.current_state_part_directory.v1",
+);
+pub(crate) const CURRENT_STATE_CATALOG_SPACE: StorageSpace = StorageSpace::immutable(
+    StorageSpaceId(0x0004_002d),
+    "tracked_state.current_state_catalog.v1",
+);
+
+const DIRECTORY_NODE_RAW_MAGIC: &[u8; 6] = b"LXCSDR";
+const DIRECTORY_NODE_ZSTD_MAGIC: &[u8; 6] = b"LXCSDZ";
+const DIRECTORY_NODE_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
+const DIRECTORY_FANOUT: usize = 128;
+const DIRECTORY_HASH_CONTEXT: &str = "lix current-state part directory node v1";
+const CATALOG_NODE_MAGIC: &[u8; 6] = b"LXCSCR";
+const CATALOG_HASH_CONTEXT: &str = "lix current-state catalog node v1";
+const EMPTY_CATALOG_CONTEXT: &str = "lix empty Arrow state catalog v1";
+const CATALOG_TRANSITION_CONTEXT: &str = "lix current-state catalog transition v1";
+const CATALOG_LEAF_MAX_ENTRIES: usize = 128;
+const CATALOG_MAX_KEY_BYTES: usize = 64 * 1024;
+const CURRENT_STATE_DESCRIPTOR_DIGEST_CONTEXT: &str = "lix current-state descriptor set v1";
+
+/// Publishes the serving directory for a certified complete replacement.
+/// Ordinary mutation inventories are not state partitions and return `None`.
+pub(crate) fn stage_complete_replacement_current_state_part_set(
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+) -> Result<Option<CurrentStatePartSet>, LixError> {
+    let Some(initial_generation) = inventory.replacement_generation.as_ref() else {
+        return Ok(None);
+    };
+    inventory.replacement_parts.as_ref().ok_or_else(|| {
+        directory_error("replacement generation omitted its immutable part authority")
+    })?;
+    if inventory.parts.len() != inventory.direct_part_row_counts.len() || inventory.parts.is_empty()
+    {
+        return Err(directory_error(
+            "replacement generation has no complete directly-addressable part set",
+        ));
+    }
+    let descriptors =
+        crate::tracked_state::storage::stage_complete_arrow_current_state_descriptors(
+            writes, commit_id, inventory,
+        )?;
+    let directory = stage_current_state_part_directory(writes, &descriptors)?;
+    if directory.row_count != u64::from(inventory.member_count)
+        || initial_generation.owner_commit_id != *commit_id.as_uuid().as_bytes()
+    {
+        return Err(directory_error(
+            "replacement state set disagrees with its commit authority",
+        ));
+    }
+    Ok(Some(CurrentStatePartSet {
+        scope: initial_generation.scope.clone(),
+        directory,
+    }))
+}
+
+fn stage_certified_native_current_state_part_set(
+    writes: &mut StorageWriteSet,
+    inventory: &CommitStateMutationInventory,
+) -> Result<Option<CurrentStatePartSet>, LixError> {
+    if inventory.sealed_state_parts.is_empty() {
+        return Ok(None);
+    }
+    let scope = inventory.single_partition.clone().ok_or_else(|| {
+        directory_error("certified native state leaves omitted their collection scope")
+    })?;
+    let directory = stage_current_state_part_directory(writes, &inventory.sealed_state_parts)?;
+    if directory.row_count != u64::from(inventory.member_count) {
+        return Err(directory_error(
+            "certified native state leaves disagree with their mutation inventory",
+        ));
+    }
+    Ok(Some(CurrentStatePartSet { scope, directory }))
+}
+
+fn complete_publication_coordinates(
+    scope: &CommitDeltaReplacementScope,
+    descriptors: &[CurrentStatePartDescriptor],
+    planned_members: &[CommitDeltaMember],
+) -> Result<
+    std::collections::BTreeMap<Vec<u8>, crate::tracked_state::types::TrackedStateBaseCoordinate>,
+    LixError,
+> {
+    let mut keys = planned_members
+        .iter()
+        .filter(|member| {
+            member.key.schema_key == scope.schema_key && member.key.file_id == scope.file_id
+        })
+        .map(|member| crate::tracked_state::codec::encode_key(&member.key))
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(directory_error(
+            "complete Arrow publication contains duplicate or unordered identities",
+        ));
+    }
+    let descriptor_row_count = descriptors.iter().try_fold(0usize, |total, descriptor| {
+        total
+            .checked_add(usize::from(descriptor.row_count))
+            .ok_or_else(|| directory_error("complete Arrow publication row count overflows"))
+    })?;
+    if keys.len() != planned_members.len() || keys.len() != descriptor_row_count {
+        return Err(directory_error(
+            "complete Arrow publication does not cover exactly its planned members",
+        ));
+    }
+
+    let mut coordinates = std::collections::BTreeMap::new();
+    let mut offset = 0usize;
+    for descriptor in descriptors {
+        let row_count = usize::from(descriptor.row_count);
+        let part_keys = keys.get(offset..offset + row_count).ok_or_else(|| {
+            directory_error("complete Arrow publication descriptor exceeds its member set")
+        })?;
+        if part_keys.first().map(Vec::as_slice) != Some(descriptor.first_key.as_slice())
+            || part_keys.last().map(Vec::as_slice) != Some(descriptor.last_key.as_slice())
+        {
+            return Err(directory_error(
+                "complete Arrow publication descriptor bounds disagree with its members",
+            ));
+        }
+        for (row_index, key) in part_keys.iter().enumerate() {
+            coordinates.insert(
+                key.clone(),
+                crate::tracked_state::types::TrackedStateBaseCoordinate {
+                    state_set_id: descriptor.state_set_id,
+                    group_index: descriptor.state_group_index,
+                    row_index: u32::try_from(row_index)
+                        .expect("bounded Arrow leaf row count fits u32"),
+                },
+            );
+        }
+        offset += row_count;
+    }
+    if offset != keys.len() {
+        return Err(directory_error(
+            "complete Arrow publication descriptors omit planned members",
+        ));
+    }
+    Ok(coordinates)
+}
+
+pub(crate) fn current_state_catalog_transition_digest(
+    commit_id: CommitId,
+    parent_root_id: Option<[u8; 32]>,
+    root_id: [u8; 32],
+    entry_count: u32,
+) -> Result<[u8; 32], LixError> {
+    let mut digest = blake3::Hasher::new_derive_key(CATALOG_TRANSITION_CONTEXT);
+    digest.update(commit_id.as_uuid().as_bytes());
+    match parent_root_id {
+        Some(parent_root_id) => {
+            digest.update(&[1]);
+            digest.update(&parent_root_id);
+        }
+        None => {
+            digest.update(&[0]);
+        }
+    }
+    digest.update(&root_id);
+    digest.update(&entry_count.to_be_bytes());
+    Ok(*digest.finalize().as_bytes())
+}
+
+pub(super) fn attest_catalog_root(
+    mut root: CurrentStateCatalogRoot,
+    parent: Option<&CurrentStateCatalogRoot>,
+    commit_id: CommitId,
+) -> Result<CurrentStateCatalogRoot, LixError> {
+    root.parent_root_id = parent.map(|parent| parent.root_id);
+    root.transition_digest = current_state_catalog_transition_digest(
+        commit_id,
+        root.parent_root_id,
+        root.root_id,
+        root.entry_count,
+    )?;
+    Ok(root)
+}
+
+fn empty_catalog_root_id() -> [u8; 32] {
+    *blake3::Hasher::new_derive_key(EMPTY_CATALOG_CONTEXT)
+        .finalize()
+        .as_bytes()
+}
+
+pub(crate) fn empty_current_state_catalog_root(
+    parent: Option<&CurrentStateCatalogRoot>,
+    commit_id: CommitId,
+) -> Result<CurrentStateCatalogRoot, LixError> {
+    attest_catalog_root(
+        CurrentStateCatalogRoot {
+            root_id: empty_catalog_root_id(),
+            entry_count: 0,
+            parent_root_id: None,
+            transition_digest: [0; 32],
+        },
+        parent,
+        commit_id,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct CatalogChild {
+    #[musli(bytes)]
+    route: Vec<u8>,
+    node_id: [u8; 32],
+    entry_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct CatalogNode {
+    depth: u32,
+    #[musli(bytes)]
+    sample_key: Vec<u8>,
+    entries: Vec<CurrentStatePartSet>,
+    children: Vec<CatalogChild>,
+}
+
+impl CatalogNode {
+    fn entry_count(&self) -> Result<u32, LixError> {
+        if self.children.is_empty() {
+            u32::try_from(self.entries.len())
+                .map_err(|_| directory_error("catalog entry count overflows u32"))
+        } else {
+            self.children.iter().try_fold(0u32, |total, child| {
+                total
+                    .checked_add(child.entry_count)
+                    .ok_or_else(|| directory_error("catalog entry count overflows u32"))
+            })
+        }
+    }
+}
+
+/// Opaque proof that the serving catalog was produced by the canonical
+/// parent-plus-mutation transition in this module.
+pub(crate) struct CertifiedCurrentStateCatalogPublication {
+    write_set_id: u64,
+    parent_commit_id: Option<CommitId>,
+    root: CurrentStateCatalogRoot,
+    coordinates: std::collections::BTreeMap<
+        Vec<u8>,
+        crate::tracked_state::types::TrackedStateBaseCoordinate,
+    >,
+}
+
+impl CertifiedCurrentStateCatalogPublication {
+    pub(crate) fn root(&self) -> Box<CurrentStateCatalogRoot> {
+        Box::new(self.root.clone())
+    }
+
+    pub(crate) fn parent_commit_id(&self) -> Option<CommitId> {
+        self.parent_commit_id
+    }
+
+    pub(crate) fn write_set_id(&self) -> u64 {
+        self.write_set_id
+    }
+
+    pub(crate) fn coordinates(
+        &self,
+    ) -> &std::collections::BTreeMap<Vec<u8>, crate::tracked_state::types::TrackedStateBaseCoordinate>
+    {
+        &self.coordinates
+    }
+}
+
+/// Path-copies the collection catalog after one sealed commit inventory.
+/// Every mutation must expose exact touched scopes; broad/unknown scopes are a
+/// publication error because there is no replay fallback after the hard cut.
+pub(super) async fn stage_current_state_catalog(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    parent: Option<&CommitStateManifest>,
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+    planned_members: &[CommitDeltaMember],
+    arrow_mutations: Option<&crate::live_state::EntityColumnarWriteSets>,
+) -> Result<CertifiedCurrentStateCatalogPublication, LixError> {
+    let parent_root = parent.map(|parent| parent.current_state_catalog.as_ref());
+    let parent_commit_id = parent.map(|parent| parent.commit_id);
+    let mut replacement =
+        stage_complete_replacement_current_state_part_set(writes, commit_id, inventory)?;
+    if replacement.is_none()
+        && let Some(native) = stage_certified_native_current_state_part_set(writes, inventory)?
+    {
+        let parent_has_scope = if let Some(parent_root) = parent_root {
+            load_current_state_catalog_entry_for_write(store, writes, parent_root, &native.scope)
+                .await?
+                .is_some()
+        } else {
+            false
+        };
+        if !parent_has_scope {
+            replacement = Some(native);
+        }
+    }
+    let replacement_coordinates = if let Some(entry) = replacement.as_ref() {
+        let descriptors = if inventory.replacement_generation.is_some() {
+            crate::tracked_state::storage::stage_complete_arrow_current_state_descriptors(
+                writes, commit_id, inventory,
+            )?
+        } else {
+            inventory.sealed_state_parts.clone()
+        };
+        complete_publication_coordinates(&entry.scope, &descriptors, planned_members)?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    let (mut touched_scopes, cascade_file_ids) =
+        crate::tracked_state::storage::commit_delta_members_touched_scopes(
+            inventory,
+            planned_members,
+        )?;
+    if !cascade_file_ids.is_empty()
+        && let Some(parent_root) = parent_root
+    {
+        touched_scopes.extend(
+            load_current_state_catalog_entries_for_write(store, writes, parent_root)
+                .await?
+                .into_iter()
+                .filter(|entry| {
+                    entry
+                        .scope
+                        .file_id
+                        .as_ref()
+                        .is_some_and(|file_id| cascade_file_ids.contains(file_id))
+                })
+                .map(|entry| entry.scope),
+        );
+    }
+    touched_scopes.sort();
+    touched_scopes.dedup();
+
+    let mut root = parent_root.filter(|root| root.entry_count != 0).cloned();
+    let mut staged = std::collections::BTreeMap::<[u8; 32], CatalogNode>::new();
+    let mut coordinates = replacement_coordinates;
+    for scope in touched_scopes {
+        if replacement
+            .as_ref()
+            .is_some_and(|entry| entry.scope == scope)
+        {
+            continue;
+        }
+        let parent_entry = if let Some(parent_root) = parent_root {
+            load_current_state_catalog_entry_for_write(store, writes, parent_root, &scope)
+                .await
+                .map_err(|error| {
+                    directory_error(format!(
+                        "failed to read state parent '{}' Arrow root {:?} for scope {:?}: {}",
+                        parent_commit_id.expect("parent root has a parent commit"),
+                        parent_root.root_id,
+                        scope,
+                        error.message
+                    ))
+                })?
+        } else {
+            None
+        };
+        let arrow_mutation = arrow_mutations.and_then(|sets| sets.get_scope(commit_id, &scope));
+        let (rewritten, scope_coordinates) =
+            crate::tracked_state::storage::stage_sparse_current_state_part_set(
+                store,
+                writes,
+                parent_entry.as_ref(),
+                &scope,
+                planned_members,
+                arrow_mutation,
+            )
+            .await?;
+        if scope_coordinates
+            .into_iter()
+            .any(|(key, coordinate)| coordinates.insert(key, coordinate).is_some())
+        {
+            return Err(directory_error(
+                "Arrow state publication produced duplicate mutation coordinates",
+            ));
+        }
+        root = update_catalog_entry(store, writes, &mut staged, root.as_ref(), &scope, rewritten)
+            .await
+            .map_err(|error| {
+                directory_error(format!(
+                    "failed to path-copy Arrow scope {scope:?} for commit '{commit_id}' from state parent {parent_commit_id:?}: {}",
+                    error.message
+                ))
+            })?;
+    }
+    if let Some(entry) = replacement {
+        let scope = entry.scope.clone();
+        root = update_catalog_entry(
+            store,
+            writes,
+            &mut staged,
+            root.as_ref(),
+            &scope,
+            Some(entry),
+        )
+        .await
+        .map_err(|error| {
+            directory_error(format!(
+                "failed to publish replacement Arrow scope {scope:?} for commit '{commit_id}': {}",
+                error.message
+            ))
+        })?;
+    }
+    let root = match root {
+        Some(root) => attest_catalog_root(root, parent_root, commit_id)?,
+        None => empty_current_state_catalog_root(parent_root, commit_id)?,
+    };
+    if root.entry_count != 0 {
+        flush_reachable_staged_catalog_nodes(writes, &staged, root.root_id)?;
+    }
+    Ok(CertifiedCurrentStateCatalogPublication {
+        write_set_id: writes.identity(),
+        parent_commit_id,
+        root,
+        coordinates,
+    })
+}
+
+/// Validates the content-addressed root and its commit-bound transition.
+pub(crate) async fn validate_current_state_catalog_transition_root(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &CommitStateManifest,
+    parent: Option<&CommitStateManifest>,
+) -> Result<(), LixError> {
+    let root = state.current_state_catalog.as_ref();
+    let parent_root = parent.map(|parent| parent.current_state_catalog.as_ref());
+    let expected_transition = current_state_catalog_transition_digest(
+        state.commit_id,
+        parent_root.map(|root| root.root_id),
+        root.root_id,
+        root.entry_count,
+    )?;
+    if root.parent_root_id != parent_root.map(|root| root.root_id)
+        || root.transition_digest != expected_transition
+    {
+        return Err(directory_error(
+            "Arrow state root transition disagrees with its commit authority",
+        ));
+    }
+    if root.entry_count == 0 {
+        if root.root_id != empty_catalog_root_id() {
+            return Err(directory_error(
+                "empty Arrow state root has the wrong digest",
+            ));
+        }
+    } else {
+        load_current_state_catalog_reachability_many(store, std::slice::from_ref(root)).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn stage_fresh_current_state_catalog(
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    inventory: &CommitStateMutationInventory,
+) -> Result<CertifiedCurrentStateCatalogPublication, LixError> {
+    let Some(entry) =
+        stage_complete_replacement_current_state_part_set(writes, commit_id, inventory)?
+    else {
+        return Ok(CertifiedCurrentStateCatalogPublication {
+            write_set_id: writes.identity(),
+            parent_commit_id: None,
+            root: empty_current_state_catalog_root(None, commit_id)?,
+            coordinates: std::collections::BTreeMap::new(),
+        });
+    };
+    let root = attest_catalog_root(
+        stage_catalog_from_entries(writes, vec![entry])?,
+        None,
+        commit_id,
+    )?;
+    Ok(CertifiedCurrentStateCatalogPublication {
+        write_set_id: writes.identity(),
+        parent_commit_id: None,
+        root,
+        coordinates: std::collections::BTreeMap::new(),
+    })
+}
+
+#[cfg(test)]
+pub(super) fn stage_catalog_from_entries(
+    writes: &mut StorageWriteSet,
+    entries: Vec<CurrentStatePartSet>,
+) -> Result<CurrentStateCatalogRoot, LixError> {
+    let mut staged = std::collections::BTreeMap::new();
+    let child = stage_catalog_subtree(writes, &mut staged, 0, entries)?;
+    flush_reachable_staged_catalog_nodes(writes, &staged, child.node_id)?;
+    Ok(CurrentStateCatalogRoot {
+        root_id: child.node_id,
+        entry_count: child.entry_count,
+        parent_root_id: None,
+        transition_digest: [0; 32],
+    })
+}
+
+async fn update_catalog_entry(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    staged: &mut std::collections::BTreeMap<[u8; 32], CatalogNode>,
+    root: Option<&CurrentStateCatalogRoot>,
+    scope: &CommitDeltaReplacementScope,
+    replacement: Option<CurrentStatePartSet>,
+) -> Result<Option<CurrentStateCatalogRoot>, LixError> {
+    let route_key = catalog_scope_key(scope)?;
+    let Some(root) = root else {
+        let Some(entry) = replacement else {
+            return Ok(None);
+        };
+        let child = stage_catalog_subtree(writes, staged, 0, vec![entry])?;
+        return Ok(Some(CurrentStateCatalogRoot {
+            root_id: child.node_id,
+            entry_count: child.entry_count,
+            parent_root_id: None,
+            transition_digest: [0; 32],
+        }));
+    };
+    let mut path = Vec::<(CatalogNode, usize)>::new();
+    let mut node_id = root.root_id;
+    let staged_node = staged.get(&node_id).cloned();
+    let staged_bytes = writes.staged_value(CURRENT_STATE_CATALOG_SPACE, &node_id);
+    let mut node =
+        load_catalog_node_with_staged(store, staged_node.clone(), staged_bytes.clone(), node_id)
+            .await
+            .map_err(|error| {
+                directory_error(format!(
+                    "cannot load catalog root {node_id:?} (local={}, write_set={}): {}",
+                    staged_node.is_some(),
+                    staged_bytes.is_some(),
+                    error.message
+                ))
+            })?;
+    if node.entry_count()? != root.entry_count || node.depth != 0 {
+        return Err(directory_error("catalog root summary mismatch"));
+    }
+    while !node.children.is_empty() {
+        let depth = usize::try_from(node.depth).expect("u32 fits usize");
+        let selector = *route_key
+            .get(depth)
+            .ok_or_else(|| directory_error("catalog exceeds its hash depth"))?;
+        match node
+            .children
+            .binary_search_by_key(&selector, |child| child.route[0])
+        {
+            Ok(child_index) => {
+                let expected = node.children[child_index].clone();
+                if route_key.get(depth..depth + expected.route.len())
+                    != Some(expected.route.as_slice())
+                {
+                    let Some(entry) = replacement else {
+                        return Ok(Some(root.clone()));
+                    };
+                    let existing = load_catalog_node_with_staged(
+                        store,
+                        staged.get(&expected.node_id).cloned(),
+                        writes.staged_value(CURRENT_STATE_CATALOG_SPACE, &expected.node_id),
+                        expected.node_id,
+                    )
+                    .await?;
+                    validate_catalog_child(&node, &expected, &existing)?;
+                    let mismatch = expected
+                        .route
+                        .iter()
+                        .zip(route_key.iter().skip(depth))
+                        .position(|(left, right)| left != right)
+                        .unwrap_or_else(|| expected.route.len().min(route_key.len() - depth));
+                    let divergence = depth + mismatch;
+                    if divergence == depth {
+                        let child =
+                            stage_catalog_subtree(writes, staged, divergence + 1, vec![entry])?;
+                        let child = catalog_child_for_parent(staged, depth, child.node_id)?;
+                        node.children.insert(child_index, child);
+                        node.children.sort_by_key(|child| child.route[0]);
+                        let node_id = stage_catalog_node(writes, staged, node)?;
+                        return rebuild_catalog_path(store, writes, staged, path, Some(node_id))
+                            .await;
+                    }
+                    let mut new_child =
+                        stage_catalog_subtree(writes, staged, divergence + 1, vec![entry])?;
+                    new_child = catalog_child_for_parent(staged, divergence, new_child.node_id)?;
+                    let old_child = catalog_child_for_parent(staged, divergence, expected.node_id)
+                        .or_else(|_| {
+                            let route = existing.sample_key[divergence
+                                ..usize::try_from(existing.depth).expect("u32 fits usize")]
+                                .to_vec();
+                            Ok::<CatalogChild, LixError>(CatalogChild {
+                                route,
+                                node_id: expected.node_id,
+                                entry_count: expected.entry_count,
+                            })
+                        })?;
+                    let mut children = vec![old_child, new_child];
+                    children.sort_by_key(|child| child.route[0]);
+                    let branch = CatalogNode {
+                        depth: u32::try_from(divergence).expect("catalog depth fits u32"),
+                        sample_key: existing.sample_key.clone(),
+                        entries: Vec::new(),
+                        children,
+                    };
+                    let branch_id = stage_catalog_node(writes, staged, branch)?;
+                    node.children[child_index] =
+                        catalog_child_for_parent(staged, depth, branch_id)?;
+                    let node_id = stage_catalog_node(writes, staged, node)?;
+                    return rebuild_catalog_path(store, writes, staged, path, Some(node_id)).await;
+                }
+                path.push((node, child_index));
+                node_id = expected.node_id;
+                node = load_catalog_node_with_staged(
+                    store,
+                    staged.get(&node_id).cloned(),
+                    writes.staged_value(CURRENT_STATE_CATALOG_SPACE, &node_id),
+                    node_id,
+                )
+                .await?;
+                validate_catalog_child(
+                    &path.last().expect("catalog path exists").0,
+                    &expected,
+                    &node,
+                )?;
+            }
+            Err(child_index) => {
+                let Some(entry) = replacement else {
+                    return Ok(Some(root.clone()));
+                };
+                let child = stage_catalog_subtree(writes, staged, depth + 1, vec![entry])?;
+                let child = catalog_child_for_parent(staged, depth, child.node_id)?;
+                node.children.insert(child_index, child);
+                node_id = stage_catalog_node(writes, staged, node)?;
+                return rebuild_catalog_path(store, writes, staged, path, Some(node_id)).await;
+            }
+        }
+    }
+
+    let entry_index = node
+        .entries
+        .binary_search_by(|entry| entry.scope.cmp(scope));
+    match (entry_index, replacement) {
+        (Ok(index), Some(entry)) => node.entries[index] = entry,
+        (Err(index), Some(entry)) => node.entries.insert(index, entry),
+        (Ok(index), None) => {
+            node.entries.remove(index);
+        }
+        (Err(_), None) => return Ok(Some(root.clone())),
+    }
+    let child = if node.entries.is_empty() {
+        None
+    } else {
+        Some(stage_catalog_subtree(
+            writes,
+            staged,
+            usize::try_from(node.depth).expect("u32 fits usize"),
+            node.entries,
+        )?)
+    };
+    rebuild_catalog_path(
+        store,
+        writes,
+        staged,
+        path,
+        child.map(|child| child.node_id),
+    )
+    .await
+}
+
+async fn rebuild_catalog_path(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    staged: &mut std::collections::BTreeMap<[u8; 32], CatalogNode>,
+    mut path: Vec<(CatalogNode, usize)>,
+    mut child_id: Option<[u8; 32]>,
+) -> Result<Option<CurrentStateCatalogRoot>, LixError> {
+    while let Some((mut parent, child_index)) = path.pop() {
+        match child_id {
+            Some(node_id) => {
+                let staged_bytes = writes.staged_value(CURRENT_STATE_CATALOG_SPACE, &node_id);
+                parent.children[child_index] = catalog_child_for_parent_with_store(
+                    store,
+                    staged_bytes,
+                    staged,
+                    usize::try_from(parent.depth).expect("u32 fits usize"),
+                    node_id,
+                )
+                .await?;
+            }
+            None => {
+                parent.children.remove(child_index);
+            }
+        }
+        child_id = if parent.children.is_empty() {
+            None
+        } else if parent.children.len() == 1 && parent.depth != 0 {
+            Some(parent.children[0].node_id)
+        } else if parent
+            .children
+            .iter()
+            .try_fold(0u32, |total, child| total.checked_add(child.entry_count))
+            .is_some_and(|count| count <= CATALOG_LEAF_MAX_ENTRIES as u32)
+        {
+            let mut entries = Vec::new();
+            let mut pending = parent
+                .children
+                .iter()
+                .map(|child| child.node_id)
+                .collect::<Vec<_>>();
+            while let Some(node_id) = pending.pop() {
+                let mut node = load_catalog_node_with_staged(
+                    store,
+                    staged.get(&node_id).cloned(),
+                    writes.staged_value(CURRENT_STATE_CATALOG_SPACE, &node_id),
+                    node_id,
+                )
+                .await?;
+                if node.children.is_empty() {
+                    entries.append(&mut node.entries);
+                } else {
+                    pending.extend(node.children.into_iter().map(|child| child.node_id));
+                }
+            }
+            Some(
+                stage_catalog_subtree(
+                    writes,
+                    staged,
+                    usize::try_from(parent.depth).expect("catalog depth fits usize"),
+                    entries,
+                )?
+                .node_id,
+            )
+        } else {
+            Some(stage_catalog_node(writes, staged, parent)?)
+        };
+    }
+    let Some(root_id) = child_id else {
+        return Ok(None);
+    };
+    let entry_count = staged
+        .get(&root_id)
+        .ok_or_else(|| directory_error("staged catalog root is missing"))?
+        .entry_count()?;
+    Ok(Some(CurrentStateCatalogRoot {
+        root_id,
+        entry_count,
+        parent_root_id: None,
+        transition_digest: [0; 32],
+    }))
+}
+
+fn stage_catalog_subtree(
+    writes: &mut StorageWriteSet,
+    staged: &mut std::collections::BTreeMap<[u8; 32], CatalogNode>,
+    depth: usize,
+    mut entries: Vec<CurrentStatePartSet>,
+) -> Result<CatalogChild, LixError> {
+    entries.sort_by(|left, right| left.scope.cmp(&right.scope));
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].scope == pair[1].scope)
+    {
+        return Err(directory_error("catalog contains duplicate scopes"));
+    }
+    if entries.len() <= CATALOG_LEAF_MAX_ENTRIES {
+        let sample_key = catalog_scope_key(&entries[0].scope)?;
+        let node = CatalogNode {
+            depth: u32::try_from(depth).expect("catalog depth fits u32"),
+            sample_key,
+            entries,
+            children: Vec::new(),
+        };
+        let entry_count = node.entry_count()?;
+        let node_id = stage_catalog_node(writes, staged, node)?;
+        return Ok(CatalogChild {
+            route: Vec::new(),
+            node_id,
+            entry_count,
+        });
+    }
+    let mut groups = std::collections::BTreeMap::<u8, Vec<CurrentStatePartSet>>::new();
+    for entry in entries {
+        let route_key = catalog_scope_key(&entry.scope)?;
+        let selector = *route_key
+            .get(depth)
+            .ok_or_else(|| directory_error("duplicate canonical catalog scope key"))?;
+        groups.entry(selector).or_default().push(entry);
+    }
+    if groups.len() == 1 {
+        let (selector, entries) = groups
+            .into_iter()
+            .next()
+            .expect("one catalog route group exists");
+        let keys = entries
+            .iter()
+            .map(|entry| catalog_scope_key(&entry.scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        let shortest = keys.iter().map(Vec::len).min().unwrap_or(depth + 1);
+        let mut divergence = depth + 1;
+        while divergence < shortest
+            && keys
+                .iter()
+                .all(|key| key[divergence] == keys[0][divergence])
+        {
+            divergence += 1;
+        }
+        let child = stage_catalog_subtree(writes, staged, divergence, entries)?;
+        let child = catalog_child_for_parent(staged, depth, child.node_id)?;
+        debug_assert_eq!(child.route[0], selector);
+        if depth == 0 {
+            let sample_key = staged
+                .get(&child.node_id)
+                .expect("staged catalog child exists")
+                .sample_key
+                .clone();
+            let root = CatalogNode {
+                depth: 0,
+                sample_key,
+                entries: Vec::new(),
+                children: vec![child],
+            };
+            let entry_count = root.entry_count()?;
+            let node_id = stage_catalog_node(writes, staged, root)?;
+            return Ok(CatalogChild {
+                route: Vec::new(),
+                node_id,
+                entry_count,
+            });
+        }
+        return Ok(child);
+    }
+    let mut children = Vec::with_capacity(groups.len());
+    for (selector, entries) in groups {
+        let child = stage_catalog_subtree(writes, staged, depth + 1, entries)?;
+        let child = catalog_child_for_parent(staged, depth, child.node_id)?;
+        debug_assert_eq!(child.route[0], selector);
+        children.push(child);
+    }
+    let sample_key = staged
+        .get(&children[0].node_id)
+        .expect("staged catalog child exists")
+        .sample_key
+        .clone();
+    let node = CatalogNode {
+        depth: u32::try_from(depth).expect("catalog depth fits u32"),
+        sample_key,
+        entries: Vec::new(),
+        children,
+    };
+    let entry_count = node.entry_count()?;
+    let node_id = stage_catalog_node(writes, staged, node)?;
+    Ok(CatalogChild {
+        route: Vec::new(),
+        node_id,
+        entry_count,
+    })
+}
+
+fn stage_catalog_node(
+    _writes: &mut StorageWriteSet,
+    staged: &mut std::collections::BTreeMap<[u8; 32], CatalogNode>,
+    node: CatalogNode,
+) -> Result<[u8; 32], LixError> {
+    validate_catalog_node(&node)?;
+    let payload = storage_codec::encode("current-state catalog node", &node)?;
+    if payload.len() > DIRECTORY_NODE_MAX_DECODED_BYTES {
+        return Err(directory_error(
+            "catalog node exceeds its decoded size bound",
+        ));
+    }
+    let mut encoded = Vec::with_capacity(CATALOG_NODE_MAGIC.len() + payload.len());
+    encoded.extend_from_slice(CATALOG_NODE_MAGIC);
+    encoded.extend_from_slice(&payload);
+    let bytes = Bytes::from(encoded);
+    let node_id = catalog_node_digest(&bytes);
+    staged.insert(node_id, node);
+    Ok(node_id)
+}
+
+fn flush_reachable_staged_catalog_nodes(
+    writes: &mut StorageWriteSet,
+    staged: &std::collections::BTreeMap<[u8; 32], CatalogNode>,
+    root_id: [u8; 32],
+) -> Result<(), LixError> {
+    let mut pending = vec![root_id];
+    let mut reachable = std::collections::BTreeSet::new();
+    while let Some(node_id) = pending.pop() {
+        if !reachable.insert(node_id) {
+            continue;
+        }
+        let Some(node) = staged.get(&node_id) else {
+            continue;
+        };
+        pending.extend(node.children.iter().map(|child| child.node_id));
+    }
+    for node_id in reachable {
+        let Some(node) = staged.get(&node_id) else {
+            continue;
+        };
+        let payload = storage_codec::encode("current-state catalog node", node)?;
+        let mut encoded = Vec::with_capacity(CATALOG_NODE_MAGIC.len() + payload.len());
+        encoded.extend_from_slice(CATALOG_NODE_MAGIC);
+        encoded.extend_from_slice(&payload);
+        let bytes = Bytes::from(encoded);
+        if catalog_node_digest(&bytes) != node_id {
+            return Err(directory_error("staged catalog node digest drifted"));
+        }
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_crud_current_state_catalog_bytes(bytes.len());
+        writes.put(
+            CURRENT_STATE_CATALOG_SPACE,
+            StorageKey(Bytes::copy_from_slice(&node_id)),
+            StorageValue { bytes },
+        );
+    }
+    Ok(())
+}
+
+fn catalog_child_for_parent(
+    staged: &std::collections::BTreeMap<[u8; 32], CatalogNode>,
+    parent_depth: usize,
+    node_id: [u8; 32],
+) -> Result<CatalogChild, LixError> {
+    let node = staged
+        .get(&node_id)
+        .ok_or_else(|| directory_error("staged catalog child is missing"))?;
+    let child_depth = usize::try_from(node.depth).expect("u32 fits usize");
+    if child_depth <= parent_depth || child_depth > node.sample_key.len() {
+        return Err(directory_error(
+            "catalog child has an invalid compressed route",
+        ));
+    }
+    Ok(CatalogChild {
+        route: node.sample_key[parent_depth..child_depth].to_vec(),
+        node_id,
+        entry_count: node.entry_count()?,
+    })
+}
+
+async fn catalog_child_for_parent_with_store(
+    store: &(impl StorageAdapterRead + ?Sized),
+    staged_bytes: Option<Bytes>,
+    staged: &std::collections::BTreeMap<[u8; 32], CatalogNode>,
+    parent_depth: usize,
+    node_id: [u8; 32],
+) -> Result<CatalogChild, LixError> {
+    if staged.contains_key(&node_id) {
+        return catalog_child_for_parent(staged, parent_depth, node_id);
+    }
+    let node = load_catalog_node_with_staged(store, None, staged_bytes, node_id)
+        .await
+        .map_err(|error| {
+            directory_error(format!(
+                "rebuild path cannot load child {node_id:?} at depth {parent_depth}: {}",
+                error.message
+            ))
+        })?;
+    let child_depth = usize::try_from(node.depth).expect("u32 fits usize");
+    if child_depth <= parent_depth || child_depth > node.sample_key.len() {
+        return Err(directory_error(
+            "catalog child has an invalid compressed route",
+        ));
+    }
+    Ok(CatalogChild {
+        route: node.sample_key[parent_depth..child_depth].to_vec(),
+        node_id,
+        entry_count: node.entry_count()?,
+    })
+}
+
+fn validate_catalog_child(
+    parent: &CatalogNode,
+    expected: &CatalogChild,
+    child: &CatalogNode,
+) -> Result<(), LixError> {
+    let parent_depth = usize::try_from(parent.depth).expect("u32 fits usize");
+    let child_depth = usize::try_from(child.depth).expect("u32 fits usize");
+    if child.entry_count()? != expected.entry_count
+        || child_depth <= parent_depth
+        || child_depth > child.sample_key.len()
+        || child.sample_key.get(parent_depth..child_depth) != Some(expected.route.as_slice())
+    {
+        return Err(directory_error("catalog child summary mismatch"));
+    }
+    Ok(())
+}
+
+async fn load_catalog_node_with_staged(
+    store: &(impl StorageAdapterRead + ?Sized),
+    staged: Option<CatalogNode>,
+    staged_bytes: Option<Bytes>,
+    node_id: [u8; 32],
+) -> Result<CatalogNode, LixError> {
+    if let Some(node) = staged {
+        return Ok(node);
+    }
+    if let Some(bytes) = staged_bytes {
+        return decode_catalog_node(&bytes, node_id);
+    }
+    load_catalog_node(store, node_id).await
+}
+
+async fn load_catalog_node(
+    store: &(impl StorageAdapterRead + ?Sized),
+    node_id: [u8; 32],
+) -> Result<CatalogNode, LixError> {
+    let key = StorageKey(Bytes::copy_from_slice(&node_id));
+    let result = PointReadPlan::new(CURRENT_STATE_CATALOG_SPACE, &[key])
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let value = result
+        .value
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| directory_error("catalog references a missing node"))?;
+    let StorageProjectedValue::FullValue(bytes) = value else {
+        return Err(directory_error("catalog node read omitted its value"));
+    };
+    decode_catalog_node(&bytes, node_id)
+}
+
+fn decode_catalog_node(bytes: &[u8], node_id: [u8; 32]) -> Result<CatalogNode, LixError> {
+    if catalog_node_digest(bytes) != node_id {
+        return Err(directory_error("catalog node content digest mismatch"));
+    }
+    let payload = bytes
+        .strip_prefix(CATALOG_NODE_MAGIC)
+        .ok_or_else(|| directory_error("catalog node has an unsupported format"))?;
+    let node: CatalogNode = storage_codec::decode("current-state catalog node", payload)?;
+    validate_catalog_node(&node)?;
+    Ok(node)
+}
+
+pub(crate) async fn load_current_state_catalog_entry(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &CurrentStateCatalogRoot,
+    scope: &CommitDeltaReplacementScope,
+) -> Result<Option<CurrentStatePartSet>, LixError> {
+    if root.entry_count == 0 {
+        return (root.root_id == empty_catalog_root_id())
+            .then_some(None)
+            .ok_or_else(|| directory_error("empty Arrow state root has the wrong digest"));
+    }
+    let route_key = catalog_scope_key(scope)?;
+    let mut expected_count = root.entry_count;
+    let mut minimum_depth = 0u32;
+    let mut expected_route: Option<(usize, Vec<u8>)> = None;
+    let mut node_id = root.root_id;
+    loop {
+        let node = load_catalog_node(store, node_id).await?;
+        if node.entry_count()? != expected_count
+            || node.depth < minimum_depth
+            || (minimum_depth == 0 && node.depth != 0)
+        {
+            return Err(directory_error("catalog node summary mismatch"));
+        }
+        if let Some((parent_depth, route)) = expected_route.take() {
+            let child_depth = usize::try_from(node.depth).expect("u32 fits usize");
+            if child_depth > node.sample_key.len()
+                || node.sample_key.get(parent_depth..child_depth) != Some(route.as_slice())
+            {
+                return Err(directory_error("catalog child route mismatch"));
+            }
+        }
+        if node.children.is_empty() {
+            return Ok(node
+                .entries
+                .binary_search_by(|entry| entry.scope.cmp(scope))
+                .ok()
+                .map(|index| node.entries[index].clone()));
+        }
+        let depth = usize::try_from(node.depth).expect("u32 fits usize");
+        let selector = *route_key
+            .get(depth)
+            .ok_or_else(|| directory_error("catalog exceeds its hash depth"))?;
+        let Ok(index) = node
+            .children
+            .binary_search_by_key(&selector, |child| child.route[0])
+        else {
+            return Ok(None);
+        };
+        let child = &node.children[index];
+        if route_key.get(depth..depth + child.route.len()) != Some(child.route.as_slice()) {
+            return Ok(None);
+        }
+        node_id = child.node_id;
+        expected_count = child.entry_count;
+        minimum_depth = node.depth.saturating_add(1);
+        expected_route = Some((depth, child.route.clone()));
+    }
+}
+
+async fn load_current_state_catalog_entry_for_write(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    root: &CurrentStateCatalogRoot,
+    scope: &CommitDeltaReplacementScope,
+) -> Result<Option<CurrentStatePartSet>, LixError> {
+    if root.entry_count == 0 {
+        return (root.root_id == empty_catalog_root_id())
+            .then_some(None)
+            .ok_or_else(|| directory_error("empty Arrow state root has the wrong digest"));
+    }
+    let route_key = catalog_scope_key(scope)?;
+    let mut expected_count = root.entry_count;
+    let mut minimum_depth = 0u32;
+    let mut expected_route: Option<(usize, Vec<u8>)> = None;
+    let mut node_id = root.root_id;
+    loop {
+        let staged = writes.staged_value(CURRENT_STATE_CATALOG_SPACE, &node_id);
+        let node = load_catalog_node_with_staged(store, None, staged, node_id).await?;
+        if node.entry_count()? != expected_count
+            || node.depth < minimum_depth
+            || (minimum_depth == 0 && node.depth != 0)
+        {
+            return Err(directory_error("catalog node summary mismatch"));
+        }
+        if let Some((parent_depth, route)) = expected_route.take() {
+            let child_depth = usize::try_from(node.depth).expect("u32 fits usize");
+            if child_depth > node.sample_key.len()
+                || node.sample_key.get(parent_depth..child_depth) != Some(route.as_slice())
+            {
+                return Err(directory_error("catalog child route mismatch"));
+            }
+        }
+        if node.children.is_empty() {
+            return Ok(node
+                .entries
+                .binary_search_by(|entry| entry.scope.cmp(scope))
+                .ok()
+                .map(|index| node.entries[index].clone()));
+        }
+        let depth = usize::try_from(node.depth).expect("u32 fits usize");
+        let selector = *route_key
+            .get(depth)
+            .ok_or_else(|| directory_error("catalog exceeds its hash depth"))?;
+        let Ok(index) = node
+            .children
+            .binary_search_by_key(&selector, |child| child.route[0])
+        else {
+            return Ok(None);
+        };
+        let child = &node.children[index];
+        if route_key.get(depth..depth + child.route.len()) != Some(child.route.as_slice()) {
+            return Ok(None);
+        }
+        node_id = child.node_id;
+        expected_count = child.entry_count;
+        minimum_depth = node.depth.saturating_add(1);
+        expected_route = Some((depth, child.route.clone()));
+    }
+}
+
+/// Resolves catalog scopes in caller order while reading each shared trie node
+/// at most once. Each frontier is issued as one storage point-read batch.
+pub(crate) async fn load_current_state_catalog_entries_for_scopes(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &CurrentStateCatalogRoot,
+    scopes: &[CommitDeltaReplacementScope],
+) -> Result<Vec<Option<CurrentStatePartSet>>, LixError> {
+    let mut loaded =
+        load_current_state_catalog_entries_for_scope_sets(store, &[(root, scopes)]).await?;
+    Ok(loaded.pop().unwrap_or_default())
+}
+
+/// Resolves multiple caller-owned scope batches while reading every shared
+/// catalog node at most once. Results retain request, scope, and duplicate order.
+pub(crate) async fn load_current_state_catalog_entries_for_scope_sets(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[(&CurrentStateCatalogRoot, &[CommitDeltaReplacementScope])],
+) -> Result<Vec<Vec<Option<CurrentStatePartSet>>>, LixError> {
+    #[derive(Clone)]
+    struct PendingCatalogNode {
+        request_index: usize,
+        expected_count: u32,
+        minimum_depth: u32,
+        expected_route: Option<(usize, Vec<u8>)>,
+        scope_indices: Vec<usize>,
+    }
+
+    let route_keys = requests
+        .iter()
+        .map(|(_, scopes)| {
+            scopes
+                .iter()
+                .map(catalog_scope_key)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut results = requests
+        .iter()
+        .map(|(_, scopes)| vec![None; scopes.len()])
+        .collect::<Vec<_>>();
+    let mut frontier = std::collections::BTreeMap::<[u8; 32], Vec<PendingCatalogNode>>::new();
+    for (request_index, (root, scopes)) in requests.iter().enumerate() {
+        if root.entry_count == 0 && root.root_id != empty_catalog_root_id() {
+            return Err(directory_error(
+                "empty Arrow state root has the wrong digest",
+            ));
+        }
+        if !scopes.is_empty() && root.entry_count != 0 {
+            frontier
+                .entry(root.root_id)
+                .or_default()
+                .push(PendingCatalogNode {
+                    request_index,
+                    expected_count: root.entry_count,
+                    minimum_depth: 0,
+                    expected_route: None,
+                    scope_indices: (0..scopes.len()).collect(),
+                });
+        }
+    }
+    let mut cache = std::collections::BTreeMap::<[u8; 32], CatalogNode>::new();
+    let mut visited = std::collections::BTreeSet::<(usize, [u8; 32])>::new();
+
+    while !frontier.is_empty() {
+        let unseen = frontier
+            .keys()
+            .filter(|node_id| !cache.contains_key(*node_id))
+            .copied()
+            .collect::<Vec<_>>();
+        let storage_keys = unseen
+            .iter()
+            .map(|node_id| StorageKey(Bytes::copy_from_slice(node_id)))
+            .collect::<Vec<_>>();
+        if !storage_keys.is_empty() {
+            let loaded = PointReadPlan::new(CURRENT_STATE_CATALOG_SPACE, &storage_keys)
+                .materialize(store, StorageGetOptions::default())
+                .await?;
+            for (node_id, value) in unseen.into_iter().zip(loaded.value) {
+                let value = value.ok_or_else(|| {
+                    directory_error(format!(
+                        "scope lookup references missing catalog node {node_id:?}"
+                    ))
+                })?;
+                let StorageProjectedValue::FullValue(bytes) = value else {
+                    return Err(directory_error("catalog node read omitted its value"));
+                };
+                if catalog_node_digest(&bytes) != node_id {
+                    return Err(directory_error("catalog node content digest mismatch"));
+                }
+                let payload = bytes
+                    .strip_prefix(CATALOG_NODE_MAGIC)
+                    .ok_or_else(|| directory_error("catalog node has an unsupported format"))?;
+                let node: CatalogNode =
+                    storage_codec::decode("current-state catalog node", payload)?;
+                validate_catalog_node(&node)?;
+                cache.insert(node_id, node);
+            }
+        }
+        let mut next = std::collections::BTreeMap::<[u8; 32], Vec<PendingCatalogNode>>::new();
+
+        for (node_id, pending_requests) in frontier {
+            let node = cache
+                .get(&node_id)
+                .ok_or_else(|| directory_error("catalog frontier omitted a node"))?;
+            for pending in pending_requests {
+                if !visited.insert((pending.request_index, node_id)) {
+                    return Err(directory_error(
+                        "catalog scoped lookup contains a cycle or duplicate child",
+                    ));
+                }
+                if node.entry_count()? != pending.expected_count
+                    || node.depth < pending.minimum_depth
+                    || (pending.minimum_depth == 0 && node.depth != 0)
+                {
+                    return Err(directory_error("catalog node summary mismatch"));
+                }
+                if let Some((parent_depth, route)) = pending.expected_route {
+                    let child_depth = usize::try_from(node.depth).expect("u32 fits usize");
+                    if child_depth > node.sample_key.len()
+                        || node.sample_key.get(parent_depth..child_depth) != Some(route.as_slice())
+                    {
+                        return Err(directory_error("catalog child route mismatch"));
+                    }
+                }
+
+                if node.children.is_empty() {
+                    let scopes = requests[pending.request_index].1;
+                    for scope_index in pending.scope_indices {
+                        results[pending.request_index][scope_index] = node
+                            .entries
+                            .binary_search_by(|entry| entry.scope.cmp(&scopes[scope_index]))
+                            .ok()
+                            .map(|index| node.entries[index].clone());
+                    }
+                    continue;
+                }
+
+                let depth = usize::try_from(node.depth).expect("u32 fits usize");
+                for scope_index in pending.scope_indices {
+                    let route_key = &route_keys[pending.request_index][scope_index];
+                    let Some(&selector) = route_key.get(depth) else {
+                        // The query cannot lie below this compressed prefix.
+                        continue;
+                    };
+                    let Ok(child_index) = node
+                        .children
+                        .binary_search_by_key(&selector, |child| child.route[0])
+                    else {
+                        continue;
+                    };
+                    let child = &node.children[child_index];
+                    if route_key.get(depth..depth + child.route.len())
+                        != Some(child.route.as_slice())
+                    {
+                        continue;
+                    }
+                    let child_pending = next.entry(child.node_id).or_default();
+                    if let Some(existing) = child_pending
+                        .iter_mut()
+                        .find(|existing| existing.request_index == pending.request_index)
+                    {
+                        if existing.expected_count != child.entry_count
+                            || existing.minimum_depth != node.depth.saturating_add(1)
+                            || existing.expected_route.as_ref()
+                                != Some(&(depth, child.route.clone()))
+                        {
+                            return Err(directory_error(
+                                "catalog shared child has conflicting summaries",
+                            ));
+                        }
+                        existing.scope_indices.push(scope_index);
+                    } else {
+                        child_pending.push(PendingCatalogNode {
+                            request_index: pending.request_index,
+                            expected_count: child.entry_count,
+                            minimum_depth: node.depth.saturating_add(1),
+                            expected_route: Some((depth, child.route.clone())),
+                            scope_indices: vec![scope_index],
+                        });
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    Ok(results)
+}
+
+pub(crate) async fn load_current_state_catalog_entries(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &CurrentStateCatalogRoot,
+) -> Result<Vec<CurrentStatePartSet>, LixError> {
+    if root.entry_count == 0 {
+        return (root.root_id == empty_catalog_root_id())
+            .then_some(Vec::new())
+            .ok_or_else(|| directory_error("empty Arrow state root has the wrong digest"));
+    }
+    let mut pending = vec![(
+        root.root_id,
+        root.entry_count,
+        0u32,
+        None::<(usize, Vec<u8>)>,
+    )];
+    let mut entries = Vec::with_capacity(root.entry_count as usize);
+    while let Some((node_id, expected_count, minimum_depth, expected_route)) = pending.pop() {
+        let mut node = load_catalog_node(store, node_id).await?;
+        if node.entry_count()? != expected_count
+            || node.depth < minimum_depth
+            || (minimum_depth == 0 && node.depth != 0)
+        {
+            return Err(directory_error("catalog node summary mismatch"));
+        }
+        if let Some((parent_depth, route)) = expected_route {
+            let child_depth = usize::try_from(node.depth).expect("u32 fits usize");
+            if child_depth > node.sample_key.len()
+                || node.sample_key.get(parent_depth..child_depth) != Some(route.as_slice())
+            {
+                return Err(directory_error("catalog child route mismatch"));
+            }
+        }
+        if node.children.is_empty() {
+            entries.append(&mut node.entries);
+        } else {
+            let child_min_depth = node.depth.saturating_add(1);
+            let parent_depth = usize::try_from(node.depth).expect("u32 fits usize");
+            pending.extend(node.children.into_iter().rev().map(|child| {
+                (
+                    child.node_id,
+                    child.entry_count,
+                    child_min_depth,
+                    Some((parent_depth, child.route)),
+                )
+            }));
+        }
+    }
+    if entries.len() != root.entry_count as usize {
+        return Err(directory_error("catalog root entry count mismatch"));
+    }
+    entries.sort_by(|left, right| left.scope.cmp(&right.scope));
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].scope == pair[1].scope)
+    {
+        return Err(directory_error("catalog contains duplicate scopes"));
+    }
+    Ok(entries)
+}
+
+async fn load_current_state_catalog_entries_for_write(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    root: &CurrentStateCatalogRoot,
+) -> Result<Vec<CurrentStatePartSet>, LixError> {
+    if root.entry_count == 0 {
+        return (root.root_id == empty_catalog_root_id())
+            .then_some(Vec::new())
+            .ok_or_else(|| directory_error("empty Arrow state root has the wrong digest"));
+    }
+    let mut pending = vec![(
+        root.root_id,
+        root.entry_count,
+        0u32,
+        None::<(usize, Vec<u8>)>,
+    )];
+    let mut entries = Vec::with_capacity(root.entry_count as usize);
+    while let Some((node_id, expected_count, minimum_depth, expected_route)) = pending.pop() {
+        let staged_bytes = writes.staged_value(CURRENT_STATE_CATALOG_SPACE, &node_id);
+        let mut node = load_catalog_node_with_staged(store, None, staged_bytes, node_id).await?;
+        if node.entry_count()? != expected_count
+            || node.depth < minimum_depth
+            || (minimum_depth == 0 && node.depth != 0)
+        {
+            return Err(directory_error("catalog node summary mismatch"));
+        }
+        if let Some((parent_depth, route)) = expected_route {
+            let child_depth = usize::try_from(node.depth).expect("u32 fits usize");
+            if child_depth > node.sample_key.len()
+                || node.sample_key.get(parent_depth..child_depth) != Some(route.as_slice())
+            {
+                return Err(directory_error("catalog child route mismatch"));
+            }
+        }
+        if node.children.is_empty() {
+            entries.append(&mut node.entries);
+        } else {
+            let child_min_depth = node.depth.saturating_add(1);
+            let parent_depth = usize::try_from(node.depth).expect("u32 fits usize");
+            pending.extend(node.children.into_iter().rev().map(|child| {
+                (
+                    child.node_id,
+                    child.entry_count,
+                    child_min_depth,
+                    Some((parent_depth, child.route)),
+                )
+            }));
+        }
+    }
+    if entries.len() != root.entry_count as usize {
+        return Err(directory_error("catalog root entry count mismatch"));
+    }
+    entries.sort_by(|left, right| left.scope.cmp(&right.scope));
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].scope == pair[1].scope)
+    {
+        return Err(directory_error("catalog contains duplicate scopes"));
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+pub(crate) async fn load_current_state_catalog_reachability(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &CurrentStateCatalogRoot,
+) -> Result<
+    (
+        std::collections::BTreeSet<[u8; 32]>,
+        Vec<CurrentStatePartSet>,
+    ),
+    LixError,
+> {
+    let (nodes, mut entries) =
+        load_current_state_catalog_reachability_many(store, std::slice::from_ref(root)).await?;
+    entries.sort_by(|left, right| left.scope.cmp(&right.scope));
+    if entries.len() != root.entry_count as usize
+        || entries
+            .windows(2)
+            .any(|pair| pair[0].scope == pair[1].scope)
+    {
+        return Err(directory_error(
+            "catalog reachability count or scope mismatch",
+        ));
+    }
+    Ok((nodes, entries))
+}
+
+pub(crate) async fn load_current_state_catalog_reachability_many(
+    store: &(impl StorageAdapterRead + ?Sized),
+    roots: &[CurrentStateCatalogRoot],
+) -> Result<
+    (
+        std::collections::BTreeSet<[u8; 32]>,
+        Vec<CurrentStatePartSet>,
+    ),
+    LixError,
+> {
+    type ExpectedCatalogNode = (u32, u32, Option<(usize, Vec<u8>)>, bool);
+    let mut pending = std::collections::BTreeMap::<[u8; 32], Vec<ExpectedCatalogNode>>::new();
+    for root in roots {
+        if root.entry_count == 0 {
+            if root.root_id != empty_catalog_root_id() {
+                return Err(directory_error(
+                    "empty Arrow state root has the wrong digest",
+                ));
+            }
+            continue;
+        }
+        pending
+            .entry(root.root_id)
+            .or_default()
+            .push((root.entry_count, 0, None, true));
+    }
+    let mut node_ids = std::collections::BTreeSet::new();
+    let mut node_cache = std::collections::BTreeMap::<[u8; 32], CatalogNode>::new();
+    let mut entries = Vec::new();
+    while !pending.is_empty() {
+        let frontier = std::mem::take(&mut pending);
+        let unseen = frontier
+            .keys()
+            .filter(|node_id| !node_cache.contains_key(*node_id))
+            .copied()
+            .collect::<Vec<_>>();
+        let storage_keys = unseen
+            .iter()
+            .map(|node_id| StorageKey(Bytes::copy_from_slice(node_id)))
+            .collect::<Vec<_>>();
+        let loaded = PointReadPlan::new(CURRENT_STATE_CATALOG_SPACE, &storage_keys)
+            .materialize(store, StorageGetOptions::default())
+            .await?;
+        for (node_id, value) in unseen.into_iter().zip(loaded.value) {
+            let value = value.ok_or_else(|| {
+                directory_error(format!(
+                    "reachability scan references missing catalog node {node_id:?}"
+                ))
+            })?;
+            let StorageProjectedValue::FullValue(bytes) = value else {
+                return Err(directory_error("catalog node read omitted its value"));
+            };
+            if catalog_node_digest(&bytes) != node_id {
+                return Err(directory_error("catalog node content digest mismatch"));
+            }
+            let payload = bytes
+                .strip_prefix(CATALOG_NODE_MAGIC)
+                .ok_or_else(|| directory_error("catalog node has an unsupported format"))?;
+            let node: CatalogNode = storage_codec::decode("current-state catalog node", payload)?;
+            validate_catalog_node(&node)?;
+            node_cache.insert(node_id, node);
+        }
+        for (node_id, expectations) in frontier {
+            let already_expanded = !node_ids.insert(node_id);
+            let node = node_cache
+                .get(&node_id)
+                .ok_or_else(|| directory_error("catalog frontier omitted a node"))?;
+            for (expected_count, expected_depth, expected_route, is_root) in expectations {
+                if node.entry_count()? != expected_count
+                    || node.depth < expected_depth
+                    || (is_root && node.depth != 0)
+                {
+                    return Err(directory_error("catalog child summary mismatch"));
+                }
+                if let Some((parent_depth, route)) = expected_route {
+                    let child_depth = usize::try_from(node.depth).expect("u32 fits usize");
+                    if child_depth > node.sample_key.len()
+                        || node.sample_key.get(parent_depth..child_depth) != Some(route.as_slice())
+                    {
+                        return Err(directory_error("catalog child route mismatch"));
+                    }
+                }
+            }
+            if already_expanded {
+                continue;
+            }
+            if node.children.is_empty() {
+                entries.extend(node.entries.iter().cloned());
+            } else {
+                let child_min_depth = node.depth.saturating_add(1);
+                let parent_depth = usize::try_from(node.depth).expect("u32 fits usize");
+                for child in &node.children {
+                    pending.entry(child.node_id).or_default().push((
+                        child.entry_count,
+                        child_min_depth,
+                        Some((parent_depth, child.route.clone())),
+                        false,
+                    ));
+                }
+            }
+        }
+    }
+    Ok((node_ids, entries))
+}
+
+#[cfg(test)]
+pub(crate) async fn load_current_state_part_directory_reachability(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &CurrentStatePartDirectoryRoot,
+) -> Result<
+    (
+        std::collections::BTreeSet<[u8; 32]>,
+        Vec<CurrentStatePartDescriptor>,
+    ),
+    LixError,
+> {
+    let (nodes, mut descriptor_sets) =
+        load_current_state_part_directory_reachability_many(store, std::slice::from_ref(root))
+            .await?;
+    Ok((nodes, descriptor_sets.pop().unwrap_or_default()))
+}
+
+pub(crate) async fn load_current_state_part_directory_reachability_for_write(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    root: &CurrentStatePartDirectoryRoot,
+) -> Result<
+    (
+        std::collections::BTreeSet<[u8; 32]>,
+        Vec<CurrentStatePartDescriptor>,
+    ),
+    LixError,
+> {
+    if root.part_count == 0 {
+        validate_empty_root(root)?;
+        return Ok((std::collections::BTreeSet::new(), Vec::new()));
+    }
+    let mut pending = vec![(root.root_id, None)];
+    let mut node_ids = std::collections::BTreeSet::new();
+    let mut descriptors = Vec::with_capacity(root.part_count as usize);
+    while let Some((node_id, expected_child)) = pending.pop() {
+        if !node_ids.insert(node_id) {
+            return Err(directory_error(
+                "part directory contains a cycle or duplicate child",
+            ));
+        }
+        let staged = writes.staged_value(CURRENT_STATE_PART_DIRECTORY_SPACE, &node_id);
+        let node = if let Some(bytes) = staged {
+            if node_digest(&bytes) != node_id {
+                return Err(directory_error("node content digest mismatch"));
+            }
+            decode_node(&bytes)?
+        } else {
+            load_node(store, node_id).await?
+        };
+        if expected_child.is_none() {
+            validate_root_summary(root, &node)?;
+        }
+        if let Some(expected) = expected_child.as_ref() {
+            validate_child_summary(expected, &node)?;
+        }
+        if node.kind == 0 {
+            descriptors.extend(node.parts);
+        } else {
+            pending.extend(
+                node.children
+                    .into_iter()
+                    .rev()
+                    .map(|child| (child.node_id, Some(child))),
+            );
+        }
+    }
+    descriptors.sort_by(|left, right| left.first_key.cmp(&right.first_key));
+    validate_descriptors(&descriptors)?;
+    if descriptors.len() != root.part_count as usize
+        || !descriptor_digest_matches(root, &descriptors)?
+    {
+        return Err(directory_error("part directory reachability mismatch"));
+    }
+    Ok((node_ids, descriptors))
+}
+
+pub(crate) async fn load_current_state_part_directory_reachability_many(
+    store: &(impl StorageAdapterRead + ?Sized),
+    roots: &[CurrentStatePartDirectoryRoot],
+) -> Result<
+    (
+        std::collections::BTreeSet<[u8; 32]>,
+        Vec<Vec<CurrentStatePartDescriptor>>,
+    ),
+    LixError,
+> {
+    let mut frontier =
+        std::collections::BTreeMap::<[u8; 32], Vec<(usize, Option<DirectoryChild>)>>::new();
+    for (root_index, root) in roots.iter().enumerate() {
+        if root.part_count == 0 {
+            validate_empty_root(root)?;
+            continue;
+        }
+        frontier
+            .entry(root.root_id)
+            .or_default()
+            .push((root_index, None));
+    }
+    let mut node_ids = std::collections::BTreeSet::new();
+    let mut visited = std::collections::BTreeSet::<(usize, [u8; 32])>::new();
+    let mut cache = std::collections::BTreeMap::<[u8; 32], DirectoryNode>::new();
+    let mut descriptor_sets = roots
+        .iter()
+        .map(|root| Vec::with_capacity(root.part_count as usize))
+        .collect::<Vec<_>>();
+    while !frontier.is_empty() {
+        let unseen = frontier
+            .keys()
+            .filter(|node_id| !cache.contains_key(*node_id))
+            .copied()
+            .collect::<Vec<_>>();
+        let loaded = load_directory_nodes(store, &unseen).await?;
+        cache.extend(unseen.into_iter().zip(loaded));
+        let mut next =
+            std::collections::BTreeMap::<[u8; 32], Vec<(usize, Option<DirectoryChild>)>>::new();
+        for (node_id, expectations) in frontier {
+            node_ids.insert(node_id);
+            let node = cache
+                .get(&node_id)
+                .ok_or_else(|| directory_error("directory frontier omitted a node"))?;
+            for (root_index, expected_child) in expectations {
+                if !visited.insert((root_index, node_id)) {
+                    return Err(directory_error(
+                        "part directory contains a cycle or duplicate child",
+                    ));
+                }
+                let root = &roots[root_index];
+                if expected_child.is_none() {
+                    validate_root_summary(root, node)?;
+                }
+                if let Some(expected) = expected_child.as_ref() {
+                    validate_child_summary(expected, node)?;
+                }
+                if node.kind == 0 {
+                    descriptor_sets[root_index].extend(node.parts.iter().cloned());
+                } else {
+                    for child in &node.children {
+                        next.entry(child.node_id)
+                            .or_default()
+                            .push((root_index, Some(child.clone())));
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+    for (root, descriptors) in roots.iter().zip(&mut descriptor_sets) {
+        if root.part_count == 0 {
+            validate_empty_root(root)?;
+            continue;
+        }
+        // Frontier batching is content-ID ordered, so normalize the
+        // caller-visible descriptor sequence before semantic validation.
+        descriptors.sort_by(|left, right| left.first_key.cmp(&right.first_key));
+        validate_descriptors(descriptors)?;
+        if descriptors.len() != root.part_count as usize
+            || !descriptor_digest_matches(root, descriptors)?
+        {
+            return Err(directory_error("part directory reachability mismatch"));
+        }
+    }
+    Ok((node_ids, descriptor_sets))
+}
+
+fn validate_catalog_node(node: &CatalogNode) -> Result<(), LixError> {
+    let depth = usize::try_from(node.depth).expect("u32 fits usize");
+    let empty_descriptor_digest = current_state_descriptor_digest(&[])?;
+    if depth > CATALOG_MAX_KEY_BYTES
+        || node.sample_key.len() > CATALOG_MAX_KEY_BYTES
+        || node.sample_key.len() < depth
+        || node.entries.is_empty() == node.children.is_empty()
+        || (node.children.len() == 1 && node.depth != 0)
+        || (!node.entries.is_empty() && node.entries.len() > CATALOG_LEAF_MAX_ENTRIES)
+        || node
+            .entries
+            .windows(2)
+            .any(|pair| pair[0].scope >= pair[1].scope)
+        || node.entries.iter().any(|entry| {
+            let valid_empty_directory = entry.directory.root_id == [0; 32]
+                && entry.directory.descriptor_digest == empty_descriptor_digest
+                && entry.directory.row_count == 0
+                && entry.directory.part_count == 0
+                && entry.directory.tree_height == 0;
+            let valid_nonempty_directory = entry.directory.root_id != [0; 32]
+                && entry.directory.descriptor_digest != [0; 32]
+                && entry.directory.row_count > 0
+                && entry.directory.part_count > 0
+                && entry.directory.tree_height > 0;
+            entry.scope.schema_key.is_empty()
+                || !(valid_empty_directory || valid_nonempty_directory)
+        })
+        || node
+            .children
+            .windows(2)
+            .any(|pair| pair[0].route.first() >= pair[1].route.first())
+        || node.children.iter().any(|child| {
+            child.route.is_empty()
+                || child.node_id == [0; 32]
+                || child.entry_count == 0
+                || depth >= CATALOG_MAX_KEY_BYTES
+        })
+        || node.entries.iter().any(|entry| {
+            let Ok(key) = catalog_scope_key(&entry.scope) else {
+                return true;
+            };
+            key.get(..depth) != node.sample_key.get(..depth)
+        })
+    {
+        return Err(directory_error("catalog node is structurally invalid"));
+    }
+    Ok(())
+}
+
+fn catalog_scope_key(scope: &CommitDeltaReplacementScope) -> Result<Vec<u8>, LixError> {
+    let file_len = scope.file_id.as_ref().map_or(0, String::len);
+    let capacity = 1usize
+        .checked_add(size_of::<u32>() * 2)
+        .and_then(|value| value.checked_add(file_len))
+        .and_then(|value| value.checked_add(scope.schema_key.len()))
+        .ok_or_else(|| directory_error("catalog scope key length overflows"))?;
+    if capacity > CATALOG_MAX_KEY_BYTES {
+        return Err(directory_error("catalog scope key exceeds its bound"));
+    }
+    let mut encoded = Vec::with_capacity(capacity);
+    match scope.file_id.as_deref() {
+        Some(file_id) => {
+            encoded.push(1);
+            encoded.extend_from_slice(
+                &u32::try_from(file_id.len())
+                    .map_err(|_| directory_error("catalog file id is too long"))?
+                    .to_be_bytes(),
+            );
+            encoded.extend_from_slice(file_id.as_bytes());
+        }
+        None => {
+            encoded.push(0);
+            encoded.extend_from_slice(&0u32.to_be_bytes());
+        }
+    }
+    encoded.extend_from_slice(
+        &u32::try_from(scope.schema_key.len())
+            .map_err(|_| directory_error("catalog schema key is too long"))?
+            .to_be_bytes(),
+    );
+    encoded.extend_from_slice(scope.schema_key.as_bytes());
+    Ok(encoded)
+}
+
+fn catalog_node_digest(bytes: &[u8]) -> [u8; 32] {
+    *blake3::Hasher::new_derive_key(CATALOG_HASH_CONTEXT)
+        .update(bytes)
+        .finalize()
+        .as_bytes()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct DirectoryChild {
+    #[musli(bytes)]
+    first_key: Vec<u8>,
+    #[musli(bytes)]
+    last_key: Vec<u8>,
+    node_id: [u8; 32],
+    row_count: u64,
+    part_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct DirectoryNode {
+    kind: u8,
+    parts: Vec<CurrentStatePartDescriptor>,
+    children: Vec<DirectoryChild>,
+}
+
+impl DirectoryNode {
+    fn leaf(parts: Vec<CurrentStatePartDescriptor>) -> Self {
+        Self {
+            kind: 0,
+            parts,
+            children: Vec::new(),
+        }
+    }
+
+    fn internal(children: Vec<DirectoryChild>) -> Self {
+        Self {
+            kind: 1,
+            parts: Vec::new(),
+            children,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StagedNode {
+    child: DirectoryChild,
+}
+
+/// Stages one complete ordered post-image part set as a bounded persistent
+/// range directory. Equal nodes naturally share storage across generations.
+pub(crate) fn stage_current_state_part_directory(
+    writes: &mut StorageWriteSet,
+    descriptors: &[CurrentStatePartDescriptor],
+) -> Result<CurrentStatePartDirectoryRoot, LixError> {
+    stage_current_state_part_directory_reusing(
+        writes,
+        descriptors,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+/// Rebuilds the logical directory while retaining all content-identical nodes
+/// already reachable from the parent root. When descriptor cardinality stays
+/// stable, leaf chunking stages only changed leaves and their ancestors. A
+/// fully key-addressed range splice is deliberately left to the next cut.
+pub(crate) fn stage_current_state_part_directory_reusing(
+    writes: &mut StorageWriteSet,
+    descriptors: &[CurrentStatePartDescriptor],
+    reusable_node_ids: &std::collections::BTreeSet<[u8; 32]>,
+) -> Result<CurrentStatePartDirectoryRoot, LixError> {
+    if descriptors.is_empty() {
+        return Ok(CurrentStatePartDirectoryRoot {
+            root_id: [0; 32],
+            descriptor_digest: current_state_descriptor_digest(descriptors)?,
+            row_count: 0,
+            part_count: 0,
+            tree_height: 0,
+        });
+    }
+    validate_descriptors(descriptors)?;
+    let descriptor_digest = current_state_descriptor_digest(descriptors)?;
+    let mut level = descriptors
+        .chunks(DIRECTORY_FANOUT)
+        .map(|chunk| {
+            stage_node_reusing(
+                writes,
+                DirectoryNode::leaf(chunk.to_vec()),
+                reusable_node_ids,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut tree_height = 1u16;
+    while level.len() > 1 {
+        level = level
+            .chunks(DIRECTORY_FANOUT)
+            .map(|chunk| {
+                stage_node_reusing(
+                    writes,
+                    DirectoryNode::internal(chunk.iter().map(|node| node.child.clone()).collect()),
+                    reusable_node_ids,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        tree_height = tree_height
+            .checked_add(1)
+            .ok_or_else(|| directory_error("tree height overflows"))?;
+    }
+    let root = level
+        .into_iter()
+        .next()
+        .ok_or_else(|| directory_error("cannot stage an empty part set"))?;
+    Ok(CurrentStatePartDirectoryRoot {
+        root_id: root.child.node_id,
+        descriptor_digest,
+        row_count: root.child.row_count,
+        part_count: root.child.part_count,
+        tree_height,
+    })
+}
+
+/// Routes one encoded identity to its bounded immutable state part.
+#[cfg(test)]
+pub(crate) async fn route_current_state_part(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &CurrentStatePartDirectoryRoot,
+    encoded_key: &[u8],
+) -> Result<Option<CurrentStatePartDescriptor>, LixError> {
+    if root.part_count == 0 {
+        validate_empty_root(root)?;
+        return Ok(None);
+    }
+    let mut node_id = root.root_id;
+    let mut expected_child = None;
+    loop {
+        let node = load_node(store, node_id).await?;
+        if node_id == root.root_id {
+            validate_root_summary(root, &node)?;
+        }
+        if let Some(expected) = expected_child.as_ref() {
+            validate_child_summary(expected, &node)?;
+        }
+        match node.kind {
+            0 => {
+                let parts = node.parts;
+                let index = parts.partition_point(|part| part.first_key.as_slice() <= encoded_key);
+                let Some(part) = index.checked_sub(1).and_then(|index| parts.get(index)) else {
+                    return Ok(None);
+                };
+                return Ok((encoded_key <= part.last_key.as_slice()).then(|| part.clone()));
+            }
+            1 => {
+                let children = node.children;
+                let upper =
+                    children.partition_point(|child| child.first_key.as_slice() <= encoded_key);
+                let Some(child) = upper.checked_sub(1).and_then(|index| children.get(index)) else {
+                    return Ok(None);
+                };
+                if encoded_key > child.last_key.as_slice() {
+                    return Ok(None);
+                }
+                node_id = child.node_id;
+                expected_child = Some(child.clone());
+            }
+            _ => unreachable!("validated directory node kind"),
+        }
+    }
+}
+
+/// Routes a caller-owned encoded-key batch while reading each shared
+/// directory node at most once for that batch.
+#[cfg(test)]
+pub(crate) async fn route_current_state_parts(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &CurrentStatePartDirectoryRoot,
+    encoded_keys: &[Bytes],
+) -> Result<Vec<Option<CurrentStatePartDescriptor>>, LixError> {
+    let mut routed = route_current_state_part_sets(store, &[(root, encoded_keys)]).await?;
+    Ok(routed.pop().unwrap_or_default())
+}
+
+pub(crate) async fn route_current_state_part_sets(
+    store: &(impl StorageAdapterRead + ?Sized),
+    requests: &[(&CurrentStatePartDirectoryRoot, &[Bytes])],
+) -> Result<Vec<Vec<Option<CurrentStatePartDescriptor>>>, LixError> {
+    type PendingDirectoryRoute = (usize, Option<DirectoryChild>, Vec<usize>);
+    let mut routes = requests
+        .iter()
+        .map(|(_, keys)| vec![None; keys.len()])
+        .collect::<Vec<_>>();
+    let mut frontier = std::collections::BTreeMap::<[u8; 32], Vec<PendingDirectoryRoute>>::new();
+    for (request_index, (root, keys)) in requests.iter().enumerate() {
+        if root.part_count == 0 {
+            validate_empty_root(root)?;
+            continue;
+        }
+        frontier.entry(root.root_id).or_default().push((
+            request_index,
+            None,
+            (0..keys.len()).collect::<Vec<_>>(),
+        ));
+    }
+    let mut cache = std::collections::BTreeMap::<[u8; 32], DirectoryNode>::new();
+    let mut visited = std::collections::BTreeSet::<(usize, [u8; 32])>::new();
+    while !frontier.is_empty() {
+        let unseen = frontier
+            .keys()
+            .filter(|node_id| !cache.contains_key(*node_id))
+            .copied()
+            .collect::<Vec<_>>();
+        let loaded = load_directory_nodes(store, &unseen).await?;
+        cache.extend(unseen.into_iter().zip(loaded));
+        let mut next = std::collections::BTreeMap::<[u8; 32], Vec<PendingDirectoryRoute>>::new();
+        for (node_id, pending_routes) in frontier {
+            let node = cache
+                .get(&node_id)
+                .ok_or_else(|| directory_error("directory frontier omitted a node"))?;
+            for (request_index, expected_child, key_indices) in pending_routes {
+                if !visited.insert((request_index, node_id)) {
+                    return Err(directory_error(
+                        "part directory contains a cycle or duplicate child",
+                    ));
+                }
+                let (root, encoded_keys) = requests[request_index];
+                if expected_child.is_none() {
+                    validate_root_summary(root, node)?;
+                }
+                if let Some(expected) = expected_child.as_ref() {
+                    validate_child_summary(expected, node)?;
+                }
+                match node.kind {
+                    0 => {
+                        for key_index in key_indices {
+                            let key = &encoded_keys[key_index];
+                            let index = node
+                                .parts
+                                .partition_point(|part| part.first_key.as_slice() <= key.as_ref());
+                            let Some(part) =
+                                index.checked_sub(1).and_then(|index| node.parts.get(index))
+                            else {
+                                continue;
+                            };
+                            if key.as_ref() <= part.last_key.as_slice() {
+                                routes[request_index][key_index] = Some(part.clone());
+                            }
+                        }
+                    }
+                    1 => {
+                        let mut child_keys = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+                        for key_index in key_indices {
+                            let key = &encoded_keys[key_index];
+                            let upper = node.children.partition_point(|child| {
+                                child.first_key.as_slice() <= key.as_ref()
+                            });
+                            if let Some(child_index) = upper.checked_sub(1)
+                                && key.as_ref() <= node.children[child_index].last_key.as_slice()
+                            {
+                                child_keys.entry(child_index).or_default().push(key_index);
+                            }
+                        }
+                        for (child_index, keys) in child_keys {
+                            let child = node.children[child_index].clone();
+                            next.entry(child.node_id).or_default().push((
+                                request_index,
+                                Some(child),
+                                keys,
+                            ));
+                        }
+                    }
+                    _ => unreachable!("validated directory node kind"),
+                }
+            }
+        }
+        frontier = next;
+    }
+    Ok(routes)
+}
+
+/// Loads the complete ordered descriptor set for scans, rebuild, and audit.
+pub(crate) async fn load_current_state_part_descriptors(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &CurrentStatePartDirectoryRoot,
+) -> Result<Vec<CurrentStatePartDescriptor>, LixError> {
+    if root.part_count == 0 {
+        validate_empty_root(root)?;
+        return Ok(Vec::new());
+    }
+    let mut pending = vec![(root.root_id, None)];
+    let mut descriptors = Vec::with_capacity(root.part_count as usize);
+    while let Some((node_id, expected_child)) = pending.pop() {
+        let mut node = load_node(store, node_id).await?;
+        if node_id == root.root_id {
+            validate_root_summary(root, &node)?;
+        }
+        if let Some(expected) = expected_child.as_ref() {
+            validate_child_summary(expected, &node)?;
+        }
+        match node.kind {
+            0 => descriptors.append(&mut node.parts),
+            1 => {
+                pending.extend(
+                    node.children
+                        .into_iter()
+                        .rev()
+                        .map(|child| (child.node_id, Some(child))),
+                );
+            }
+            _ => unreachable!("validated directory node kind"),
+        }
+    }
+    validate_descriptors(&descriptors)?;
+    if descriptors.len() != root.part_count as usize
+        || descriptors
+            .iter()
+            .map(|part| u64::from(part.row_count))
+            .sum::<u64>()
+            != root.row_count
+        || !descriptor_digest_matches(root, &descriptors)?
+    {
+        return Err(directory_error(
+            "root summary does not match its descriptor set",
+        ));
+    }
+    Ok(descriptors)
+}
+
+fn stage_node_reusing(
+    writes: &mut StorageWriteSet,
+    node: DirectoryNode,
+    reusable_node_ids: &std::collections::BTreeSet<[u8; 32]>,
+) -> Result<StagedNode, LixError> {
+    let (first_key, last_key, row_count, part_count) = node_summary(&node)?;
+    let bytes = encode_node(&node)?;
+    let node_id = node_digest(&bytes);
+    if !reusable_node_ids.contains(&node_id) {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_crud_current_state_directory_bytes(bytes.len());
+        writes.put(
+            CURRENT_STATE_PART_DIRECTORY_SPACE,
+            StorageKey(Bytes::copy_from_slice(&node_id)),
+            StorageValue {
+                bytes: bytes.clone(),
+            },
+        );
+    }
+    Ok(StagedNode {
+        child: DirectoryChild {
+            first_key,
+            last_key,
+            node_id,
+            row_count,
+            part_count,
+        },
+    })
+}
+
+async fn load_node(
+    store: &(impl StorageAdapterRead + ?Sized),
+    node_id: [u8; 32],
+) -> Result<DirectoryNode, LixError> {
+    let key = StorageKey(Bytes::copy_from_slice(&node_id));
+    let result = PointReadPlan::new(CURRENT_STATE_PART_DIRECTORY_SPACE, &[key])
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let value = result
+        .value
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| directory_error("references a missing content-addressed node"))?;
+    let StorageProjectedValue::FullValue(bytes) = value else {
+        return Err(directory_error("node read omitted its value"));
+    };
+    if node_digest(&bytes) != node_id {
+        return Err(directory_error("node content digest mismatch"));
+    }
+    decode_node(&bytes)
+}
+
+async fn load_directory_nodes(
+    store: &(impl StorageAdapterRead + ?Sized),
+    node_ids: &[[u8; 32]],
+) -> Result<Vec<DirectoryNode>, LixError> {
+    let keys = node_ids
+        .iter()
+        .map(|node_id| StorageKey(Bytes::copy_from_slice(node_id)))
+        .collect::<Vec<_>>();
+    let result = PointReadPlan::new(CURRENT_STATE_PART_DIRECTORY_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    node_ids
+        .iter()
+        .zip(result.value)
+        .map(|(node_id, value)| {
+            let value = value
+                .ok_or_else(|| directory_error("references a missing content-addressed node"))?;
+            let StorageProjectedValue::FullValue(bytes) = value else {
+                return Err(directory_error("node read omitted its value"));
+            };
+            if node_digest(&bytes) != *node_id {
+                return Err(directory_error("node content digest mismatch"));
+            }
+            decode_node(&bytes)
+        })
+        .collect()
+}
+
+fn encode_node(node: &DirectoryNode) -> Result<Bytes, LixError> {
+    let payload = storage_codec::encode("current-state part directory node", node)?;
+    if payload.len() > DIRECTORY_NODE_MAX_DECODED_BYTES {
+        return Err(directory_error("node exceeds its decoded size bound"));
+    }
+    let compressed = crate::compression::compress_zstd_level_1(&payload)
+        .map_err(|error| directory_error(format!("compression failed: {error}")))?;
+    let use_compressed = compressed.len().saturating_add(size_of::<u32>()) < payload.len();
+    let body = if use_compressed {
+        compressed.as_slice()
+    } else {
+        payload.as_slice()
+    };
+    let mut encoded = Vec::with_capacity(
+        DIRECTORY_NODE_RAW_MAGIC.len()
+            + if use_compressed { size_of::<u32>() } else { 0 }
+            + body.len(),
+    );
+    if use_compressed {
+        encoded.extend_from_slice(DIRECTORY_NODE_ZSTD_MAGIC);
+        encoded.extend_from_slice(
+            &u32::try_from(payload.len())
+                .map_err(|_| directory_error("node exceeds the decoded size bound"))?
+                .to_be_bytes(),
+        );
+    } else {
+        encoded.extend_from_slice(DIRECTORY_NODE_RAW_MAGIC);
+    }
+    encoded.extend_from_slice(body);
+    Ok(Bytes::from(encoded))
+}
+
+fn decode_node(bytes: &[u8]) -> Result<DirectoryNode, LixError> {
+    let payload = if let Some(payload) = bytes.strip_prefix(DIRECTORY_NODE_RAW_MAGIC) {
+        if payload.len() > DIRECTORY_NODE_MAX_DECODED_BYTES {
+            return Err(directory_error("raw node exceeds its decode bound"));
+        }
+        payload.to_vec()
+    } else if let Some(encoded) = bytes.strip_prefix(DIRECTORY_NODE_ZSTD_MAGIC) {
+        let (length, compressed) = encoded
+            .split_at_checked(size_of::<u32>())
+            .ok_or_else(|| directory_error("compressed node omitted its decoded length"))?;
+        let decoded_len = usize::try_from(u32::from_be_bytes(
+            length
+                .try_into()
+                .expect("checked node length is four bytes"),
+        ))
+        .expect("u32 fits usize");
+        if decoded_len > DIRECTORY_NODE_MAX_DECODED_BYTES {
+            return Err(directory_error("compressed node exceeds its decode bound"));
+        }
+        crate::compression::decompress_zstd(compressed, decoded_len)
+            .map_err(|error| directory_error(format!("decompression failed: {error}")))?
+    } else {
+        return Err(directory_error(
+            "node has an unsupported format; recreate the serving directory",
+        ));
+    };
+    let node = storage_codec::decode("current-state part directory node", &payload)?;
+    validate_node(&node)?;
+    Ok(node)
+}
+
+fn node_digest(bytes: &[u8]) -> [u8; 32] {
+    *blake3::Hasher::new_derive_key(DIRECTORY_HASH_CONTEXT)
+        .update(bytes)
+        .finalize()
+        .as_bytes()
+}
+
+fn current_state_descriptor_digest(
+    descriptors: &[CurrentStatePartDescriptor],
+) -> Result<[u8; 32], LixError> {
+    let encoded = storage_codec::encode("current-state descriptor set", &descriptors)?;
+    Ok(
+        *blake3::Hasher::new_derive_key(CURRENT_STATE_DESCRIPTOR_DIGEST_CONTEXT)
+            .update(&encoded)
+            .finalize()
+            .as_bytes(),
+    )
+}
+
+fn descriptor_digest_matches(
+    root: &CurrentStatePartDirectoryRoot,
+    descriptors: &[CurrentStatePartDescriptor],
+) -> Result<bool, LixError> {
+    Ok(current_state_descriptor_digest(descriptors)? == root.descriptor_digest)
+}
+
+fn validate_root_summary(
+    root: &CurrentStatePartDirectoryRoot,
+    node: &DirectoryNode,
+) -> Result<(), LixError> {
+    let (_, _, row_count, part_count) = node_summary(node)?;
+    if row_count != root.row_count || part_count != root.part_count {
+        return Err(directory_error("root summary disagrees with its node"));
+    }
+    Ok(())
+}
+
+fn validate_empty_root(root: &CurrentStatePartDirectoryRoot) -> Result<(), LixError> {
+    if root.root_id != [0; 32]
+        || root.descriptor_digest != current_state_descriptor_digest(&[])?
+        || root.row_count != 0
+        || root.part_count != 0
+        || root.tree_height != 0
+    {
+        return Err(directory_error("empty root summary is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_child_summary(expected: &DirectoryChild, node: &DirectoryNode) -> Result<(), LixError> {
+    let (first_key, last_key, row_count, part_count) = node_summary(node)?;
+    if first_key != expected.first_key
+        || last_key != expected.last_key
+        || row_count != expected.row_count
+        || part_count != expected.part_count
+    {
+        return Err(directory_error("child summary disagrees with its node"));
+    }
+    Ok(())
+}
+
+fn node_summary(node: &DirectoryNode) -> Result<(Vec<u8>, Vec<u8>, u64, u32), LixError> {
+    validate_node(node)?;
+    match node.kind {
+        0 => Ok((
+            node.parts[0].first_key.clone(),
+            node.parts
+                .last()
+                .expect("validated leaf is non-empty")
+                .last_key
+                .clone(),
+            node.parts
+                .iter()
+                .map(|part| u64::from(part.row_count))
+                .sum(),
+            u32::try_from(node.parts.len()).map_err(|_| directory_error("part count overflows"))?,
+        )),
+        1 => Ok((
+            node.children[0].first_key.clone(),
+            node.children
+                .last()
+                .expect("validated internal node is non-empty")
+                .last_key
+                .clone(),
+            node.children.iter().map(|child| child.row_count).sum(),
+            node.children.iter().map(|child| child.part_count).sum(),
+        )),
+        _ => unreachable!("validated directory node kind"),
+    }
+}
+
+fn validate_node(node: &DirectoryNode) -> Result<(), LixError> {
+    match node.kind {
+        0 => {
+            if !node.children.is_empty() || node.parts.len() > DIRECTORY_FANOUT {
+                return Err(directory_error("leaf exceeds bounded fanout"));
+            }
+            validate_descriptor_slice(&node.parts)
+        }
+        1 => {
+            if !node.parts.is_empty()
+                || node.children.is_empty()
+                || node.children.len() > DIRECTORY_FANOUT
+                || node.children.iter().any(|child| {
+                    child.first_key.is_empty()
+                        || child.last_key.is_empty()
+                        || child.first_key > child.last_key
+                        || child.row_count == 0
+                        || child.part_count == 0
+                })
+                || node
+                    .children
+                    .windows(2)
+                    .any(|pair| pair[0].last_key >= pair[1].first_key)
+            {
+                return Err(directory_error(
+                    "internal node has invalid or overlapping ranges",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(directory_error("node has an unknown kind")),
+    }
+}
+
+fn validate_descriptors(parts: &[CurrentStatePartDescriptor]) -> Result<(), LixError> {
+    validate_descriptor_slice(parts)
+}
+
+fn validate_descriptor_slice(parts: &[CurrentStatePartDescriptor]) -> Result<(), LixError> {
+    let first = parts.first();
+    if first.is_none()
+        || parts.iter().any(|part| {
+            part.first_key.is_empty()
+            || part.last_key.is_empty()
+            || part.first_key > part.last_key
+            || part.row_count == 0
+            || usize::from(part.row_count)
+                > crate::tracked_state::current_state_data_part::CURRENT_STATE_DATA_PART_MAX_ROWS
+            || part.state_set_id.as_bytes() == [0; 32]
+            || part.payload_refs_digest == [0; 32]
+        })
+        || parts
+            .windows(2)
+            .any(|pair| pair[0].last_key >= pair[1].first_key)
+    {
+        return Err(directory_error(
+            "descriptor set is empty, unordered, or overlapping",
+        ));
+    }
+    Ok(())
+}
+
+fn directory_error(message: impl std::fmt::Display) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("tracked_state current-state part directory {message}"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+
+    use super::*;
+
+    struct CountingDirectoryRead<R> {
+        inner: R,
+        directory_batch_sizes: Arc<Mutex<Vec<usize>>>,
+        catalog_batch_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl<R> StorageAdapterRead for CountingDirectoryRead<R>
+    where
+        R: StorageAdapterRead,
+    {
+        fn snapshot_cache_key(&self) -> Option<u128> {
+            self.inner.snapshot_cache_key()
+        }
+
+        fn get_many(
+            &self,
+            requests: &[crate::storage::GetManyRequest<'_>],
+        ) -> impl Future<
+            Output = Result<crate::storage::GetManyResult, crate::storage::StorageError>,
+        > + Send {
+            for request in requests {
+                if request.space == CURRENT_STATE_PART_DIRECTORY_SPACE {
+                    self.directory_batch_sizes
+                        .lock()
+                        .expect("directory batch counts lock")
+                        .push(request.keys.len());
+                }
+                if request.space == CURRENT_STATE_CATALOG_SPACE {
+                    self.catalog_batch_sizes
+                        .lock()
+                        .expect("catalog batch counts lock")
+                        .push(request.keys.len());
+                }
+            }
+            self.inner.get_many(requests)
+        }
+
+        fn scan(
+            &self,
+            space: StorageSpace,
+            range: crate::storage::KeyRange,
+            opts: crate::storage::ScanOptions,
+        ) -> impl Future<Output = Result<crate::storage::ScanChunk, crate::storage::StorageError>> + Send
+        {
+            self.inner.scan(space, range, opts)
+        }
+    }
+
+    fn descriptors(count: usize) -> Vec<CurrentStatePartDescriptor> {
+        (0..count)
+            .map(|index| CurrentStatePartDescriptor {
+                first_key: format!("key-{index:06}-a").into_bytes(),
+                last_key: format!("key-{index:06}-z").into_bytes(),
+                state_set_id: crate::columnar_row_group::ArrowStateSetId::from_digest(
+                    *blake3::hash(&index.to_be_bytes()).as_bytes(),
+                ),
+                state_group_index: 0,
+                payload_refs_digest: [1; 32],
+                row_count: 10,
+            })
+            .collect()
+    }
+
+    fn catalog_entry(index: usize) -> CurrentStatePartSet {
+        CurrentStatePartSet {
+            scope: CommitDeltaReplacementScope {
+                schema_key: format!("schema-{index:05}"),
+                file_id: Some(format!("file-{:03}", index % 100)),
+            },
+            directory: CurrentStatePartDirectoryRoot {
+                root_id: *blake3::hash(format!("root-{index}").as_bytes()).as_bytes(),
+                descriptor_digest: *blake3::hash(format!("descriptors-{index}").as_bytes())
+                    .as_bytes(),
+                row_count: 1,
+                part_count: 1,
+                tree_height: 1,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_catalog_bounds_lookup_and_path_copies_one_leaf() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let entries = (0..10_000).map(catalog_entry).collect::<Vec<_>>();
+        let mut writes = adapter.new_write_set();
+        let root =
+            stage_catalog_from_entries(&mut writes, entries.clone()).expect("catalog should stage");
+        assert_eq!(root.entry_count, 10_000);
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("catalog should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("catalog read should open");
+        for index in [0, 31, 32, 4_999, 9_999] {
+            assert_eq!(
+                load_current_state_catalog_entry(&read, &root, &entries[index].scope)
+                    .await
+                    .expect("catalog lookup should succeed"),
+                Some(entries[index].clone())
+            );
+        }
+        let missing = CommitDeltaReplacementScope {
+            schema_key: "missing".to_string(),
+            file_id: Some("file-001".to_string()),
+        };
+        assert!(
+            load_current_state_catalog_entry(&read, &root, &missing)
+                .await
+                .expect("catalog miss should succeed")
+                .is_none()
+        );
+        let requested = vec![
+            entries[9_999].scope.clone(),
+            missing.clone(),
+            entries[0].scope.clone(),
+            entries[9_999].scope.clone(),
+        ];
+        assert_eq!(
+            load_current_state_catalog_entries_for_scopes(&read, &root, &requested)
+                .await
+                .expect("batched catalog lookup should succeed"),
+            vec![
+                Some(entries[9_999].clone()),
+                None,
+                Some(entries[0].clone()),
+                Some(entries[9_999].clone()),
+            ],
+            "batched lookup must preserve caller order and duplicate scopes"
+        );
+        let (reachable, loaded) = load_current_state_catalog_reachability(&read, &root)
+            .await
+            .expect("catalog reachability should validate");
+        assert!(
+            reachable.len() < 1_000,
+            "adaptive buckets must remain shallow; got {} nodes",
+            reachable.len()
+        );
+        assert_eq!(loaded.len(), entries.len());
+
+        let removed = entries[4_999].scope.clone();
+        let mut rewrite = adapter.new_write_set();
+        let mut staged = std::collections::BTreeMap::new();
+        let rewritten = update_catalog_entry(
+            &read,
+            &mut rewrite,
+            &mut staged,
+            Some(&root),
+            &removed,
+            None,
+        )
+        .await
+        .expect("catalog delete should path-copy")
+        .expect("catalog should remain non-empty");
+        assert_eq!(rewritten.entry_count, root.entry_count - 1);
+        assert_ne!(rewritten.root_id, root.root_id);
+        assert!(staged.len() < 16, "one update must rewrite a bounded path");
+        flush_reachable_staged_catalog_nodes(&mut rewrite, &staged, rewritten.root_id)
+            .expect("reachable path copy should flush");
+        adapter
+            .commit_write_set(rewrite, StorageWriteOptions::default())
+            .await
+            .expect("catalog rewrite should commit");
+        let rewritten_read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rewritten catalog read should open");
+        assert!(
+            load_current_state_catalog_entry(&rewritten_read, &rewritten, &removed)
+                .await
+                .expect("removed scope lookup should succeed")
+                .is_none()
+        );
+        assert_eq!(
+            load_current_state_catalog_entry(&rewritten_read, &rewritten, &entries[5_000].scope)
+                .await
+                .expect("untouched scope lookup should succeed"),
+            Some(entries[5_000].clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_scope_sets_read_shared_root_frontiers_once() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let entries = (0..10_000).map(catalog_entry).collect::<Vec<_>>();
+        let mut writes = adapter.new_write_set();
+        let root =
+            stage_catalog_from_entries(&mut writes, entries.clone()).expect("catalog should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("catalog should commit");
+
+        let catalog_batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let read = CountingDirectoryRead {
+            inner: adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("catalog read should open"),
+            directory_batch_sizes: Arc::new(Mutex::new(Vec::new())),
+            catalog_batch_sizes: Arc::clone(&catalog_batch_sizes),
+        };
+        let first = vec![
+            entries[9_999].scope.clone(),
+            entries[0].scope.clone(),
+            entries[9_999].scope.clone(),
+        ];
+        let second = vec![entries[5_000].scope.clone(), entries[31].scope.clone()];
+
+        let single =
+            load_current_state_catalog_entries_for_scope_sets(&read, &[(&root, first.as_slice())])
+                .await
+                .expect("single catalog request should route");
+        let single_batches = std::mem::take(
+            &mut *catalog_batch_sizes
+                .lock()
+                .expect("catalog batch counts lock"),
+        );
+
+        let shared = load_current_state_catalog_entries_for_scope_sets(
+            &read,
+            &[
+                (&root, first.as_slice()),
+                (&root, second.as_slice()),
+                (&root, first.as_slice()),
+            ],
+        )
+        .await
+        .expect("shared-root catalog requests should route");
+        assert_eq!(shared[0], single[0]);
+        assert_eq!(shared[2], single[0]);
+        assert_eq!(
+            shared[1],
+            vec![Some(entries[5_000].clone()), Some(entries[31].clone())]
+        );
+
+        let shared_batches = catalog_batch_sizes
+            .lock()
+            .expect("catalog batch counts lock")
+            .clone();
+        assert_eq!(shared_batches.len(), single_batches.len());
+        assert_eq!(shared_batches[0], 1, "shared root must be read once");
+        assert!(shared_batches.iter().any(|&size| size > 1));
+        assert!(
+            shared_batches.iter().sum::<usize>() < single_batches.iter().sum::<usize>() * 3,
+            "three requests must share physical node reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_catalog_root_handles_short_misses_and_prefix_divergence() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let mut entries = (0..129).map(catalog_entry).collect::<Vec<_>>();
+        for (index, entry) in entries.iter_mut().enumerate() {
+            entry.scope.file_id = Some(format!("shared-prefix-{index:04}"));
+            entry.scope.schema_key = "shared-schema".to_string();
+        }
+        let mut writes = adapter.new_write_set();
+        let root = stage_catalog_from_entries(&mut writes, entries.clone())
+            .expect("compressed catalog should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("compressed catalog should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("compressed catalog read should open");
+        let short_scope = CommitDeltaReplacementScope {
+            schema_key: "x".to_string(),
+            file_id: None,
+        };
+        let mut no_op_writes = adapter.new_write_set();
+        let mut no_op_staged = std::collections::BTreeMap::new();
+        let unchanged = update_catalog_entry(
+            &read,
+            &mut no_op_writes,
+            &mut no_op_staged,
+            Some(&root),
+            &short_scope,
+            None,
+        )
+        .await
+        .expect("short absent scope must be a no-op")
+        .expect("catalog should remain present");
+        assert_eq!(unchanged.root_id, root.root_id);
+        assert!(no_op_staged.is_empty());
+
+        let mut inserted = catalog_entry(10_000);
+        inserted.scope = short_scope.clone();
+        let mut insert_writes = adapter.new_write_set();
+        let mut insert_staged = std::collections::BTreeMap::new();
+        let rewritten = update_catalog_entry(
+            &read,
+            &mut insert_writes,
+            &mut insert_staged,
+            Some(&root),
+            &short_scope,
+            Some(inserted.clone()),
+        )
+        .await
+        .expect("prefix-divergent insertion should stage")
+        .expect("catalog should remain present");
+        flush_reachable_staged_catalog_nodes(&mut insert_writes, &insert_staged, rewritten.root_id)
+            .expect("rewritten catalog should flush");
+        drop(read);
+        adapter
+            .commit_write_set(insert_writes, StorageWriteOptions::default())
+            .await
+            .expect("prefix-divergent insertion should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("rewritten catalog read should open");
+        assert_eq!(
+            load_current_state_catalog_entry(&read, &rewritten, &short_scope)
+                .await
+                .expect("inserted scope should route"),
+            Some(inserted)
+        );
+        assert_eq!(
+            load_current_state_catalog_entry(&read, &rewritten, &entries[64].scope)
+                .await
+                .expect("old compressed scope should still route"),
+            Some(entries[64].clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_delete_collapses_to_an_unstaged_shared_subtree() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let mut entries = (0..130).map(catalog_entry).collect::<Vec<_>>();
+        for (index, entry) in entries.iter_mut().take(129).enumerate() {
+            entry.scope.file_id = Some(format!("shared-A-{index:04}"));
+            entry.scope.schema_key = "schema".to_string();
+        }
+        entries[129].scope.file_id = Some("shared-B".to_string());
+        entries[129].scope.schema_key = "schema".to_string();
+        let removed = entries[129].scope.clone();
+        let mut writes = adapter.new_write_set();
+        let root = stage_catalog_from_entries(&mut writes, entries.clone())
+            .expect("branching catalog should stage");
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("branching catalog should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branching catalog read should open");
+        let mut rewrite = adapter.new_write_set();
+        let mut staged = std::collections::BTreeMap::new();
+        let rewritten = update_catalog_entry(
+            &read,
+            &mut rewrite,
+            &mut staged,
+            Some(&root),
+            &removed,
+            None,
+        )
+        .await
+        .expect("singleton branch deletion should collapse")
+        .expect("shared subtree should remain");
+        flush_reachable_staged_catalog_nodes(&mut rewrite, &staged, rewritten.root_id)
+            .expect("collapsed root should flush");
+        drop(read);
+        adapter
+            .commit_write_set(rewrite, StorageWriteOptions::default())
+            .await
+            .expect("collapsed catalog should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("collapsed catalog read should open");
+        assert!(
+            load_current_state_catalog_entry(&read, &rewritten, &removed)
+                .await
+                .expect("removed branch should miss")
+                .is_none()
+        );
+        assert_eq!(
+            load_current_state_catalog_entry(&read, &rewritten, &entries[64].scope)
+                .await
+                .expect("shared surviving subtree should route"),
+            Some(entries[64].clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_directory_routes_bounded_ranges_and_scans_in_order() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT * 2 + 7);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("directory should stage");
+        assert_eq!(root.tree_height, 2);
+        assert_eq!(root.part_count as usize, descriptors.len());
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("directory should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+
+        for index in [0, DIRECTORY_FANOUT, descriptors.len() - 1] {
+            let key = format!("key-{index:06}-m");
+            let routed = route_current_state_part(&read, &root, key.as_bytes())
+                .await
+                .expect("route should succeed")
+                .expect("key should be covered");
+            assert_eq!(routed, descriptors[index]);
+        }
+        assert!(
+            route_current_state_part(&read, &root, b"key-000001-zz")
+                .await
+                .expect("gap route should succeed")
+                .is_none()
+        );
+        assert_eq!(
+            load_current_state_part_descriptors(&read, &root)
+                .await
+                .expect("scan should succeed"),
+            descriptors
+        );
+
+        let mut foreign_descriptors = descriptors.clone();
+        foreign_descriptors[0].state_set_id =
+            crate::columnar_row_group::ArrowStateSetId::from_digest([7; 32]);
+        let mut foreign_writes = adapter.new_write_set();
+        let foreign_root =
+            stage_current_state_part_directory(&mut foreign_writes, &foreign_descriptors)
+                .expect("foreign directory should stage");
+        drop(read);
+        adapter
+            .commit_write_set(foreign_writes, StorageWriteOptions::default())
+            .await
+            .expect("foreign directory should commit");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("cross-wire read should open");
+        let forged_root = CurrentStatePartDirectoryRoot {
+            root_id: foreign_root.root_id,
+            ..root.clone()
+        };
+        let routed = route_current_state_part(&read, &forged_root, b"key-000000-m")
+            .await
+            .expect("content-addressed foreign root remains structurally readable")
+            .expect("foreign range should route");
+        assert_ne!(routed.state_set_id, descriptors[0].state_set_id);
+    }
+
+    #[tokio::test]
+    async fn directory_routing_and_reachability_batch_each_tree_frontier() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let descriptors = descriptors(DIRECTORY_FANOUT * DIRECTORY_FANOUT + 1);
+        let mut writes = adapter.new_write_set();
+        let root = stage_current_state_part_directory(&mut writes, &descriptors)
+            .expect("multi-level directory should stage");
+        assert!(root.tree_height >= 3);
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("multi-level directory should commit");
+
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let read = CountingDirectoryRead {
+            inner: adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("directory read should open"),
+            directory_batch_sizes: Arc::clone(&batch_sizes),
+            catalog_batch_sizes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let keys = descriptors
+            .iter()
+            .map(|descriptor| Bytes::copy_from_slice(&descriptor.first_key))
+            .collect::<Vec<_>>();
+        let routed = route_current_state_parts(&read, &root, &keys)
+            .await
+            .expect("multi-level batch should route");
+        assert_eq!(
+            routed,
+            descriptors.iter().cloned().map(Some).collect::<Vec<_>>()
+        );
+        let routing_batches =
+            std::mem::take(&mut *batch_sizes.lock().expect("directory batch counts lock"));
+        assert_eq!(routing_batches.len(), usize::from(root.tree_height));
+        assert!(routing_batches.iter().any(|&size| size > 1));
+
+        let (node_ids, loaded) = load_current_state_part_directory_reachability(&read, &root)
+            .await
+            .expect("multi-level reachability should load");
+        assert!(node_ids.len() > usize::from(root.tree_height));
+        assert_eq!(loaded, descriptors);
+        let reachability_batches = batch_sizes
+            .lock()
+            .expect("directory batch counts lock")
+            .clone();
+        assert_eq!(reachability_batches.len(), usize::from(root.tree_height));
+        assert!(reachability_batches.iter().any(|&size| size > 1));
+
+        batch_sizes
+            .lock()
+            .expect("directory batch counts lock")
+            .clear();
+        let requests = [(&root, keys.as_slice()), (&root, keys.as_slice())];
+        let routed_sets = route_current_state_part_sets(&read, &requests)
+            .await
+            .expect("shared directory roots should route in one traversal");
+        assert_eq!(routed_sets[0], routed_sets[1]);
+        assert_eq!(
+            batch_sizes
+                .lock()
+                .expect("directory batch counts lock")
+                .len(),
+            usize::from(root.tree_height)
+        );
+
+        batch_sizes
+            .lock()
+            .expect("directory batch counts lock")
+            .clear();
+        let (_, loaded_sets) = load_current_state_part_directory_reachability_many(
+            &read,
+            &[root.clone(), root.clone()],
+        )
+        .await
+        .expect("shared directory roots should traverse once");
+        assert_eq!(loaded_sets, vec![descriptors.clone(), descriptors.clone()]);
+        assert_eq!(
+            batch_sizes
+                .lock()
+                .expect("directory batch counts lock")
+                .len(),
+            usize::from(root.tree_height)
+        );
+    }
+
+    #[test]
+    fn directory_rejects_overlap_and_invalid_arrow_identities() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let mut overlapping = descriptors(2);
+        overlapping[1].first_key = overlapping[0].last_key.clone();
+        assert!(
+            stage_current_state_part_directory(&mut adapter.new_write_set(), &overlapping).is_err()
+        );
+        let mut invalid_source = descriptors(2);
+        invalid_source[1].state_set_id =
+            crate::columnar_row_group::ArrowStateSetId::from_digest([0; 32]);
+        assert!(
+            stage_current_state_part_directory(&mut adapter.new_write_set(), &invalid_source)
+                .is_err()
+        );
+
+        let mut oversized = descriptors(1);
+        oversized[0].first_key = vec![b'a'; DIRECTORY_NODE_MAX_DECODED_BYTES / 2 + 1];
+        oversized[0].last_key = vec![b'b'; DIRECTORY_NODE_MAX_DECODED_BYTES / 2 + 1];
+        assert!(
+            stage_current_state_part_directory(&mut adapter.new_write_set(), &oversized).is_err(),
+            "staging must not publish a node that its decoder rejects"
+        );
+    }
+}

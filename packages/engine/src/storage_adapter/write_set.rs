@@ -4,12 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::{
     BufferRange, CommitResult, EncodedMutationBatch, Key, KeyRange, PutBatch, PutEntry, SpaceId,
-    Storage, StorageError, StorageWrite, StoredValue, WriteOptions,
+    Storage, StorageError, StorageWrite, StoredValue, ValueSemantics, WriteOptions,
 };
 use crate::storage_adapter::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
 use bytes::Bytes;
-use tracing::Instrument as _;
 
 type FastHashBuilder = RandomState;
 static NEXT_STORAGE_WRITE_SET_ID: AtomicU64 = AtomicU64::new(1);
@@ -81,7 +80,6 @@ pub struct StorageWriteSet {
     groups: Vec<StorageWriteGroup>,
     group_index: HashMap<SpaceId, usize, FastHashBuilder>,
     exclusive_range_deletes: Vec<(StorageSpace, KeyRange)>,
-    deferred_final_puts: Vec<Box<dyn DeferredFinalPutSource>>,
     stats: StorageWriteSetStats,
     // Domain stores can seal a write lane after planning a destructive sweep.
     // The flag carries no storage representation; it only prevents a later
@@ -96,37 +94,10 @@ impl fmt::Debug for StorageWriteSet {
             .debug_struct("StorageWriteSet")
             .field("groups", &self.groups)
             .field("exclusive_range_deletes", &self.exclusive_range_deletes)
-            .field(
-                "deferred_final_put_sources",
-                &self.deferred_final_puts.len(),
-            )
             .field("stats", &self.stats)
             .field("changelog_gc_sealed", &self.changelog_gc_sealed)
             .finish_non_exhaustive()
     }
-}
-
-/// One bounded page produced by a storage-native owner at final lowering.
-///
-/// The source has already validated logical uniqueness and ownership. Pages
-/// are deliberately restricted to final point puts so they cannot interact
-/// with a later range deletion in the same backend transaction.
-pub(crate) struct DeferredFinalPutPage {
-    pub(crate) space: StorageSpace,
-    pub(crate) entries: PutBatch,
-}
-
-/// Compact transaction-owned data that expands only at the backend boundary.
-///
-/// This is the storage-native escape hatch for large certified batches. The
-/// ordinary write set remains the general representation; a deferred source
-/// is accepted only when its target spaces have no ordinary mutations.
-pub(crate) trait DeferredFinalPutSource: Send {
-    fn target_spaces(&self) -> &[StorageSpace];
-    fn put_count(&self) -> u64;
-    fn written_bytes(&self) -> u64;
-    fn backend_capacity_hint_bytes(&self) -> usize;
-    fn next_page(&mut self) -> Option<DeferredFinalPutPage>;
 }
 
 #[derive(Clone, Debug)]
@@ -254,15 +225,13 @@ impl StorageWriteSet {
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
             ),
             exclusive_range_deletes: Vec::new(),
-            deferred_final_puts: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.deferred_final_puts.is_empty()
-            && self.exclusive_range_deletes.is_empty()
+        self.exclusive_range_deletes.is_empty()
             && self
                 .groups
                 .iter()
@@ -293,11 +262,7 @@ impl StorageWriteSet {
             });
             total.saturating_add(puts).saturating_add(deletes)
         });
-        self.deferred_final_puts
-            .iter()
-            .fold(ordinary, |total, source| {
-                total.saturating_add(source.backend_capacity_hint_bytes())
-            })
+        ordinary
     }
 
     #[cfg(feature = "storage-benches")]
@@ -409,44 +374,6 @@ impl StorageWriteSet {
         self.stats.written_bytes += written_bytes;
     }
 
-    /// Retains a compact, already-validated owner until backend lowering.
-    ///
-    /// Deferred sources are intentionally exclusive per target space. This
-    /// makes their no-duplicate certificate compositional with the ordinary
-    /// write-set validator instead of silently bypassing mutations staged by
-    /// another domain writer.
-    pub(crate) fn stage_deferred_final_put_source(
-        &mut self,
-        source: Box<dyn DeferredFinalPutSource>,
-    ) -> Result<(), StorageWriteSetError> {
-        for &space in source.target_spaces() {
-            if self
-                .group_index
-                .get(&space.id)
-                .and_then(|index| self.groups.get(*index))
-                .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
-                || self.deferred_final_puts.iter().any(|existing| {
-                    existing
-                        .target_spaces()
-                        .iter()
-                        .any(|target| target.id == space.id)
-                })
-            {
-                return Err(StorageWriteSetError::DuplicateMutation {
-                    space,
-                    key: Key(Bytes::new()),
-                });
-            }
-        }
-        self.stats.staged_puts = self.stats.staged_puts.saturating_add(source.put_count());
-        self.stats.written_bytes = self
-            .stats
-            .written_bytes
-            .saturating_add(source.written_bytes());
-        self.deferred_final_puts.push(source);
-        Ok(())
-    }
-
     /// Retains one contiguous content-addressed batch while coalescing puts
     /// already present in the same storage-space lane.
     ///
@@ -555,13 +482,7 @@ impl StorageWriteSet {
             .exclusive_range_deletes
             .iter()
             .any(|(existing, _)| existing.id == space.id);
-        let has_deferred = self.deferred_final_puts.iter().any(|source| {
-            source
-                .target_spaces()
-                .iter()
-                .any(|target| target.id == space.id)
-        });
-        if has_points || has_range || has_deferred {
+        if has_points || has_range {
             return Err(StorageWriteSetError::DuplicateMutation {
                 space,
                 key: Key(Bytes::new()),
@@ -603,8 +524,8 @@ impl StorageWriteSet {
             .is_some_and(|group| group.puts.iter().any(|put| group.key_bytes(put.key) == key))
     }
 
-    /// Returns an exact ordinary staged put value for transaction-local
-    /// immutable read-your-writes. Deferred sources remain final-only.
+    /// Returns an exact staged put value for transaction-local immutable
+    /// read-your-writes.
     pub(crate) fn staged_value(&self, space: StorageSpace, key: &[u8]) -> Option<Bytes> {
         let group = self
             .group_index
@@ -617,72 +538,64 @@ impl StorageWriteSet {
         Some(Bytes::copy_from_slice(group.value_bytes(put.value)))
     }
 
-    /// Takes an owned snapshot of ordinary puts in one storage lane for an
-    /// async read-your-writes planner. The owned bytes keep the planner's
-    /// future `Send` without requiring `StorageWriteSet` to be `Sync`.
-    pub(crate) fn staged_values_in_space(&self, space: StorageSpace) -> Vec<(Bytes, Bytes)> {
-        let Some(group) = self
-            .group_index
-            .get(&space.id)
-            .and_then(|index| self.groups.get(*index))
-        else {
-            return Vec::new();
+    /// Finalizes the value of one already-staged put without creating a second
+    /// mutation for the same key. Domain protocols use this only when an
+    /// earlier transaction-local plan cannot know a content address until a
+    /// dependent immutable tree has been published.
+    pub(crate) fn replace_staged_put_value(
+        &mut self,
+        space: StorageSpace,
+        key: &[u8],
+        value: Bytes,
+    ) -> bool {
+        let Some(group_index) = self.group_index.get(&space.id).copied() else {
+            return false;
         };
-        group
+        let group = &mut self.groups[group_index];
+        let Some(put_index) = group
             .puts
             .iter()
-            .map(|put| {
-                (
-                    Bytes::copy_from_slice(group.key_bytes(put.key)),
-                    Bytes::copy_from_slice(group.value_bytes(put.value)),
-                )
-            })
-            .collect()
+            .position(|put| group.key_bytes(put.key) == key)
+        else {
+            return false;
+        };
+        let previous_len = group.value_bytes(group.puts[put_index].value).len() as u64;
+        let replacement_len = value.len() as u64;
+        let value = group.value_arena.stage_bytes(value);
+        group.puts[put_index].value = value;
+        self.stats.written_bytes = self
+            .stats
+            .written_bytes
+            .saturating_sub(previous_len)
+            .saturating_add(replacement_len);
+        true
     }
 
     pub fn extend(&mut self, other: Self) {
         let Self {
             groups,
             exclusive_range_deletes,
-            deferred_final_puts,
             stats,
             changelog_gc_sealed,
             ..
         } = other;
         self.changelog_gc_sealed |= changelog_gc_sealed;
+        let mut coalesced_puts = 0_u64;
+        let mut coalesced_bytes = 0_u64;
         for group in groups {
             let space = group.space;
             let target = self.group_mut(space);
-            target.append(group);
+            let (puts, bytes) = target.append(group);
+            coalesced_puts = coalesced_puts.saturating_add(puts);
+            coalesced_bytes = coalesced_bytes.saturating_add(bytes);
         }
         for (space, range) in exclusive_range_deletes {
             self.delete_range_exclusive(space, range)
                 .expect("extended exclusive range-delete spaces remain exclusive");
         }
-        for source in deferred_final_puts {
-            for &space in source.target_spaces() {
-                assert!(
-                    self.group_index
-                        .get(&space.id)
-                        .and_then(|index| self.groups.get(*index))
-                        .is_none_or(|group| group.puts.is_empty() && group.deletes.is_empty()),
-                    "extended deferred spaces remain exclusive"
-                );
-                assert!(
-                    self.deferred_final_puts.iter().all(|existing| {
-                        existing
-                            .target_spaces()
-                            .iter()
-                            .all(|target| target.id != space.id)
-                    }),
-                    "extended deferred sources remain exclusive"
-                );
-            }
-            self.deferred_final_puts.push(source);
-        }
-        self.stats.staged_puts += stats.staged_puts;
+        self.stats.staged_puts += stats.staged_puts.saturating_sub(coalesced_puts);
         self.stats.staged_deletes += stats.staged_deletes;
-        self.stats.written_bytes += stats.written_bytes;
+        self.stats.written_bytes += stats.written_bytes.saturating_sub(coalesced_bytes);
     }
 
     pub fn stats(&self) -> StorageWriteSetStats {
@@ -758,7 +671,19 @@ impl StorageWriteSet {
             if let Some(duplicate) = mutations.windows(2).find_map(|pair| {
                 let left = group.mutation_key(pair[0]);
                 let right = group.mutation_key(pair[1]);
-                (left == right).then_some(left)
+                if left != right {
+                    return None;
+                }
+                let identical_immutable_puts = match (pair[0], pair[1]) {
+                    (MutationIndex::Put(left), MutationIndex::Put(right))
+                        if group.space.value_semantics == ValueSemantics::Immutable =>
+                    {
+                        group.value_bytes(group.puts[left].value)
+                            == group.value_bytes(group.puts[right].value)
+                    }
+                    _ => false,
+                };
+                (!identical_immutable_puts).then_some(left)
             }) {
                 return Err(StorageWriteSetError::DuplicateMutation {
                     space: group.space,
@@ -800,7 +725,12 @@ impl StorageWriteSet {
             }
         }
 
+        let mut coalesced_puts = 0_u64;
+        let mut coalesced_bytes = 0_u64;
         for group in &mut self.groups {
+            let (puts, bytes) = group.coalesce_identical_immutable_puts();
+            coalesced_puts = coalesced_puts.saturating_add(puts);
+            coalesced_bytes = coalesced_bytes.saturating_add(bytes);
             let puts_sorted = group.puts_are_sorted();
             let deletes_sorted = group.deletes_are_sorted();
             #[cfg(feature = "storage-benches")]
@@ -820,6 +750,8 @@ impl StorageWriteSet {
             }
             validate_sorted_group(group)?;
         }
+        self.stats.staged_puts = self.stats.staged_puts.saturating_sub(coalesced_puts);
+        self.stats.written_bytes = self.stats.written_bytes.saturating_sub(coalesced_bytes);
         Ok(())
     }
 
@@ -833,7 +765,6 @@ impl StorageWriteSet {
         let Self {
             groups,
             exclusive_range_deletes,
-            mut deferred_final_puts,
             mut stats,
             ..
         } = self;
@@ -884,29 +815,6 @@ impl StorageWriteSet {
                 stats.storage_calls += 1;
                 write
                     .delete_many(space, &deletes)
-                    .await
-                    .map_err(StorageWriteSetError::Storage)?;
-            }
-        }
-
-        for source in &mut deferred_final_puts {
-            while let Some(page) = tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.storage_lowering.deferred_next_page"
-            )
-            .in_scope(|| source.next_page())
-            {
-                if page.entries.entries.is_empty() {
-                    continue;
-                }
-                stats.put_batches += 1;
-                stats.storage_calls += 1;
-                write
-                    .put_many(page.space, page.entries)
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.storage_lowering.deferred_put_page"
-                    ))
                     .await
                     .map_err(StorageWriteSetError::Storage)?;
             }
@@ -971,13 +879,7 @@ impl StorageWriteSet {
             let conflicts_with_range = self.exclusive_range_deletes[index + 1..]
                 .iter()
                 .any(|(other, _)| other.id == space.id);
-            let conflicts_with_deferred = self.deferred_final_puts.iter().any(|source| {
-                source
-                    .target_spaces()
-                    .iter()
-                    .any(|target| target.id == space.id)
-            });
-            if conflicts_with_points || conflicts_with_range || conflicts_with_deferred {
+            if conflicts_with_points || conflicts_with_range {
                 return Err(StorageWriteSetError::DuplicateMutation {
                     space: *space,
                     key: Key(Bytes::new()),
@@ -1036,7 +938,6 @@ impl Default for StorageWriteSet {
             groups: Vec::new(),
             group_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
             exclusive_range_deletes: Vec::new(),
-            deferred_final_puts: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
         }
@@ -1126,7 +1027,7 @@ impl StorageWriteGroup {
             .sort_unstable_by(|left, right| key_arena.bytes(*left).cmp(key_arena.bytes(*right)));
     }
 
-    fn append(&mut self, other: Self) {
+    fn append(&mut self, other: Self) -> (u64, u64) {
         let Self {
             space,
             key_arena,
@@ -1136,18 +1037,89 @@ impl StorageWriteGroup {
             conflicting_declarations,
         } = other;
         debug_assert_eq!(self.space.id, space.id);
+        let keep = if self.space.value_semantics == ValueSemantics::Immutable {
+            let mut existing = HashSet::with_capacity_and_hasher(
+                self.puts.len().saturating_add(puts.len()),
+                FastHashBuilder::with_seeds(0, 0, 0, 0),
+            );
+            for put in &self.puts {
+                existing.insert(ContentAddressedRef {
+                    key: self.key_bytes(put.key),
+                    value: self.value_bytes(put.value),
+                });
+            }
+            puts.iter()
+                .map(|put| {
+                    existing.insert(ContentAddressedRef {
+                        key: key_arena.bytes(put.key),
+                        value: value_arena.bytes(put.value),
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![true; puts.len()]
+        };
+        let coalesced_puts = keep.iter().filter(|keep| !**keep).count() as u64;
+        let coalesced_bytes = puts
+            .iter()
+            .zip(&keep)
+            .filter(|(_, keep)| !**keep)
+            .map(|(put, _)| value_arena.bytes(put.value).len() as u64)
+            .sum();
         self.puts.reserve(puts.len());
         self.deletes.reserve(deletes.len());
         let key_remap = self.key_arena.append(key_arena);
         let value_remap = self.value_arena.append(value_arena);
-        self.puts.extend(puts.into_iter().map(|put| StagedPut {
-            key: key_remap.remap(put.key),
-            value: value_remap.remap(put.value),
-        }));
+        self.puts
+            .extend(puts.into_iter().zip(keep).filter_map(|(put, keep)| {
+                keep.then_some(StagedPut {
+                    key: key_remap.remap(put.key),
+                    value: value_remap.remap(put.value),
+                })
+            }));
         self.deletes
             .extend(deletes.into_iter().map(|key| key_remap.remap(key)));
         self.conflicting_declarations
             .extend(conflicting_declarations);
+        (coalesced_puts, coalesced_bytes)
+    }
+
+    fn coalesce_identical_immutable_puts(&mut self) -> (u64, u64) {
+        if self.space.value_semantics != ValueSemantics::Immutable || self.puts.len() < 2 {
+            return (0, 0);
+        }
+        let mut existing = HashSet::with_capacity_and_hasher(
+            self.puts.len(),
+            FastHashBuilder::with_seeds(0, 0, 0, 0),
+        );
+        let keep = self
+            .puts
+            .iter()
+            .map(|put| {
+                existing.insert(ContentAddressedRef {
+                    key: self.key_bytes(put.key),
+                    value: self.value_bytes(put.value),
+                })
+            })
+            .collect::<Vec<_>>();
+        let coalesced_puts = keep.iter().filter(|keep| !**keep).count() as u64;
+        if coalesced_puts == 0 {
+            return (0, 0);
+        }
+        let coalesced_bytes = self
+            .puts
+            .iter()
+            .zip(&keep)
+            .filter(|(_, keep)| !**keep)
+            .map(|(put, _)| self.value_bytes(put.value).len() as u64)
+            .sum();
+        let puts = std::mem::take(&mut self.puts);
+        self.puts = puts
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(put, keep)| keep.then_some(put))
+            .collect();
+        (coalesced_puts, coalesced_bytes)
     }
 
     fn lower(self) -> (StorageSpace, Vec<PutEntry>, Vec<Key>) {
@@ -1668,6 +1640,25 @@ mod tests {
             vec![b"A".as_slice(), b"B".as_slice()]
         );
         assert_eq!(backend.deletes[0].1[0].0.as_ref(), b"c");
+    }
+
+    #[tokio::test]
+    async fn extending_write_sets_coalesces_identical_immutable_content() {
+        let immutable = StorageSpace::immutable(SpaceId(2), "test.immutable");
+        let mut writes = StorageWriteSet::new();
+        writes.put(immutable, key("digest"), value("content"));
+        let mut other = StorageWriteSet::new();
+        other.put(immutable, key("digest"), value("content"));
+        writes.extend(other);
+
+        assert_eq!(writes.stats().staged_puts, 1);
+        assert_eq!(writes.stats().written_bytes, 7);
+        let mut backend = CapturingStorageWrite::default();
+        writes
+            .lower_into(&mut backend)
+            .await
+            .expect("identical immutable content should coalesce");
+        assert_eq!(backend.puts[0].1.entries.len(), 1);
     }
 
     #[test]

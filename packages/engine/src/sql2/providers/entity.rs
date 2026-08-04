@@ -776,15 +776,24 @@ fn entity_columnar_projection(
     {
         return None;
     }
+    let entity_pk_index = manifest.fields.iter().position(|field| {
+        field.name == crate::sql2::ENTITY_COLUMNAR_ENTITY_PK_FIELD
+            && field.data_type.to_arrow() == datafusion::arrow::datatypes::DataType::Utf8
+    })?;
+    let visible_field_count = crate::sql2::entity_visible_fields(spec).len();
+    let visible_start = entity_pk_index.checked_sub(visible_field_count)?;
     schema
         .fields()
         .iter()
         .map(|field| {
             spec.visible_column(field.name())?;
-            manifest.fields.iter().position(|candidate| {
-                candidate.name == *field.name()
-                    && candidate.data_type.to_arrow() == *field.data_type()
-            })
+            manifest.fields[visible_start..entity_pk_index]
+                .iter()
+                .position(|candidate| {
+                    candidate.name == *field.name()
+                        && candidate.data_type.to_arrow() == *field.data_type()
+                })
+                .map(|index| visible_start + index)
         })
         .collect()
 }
@@ -811,7 +820,23 @@ async fn entity_columnar_scan_source(
                 "entity columnar sidecar is missing its hidden entity identity".to_owned(),
             )
         })?;
-    let coordinate_shadow_masks = entity_columnar_coordinate_shadow_masks(&layout, &spec)?;
+    let deleted_column = layout
+        .manifest
+        .fields
+        .iter()
+        .position(|field| {
+            field.name == "deleted"
+                && field.data_type.to_arrow() == datafusion::arrow::datatypes::DataType::Boolean
+        })
+        .ok_or_else(|| {
+            DataFusionError::Execution(
+                "canonical entity Arrow leaf is missing its tombstone column".to_owned(),
+            )
+        })?;
+    let mut physical_projection = projection.clone();
+    physical_projection.push(deleted_column);
+    let public_column_count = projection.len();
+    let coordinate_shadow_masks = entity_columnar_coordinate_shadow_masks(&layout)?;
     let mut shadow_identities = if coordinate_shadow_masks.is_some() {
         Vec::new()
     } else {
@@ -902,18 +927,28 @@ async fn entity_columnar_scan_source(
             },
         ));
     }
-    let mut all_reconciled_statistics_cached = true;
+    let group_has_tombstones = |group_index: usize| {
+        layout.manifest.groups[group_index].columns[deleted_column].max
+            == Some(crate::columnar_row_group::RowGroupScalar::Boolean(true))
+    };
+    let mut all_reconciled_statistics_cached =
+        !group_indices.iter().copied().any(group_has_tombstones);
     let mut base_statistics_cached = Vec::with_capacity(group_indices.len());
     let mut statistics = if layout.overlay.is_empty() {
-        base_statistics_cached.resize(group_indices.len(), true);
         group_indices
             .iter()
             .map(|&group_index| {
-                entity_columnar_group_statistics(
-                    &layout.manifest.groups[group_index],
-                    &projection,
-                    schema.as_ref(),
-                )
+                if group_has_tombstones(group_index) {
+                    base_statistics_cached.push(false);
+                    Statistics::new_unknown(schema.as_ref())
+                } else {
+                    base_statistics_cached.push(true);
+                    entity_columnar_group_statistics(
+                        &layout.manifest.groups[group_index],
+                        &projection,
+                        schema.as_ref(),
+                    )
+                }
             })
             .collect::<Vec<_>>()
     } else {
@@ -996,6 +1031,7 @@ async fn entity_columnar_scan_source(
             let reader = Arc::clone(&reader);
             let layout = layout.clone();
             let public_projection = projection.clone();
+            let physical_projection = physical_projection.clone();
             let statistics_projection = projection.clone();
             let statistics_cached = base_statistics_cached[partition];
             let shadow_identities = Arc::clone(&shadow_identities);
@@ -1003,6 +1039,7 @@ async fn entity_columnar_scan_source(
             let group_index = group_indices[partition];
             let schema = Arc::clone(&stream_schema);
             let batch_schema = Arc::clone(&schema);
+            let loaded_public_schema = Arc::clone(&schema);
             let batches = stream::once(async move {
                 let coordinate_keep = coordinate_shadow_masks
                     .as_ref()
@@ -1017,19 +1054,20 @@ async fn entity_columnar_scan_source(
                     shadow_identity_digest,
                     public_projection.clone(),
                     async {
-                        let batch = if (shadow_identities.is_empty()
+                        let (batch, overlay_keep) = if (shadow_identities.is_empty()
                             && coordinate_shadow_masks.is_none())
                             || coordinates_prove_unshadowed
                         {
-                            Arc::new(
+                            (
                                 reader
                                     .load_entity_columnar_group(
                                         layout.clone(),
                                         group_index,
-                                        public_projection.clone(),
+                                        physical_projection.clone(),
                                     )
                                     .await
                                     .map_err(lix_error_to_datafusion_error)?,
+                                None,
                             )
                         } else {
                             let keep = if let Some(keep) = coordinate_keep {
@@ -1050,13 +1088,37 @@ async fn entity_columnar_scan_source(
                                 .load_entity_columnar_group(
                                     layout.clone(),
                                     group_index,
-                                    public_projection.clone(),
+                                    physical_projection.clone(),
                                 )
                                 .await
                                 .map_err(lix_error_to_datafusion_error)?;
-                            Arc::new(filter_record_batch(&batch, keep.as_ref())?)
+                            (batch, Some(keep))
                         };
-                        Ok(batch)
+                        let deleted = batch
+                            .column(public_column_count)
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(
+                                    "canonical entity Arrow tombstone column is not Boolean"
+                                        .to_owned(),
+                                )
+                            })?;
+                        let keep = BooleanArray::from(
+                            (0..batch.num_rows())
+                                .map(|row_index| {
+                                    !deleted.value(row_index)
+                                        && overlay_keep
+                                            .as_ref()
+                                            .is_none_or(|keep| keep.value(row_index))
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                        let batch = filter_record_batch(&batch, &keep)?;
+                        Ok(Arc::new(RecordBatch::try_new(
+                            loaded_public_schema,
+                            batch.columns()[..public_column_count].to_vec(),
+                        )?))
                     },
                 )
                 .await?;
@@ -1111,7 +1173,6 @@ async fn cached_or_load_entity_columnar_batch(
 
 fn entity_columnar_coordinate_shadow_masks(
     layout: &crate::sql2::entity_batch::EntityColumnarScanLayout,
-    spec: &EntitySurfaceSpec,
 ) -> Result<Option<Arc<Vec<Option<Arc<BooleanArray>>>>>> {
     if layout
         .manifest
@@ -1134,14 +1195,20 @@ fn entity_columnar_coordinate_shadow_masks(
             // has no stale base member to suppress.
             continue;
         };
-        let owner =
-            crate::live_state::entity_row_group_set_id(coordinate.base_commit_id, &spec.schema_key);
-        if owner != layout.id {
-            return exec_err!(
-                "entity overlay columnar coordinate belongs to a different immutable base"
-            );
-        }
-        let group_index = coordinate.group_index as usize;
+        let owner = coordinate.state_set_id;
+        let group_index = layout
+            .group_sources
+            .iter()
+            .position(|source| {
+                source.state_set_id == owner
+                    && source.group_index == coordinate.group_index as usize
+            })
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "entity overlay columnar coordinate belongs to a different immutable leaf"
+                        .to_owned(),
+                )
+            })?;
         let group = layout.manifest.groups.get(group_index).ok_or_else(|| {
             DataFusionError::Execution(
                 "entity overlay columnar coordinate has an invalid group index".to_owned(),
@@ -1300,8 +1367,14 @@ fn entity_columnar_scalar_precision(
         Some(crate::columnar_row_group::RowGroupScalar::String(value)) => {
             ScalarValue::Utf8(Some(value.clone()))
         }
+        Some(crate::columnar_row_group::RowGroupScalar::Binary(value)) => {
+            ScalarValue::Binary(Some(value.clone()))
+        }
         Some(crate::columnar_row_group::RowGroupScalar::Int64(value)) => {
             ScalarValue::Int64(Some(*value))
+        }
+        Some(crate::columnar_row_group::RowGroupScalar::UInt64(value)) => {
+            ScalarValue::UInt64(Some(*value))
         }
         Some(crate::columnar_row_group::RowGroupScalar::Float64(value)) => {
             ScalarValue::Float64(Some(*value))
@@ -1791,7 +1864,7 @@ fn branch_id_from_column_literal_filter(column_expr: &Expr, literal_expr: &Expr)
 impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
     pub(super) fn new(spec: &'a EntitySurfaceSpec) -> Self {
         Self {
-            primary_key_columns: top_level_primary_key_columns(spec),
+            primary_key_columns: string_primary_key_columns(spec),
             primary_key_component_types: spec.primary_key_component_types.clone(),
         }
     }
@@ -2276,15 +2349,15 @@ fn entity_filter_values_equal(
     }
 }
 
-fn top_level_primary_key_columns(spec: &EntitySurfaceSpec) -> Vec<&str> {
+fn string_primary_key_columns(spec: &EntitySurfaceSpec) -> Vec<&str> {
     spec.primary_key_paths
         .iter()
         .map(|path| {
             let [column_name] = path.as_slice() else {
                 return None;
             };
-            spec.visible_column(column_name)
-                .map(|column| column.name.as_str())
+            let column = spec.visible_column(column_name)?;
+            (column.column_type == EntityColumnType::String).then_some(column.name.as_str())
         })
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default()
@@ -2325,15 +2398,16 @@ fn entity_pk_constraint_from_in_list_filter(
     let Expr::Column(column) = in_list.expr.as_ref() else {
         return None;
     };
-    if in_list.list.is_empty() {
+    let values = in_list
+        .list
+        .iter()
+        .map(string_expr_literal)
+        .collect::<Option<Vec<_>>>()?;
+    if values.is_empty() {
         return None;
     }
     match column.name.as_str() {
-        "lixcol_entity_pk" => in_list
-            .list
-            .iter()
-            .map(string_expr_literal)
-            .collect::<Option<Vec<_>>>()?
+        "lixcol_entity_pk" => values
             .into_iter()
             .map(|value| {
                 let parts = EntityPk::from_json_array_text(&value).ok()?.into_parts();
@@ -2342,16 +2416,9 @@ fn entity_pk_constraint_from_in_list_filter(
             .collect::<Option<BTreeSet<_>>>()
             .map(EntityPkConstraint::Full),
         column_name if primary_key_columns.contains(&column_name) => {
-            let component_type =
-                primary_key_component_type(column_name, primary_key_columns, component_types)?;
-            let values = in_list
-                .list
-                .iter()
-                .map(|expr| primary_key_expr_literal(expr, component_type))
-                .collect::<Option<BTreeSet<_>>>()?;
             Some(EntityPkConstraint::Parts(BTreeMap::from([(
                 column_name.to_string(),
-                values,
+                values.into_iter().collect(),
             )])))
         }
         _ => None,
@@ -2367,60 +2434,19 @@ fn entity_pk_constraint_from_column_literal_filter(
     let Expr::Column(column) = column_expr else {
         return None;
     };
+    let value = string_expr_literal(literal_expr)?;
     match column.name.as_str() {
-        "lixcol_entity_pk" => EntityPk::from_json_array_text(&string_expr_literal(literal_expr)?)
+        "lixcol_entity_pk" => EntityPk::from_json_array_text(&value)
             .ok()
             .and_then(|identity| {
                 EntityPk::from_external_parts(identity.into_parts(), component_types).ok()
             })
             .map(|identity| EntityPkConstraint::Full(BTreeSet::from([identity]))),
         column_name if primary_key_columns.contains(&column_name) => {
-            let component_type =
-                primary_key_component_type(column_name, primary_key_columns, component_types)?;
-            let value = primary_key_expr_literal(literal_expr, component_type)?;
             Some(EntityPkConstraint::Parts(BTreeMap::from([(
                 column_name.to_string(),
                 BTreeSet::from([value]),
             )])))
-        }
-        _ => None,
-    }
-}
-
-fn primary_key_component_type(
-    column_name: &str,
-    primary_key_columns: &[&str],
-    component_types: &[crate::entity_pk::EntityPkComponentType],
-) -> Option<crate::entity_pk::EntityPkComponentType> {
-    primary_key_columns
-        .iter()
-        .position(|candidate| *candidate == column_name)
-        .and_then(|index| component_types.get(index))
-        .copied()
-}
-
-fn primary_key_expr_literal(
-    expr: &Expr,
-    component_type: crate::entity_pk::EntityPkComponentType,
-) -> Option<String> {
-    use crate::entity_pk::EntityPkComponentType;
-
-    if !matches!(component_type, EntityPkComponentType::Integer) {
-        return string_expr_literal(expr);
-    }
-    let Expr::Literal(literal, _) = expr else {
-        return None;
-    };
-    match literal {
-        ScalarValue::Int8(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::Int16(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::Int32(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::Int64(Some(value)) => Some(value.to_string()),
-        ScalarValue::UInt8(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::UInt16(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::UInt32(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::UInt64(Some(value)) => {
-            i64::try_from(*value).ok().map(|value| value.to_string())
         }
         _ => None,
     }
@@ -2452,11 +2478,15 @@ fn entity_pks_from_primary_key_parts(
             })
             .collect();
     }
-    identities
-        .into_iter()
-        .map(|parts| EntityPk::from_external_parts(parts, component_types))
-        .collect::<std::result::Result<BTreeSet<_>, _>>()
-        .ok()
+    Some(
+        identities
+            .into_iter()
+            .map(|parts| {
+                EntityPk::from_external_parts(parts, component_types)
+                    .expect("schema primary-key projection contains at least one part")
+            })
+            .collect(),
+    )
 }
 
 fn identity_matches_parts(
@@ -3566,6 +3596,7 @@ mod tests {
     #[test]
     fn excludes_non_entity_builtin_session_surfaces() {
         for schema_key in [
+            "lix_active_account",
             "lix_binary_blob_ref",
             "lix_change",
             "lix_checkpoint_marker",
@@ -4134,103 +4165,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn integer_primary_key_filter_pushes_exact_identity_into_scan() {
-        let spec = Arc::new(
-            derive_entity_surface_spec_from_schema(&json!({
-                "x-lix-key": "integer_note",
-                "x-lix-primary-key": ["/id"],
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer" },
-                    "body": { "type": "string" }
-                },
-                "required": ["id", "body"]
-            }))
-            .expect("integer primary-key schema should derive"),
-        );
-        let filter = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(column("id")),
-            Operator::Eq,
-            Box::new(Expr::Literal(ScalarValue::Int64(Some(42)), None)),
-        ));
-        let expected = crate::entity_pk::EntityPk::from_external_parts(
-            vec!["42".to_string()],
-            &spec.primary_key_component_types,
-        )
-        .expect("integer identity should encode");
-        let provider = super::EntitySpec::by_branch(
-            Arc::clone(&spec),
-            Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
-            empty_branch_ref(),
-            None,
-        );
-
-        assert_eq!(
-            <super::EntitySpec as super::super::spec::TableSpec>::filter_pushdown(
-                &provider, &filter
-            ),
-            datafusion::logical_expr::TableProviderFilterPushDown::Exact
-        );
-        let (_schema, request, _row_filters) = provider
-            .plan_scan_parts(None, &[filter], None)
-            .await
-            .expect("integer point scan should plan");
-        assert_eq!(request.filter.entity_pks, vec![expected]);
-    }
-
-    #[test]
-    fn mixed_composite_primary_key_filters_use_typed_components() {
-        let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "versioned_note",
-            "x-lix-primary-key": ["/namespace", "/revision"],
-            "type": "object",
-            "properties": {
-                "namespace": { "type": "string" },
-                "revision": { "type": "integer" },
-                "body": { "type": "string" }
-            },
-            "required": ["namespace", "revision", "body"]
-        }))
-        .expect("mixed primary-key schema should derive");
-        let filters = vec![
-            Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(column("revision")),
-                Operator::Eq,
-                Box::new(Expr::Literal(ScalarValue::UInt32(Some(7)), None)),
-            )),
-            eq_filter("namespace", "docs"),
-        ];
-
-        let actual = super::entity_pks_from_primary_key_filters(&spec, &filters)
-            .expect("mixed primary-key filters should analyze")
-            .expect("complete mixed primary key should route");
-        let expected = crate::entity_pk::EntityPk::from_external_parts(
-            vec!["docs".to_string(), "7".to_string()],
-            &spec.primary_key_component_types,
-        )
-        .expect("mixed identity should encode");
-        assert_eq!(actual, vec![expected]);
-    }
-
-    #[test]
-    fn integer_primary_key_rejects_string_literal_pushdown() {
-        let spec = derive_entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "integer_note",
-            "x-lix-primary-key": ["/id"],
-            "type": "object",
-            "properties": { "id": { "type": "integer" } },
-            "required": ["id"]
-        }))
-        .expect("integer primary-key schema should derive");
-
-        assert!(
-            super::entity_pks_from_primary_key_filters(&spec, &[eq_filter("id", "42")])
-                .expect("mismatched filter should be safely ignored")
-                .is_none()
-        );
-    }
-
     #[test]
     fn split_composite_primary_key_filters_use_declared_path_order() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
@@ -4505,7 +4439,8 @@ mod tests {
                 |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
                     entity_pk,
                     snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_value: Some(snapshot),
+                    authority: None,
                 },
             ),
         )
@@ -4583,7 +4518,8 @@ mod tests {
                 |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
                     entity_pk,
                     snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_value: Some(snapshot),
+                    authority: None,
                 },
             ),
         )
@@ -4659,7 +4595,8 @@ mod tests {
                 |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
                     entity_pk,
                     snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_value: Some(snapshot),
+                    authority: None,
                 },
             ),
         )
@@ -4727,7 +4664,8 @@ mod tests {
             std::iter::once(crate::sql2::EntityColumnarRowRef {
                 entity_pk: &identity,
                 snapshot_bytes: canonical.as_bytes(),
-                snapshot_value: &snapshot,
+                snapshot_value: Some(&snapshot),
+                authority: None,
             }),
         )
         .expect("encode")
@@ -4920,28 +4858,46 @@ mod tests {
                 |((entity_pk, snapshot), canonical)| crate::sql2::EntityColumnarRowRef {
                     entity_pk,
                     snapshot_bytes: canonical.as_bytes(),
-                    snapshot_value: snapshot,
+                    snapshot_value: Some(snapshot),
+                    authority: None,
                 },
             ),
         )
         .expect("encode")
         .expect("registered sidecar");
         let base_commit_id = CommitId::for_test_label("coordinate-base");
-        let location = encoded
-            .input_locations
-            .location(0)
-            .expect("encoded entity row has an input coordinate");
+        let state_set_id = encoded.id();
+        let location = encoded.input_locations[0];
         let layout = crate::sql2::entity_batch::EntityColumnarScanLayout {
-            id: crate::live_state::entity_row_group_set_id(base_commit_id, &spec.schema_key),
+            id: state_set_id,
             manifest: Arc::new(encoded.manifest.clone()),
             manifest_digest: encoded.manifest.content_digest().expect("manifest digest"),
+            group_sources: Arc::new(
+                encoded
+                    .manifest
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(group_index, _)| crate::live_state::EntityColumnarGroupSource {
+                            state_set_id,
+                            manifest: Arc::new(encoded.manifest.clone()),
+                            manifest_digest: encoded
+                                .manifest
+                                .content_digest()
+                                .expect("manifest digest"),
+                            group_index,
+                        },
+                    )
+                    .collect(),
+            ),
             overlay: Arc::new(vec![
                 crate::live_state::EntityColumnarOverlayRow {
                     entity_pk: identities[0].clone(),
                     snapshot_content: Some(Bytes::from_static(br#"{"id":"a","active":false}"#)),
                     deleted: false,
                     columnar_base_coordinate: Some(crate::live_state::ColumnarBaseCoordinate {
-                        base_commit_id,
+                        state_set_id,
                         group_index: location.group_index,
                         row_index: location.row_index,
                     }),
@@ -4962,7 +4918,7 @@ mod tests {
             live_count: identities.len() as u64 + 1,
         };
 
-        let masks = super::entity_columnar_coordinate_shadow_masks(&layout, &spec)
+        let masks = super::entity_columnar_coordinate_shadow_masks(&layout)
             .expect("coordinate masks")
             .expect("coordinate-capable layout");
         assert_eq!(masks.len(), encoded.manifest.groups.len());
@@ -4982,15 +4938,15 @@ mod tests {
         revision: u64,
     ) -> Arc<crate::sql2::entity_batch::EntityColumnarScanLayout> {
         Arc::new(crate::sql2::entity_batch::EntityColumnarScanLayout {
-            id: crate::columnar_row_group::RowGroupSetId::new([23; 16]),
+            id: crate::columnar_row_group::ArrowStateSetId::from_digest([23; 32]),
             manifest: Arc::new(crate::columnar_row_group::RowGroupManifest {
                 namespace: "cached_batch_test".to_owned(),
                 metadata: HashMap::new(),
                 fields: Vec::new(),
                 groups: Vec::new(),
-                encoded_digest: [0; 32],
             }),
             manifest_digest: [24; 32],
+            group_sources: Arc::new(Vec::new()),
             overlay: Arc::new(Vec::new()),
             branch_id: Arc::from(branch_id),
             head_commit_id: CommitId::for_test_label("cached-batch-test-head"),

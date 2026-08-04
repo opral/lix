@@ -2,8 +2,8 @@ use crate::LixError;
 use crate::changelog::CommitId;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
-    TrackedStateDiff, TrackedStateDiffRequest, TrackedStateMergePlan, TrackedStatePayloadBatch,
-    TrackedStateStoreReader, plan_merge,
+    TrackedStateDiff, TrackedStateDiffRequest, TrackedStateMergePlan, TrackedStateStoreReader,
+    plan_merge,
 };
 
 use super::conflicts::MergeConflictBatch;
@@ -78,14 +78,7 @@ where
     };
 
     let merge_plan = if outcome == MergeOutcome::MergeCommitted {
-        let fallback_ids =
-            crate::tracked_state::merge_payload_fallback_ids(&target_diff, &source_diff)?;
-        let payloads = if fallback_ids.is_empty() {
-            TrackedStatePayloadBatch::default()
-        } else {
-            reader.load_change_payloads(&fallback_ids).await?
-        };
-        Some(plan_merge(&target_diff, &source_diff, &payloads)?)
+        Some(plan_merge(&target_diff, &source_diff)?)
     } else {
         None
     };

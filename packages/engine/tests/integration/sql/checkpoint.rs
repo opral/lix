@@ -168,9 +168,9 @@ simulation_test!(
         );
 
         engine
-            .rebuild_tracked_state_for_branch(sim.main_branch_id())
+            .validate_tracked_state_for_branch(sim.main_branch_id())
             .await
-            .expect("checkpoint tracked state should rebuild");
+            .expect("checkpoint tracked state should validate");
         assert_eq!(
             select_rows(
                 &session,
@@ -179,7 +179,7 @@ simulation_test!(
             )
             .await,
             timestamps_before_rebuild,
-            "checkpoint timestamps must remain stable after tracked-state rebuild"
+            "checkpoint timestamps must remain stable after tracked-state validation"
         );
     }
 );

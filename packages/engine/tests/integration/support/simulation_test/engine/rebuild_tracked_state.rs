@@ -46,7 +46,7 @@ impl RebuildTrackedStateSimulation {
         if !self.pending.swap(false, Ordering::SeqCst) {
             return Ok(());
         }
-        engine.rebuild_tracked_state_for_branch(branch_id).await
+        engine.validate_tracked_state_for_branch(branch_id).await
     }
 
     #[cfg(test)]

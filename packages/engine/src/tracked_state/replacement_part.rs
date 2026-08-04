@@ -1,10 +1,10 @@
-//! Point- and range-addressable immutable identity parts for complete replacements.
+//! Point- and range-addressable authored-event identities for complete replacements.
 //!
-//! A replacement part contains the ordered tracked key and canonical
-//! snapshot/metadata authority. Small JSON remains inline; large JSON keeps
-//! its content-addressed reference to avoid duplicate storage.
-//! Commit-wide timestamps, change identifiers, lifecycle metadata, and the
-//! row-group set identity belong to the publishing manifest.
+//! A replacement part contains only the ordered tracked key and the coordinate
+//! of its canonical Arrow post-image. Commit-wide timestamps, change
+//! identifiers, lifecycle metadata, and the row-group set identity belong to
+//! the publishing manifest. Snapshot and metadata payloads are never copied
+//! into this sidecar.
 
 // Point/range/ordinal routing is the public handoff to the columnar scan layer;
 // UPDATE publication currently consumes only the writer and strict decoder.
@@ -21,11 +21,12 @@ pub(crate) const REPLACEMENT_PART_MAX_ROWS: usize = 512;
 pub(crate) const REPLACEMENT_PART_TARGET_BYTES: usize = 64 * 1024;
 pub(crate) const REPLACEMENT_PART_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-const REPLACEMENT_PART_MAGIC: &[u8; 8] = b"LXRPI003";
-const REPLACEMENT_PART_COMPRESSED_MAGIC: &[u8; 8] = b"LXRPZ003";
+const REPLACEMENT_PART_MAGIC: &[u8; 8] = b"LXRPI005";
+const REPLACEMENT_PART_COMPRESSED_MAGIC: &[u8; 8] = b"LXRPZ005";
 const REPLACEMENT_PART_MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const REPLACEMENT_DIRECTORY_MAGIC: &[u8; 8] = b"LXRPD001";
-const REPLACEMENT_PART_DIGEST_CONTEXT: &str = "lix tracked-state replacement identity part v1";
+const REPLACEMENT_PART_DIGEST_CONTEXT: &str =
+    "lix tracked-state replacement Arrow-coordinate event part v2";
 const REPLACEMENT_DIRECTORY_DIGEST_CONTEXT: &str =
     "lix tracked-state replacement part directory v1";
 const DIGEST_BYTES: usize = 32;
@@ -35,8 +36,7 @@ const DIRECTORY_FIXED_ENTRY_BYTES: usize = DIGEST_BYTES + 4 + 2 + 4 + 4;
 pub(crate) struct ReplacementPartRowRef<'a> {
     /// Canonical bytes produced by the tracked-state key codec.
     pub(crate) encoded_key: &'a [u8],
-    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
-    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) base_coordinate: crate::tracked_state::TrackedStateBaseCoordinate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,8 +84,7 @@ impl EncodedReplacementPart {
 pub(crate) struct DecodedReplacementPart {
     key_arena: Bytes,
     key_ranges: Vec<Range<usize>>,
-    snapshots: Vec<crate::json_store::JsonSlot>,
-    metadata: Vec<crate::json_store::JsonSlot>,
+    base_coordinates: Vec<crate::tracked_state::TrackedStateBaseCoordinate>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,18 +116,13 @@ impl DecodedReplacementPart {
             .map(|range| &self.key_arena[range.clone()]))
     }
 
-    pub(crate) fn snapshot(
+    pub(crate) fn base_coordinate(
         &self,
         ordinal: usize,
-    ) -> Result<Option<crate::json_store::JsonSlotRef<'_>>, LixError> {
-        Ok(self.snapshots.get(ordinal).map(|slot| slot.as_ref_slot()))
-    }
-
-    pub(crate) fn metadata(
-        &self,
-        ordinal: usize,
-    ) -> Result<Option<crate::json_store::JsonSlotRef<'_>>, LixError> {
-        Ok(self.metadata.get(ordinal).map(|slot| slot.as_ref_slot()))
+    ) -> Result<crate::tracked_state::TrackedStateBaseCoordinate, LixError> {
+        self.base_coordinates.get(ordinal).copied().ok_or_else(|| {
+            replacement_part_error("replacement part omitted base-coordinate authority")
+        })
     }
 
     pub(crate) fn find(
@@ -488,8 +482,7 @@ pub(crate) fn encode_replacement_part_with_compressor(
                 .to_be_bytes(),
         );
         encoded.extend_from_slice(suffix);
-        encode_json_slot(&mut encoded, row.snapshot, true)?;
-        encode_json_slot(&mut encoded, row.metadata, false)?;
+        encode_base_coordinate(&mut encoded, row.base_coordinate);
         previous_key = row.encoded_key;
     }
     if encoded.len() > REPLACEMENT_PART_MAX_DECODED_BYTES {
@@ -596,8 +589,7 @@ pub(crate) fn decode_replacement_part(
     }
     let mut key_arena = Vec::new();
     let mut key_ranges = Vec::with_capacity(row_count);
-    let mut snapshots = Vec::with_capacity(row_count);
-    let mut metadata = Vec::with_capacity(row_count);
+    let mut base_coordinates = Vec::with_capacity(row_count);
     let mut previous_key = Vec::new();
     for _ in 0..row_count {
         let shared = usize::from(decode_u16(body, &mut cursor)?);
@@ -619,8 +611,7 @@ pub(crate) fn decode_replacement_part(
         let start = key_arena.len();
         key_arena.extend_from_slice(&key);
         key_ranges.push(start..key_arena.len());
-        snapshots.push(decode_json_slot(body, &mut cursor, true)?);
-        metadata.push(decode_json_slot(body, &mut cursor, false)?);
+        base_coordinates.push(decode_base_coordinate(body, &mut cursor)?);
         previous_key = key;
     }
     if cursor != body.len() {
@@ -631,8 +622,31 @@ pub(crate) fn decode_replacement_part(
     Ok(DecodedReplacementPart {
         key_arena: Bytes::from(key_arena),
         key_ranges,
-        snapshots,
-        metadata,
+        base_coordinates,
+    })
+}
+
+fn encode_base_coordinate(
+    out: &mut Vec<u8>,
+    coordinate: crate::tracked_state::TrackedStateBaseCoordinate,
+) {
+    out.extend_from_slice(&coordinate.state_set_id.as_bytes());
+    out.extend_from_slice(&coordinate.group_index.to_be_bytes());
+    out.extend_from_slice(&coordinate.row_index.to_be_bytes());
+}
+
+fn decode_base_coordinate(
+    encoded: &[u8],
+    cursor: &mut usize,
+) -> Result<crate::tracked_state::TrackedStateBaseCoordinate, LixError> {
+    Ok(crate::tracked_state::TrackedStateBaseCoordinate {
+        state_set_id: crate::columnar_row_group::ArrowStateSetId::from_digest(
+            take_exact(encoded, cursor, 32)?
+                .try_into()
+                .expect("Arrow state-set digest width checked"),
+        ),
+        group_index: decode_u32(encoded, cursor)?,
+        row_index: decode_u32(encoded, cursor)?,
     })
 }
 
@@ -664,76 +678,6 @@ fn encode_sized_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), LixError> {
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
     Ok(())
-}
-
-fn encode_u32_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), LixError> {
-    let len = u32::try_from(bytes.len())
-        .map_err(|_| replacement_part_error("replacement payload exceeds u32"))?;
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn encode_json_slot(
-    out: &mut Vec<u8>,
-    slot: crate::json_store::JsonSlotRef<'_>,
-    required: bool,
-) -> Result<(), LixError> {
-    match slot {
-        crate::json_store::JsonSlotRef::None if required => Err(replacement_part_error(
-            "replacement snapshot payload is missing",
-        )),
-        crate::json_store::JsonSlotRef::None => {
-            out.push(0);
-            Ok(())
-        }
-        crate::json_store::JsonSlotRef::Ref(json_ref) => {
-            out.push(1);
-            out.extend_from_slice(json_ref.as_hash_bytes());
-            Ok(())
-        }
-        crate::json_store::JsonSlotRef::Inline(json) => {
-            out.push(2);
-            encode_u32_bytes(out, json.as_bytes())
-        }
-    }
-}
-
-fn decode_json_slot(
-    encoded: &[u8],
-    cursor: &mut usize,
-    required: bool,
-) -> Result<crate::json_store::JsonSlot, LixError> {
-    let tag = *take_exact(encoded, cursor, 1)?
-        .first()
-        .expect("one tag byte");
-    match tag {
-        0 if required => Err(replacement_part_error(
-            "replacement snapshot payload is missing",
-        )),
-        0 => Ok(crate::json_store::JsonSlot::None),
-        1 => Ok(crate::json_store::JsonSlot::Ref(
-            crate::json_store::JsonRef::from_hash_bytes(
-                take_exact(encoded, cursor, 32)?
-                    .try_into()
-                    .expect("JSON reference width checked"),
-            ),
-        )),
-        2 => {
-            let bytes = decode_u32_bytes(encoded, cursor)?;
-            let json = std::str::from_utf8(bytes)
-                .map_err(|_| replacement_part_error("replacement inline JSON is not UTF-8"))?;
-            Ok(crate::json_store::JsonSlot::Inline(json.to_owned().into()))
-        }
-        _ => Err(replacement_part_error(
-            "replacement JSON slot has an invalid tag",
-        )),
-    }
-}
-
-fn decode_u32_bytes<'a>(encoded: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], LixError> {
-    let len = usize::try_from(decode_u32(encoded, cursor)?).expect("u32 length fits usize");
-    take_exact(encoded, cursor, len)
 }
 
 fn decode_sized_bytes<'a>(encoded: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], LixError> {
@@ -791,8 +735,11 @@ mod tests {
         keys.iter()
             .map(|key| ReplacementPartRowRef {
                 encoded_key: key,
-                snapshot: crate::json_store::JsonSlotRef::Inline("{}"),
-                metadata: crate::json_store::JsonSlotRef::None,
+                base_coordinate: crate::tracked_state::TrackedStateBaseCoordinate {
+                    state_set_id: crate::columnar_row_group::ArrowStateSetId::from_digest([7; 32]),
+                    group_index: 0,
+                    row_index: 0,
+                },
             })
             .collect()
     }
@@ -829,26 +776,21 @@ mod tests {
     }
 
     #[test]
-    fn part_preserves_content_references_without_inlining_payloads() {
-        let snapshot_ref = crate::json_store::JsonRef::for_content(&vec![b'x'; 8 * 1024 * 1024]);
-        let metadata_ref = crate::json_store::JsonRef::for_content(&vec![b'y'; 2 * 1024 * 1024]);
+    fn part_preserves_only_the_arrow_coordinate() {
+        let coordinate = crate::tracked_state::TrackedStateBaseCoordinate {
+            state_set_id: crate::columnar_row_group::ArrowStateSetId::from_digest([11; 32]),
+            group_index: 12,
+            row_index: 34,
+        };
         let rows = [ReplacementPartRowRef {
             encoded_key: b"alpha",
-            snapshot: crate::json_store::JsonSlotRef::Ref(&snapshot_ref),
-            metadata: crate::json_store::JsonSlotRef::Ref(&metadata_ref),
+            base_coordinate: coordinate,
         }];
-        let encoded = encode_replacement_part(&rows).expect("encode referenced replacement part");
+        let encoded = encode_replacement_part(&rows).expect("encode coordinate replacement part");
         assert!(encoded.bytes().len() < 256);
         let decoded = decode_replacement_part(encoded.digest(), encoded.bytes())
-            .expect("decode referenced replacement part");
-        assert_eq!(
-            decoded.snapshot(0).expect("snapshot slot"),
-            Some(crate::json_store::JsonSlotRef::Ref(&snapshot_ref))
-        );
-        assert_eq!(
-            decoded.metadata(0).expect("metadata slot"),
-            Some(crate::json_store::JsonSlotRef::Ref(&metadata_ref))
-        );
+            .expect("decode coordinate replacement part");
+        assert_eq!(decoded.base_coordinate(0).expect("coordinate"), coordinate);
     }
 
     #[test]

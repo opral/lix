@@ -144,70 +144,6 @@ pub(crate) struct TrackedStateMergeConflict {
     pub(crate) source: TrackedStateDiffEntry,
 }
 
-/// Change ids whose payloads the merge planner needs for cross-change
-/// equality (live/live after-pairs with differing change ids).
-pub(crate) fn merge_payload_fallback_ids(
-    target_diff: &TrackedStateDiff,
-    source_diff: &TrackedStateDiff,
-) -> Result<Vec<ChangeId>, LixError> {
-    let mut ids = match SortedMergeInputs::new(target_diff, source_diff)? {
-        SortedMergeInputs::Borrowed { target, source } => {
-            sorted_merge_payload_fallback_ids(target, source)
-        }
-        SortedMergeInputs::Fallback {
-            entries,
-            target_len,
-        } => {
-            let (target, source) = entries.split_at(target_len);
-            sorted_merge_payload_fallback_ids(target, source)
-        }
-    };
-    ids.retain(|change_id| {
-        !target_diff.payloads().contains(*change_id) && !source_diff.payloads().contains(*change_id)
-    });
-    Ok(ids)
-}
-
-/// Collects payload ids only for identities that can reach the expensive
-/// live/live cross-change equality comparison.
-///
-/// Tree diffs are already identity sorted, so the production path performs
-/// one linear intersection without an index or candidate buffer. Defensive
-/// unsorted callers are normalized once by [`SortedMergeInputs`].
-fn sorted_merge_payload_fallback_ids<T, S>(
-    target_entries: &[T],
-    source_entries: &[S],
-) -> Vec<ChangeId>
-where
-    T: MergeDiffEntry,
-    S: MergeDiffEntry,
-{
-    let mut ids = Vec::new();
-    let mut target_index = 0;
-    let mut source_index = 0;
-    while target_index < target_entries.len() && source_index < source_entries.len() {
-        let target = target_entries[target_index].as_diff_entry();
-        let source = source_entries[source_index].as_diff_entry();
-        match target.identity.cmp(&source.identity) {
-            Ordering::Less => target_index += 1,
-            Ordering::Greater => source_index += 1,
-            Ordering::Equal => {
-                if let (Some(target), Some(source)) = (target.after.as_ref(), source.after.as_ref())
-                    && !target.deleted
-                    && !source.deleted
-                    && target.change_id != source.change_id
-                {
-                    ids.push(target.change_id);
-                    ids.push(source.change_id);
-                }
-                target_index += 1;
-                source_index += 1;
-            }
-        }
-    }
-    ids
-}
-
 /// Plans a three-way tracked-state merge from two base-relative diffs.
 ///
 /// This follows the same shape as prolly-tree merge systems: compare
@@ -217,36 +153,23 @@ where
 pub(crate) fn plan_merge(
     target_diff: &TrackedStateDiff,
     source_diff: &TrackedStateDiff,
-    fallback_payloads: &TrackedStatePayloadBatch,
 ) -> Result<TrackedStateMergePlan, LixError> {
     let payloads = MergePayloadOwners {
         target: target_diff.payloads(),
         source: source_diff.payloads(),
-        fallback: fallback_payloads,
     };
-    match SortedMergeInputs::new(target_diff, source_diff)? {
-        SortedMergeInputs::Borrowed { target, source } => {
-            plan_sorted_merge(target, source, &payloads)
-        }
-        SortedMergeInputs::Fallback {
-            entries,
-            target_len,
-        } => {
-            let (target, source) = entries.split_at(target_len);
-            plan_sorted_merge(target, source, &payloads)
-        }
-    }
+    validate_strictly_sorted_entries(&target_diff.entries)?;
+    validate_strictly_sorted_entries(&source_diff.entries)?;
+    plan_sorted_merge(&target_diff.entries, &source_diff.entries, &payloads)
 }
 
 /// Borrowed payload owners available to one merge analysis.
 ///
-/// Target and source diffs retain the records loaded during diff validation.
-/// The fallback owner is only populated by defensive callers that construct
-/// payload-light diffs outside the durable diff path.
+/// Target and source diffs retain payload slots read from their changed Arrow
+/// leaves. No event or changelog payload owner participates in merge.
 struct MergePayloadOwners<'a> {
     target: &'a TrackedStatePayloadBatch,
     source: &'a TrackedStatePayloadBatch,
-    fallback: &'a TrackedStatePayloadBatch,
 }
 
 impl MergePayloadOwners<'_> {
@@ -254,75 +177,22 @@ impl MergePayloadOwners<'_> {
         self.target
             .get(change_id)
             .or_else(|| self.source.get(change_id))
-            .or_else(|| self.fallback.get(change_id))
     }
 }
 
-/// Identity-sorted diff inputs consumed by the two-pointer merge.
-///
-/// Tracked-state tree diffs are emitted in key order, so the production path
-/// borrows both entry slices without building an index. Hand-built or
-/// defensive unsorted inputs share one contiguous reference buffer: its two
-/// partitions are sorted independently before merge planning.
-enum SortedMergeInputs<'a> {
-    Borrowed {
-        target: &'a [TrackedStateDiffEntry],
-        source: &'a [TrackedStateDiffEntry],
-    },
-    Fallback {
-        entries: Vec<&'a TrackedStateDiffEntry>,
-        target_len: usize,
-    },
-}
-
-impl<'a> SortedMergeInputs<'a> {
-    fn new(
-        target_diff: &'a TrackedStateDiff,
-        source_diff: &'a TrackedStateDiff,
-    ) -> Result<Self, LixError> {
-        let target_is_sorted = entries_are_strictly_sorted(&target_diff.entries)?;
-        let source_is_sorted = entries_are_strictly_sorted(&source_diff.entries)?;
-        if target_is_sorted && source_is_sorted {
-            return Ok(Self::Borrowed {
-                target: &target_diff.entries,
-                source: &source_diff.entries,
-            });
-        }
-
-        let target_len = target_diff.entries.len();
-        let mut entries = Vec::with_capacity(target_len.saturating_add(source_diff.entries.len()));
-        entries.extend(&target_diff.entries);
-        entries.extend(&source_diff.entries);
-        entries[..target_len].sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
-        entries[target_len..].sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
-        reject_adjacent_duplicates(&entries[..target_len])?;
-        reject_adjacent_duplicates(&entries[target_len..])?;
-        Ok(Self::Fallback {
-            entries,
-            target_len,
-        })
-    }
-}
-
-/// Returns `true` for the borrowed merge path and `false` when sorting is
-/// required. Adjacent duplicates are rejected immediately; non-adjacent
-/// duplicates are rejected after the fallback sort.
-fn entries_are_strictly_sorted(entries: &[TrackedStateDiffEntry]) -> Result<bool, LixError> {
-    let mut is_sorted = true;
+/// Tree diff batches are a physical ordered stream. Merge consumes that
+/// contract directly and fails closed rather than allocating a sorted copy.
+fn validate_strictly_sorted_entries(entries: &[TrackedStateDiffEntry]) -> Result<(), LixError> {
     for pair in entries.windows(2) {
         match pair[0].identity.cmp(&pair[1].identity) {
             Ordering::Less => {}
             Ordering::Equal => return Err(duplicate_diff_entry_error(&pair[1])),
-            Ordering::Greater => is_sorted = false,
-        }
-    }
-    Ok(is_sorted)
-}
-
-fn reject_adjacent_duplicates(entries: &[&TrackedStateDiffEntry]) -> Result<(), LixError> {
-    for pair in entries.windows(2) {
-        if pair[0].identity == pair[1].identity {
-            return Err(duplicate_diff_entry_error(pair[1]));
+            Ordering::Greater => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked-state merge received a diff outside physical identity order",
+                ));
+            }
         }
     }
     Ok(())
@@ -546,7 +416,6 @@ mod tests {
                 None,
                 Some(row("entity-a", "source")),
             )]),
-            &TrackedStatePayloadBatch::default(),
         )
         .expect("merge should plan");
 
@@ -564,7 +433,6 @@ mod tests {
                 Some(row_with_value("entity-a", "base")),
                 Some(row_with_value("entity-a", "source")),
             )]),
-            &TrackedStatePayloadBatch::default(),
         )
         .expect("merge should plan");
 
@@ -583,7 +451,6 @@ mod tests {
                 Some(row("entity-a", "base")),
                 Some(tombstone("entity-a", "source-delete")),
             )]),
-            &TrackedStatePayloadBatch::default(),
         )
         .expect("merge should plan");
 
@@ -602,7 +469,6 @@ mod tests {
                 Some(row("entity-a", "target")),
             )]),
             &TrackedStateDiff::default(),
-            &TrackedStatePayloadBatch::default(),
         )
         .expect("merge should plan");
 
@@ -647,14 +513,7 @@ mod tests {
             )])
             .expect("source payload batch should seal"),
         );
-        assert!(
-            merge_payload_fallback_ids(&target, &source)
-                .expect("retained payloads should prepare")
-                .is_empty(),
-            "retained diff owners must eliminate merge payload reloads"
-        );
-        let plan = plan_merge(&target, &source, &TrackedStatePayloadBatch::default())
-            .expect("merge should plan from retained owners");
+        let plan = plan_merge(&target, &source).expect("merge should plan from retained owners");
 
         assert!(plan.picks.is_empty());
         assert!(plan.conflicts.is_empty());
@@ -675,12 +534,7 @@ mod tests {
             Some(tombstone("entity-a", "source-delete")),
         );
 
-        let plan = plan_merge(
-            &diff(vec![target]),
-            &diff(vec![source]),
-            &TrackedStatePayloadBatch::default(),
-        )
-        .expect("merge should plan");
+        let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
 
         assert!(plan.picks.is_empty());
         assert!(plan.conflicts.is_empty());
@@ -701,12 +555,7 @@ mod tests {
             Some(row_with_value("entity-a", "source")),
         );
 
-        let plan = plan_merge(
-            &diff(vec![target]),
-            &diff(vec![source]),
-            &TrackedStatePayloadBatch::default(),
-        )
-        .expect("merge should plan");
+        let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
 
         assert!(plan.picks.is_empty());
         assert_eq!(conflict_ids(&plan), vec!["entity-a"]);
@@ -727,12 +576,7 @@ mod tests {
             Some(row_with_value("entity-a", "source")),
         );
 
-        let plan = plan_merge(
-            &diff(vec![target]),
-            &diff(vec![source]),
-            &TrackedStatePayloadBatch::default(),
-        )
-        .expect("merge should plan");
+        let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
 
         assert_eq!(conflict_ids(&plan), vec!["entity-a"]);
     }
@@ -752,12 +596,7 @@ mod tests {
             Some(tombstone("entity-a", "source-delete")),
         );
 
-        let plan = plan_merge(
-            &diff(vec![target]),
-            &diff(vec![source]),
-            &TrackedStatePayloadBatch::default(),
-        )
-        .expect("merge should plan");
+        let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
 
         assert_eq!(conflict_ids(&plan), vec!["entity-a"]);
     }
@@ -772,7 +611,6 @@ mod tests {
                 Some(row("entity-a", "base")),
                 None,
             )]),
-            &TrackedStatePayloadBatch::default(),
         )
         .expect_err("merge should reject impossible source removal");
 
@@ -789,12 +627,6 @@ mod tests {
         )]);
         let source = diff(vec![
             entry(
-                "entity-c",
-                TrackedStateDiffKind::Added,
-                None,
-                Some(row("entity-c", "source-c")),
-            ),
-            entry(
                 "entity-a",
                 TrackedStateDiffKind::Added,
                 None,
@@ -806,10 +638,15 @@ mod tests {
                 Some(row_with_value("entity-b", "base")),
                 Some(row_with_value("entity-b", "source")),
             ),
+            entry(
+                "entity-c",
+                TrackedStateDiffKind::Added,
+                None,
+                Some(row("entity-c", "source-c")),
+            ),
         ]);
 
-        let plan = plan_merge(&target, &source, &TrackedStatePayloadBatch::default())
-            .expect("merge should plan");
+        let plan = plan_merge(&target, &source).expect("merge should plan");
 
         assert_eq!(pick_ids(&plan), vec!["entity-a", "entity-c"]);
         assert_eq!(conflict_ids(&plan), vec!["entity-b"]);
@@ -832,21 +669,10 @@ mod tests {
                 .collect(),
         );
 
-        match SortedMergeInputs::new(&target, &source).expect("merge inputs should prepare") {
-            SortedMergeInputs::Borrowed {
-                target: borrowed_target,
-                source: borrowed_source,
-            } => {
-                assert_eq!(borrowed_target.as_ptr(), target.entries.as_ptr());
-                assert_eq!(borrowed_source.as_ptr(), source.entries.as_ptr());
-            }
-            SortedMergeInputs::Fallback { .. } => {
-                panic!("identity-sorted engine batches must not allocate a sorting fallback");
-            }
-        }
+        validate_strictly_sorted_entries(&target.entries).expect("target order");
+        validate_strictly_sorted_entries(&source.entries).expect("source order");
 
-        let plan = plan_merge(&target, &source, &TrackedStatePayloadBatch::default())
-            .expect("large sorted merge should plan");
+        let plan = plan_merge(&target, &source).expect("large sorted merge should plan");
         assert_eq!(plan.picks.len(), source.entries.len());
         assert!(plan.conflicts.is_empty());
     }
@@ -889,8 +715,7 @@ mod tests {
         );
         let source = TrackedStateDiff::from_entries(source_entries);
 
-        let plan = plan_merge(&target, &source, &TrackedStatePayloadBatch::default())
-            .expect("sparse pick merge should plan");
+        let plan = plan_merge(&target, &source).expect("sparse pick merge should plan");
 
         assert_eq!(plan.picks.len(), 1);
         assert_eq!(plan.picks.row_capacity(), 1);
@@ -931,8 +756,7 @@ mod tests {
                 .collect(),
         );
 
-        let plan = plan_merge(&target, &source, &TrackedStatePayloadBatch::default())
-            .expect("sparse conflict merge should plan");
+        let plan = plan_merge(&target, &source).expect("sparse conflict merge should plan");
 
         assert!(plan.picks.is_empty());
         assert_eq!(plan.picks.row_capacity(), 0);
@@ -941,122 +765,6 @@ mod tests {
         assert_eq!(
             plan.conflicts[0].identity.entity_pk(),
             &integer_entity_pk(-1)
-        );
-    }
-
-    #[test]
-    fn ten_thousand_disjoint_sorted_rows_need_no_payload_fallback_reads() {
-        const ROW_COUNT: usize = 10_000;
-        let batched_diff = |identity_prefix: &str, change_prefix: &str| {
-            let identities = TrackedStateDiffIdentity::from_key_batch(
-                (0..ROW_COUNT)
-                    .map(|index| crate::tracked_state::TrackedStateKey {
-                        schema_key: "shared_schema".to_string(),
-                        file_id: None,
-                        entity_pk: EntityPk::single(format!("{identity_prefix}-{index:05}")),
-                    })
-                    .collect(),
-            )
-            .expect("identity batch should seal");
-            let timestamp = crate::common::LixTimestamp::from_unix_millis_utc_lossy(0);
-            let commit_id = CommitId::for_test_label(change_prefix);
-            TrackedStateDiff::from_entries(
-                identities
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, identity)| {
-                        let after = TrackedStateDiffRow {
-                            identity: identity.clone(),
-                            deleted: false,
-                            created_at: timestamp,
-                            updated_at: timestamp,
-                            change_id: ChangeId::for_test_label(&format!(
-                                "{change_prefix}-{index:05}"
-                            )),
-                            commit_id,
-                        };
-                        TrackedStateDiffEntry {
-                            identity,
-                            kind: TrackedStateDiffKind::Added,
-                            before: None,
-                            after: Some(after),
-                        }
-                    })
-                    .collect(),
-            )
-        };
-        let target = batched_diff("entity-a", "target");
-        let source = batched_diff("entity-b", "source");
-
-        let fallback_ids = merge_payload_fallback_ids(&target, &source)
-            .expect("disjoint sorted batches should intersect");
-
-        assert!(
-            fallback_ids.is_empty(),
-            "disjoint identities must not issue changelog payload reads"
-        );
-    }
-
-    #[test]
-    fn unsorted_payload_fallback_intersects_only_live_differing_changes() {
-        let mut target_deleted = row("entity-c", "target-c");
-        target_deleted.deleted = true;
-        let target = diff(vec![
-            entry(
-                "entity-c",
-                TrackedStateDiffKind::Removed,
-                None,
-                Some(target_deleted),
-            ),
-            entry(
-                "entity-a",
-                TrackedStateDiffKind::Modified,
-                None,
-                Some(row("entity-a", "target-a")),
-            ),
-            entry(
-                "entity-b",
-                TrackedStateDiffKind::Modified,
-                None,
-                Some(row("entity-b", "same-b")),
-            ),
-        ]);
-        let source = diff(vec![
-            entry(
-                "entity-b",
-                TrackedStateDiffKind::Modified,
-                None,
-                Some(row("entity-b", "same-b")),
-            ),
-            entry(
-                "entity-c",
-                TrackedStateDiffKind::Modified,
-                None,
-                Some(row("entity-c", "source-c")),
-            ),
-            entry(
-                "entity-a",
-                TrackedStateDiffKind::Modified,
-                None,
-                Some(row("entity-a", "source-a")),
-            ),
-            entry(
-                "entity-d",
-                TrackedStateDiffKind::Added,
-                None,
-                Some(row("entity-d", "source-d")),
-            ),
-        ]);
-
-        let fallback_ids =
-            merge_payload_fallback_ids(&target, &source).expect("unsorted inputs should normalize");
-
-        assert_eq!(
-            fallback_ids,
-            vec![
-                ChangeId::for_test_label("target-a"),
-                ChangeId::for_test_label("source-a")
-            ]
         );
     }
 
@@ -1103,8 +811,7 @@ mod tests {
         let target = TrackedStateDiff::from_entries(entries(&target_identities, "target"));
         let source = TrackedStateDiff::from_entries(entries(&source_identities, "source"));
 
-        let plan = plan_merge(&target, &source, &TrackedStatePayloadBatch::default())
-            .expect("divergent batches should plan");
+        let plan = plan_merge(&target, &source).expect("divergent batches should plan");
 
         assert!(plan.picks.is_empty());
         assert_eq!(plan.conflicts.len(), ROW_COUNT);
@@ -1133,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn unsorted_merge_uses_one_partitioned_reference_buffer() {
+    fn unsorted_merge_input_is_rejected() {
         let target = diff(vec![
             entry(
                 "entity-c",
@@ -1163,43 +870,12 @@ mod tests {
             ),
         ]);
 
-        match SortedMergeInputs::new(&target, &source).expect("merge inputs should prepare") {
-            SortedMergeInputs::Borrowed { .. } => {
-                panic!("unsorted input must use the defensive sorting fallback");
-            }
-            SortedMergeInputs::Fallback {
-                entries,
-                target_len,
-            } => {
-                assert_eq!(entries.len(), 4);
-                assert_eq!(target_len, 2);
-                assert_eq!(
-                    entries[0]
-                        .identity
-                        .entity_pk()
-                        .as_single_string_owned()
-                        .expect("target identity"),
-                    "entity-a"
-                );
-                assert_eq!(
-                    entries[target_len]
-                        .identity
-                        .entity_pk()
-                        .as_single_string_owned()
-                        .expect("source identity"),
-                    "entity-b"
-                );
-            }
-        }
-
-        let plan = plan_merge(&target, &source, &TrackedStatePayloadBatch::default())
-            .expect("unsorted merge should plan");
-        assert_eq!(pick_ids(&plan), vec!["entity-b", "entity-d"]);
-        assert!(plan.conflicts.is_empty());
+        let error = plan_merge(&target, &source).expect_err("unsorted merge must fail closed");
+        assert!(error.message.contains("physical identity order"));
     }
 
     #[test]
-    fn unsorted_non_adjacent_duplicate_identity_is_rejected() {
+    fn unsorted_non_adjacent_duplicate_identity_is_rejected_before_merge() {
         let duplicate = entry(
             "entity-a",
             TrackedStateDiffKind::Added,
@@ -1217,15 +893,10 @@ mod tests {
             duplicate,
         ]);
 
-        let error = plan_merge(
-            &TrackedStateDiff::default(),
-            &source,
-            &TrackedStatePayloadBatch::default(),
-        )
-        .expect_err("duplicate source identity must be rejected");
+        let error = plan_merge(&TrackedStateDiff::default(), &source)
+            .expect_err("duplicate source identity must be rejected");
 
-        assert!(error.message.contains("duplicate diff entry"));
-        assert!(error.message.contains("entity-a"));
+        assert!(error.message.contains("physical identity order"));
     }
 
     fn diff(entries: Vec<TrackedStateDiffEntry>) -> TrackedStateDiff {
@@ -1395,12 +1066,7 @@ mod tests {
         );
         let source_owner = source.identity.clone();
 
-        let plan = plan_merge(
-            &diff(vec![target]),
-            &diff(vec![source]),
-            &TrackedStatePayloadBatch::default(),
-        )
-        .expect("merge should plan");
+        let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
         let conflict = &plan.conflicts[0];
 
         assert!(target_owner.shares_key_with(&conflict.identity));

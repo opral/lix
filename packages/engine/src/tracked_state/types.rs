@@ -5,22 +5,6 @@ use crate::entity_pk::EntityPk;
 use bytes::Bytes;
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
-pub(crate) const COMMIT_STATE_MAX_REPLAY_DEPTH: u16 = 32;
-pub(crate) const COMMIT_STATE_MAX_REPLAY_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Content-addressed root id for one tracked-state commit-root tree.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, musli::Encode, musli::Decode)]
-pub(crate) struct TrackedStateRootId(#[musli(bytes)] [u8; TRACKED_STATE_HASH_BYTES]);
-
-impl TrackedStateRootId {
-    pub(crate) fn new(bytes: [u8; TRACKED_STATE_HASH_BYTES]) -> Self {
-        Self(bytes)
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8; TRACKED_STATE_HASH_BYTES] {
-        &self.0
-    }
-}
 
 /// Root-independent tracked entity primary key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -51,17 +35,15 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
 }
 
-/// Physical location of an entity snapshot in an immutable columnar base.
+/// Physical location of an entity snapshot in immutable Arrow-native state.
 ///
-/// Commit deltas carry this coordinate alongside their authoritative payload,
-/// allowing exact identity lookups to reconcile an overlay row with its base
-/// row without reading a second index. The commit id owns the referenced base
-/// layout; group and row ordinals are intentionally fixed-width so the packed
-/// commit-delta sidecar remains compact.
+/// The content digest is carried explicitly. Resolving a physical row must
+/// never derive its storage identity from a commit and schema: commits point
+/// at state, while immutable state is independently content addressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct TrackedStateBaseCoordinate {
-    pub(crate) base_commit_id: CommitId,
+    pub(crate) state_set_id: crate::columnar_row_group::ArrowStateSetId,
     pub(crate) group_index: u32,
     pub(crate) row_index: u32,
 }
@@ -96,18 +78,7 @@ pub(crate) struct TrackedStateSingleStringReplacementRef<'a> {
     pub(crate) updated_at: LixTimestamp,
     pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
     pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
-}
-
-/// One ordered tracked-root mutation with its insert-collision contract.
-///
-/// Bulk commit assembly keeps this zero-copy form until it has compared the
-/// mutation with the parent leaf. That lets the common full-batch path retain
-/// only one incoming key/value at a time instead of a second `Vec` plus a
-/// cloned absence-guard set.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TrackedStateRootMutationRef<'a> {
-    pub(crate) delta: TrackedStateDeltaRef<'a>,
-    pub(crate) require_absence: bool,
+    pub(crate) base_coordinate: Option<TrackedStateBaseCoordinate>,
 }
 
 /// Value stored in tracked-state commit-root trees.
@@ -144,42 +115,6 @@ pub(crate) struct TrackedStateIndexValueRef {
     pub(crate) updated_at: LixTimestamp,
 }
 
-/// Durable tracked-state root metadata for one commit.
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct TrackedStateCommitRoot {
-    pub(crate) commit_id: CommitId,
-    pub(crate) root_id: TrackedStateRootId,
-    pub(crate) parent_roots: Vec<TrackedStateCommitRootParent>,
-    pub(crate) changed_key_count: u64,
-    pub(crate) row_count_estimate: u64,
-    pub(crate) tree_height: u32,
-    pub(crate) primary_chunk_count: u64,
-    pub(crate) primary_chunk_bytes: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct TrackedStateCommitRootParent {
-    pub(crate) commit_id: CommitId,
-    pub(crate) root_id: TrackedStateRootId,
-}
-
-/// Bounded first-parent replay work carried by a commit's canonical mutation
-/// interval.
-///
-/// Zero debt means the snapshot root is the canonical serving layout. Nonzero
-/// debt means readers can reconstruct the state from the bounded interval;
-/// [`CommitStateManifest::snapshot_root`] may still contain an equivalent,
-/// rebuildable snapshot accelerator without changing that policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct CommitStateReplayDebt {
-    pub(crate) depth: u16,
-    pub(crate) rows: u64,
-    pub(crate) bytes: u64,
-}
-
 /// Key bounds for one existing commit-addressed mutation segment.
 ///
 /// Segment slot order is durable because directly addressable `ChangeId`s
@@ -194,33 +129,6 @@ pub(crate) struct CommitStateMutationPart {
     pub(crate) last_key: Vec<u8>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) replacement_part: Option<StoredReplacementPart>,
-}
-
-/// One lossless entity-columnar generation used directly as authored history.
-///
-/// The row-group manifest binds every column digest. Uniform lifecycle and
-/// origin metadata remain in the commit authority instead of being repeated
-/// in every row. Direct change addresses retain their established 512-row
-/// logical slots and translate to these larger physical groups by ordinal.
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-pub(crate) struct ColumnarMutationPartSet {
-    pub(crate) owner_commit_id: [u8; 16],
-    pub(crate) row_group_set_id: [u8; 16],
-    pub(crate) manifest_digest: [u8; 32],
-    pub(crate) schema_key: String,
-    pub(crate) row_count: u32,
-    pub(crate) group_row_counts: Vec<u32>,
-    #[musli(bytes)]
-    pub(crate) first_key: Vec<u8>,
-    #[musli(bytes)]
-    pub(crate) last_key: Vec<u8>,
-    pub(crate) page_first_keys: Vec<Vec<u8>>,
-    pub(crate) page_last_keys: Vec<Vec<u8>>,
-    pub(crate) uniform_created_at: LixTimestamp,
-    pub(crate) uniform_updated_at: LixTimestamp,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) origin_key: Option<String>,
 }
 
 /// One collection partition replaced by a certified immutable generation.
@@ -247,8 +155,6 @@ pub(crate) struct CommitDeltaLifecycleSummary {
 pub(crate) struct StoredCommitDeltaReplacementGeneration {
     pub(crate) owner_commit_id: [u8; 16],
     pub(crate) scope: CommitDeltaReplacementScope,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) fallback_commit_id: Option<[u8; 16]>,
     pub(crate) integrity_digest: [u8; 32],
 }
 
@@ -262,7 +168,13 @@ pub(crate) struct StoredReplacementPartsAuthority {
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct StoredReplacementPart {
+    /// Compact authored-event sidecar identity. It is not state authority.
     pub(crate) content_digest: [u8; 32],
+    /// The immutable Arrow leaf that owns the post-image payload and current
+    /// state for this exact key range.
+    pub(crate) state_set_id: crate::columnar_row_group::ArrowStateSetId,
+    pub(crate) state_group_index: u32,
+    pub(crate) payload_refs_digest: [u8; 32],
     pub(crate) owner_commit_id: [u8; 16],
     pub(crate) first_address: u32,
     pub(crate) uniform_created_at: LixTimestamp,
@@ -281,73 +193,61 @@ pub(crate) struct CurrentStatePartDescriptor {
     pub(crate) first_key: Vec<u8>,
     #[musli(bytes)]
     pub(crate) last_key: Vec<u8>,
-    pub(crate) content_digest: [u8; 32],
-    /// Digest of the native part's compact JSON-reference summary. Zero for
-    /// complete-replacement sources whose history authority owns reachability.
+    pub(crate) state_set_id: crate::columnar_row_group::ArrowStateSetId,
+    pub(crate) state_group_index: u32,
+    /// Digest of this Arrow leaf's compact JSON-reference summary.
     pub(crate) payload_refs_digest: [u8; 32],
-    /// 0 references an immutable complete-replacement mutation part; 1
-    /// references a native content-addressed current-state data part; 2
-    /// references one authenticated page in a canonical entity row-group set.
-    pub(crate) source_kind: u8,
-    /// Physical immutable source generation. Zero for replacement/native
-    /// sources; the exact row-group-set ID for columnar pages.
-    pub(crate) source_id: [u8; 16],
-    pub(crate) owner_commit_id: [u8; 16],
-    /// Replacement segment index or columnar row-group index. Zero for native
-    /// current-state data parts.
-    pub(crate) part_index: u32,
-    /// Columnar page index inside `part_index`. Zero for other source kinds.
-    pub(crate) source_page_index: u16,
-    /// First physical row selected from the source part. Descriptor slicing
-    /// allows sparse deletes and updates to retain untouched source bytes.
-    pub(crate) source_row_offset: u16,
     pub(crate) row_count: u16,
-    /// True only for structural slices and authored islands introduced by a
-    /// sparse rewrite. Canonical encodes clear this bit, making compaction
-    /// self-stabilizing without guessing from physical row density.
-    pub(crate) fragmented: bool,
-    pub(crate) uniform_created_at: LixTimestamp,
-    pub(crate) uniform_updated_at: LixTimestamp,
 }
 
-/// Manifest-attested root of the unified scope/part serving tree.
-///
-/// The generic tree owns only authenticated physical routing. These fields
-/// bind one result root to the physical serving base and sealed mutation
-/// authority that produced it. Graph ancestry remains an independent semantic
-/// relationship and is not exposed to the tree.
+/// Content-addressed root of a persistent current-state range directory.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
-pub(crate) struct CurrentStateScopedRangeRoot {
-    pub(crate) tree: super::scoped_range::ScopedRangeRoot,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) serving_base_commit_id: Option<CommitId>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) serving_base_root_id: Option<[u8; 32]>,
-    pub(crate) transition_digest: [u8; 32],
+pub(crate) struct CurrentStatePartDirectoryRoot {
+    pub(crate) root_id: [u8; 32],
+    pub(crate) descriptor_digest: [u8; 32],
+    pub(crate) row_count: u64,
+    pub(crate) part_count: u32,
+    pub(crate) tree_height: u16,
 }
 
-/// Cumulative negative-membership certificate for collection scopes.
+/// One authoritative current-state collection generation.
 ///
-/// A complete filter may have false positives, but never false negatives: a
-/// missing schema-family bit therefore proves that no effective graph-parent
-/// or selected-source lineage authored any scope for that schema. Coarsening
-/// file-scoped collections to their schema avoids cardinality-driven
-/// saturation while remaining conservative. Incomplete filters fail closed
-/// and carry no bits.
-#[derive(Debug, Clone, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
+/// The mutation-directory digest binds this rebuildable serving projection to
+/// the commit's historical replacement certificate without making the serving
+/// directory part of commit semantics.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
-pub(crate) struct CommitStateTouchedScopeFilter {
-    pub(crate) complete: bool,
-    #[musli(bytes)]
-    pub(crate) bits: Vec<u8>,
+pub(crate) struct CurrentStatePartSet {
+    pub(crate) scope: CommitDeltaReplacementScope,
+    pub(crate) directory: CurrentStatePartDirectoryRoot,
+}
+
+/// Content-addressed root of the persistent collection-to-state-part catalog.
+///
+/// One root in each commit manifest replaces an O(collections) copied vector.
+/// Unchanged commits reuse the exact root; updates rewrite only the bounded
+/// radix path for affected collections.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CurrentStateCatalogRoot {
+    pub(crate) root_id: [u8; 32],
+    pub(crate) entry_count: u32,
+    /// Root inherited from the sole parent before applying this commit. This
+    /// is serving-layout lineage, not commit-graph ancestry.
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) parent_root_id: Option<[u8; 32]>,
+    /// Binds this commit, its inherited root, and the resulting content root.
+    /// Event-sidecar placement is deliberately independent so state can be
+    /// sealed before authored coordinates are finalized.
+    pub(crate) transition_digest: [u8; 32],
 }
 
 /// Point-addressable immutable mutation inventory owned by one commit.
 ///
 /// The fields intentionally mirror the existing commit-delta directory. This
 /// lets the hard-cut manifest become authoritative without changing the
-/// bounded LXCD14 segment and payload-sidecar codec in the same step.
+/// bounded LXCD15 identity/event-sidecar codec in the same step.
 #[derive(Debug, Clone, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateMutationInventory {
@@ -375,11 +275,10 @@ pub(crate) struct CommitStateMutationInventory {
     pub(crate) replacement_generation: Option<StoredCommitDeltaReplacementGeneration>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) replacement_parts: Option<StoredReplacementPartsAuthority>,
-    /// Lossless typed post-images that are both the authored mutation payload
-    /// and the serving columnar source. When present, legacy LXCD parts are
-    /// forbidden rather than retained as a compatibility copy.
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) columnar_parts: Option<ColumnarMutationPartSet>,
+    /// Native post-image leaves already sealed by certified typed ingress.
+    /// When the state parent has no entry for `single_partition`, these are
+    /// published directly instead of replaying and re-encoding mutations.
+    pub(crate) sealed_state_parts: Vec<CurrentStatePartDescriptor>,
     /// Tiny commits retain their only part inline so an exact history lookup
     /// remains one backend point read.
     #[musli(bytes)]
@@ -394,10 +293,7 @@ impl CommitStateMutationInventory {
     }
 
     pub(crate) fn part_count(&self) -> usize {
-        self.columnar_parts
-            .as_ref()
-            .map_or(0, |parts| parts.group_row_counts.len())
-            + usize::from(!self.inline_part.is_empty())
+        usize::from(!self.inline_part.is_empty())
             + if self.replacement_part_digests.is_empty() {
                 self.parts.len()
             } else {
@@ -417,16 +313,13 @@ pub(crate) struct CommitStateManifest {
     pub(crate) commit_id: CommitId,
     pub(crate) generation: u64,
     pub(crate) parent_commit_ids: Vec<CommitId>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) state_parent_commit_id: Option<CommitId>,
     pub(crate) commit_change_id: ChangeId,
     pub(crate) account_id: String,
     pub(crate) created_at: LixTimestamp,
-    pub(crate) replay_debt: CommitStateReplayDebt,
     pub(crate) mutations: CommitStateMutationInventory,
-    pub(crate) touched_scope_filter: CommitStateTouchedScopeFilter,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) snapshot_root: Option<TrackedStateCommitRoot>,
+    pub(crate) current_state_catalog: Box<CurrentStateCatalogRoot>,
 }
 
 /// Materialized tracked-state commit-root row.
@@ -487,14 +380,6 @@ pub(crate) struct TrackedStateMutation {
 }
 
 impl TrackedStateMutation {
-    #[cfg(test)]
-    pub(crate) fn put_encoded(encoded_key: Vec<u8>, encoded_value: Vec<u8>) -> Self {
-        Self {
-            encoded_key: Bytes::from(encoded_key),
-            encoded_value: Bytes::from(encoded_value),
-        }
-    }
-
     pub(crate) fn from_shared(encoded_key: Bytes, encoded_value: Bytes) -> Self {
         Self {
             encoded_key,
@@ -519,16 +404,6 @@ impl TrackedStateMutationBatch {
         Self { mutations }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.mutations.len()
-    }
-
-    pub(crate) fn first_encoded_key(&self) -> Option<&[u8]> {
-        self.mutations
-            .first()
-            .map(|mutation| mutation.encoded_key.as_ref())
-    }
-
     #[cfg(test)]
     pub(crate) fn as_slice(&self) -> &[TrackedStateMutation] {
         &self.mutations
@@ -540,7 +415,7 @@ impl TrackedStateMutationBatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateTreeScanRequest {
+pub(crate) struct TrackedStatePhysicalScanRequest {
     pub(crate) schema_keys: Vec<String>,
     pub(crate) entity_pks: Vec<EntityPk>,
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
@@ -548,7 +423,7 @@ pub(crate) struct TrackedStateTreeScanRequest {
     pub(crate) limit: Option<usize>,
 }
 
-impl Default for TrackedStateTreeScanRequest {
+impl Default for TrackedStatePhysicalScanRequest {
     fn default() -> Self {
         Self {
             schema_keys: Vec::new(),
@@ -560,18 +435,7 @@ impl Default for TrackedStateTreeScanRequest {
     }
 }
 
-impl TrackedStateTreeScanRequest {
-    pub(crate) fn matches(&self, key: &TrackedStateKey, value: &TrackedStateIndexValue) -> bool {
-        self.matches_ref(
-            TrackedStateKeyRef {
-                schema_key: &key.schema_key,
-                file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
-            },
-            value,
-        )
-    }
-
+impl TrackedStatePhysicalScanRequest {
     pub(crate) fn matches_ref(
         &self,
         key: TrackedStateKeyRef<'_>,
@@ -606,27 +470,4 @@ impl TrackedStateTreeScanRequest {
         }
         true
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateApplyResult {
-    pub(crate) root_id: TrackedStateRootId,
-    pub(crate) row_count: usize,
-    pub(crate) tree_height: usize,
-    pub(crate) chunk_count: usize,
-    pub(crate) chunk_bytes: usize,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateTreeDiffEntry {
-    /// Identity column shared by both sides of a modified row.
-    ///
-    /// Tree ordering already proves that a modified entry has the same
-    /// encoded key on both sides. Keeping one decoded key avoids decoding and
-    /// allocating the schema/file/entity identity twice before diff and merge
-    /// immediately re-share it.
-    pub(crate) key: TrackedStateKey,
-    pub(crate) before: Option<TrackedStateIndexValue>,
-    pub(crate) after: Option<TrackedStateIndexValue>,
 }

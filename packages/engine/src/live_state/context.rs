@@ -86,9 +86,10 @@ struct EntityColumnarLayoutCacheKey {
 #[derive(Debug)]
 struct CachedEntityColumnarLayout {
     key: EntityColumnarLayoutCacheKey,
-    id: crate::columnar_row_group::RowGroupSetId,
+    id: crate::columnar_row_group::ArrowStateSetId,
     manifest: std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
     manifest_digest: [u8; 32],
+    group_sources: std::sync::Arc<Vec<crate::live_state::EntityColumnarGroupSource>>,
     overlay: std::sync::Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
     head_commit_id: CommitId,
     live_count: u64,
@@ -121,9 +122,10 @@ impl EntityColumnarLayoutCache {
     fn insert(
         &self,
         key: EntityColumnarLayoutCacheKey,
-        id: crate::columnar_row_group::RowGroupSetId,
+        id: crate::columnar_row_group::ArrowStateSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
         manifest_digest: [u8; 32],
+        group_sources: Vec<crate::live_state::EntityColumnarGroupSource>,
         overlay: Vec<crate::live_state::EntityColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
@@ -133,6 +135,7 @@ impl EntityColumnarLayoutCache {
             id,
             manifest,
             manifest_digest,
+            group_sources,
             overlay,
             head_commit_id,
             live_count,
@@ -144,9 +147,10 @@ impl EntityColumnarLayoutCache {
     fn insert_with_max_bytes(
         &self,
         key: EntityColumnarLayoutCacheKey,
-        id: crate::columnar_row_group::RowGroupSetId,
+        id: crate::columnar_row_group::ArrowStateSetId,
         manifest: crate::columnar_row_group::RowGroupManifest,
         manifest_digest: [u8; 32],
+        group_sources: Vec<crate::live_state::EntityColumnarGroupSource>,
         overlay: Vec<crate::live_state::EntityColumnarOverlayRow>,
         head_commit_id: CommitId,
         live_count: u64,
@@ -160,11 +164,13 @@ impl EntityColumnarLayoutCache {
             estimated_entity_columnar_layout_bytes(&key, &manifest, &overlay, overlay.capacity())
                 .saturating_mul(2);
         let manifest = std::sync::Arc::new(manifest);
+        let group_sources = std::sync::Arc::new(group_sources);
         let entry = std::sync::Arc::new(CachedEntityColumnarLayout {
             key,
             id,
             manifest,
             manifest_digest,
+            group_sources,
             overlay,
             head_commit_id,
             live_count,
@@ -426,26 +432,6 @@ impl<S> LiveStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    pub(crate) async fn prepare_packed_identity_membership(
-        &self,
-        branch_id: &str,
-        schema_key: &str,
-    ) -> Result<Option<crate::live_state::PackedIdentityMembership>, LixError> {
-        let Some(cache) = self.branch_head_control_cache.as_ref() else {
-            return Ok(None);
-        };
-        let controls =
-            load_branch_head_controls(&self.store, &[branch_id.to_owned()], Some(cache.as_ref()))
-                .await?;
-        let Some(control) = controls.get(branch_id).copied() else {
-            return Ok(None);
-        };
-        self.tracked_head
-            .transaction_reader(&self.store, std::sync::Arc::clone(&cache.hot_state))
-            .prepare_packed_identity_membership(branch_id, control.generation, schema_key)
-            .await
-    }
-
     /// Returns raw current-state snapshot bytes for one current SQL entity scan.
     ///
     /// `None` means the normal materialized visibility path remains
@@ -530,9 +516,10 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<
         Option<(
-            crate::columnar_row_group::RowGroupSetId,
+            crate::columnar_row_group::ArrowStateSetId,
             std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
             [u8; 32],
+            std::sync::Arc<Vec<crate::live_state::EntityColumnarGroupSource>>,
             std::sync::Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
             String,
             CommitId,
@@ -567,6 +554,7 @@ where
                 layout.id,
                 std::sync::Arc::clone(&layout.manifest),
                 layout.manifest_digest,
+                std::sync::Arc::clone(&layout.group_sources),
                 std::sync::Arc::clone(&layout.overlay),
                 branch_id,
                 layout.head_commit_id,
@@ -579,7 +567,7 @@ where
             .reader(&self.store)
             .entity_columnar_layout(&branch_id, control, &schema_key)
             .await?;
-        let Some((id, manifest, overlay, live_count)) = layout else {
+        let Some((id, manifest, group_sources, overlay, live_count)) = layout else {
             return Ok(None);
         };
         let manifest_digest = manifest.content_digest()?;
@@ -588,6 +576,7 @@ where
             id,
             manifest,
             manifest_digest,
+            group_sources,
             overlay,
             control.head_commit_id,
             live_count,
@@ -596,6 +585,7 @@ where
             layout.id,
             std::sync::Arc::clone(&layout.manifest),
             layout.manifest_digest,
+            std::sync::Arc::clone(&layout.group_sources),
             std::sync::Arc::clone(&layout.overlay),
             branch_id,
             layout.head_commit_id,
@@ -622,7 +612,7 @@ where
             .reader(&self.store)
             .entity_columnar_layout(branch_id, control, schema_key)
             .await?
-            .map(|(_, _, overlay, _)| overlay.len()))
+            .map(|(_, _, _, overlay, _)| overlay.len()))
     }
 
     async fn direct_entity_snapshot_scope(
@@ -1582,22 +1572,18 @@ async fn load_branch_head_control_ids(
 mod tests {
     use super::*;
     use crate::NullableKeyFilter;
-    use crate::changelog::{
-        ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader, CommitId,
-        CommitLoadRequest,
-    };
+    use crate::changelog::{ChangeId, ChangelogAppend, ChangelogContext, CommitId};
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
     use crate::live_state::{
         CurrentStateDeltaRef, LiveStateExactBatchRequest, LiveStateExactRowRequest,
-        LiveStateFilter, LiveStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
+        LiveStateFilter, LiveStateProjection, TrackedHeadDeltaRef,
     };
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
     use crate::tracked_state::{
-        CommitStateManifest, CommitStateReplayDebt, MaterializedTrackedStateRow,
-        TrackedStateCommitDeltaRef, TrackedStateDeltaRef, TrackedStateScanRequest,
-        stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
+        CommitStateManifest, MaterializedTrackedStateRow, TrackedStateScanRequest,
+        stage_commit_state_manifest,
     };
     use serde_json::json;
 
@@ -1616,7 +1602,6 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             fields: Vec::new(),
             groups: Vec::new(),
-            encoded_digest: [0; 32],
         }
     }
 
@@ -1626,9 +1611,10 @@ mod tests {
         let key = columnar_cache_key(7);
         let inserted = cache.insert(
             key,
-            crate::columnar_row_group::RowGroupSetId::new([1; 16]),
+            crate::columnar_row_group::ArrowStateSetId::from_digest([1; 32]),
             empty_columnar_manifest(),
             [2; 32],
+            Vec::new(),
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head"),
             1_000_000,
@@ -1646,9 +1632,10 @@ mod tests {
         let first = columnar_cache_key(7);
         cache.insert(
             first,
-            crate::columnar_row_group::RowGroupSetId::new([1; 16]),
+            crate::columnar_row_group::ArrowStateSetId::from_digest([1; 32]),
             empty_columnar_manifest(),
             [2; 32],
+            Vec::new(),
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head-7"),
             1_000_000,
@@ -1656,9 +1643,10 @@ mod tests {
         assert!(cache.get(&columnar_cache_key(8)).is_none());
         cache.insert(
             columnar_cache_key(8),
-            crate::columnar_row_group::RowGroupSetId::new([2; 16]),
+            crate::columnar_row_group::ArrowStateSetId::from_digest([2; 32]),
             empty_columnar_manifest(),
             [3; 32],
+            Vec::new(),
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head-8"),
             999_999,
@@ -1673,9 +1661,10 @@ mod tests {
         let key = columnar_cache_key(7);
         let returned = cache.insert_with_max_bytes(
             key,
-            crate::columnar_row_group::RowGroupSetId::new([1; 16]),
+            crate::columnar_row_group::ArrowStateSetId::from_digest([1; 32]),
             empty_columnar_manifest(),
             [2; 32],
+            Vec::new(),
             Vec::new(),
             CommitId::for_test_label("columnar-cache-head"),
             1_000_000,
@@ -2563,29 +2552,21 @@ mod tests {
             let branch_rows = rows_by_branch.remove(&branch_id).unwrap_or_default();
             let head_commit_id_text = head_commit_id.to_string();
             let mut tracked_reader = TrackedStateContext::new().reader(&read);
-            let parent_rows = if tracked_reader
-                .has_durable_commit_root(&head_commit_id_text)
-                .await
-                .expect("test branch root should inspect")
-            {
-                tracked_reader
-                    .scan_batch_at_commit(
-                        &head_commit_id_text,
-                        &TrackedStateScanRequest {
-                            filter: TrackedStateFilter {
-                                include_tombstones: true,
-                                ..Default::default()
-                            },
-                            read_columns: TrackedStateReadColumns::default(),
-                            limit: None,
+            let parent_rows = tracked_reader
+                .scan_batch_at_commit(
+                    &head_commit_id_text,
+                    &TrackedStateScanRequest {
+                        filter: TrackedStateFilter {
+                            include_tombstones: true,
+                            ..Default::default()
                         },
-                    )
-                    .await
-                    .expect("test branch root should load")
-                    .into_rows()
-            } else {
-                Vec::new()
-            };
+                        read_columns: TrackedStateReadColumns::default(),
+                        limit: None,
+                    },
+                )
+                .await
+                .expect("test Arrow root should load")
+                .into_rows();
             let snapshots = branch_rows
                 .iter()
                 .map(|row| {
@@ -2628,10 +2609,9 @@ mod tests {
                 .map(|row| row.schema_key.clone())
                 .chain(branch_rows.iter().map(|row| row.schema_key.clone()))
                 .collect::<Vec<_>>();
-            let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
             let generation = TrackedHeadContext::new()
                 .writer(&read, &mut writes)
-                .stage_current_state_with_working_diff(
+                .stage_current_state(
                     &branch_id,
                     None,
                     head_commit_id,
@@ -2639,8 +2619,6 @@ mod tests {
                     &std::collections::BTreeSet::new(),
                     Some(parent_rows),
                     None,
-                    None,
-                    &mut working_diff_coverage,
                 )
                 .await
                 .expect("test current-state generation should stage");
@@ -2706,10 +2684,9 @@ mod tests {
                     columnar_base_coordinate: None,
                 })
                 .collect::<Vec<_>>();
-            let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
             TrackedHeadContext::new()
                 .writer(&read, &mut writes)
-                .stage_current_state_with_working_diff(
+                .stage_current_state(
                     &branch_id,
                     Some(control.generation),
                     control.head_commit_id,
@@ -2717,8 +2694,6 @@ mod tests {
                     &std::collections::BTreeSet::new(),
                     None,
                     None,
-                    None,
-                    &mut working_diff_coverage,
                 )
                 .await
                 .expect("test untracked current state should stage");
@@ -2743,68 +2718,16 @@ mod tests {
         commit_ids: &[&str],
     ) {
         let mut writes = storage.new_write_set();
-        let mut append = ChangelogAppend::default();
-        let mut records = std::collections::BTreeMap::new();
         for commit_id in commit_ids {
-            let commit_id_text = CommitId::for_test_label(commit_id).to_string();
-            let commit_change_id = format!("{commit_id_text}:commit");
-            let record = crate::changelog::CommitRecord {
-                format_version: 1,
-                commit_id: CommitId::for_test_label(&commit_id_text),
-                generation: 0,
-                parent_commit_ids: Vec::new(),
-                tracked_state_rootless: false,
-                tracked_state_rootless_depth: 0,
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
-                change_id: ChangeId::for_test_label(&commit_change_id),
-                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                created_at: ts("1970-01-01T00:00:00.000Z"),
-            };
-            records.insert(record.commit_id, record.clone());
-            append.commits.push(record);
-        }
-        let mut changelog_read = read;
-        let mut writer = ChangelogContext::new().writer(&mut changelog_read, &mut writes);
-        crate::changelog::ChangelogWriter::stage_append(&mut writer, append)
-            .await
-            .expect("empty changelog commits should stage");
-        drop(writer);
-        for commit_id in commit_ids {
-            let commit_id_text = CommitId::for_test_label(commit_id).to_string();
-            let typed_commit_id = CommitId::for_test_label(commit_id);
-            let tracked_state = TrackedStateContext::new();
-            let mut root_writer = tracked_state.writer(read, &mut writes);
-            root_writer
-                .stage_commit_root(&commit_id_text, None, [])
-                .await
-                .expect("empty tracked roots should stage");
-            let snapshot_root = root_writer
-                .staged_commit_roots()
-                .find(|root| root.commit_id == typed_commit_id)
-                .cloned()
-                .expect("empty tracked snapshot should stage");
-            drop(root_writer);
-            let record = records
-                .get(&typed_commit_id)
-                .expect("empty commit record should exist");
-            stage_commit_state_manifest(
+            let mut fixture_read = read;
+            crate::test_support::stage_empty_changelog_commit(
+                &mut fixture_read,
                 &mut writes,
-                &CommitStateManifest {
-                    commit_id: record.commit_id,
-                    generation: record.generation,
-                    parent_commit_ids: record.parent_commit_ids.clone(),
-                    commit_change_id: record.change_id,
-                    account_id: record.account_id.clone(),
-                    created_at: record.created_at,
-                    replay_debt: CommitStateReplayDebt::default(),
-                    mutations: Default::default(),
-                    touched_scope_filter: Default::default(),
-                    current_state_scoped_ranges: None,
-                    snapshot_root: Some(snapshot_root),
-                },
+                commit_id,
+                None,
             )
-            .expect("empty commit-state authority should stage");
+            .await
+            .expect("empty Arrow commit authority should stage");
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2994,11 +2917,6 @@ mod tests {
                 commit_id,
                 generation,
                 parent_commit_ids: parents,
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: u16::try_from(generation + 1)
-                    .expect("fixture generation should fit replay depth"),
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label(&format!("{commit_id}:change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
@@ -3017,19 +2935,19 @@ mod tests {
                 &CommitStateManifest {
                     commit_id: record.commit_id,
                     generation: record.generation,
+                    state_parent_commit_id: record.parent_commit_ids.first().copied(),
                     parent_commit_ids: record.parent_commit_ids,
                     commit_change_id: record.change_id,
                     account_id: record.account_id,
                     created_at: record.created_at,
-                    replay_debt: CommitStateReplayDebt {
-                        depth: record.tracked_state_rootless_depth,
-                        rows: record.tracked_state_rootless_rows,
-                        bytes: record.tracked_state_rootless_bytes,
-                    },
+                    current_state_catalog: Box::new(
+                        crate::tracked_state::empty_current_state_catalog_root(
+                            None,
+                            record.commit_id,
+                        )
+                        .expect("empty Arrow state root should construct"),
+                    ),
                     mutations: Default::default(),
-                    touched_scope_filter: Default::default(),
-                    current_state_scoped_ranges: None,
-                    snapshot_root: None,
                 },
             )
             .expect("mixed derived commit authority should stage");
@@ -3088,17 +3006,11 @@ mod tests {
     async fn stage_materialized_live_rows(
         store: &impl StorageAdapterRead,
         writes: &mut StorageWriteSet,
-        json_writer: &mut crate::json_store::JsonStoreWriter,
+        _json_writer: &mut crate::json_store::JsonStoreWriter,
         rows: &[MaterializedLiveStateRow],
     ) -> Result<(), LixError> {
-        let mut tracked_rows_by_commit = std::collections::BTreeMap::<
-            String,
-            Vec<(
-                ChangeRecord,
-                crate::common::LixTimestamp,
-                crate::common::LixTimestamp,
-            )>,
-        >::new();
+        let mut tracked_rows_by_commit =
+            std::collections::BTreeMap::<String, Vec<MaterializedTrackedStateRow>>::new();
         let mut parent_by_commit = std::collections::BTreeMap::<String, Option<String>>::new();
 
         for row in rows {
@@ -3120,167 +3032,27 @@ mod tests {
                 );
             }
             if row.schema_key != COMMIT_SCHEMA_KEY {
-                let change = crate::test_support::tracked_change_from_materialized(&materialized)?;
-                stage_json_payloads_from_materialized(writes, json_writer, &materialized)?;
                 tracked_rows_by_commit
                     .entry(commit_id_text)
                     .or_default()
-                    .push((
-                        change,
-                        ts(&materialized.created_at),
-                        ts(&materialized.updated_at),
-                    ));
+                    .push(materialized);
             }
         }
 
-        let mut generations = std::collections::BTreeMap::<String, u64>::new();
         for (commit_id, rows) in tracked_rows_by_commit {
             let parent_commit_id = parent_by_commit.remove(&commit_id).flatten();
-            let parent_ids = parent_commit_id
-                .as_ref()
-                .map(|parent| vec![parent.clone()])
-                .unwrap_or_default();
-            let commit_created_at = rows
-                .first()
-                .map(|(change, _, _)| change.created_at)
-                .unwrap_or_else(|| ts("1970-01-01T00:00:00.000Z"));
-            let commit_change_id = format!("{commit_id}:commit");
-            let generation = if let Some(parent) = parent_ids.first() {
-                let parent_generation = if let Some(generation) = generations.get(parent) {
-                    *generation
-                } else {
-                    let typed_parent = CommitId::for_test_label(parent);
-                    let mut changelog_read = store;
-                    ChangelogContext::new()
-                        .reader(&mut changelog_read)
-                        .load_commits(CommitLoadRequest {
-                            commit_ids: &[typed_parent],
-                        })
-                        .await?
-                        .into_iter()
-                        .next()
-                        .and_then(|(_, value)| value)
-                        .ok_or_else(|| {
-                            LixError::unknown("test changelog parent commit is missing")
-                        })?
-                        .generation
-                };
-                parent_generation
-                    .checked_add(1)
-                    .ok_or_else(|| LixError::unknown("test commit generation exceeds u64"))?
-            } else {
-                0
-            };
-            let typed_parent_ids = parent_ids
-                .iter()
-                .map(|id| CommitId::for_test_label(id))
-                .collect::<Vec<_>>();
-            let record = crate::changelog::CommitRecord {
-                format_version: 1,
-                commit_id: CommitId::for_test_label(&commit_id),
-                generation,
-                parent_commit_ids: typed_parent_ids,
-                tracked_state_rootless: false,
-                tracked_state_rootless_depth: 0,
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
-                change_id: ChangeId::for_test_label(&commit_change_id),
-                account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-                created_at: commit_created_at,
-            };
-            let mut append = ChangelogAppend::default();
-            append.commits.push(record.clone());
-            let mut changelog_read = store;
-            let mut writer = ChangelogContext::new().writer(&mut changelog_read, writes);
-            crate::changelog::ChangelogWriter::stage_append(&mut writer, append).await?;
-            drop(writer);
-            generations.insert(commit_id.clone(), generation);
-            let typed_commit_id = CommitId::for_test_label(&commit_id);
-            let root_deltas = rows
-                .iter()
-                .map(|(change, created_at, updated_at)| TrackedStateDeltaRef {
-                    schema_key: &change.schema_key,
-                    file_id: change.file_id.as_deref(),
-                    entity_pk: &change.entity_pk,
-                    change_id: change.change_id,
-                    commit_id: typed_commit_id,
-                    deleted: change.snapshot.is_none(),
-                    created_at: *created_at,
-                    updated_at: *updated_at,
-                })
-                .collect::<Vec<_>>();
-            let commit_deltas = rows
-                .iter()
-                .zip(&root_deltas)
-                .map(|((change, _, _), delta)| TrackedStateCommitDeltaRef {
-                    delta: *delta,
-                    snapshot: change.snapshot.as_ref_slot(),
-                    metadata: change.metadata.as_ref_slot(),
-                    origin_key: change.origin_key.as_deref(),
-                    base_coordinate: None,
-                    authored: true,
-                })
-                .collect::<Vec<_>>();
-            let staged_delta = stage_commit_deltas_for_commit_state(writes, &commit_deltas)?;
-            let mutation_inventory = staged_delta.mutation_inventory().clone();
-            let tracked_state = TrackedStateContext::new();
-            let mut root_writer = tracked_state.writer(&*store, writes);
-            root_writer
-                .stage_commit_root(&commit_id, parent_commit_id.as_deref(), root_deltas)
-                .await?;
-            let snapshot_root = root_writer
-                .staged_commit_roots()
-                .find(|root| root.commit_id == typed_commit_id)
-                .cloned()
-                .ok_or_else(|| LixError::unknown("test materialization did not stage a root"))?;
-            drop(root_writer);
-            stage_commit_state_manifest(
+            let mut fixture_read = store;
+            crate::test_support::stage_tracked_root_from_materialized(
+                &mut fixture_read,
                 writes,
-                &CommitStateManifest {
-                    commit_id: record.commit_id,
-                    generation: record.generation,
-                    parent_commit_ids: record.parent_commit_ids,
-                    commit_change_id: record.change_id,
-                    account_id: record.account_id,
-                    created_at: record.created_at,
-                    replay_debt: CommitStateReplayDebt::default(),
-                    mutations: mutation_inventory,
-                    touched_scope_filter: Default::default(),
-                    current_state_scoped_ranges: None,
-                    snapshot_root: Some(snapshot_root),
-                },
-            )?;
+                &TrackedStateContext::new(),
+                &commit_id,
+                parent_commit_id.as_deref(),
+                &rows,
+            )
+            .await?;
         }
 
-        Ok(())
-    }
-
-    fn stage_json_payloads_from_materialized(
-        writes: &mut StorageWriteSet,
-        json_writer: &mut crate::json_store::JsonStoreWriter,
-        row: &MaterializedTrackedStateRow,
-    ) -> Result<(), LixError> {
-        if let Some(snapshot) = row.snapshot_content.as_deref() {
-            json_writer.stage_batch(
-                writes,
-                JsonWritePlacementRef::OutOfBand,
-                [NormalizedJsonRef::trusted_prehashed(
-                    snapshot,
-                    JsonRef::for_content(snapshot.as_bytes()),
-                )],
-            )?;
-        }
-        if let Some(metadata) = row.metadata.as_ref() {
-            let serialized = crate::serialize_row_metadata(metadata);
-            json_writer.stage_batch(
-                writes,
-                JsonWritePlacementRef::OutOfBand,
-                [NormalizedJsonRef::trusted_prehashed(
-                    &serialized,
-                    JsonRef::for_content(serialized.as_bytes()),
-                )],
-            )?;
-        }
         Ok(())
     }
 
@@ -3534,6 +3306,12 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
+        write_empty_commits_to_store(
+            &storage,
+            &read,
+            &["commit-01920000-0000-7000-8000-0000000000a1"],
+        )
+        .await;
         write_untracked_rows_to_store(
             &storage,
             &read,
@@ -3544,12 +3322,6 @@ mod tests {
                     "commit-01920000-0000-7000-8000-0000000000a1",
                 ),
             ],
-        )
-        .await;
-        write_empty_commits_to_store(
-            &storage,
-            &read,
-            &["commit-01920000-0000-7000-8000-0000000000a1"],
         )
         .await;
 
@@ -3602,6 +3374,7 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
+        write_empty_commits_to_store(&storage, &read, &["commit-main"]).await;
         write_untracked_rows_to_store(
             &storage,
             &read,
@@ -3611,7 +3384,6 @@ mod tests {
             ],
         )
         .await;
-        write_empty_commits_to_store(&storage, &read, &["commit-main"]).await;
 
         let loaded = load_selected_tab_at(&live_state, &storage, "main")
             .await
@@ -3662,6 +3434,12 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
+        write_empty_commits_to_store(
+            &storage,
+            &read,
+            &["commit-01920000-0000-7000-8000-0000000000a1"],
+        )
+        .await;
         write_untracked_rows_to_store(
             &storage,
             &read,
@@ -3834,6 +3612,12 @@ mod tests {
                 .await
                 .expect("writes should commit");
         }
+        write_empty_commits_to_store(
+            &storage,
+            &read,
+            &["commit-01920000-0000-7000-8000-0000000000a1"],
+        )
+        .await;
         write_untracked_rows_to_store(
             &storage,
             &read,
@@ -3844,12 +3628,6 @@ mod tests {
                     "commit-01920000-0000-7000-8000-0000000000a1",
                 ),
             ],
-        )
-        .await;
-        write_empty_commits_to_store(
-            &storage,
-            &read,
-            &["commit-01920000-0000-7000-8000-0000000000a1"],
         )
         .await;
 
@@ -4250,17 +4028,6 @@ mod tests {
             .await
             .expect("read should open");
         write_empty_commits_to_store(&storage, &read, &["parent-left"]).await;
-        let mut writes = StorageWriteSet::new();
-        TrackedStateContext::new()
-            .writer(&read, &mut writes)
-            .stage_commit_root("parent-left", None, [])
-            .await
-            .expect("first parent tracked root should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("first parent tracked root should commit");
-
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await

@@ -11,8 +11,10 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::json_store::JsonSlot;
 use crate::tracked_state::codec::DecodedTrackedStateKeyShared;
+#[cfg(test)]
+use crate::tracked_state::types::TrackedStateKey;
 use crate::tracked_state::types::{
-    TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef, TrackedStateTreeScanRequest,
+    TrackedStateIndexValue, TrackedStateKeyRef, TrackedStatePhysicalScanRequest,
 };
 use crate::tracked_state::{TrackedStateFilter, TrackedStateStoreReader};
 
@@ -20,14 +22,12 @@ use crate::tracked_state::{TrackedStateFilter, TrackedStateStoreReader};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateDiffRequest {
     pub(crate) filter: TrackedStateFilter,
-    pub(crate) retain_payloads: bool,
 }
 
 impl Default for TrackedStateDiffRequest {
     fn default() -> Self {
         Self {
             filter: TrackedStateFilter::default(),
-            retain_payloads: true,
         }
     }
 }
@@ -120,15 +120,7 @@ pub(crate) struct TrackedStateDiffRow {
 /// schema key, file id, entity pk, or per-key heap owner.
 #[derive(Debug)]
 struct TrackedStateDiffIdentityBatch {
-    keys: TrackedStateDiffKeyStorage,
-}
-
-#[derive(Debug)]
-enum TrackedStateDiffKeyStorage {
-    /// Keeps hand-built single-row tests and point-read helpers ergonomic
-    /// without allocating dictionary and one-element column buffers.
-    Singleton(TrackedStateDiffKey),
-    Batch(TrackedStateDiffKeyColumns),
+    keys: TrackedStateDiffKeyColumns,
 }
 
 /// Dictionary-encoded identity columns for one diff batch.
@@ -164,39 +156,26 @@ struct TrackedStateDiffKeyRow {
     entity_pk: crate::entity_pk::EntityPk,
 }
 
-#[derive(Debug)]
-struct TrackedStateDiffKey {
-    schema_key: SharedStr,
-    file_id: Option<SharedStr>,
-    entity_pk: crate::entity_pk::EntityPk,
-}
-
 /// Typed tree-diff stage shared directly with diff validation/classification.
 ///
 /// Identity metadata is dictionary encoded once, entity keys occupy one typed
 /// column, and both root sides are aligned `TrackedStateIndexValue` columns.
-/// No production `TrackedStateTreeDiffEntry` or row-owned key exists between
+/// No production `TrackedStateArrowDiffEntry` or row-owned key exists between
 /// tree traversal and the final public diff entries.
 #[derive(Debug, Default)]
-pub(crate) struct TrackedStateTreeDiffBatch {
+pub(crate) struct TrackedStateArrowDiffBatch {
     identities: Option<Arc<TrackedStateDiffIdentityBatch>>,
     before: Vec<Option<TrackedStateIndexValue>>,
     after: Vec<Option<TrackedStateIndexValue>>,
+    payloads: TrackedStatePayloadBatch,
 }
 
-pub(crate) struct TrackedStateTreeDiffBatchBuilder {
+pub(crate) struct TrackedStateArrowDiffBatchBuilder {
     schema_keys: TrackedStateDiffStringInterner,
     file_ids: TrackedStateDiffStringInterner,
     rows: Vec<TrackedStateDiffKeyRow>,
     before: Vec<Option<TrackedStateIndexValue>>,
     after: Vec<Option<TrackedStateIndexValue>>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct TrackedStateTreeDiffRowRef<'a> {
-    identities: &'a TrackedStateDiffIdentityBatch,
-    ordinal: u32,
-    value: &'a TrackedStateIndexValue,
 }
 
 /// Root-local tracked-state identity view.
@@ -286,10 +265,6 @@ impl TrackedStatePayloadBatch {
         })
     }
 
-    pub(crate) fn contains(&self, change_id: ChangeId) -> bool {
-        self.columns.id_ordinals.contains_key(&change_id)
-    }
-
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.columns.change_ids.is_empty()
@@ -318,6 +293,7 @@ impl TrackedStatePayloadBatch {
 }
 
 impl TrackedStateDiff {
+    #[cfg(test)]
     pub(crate) fn from_entries(entries: Vec<TrackedStateDiffEntry>) -> Self {
         Self {
             entries,
@@ -356,49 +332,30 @@ where
     S: crate::storage_adapter::StorageAdapterRead,
 {
     let scan_request = scan_request_for_diff(request);
-    let tree_diff = reader
-        .diff_semantic_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
+    let arrow_diff = reader
+        .diff_arrow_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
         .await?;
 
-    // Validate only rows exposed by the hash-guided tree diff. Whole-root
-    // coverage validation is an explicit integrity audit; doing it here would
-    // turn every sparse diff back into an O(total rows) scan.
-    //
-    // Rootless rows still come from an independently stored packed-delta
-    // index. Merge/checkpoint consumers retain full payload authority; SQL
-    // consumers validate the allocation-free leaf index and avoid decoding
-    // payload sidecars for added/removed rows.
-    let payloads = if request.retain_payloads {
-        reader
-            .validate_tree_diff_batch_and_load_payloads(&tree_diff)
-            .await?
-    } else {
-        reader
-            .load_tree_diff_comparison_payloads(&tree_diff)
-            .await?
-    };
+    // Payload equality is resolved from the changed canonical Arrow leaves.
+    // The compact authored-event sidecar is not a post-image authority and is
+    // therefore neither read nor replayed by structural diff.
+    let payloads = arrow_diff.payloads().clone();
 
-    // Rows are identity-only; payload equality needs the change records when
-    // a live/live pair carries different change ids (cross-branch writes can
-    // produce identical content under distinct changes, which must classify
-    // as no-diff). Reuse the records loaded for changed-row validation instead
-    // of issuing a second changelog read.
-
-    let entries = classify_tree_diff_batch(tree_diff, &payloads)?;
+    let entries = classify_arrow_diff_batch(arrow_diff, &payloads)?;
 
     let diff = TrackedStateDiff::from_entries_with_payloads(entries, payloads);
     Ok(diff)
 }
 
-fn classify_tree_diff_batch(
-    tree_diff: TrackedStateTreeDiffBatch,
+fn classify_arrow_diff_batch(
+    arrow_diff: TrackedStateArrowDiffBatch,
     payloads: &TrackedStatePayloadBatch,
 ) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
-    let row_count = tree_diff.len();
+    let row_count = arrow_diff.len();
     if row_count == 0 {
         return Ok(Vec::new());
     }
-    let (identities, before, after) = tree_diff.into_columns();
+    let (identities, before, after) = arrow_diff.into_columns();
     let identities = identities.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -428,10 +385,10 @@ fn classify_tree_diff_batch(
     Ok(entries)
 }
 
-fn scan_request_for_diff(request: &TrackedStateDiffRequest) -> TrackedStateTreeScanRequest {
+fn scan_request_for_diff(request: &TrackedStateDiffRequest) -> TrackedStatePhysicalScanRequest {
     let mut filter = request.filter.clone();
     filter.include_tombstones = true;
-    TrackedStateTreeScanRequest {
+    TrackedStatePhysicalScanRequest {
         schema_keys: filter.schema_keys,
         entity_pks: filter.entity_pks,
         file_ids: filter.file_ids,
@@ -474,7 +431,7 @@ fn tracked_value_payload_eq(
     }
 }
 
-impl TrackedStateTreeDiffBatchBuilder {
+impl TrackedStateArrowDiffBatchBuilder {
     pub(crate) fn with_row_capacity(row_count: usize) -> Self {
         Self {
             schema_keys: TrackedStateDiffStringInterner::new(row_count),
@@ -483,23 +440,6 @@ impl TrackedStateTreeDiffBatchBuilder {
             before: Vec::with_capacity(row_count),
             after: Vec::with_capacity(row_count),
         }
-    }
-
-    /// Reserves the aligned columns once after the tree root exposes its
-    /// subtree count. Corrupt or overflowing hints are ignored by callers;
-    /// logical rows remain checked when the batch seals.
-    pub(crate) fn reserve_exact_once(&mut self, row_count: usize) {
-        if self.rows.capacity() == 0 {
-            let _ = self.rows.try_reserve_exact(row_count);
-            let _ = self.before.try_reserve_exact(row_count);
-            let _ = self.after.try_reserve_exact(row_count);
-            self.schema_keys.set_expected_cardinality(row_count);
-            self.file_ids.set_expected_cardinality(row_count);
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.rows.len()
     }
 
     pub(crate) fn push_shared(
@@ -522,12 +462,12 @@ impl TrackedStateTreeDiffBatchBuilder {
         self.after.push(after);
     }
 
-    pub(crate) fn finish(self) -> Result<TrackedStateTreeDiffBatch, LixError> {
+    pub(crate) fn finish(self) -> Result<TrackedStateArrowDiffBatch, LixError> {
         let row_count = self.rows.len();
         debug_assert_eq!(self.before.len(), row_count);
         debug_assert_eq!(self.after.len(), row_count);
         if row_count == 0 {
-            return Ok(TrackedStateTreeDiffBatch::default());
+            return Ok(TrackedStateArrowDiffBatch::default());
         }
         if row_count > u32::MAX as usize {
             return Err(LixError::new(
@@ -536,21 +476,31 @@ impl TrackedStateTreeDiffBatchBuilder {
             ));
         }
         let identities = Arc::new(TrackedStateDiffIdentityBatch {
-            keys: TrackedStateDiffKeyStorage::Batch(TrackedStateDiffKeyColumns {
+            keys: TrackedStateDiffKeyColumns {
                 schema_keys: self.schema_keys.finish(),
                 file_ids: self.file_ids.finish(),
                 rows: self.rows,
-            }),
+            },
         });
-        Ok(TrackedStateTreeDiffBatch {
+        Ok(TrackedStateArrowDiffBatch {
             identities: Some(identities),
             before: self.before,
             after: self.after,
+            payloads: TrackedStatePayloadBatch::default(),
         })
     }
 }
 
-impl TrackedStateTreeDiffBatch {
+impl TrackedStateArrowDiffBatch {
+    pub(crate) fn with_payloads(mut self, payloads: TrackedStatePayloadBatch) -> Self {
+        self.payloads = payloads;
+        self
+    }
+
+    pub(crate) fn payloads(&self) -> &TrackedStatePayloadBatch {
+        &self.payloads
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.before.len()
     }
@@ -558,56 +508,6 @@ impl TrackedStateTreeDiffBatch {
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.before.is_empty()
-    }
-
-    pub(crate) fn swap_sides(&mut self) {
-        std::mem::swap(&mut self.before, &mut self.after);
-    }
-
-    pub(crate) fn side_rows(&self) -> impl Iterator<Item = TrackedStateTreeDiffRowRef<'_>> {
-        let identities = self.identities.as_deref();
-        self.before.iter().zip(&self.after).enumerate().flat_map(
-            move |(ordinal, (before, after))| {
-                [before.as_ref(), after.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .map(move |value| TrackedStateTreeDiffRowRef {
-                        identities: identities
-                            .expect("non-empty tree diff columns retain identities"),
-                        ordinal: u32::try_from(ordinal)
-                            .expect("tree diff batch row count is bounded to u32"),
-                        value,
-                    })
-            },
-        )
-    }
-
-    pub(crate) fn comparison_rows(&self) -> Vec<TrackedStateTreeDiffRowRef<'_>> {
-        let Some(identities) = self.identities.as_deref() else {
-            return Vec::new();
-        };
-        let mut rows = Vec::new();
-        for (ordinal, (before, after)) in self.before.iter().zip(&self.after).enumerate() {
-            let (Some(before), Some(after)) = (before.as_ref(), after.as_ref()) else {
-                continue;
-            };
-            if before.deleted || after.deleted || before.change_id == after.change_id {
-                continue;
-            }
-            let ordinal =
-                u32::try_from(ordinal).expect("tree diff batch row count is bounded to u32");
-            rows.push(TrackedStateTreeDiffRowRef {
-                identities,
-                ordinal,
-                value: before,
-            });
-            rows.push(TrackedStateTreeDiffRowRef {
-                identities,
-                ordinal,
-                value: after,
-            });
-        }
-        rows
     }
 
     fn into_columns(
@@ -630,81 +530,10 @@ impl TrackedStateTreeDiffBatch {
             3
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn row_capacity(&self) -> usize {
-        let identity_capacity = self
-            .identities
-            .as_ref()
-            .map_or(0, |identities| match &identities.keys {
-                TrackedStateDiffKeyStorage::Singleton(_) => 1,
-                TrackedStateDiffKeyStorage::Batch(keys) => keys.rows.capacity(),
-            });
-        identity_capacity
-            .max(self.before.capacity())
-            .max(self.after.capacity())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_rows_for_test(
-        self,
-    ) -> Vec<crate::tracked_state::types::TrackedStateTreeDiffEntry> {
-        let (identities, before, after) = self.into_columns();
-        let Some(identities) = identities else {
-            return Vec::new();
-        };
-        before
-            .into_iter()
-            .zip(after)
-            .enumerate()
-            .map(|(ordinal, (before, after))| {
-                let ordinal =
-                    u32::try_from(ordinal).expect("test tree diff batch was bounded to u32");
-                crate::tracked_state::types::TrackedStateTreeDiffEntry {
-                    key: TrackedStateKey {
-                        schema_key: identities.schema_key(ordinal).to_owned(),
-                        file_id: identities.file_id(ordinal).map(str::to_owned),
-                        entity_pk: identities.entity_pk(ordinal).clone(),
-                    },
-                    before,
-                    after,
-                }
-            })
-            .collect()
-    }
-}
-
-impl<'a> TrackedStateTreeDiffRowRef<'a> {
-    pub(crate) fn schema_key(self) -> &'a str {
-        self.identities.schema_key(self.ordinal)
-    }
-
-    pub(crate) fn file_id(self) -> Option<&'a str> {
-        self.identities.file_id(self.ordinal)
-    }
-
-    pub(crate) fn entity_pk(self) -> &'a crate::entity_pk::EntityPk {
-        self.identities.entity_pk(self.ordinal)
-    }
-
-    pub(crate) fn change_id(self) -> ChangeId {
-        self.value.change_id
-    }
-
-    pub(crate) fn commit_id(self) -> CommitId {
-        self.value.commit_id
-    }
-
-    pub(crate) fn deleted(self) -> bool {
-        self.value.deleted
-    }
-
-    pub(crate) fn updated_at(self) -> LixTimestamp {
-        self.value.updated_at()
-    }
 }
 
 impl TrackedStateDiffIdentityBatch {
+    #[cfg(test)]
     fn from_keys(keys: Vec<TrackedStateKey>) -> Arc<Self> {
         debug_assert!(!keys.is_empty());
         let row_count = keys.len();
@@ -723,11 +552,11 @@ impl TrackedStateDiffIdentityBatch {
             });
         }
         Arc::new(Self {
-            keys: TrackedStateDiffKeyStorage::Batch(TrackedStateDiffKeyColumns {
+            keys: TrackedStateDiffKeyColumns {
                 schema_keys: schema_keys.finish(),
                 file_ids: file_ids.finish(),
                 rows,
-            }),
+            },
         })
     }
 
@@ -752,77 +581,36 @@ impl TrackedStateDiffIdentityBatch {
             });
         }
         Arc::new(Self {
-            keys: TrackedStateDiffKeyStorage::Batch(TrackedStateDiffKeyColumns {
+            keys: TrackedStateDiffKeyColumns {
                 schema_keys: schema_keys.finish(),
                 file_ids: file_ids.finish(),
                 rows,
-            }),
-        })
-    }
-
-    fn singleton(key: TrackedStateKey) -> Arc<Self> {
-        Arc::new(Self {
-            keys: TrackedStateDiffKeyStorage::Singleton(TrackedStateDiffKey {
-                schema_key: key.schema_key.into(),
-                file_id: key.file_id.map(Into::into),
-                entity_pk: key.entity_pk,
-            }),
+            },
         })
     }
 
     fn schema_key(&self, ordinal: u32) -> &str {
-        match &self.keys {
-            TrackedStateDiffKeyStorage::Singleton(key) => {
-                debug_assert_eq!(ordinal, 0);
-                key.schema_key.as_str()
-            }
-            TrackedStateDiffKeyStorage::Batch(keys) => {
-                let row = &keys.rows[ordinal as usize];
-                keys.schema_keys[row.schema_key_ordinal as usize].as_str()
-            }
-        }
+        let row = &self.keys.rows[ordinal as usize];
+        self.keys.schema_keys[row.schema_key_ordinal as usize].as_str()
     }
 
     fn file_id(&self, ordinal: u32) -> Option<&str> {
-        match &self.keys {
-            TrackedStateDiffKeyStorage::Singleton(key) => {
-                debug_assert_eq!(ordinal, 0);
-                key.file_id.as_deref()
-            }
-            TrackedStateDiffKeyStorage::Batch(keys) => {
-                let row = &keys.rows[ordinal as usize];
-                (row.file_id_ordinal != u32::MAX)
-                    .then(|| keys.file_ids[row.file_id_ordinal as usize].as_str())
-            }
-        }
+        let row = &self.keys.rows[ordinal as usize];
+        (row.file_id_ordinal != u32::MAX)
+            .then(|| self.keys.file_ids[row.file_id_ordinal as usize].as_str())
     }
 
     fn entity_pk(&self, ordinal: u32) -> &crate::entity_pk::EntityPk {
-        match &self.keys {
-            TrackedStateDiffKeyStorage::Singleton(key) => {
-                debug_assert_eq!(ordinal, 0);
-                &key.entity_pk
-            }
-            TrackedStateDiffKeyStorage::Batch(keys) => &keys.rows[ordinal as usize].entity_pk,
-        }
+        &self.keys.rows[ordinal as usize].entity_pk
     }
 
     #[cfg(test)]
     fn into_key(self, ordinal: u32) -> TrackedStateKey {
-        match self.keys {
-            TrackedStateDiffKeyStorage::Singleton(key) => {
-                debug_assert_eq!(ordinal, 0);
-                key.into_key()
-            }
-            TrackedStateDiffKeyStorage::Batch(keys) => keys.key(ordinal).into_key(),
-        }
+        self.keys.key(ordinal)
     }
 
     fn len(&self) -> usize {
-        match &self.keys {
-            TrackedStateDiffKeyStorage::Singleton(_) => 1,
-            TrackedStateDiffKeyStorage::Batch(keys) => keys.rows.len(),
-        }
+        self.keys.rows.len()
     }
 }
 
@@ -837,16 +625,7 @@ impl TrackedStateDiffStringInterner {
         }
     }
 
-    fn set_expected_cardinality(&mut self, expected_cardinality: usize) {
-        self.expected_cardinality = self.expected_cardinality.max(expected_cardinality);
-        if self.values.capacity() == 0 {
-            let small_capacity = self
-                .expected_cardinality
-                .min(DIFF_SMALL_STRING_DICTIONARY_LIMIT);
-            let _ = self.values.try_reserve_exact(small_capacity);
-        }
-    }
-
+    #[cfg(test)]
     fn intern_owned(&mut self, value: String) -> u32 {
         if let Some(ordinal) = self.ordinal(value.as_str()) {
             return ordinal;
@@ -915,34 +694,24 @@ impl TrackedStateDiffStringInterner {
 
 impl TrackedStateDiffKeyColumns {
     #[cfg(test)]
-    fn key(&self, ordinal: u32) -> TrackedStateDiffKey {
+    fn key(&self, ordinal: u32) -> TrackedStateKey {
         let row = &self.rows[ordinal as usize];
-        TrackedStateDiffKey {
-            schema_key: self.schema_keys[row.schema_key_ordinal as usize].clone(),
+        TrackedStateKey {
+            schema_key: self.schema_keys[row.schema_key_ordinal as usize].to_string(),
             file_id: (row.file_id_ordinal != u32::MAX)
-                .then(|| self.file_ids[row.file_id_ordinal as usize].clone()),
+                .then(|| self.file_ids[row.file_id_ordinal as usize].to_string()),
             entity_pk: row.entity_pk.clone(),
         }
     }
 }
 
-impl TrackedStateDiffKey {
-    #[cfg(test)]
-    fn into_key(self) -> TrackedStateKey {
-        TrackedStateKey {
-            schema_key: self.schema_key.to_string(),
-            file_id: self.file_id.map(|file_id| file_id.to_string()),
-            entity_pk: self.entity_pk,
-        }
-    }
-}
-
 impl TrackedStateDiffIdentity {
+    #[cfg(test)]
     pub(crate) fn from_key(key: TrackedStateKey) -> Self {
-        Self {
-            batch: TrackedStateDiffIdentityBatch::singleton(key),
-            ordinal: 0,
-        }
+        Self::from_key_batch(vec![key])
+            .expect("one identity fits the diff ordinal range")
+            .pop()
+            .expect("one identity was supplied")
     }
 
     /// Moves a complete key batch behind one shared identity owner.
@@ -950,6 +719,7 @@ impl TrackedStateDiffIdentity {
     /// This is used by accelerators that discover changed keys outside the
     /// tracked-state tree diff. It preserves the same one-owner-per-batch
     /// contract instead of creating a singleton `Arc` allocation per key.
+    #[cfg(test)]
     pub(crate) fn from_key_batch(keys: Vec<TrackedStateKey>) -> Result<Vec<Self>, LixError> {
         let row_count = keys.len();
         if row_count == 0 {
@@ -1025,13 +795,8 @@ impl TrackedStateDiffIdentity {
     /// identity at another boundary, such as plugin merge output entering the
     /// transaction pipeline.
     pub(crate) fn schema_key_shared(&self) -> SharedStr {
-        match &self.batch.keys {
-            TrackedStateDiffKeyStorage::Singleton(key) => key.schema_key.clone(),
-            TrackedStateDiffKeyStorage::Batch(keys) => {
-                let row = &keys.rows[self.ordinal as usize];
-                keys.schema_keys[row.schema_key_ordinal as usize].clone()
-            }
-        }
+        let row = &self.batch.keys.rows[self.ordinal as usize];
+        self.batch.keys.schema_keys[row.schema_key_ordinal as usize].clone()
     }
 
     pub(crate) fn file_id(&self) -> Option<&str> {
@@ -1040,14 +805,9 @@ impl TrackedStateDiffIdentity {
 
     /// Clones the shared file-id owner without allocating decoded text.
     pub(crate) fn file_id_shared(&self) -> Option<SharedStr> {
-        match &self.batch.keys {
-            TrackedStateDiffKeyStorage::Singleton(key) => key.file_id.clone(),
-            TrackedStateDiffKeyStorage::Batch(keys) => {
-                let row = &keys.rows[self.ordinal as usize];
-                (row.file_id_ordinal != u32::MAX)
-                    .then(|| keys.file_ids[row.file_id_ordinal as usize].clone())
-            }
-        }
+        let row = &self.batch.keys.rows[self.ordinal as usize];
+        (row.file_id_ordinal != u32::MAX)
+            .then(|| self.batch.keys.file_ids[row.file_id_ordinal as usize].clone())
     }
 
     pub(crate) fn entity_pk(&self) -> &crate::entity_pk::EntityPk {
@@ -1083,22 +843,18 @@ impl TrackedStateDiffIdentity {
 
     #[cfg(test)]
     fn batch_dictionary_counts(&self) -> (usize, usize) {
-        match &self.batch.keys {
-            TrackedStateDiffKeyStorage::Singleton(key) => (1, usize::from(key.file_id.is_some())),
-            TrackedStateDiffKeyStorage::Batch(keys) => {
-                (keys.schema_keys.len(), keys.file_ids.len())
-            }
-        }
+        (
+            self.batch.keys.schema_keys.len(),
+            self.batch.keys.file_ids.len(),
+        )
     }
 
     #[cfg(test)]
     fn batch_dictionary_capacities(&self) -> (usize, usize) {
-        match &self.batch.keys {
-            TrackedStateDiffKeyStorage::Singleton(key) => (1, usize::from(key.file_id.is_some())),
-            TrackedStateDiffKeyStorage::Batch(keys) => {
-                (keys.schema_keys.capacity(), keys.file_ids.capacity())
-            }
-        }
+        (
+            self.batch.keys.schema_keys.capacity(),
+            self.batch.keys.file_ids.capacity(),
+        )
     }
 }
 
@@ -1147,10 +903,6 @@ impl Hash for TrackedStateDiffIdentity {
 }
 
 impl TrackedStateDiffRow {
-    pub(crate) fn from_tree_entry(key: TrackedStateKey, value: TrackedStateIndexValue) -> Self {
-        Self::from_index_value(TrackedStateDiffIdentity::from_key(key), value)
-    }
-
     fn from_index_value(identity: TrackedStateDiffIdentity, value: TrackedStateIndexValue) -> Self {
         Self {
             identity,
@@ -1174,6 +926,7 @@ impl TrackedStateDiffRow {
         self.identity.entity_pk()
     }
 
+    #[cfg(test)]
     pub(crate) fn index_value(&self) -> TrackedStateIndexValue {
         TrackedStateIndexValue {
             change_id: self.change_id,
@@ -1191,83 +944,26 @@ impl TrackedStateDiffRow {
     }
 }
 
-impl TrackedStateDiffEntry {
-    #[cfg(test)]
-    pub(crate) fn before_is_live(&self) -> bool {
-        self.visible_before().is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn after_is_live(&self) -> bool {
-        self.visible_after().is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn visible_before(&self) -> Option<&TrackedStateDiffRow> {
-        self.before.as_ref().filter(|row| !row.deleted)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn visible_after(&self) -> Option<&TrackedStateDiffRow> {
-        self.after.as_ref().filter(|row| !row.deleted)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NullableKeyFilter;
     use crate::entity_pk::EntityPk;
-    use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
-    use crate::storage_adapter::{StorageAdapter, StorageAdapterRead, StorageWriteSet};
-    use crate::tracked_state::types::{
-        TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateMutation,
-        TrackedStateRootId,
-    };
-    use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateContext};
+    use crate::tracked_state::types::TrackedStateIndexValue;
 
     fn ts(value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse("timestamp", value)
     }
 
-    fn change_id(label: &str) -> String {
-        ChangeId::for_test_label(label).to_string()
-    }
-
-    async fn stage_snapshot_authority_for_test(
-        read: &(impl StorageAdapterRead + ?Sized),
-        writes: &mut StorageWriteSet,
-        snapshot_root: &TrackedStateCommitRoot,
-    ) -> Result<(), LixError> {
-        let mut manifest =
-            crate::tracked_state::storage::load_unchecked_commit_state_manifest_for_test(
-                read,
-                snapshot_root.commit_id,
-            )
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "corrupt-root fixture has no commit-state manifest",
-                )
-            })?;
-        manifest.snapshot_root = Some(snapshot_root.clone());
-        manifest.replay_debt = Default::default();
-        crate::tracked_state::storage::stage_unchecked_commit_state_manifest_for_test(
-            writes, &manifest,
-        )
-    }
-
     #[test]
-    fn ten_thousand_tree_diff_rows_share_one_ordered_identity_batch() {
+    fn ten_thousand_arrow_diff_rows_share_one_ordered_identity_batch() {
         let row_count = 10_000;
         let created_at = ts("2024-01-01T00:00:00.000Z");
         let updated_at = ts("2024-01-02T00:00:00.000Z");
         let change_id = ChangeId::for_test_label("shared-batch-change");
         let commit_id = CommitId::for_test_label("shared-batch-commit");
-        let mut tree_entries = TrackedStateTreeDiffBatchBuilder::with_row_capacity(row_count);
+        let mut arrow_entries = TrackedStateArrowDiffBatchBuilder::with_row_capacity(row_count);
         for index in 0..row_count {
-            tree_entries.push_shared(
+            arrow_entries.push_shared(
                 DecodedTrackedStateKeyShared {
                     schema_key: SharedStr::from_static("test_schema"),
                     file_id: Some(SharedStr::from_static(
@@ -1285,9 +981,9 @@ mod tests {
                 }),
             );
         }
-        let tree_entries = tree_entries.finish().expect("tree batch should seal");
-        assert_eq!(tree_entries.large_buffer_count(), 3);
-        let rows = classify_tree_diff_batch(tree_entries, &TrackedStatePayloadBatch::default())
+        let arrow_entries = arrow_entries.finish().expect("tree batch should seal");
+        assert_eq!(arrow_entries.large_buffer_count(), 3);
+        let rows = classify_arrow_diff_batch(arrow_entries, &TrackedStatePayloadBatch::default())
             .expect("tree rows should classify");
         assert_eq!(rows.len(), row_count);
         let first = &rows[0].identity;
@@ -1379,7 +1075,7 @@ mod tests {
         let arena_start = encoded_arena.as_ptr() as usize;
         let arena_end = arena_start + encoded_arena.len();
         let timestamp = ts("2024-01-01T00:00:00.000Z");
-        let mut builder = TrackedStateTreeDiffBatchBuilder::with_row_capacity(row_count);
+        let mut builder = TrackedStateArrowDiffBatchBuilder::with_row_capacity(row_count);
         for (index, range) in ranges.into_iter().enumerate() {
             let key = crate::tracked_state::codec::decode_key_shared(encoded_arena.slice(range))
                 .expect("shared tree key should decode");
@@ -1400,9 +1096,7 @@ mod tests {
         assert_eq!(batch.len(), row_count);
         assert_eq!(batch.large_buffer_count(), 3);
         let identities = batch.identities.as_ref().expect("identity columns");
-        let TrackedStateDiffKeyStorage::Batch(keys) = &identities.keys else {
-            panic!("tree diff must use batch identity columns");
-        };
+        let keys = &identities.keys;
         assert_eq!((keys.schema_keys.len(), keys.file_ids.len()), (1, 1));
         assert!(
             keys.schema_keys.capacity() <= DIFF_SMALL_STRING_DICTIONARY_LIMIT
@@ -1453,9 +1147,9 @@ mod tests {
         let timestamp = ts("2024-01-01T00:00:00.000Z");
         let change_id = ChangeId::for_test_label("merge-batch-change");
         let commit_id = CommitId::for_test_label("merge-batch-commit");
-        let mut tree_entries = TrackedStateTreeDiffBatchBuilder::with_row_capacity(row_count);
+        let mut arrow_entries = TrackedStateArrowDiffBatchBuilder::with_row_capacity(row_count);
         for index in 0..row_count {
-            tree_entries.push_shared(
+            arrow_entries.push_shared(
                 DecodedTrackedStateKeyShared {
                     schema_key: SharedStr::from_static("test_schema"),
                     file_id: None,
@@ -1471,20 +1165,16 @@ mod tests {
                 }),
             );
         }
-        let entries = classify_tree_diff_batch(
-            tree_entries.finish().expect("tree batch should seal"),
+        let entries = classify_arrow_diff_batch(
+            arrow_entries.finish().expect("tree batch should seal"),
             &TrackedStatePayloadBatch::default(),
         )
         .expect("tree rows should classify");
         let source = TrackedStateDiff::from_entries(entries);
         let source_batch = source.entries[0].identity.clone();
 
-        let plan = crate::tracked_state::merge::plan_merge(
-            &TrackedStateDiff::default(),
-            &source,
-            &TrackedStatePayloadBatch::default(),
-        )
-        .expect("source-only merge should plan");
+        let plan = crate::tracked_state::merge::plan_merge(&TrackedStateDiff::default(), &source)
+            .expect("source-only merge should plan");
         drop(source);
 
         assert_eq!(plan.picks.len(), row_count);
@@ -1503,2027 +1193,6 @@ mod tests {
                 pick.identity.shares_key_with(&pick.selected_row.identity),
                 "merge pick {index} did not retain the same ordinal for its selected row"
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn diff_commits_reports_added_rows() {
-        let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
-
-        let diff = diff(&storage, &tracked_state).await;
-
-        assert_eq!(
-            kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Added)]
-        );
-        assert!(diff.entries[0].before.is_none());
-        assert_eq!(
-            diff.entries[0]
-                .after
-                .as_ref()
-                .map(|row| row.change_id.to_string()),
-            Some(change_id("after"))
-        );
-        assert!(!diff.entries[0].before_is_live());
-        assert!(diff.entries[0].after_is_live());
-        let payload_owner = diff.payloads().clone();
-        let after_change_id = diff.entries[0].after.as_ref().expect("added row").change_id;
-        assert!(
-            payload_owner.get(after_change_id).is_some(),
-            "diff must retain the payload loaded during row validation"
-        );
-        assert!(payload_owner.shares_owner_with(diff.payloads()));
-    }
-
-    #[tokio::test]
-    async fn diff_commits_reports_removed_rows_when_right_side_is_absent() {
-        let (storage, tracked_state) = seed_roots(&[row("entity-a", None, "before")], &[]).await;
-
-        let diff = diff(&storage, &tracked_state).await;
-
-        assert_eq!(
-            kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Removed)]
-        );
-        assert_eq!(
-            diff.entries[0]
-                .before
-                .as_ref()
-                .map(|row| row.change_id.to_string()),
-            Some(change_id("before"))
-        );
-        assert!(diff.entries[0].after.is_none());
-        assert!(diff.entries[0].before_is_live());
-        assert!(!diff.entries[0].after_is_live());
-    }
-
-    #[tokio::test]
-    async fn diff_commits_reports_removed_rows_when_right_side_is_tombstone() {
-        let (storage, tracked_state) = seed_roots(
-            &[row("entity-a", None, "before")],
-            &[tombstone("entity-a", None, "delete")],
-        )
-        .await;
-
-        let diff = diff(&storage, &tracked_state).await;
-
-        assert_eq!(
-            kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Removed)]
-        );
-        let entry = &diff.entries[0];
-        assert_eq!(
-            entry.after.as_ref().map(|row| row.change_id.to_string()),
-            Some(change_id("delete"))
-        );
-        assert!(
-            entry.after.as_ref().is_some_and(|row| row.deleted),
-            "removed diff should preserve the right-side tombstone for merge"
-        );
-        assert!(entry.before_is_live());
-        assert!(!entry.after_is_live());
-    }
-
-    #[tokio::test]
-    async fn diff_commits_reports_added_rows_when_left_side_is_tombstone() {
-        let (storage, tracked_state) = seed_roots(
-            &[tombstone("entity-a", None, "delete")],
-            &[row("entity-a", None, "after")],
-        )
-        .await;
-
-        let diff = diff(&storage, &tracked_state).await;
-
-        assert_eq!(
-            kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Added)]
-        );
-        let entry = &diff.entries[0];
-        assert_eq!(
-            entry.before.as_ref().map(|row| row.change_id.to_string()),
-            Some(change_id("delete"))
-        );
-        assert!(
-            entry.before.as_ref().is_some_and(|row| row.deleted),
-            "added diff should preserve the left-side tombstone for merge"
-        );
-        assert!(!entry.before_is_live());
-        assert!(entry.after_is_live());
-    }
-
-    #[tokio::test]
-    async fn diff_commits_reports_modified_rows_for_changed_payload() {
-        let (storage, tracked_state) = seed_roots(
-            &[row_with_value("entity-a", None, "before", "one")],
-            &[row_with_value("entity-a", None, "after", "two")],
-        )
-        .await;
-
-        let diff = diff(&storage, &tracked_state).await;
-
-        assert_eq!(
-            kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Modified)]
-        );
-        assert!(diff.entries[0].before_is_live());
-        assert!(diff.entries[0].after_is_live());
-    }
-
-    #[tokio::test]
-    async fn diff_commits_omits_unchanged_rows_even_when_metadata_differs_only_by_commit() {
-        let (storage, tracked_state) = seed_roots(
-            &[row_with_value("entity-a", None, "before", "same")],
-            &[row_with_value("entity-a", None, "after", "same")],
-        )
-        .await;
-
-        let diff = diff(&storage, &tracked_state).await;
-
-        assert!(diff.entries.is_empty());
-    }
-
-    #[tokio::test]
-    async fn diff_commits_distinguishes_same_entity_with_different_file_id() {
-        let (storage, tracked_state) = seed_parent_child_delta(
-            &[row(
-                "entity-a",
-                Some("01920000-0000-7000-8000-0000000000a2"),
-                "before-a",
-            )],
-            &[row(
-                "entity-a",
-                Some("01920000-0000-7000-8000-0000000000b2"),
-                "after-b",
-            )],
-        )
-        .await;
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let diff = tracked_state
-            .reader(read)
-            .diff_commits("parent", "child", &TrackedStateDiffRequest::default())
-            .await
-            .expect("diff should load");
-
-        assert_eq!(diff.entries.len(), 1);
-        assert_eq!(
-            diff.entries[0].identity.file_id(),
-            Some("01920000-0000-7000-8000-0000000000b2")
-        );
-        assert_eq!(diff.entries[0].kind, TrackedStateDiffKind::Added);
-    }
-
-    #[tokio::test]
-    async fn diff_commits_filters_by_schema_entity_and_file_id() {
-        let (storage, tracked_state) = seed_roots(
-            &[],
-            &[
-                row_with_schema(
-                    "entity-a",
-                    Some("01920000-0000-7000-8000-0000000000a2"),
-                    "schema-a",
-                    "change-a",
-                ),
-                row_with_schema(
-                    "entity-b",
-                    Some("01920000-0000-7000-8000-0000000000b2"),
-                    "schema-b",
-                    "change-b",
-                ),
-            ],
-        )
-        .await;
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let mut reader = tracked_state.reader(read);
-        let diff = reader
-            .diff_commits(
-                "left",
-                "right",
-                &TrackedStateDiffRequest {
-                    filter: TrackedStateFilter {
-                        schema_keys: vec!["schema-b".to_string()],
-                        entity_pks: vec![EntityPk::single("entity-b")],
-                        file_ids: vec![NullableKeyFilter::Value(
-                            "01920000-0000-7000-8000-0000000000b2".to_string(),
-                        )],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("diff should load");
-
-        assert_eq!(
-            kinds(&diff),
-            vec![("entity-b".to_string(), TrackedStateDiffKind::Added)]
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_validation_rejects_row_identity_that_does_not_match_changelog_change() {
-        let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
-        let mut diff = diff(&storage, &tracked_state).await;
-        diff.entries[0].after.as_mut().expect("after row").identity =
-            TrackedStateDiffIdentity::from_key(TrackedStateKey {
-                schema_key: "test_schema".to_owned(),
-                file_id: None,
-                entity_pk: EntityPk::single("entity-corrupt"),
-            });
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .validate_diff_rows_for_commits_against_changelog(&[(
-                diff.entries[0].after.as_ref().expect("after row"),
-                "right",
-            )])
-            .await
-            .expect_err("identity drift must be rejected");
-
-        assert!(
-            error
-                .message
-                .contains("does not match changelog change identity")
-                || error.message.contains("changelog commit")
-                || error.message.contains("has no authoritative payload"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_validation_rejects_missing_changelog_change() {
-        let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
-        let mut diff = diff(&storage, &tracked_state).await;
-        diff.entries[0].after.as_mut().expect("after row").change_id =
-            ChangeId::for_test_label("missing-change");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .validate_diff_rows_for_commits_against_changelog(&[(
-                diff.entries[0].after.as_ref().expect("after row"),
-                "right",
-            )])
-            .await
-            .expect_err("missing change must be rejected");
-
-        assert!(
-            error.message.contains("resolves to payload"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_validation_rejects_forged_updated_at() {
-        let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
-        let mut diff = diff(&storage, &tracked_state).await;
-        diff.entries[0]
-            .after
-            .as_mut()
-            .expect("after row")
-            .updated_at = ts("2026-01-02T00:00:00Z");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .validate_diff_rows_for_commits_against_changelog(&[(
-                diff.entries[0].after.as_ref().expect("after row"),
-                "right",
-            )])
-            .await
-            .expect_err("forged updated_at must be rejected");
-
-        assert!(
-            error.message.contains("updated_at does not match"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_validation_rejects_forged_created_at() {
-        let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
-        let mut diff = diff(&storage, &tracked_state).await;
-        diff.entries[0]
-            .after
-            .as_mut()
-            .expect("after row")
-            .created_at = ts("2025-12-31T00:00:00Z");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .validate_diff_rows_for_commits_against_changelog(&[(
-                diff.entries[0].after.as_ref().expect("after row"),
-                "right",
-            )])
-            .await
-            .expect_err("forged created_at must be rejected");
-
-        assert!(
-            error.message.contains("created_at"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn full_root_audit_rejects_update_with_arbitrary_forged_created_at() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
-            .await
-            .expect("left root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "parent",
-            None,
-            &[row_with_times(
-                "entity-a",
-                None,
-                "parent-change",
-                "old",
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T00:00:00Z",
-            )],
-        )
-        .await
-        .expect("parent root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "child",
-            Some("parent"),
-            &[row_with_times(
-                "entity-a",
-                None,
-                "child-change",
-                "new",
-                "2026-01-02T00:00:00Z",
-                "2026-01-02T00:00:00Z",
-            )],
-        )
-        .await
-        .expect("child root should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let valid_diff = tracked_state
-            .reader(read)
-            .diff_commits("left", "child", &TrackedStateDiffRequest::default())
-            .await
-            .expect("valid update should load");
-        let row = valid_diff
-            .entries
-            .iter()
-            .find_map(|entry| entry.after.clone())
-            .expect("child row should appear");
-        let (key, mut value) = row.into_index_entry();
-        let updated_at = value.updated_at().to_string();
-        value.created_at = LixTimestamp::expect_parse("created_at", "2026-01-03T00:00:00Z");
-        value.updated_at = LixTimestamp::expect_parse("updated_at", &updated_at);
-        stage_corrupt_commit_root(
-            &storage,
-            "child",
-            vec![(key, value)],
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("parent"),
-                root_id: tracked_state_root_id(&storage, "parent").await,
-            }],
-        )
-        .await;
-
-        let error = audit_root(&storage, &tracked_state, "child")
-            .await
-            .expect_err("arbitrary forged created_at must be rejected");
-
-        assert!(
-            error.message.contains("created_at"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_commits_validates_same_payload_rows_before_classification_drops_them() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "left",
-            None,
-            &[row_with_value("entity-a", None, "left-a", "same")],
-        )
-        .await
-        .expect("left root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "right-valid",
-            None,
-            &[row_with_value("entity-b", None, "right-b", "same")],
-        )
-        .await
-        .expect("right changelog should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let valid_diff = tracked_state
-            .reader(read)
-            .diff_commits("left", "right-valid", &TrackedStateDiffRequest::default())
-            .await
-            .expect("valid diff should load");
-        let source_row = valid_diff
-            .entries
-            .iter()
-            .find_map(|entry| entry.after.clone())
-            .expect("right row should appear in valid diff");
-        let (_source_key, source_value) = source_row.into_index_entry();
-        let corrupt_key = TrackedStateKey {
-            schema_key: "test_schema".to_string(),
-            file_id: None,
-            entity_pk: EntityPk::single("entity-a"),
-        };
-        {
-            let mut read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("corrupt commit read should open");
-            let mut writes = storage.new_write_set();
-            crate::test_support::stage_empty_changelog_commit(
-                &mut read,
-                &mut writes,
-                "right-corrupt",
-                None,
-            )
-            .await
-            .expect("corrupt commit authority should stage");
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("corrupt commit authority should commit");
-        }
-        let result = {
-            let mut read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open");
-            let mut writes = storage.new_write_set();
-            let result = crate::tracked_state::tree::TrackedStateTree::new()
-                .apply_mutations(
-                    &mut read,
-                    &mut writes,
-                    None,
-                    crate::tracked_state::types::TrackedStateMutationBatch::from_shared(vec![
-                        TrackedStateMutation::put_encoded(
-                            crate::tracked_state::codec::encode_key(&corrupt_key),
-                            crate::tracked_state::codec::encode_value(&source_value),
-                        ),
-                    ]),
-                    Some("right-corrupt"),
-                )
-                .await
-                .expect("corrupt root should write");
-            stage_snapshot_authority_for_test(
-                &read,
-                &mut writes,
-                &TrackedStateCommitRoot {
-                    commit_id: CommitId::for_test_label("right-corrupt"),
-                    root_id: result.root_id.clone(),
-                    parent_roots: Vec::new(),
-                    changed_key_count: 1,
-                    row_count_estimate: result.row_count as u64,
-                    tree_height: result.tree_height as u32,
-                    primary_chunk_count: result.chunk_count as u64,
-                    primary_chunk_bytes: result.chunk_bytes as u64,
-                },
-            )
-            .await
-            .expect("metadata should encode");
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("corrupt root should commit");
-            result
-        };
-        assert_eq!(result.row_count, 1);
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("left", "right-corrupt", &TrackedStateDiffRequest::default())
-            .await
-            .expect_err("raw same-payload corruption must be rejected before classification");
-
-        assert!(
-            error
-                .message
-                .contains("does not match changelog change identity")
-                || error.message.contains("changelog commit")
-                || error.message.contains("has no authoritative payload"),
-            "unexpected error: {error}"
-        );
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits(
-                "left",
-                "right-corrupt",
-                &TrackedStateDiffRequest {
-                    retain_payloads: false,
-                    ..TrackedStateDiffRequest::default()
-                },
-            )
-            .await
-            .expect_err("identity-only diff must validate the packed delta leaf");
-        assert!(
-            error.message.contains("delta index") || error.message.contains("changelog commit"),
-            "unexpected identity-only validation error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn full_root_audit_rejects_stale_ancestor_row_that_is_not_root_winner() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
-            .await
-            .expect("left root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "parent",
-            None,
-            &[row_with_value("entity-a", None, "parent-change", "old")],
-        )
-        .await
-        .expect("parent root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "child",
-            Some("parent"),
-            &[row_with_value("entity-a", None, "child-change", "new")],
-        )
-        .await
-        .expect("child root should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let parent_diff = tracked_state
-            .reader(read)
-            .diff_commits("left", "parent", &TrackedStateDiffRequest::default())
-            .await
-            .expect("parent diff should load");
-        let stale_row = parent_diff
-            .entries
-            .iter()
-            .find_map(|entry| entry.after.clone())
-            .expect("parent row should appear");
-        let (stale_key, stale_value) = stale_row.into_index_entry();
-        stage_corrupt_commit_root(
-            &storage,
-            "child",
-            vec![(stale_key, stale_value)],
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("parent"),
-                root_id: tracked_state_root_id(&storage, "parent").await,
-            }],
-        )
-        .await;
-
-        let error = audit_root(&storage, &tracked_state, "child")
-            .await
-            .expect_err("stale ancestor winner must be rejected");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn full_root_audit_rejects_valid_change_from_unreachable_commit_root() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
-            .await
-            .expect("left root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "unrelated",
-            None,
-            &[row_with_value(
-                "entity-a",
-                None,
-                "unrelated-change",
-                "value",
-            )],
-        )
-        .await
-        .expect("unrelated changelog should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let unrelated_diff = tracked_state
-            .reader(read)
-            .diff_commits("left", "unrelated", &TrackedStateDiffRequest::default())
-            .await
-            .expect("valid unrelated diff should load");
-        let source_row = unrelated_diff
-            .entries
-            .iter()
-            .find_map(|entry| entry.after.clone())
-            .expect("unrelated row should appear in valid diff");
-        let (source_key, source_value) = source_row.into_index_entry();
-
-        {
-            let mut read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open");
-            let mut writes = storage.new_write_set();
-            crate::test_support::stage_empty_changelog_commit(
-                &mut read,
-                &mut writes,
-                "right-corrupt",
-                None,
-            )
-            .await
-            .expect("empty right changelog should write");
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("empty right changelog should commit");
-        };
-        let result = {
-            let mut read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open");
-            let mut writes = storage.new_write_set();
-            let result = crate::tracked_state::tree::TrackedStateTree::new()
-                .apply_mutations(
-                    &mut read,
-                    &mut writes,
-                    None,
-                    crate::tracked_state::types::TrackedStateMutationBatch::from_shared(vec![
-                        TrackedStateMutation::put_encoded(
-                            crate::tracked_state::codec::encode_key(&source_key),
-                            crate::tracked_state::codec::encode_value(&source_value),
-                        ),
-                    ]),
-                    Some("right-corrupt"),
-                )
-                .await
-                .expect("corrupt root should write");
-            stage_snapshot_authority_for_test(
-                &read,
-                &mut writes,
-                &TrackedStateCommitRoot {
-                    commit_id: CommitId::for_test_label("right-corrupt"),
-                    root_id: result.root_id.clone(),
-                    parent_roots: Vec::new(),
-                    changed_key_count: 1,
-                    row_count_estimate: result.row_count as u64,
-                    tree_height: result.tree_height as u32,
-                    primary_chunk_count: result.chunk_count as u64,
-                    primary_chunk_bytes: result.chunk_bytes as u64,
-                },
-            )
-            .await
-            .expect("metadata should encode");
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("corrupt root should commit");
-            result
-        };
-        assert_eq!(result.row_count, 1);
-
-        let error = audit_root(&storage, &tracked_state, "right-corrupt")
-            .await
-            .expect_err("unreachable valid change must be rejected");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn full_root_audit_rejects_second_parent_row_without_commit_root_proof() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
-            .await
-            .expect("left root should write");
-        write_root_committed_for_test(&storage, &tracked_state, "target", None, &[])
-            .await
-            .expect("target root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "source",
-            None,
-            &[row_with_value("entity-a", None, "source-change", "value")],
-        )
-        .await
-        .expect("source root should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let source_diff = tracked_state
-            .reader(read)
-            .diff_commits("left", "source", &TrackedStateDiffRequest::default())
-            .await
-            .expect("source diff should load");
-        let source_row = source_diff
-            .entries
-            .iter()
-            .find_map(|entry| entry.after.clone())
-            .expect("source row should appear");
-        let (source_key, source_value) = source_row.into_index_entry();
-
-        {
-            let mut read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open");
-            let mut writes = storage.new_write_set();
-            crate::test_support::stage_empty_changelog_commit_with_parents(
-                &mut read,
-                &mut writes,
-                "merge",
-                &["target".to_string(), "source".to_string()],
-            )
-            .await
-            .expect("merge changelog should write");
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("merge changelog should commit");
-        }
-        stage_corrupt_commit_root(
-            &storage,
-            "merge",
-            vec![(source_key, source_value)],
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("target"),
-                root_id: tracked_state_root_id(&storage, "target").await,
-            }],
-        )
-        .await;
-
-        let error = audit_root(&storage, &tracked_state, "merge")
-            .await
-            .expect_err("second-parent row without commit-root proof must be rejected");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_commits_rejects_second_parent_row_with_forged_commit_root_parent() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
-            .await
-            .expect("left root should write");
-        write_root_committed_for_test(&storage, &tracked_state, "target", None, &[])
-            .await
-            .expect("target root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "source",
-            None,
-            &[row_with_value("entity-a", None, "source-change", "value")],
-        )
-        .await
-        .expect("source root should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let source_diff = tracked_state
-            .reader(read)
-            .diff_commits("left", "source", &TrackedStateDiffRequest::default())
-            .await
-            .expect("source diff should load");
-        let source_row = source_diff
-            .entries
-            .iter()
-            .find_map(|entry| entry.after.clone())
-            .expect("source row should appear");
-        let (source_key, source_value) = source_row.into_index_entry();
-
-        {
-            let mut read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open");
-            let mut writes = storage.new_write_set();
-            crate::test_support::stage_empty_changelog_commit_with_parents(
-                &mut read,
-                &mut writes,
-                "merge",
-                &["target".to_string(), "source".to_string()],
-            )
-            .await
-            .expect("merge changelog should write");
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("merge changelog should commit");
-        }
-        stage_corrupt_commit_root(
-            &storage,
-            "merge",
-            vec![(source_key, source_value)],
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("source"),
-                root_id: tracked_state_root_id(&storage, "source").await,
-            }],
-        )
-        .await;
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("left", "merge", &TrackedStateDiffRequest::default())
-            .await
-            .expect_err("forged source parent must be rejected");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_commits_rejects_unrelated_row_with_forged_commit_root_parent() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
-            .await
-            .expect("left root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "source",
-            None,
-            &[row_with_value("entity-a", None, "source-change", "value")],
-        )
-        .await
-        .expect("source root should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let source_diff = tracked_state
-            .reader(read)
-            .diff_commits("left", "source", &TrackedStateDiffRequest::default())
-            .await
-            .expect("source diff should load");
-        let source_row = source_diff
-            .entries
-            .iter()
-            .find_map(|entry| entry.after.clone())
-            .expect("source row should appear");
-        let (source_key, source_value) = source_row.into_index_entry();
-
-        {
-            let mut read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open");
-            let mut writes = storage.new_write_set();
-            crate::test_support::stage_empty_changelog_commit(
-                &mut read,
-                &mut writes,
-                "right-corrupt",
-                None,
-            )
-            .await
-            .expect("empty right changelog should write");
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("right changelog should commit");
-        }
-        stage_corrupt_commit_root(
-            &storage,
-            "right-corrupt",
-            vec![(source_key, source_value)],
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("source"),
-                root_id: tracked_state_root_id(&storage, "source").await,
-            }],
-        )
-        .await;
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("left", "right-corrupt", &TrackedStateDiffRequest::default())
-            .await
-            .expect_err("forged unrelated parent must be rejected");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_commits_rejects_forged_parent_metadata_even_for_current_winner_rows() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
-            .await
-            .expect("left root should write");
-        write_root_committed_for_test(&storage, &tracked_state, "target", None, &[])
-            .await
-            .expect("target root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "source",
-            None,
-            &[row_with_value("entity-b", None, "source-b", "source")],
-        )
-        .await
-        .expect("source root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "child",
-            Some("target"),
-            &[row_with_value("entity-a", None, "child-a", "current")],
-        )
-        .await
-        .expect("child root should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let child_diff = tracked_state
-            .reader(read)
-            .diff_commits("left", "child", &TrackedStateDiffRequest::default())
-            .await
-            .expect("child diff should load");
-        let child_row = child_diff
-            .entries
-            .iter()
-            .find_map(|entry| entry.after.clone())
-            .expect("child row should appear");
-        let (child_key, child_value) = child_row.into_index_entry();
-
-        stage_corrupt_commit_root(
-            &storage,
-            "child",
-            vec![(child_key, child_value)],
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("source"),
-                root_id: tracked_state_root_id(&storage, "source").await,
-            }],
-        )
-        .await;
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("left", "child", &TrackedStateDiffRequest::default())
-            .await
-            .expect_err("current winner root metadata must still be validated");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_commits_rejects_stale_grandparent_row_with_forged_commit_root_parent() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
-            .await
-            .expect("left root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "grandparent",
-            None,
-            &[row_with_value("entity-a", None, "grandparent-a", "old")],
-        )
-        .await
-        .expect("grandparent root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "parent",
-            Some("grandparent"),
-            &[row_with_value("entity-a", None, "parent-a", "new")],
-        )
-        .await
-        .expect("parent root should write");
-        write_root_committed_for_test(&storage, &tracked_state, "child", Some("parent"), &[])
-            .await
-            .expect("child root should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let stale_diff = tracked_state
-            .reader(read)
-            .diff_commits("left", "grandparent", &TrackedStateDiffRequest::default())
-            .await
-            .expect("grandparent diff should load");
-        let stale_row = stale_diff
-            .entries
-            .iter()
-            .find_map(|entry| entry.after.clone())
-            .expect("grandparent row should appear");
-        let (stale_key, stale_value) = stale_row.into_index_entry();
-
-        stage_corrupt_commit_root(
-            &storage,
-            "child",
-            vec![(stale_key, stale_value)],
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("grandparent"),
-                root_id: tracked_state_root_id(&storage, "grandparent").await,
-            }],
-        )
-        .await;
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let error = tracked_state
-            .reader(read)
-            .diff_commits("left", "child", &TrackedStateDiffRequest::default())
-            .await
-            .expect_err("forged grandparent parent must be rejected");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_commits_allows_rows_reachable_through_parent_commit() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
-            .await
-            .expect("left root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "parent",
-            None,
-            &[row_with_value("entity-a", None, "parent-change", "value")],
-        )
-        .await
-        .expect("parent root should write");
-        write_root_committed_for_test(&storage, &tracked_state, "child", Some("parent"), &[])
-            .await
-            .expect("child root should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let diff = tracked_state
-            .reader(read)
-            .diff_commits("left", "child", &TrackedStateDiffRequest::default())
-            .await
-            .expect("ancestor-reachable row should validate");
-
-        assert_eq!(
-            kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Added)]
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_commits_allows_source_update_with_source_created_at() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "target", None, &[])
-            .await
-            .expect("target root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "source-add",
-            None,
-            &[row_with_times(
-                "entity-a",
-                None,
-                "source-add-a",
-                "old",
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T00:00:00Z",
-            )],
-        )
-        .await
-        .expect("source add root should write");
-        let mut source_update = row_with_times(
-            "entity-a",
-            None,
-            "source-update-a",
-            "new",
-            "2026-01-01T00:00:00Z",
-            "2026-01-02T00:00:00Z",
-        );
-        source_update.commit_id = CommitId::for_test_label("source-update");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "source-update",
-            Some("source-add"),
-            std::slice::from_ref(&source_update),
-        )
-        .await
-        .expect("source update root should write");
-        {
-            let mut read = storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open");
-            let mut writes = storage.new_write_set();
-            crate::test_support::stage_tracked_root_from_materialized_with_parents(
-                &mut read,
-                &mut writes,
-                &tracked_state,
-                "merge",
-                &["target".to_string(), "source-update".to_string()],
-                Some("target"),
-                std::slice::from_ref(&source_update),
-            )
-            .await
-            .expect("merge root should stage");
-            storage
-                .commit_write_set(writes, StorageWriteOptions::default())
-                .await
-                .expect("merge root should commit");
-        }
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let diff = tracked_state
-            .reader(read)
-            .diff_commits("target", "merge", &TrackedStateDiffRequest::default())
-            .await
-            .expect("source update should validate");
-
-        assert_eq!(
-            kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Added)]
-        );
-        let row = diff.entries[0].after.as_ref().expect("after row");
-        assert_eq!(row.created_at.to_string(), "2026-01-01T00:00:00.000Z");
-        assert_eq!(row.updated_at.to_string(), "2026-01-02T00:00:00.000Z");
-        assert_eq!(row.change_id, "source-update-a");
-    }
-
-    #[tokio::test]
-    async fn full_root_audit_rejects_omitted_inherited_row() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "parent",
-            None,
-            &[row_with_value("entity-a", None, "parent-a", "inherited")],
-        )
-        .await
-        .expect("parent root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "child",
-            Some("parent"),
-            &[row_with_value("entity-b", None, "child-b", "unrelated")],
-        )
-        .await
-        .expect("child root should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let valid_diff = tracked_state
-            .reader(read)
-            .diff_commits("parent", "child", &TrackedStateDiffRequest::default())
-            .await
-            .expect("valid child diff should load");
-        let unrelated_row = valid_diff
-            .entries
-            .iter()
-            .find_map(|entry| {
-                entry
-                    .after
-                    .as_ref()
-                    .filter(|row| row.change_id == "child-b")
-                    .cloned()
-            })
-            .expect("unrelated child row should appear");
-        let (unrelated_key, unrelated_value) = unrelated_row.into_index_entry();
-        stage_corrupt_commit_root(
-            &storage,
-            "child",
-            vec![(unrelated_key, unrelated_value)],
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("parent"),
-                root_id: tracked_state_root_id(&storage, "parent").await,
-            }],
-        )
-        .await;
-
-        let error = audit_root(&storage, &tracked_state, "child")
-            .await
-            .expect_err("omitted inherited row must be rejected");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn full_root_audit_rejects_omitted_updated_row() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "parent",
-            None,
-            &[row_with_value("entity-a", None, "parent-a", "old")],
-        )
-        .await
-        .expect("parent root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "child",
-            Some("parent"),
-            &[
-                row_with_value("entity-a", None, "child-a", "new"),
-                row_with_value("entity-b", None, "child-b", "unrelated"),
-            ],
-        )
-        .await
-        .expect("child root should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let valid_diff = tracked_state
-            .reader(read)
-            .diff_commits("parent", "child", &TrackedStateDiffRequest::default())
-            .await
-            .expect("valid child diff should load");
-        let unrelated_row = valid_diff
-            .entries
-            .iter()
-            .find_map(|entry| {
-                entry
-                    .after
-                    .as_ref()
-                    .filter(|row| row.change_id == "child-b")
-                    .cloned()
-            })
-            .expect("unrelated child row should appear");
-        let (unrelated_key, unrelated_value) = unrelated_row.into_index_entry();
-        stage_corrupt_commit_root(
-            &storage,
-            "child",
-            vec![(unrelated_key, unrelated_value)],
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("parent"),
-                root_id: tracked_state_root_id(&storage, "parent").await,
-            }],
-        )
-        .await;
-
-        let error = audit_root(&storage, &tracked_state, "child")
-            .await
-            .expect_err("omitted updated row must be rejected");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn full_root_audit_rejects_shared_omitted_row() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "parent",
-            None,
-            &[row_with_value("entity-a", None, "parent-a", "shared")],
-        )
-        .await
-        .expect("parent root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "left",
-            Some("parent"),
-            &[row_with_value("entity-b", None, "left-b", "left")],
-        )
-        .await
-        .expect("left root should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "right",
-            Some("parent"),
-            &[row_with_value("entity-c", None, "right-c", "right")],
-        )
-        .await
-        .expect("right root should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let left_diff = tracked_state
-            .reader(read)
-            .diff_commits("parent", "left", &TrackedStateDiffRequest::default())
-            .await
-            .expect("left diff should load");
-        let left_row = left_diff
-            .entries
-            .iter()
-            .find_map(|entry| {
-                entry
-                    .after
-                    .as_ref()
-                    .filter(|row| row.change_id == "left-b")
-                    .cloned()
-            })
-            .expect("left row should appear");
-        let (left_key, left_value) = left_row.into_index_entry();
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let right_diff = tracked_state
-            .reader(read)
-            .diff_commits("parent", "right", &TrackedStateDiffRequest::default())
-            .await
-            .expect("right diff should load");
-        let right_row = right_diff
-            .entries
-            .iter()
-            .find_map(|entry| {
-                entry
-                    .after
-                    .as_ref()
-                    .filter(|row| row.change_id == "right-c")
-                    .cloned()
-            })
-            .expect("right row should appear");
-        let (right_key, right_value) = right_row.into_index_entry();
-        stage_corrupt_commit_root(
-            &storage,
-            "left",
-            vec![(left_key, left_value)],
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("parent"),
-                root_id: tracked_state_root_id(&storage, "parent").await,
-            }],
-        )
-        .await;
-        stage_corrupt_commit_root(
-            &storage,
-            "right",
-            vec![(right_key, right_value)],
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("parent"),
-                root_id: tracked_state_root_id(&storage, "parent").await,
-            }],
-        )
-        .await;
-
-        let error = audit_root(&storage, &tracked_state, "left")
-            .await
-            .expect_err("shared hidden omission must be rejected");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn full_root_audit_validates_even_when_tree_diff_is_empty() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "source",
-            None,
-            &[row_with_value("entity-a", None, "source-change", "value")],
-        )
-        .await
-        .expect("source root should write");
-        write_root_committed_for_test(&storage, &tracked_state, "left-corrupt", None, &[])
-            .await
-            .expect("left changelog should write");
-        write_root_committed_for_test(&storage, &tracked_state, "right-corrupt", None, &[])
-            .await
-            .expect("right changelog should write");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let source_diff = tracked_state
-            .reader(read)
-            .diff_commits(
-                "left-corrupt",
-                "source",
-                &TrackedStateDiffRequest::default(),
-            )
-            .await
-            .expect("source diff should load");
-        let source_row = source_diff
-            .entries
-            .iter()
-            .find_map(|entry| entry.after.clone())
-            .expect("source row should appear");
-        let (source_key, source_value) = source_row.into_index_entry();
-
-        stage_corrupt_commit_root(
-            &storage,
-            "left-corrupt",
-            vec![(source_key.clone(), source_value.clone())],
-            Vec::new(),
-        )
-        .await;
-        stage_corrupt_commit_root(
-            &storage,
-            "right-corrupt",
-            vec![(source_key, source_value)],
-            Vec::new(),
-        )
-        .await;
-
-        let error = audit_root(&storage, &tracked_state, "left-corrupt")
-            .await
-            .expect_err("identical corrupt roots must still be validated");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn full_root_audit_rejects_forged_parent_metadata_on_empty_root() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "parent", None, &[])
-            .await
-            .expect("parent root should write");
-        write_root_committed_for_test(&storage, &tracked_state, "unrelated", None, &[])
-            .await
-            .expect("unrelated root should write");
-        write_root_committed_for_test(&storage, &tracked_state, "child", Some("parent"), &[])
-            .await
-            .expect("child root should write");
-
-        stage_corrupt_commit_root(
-            &storage,
-            "child",
-            Vec::new(),
-            vec![TrackedStateCommitRootParent {
-                commit_id: CommitId::for_test_label("unrelated"),
-                root_id: tracked_state_root_id(&storage, "unrelated").await,
-            }],
-        )
-        .await;
-
-        let error = audit_root(&storage, &tracked_state, "child")
-            .await
-            .expect_err("forged empty-root parent metadata must be rejected");
-
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-
-        stage_corrupt_commit_root(
-            &storage,
-            "child",
-            Vec::new(),
-            vec![
-                TrackedStateCommitRootParent {
-                    commit_id: CommitId::for_test_label("parent"),
-                    root_id: tracked_state_root_id(&storage, "parent").await,
-                },
-                TrackedStateCommitRootParent {
-                    commit_id: CommitId::for_test_label("unrelated"),
-                    root_id: tracked_state_root_id(&storage, "unrelated").await,
-                },
-            ],
-        )
-        .await;
-        let error = audit_root(&storage, &tracked_state, "child")
-            .await
-            .expect_err("extra commit-root parents must be rejected");
-        assert!(
-            is_commit_root_validation_error(&error),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_commits_between_delta_parent_and_child_reports_suffix_rows() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        let mut read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let mut writes = storage.new_write_set();
-        write_root_for_test(
-            &mut read,
-            &mut writes,
-            &tracked_state,
-            "parent",
-            None,
-            &[
-                row_with_value("entity-a", None, "parent-a", "before"),
-                row_with_value("entity-b", None, "parent-b", "same"),
-            ],
-        )
-        .await
-        .expect("parent should write");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("parent writes should commit");
-        let mut read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("child read should open");
-        let mut writes = storage.new_write_set();
-        write_root_for_test(
-            &mut read,
-            &mut writes,
-            &tracked_state,
-            "child",
-            Some("parent"),
-            &[row_with_value("entity-a", None, "child-a", "after")],
-        )
-        .await
-        .expect("child should write");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("writes should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let diff = tracked_state
-            .reader(read)
-            .diff_commits("parent", "child", &TrackedStateDiffRequest::default())
-            .await
-            .expect("diff should load");
-
-        assert_eq!(
-            kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Modified)]
-        );
-        assert_ne!(
-            diff.entries[0].before.as_ref().map(|row| row.change_id),
-            diff.entries[0].after.as_ref().map(|row| row.change_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_commits_between_delta_child_and_parent_reports_reverse_suffix_rows() {
-        let (storage, tracked_state) = seed_parent_child_delta(
-            &[
-                row_with_value("entity-a", None, "parent-a", "before"),
-                row_with_value("entity-b", None, "parent-b", "same"),
-            ],
-            &[row_with_value("entity-a", None, "child-a", "after")],
-        )
-        .await;
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let diff = tracked_state
-            .reader(read)
-            .diff_commits("child", "parent", &TrackedStateDiffRequest::default())
-            .await
-            .expect("diff should load");
-
-        assert_eq!(
-            kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Modified)]
-        );
-        assert_ne!(
-            diff.entries[0].before.as_ref().map(|row| row.change_id),
-            diff.entries[0].after.as_ref().map(|row| row.change_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_commits_between_delta_parent_and_child_preserves_suffix_tombstones() {
-        let (storage, tracked_state) = seed_parent_child_delta(
-            &[
-                row_with_value("entity-a", None, "parent-a", "before"),
-                row_with_value("entity-b", None, "parent-b", "same"),
-            ],
-            &[tombstone("entity-a", None, "child-delete")],
-        )
-        .await;
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let diff = tracked_state
-            .reader(read)
-            .diff_commits("parent", "child", &TrackedStateDiffRequest::default())
-            .await
-            .expect("diff should load");
-
-        assert_eq!(
-            kinds(&diff),
-            vec![("entity-a".to_string(), TrackedStateDiffKind::Removed)]
-        );
-        assert!(diff.entries[0].before_is_live());
-        assert!(!diff.entries[0].after_is_live());
-        assert_eq!(
-            diff.entries[0]
-                .after
-                .as_ref()
-                .map(|row| row.change_id.to_string()),
-            Some(change_id("child-delete"))
-        );
-    }
-
-    async fn diff(
-        storage: &StorageAdapter,
-        tracked_state: &TrackedStateContext,
-    ) -> TrackedStateDiff {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        tracked_state
-            .reader(read)
-            .diff_commits("left", "right", &TrackedStateDiffRequest::default())
-            .await
-            .expect("diff should load")
-    }
-
-    async fn audit_root(
-        storage: &StorageAdapter,
-        tracked_state: &TrackedStateContext,
-        commit_id: &str,
-    ) -> Result<(), LixError> {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        tracked_state
-            .reader(read)
-            .validate_commit_root_against_changelog(commit_id)
-            .await
-    }
-
-    async fn seed_roots(
-        left_rows: &[MaterializedTrackedStateRow],
-        right_rows: &[MaterializedTrackedStateRow],
-    ) -> (StorageAdapter, TrackedStateContext) {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "left", None, left_rows)
-            .await
-            .expect("left root should write");
-        write_root_committed_for_test(&storage, &tracked_state, "right", None, right_rows)
-            .await
-            .expect("right root should write");
-        (storage, tracked_state)
-    }
-
-    async fn seed_parent_child_delta(
-        parent_rows: &[MaterializedTrackedStateRow],
-        child_rows: &[MaterializedTrackedStateRow],
-    ) -> (StorageAdapter, TrackedStateContext) {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_committed_for_test(&storage, &tracked_state, "parent", None, parent_rows)
-            .await
-            .expect("parent should write");
-        write_root_committed_for_test(
-            &storage,
-            &tracked_state,
-            "child",
-            Some("parent"),
-            child_rows,
-        )
-        .await
-        .expect("child should write");
-        (storage, tracked_state)
-    }
-
-    async fn write_root_committed_for_test(
-        storage: &StorageAdapter,
-        tracked_state: &TrackedStateContext,
-        commit_id: &str,
-        parent_commit_id: Option<&str>,
-        rows: &[MaterializedTrackedStateRow],
-    ) -> Result<(), LixError> {
-        let mut read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let mut writes = storage.new_write_set();
-        write_root_for_test(
-            &mut read,
-            &mut writes,
-            tracked_state,
-            commit_id,
-            parent_commit_id,
-            rows,
-        )
-        .await?;
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await?;
-        Ok(())
-    }
-
-    async fn write_root_for_test(
-        read: &mut (impl StorageAdapterRead + ?Sized),
-        writes: &mut StorageWriteSet,
-        tracked_state: &TrackedStateContext,
-        commit_id: &str,
-        parent_commit_id: Option<&str>,
-        rows: &[MaterializedTrackedStateRow],
-    ) -> Result<(), LixError> {
-        crate::test_support::stage_tracked_root_from_materialized(
-            read,
-            writes,
-            tracked_state,
-            commit_id,
-            parent_commit_id,
-            rows,
-        )
-        .await
-    }
-
-    async fn tracked_state_root_id(
-        storage: &StorageAdapter,
-        commit_id: &str,
-    ) -> TrackedStateRootId {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        crate::tracked_state::storage::load_root(&read, commit_id)
-            .await
-            .expect("root should load")
-            .expect("root should exist")
-    }
-
-    async fn stage_corrupt_commit_root(
-        storage: &StorageAdapter,
-        commit_id: &str,
-        entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
-        parent_roots: Vec<TrackedStateCommitRootParent>,
-    ) {
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let mut writes = storage.new_write_set();
-        let mutations = entries
-            .into_iter()
-            .map(|(key, value)| {
-                TrackedStateMutation::put_encoded(
-                    crate::tracked_state::codec::encode_key(&key),
-                    crate::tracked_state::codec::encode_value(&value),
-                )
-            })
-            .collect::<Vec<_>>();
-        let changed_key_count = mutations.len() as u64;
-        let result = crate::tracked_state::tree::TrackedStateTree::new()
-            .apply_mutations(
-                &read,
-                &mut writes,
-                None,
-                crate::tracked_state::types::TrackedStateMutationBatch::from_shared(mutations),
-                Some(commit_id),
-            )
-            .await
-            .expect("corrupt root should write");
-        stage_snapshot_authority_for_test(
-            &read,
-            &mut writes,
-            &TrackedStateCommitRoot {
-                commit_id: CommitId::for_test_label(commit_id),
-                root_id: result.root_id,
-                parent_roots,
-                changed_key_count,
-                row_count_estimate: result.row_count as u64,
-                tree_height: result.tree_height as u32,
-                primary_chunk_count: result.chunk_count as u64,
-                primary_chunk_bytes: result.chunk_bytes as u64,
-            },
-        )
-        .await
-        .expect("metadata should encode");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("corrupt root should commit");
-    }
-
-    fn kinds(diff: &TrackedStateDiff) -> Vec<(String, TrackedStateDiffKind)> {
-        diff.entries
-            .iter()
-            .map(|entry| {
-                (
-                    entry
-                        .identity
-                        .entity_pk()
-                        .as_single_string_owned()
-                        .expect("identity"),
-                    entry.kind,
-                )
-            })
-            .collect()
-    }
-
-    fn is_commit_root_validation_error(error: &LixError) -> bool {
-        error.message.contains("not the first-parent winner")
-            || error.message.contains("does not match parent root")
-            || error.message.contains("snapshot ancestry disagrees")
-            || error
-                .message
-                .contains("does not match changelog first-parent winners")
-            || error.message.contains("contains non-winner identity")
-            || error.message.contains("but changelog first parent is")
-            || error
-                .message
-                .contains("nearest available first-parent root")
-            || error.message.contains("references unexpected parent")
-            || error.message.contains("missing changelog winner")
-            || error.message.contains("has change")
-            || error.message.contains("omits current changelog change")
-            || error.message.contains("omits inherited identity")
-            || error
-                .message
-                .contains("does not preserve inherited identity")
-            || error.message.contains("but changelog winner is")
-    }
-
-    fn tombstone(
-        entity_pk: &str,
-        file_id: Option<&str>,
-        change_id: &str,
-    ) -> MaterializedTrackedStateRow {
-        let mut row = row(entity_pk, file_id, change_id);
-        row.snapshot_content = None;
-        row.deleted = true;
-        row
-    }
-
-    fn row(entity_pk: &str, file_id: Option<&str>, change_id: &str) -> MaterializedTrackedStateRow {
-        row_with_schema(entity_pk, file_id, "test_schema", change_id)
-    }
-
-    fn row_with_schema(
-        entity_pk: &str,
-        file_id: Option<&str>,
-        schema_key: &str,
-        change_id: &str,
-    ) -> MaterializedTrackedStateRow {
-        row_with_schema_and_value(entity_pk, file_id, schema_key, change_id, "value")
-    }
-
-    fn row_with_value(
-        entity_pk: &str,
-        file_id: Option<&str>,
-        change_id: &str,
-        value: &str,
-    ) -> MaterializedTrackedStateRow {
-        row_with_schema_and_value(entity_pk, file_id, "test_schema", change_id, value)
-    }
-
-    fn row_with_times(
-        entity_pk: &str,
-        file_id: Option<&str>,
-        change_id: &str,
-        value: &str,
-        created_at: &str,
-        updated_at: &str,
-    ) -> MaterializedTrackedStateRow {
-        let mut row = row_with_value(entity_pk, file_id, change_id, value);
-        row.created_at = created_at.to_string();
-        row.updated_at = updated_at.to_string();
-        row
-    }
-
-    fn row_with_schema_and_value(
-        entity_pk: &str,
-        file_id: Option<&str>,
-        schema_key: &str,
-        change_id: &str,
-        value: &str,
-    ) -> MaterializedTrackedStateRow {
-        MaterializedTrackedStateRow {
-            entity_pk: EntityPk::single(entity_pk),
-            schema_key: schema_key.to_string(),
-            file_id: file_id.map(str::to_string),
-            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),
-            metadata: None,
-            deleted: false,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-            change_id: ChangeId::for_test_label(change_id),
-            commit_id: CommitId::for_test_label(&change_id.replace("change", "commit")),
         }
     }
 }

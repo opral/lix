@@ -2189,9 +2189,20 @@ async fn entity_delete_collection(
         file_id: None,
     };
     let active_branch_id = ctx.active_branch_id().to_string();
-    let global = ctx
+    let mut global = ctx
         .load_collection_generation(crate::GLOBAL_BRANCH_ID, scope)
         .await?;
+    if let Some(global_generation) = &mut global
+        && global_generation.live_count == crate::collection_generation::DEFERRED_LIVE_COUNT
+    {
+        let Some(live_count) = ctx
+            .load_exact_collection_live_count(crate::GLOBAL_BRANCH_ID, scope)
+            .await?
+        else {
+            return Ok(None);
+        };
+        global_generation.live_count = live_count;
+    }
     // A visible active-branch collection can shadow global rows with the same
     // identity. Per-branch counts cannot recover that union cardinality
     // exactly, so preserve the row-wise route until the projection itself has
@@ -2918,36 +2929,6 @@ impl PreparedPathValueReplacementProgram {
             ));
         };
         Ok(primary_key)
-    }
-
-    pub(crate) fn primary_key_text<'a>(
-        &self,
-        params: &'a [impl AsRef<str>],
-    ) -> Result<&'a str, LixError> {
-        params
-            .get(self.primary_key_param_index)
-            .map(AsRef::as_ref)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "prepared path replacement primary key text is missing",
-                )
-            })
-    }
-
-    pub(crate) fn replacement_value_text<'a>(
-        &self,
-        params: &'a [impl AsRef<str>],
-    ) -> Result<&'a str, LixError> {
-        params
-            .get(self.value_param_index)
-            .map(AsRef::as_ref)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "prepared path replacement value text is missing",
-                )
-            })
     }
 }
 

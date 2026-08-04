@@ -17,19 +17,8 @@ pub mod bench {
 }
 
 #[cfg(test)]
-pub(crate) use commit::take_certified_columnar_current_base_publications;
-#[cfg(test)]
-pub(crate) use commit::take_complete_replacement_packed_current_base_publications;
-#[cfg(test)]
-pub(crate) use commit::take_complete_replacement_packed_current_base_retirements;
-#[cfg(test)]
 pub(crate) use commit::take_direct_journal_replacement_publications;
-#[cfg(test)]
-pub(crate) use commit::take_ordered_packed_current_base_publications;
-#[cfg(test)]
-pub(crate) use commit::take_rootless_replacement_generation_publications;
 pub(crate) use commit_coordinator::CommitCoordinator;
-pub(crate) use context::CertifiedHistoryStoreReader;
 #[cfg(test)]
 pub(crate) use context::CommitBoundaryGuard;
 pub(crate) use context::CommitBoundaryState;

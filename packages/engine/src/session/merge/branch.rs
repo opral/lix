@@ -967,19 +967,6 @@ where
             &ChangeRecordProjection::full(),
         )
         .await?;
-    let missing_base_keys = keys
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| base_rows.row(*index).is_none())
-        .map(|(_, key)| key.clone())
-        .collect::<Vec<_>>();
-    let certified_base_rows = reader
-        .load_certified_rows_at_commit(
-            &analysis.commits.base_commit_id.to_string(),
-            &missing_base_keys,
-        )
-        .await?;
-
     let mut groups = BTreeMap::<String, PluginMergeConflictGroup>::new();
     for (index, conflict) in semantic_conflicts.into_iter().enumerate() {
         let base = base_rows.row(index);
@@ -999,11 +986,7 @@ where
         verify_historical_conflict_row_ref(source, conflict.source.after.as_ref(), "source")?;
 
         let (a, b) = canonical_conflict_variants_ref(conflict, target, source)?;
-        let base = historical_live_payload_ref(base)?.or_else(|| {
-            certified_base_rows
-                .get(&keys[index])
-                .and_then(certified_live_payload)
-        });
+        let base = historical_live_payload_ref(base)?;
         let row = PluginMergeConflictRow {
             identity: conflict.identity.clone(),
             base,
@@ -1043,18 +1026,6 @@ where
         group.conflicts.sort_by_identity();
     }
     Ok(groups)
-}
-
-fn certified_live_payload(
-    row: &crate::live_state::MaterializedLiveStateRow,
-) -> Option<PluginMergeConflictPayload> {
-    if row.deleted {
-        return None;
-    }
-    Some(PluginMergeConflictPayload {
-        snapshot: row.snapshot_content.clone()?,
-        metadata: row.metadata.clone(),
-    })
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]

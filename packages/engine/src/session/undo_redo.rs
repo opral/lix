@@ -761,6 +761,11 @@ mod tests {
             .create_checkpoint()
             .await
             .expect("checkpoint commits");
+        assert_eq!(
+            value(&session, "before").await.as_deref(),
+            Some("checkpoint"),
+            "checkpoint publication must preserve its compacted post-image"
+        );
         let error = session.undo().await.expect_err("checkpoint blocks undo");
         assert_eq!(error.code, LixError::CODE_NOTHING_TO_UNDO);
 

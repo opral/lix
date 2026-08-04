@@ -123,7 +123,7 @@ mod tests {
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{DeterministicSequence, state::load_sequence};
     use crate::live_state::LiveStateContext;
-    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
+    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext};
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
@@ -354,10 +354,9 @@ mod tests {
             .expect("global branch control should load")
             .expect("global branch control should exist");
         let snapshot = crate::json_store::JsonSlot::from_json(&snapshot_content);
-        let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_current_state_with_working_diff(
+            .stage_current_state(
                 GLOBAL_BRANCH_ID,
                 Some(control.generation),
                 control.head_commit_id,
@@ -378,8 +377,6 @@ mod tests {
                 &std::collections::BTreeSet::new(),
                 None,
                 None,
-                None,
-                &mut working_diff_coverage,
             )
             .await
             .expect("test key-value current row should stage");

@@ -18,11 +18,13 @@ use crate::plugin::{
 use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Storage;
+use crate::storage_adapter::StorageAdapter;
+#[cfg(test)]
+use crate::storage_adapter::StorageWriteOptions;
 use crate::storage_adapter::{
     ScanPlan, SharedStorageAdapterRead, StorageCoreProjection, StoragePrefix, StorageReadOptions,
-    StorageScanOptions, StorageWriteOptions,
+    StorageScanOptions,
 };
-use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::CommitCoordinator;
@@ -304,22 +306,15 @@ where
         self.plugin_host.reset_transition_counters();
     }
 
-    /// Rebuilds the tracked serving commit root for one branch from changelog.
-    ///
-    /// This is intentionally an engine-level operation: callers should not need
-    /// to know which KV namespaces back changelog, commit graph, or tracked
-    /// state. The current branch head is read from the live-state facade so
-    /// rebuild uses the same moving-ref visibility as normal execution. The
-    /// rebuilt root receives the full changelog coverage audit against its
-    /// staged chunks before the replacement root is published.
-    pub async fn rebuild_tracked_state_for_branch(&self, branch_id: &str) -> Result<(), LixError> {
+    /// Verifies that a branch head has a canonical Arrow state authority.
+    pub async fn validate_tracked_state_for_branch(&self, branch_id: &str) -> Result<(), LixError> {
         let head_commit_id = self
             .load_branch_head_commit_id(branch_id)
             .await?
             .ok_or_else(|| {
                 LixError::branch_not_found(
                     branch_id.to_string(),
-                    "rebuild_tracked_state_for_branch",
+                    "validate_tracked_state_for_branch",
                     "target",
                 )
             })?;
@@ -328,9 +323,9 @@ where
             SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
         let typed_head_commit_id = crate::changelog::CommitId::parse_lix(
             &head_commit_id,
-            "tracked-state branch rebuild authority",
+            "tracked-state branch authority validation",
         )?;
-        crate::tracked_state::load_commit_state_manifest(
+        let manifest = crate::tracked_state::load_commit_state_manifest(
             &read,
             typed_head_commit_id,
         )
@@ -339,27 +334,16 @@ where
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "cannot rebuild tracked_state root for commit '{head_commit_id}' without its commit-state manifest"
+                    "cannot validate tracked_state root for commit '{head_commit_id}' without its commit-state manifest"
                 ),
             )
         })?;
-        let mut writes = StorageWriteSet::new();
-        let rebuild_result = self
-            .tracked_state
-            .root_rebuilder(&read, &mut writes)
-            .rebuild_commit_root_at(&head_commit_id)
-            .await;
-        rebuild_result?;
-        // A healthy rebuild is content-equivalent, but this API also repairs a
-        // stale or damaged serving root. Conservatively invalidate transaction
-        // opening catalogs so repaired registered-schema facts are never hidden
-        // behind a pre-rebuild cache entry.
-        crate::catalog::stage_catalog_revision(&mut writes);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .map(|_| ())
-            .map_err(LixError::from)
+        crate::tracked_state::load_current_state_catalog_reachability_many(
+            &read,
+            std::slice::from_ref(manifest.current_state_catalog.as_ref()),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {
@@ -530,10 +514,6 @@ mod tests {
 
     async fn register_json_pointer_schema(session: &SessionContext<Memory>) {
         register_json_pointer_schema_in_scope(session, false).await;
-    }
-
-    async fn register_global_json_pointer_schema(session: &SessionContext<Memory>) {
-        register_json_pointer_schema_in_scope(session, true).await;
     }
 
     #[tokio::test]
@@ -1404,134 +1384,6 @@ mod tests {
                 .map(|row| row.get::<String>("path").expect("row path"))
                 .collect::<Vec<_>>(),
             ["/after-checkpoint", "/checkpointed", "/workspace"]
-        );
-    }
-
-    #[tokio::test]
-    async fn checkpoint_reclaims_the_superseded_physical_working_diff_epoch() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("engine should initialize");
-        let engine = Engine::new(storage.clone())
-            .await
-            .expect("initialized engine should open");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        register_json_pointer_schema(&session).await;
-        session
-            .execute(
-                "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/dirty', lix_json('{\"value\":\"before-checkpoint\"}'))",
-                &[],
-            )
-            .await
-            .expect("tracked row should create a working diff");
-
-        let adapter = StorageAdapter::new(storage.clone());
-        let read = adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("working-diff inventory read should open");
-        let before_sparse = ScanPlan::prefix(
-            crate::live_state::HOT_DIFF_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        )
-        .collect(&read, StorageScanOptions::default())
-        .await
-        .expect("working-diff inventory should scan");
-        let before_packed = ScanPlan::prefix(
-            crate::live_state::PACKED_CURRENT_BASE_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        )
-        .collect(&read, StorageScanOptions::default())
-        .await
-        .expect("packed working-diff inventory should scan");
-        assert!(
-            !before_sparse.value.entries.is_empty() || !before_packed.value.entries.is_empty(),
-            "tracked mutation must persist a sparse or packed physical dirty epoch"
-        );
-        drop(read);
-
-        session
-            .create_checkpoint()
-            .await
-            .expect("checkpoint should publish a clean working state");
-
-        let read = adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("post-checkpoint inventory read should open");
-        let after = ScanPlan::prefix(
-            crate::live_state::HOT_DIFF_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        )
-        .collect(&read, StorageScanOptions::default())
-        .await
-        .expect("post-checkpoint working-diff inventory should scan");
-        assert!(
-            after.value.entries.is_empty(),
-            "superseded sparse dirty keys must not remain until repository GC"
-        );
-        let logical = session
-            .execute("SELECT COUNT(*) AS entries FROM lix_working_diff", &[])
-            .await
-            .expect("post-checkpoint logical diff should execute");
-        assert_eq!(
-            logical.rows()[0]
-                .get::<i64>("entries")
-                .expect("working-diff count should be numeric"),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn tracked_entity_public_fast_path_falls_back_for_global_tracked_rows() {
-        let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("engine should initialize");
-        let engine = Engine::new(storage)
-            .await
-            .expect("initialized engine should open");
-        let global_session = engine
-            .open_session(GLOBAL_BRANCH_ID)
-            .await
-            .expect("global session should open");
-        register_global_json_pointer_schema(&global_session).await;
-        global_session
-            .execute(
-                "INSERT INTO json_pointer (path, value, lixcol_global, lixcol_untracked) \
-                 VALUES ('/global', lix_json('{\"source\":\"global\"}'), true, false)",
-                &[],
-            )
-            .await
-            .expect("write global tracked entity row");
-
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        register_json_pointer_schema(&session).await;
-        let rows = session
-            .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
-            .await
-            .expect("global-overlaid tracked read should execute");
-        assert_eq!(
-            rows.rows()
-                .iter()
-                .map(|row| row.get::<String>("path").expect("global path"))
-                .collect::<Vec<_>>(),
-            ["/global"],
-            "a global tracked overlay must retain the general visibility resolver"
         );
     }
 

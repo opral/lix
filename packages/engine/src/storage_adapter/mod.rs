@@ -46,5 +46,4 @@ pub use stats::{
 };
 #[cfg(any(test, feature = "storage-benches"))]
 pub use write_set::StorageWriteSetArenaStats;
-pub(crate) use write_set::{DeferredFinalPutPage, DeferredFinalPutSource};
 pub use write_set::{StorageWriteSet, StorageWriteSetError};

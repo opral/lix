@@ -400,17 +400,12 @@ fn commit_graph_node_from_authority(
             ),
         ));
     };
-    let manifest_rootless = manifest.replay_debt.depth > 0;
     if record.commit_id != manifest.commit_id
         || record.generation != manifest.generation
         || record.parent_commit_ids != manifest.parent_commit_ids
         || record.change_id != manifest.commit_change_id
         || record.account_id != manifest.account_id
         || record.created_at != manifest.created_at
-        || record.tracked_state_rootless != manifest_rootless
-        || record.tracked_state_rootless_depth != manifest.replay_debt.depth
-        || record.tracked_state_rootless_rows != manifest.replay_debt.rows
-        || record.tracked_state_rootless_bytes != manifest.replay_debt.bytes
     {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -421,8 +416,8 @@ fn commit_graph_node_from_authority(
     }
     Ok(Some(CommitGraphNode {
         commit_id: manifest.commit_id,
-        change_id: manifest.commit_change_id,
         account_id: manifest.account_id,
+        change_id: manifest.commit_change_id,
         generation: manifest.generation,
         parent_commit_ids: manifest.parent_commit_ids,
         created_at: manifest.created_at,
@@ -532,9 +527,8 @@ mod tests {
         StorageReadOptions, StorageWriteOptions,
     };
     use crate::tracked_state::{
-        CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
-        TrackedStateCommitDeltaRef, TrackedStateDeltaRef, stage_commit_deltas_for_commit_state,
-        stage_commit_state_manifest,
+        CommitStateManifest, CommitStateMutationInventory, TrackedStateCommitDeltaRef,
+        TrackedStateDeltaRef, stage_commit_deltas_for_commit_state, stage_commit_state_manifest,
     };
 
     #[derive(Clone)]
@@ -662,18 +656,15 @@ mod tests {
                 commit_id,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
+                state_parent_commit_id: None,
                 commit_change_id: change_id("retained-payload-authority-change"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
-                replay_debt: CommitStateReplayDebt {
-                    depth: 1,
-                    rows: 0,
-                    bytes: 0,
-                },
+                current_state_catalog: Box::new(
+                    crate::tracked_state::empty_current_state_catalog_root(None, commit_id)
+                        .expect("empty Arrow state root should construct"),
+                ),
                 mutations: CommitStateMutationInventory::default(),
-                touched_scope_filter: Default::default(),
-                current_state_scoped_ranges: None,
-                snapshot_root: None,
             },
         )
         .expect("retained payload authority should stage");
@@ -1001,10 +992,6 @@ mod tests {
                     commit_id,
                     generation: 0,
                     parent_commit_ids: Vec::new(),
-                    tracked_state_rootless: true,
-                    tracked_state_rootless_depth: 1,
-                    tracked_state_rootless_rows: 3,
-                    tracked_state_rootless_bytes: 0,
                     change_id: change_id("selected-tombstone-commit-change"),
                     account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                     created_at,
@@ -1073,18 +1060,15 @@ mod tests {
                 commit_id,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
+                state_parent_commit_id: None,
                 commit_change_id: change_id("selected-tombstone-commit-change"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at,
-                replay_debt: CommitStateReplayDebt {
-                    depth: 1,
-                    rows: 3,
-                    bytes: 0,
-                },
+                current_state_catalog: Box::new(
+                    crate::tracked_state::empty_current_state_catalog_root(None, commit_id)
+                        .expect("selected tombstone Arrow root should construct"),
+                ),
                 mutations: staged.mutation_inventory().clone(),
-                touched_scope_filter: Default::default(),
-                current_state_scoped_ranges: None,
-                snapshot_root: None,
             },
         )
         .expect("selected tombstone commit-state manifest should stage");
@@ -1508,12 +1492,6 @@ mod tests {
                 commit_id,
                 generation,
                 parent_commit_ids: change.parent_commit_ids.clone(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: u16::try_from(generation + 1)
-                    .expect("test commit generation should fit replay depth"),
-                tracked_state_rootless_rows: u64::try_from(members.len())
-                    .expect("test member count should fit u64"),
-                tracked_state_rootless_bytes: 0,
                 change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
@@ -1555,44 +1533,53 @@ mod tests {
             inventories.insert(*commit_id, staged.mutation_inventory().clone());
         }
         for record in &commit_records {
-            stage_test_commit_manifest(
+            let rows = commit_members
+                .iter()
+                .find(|(commit_id, _)| *commit_id == record.commit_id)
+                .map(|(_, members)| {
+                    members
+                        .iter()
+                        .map(|change| crate::tracked_state::MaterializedTrackedStateRow {
+                            entity_pk: change.entity_pk.clone(),
+                            schema_key: change.schema_key.clone(),
+                            file_id: change.file_id.clone(),
+                            snapshot_content: match change.snapshot.as_ref_slot() {
+                                crate::json_store::JsonSlotRef::None => None,
+                                crate::json_store::JsonSlotRef::Inline(value) => Some(value.into()),
+                                crate::json_store::JsonSlotRef::Ref(_) => {
+                                    panic!("history fixture JSON must be inline")
+                                }
+                            },
+                            metadata: match change.metadata.as_ref_slot() {
+                                crate::json_store::JsonSlotRef::None => None,
+                                crate::json_store::JsonSlotRef::Inline(value) => Some(value.into()),
+                                crate::json_store::JsonSlotRef::Ref(_) => {
+                                    panic!("history fixture metadata must be inline")
+                                }
+                            },
+                            deleted: change.snapshot.is_none(),
+                            created_at: change.created_at.to_string(),
+                            updated_at: change.created_at.to_string(),
+                            change_id: change.change_id,
+                            commit_id: record.commit_id,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            crate::test_support::stage_test_commit_state_manifest(
+                &read,
                 &mut writes,
                 record,
                 inventories.remove(&record.commit_id).unwrap_or_default(),
-            );
+                &rows,
+            )
+            .await
+            .expect("test commit-state manifest should stage");
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("commit should succeed");
-    }
-
-    fn stage_test_commit_manifest(
-        writes: &mut crate::storage_adapter::StorageWriteSet,
-        record: &CommitRecord,
-        mutations: CommitStateMutationInventory,
-    ) {
-        stage_commit_state_manifest(
-            writes,
-            &CommitStateManifest {
-                commit_id: record.commit_id,
-                generation: record.generation,
-                parent_commit_ids: record.parent_commit_ids.clone(),
-                commit_change_id: record.change_id,
-                account_id: record.account_id.clone(),
-                created_at: record.created_at,
-                replay_debt: CommitStateReplayDebt {
-                    depth: record.tracked_state_rootless_depth,
-                    rows: record.tracked_state_rootless_rows,
-                    bytes: record.tracked_state_rootless_bytes,
-                },
-                mutations,
-                touched_scope_filter: Default::default(),
-                current_state_scoped_ranges: None,
-                snapshot_root: None,
-            },
-        )
-        .expect("test commit-state manifest should stage");
     }
 
     fn append_empty_commit(append: &mut ChangelogAppend, commit_id: CommitId) {
@@ -1602,10 +1589,6 @@ mod tests {
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
-            tracked_state_rootless: true,
-            tracked_state_rootless_depth: 1,
-            tracked_state_rootless_rows: 0,
-            tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label(&change_id),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -1644,8 +1627,8 @@ mod tests {
         let commit_id = CommitId::for_test_label(commit_label);
         crate::commit_graph::CommitGraphNode {
             commit_id,
-            change_id: ChangeId::for_test_label(&format!("{commit_label}-change")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+            change_id: ChangeId::for_test_label(&format!("{commit_label}-change")),
             generation: 0,
             parent_commit_ids: parent_commit_ids
                 .iter()

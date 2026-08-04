@@ -531,10 +531,6 @@ async fn measure_history<StorageImpl>(
         .await
         .expect("warm historical tracked diff");
     assert_eq!(warm.entries, expected_changes);
-    assert!(
-        warm.left_has_durable_root && !warm.right_has_durable_root,
-        "measure-history requires checkpoint -> rootless first-parent replay"
-    );
 
     let mut latencies = Vec::with_capacity(repetitions);
     for _ in 0..repetitions {
@@ -544,10 +540,6 @@ async fn measure_history<StorageImpl>(
             .expect("measure historical tracked diff");
         latencies.push(start.elapsed());
         assert_eq!(result.entries, expected_changes);
-        assert!(
-            result.left_has_durable_root && !result.right_has_durable_root,
-            "historical measurement must remain checkpoint -> rootless"
-        );
     }
     let mut sorted = latencies.clone();
     sorted.sort_unstable();

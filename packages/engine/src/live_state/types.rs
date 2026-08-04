@@ -120,10 +120,11 @@ pub(crate) struct MaterializedLiveStateBatch {
     /// projection column. SQL UPDATE can carry it into commit materialization
     /// and avoid reading the same current row a second time.
     durable_predecessor: Vec<Option<CertifiedCurrentStatePredecessor>>,
-    /// Lazily allocated fixed-width coordinate column. Most materialized
-    /// batches contain no columnar coordinates, so they pay no per-row
-    /// storage. Once present, the default/nil owner is the absent sentinel.
-    columnar_base_coordinate: Option<Vec<ColumnarBaseCoordinate>>,
+    /// Lazily allocated coordinate column. Most materialized batches contain
+    /// no Arrow coordinates, so they pay no per-row storage. Once allocated,
+    /// absence is explicit rather than encoded as a synthetic all-zero
+    /// content identity.
+    columnar_base_coordinate: Option<Vec<Option<ColumnarBaseCoordinate>>>,
 }
 
 /// Row-oriented storage for the overwhelmingly common one-row point-read
@@ -513,13 +514,12 @@ impl<'a> MaterializedLiveStateRowRef<'a> {
     pub(crate) fn columnar_base_coordinate(self) -> Option<ColumnarBaseCoordinate> {
         self.singleton().map_or_else(
             || {
-                let coordinate = self
-                    .batch
+                self.batch
                     .columnar_base_coordinate
                     .as_ref()?
                     .get(self.index)
-                    .copied()?;
-                (coordinate.base_commit_id != CommitId::default()).then_some(coordinate)
+                    .copied()
+                    .flatten()
             },
             |singleton| singleton.columnar_base_coordinate,
         )
@@ -994,7 +994,7 @@ pub(crate) struct MaterializedLiveStateBatchBuilder {
     commit_id: Vec<Option<CommitId>>,
     untracked: Vec<bool>,
     durable_predecessor: Vec<Option<CertifiedCurrentStatePredecessor>>,
-    columnar_base_coordinate: Option<Vec<ColumnarBaseCoordinate>>,
+    columnar_base_coordinate: Option<Vec<Option<ColumnarBaseCoordinate>>>,
 }
 
 impl MaterializedLiveStateBatchBuilder {
@@ -1347,7 +1347,7 @@ impl MaterializedLiveStateBatchBuilder {
         self.untracked.push(untracked);
         self.durable_predecessor.push(None);
         if let Some(coordinates) = &mut self.columnar_base_coordinate {
-            coordinates.push(ColumnarBaseCoordinate::default());
+            coordinates.push(None);
         }
     }
 
@@ -1393,9 +1393,8 @@ impl MaterializedLiveStateBatchBuilder {
             return;
         }
         assert!(row < self.len(), "live-state row ordinal out of bounds");
-        self.columnar_base_coordinate.get_or_insert_with(|| {
-            vec![ColumnarBaseCoordinate::default(); self.entity_pks.len()]
-        })[row] = value;
+        self.columnar_base_coordinate
+            .get_or_insert_with(|| vec![None; self.entity_pks.len()])[row] = Some(value);
     }
 
     pub(crate) fn finish(self) -> MaterializedLiveStateBatch {
@@ -1687,7 +1686,7 @@ mod batch_tests {
     fn singleton_builder_promotes_when_capacity_hint_is_exceeded() {
         let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(1);
         let coordinate = ColumnarBaseCoordinate {
-            base_commit_id: CommitId::for_test_label("batch-coordinate-base"),
+            state_set_id: crate::columnar_row_group::ArrowStateSetId::from_digest([11; 32]),
             group_index: 3,
             row_index: 19,
         };
@@ -1737,7 +1736,7 @@ mod batch_tests {
         assert!(builder.columnar_base_coordinate.is_none());
 
         let coordinate = ColumnarBaseCoordinate {
-            base_commit_id: CommitId::for_test_label("late-coordinate-base"),
+            state_set_id: crate::columnar_row_group::ArrowStateSetId::from_digest([12; 32]),
             group_index: 7,
             row_index: 23,
         };

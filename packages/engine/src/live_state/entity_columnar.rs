@@ -1,134 +1,168 @@
-//! Entity-specific contract layered over generic immutable columnar row groups.
+//! Transaction-local ownership and coordinates for canonical Arrow state sets.
 
 use std::collections::BTreeMap;
 
 use crate::changelog::CommitId;
-use crate::columnar_row_group::{RowGroupRowLocation, RowGroupSetId};
-
-pub(crate) const ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY: &str =
-    "lix.entity_columnar.lossless_snapshot.v1";
-pub(crate) const ENTITY_COLUMNAR_ENTITY_PK_FIELD: &str = "lixcol_entity_pk";
-
-pub(crate) fn entity_identity_column_index(
-    manifest: &crate::columnar_row_group::RowGroupManifest,
-) -> Option<usize> {
-    (manifest
-        .metadata
-        .get(ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY)
-        .map(String::as_str)
-        == Some("true"))
-    .then(|| manifest.fields.len().checked_sub(1))
-    .flatten()
-    .filter(|&index| manifest.fields[index].name == ENTITY_COLUMNAR_ENTITY_PK_FIELD)
-}
+use crate::columnar_row_group::{ArrowStateSetId, RowGroupRowLocation};
+use crate::tracked_state::{CommitDeltaReplacementScope, TrackedStateBaseCoordinate};
 
 pub(crate) struct EntityColumnarWriteSets {
-    sets: BTreeMap<(CommitId, String), crate::columnar_row_group::EncodedRowGroupSet>,
-    state_row_locations: StateRowLocations,
-}
-
-enum StateRowLocations {
-    None,
-    Dense { row_count: usize },
-    Explicit(Vec<Option<RowGroupRowLocation>>),
+    sets: BTreeMap<
+        (CommitId, CommitDeltaReplacementScope),
+        crate::columnar_row_group::EncodedRowGroupSet,
+    >,
+    state_row_locations: Vec<Option<TrackedStateBaseCoordinate>>,
+    replacement_row_locations: BTreeMap<(CommitId, String), Vec<TrackedStateBaseCoordinate>>,
+    addressed_row_locations:
+        BTreeMap<(CommitId, CommitDeltaReplacementScope, Vec<u8>), TrackedStateBaseCoordinate>,
 }
 
 impl EntityColumnarWriteSets {
     pub(crate) fn new() -> Self {
         Self {
             sets: BTreeMap::new(),
-            state_row_locations: StateRowLocations::None,
+            state_row_locations: Vec::new(),
+            replacement_row_locations: BTreeMap::new(),
+            addressed_row_locations: BTreeMap::new(),
         }
     }
 
     pub(crate) fn with_state_row_count(row_count: usize) -> Self {
         Self {
             sets: BTreeMap::new(),
-            state_row_locations: StateRowLocations::Explicit(vec![None; row_count]),
+            state_row_locations: vec![None; row_count],
+            replacement_row_locations: BTreeMap::new(),
+            addressed_row_locations: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn with_dense_state_rows(row_count: usize) -> Self {
-        Self {
-            sets: BTreeMap::new(),
-            state_row_locations: StateRowLocations::Dense { row_count },
-        }
-    }
-
-    pub(crate) fn dense_state_row_count(&self) -> Option<usize> {
-        match &self.state_row_locations {
-            StateRowLocations::Dense { row_count } => Some(*row_count),
-            StateRowLocations::None | StateRowLocations::Explicit(_) => None,
-        }
-    }
-
-    pub(crate) fn get(
+    pub(crate) fn get_scope(
         &self,
-        key: &(CommitId, String),
+        commit_id: CommitId,
+        scope: &CommitDeltaReplacementScope,
     ) -> Option<&crate::columnar_row_group::EncodedRowGroupSet> {
-        self.sets.get(key)
+        self.sets.get(&(commit_id, scope.clone()))
     }
 
-    pub(crate) fn take(
+    pub(crate) fn get_unfiled(
+        &self,
+        commit_id: CommitId,
+        schema_key: &str,
+    ) -> Option<&crate::columnar_row_group::EncodedRowGroupSet> {
+        self.get_scope(
+            commit_id,
+            &CommitDeltaReplacementScope {
+                schema_key: schema_key.to_owned(),
+                file_id: None,
+            },
+        )
+    }
+
+    pub(crate) fn insert_scope(
         &mut self,
-        key: &(CommitId, String),
-    ) -> Option<crate::columnar_row_group::EncodedRowGroupSet> {
-        self.sets.remove(key)
+        commit_id: CommitId,
+        scope: CommitDeltaReplacementScope,
+        value: crate::columnar_row_group::EncodedRowGroupSet,
+    ) {
+        self.sets.insert((commit_id, scope), value);
     }
 
-    pub(crate) fn insert(
+    pub(crate) fn insert_unfiled(
+        &mut self,
+        commit_id: CommitId,
+        schema_key: impl Into<String>,
+        value: crate::columnar_row_group::EncodedRowGroupSet,
+    ) {
+        self.insert_scope(
+            commit_id,
+            CommitDeltaReplacementScope {
+                schema_key: schema_key.into(),
+                file_id: None,
+            },
+            value,
+        );
+    }
+
+    pub(crate) fn insert_replacement(
         &mut self,
         key: (CommitId, String),
         value: crate::columnar_row_group::EncodedRowGroupSet,
+        input_locations: Vec<RowGroupRowLocation>,
     ) {
-        self.sets.insert(key, value);
+        let state_set_id = value.id();
+        let coordinates = input_locations
+            .into_iter()
+            .map(|location| TrackedStateBaseCoordinate {
+                state_set_id,
+                group_index: location.group_index,
+                row_index: location.row_index,
+            })
+            .collect();
+        self.replacement_row_locations
+            .insert(key.clone(), coordinates);
+        self.insert_unfiled(key.0, key.1, value);
+    }
+
+    pub(crate) fn replacement_row_location(
+        &self,
+        key: &(CommitId, String),
+        row_index: usize,
+    ) -> Option<TrackedStateBaseCoordinate> {
+        self.replacement_row_locations
+            .get(key)
+            .and_then(|locations| locations.get(row_index))
+            .copied()
     }
 
     pub(crate) fn set_state_row_location(
         &mut self,
         state_row_index: usize,
+        state_set_id: ArrowStateSetId,
         location: RowGroupRowLocation,
     ) {
-        match &mut self.state_row_locations {
-            StateRowLocations::Explicit(locations) => {
-                locations[state_row_index] = Some(location);
-            }
-            StateRowLocations::None | StateRowLocations::Dense { .. } => {
-                panic!("explicit entity row location requires an explicit location column")
-            }
-        }
+        self.state_row_locations[state_row_index] = Some(TrackedStateBaseCoordinate {
+            state_set_id,
+            group_index: location.group_index,
+            row_index: location.row_index,
+        });
     }
 
-    pub(crate) fn state_row_location(&self, state_row_index: usize) -> Option<RowGroupRowLocation> {
-        match &self.state_row_locations {
-            StateRowLocations::None => None,
-            StateRowLocations::Dense { row_count } if state_row_index < *row_count => {
-                Some(RowGroupRowLocation {
-                    group_index: u32::try_from(
-                        state_row_index / crate::columnar_row_group::ROW_GROUP_MAX_ROWS,
-                    )
-                    .ok()?,
-                    row_index: u32::try_from(
-                        state_row_index % crate::columnar_row_group::ROW_GROUP_MAX_ROWS,
-                    )
-                    .ok()?,
-                })
-            }
-            StateRowLocations::Dense { .. } => None,
-            StateRowLocations::Explicit(locations) => {
-                locations.get(state_row_index).copied().flatten()
-            }
-        }
+    pub(crate) fn state_row_location(
+        &self,
+        state_row_index: usize,
+    ) -> Option<TrackedStateBaseCoordinate> {
+        self.state_row_locations
+            .get(state_row_index)
+            .copied()
+            .flatten()
     }
-}
 
-pub(crate) fn entity_row_group_set_id(commit_id: CommitId, schema_key: &str) -> RowGroupSetId {
-    let mut digest = blake3::Hasher::new();
-    digest.update(b"lix.entity_columnar.v1");
-    digest.update(commit_id.as_uuid().as_bytes());
-    digest.update(&(schema_key.len() as u64).to_be_bytes());
-    digest.update(schema_key.as_bytes());
-    let mut id = [0_u8; 16];
-    id.copy_from_slice(&digest.finalize().as_bytes()[..16]);
-    RowGroupSetId::new(id)
+    pub(crate) fn set_addressed_row_location(
+        &mut self,
+        commit_id: CommitId,
+        scope: CommitDeltaReplacementScope,
+        encoded_key: Vec<u8>,
+        state_set_id: ArrowStateSetId,
+        location: RowGroupRowLocation,
+    ) {
+        self.addressed_row_locations.insert(
+            (commit_id, scope, encoded_key),
+            TrackedStateBaseCoordinate {
+                state_set_id,
+                group_index: location.group_index,
+                row_index: location.row_index,
+            },
+        );
+    }
+
+    pub(crate) fn addressed_row_location(
+        &self,
+        commit_id: CommitId,
+        scope: &CommitDeltaReplacementScope,
+        encoded_key: &[u8],
+    ) -> Option<TrackedStateBaseCoordinate> {
+        self.addressed_row_locations
+            .get(&(commit_id, scope.clone(), encoded_key.to_vec()))
+            .copied()
+    }
 }

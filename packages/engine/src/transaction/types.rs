@@ -2748,6 +2748,7 @@ impl PreparedStateBatch {
         self.certified_tracked_keys_strictly_ordered
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_collection_replacement_proof(
         &self,
     ) -> Option<CompleteCollectionReplacementProof> {
@@ -3484,19 +3485,6 @@ impl PreparedStateBatch {
             commit_id,
             self.strings[dense.schema_key as usize].as_str(),
             &self.json[..dense.len],
-        ))
-    }
-
-    pub(crate) fn take_dense_entity_columnar(
-        &mut self,
-    ) -> Option<(CommitId, String, crate::sql2::EncodedEntityRowGroups)> {
-        let dense = self.dense_certified_parameter.as_mut()?;
-        let commit_id = dense.commit_id?;
-        let encoded = dense.entity_columnar.take()?;
-        Some((
-            commit_id,
-            self.strings[dense.schema_key as usize].to_string(),
-            encoded,
         ))
     }
 

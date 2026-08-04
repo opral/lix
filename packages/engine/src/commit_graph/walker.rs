@@ -248,9 +248,7 @@ mod tests {
     use crate::commit_graph::CommitGraphContext;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageKey, StorageReadOptions, StorageWriteOptions};
-    use crate::tracked_state::{
-        CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
-    };
+    use crate::tracked_state::{CommitStateManifest, CommitStateMutationInventory};
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
@@ -359,10 +357,6 @@ mod tests {
                 commit_id: embedded,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: false,
-                tracked_state_rootless_depth: 0,
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label("mismatched-key-change"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -402,10 +396,6 @@ mod tests {
                 commit_id,
                 generation: 1,
                 parent_commit_ids: commit_ids([parent]),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
                 change_id: ChangeId::for_test_label(&format!("{label}-change")),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -696,10 +686,6 @@ mod tests {
             commit_id: child,
             generation: 0,
             parent_commit_ids: commit_ids(["commit-root"]),
-            tracked_state_rootless: true,
-            tracked_state_rootless_depth: 2,
-            tracked_state_rootless_rows: 0,
-            tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label("commit-child-change"),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -1025,11 +1011,6 @@ mod tests {
                 commit_id: typed_commit_id,
                 generation,
                 parent_commit_ids,
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: u16::try_from(generation + 1)
-                    .expect("test generation should fit replay depth"),
-                tracked_state_rootless_rows: 0,
-                tracked_state_rootless_bytes: 0,
                 change_id: change.change.id,
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: change.change.created_at,
@@ -1061,18 +1042,14 @@ mod tests {
                 commit_id: record.commit_id,
                 generation: record.generation,
                 parent_commit_ids: record.parent_commit_ids.clone(),
+                state_parent_commit_id: record.parent_commit_ids.first().copied(),
                 commit_change_id: record.change_id,
                 account_id: record.account_id.clone(),
                 created_at: record.created_at,
-                replay_debt: CommitStateReplayDebt {
-                    depth: record.tracked_state_rootless_depth,
-                    rows: record.tracked_state_rootless_rows,
-                    bytes: record.tracked_state_rootless_bytes,
-                },
+                current_state_catalog: Box::new(
+                    crate::tracked_state::empty_current_state_catalog_root(None, record.commit_id)?,
+                ),
                 mutations: CommitStateMutationInventory::default(),
-                touched_scope_filter: Default::default(),
-                current_state_scoped_ranges: None,
-                snapshot_root: None,
             },
         )
     }

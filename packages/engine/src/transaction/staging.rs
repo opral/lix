@@ -96,7 +96,6 @@ pub(crate) struct ImmutableMutationJournalChunk {
     snapshot_arena: Bytes,
     snapshot_offsets: Arc<[(u32, u32)]>,
     large_snapshot_refs: Arc<[(u32, crate::json_store::JsonRef)]>,
-    sealed_replacement_parts: Option<Arc<[crate::tracked_state::EncodedReplacementPart]>>,
     durable_predecessors: Option<Arc<[CertifiedCurrentStatePredecessor]>>,
     timestamp: LixTimestamp,
 }
@@ -112,7 +111,6 @@ impl PartialEq for ImmutableMutationJournalChunk {
             && self.snapshot_arena == other.snapshot_arena
             && self.snapshot_offsets == other.snapshot_offsets
             && self.large_snapshot_refs == other.large_snapshot_refs
-            && self.sealed_replacement_parts == other.sealed_replacement_parts
             && self.timestamp == other.timestamp
             && self.durable_predecessors.as_ref().map(|values| {
                 values
@@ -309,7 +307,6 @@ impl ImmutableMutationJournalChunk {
             snapshot_arena: Bytes::from(snapshot_arena),
             snapshot_offsets: offsets.into(),
             large_snapshot_refs: large_snapshot_refs.into(),
-            sealed_replacement_parts: None,
             durable_predecessors: durable_predecessors.map(Into::into),
             timestamp,
         })
@@ -370,91 +367,6 @@ impl ImmutableMutationJournalChunk {
             .binary_search_by_key(&index, |(ordinal, _)| *ordinal)
             .expect("large immutable mutation snapshot has a content ref");
         crate::json_store::JsonSlotRef::Ref(&self.large_snapshot_refs[position].1)
-    }
-
-    pub(crate) fn seal_replacement_parts(
-        &mut self,
-        finalize_tail: bool,
-        compressor: &mut Option<crate::compression::ZstdLevel1Compressor>,
-    ) -> Result<(), LixError> {
-        if self.sealed_replacement_parts.is_some() {
-            return Ok(());
-        }
-        if !finalize_tail
-            && !self
-                .len()
-                .is_multiple_of(crate::tracked_state::REPLACEMENT_PART_MAX_ROWS)
-        {
-            return Ok(());
-        }
-        let mut parts = Vec::with_capacity(
-            self.len()
-                .div_ceil(crate::tracked_state::REPLACEMENT_PART_MAX_ROWS),
-        );
-        let mut first = 0usize;
-        while first < self.len() {
-            let max_candidate_len =
-                (self.len() - first).min(crate::tracked_state::REPLACEMENT_PART_MAX_ROWS);
-            let mut keys = Vec::with_capacity(max_candidate_len);
-            for index in first..first + max_candidate_len {
-                let mut key = Vec::new();
-                crate::tracked_state::encode_single_string_key_ref_into(
-                    &mut key,
-                    self.schema_key(),
-                    None,
-                    self.identity(index),
-                );
-                keys.push(key);
-            }
-            let mut candidate_len = max_candidate_len;
-            let encoded = loop {
-                let rows = keys[..candidate_len]
-                    .iter()
-                    .enumerate()
-                    .map(
-                        |(offset, key)| crate::tracked_state::ReplacementPartRowRef {
-                            encoded_key: key,
-                            snapshot: self.snapshot_slot(first + offset),
-                            metadata: crate::json_store::JsonSlotRef::None,
-                        },
-                    )
-                    .collect::<Vec<_>>();
-                match crate::tracked_state::encode_replacement_part_with_compressor(
-                    &rows, compressor,
-                ) {
-                    Ok(encoded)
-                        if encoded.bytes().len()
-                            <= crate::tracked_state::REPLACEMENT_PART_TARGET_BYTES
-                            || candidate_len == 1 =>
-                    {
-                        break encoded;
-                    }
-                    Ok(_) | Err(_) if candidate_len > 1 => {
-                        // The canonical commit encoder retains the rejected
-                        // suffix and admits following rows into it. A
-                        // non-final journal chunk cannot reproduce that
-                        // state across its boundary, so leave this chunk and
-                        // every later chunk for the one-pass commit encoder.
-                        if !finalize_tail {
-                            return Ok(());
-                        }
-                        candidate_len = candidate_len.div_ceil(2);
-                    }
-                    Err(error) => return Err(error),
-                    Ok(_) => unreachable!("single-row replacement part satisfies the size guard"),
-                }
-            };
-            first += candidate_len;
-            parts.push(encoded);
-        }
-        self.sealed_replacement_parts = Some(parts.into());
-        Ok(())
-    }
-
-    pub(crate) fn sealed_replacement_parts(
-        &self,
-    ) -> Option<&[crate::tracked_state::EncodedReplacementPart]> {
-        self.sealed_replacement_parts.as_deref()
     }
 
     pub(crate) fn schema_key(&self) -> &str {
@@ -630,25 +542,6 @@ impl OrderedMutationJournal {
         }
     }
 
-    pub(crate) fn row_count(&self) -> usize {
-        self.row_count
-    }
-
-    pub(crate) fn sealed_replacement_prefix(
-        &self,
-    ) -> (usize, Vec<crate::tracked_state::EncodedReplacementPart>) {
-        let mut parts = Vec::new();
-        let mut row_count = 0usize;
-        for chunk in self.chunks.iter() {
-            let Some(sealed) = chunk.sealed_replacement_parts() else {
-                break;
-            };
-            parts.extend_from_slice(sealed);
-            row_count += chunk.len();
-        }
-        (row_count, parts)
-    }
-
     pub(crate) fn commit_id(&self) -> CommitId {
         self.commit_id
     }
@@ -668,6 +561,10 @@ impl OrderedMutationJournal {
     pub(crate) fn replacement_proof(&self) -> CompleteCollectionReplacementProof {
         self.replacement_proof
             .expect("drained ordered mutation journal is replacement-certified")
+    }
+
+    pub(crate) fn overlay_uniform_created_at(&self) -> Option<LixTimestamp> {
+        self.overlay_uniform_created_at
     }
 
     fn into_prepared(self) -> Result<PreparedStateBatch, LixError> {
@@ -1011,10 +908,6 @@ impl PreparedInsertSelection {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.count == 0
-    }
-
-    pub(crate) fn covers_all(&self, row_count: usize) -> bool {
-        self.row_count == row_count && self.count == row_count
     }
 
     pub(crate) fn contains(&self, row_index: usize) -> bool {
@@ -1868,6 +1761,18 @@ impl TransactionWriteBuffer {
         })?;
         journal.overlay_uniform_created_at = Some(created_at);
         Ok(())
+    }
+
+    pub(crate) fn has_provisional_mutation_journal(&self) -> Result<bool, LixError> {
+        self.ordered_mutations
+            .lock()
+            .map(|journal| journal.is_some())
+            .map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "failed to acquire immutable transaction mutation journal",
+                )
+            })
     }
 
     pub(crate) fn provisional_mutation_journal_descriptor(
@@ -4506,64 +4411,6 @@ mod tests {
             chunk.snapshot_slot(ROW_COUNT - 1),
             crate::json_store::JsonSlotRef::Ref(_)
         ));
-    }
-
-    #[test]
-    fn immutable_journal_does_not_seal_adaptive_residual_at_chunk_boundary() {
-        const ROW_COUNT: usize = 8 * crate::tracked_state::REPLACEMENT_PART_MAX_ROWS;
-        let mut identity_values = Vec::with_capacity(ROW_COUNT);
-        let mut random = 0x9e37_79b9_7f4a_7c15_u64;
-        for _ in 0..ROW_COUNT {
-            let mut identity = String::with_capacity(640);
-            for _ in 0..40 {
-                random ^= random << 13;
-                random ^= random >> 7;
-                random ^= random << 17;
-                use std::fmt::Write as _;
-                write!(&mut identity, "{random:016x}").expect("write identity");
-            }
-            identity_values.push(identity);
-        }
-        identity_values.sort_unstable();
-
-        let mut identities = Vec::with_capacity(ROW_COUNT * 640);
-        let mut identity_offsets = Vec::with_capacity(ROW_COUNT);
-        let mut snapshots = Vec::with_capacity(ROW_COUNT * 2);
-        let mut snapshot_offsets = Vec::with_capacity(ROW_COUNT);
-        for identity in identity_values {
-            let start = identities.len();
-            identities.extend_from_slice(identity.as_bytes());
-            identity_offsets.push((start, identities.len()));
-
-            let start = snapshots.len();
-            snapshots.extend_from_slice(b"{}");
-            snapshot_offsets.push((start, snapshots.len()));
-        }
-
-        let mut chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
-            SchemaPlanId::for_test(0),
-            "schema".into(),
-            "branch".into(),
-            None,
-            identities,
-            identity_offsets,
-            snapshots,
-            snapshot_offsets,
-            None,
-            LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
-        )
-        .expect("large-key journal chunk");
-        let mut compressor = None;
-
-        chunk
-            .seal_replacement_parts(false, &mut compressor)
-            .expect("non-final sealing probe");
-        assert!(chunk.sealed_replacement_parts().is_none());
-
-        chunk
-            .seal_replacement_parts(true, &mut compressor)
-            .expect("final canonical sealing");
-        assert!(chunk.sealed_replacement_parts().is_some());
     }
 
     #[test]

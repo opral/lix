@@ -241,18 +241,6 @@ fn profile_bound_update_spread() -> bool {
 /// `read_many`, `LIX_TRACKED_STATE_CRUD_PROFILE_READ_MANY_PK_COUNT` selects
 /// the setup-excluded multi-point query shape.
 fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
-    if let Ok(operation @ ("columnar_history" | "columnar_diff")) =
-        std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_OP").as_deref()
-    {
-        profile_columnar_semantic_operation(
-            runtime,
-            rows,
-            operation,
-            profile_sample_count(),
-            profile_sql_session_storage(),
-        );
-        return;
-    }
     let operation = match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_OP").as_deref() {
         Ok("insert_all") => TransactionBenchOp::InsertAll,
         Ok("read_one") => TransactionBenchOp::ReadOneByPk,
@@ -419,44 +407,6 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
             "unknown LIX_TRACKED_STATE_CRUD_PROFILE_LAYER '{other}'; expected transaction, sql_session, sql_session_bound, kv_layout, raw_sqlite, or raw_sqlite_literal"
         ),
     }
-}
-
-fn profile_columnar_semantic_operation(
-    runtime: &tokio::runtime::Runtime,
-    rows: &[WorkloadRow],
-    operation: &str,
-    sample_count: usize,
-    profile: StorageProfile,
-) {
-    let mut samples = Vec::with_capacity(sample_count);
-    for _ in 0..sample_count {
-        let fixture = runtime.block_on(sql_session::empty_fixture_with_read_many_pk_count(
-            profile,
-            rows,
-            READ_MANY_PK_COUNT.min(rows.len()),
-        ));
-        let baseline = runtime.block_on(fixture.active_commit_id());
-        runtime.block_on(fixture.insert_all());
-        let head = runtime.block_on(fixture.active_commit_id());
-        let start = Instant::now();
-        let result = match operation {
-            "columnar_history" => runtime.block_on(fixture.columnar_history_count(&head)),
-            "columnar_diff" => runtime.block_on(fixture.columnar_diff_count(&baseline, &head)),
-            _ => unreachable!("columnar semantic operation was validated"),
-        };
-        samples.push(start.elapsed());
-        black_box(result);
-    }
-    let mut sorted = samples.clone();
-    sorted.sort_unstable();
-    println!(
-        "tracked_state_crud profile: sql_session/{}/{operation}/{} samples: median={:?} min={:?} max={:?}",
-        profile.name(),
-        sample_count,
-        sorted[sorted.len() / 2],
-        sorted[0],
-        sorted[sorted.len() - 1],
-    );
 }
 
 fn profile_read_many_pk_count(operation: TransactionBenchOp, row_count: usize) -> usize {
@@ -667,26 +617,6 @@ fn profile_hot_sql_session_operations(
         repeats,
         elapsed / repeats_u32,
     );
-    if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_READ_AFTER_HOT_UPDATES").is_some()
-        && matches!(operation, TransactionBenchOp::UpdateOneByPk)
-    {
-        let _ = runtime.block_on(fixture.read_many_by_pk());
-        let mut samples = Vec::with_capacity(profile_sample_count());
-        for _ in 0..profile_sample_count() {
-            let started = Instant::now();
-            black_box(runtime.block_on(fixture.read_many_by_pk()));
-            samples.push(started.elapsed());
-        }
-        print_profile_samples(
-            &format!(
-                "sql_session/{}/warm_after_{repeats}_updates",
-                profile.name()
-            ),
-            TransactionBenchOp::ReadManyByPk,
-            read_many_pk_count,
-            samples,
-        );
-    }
     if matches!(operation, TransactionBenchOp::ReadOneByPk) {
         let cache = lix_engine::storage_bench::take_entity_point_snapshot_cache_accounting();
         println!(
@@ -1014,25 +944,13 @@ fn profile_sql_session_operation(
         };
         maybe_print_profile_rss_phase("after_seed");
         reset_allocation_accounting();
-        let _ = lix_engine::storage_bench::take_crud_current_state_scoped_range_accounting();
-        if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
-            let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
-            let _ = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
-        }
+        let _ = lix_engine::storage_bench::take_crud_sealed_manifest_loads();
         let start = Instant::now();
         let result = runtime.block_on(run_sql_session_operation(operation, &fixture));
         samples.push(start.elapsed());
         black_box(result);
         maybe_print_profile_rss_phase("after_operation");
         print_allocation_accounting("operation");
-        if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_WRITE_ACCOUNTING").is_some() {
-            let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
-            let manifest_bytes = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
-            println!(
-                "tracked_state_crud write accounting: staged_puts={} staged_deletes={} staged_value_bytes={} commit_state_manifest_value_bytes={}",
-                physical.puts, physical.deletes, physical.written_bytes, manifest_bytes,
-            );
-        }
     }
     let profile_layer = if matches!(operation, TransactionBenchOp::ReadAll) {
         format!(
@@ -1045,16 +963,9 @@ fn profile_sql_session_operation(
     };
     print_profile_samples(&profile_layer, operation, read_many_pk_count, samples);
     if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_ROUTE_ACCOUNTING").is_some() {
-        let accounting =
-            lix_engine::storage_bench::take_crud_current_state_scoped_range_accounting();
+        let sealed_manifest_loads = lix_engine::storage_bench::take_crud_sealed_manifest_loads();
         println!(
-            "tracked_state_crud current-state scoped-range accounting: attempts={} hits={} errors={} sealed_manifest_loads={} replay_manifest_loads={} ordered_delta_fallbacks={}",
-            accounting.attempts,
-            accounting.hits,
-            accounting.errors,
-            accounting.sealed_manifest_loads,
-            accounting.replay_manifest_loads,
-            accounting.ordered_delta_fallbacks,
+            "tracked_state_crud Arrow authority accounting: sealed_manifest_loads={sealed_manifest_loads}",
         );
     }
 }
@@ -1085,7 +996,7 @@ fn profile_sql_session_bound_updates(
         reset_allocation_accounting();
         let _ = lix_engine::storage_bench::take_crud_physical_write_accounting();
         let _ = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
-        let _ = lix_engine::storage_bench::take_crud_current_state_scoped_range_fallbacks();
+        let _ = lix_engine::storage_bench::take_crud_current_state_directory_bytes();
         let _ = lix_engine::storage_bench::take_certified_entity_update_value_batch_accounting();
         let start = Instant::now();
         let result = if spread {
@@ -1103,10 +1014,10 @@ fn profile_sql_session_bound_updates(
             lix_engine::storage_bench::take_certified_entity_update_value_batch_accounting();
         let physical = lix_engine::storage_bench::take_crud_physical_write_accounting();
         let manifest_bytes = lix_engine::storage_bench::take_crud_commit_state_manifest_bytes();
-        let scoped_range_fallbacks =
-            lix_engine::storage_bench::take_crud_current_state_scoped_range_fallbacks();
+        let directory_bytes = lix_engine::storage_bench::take_crud_current_state_directory_bytes();
+        let serving_metadata_bytes = manifest_bytes + directory_bytes;
         println!(
-            "tracked_state_crud generated update accounting: logical_rows={bound_update_row_count} certificate_attempts={} certificate_hits={} certificate_misses={} certified_rows={} staged_puts={} staged_deletes={} staged_value_bytes={} commit_state_manifest_value_bytes={manifest_bytes} current_state_scoped_range_fallbacks={scoped_range_fallbacks}",
+            "tracked_state_crud generated update accounting: logical_rows={bound_update_row_count} certificate_attempts={} certificate_hits={} certificate_misses={} certified_rows={} staged_puts={} staged_deletes={} staged_value_bytes={} commit_state_manifest_value_bytes={manifest_bytes} current_state_directory_value_bytes={directory_bytes} encoded_serving_metadata_value_bytes={serving_metadata_bytes}",
             certificate.attempts,
             certificate.hits,
             certificate.misses,

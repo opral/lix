@@ -8,7 +8,9 @@
 //! file-first row index.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
@@ -19,10 +21,9 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 use tracing::Instrument as _;
 
-use crate::storage_adapter::{
-    BufferRange, DeferredFinalPutPage, DeferredFinalPutSource, EncodedMutationBatch, EncodedPut,
-    PutBatch, PutEntry,
-};
+#[cfg(test)]
+use crate::branch::BranchHeadControlContext;
+use crate::storage_adapter::{BufferRange, EncodedMutationBatch, EncodedPut};
 use crate::tracked_state::TrackedStateReadColumns;
 use crate::wasm::WasmCertifiedEntityBatch;
 
@@ -30,7 +31,6 @@ use super::*;
 
 pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v21";
 pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
-pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
 pub(crate) const HOT_COLLECTION_CONTROL_NAMESPACE: &str = "live_state.hot_collection_control.v1";
 pub(crate) const HOT_ROW_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_001b), HOT_ROW_NAMESPACE);
@@ -41,34 +41,9 @@ pub(crate) const HOT_ROW_SPACE: StorageSpace =
 /// positive after the last file member is deleted but cannot hide live rows.
 pub(crate) const HOT_FILE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_001c), HOT_FILE_NAMESPACE);
-/// Reserved for the row-level first-before working-diff index.
-pub(crate) const HOT_DIFF_SPACE: StorageSpace =
-    StorageSpace::mutable(StorageSpaceId(0x0004_001d), HOT_DIFF_NAMESPACE);
 pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::mutable(
     StorageSpaceId(0x0004_0023),
     HOT_COLLECTION_CONTROL_NAMESPACE,
-);
-/// Generation-local immutable current-state bases.
-///
-/// Each tiny record points at one already-authored packed commit delta. Fresh
-/// validated inserts publish the reference instead of duplicating every row
-/// into `HOT_ROW`; later updates and deletes remain sparse HOT overlays.
-pub(crate) const PACKED_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0024),
-    "live_state.packed_current_base.v1",
-);
-pub(crate) const PACKED_CURRENT_BASE_CONTROL_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0025),
-    "live_state.packed_current_base_control.v1",
-);
-/// Generation-local index of packed bases containing exactly one schema.
-///
-/// Complete collection replacements retire every indexed predecessor for the
-/// schema without inspecting or risking packed bases shared by unrelated
-/// schemas.
-pub(crate) const PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0027),
-    "live_state.packed_current_exclusive_schema_base.v1",
 );
 /// One immutable tracked-state root used as the baseline for a sparse branch
 /// generation. Branch creation publishes this 16-byte reference instead of
@@ -79,655 +54,8 @@ pub(crate) const ROOT_CURRENT_BASE_SPACE: StorageSpace = StorageSpace::mutable(
 );
 const HOT_DENSE_SCAN_MIN_IDENTITIES: usize = 64;
 const HOT_DENSE_SCAN_MAX_OVERREAD: usize = 2;
-const HOT_DIFF_SEGMENT_VERSION: u8 = 1;
-const HOT_DIFF_SEGMENT_HEADER_BYTES: usize = 5;
-const HOT_DIFF_SEGMENT_MAX_BYTES: usize = 256 * 1024;
-const HOT_DIFF_SEGMENT_MAX_IDENTITIES: u32 = 4_096;
-// Real-repository profiling showed that smaller batches contribute negligible
-// storage amplification, so retain their allocation-free direct-key path.
-const HOT_DIFF_PACK_MIN_IDENTITIES: usize = 64;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-const CERTIFIED_ENTITY_BATCH_MAGIC_V1: &[u8; 4] = b"CEB1";
 const CERTIFIED_ENTITY_BATCH_MAGIC_V2: &[u8; 4] = b"CEB2";
-pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_001f),
-    "live_state.certified_entity_batch.v1",
-);
-pub(crate) const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0021),
-    "live_state.certified_entity_batch_manifest.v1",
-);
-pub(crate) const CERTIFIED_ENTITY_BATCH_PAGE_SPACE: StorageSpace = StorageSpace::mutable(
-    StorageSpaceId(0x0004_0022),
-    "live_state.certified_entity_batch_page.v1",
-);
-const DEFERRED_FRESH_HOT_ROWS_PER_PAGE: usize = 4_096;
-const DEFERRED_FRESH_HOT_SPACES: [StorageSpace; 3] =
-    [HOT_ROW_SPACE, HOT_FILE_SPACE, HOT_DIFF_SPACE];
-
-pub(crate) struct DeferredFreshHotRowRef<'a> {
-    pub(crate) branch_id: &'a str,
-    pub(crate) delta: CurrentStateDeltaRef<'a>,
-}
-
-pub(crate) trait DeferredFreshHotRows: Send + Sync {
-    fn row(&self, index: usize) -> DeferredFreshHotRowRef<'_>;
-}
-
-pub(crate) struct CertifiedEntityBatchFileRef<'a> {
-    pub(crate) branch_id: &'a str,
-    pub(crate) file_id: &'a str,
-    pub(crate) batches: &'a [WasmCertifiedEntityBatch],
-}
-
-/// A certified fresh-file hot-state publication whose row owner is attached
-/// only after every other commit materializer has finished reading it.
-///
-/// Keeping this as row ordinals avoids manufacturing expanded keys and values
-/// while the prepared transaction batch is still live.
-pub(crate) struct DeferredFreshHotPlan {
-    branch_id: String,
-    generation: CommitId,
-    checkpoint_commit_id: Option<CommitId>,
-    row_indices: Vec<usize>,
-    file_schema_keys: Vec<String>,
-    put_count: u64,
-    written_bytes: u64,
-    backend_capacity_hint_bytes: usize,
-}
-
-impl DeferredFreshHotPlan {
-    pub(crate) fn new(
-        branch_id: &str,
-        generation: CommitId,
-        state_rows: &dyn DeferredFreshHotRows,
-        row_indices: &[usize],
-        certified_file_id: &str,
-        validated_absence_guards: &[TrackedStateKeyRef<'_>],
-        checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<Self, LixError> {
-        if row_indices.is_empty() {
-            return Err(head_value_error(
-                "deferred fresh hot publication has no rows",
-            ));
-        }
-        let scope = hot_scope_prefix(branch_id, generation);
-        let diff_scope = checkpoint_commit_id.map(|checkpoint_commit_id| {
-            encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation)
-        });
-        let mut next_coverage = *coverage;
-        let mut written_bytes = 0_u64;
-        let mut backend_capacity_hint_bytes = 0_usize;
-        let mut put_count = 0_u64;
-        let mut coverage_key = Vec::new();
-        let mut file_schema_keys = BTreeSet::new();
-        for &row_index in row_indices {
-            let row = state_rows.row(row_index);
-            let delta =
-                deferred_fresh_delta(row, branch_id, certified_file_id, validated_absence_guards)?;
-            delta.validate()?;
-            if delta.deleted {
-                return Err(head_value_error(
-                    "deferred fresh hot publication requires live rows",
-                ));
-            }
-            let key_len = encoded_hot_identity_key_len(
-                scope.len(),
-                delta.schema_key,
-                delta.entity_pk,
-                delta.file_id,
-            )
-            .ok_or_else(|| head_value_error("deferred fresh hot key length overflowed"))?;
-            let value_len = checked_add_hot_next_value_capacity(
-                0,
-                &delta,
-                checkpoint_commit_id.is_some(),
-                false,
-            )
-            .ok_or_else(|| head_value_error("deferred fresh hot value length overflowed"))?;
-            if delta.file_id.is_some() {
-                file_schema_keys.insert(delta.schema_key.to_owned());
-            }
-            written_bytes = written_bytes
-                .checked_add(u64::try_from(value_len).unwrap_or(u64::MAX))
-                .ok_or_else(|| head_value_error("deferred fresh hot written bytes overflowed"))?;
-            backend_capacity_hint_bytes = backend_capacity_hint_bytes
-                .checked_add(key_len)
-                .and_then(|capacity| capacity.checked_add(value_len))
-                .and_then(|capacity| capacity.checked_add(16))
-                .ok_or_else(|| {
-                    head_value_error("deferred fresh hot backend capacity overflowed")
-                })?;
-            put_count = put_count
-                .checked_add(1)
-                .ok_or_else(|| head_value_error("deferred fresh hot put count overflowed"))?;
-            if let Some(diff_scope) = diff_scope.as_deref() {
-                coverage_key.clear();
-                let range = append_hot_diff_key_parts(
-                    &mut coverage_key,
-                    diff_scope,
-                    delta.schema_key,
-                    delta.entity_pk,
-                    delta.file_id,
-                );
-                next_coverage
-                    .add_encoded_group_key(&coverage_key[range])
-                    .ok_or_else(|| {
-                        head_value_error("deferred fresh hot working-diff count overflowed")
-                    })?;
-                backend_capacity_hint_bytes = backend_capacity_hint_bytes
-                    .checked_add(coverage_key.len())
-                    .and_then(|capacity| capacity.checked_add(16))
-                    .ok_or_else(|| {
-                        head_value_error("deferred fresh hot diff capacity overflowed")
-                    })?;
-                put_count = put_count
-                    .checked_add(1)
-                    .ok_or_else(|| head_value_error("deferred fresh hot put count overflowed"))?;
-            }
-        }
-        for schema_key in &file_schema_keys {
-            let marker_len = scope
-                .len()
-                .checked_add(encoded_key_bytes_len(schema_key.as_bytes()).ok_or_else(|| {
-                    head_value_error("deferred fresh hot schema marker length overflowed")
-                })?)
-                .ok_or_else(|| {
-                    head_value_error("deferred fresh hot schema marker length overflowed")
-                })?;
-            backend_capacity_hint_bytes = backend_capacity_hint_bytes
-                .checked_add(marker_len)
-                .and_then(|capacity| capacity.checked_add(16))
-                .ok_or_else(|| {
-                    head_value_error("deferred fresh hot backend capacity overflowed")
-                })?;
-            put_count = put_count
-                .checked_add(1)
-                .ok_or_else(|| head_value_error("deferred fresh hot put count overflowed"))?;
-        }
-        *coverage = next_coverage;
-        Ok(Self {
-            branch_id: branch_id.to_owned(),
-            generation,
-            checkpoint_commit_id,
-            row_indices: row_indices.to_vec(),
-            file_schema_keys: file_schema_keys.into_iter().collect(),
-            put_count,
-            written_bytes,
-            backend_capacity_hint_bytes,
-        })
-    }
-
-    pub(crate) fn into_source(
-        self,
-        state_rows: Arc<dyn DeferredFreshHotRows>,
-    ) -> Box<dyn DeferredFinalPutSource> {
-        Box::new(DeferredFreshHotSource {
-            plan: self,
-            state_rows,
-            cursor: 0,
-            schema_markers_emitted: false,
-            pending_pages: VecDeque::new(),
-        })
-    }
-}
-
-struct DeferredFreshHotSource {
-    plan: DeferredFreshHotPlan,
-    state_rows: Arc<dyn DeferredFreshHotRows>,
-    cursor: usize,
-    schema_markers_emitted: bool,
-    pending_pages: VecDeque<DeferredFinalPutPage>,
-}
-
-impl DeferredFinalPutSource for DeferredFreshHotSource {
-    fn target_spaces(&self) -> &[StorageSpace] {
-        &DEFERRED_FRESH_HOT_SPACES
-    }
-
-    fn put_count(&self) -> u64 {
-        self.plan.put_count
-    }
-
-    fn written_bytes(&self) -> u64 {
-        self.plan.written_bytes
-    }
-
-    fn backend_capacity_hint_bytes(&self) -> usize {
-        self.plan.backend_capacity_hint_bytes
-    }
-
-    fn next_page(&mut self) -> Option<DeferredFinalPutPage> {
-        if let Some(page) = self.pending_pages.pop_front() {
-            return Some(page);
-        }
-        if !self.schema_markers_emitted {
-            self.schema_markers_emitted = true;
-            if !self.plan.file_schema_keys.is_empty() {
-                let scope = hot_scope_prefix(&self.plan.branch_id, self.plan.generation);
-                return Some(DeferredFinalPutPage {
-                    space: HOT_FILE_SPACE,
-                    entries: PutBatch {
-                        entries: self
-                            .plan
-                            .file_schema_keys
-                            .iter()
-                            .map(|schema_key| PutEntry {
-                                key: StorageKey(Bytes::from(encode_hot_file_schema_key(
-                                    &scope, schema_key,
-                                ))),
-                                value: StorageValue {
-                                    bytes: Bytes::new(),
-                                },
-                            })
-                            .collect(),
-                    },
-                });
-            }
-        }
-        if self.cursor == self.plan.row_indices.len() {
-            return None;
-        }
-        let end = self
-            .cursor
-            .saturating_add(DEFERRED_FRESH_HOT_ROWS_PER_PAGE)
-            .min(self.plan.row_indices.len());
-        let indices = &self.plan.row_indices[self.cursor..end];
-        self.cursor = end;
-        let scope = hot_scope_prefix(&self.plan.branch_id, self.plan.generation);
-        let diff_scope = self.plan.checkpoint_commit_id.map(|checkpoint_commit_id| {
-            encode_working_diff_scope_prefix(
-                &self.plan.branch_id,
-                checkpoint_commit_id,
-                self.plan.generation,
-            )
-        });
-        let mut key_capacity = 0_usize;
-        let mut value_capacity = 0_usize;
-        for &row_index in indices {
-            let delta = self.state_rows.row(row_index).delta;
-            key_capacity = key_capacity.saturating_add(
-                encoded_hot_identity_key_len(
-                    scope.len(),
-                    delta.schema_key,
-                    delta.entity_pk,
-                    delta.file_id,
-                )
-                .unwrap_or(0),
-            );
-            if let Some(diff_scope) = diff_scope.as_deref() {
-                key_capacity = key_capacity.saturating_add(
-                    encoded_hot_identity_key_len(
-                        diff_scope.len(),
-                        delta.schema_key,
-                        delta.entity_pk,
-                        delta.file_id,
-                    )
-                    .unwrap_or(0),
-                );
-            }
-            value_capacity = checked_add_hot_next_value_capacity(
-                value_capacity,
-                &delta,
-                self.plan.checkpoint_commit_id.is_some(),
-                false,
-            )
-            .unwrap_or(0);
-        }
-        let mut key_bytes = Vec::with_capacity(key_capacity);
-        let mut value_bytes = Vec::with_capacity(value_capacity);
-        let mut key_ranges = Vec::with_capacity(indices.len());
-        let mut value_ranges = Vec::with_capacity(indices.len());
-        let mut diff_key_ranges =
-            Vec::with_capacity(diff_scope.as_ref().map_or(0, |_| indices.len()));
-        for &row_index in indices {
-            let delta = self.state_rows.row(row_index).delta;
-            key_ranges.push(append_hot_mutation_identity(&mut key_bytes, &scope, &delta));
-            value_ranges.push(
-                append_head_value(
-                    &mut value_bytes,
-                    &delta.value_ref(
-                        delta.created_at,
-                        if let Some(checkpoint_commit_id) = self.plan.checkpoint_commit_id {
-                            WorkingDiffBaseline::BeforeAbsent {
-                                checkpoint_commit_id,
-                            }
-                        } else {
-                            WorkingDiffBaseline::Disabled
-                        },
-                    ),
-                )
-                .expect("deferred fresh hot rows were validated before staging"),
-            );
-            if let Some(diff_scope) = diff_scope.as_deref() {
-                diff_key_ranges.push(append_hot_diff_key_parts(
-                    &mut key_bytes,
-                    diff_scope,
-                    delta.schema_key,
-                    delta.entity_pk,
-                    delta.file_id,
-                ));
-            }
-        }
-        let key_bytes = Bytes::from(key_bytes);
-        let value_bytes = Bytes::from(value_bytes);
-        let mut row_entries = Vec::with_capacity(indices.len());
-        for (identity, value) in key_ranges.into_iter().zip(value_ranges) {
-            let value = StorageValue {
-                bytes: value_bytes.slice(value.clone()),
-            };
-            row_entries.push(PutEntry {
-                key: StorageKey(key_bytes.slice(
-                    identity.row_key.offset()..identity.row_key.offset() + identity.row_key.len(),
-                )),
-                value: value.clone(),
-            });
-        }
-        if !diff_key_ranges.is_empty() {
-            self.pending_pages.push_back(DeferredFinalPutPage {
-                space: HOT_DIFF_SPACE,
-                entries: PutBatch {
-                    entries: diff_key_ranges
-                        .into_iter()
-                        .map(|key| PutEntry {
-                            key: StorageKey(key_bytes.slice(key)),
-                            value: StorageValue {
-                                bytes: Bytes::new(),
-                            },
-                        })
-                        .collect(),
-                },
-            });
-        }
-        Some(DeferredFinalPutPage {
-            space: HOT_ROW_SPACE,
-            entries: PutBatch {
-                entries: row_entries,
-            },
-        })
-    }
-}
-
-fn deferred_fresh_delta<'a>(
-    row: DeferredFreshHotRowRef<'a>,
-    branch_id: &str,
-    certified_file_id: &str,
-    validated_absence_guards: &[TrackedStateKeyRef<'_>],
-) -> Result<CurrentStateDeltaRef<'a>, LixError> {
-    let delta = row.delta;
-    let file_is_certified = delta.file_id == Some(certified_file_id);
-    let identity_is_guarded = validated_absence_guards
-        .binary_search_by(|guard| {
-            guard
-                .schema_key
-                .cmp(delta.schema_key)
-                .then_with(|| guard.entity_pk.cmp(delta.entity_pk))
-                .then_with(|| guard.file_id.cmp(&delta.file_id))
-        })
-        .is_ok();
-    if row.branch_id != branch_id || (!file_is_certified && !identity_is_guarded) || delta.untracked
-    {
-        return Err(head_value_error(
-            "deferred fresh hot row escaped its certified or guarded identity scope",
-        ));
-    }
-    if delta.commit_id.is_none() || delta.change_id.is_none() {
-        return Err(head_value_error(
-            "deferred fresh hot tracked row is missing commit identity",
-        ));
-    }
-    Ok(delta)
-}
-
-/// Publishes one immutable semantic owner per certified file batch.
-///
-/// The storage value is the authority for the batch rows. Current-state and
-/// history readers decode rows lazily; later sparse mutations remain ordinary
-/// hot rows and therefore form overlays instead of rewriting this value.
-pub(crate) async fn stage_certified_entity_batches(
-    read: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    file_writes: &[CertifiedEntityBatchFileRef<'_>],
-    controls: &BTreeMap<String, BranchHeadControl>,
-    observations: &BTreeMap<String, crate::branch::BranchHeadControlObservation>,
-    commit_created_at: &BTreeMap<CommitId, LixTimestamp>,
-    root_backed_branch_publications: &BTreeSet<String>,
-) -> Result<(), LixError> {
-    let mut content_owners = BTreeSet::new();
-    for file in file_writes {
-        for batch in file.batches {
-            if !content_owners.insert((file.branch_id, file.file_id, batch.format)) {
-                return Err(head_value_error(format!(
-                    "certified entity batches duplicate branch '{}', file '{}', format {}",
-                    file.branch_id, file.file_id, batch.format
-                )));
-            }
-        }
-    }
-    let mut complete_manifest_suffixes = BTreeMap::<String, Vec<Vec<u8>>>::new();
-    for file in file_writes {
-        for batch in file
-            .batches
-            .iter()
-            .filter(|batch| batch.complete_file_state)
-        {
-            let mut suffix = Vec::new();
-            append_batch_text(&mut suffix, file.file_id)?;
-            suffix.extend_from_slice(&batch.format.to_le_bytes());
-            complete_manifest_suffixes
-                .entry(file.branch_id.to_owned())
-                .or_default()
-                .push(suffix);
-        }
-    }
-
-    let needs_branch_creation_donor = controls.keys().any(|branch_id| {
-        !root_backed_branch_publications.contains(branch_id)
-            && observations
-                .get(branch_id)
-                .is_none_or(|observation| observation.control.is_none())
-    });
-    let durable_controls = if needs_branch_creation_donor {
-        BranchHeadControlContext::new().reader(read).scan().await?
-    } else {
-        Vec::new()
-    };
-
-    let mut inherited_manifests = BTreeMap::new();
-    for (branch_id, control) in controls {
-        if root_backed_branch_publications.contains(branch_id) {
-            continue;
-        }
-        let source_generations = observations
-            .get(branch_id)
-            .and_then(|observation| observation.control)
-            .map(|previous| BTreeSet::from([previous.generation]))
-            .unwrap_or_else(|| {
-                durable_controls
-                    .iter()
-                    .filter(|(_, candidate)| candidate.head_commit_id == control.head_commit_id)
-                    .map(|(_, candidate)| candidate.generation)
-                    .collect()
-            });
-        for source_generation in source_generations
-            .into_iter()
-            .filter(|generation| *generation != control.generation)
-        {
-            let previous_prefix = source_generation.as_uuid().as_bytes().to_vec();
-            let manifests = ScanPlan::prefix(
-                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-                StoragePrefix {
-                    bytes: Bytes::from(previous_prefix.clone()),
-                },
-            )
-            .collect(read, StorageScanOptions::default())
-            .await?;
-            for entry in manifests.value.entries {
-                let suffix = entry
-                    .key
-                    .0
-                    .get(previous_prefix.len()..)
-                    .ok_or_else(|| head_value_error("truncated certified manifest key"))?;
-                if complete_manifest_suffixes
-                    .get(branch_id)
-                    .is_some_and(|prefixes| {
-                        prefixes.iter().any(|prefix| suffix.starts_with(prefix))
-                    })
-                {
-                    continue;
-                }
-                let mut key = control.generation.as_uuid().as_bytes().to_vec();
-                key.extend_from_slice(suffix);
-                let value = full_value_bytes(entry.value)?;
-                match inherited_manifests.entry(key) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(value);
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry)
-                        if entry.get() == &value => {}
-                    std::collections::btree_map::Entry::Occupied(_) => {
-                        return Err(head_value_error(
-                            "certified manifests disagree for the same inherited key",
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    for (key, value) in inherited_manifests {
-        writes.put(
-            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-            StorageKey(Bytes::from(key)),
-            StorageValue { bytes: value },
-        );
-    }
-
-    for file in file_writes {
-        if file.batches.is_empty() {
-            continue;
-        }
-        let control = controls.get(file.branch_id).ok_or_else(|| {
-            head_value_error("certified entity batch has no published branch control")
-        })?;
-        let created_at = commit_created_at
-            .get(&control.head_commit_id)
-            .copied()
-            .ok_or_else(|| head_value_error("certified entity batch has no commit timestamp"))?;
-        for batch in file.batches {
-            if batch.complete_file_state {
-                let mut manifest_prefix = control.generation.as_uuid().as_bytes().to_vec();
-                append_batch_text(&mut manifest_prefix, file.file_id)?;
-                manifest_prefix.extend_from_slice(&batch.format.to_le_bytes());
-                let prior_manifests = ScanPlan::prefix(
-                    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-                    StoragePrefix {
-                        bytes: Bytes::from(manifest_prefix),
-                    },
-                )
-                .collect(read, StorageScanOptions::default())
-                .await?;
-                for entry in prior_manifests.value.entries {
-                    writes.delete(CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, entry.key);
-                }
-            }
-            let mut content_key = control.head_commit_id.as_uuid().as_bytes().to_vec();
-            append_batch_text(&mut content_key, file.file_id)?;
-            content_key.extend_from_slice(&batch.format.to_le_bytes());
-
-            let schema_bytes = batch
-                .schema_keys
-                .iter()
-                .try_fold(2usize, |total, schema| total.checked_add(2 + schema.len()))
-                .ok_or_else(|| head_value_error("certified schema list size overflowed"))?;
-            let mut value = Vec::with_capacity(
-                4 + schema_bytes
-                    + 2
-                    + file.file_id.len()
-                    + 16
-                    + 2
-                    + created_at.to_string().len()
-                    + 2
-                    + 8
-                    + 8
-                    + 4
-                    + 4
-                    + batch.pages.len().saturating_mul(12),
-            );
-            value.extend_from_slice(CERTIFIED_ENTITY_BATCH_MAGIC_V2);
-            value.extend_from_slice(
-                &u16::try_from(batch.schema_keys.len())
-                    .map_err(|_| head_value_error("certified batch has too many schemas"))?
-                    .to_le_bytes(),
-            );
-            for schema_key in &batch.schema_keys {
-                append_batch_text(&mut value, schema_key)?;
-            }
-            append_batch_text(&mut value, file.file_id)?;
-            value.extend_from_slice(control.head_commit_id.as_uuid().as_bytes());
-            append_batch_text(&mut value, &created_at.to_string())?;
-            value.extend_from_slice(&batch.format.to_le_bytes());
-            value.extend_from_slice(&batch.row_count.to_le_bytes());
-            value.extend_from_slice(&batch.creates.high.to_le_bytes());
-            value.extend_from_slice(&batch.creates.low.to_le_bytes());
-            value.extend_from_slice(
-                &u32::try_from(batch.pages.len())
-                    .map_err(|_| head_value_error("certified entity batch has too many pages"))?
-                    .to_le_bytes(),
-            );
-            for (page_index, page) in batch.pages.iter().enumerate() {
-                let (first_local_ref, last_local_ref) = match batch.format {
-                    1 => certified_schema_row_page_local_ref_range(page)?,
-                    2 | crate::wasm::HOST_CERTIFIED_PACKET_FORMAT => {
-                        certified_packet_page_local_ref_range(page)?.unwrap_or((0, u32::MAX))
-                    }
-                    crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT => {
-                        certified_zstd_packet_page_header(page)?.0
-                    }
-                    _ => (0, u32::MAX),
-                };
-                value.extend_from_slice(&first_local_ref.to_le_bytes());
-                value.extend_from_slice(&last_local_ref.to_le_bytes());
-                value.extend_from_slice(
-                    &u32::try_from(page.len())
-                        .map_err(|_| head_value_error("certified entity batch page exceeds 4GiB"))?
-                        .to_le_bytes(),
-                );
-                writes.put(
-                    CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
-                    certified_entity_batch_page_key(
-                        &content_key,
-                        u32::try_from(page_index).map_err(|_| {
-                            head_value_error("certified entity batch has too many pages")
-                        })?,
-                    ),
-                    StorageValue {
-                        bytes: page.clone(),
-                    },
-                );
-            }
-            writes.put(
-                CERTIFIED_ENTITY_BATCH_SPACE,
-                StorageKey(Bytes::from(content_key.clone())),
-                StorageValue {
-                    bytes: Bytes::from(value),
-                },
-            );
-            let mut manifest_key = control.generation.as_uuid().as_bytes().to_vec();
-            append_batch_text(&mut manifest_key, file.file_id)?;
-            manifest_key.extend_from_slice(&batch.format.to_le_bytes());
-            manifest_key.extend_from_slice(control.head_commit_id.as_uuid().as_bytes());
-            writes.put(
-                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-                StorageKey(Bytes::from(manifest_key)),
-                StorageValue {
-                    bytes: Bytes::from(content_key),
-                },
-            );
-        }
-    }
-    Ok(())
-}
 
 fn append_batch_text(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
     output.extend_from_slice(
@@ -737,87 +65,6 @@ fn append_batch_text(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> 
     );
     output.extend_from_slice(value.as_bytes());
     Ok(())
-}
-
-fn certified_entity_batch_page_key(content_key: &[u8], page_index: u32) -> StorageKey {
-    let mut key = Vec::with_capacity(content_key.len() + 4);
-    key.extend_from_slice(content_key);
-    key.extend_from_slice(&page_index.to_be_bytes());
-    StorageKey(Bytes::from(key))
-}
-
-fn certified_schema_row_page_local_ref_range(page: &[u8]) -> Result<(u32, u32), LixError> {
-    let page = lix_plugin_wire::Page::decode(page)
-        .map_err(|error| head_value_error(format!("invalid certified entity page: {error:?}")))?;
-    let section = page.section().map_err(|error| {
-        head_value_error(format!("invalid certified entity-page section: {error:?}"))
-    })?;
-    if section.representation != lix_plugin_wire::Representation::SchemaRows
-        || section.operation != lix_plugin_wire::Operation::Create
-    {
-        return Err(head_value_error(
-            "certified schema-row entity page must contain created rows",
-        ));
-    }
-    let layout = lix_plugin_layout::CompiledLayout::parse(section.layout)
-        .map_err(|error| head_value_error(format!("invalid schema-row layout: {error}")))?;
-    let mut rows = layout
-        .rows(section.payload, section.record_count)
-        .map_err(|error| head_value_error(format!("invalid schema-row payload: {error}")))?;
-    let mut first = None;
-    let mut last = None;
-    while let Some(local_ref) = rows
-        .validate_next()
-        .map_err(|error| head_value_error(format!("invalid schema row: {error}")))?
-    {
-        let local_ref = u32::try_from(local_ref)
-            .map_err(|_| head_value_error("schema-row local reference exceeds u32"))?;
-        if last.is_some_and(|previous| local_ref != previous + 1) {
-            return Err(head_value_error(
-                "schema-row local references are not contiguous and increasing",
-            ));
-        }
-        first.get_or_insert(local_ref);
-        last = Some(local_ref);
-    }
-    rows.finish()
-        .map_err(|error| head_value_error(format!("invalid schema-row payload: {error}")))?;
-    first
-        .zip(last)
-        .ok_or_else(|| head_value_error("certified schema-row page is empty"))
-}
-
-/// Returns an ordinal range only when every packet row is a keyless create
-/// and those local references are strictly increasing. A keyed or mixed page
-/// remains conservatively unindexed.
-fn certified_packet_page_local_ref_range(page: &[u8]) -> Result<Option<(u32, u32)>, LixError> {
-    let mut rows = CertifiedPacketReader {
-        bytes: page,
-        offset: 0,
-    };
-    let mut first = None;
-    let mut last = None;
-    while rows.offset < rows.bytes.len() {
-        let record_len = rows.u32()? as usize;
-        let record_bytes = rows.bytes(record_len)?;
-        let mut record = CertifiedPacketReader {
-            bytes: record_bytes,
-            offset: 0,
-        };
-        if record.u8()? != 2 {
-            return Ok(None);
-        }
-        let schema_len = record.u32()? as usize;
-        let _schema = record.bytes(schema_len)?;
-        let local_ref = u32::try_from(record.u64()?)
-            .map_err(|_| head_value_error("certified packet local reference exceeds u32"))?;
-        if last.is_some_and(|previous| previous >= local_ref) {
-            return Ok(None);
-        }
-        first.get_or_insert(local_ref);
-        last = Some(local_ref);
-    }
-    Ok(first.zip(last))
 }
 
 fn certified_zstd_packet_page_header(page: &[u8]) -> Result<((u32, u32), usize, &[u8]), LixError> {
@@ -871,349 +118,6 @@ fn decode_certified_zstd_packet_page(page: &[u8]) -> Result<Vec<u8>, LixError> {
         )));
     }
     Ok(decoded)
-}
-
-fn certified_external_page_plan(
-    bytes: &[u8],
-    content_key: &[u8],
-    request: &TrackedStateScanRequest,
-    filter_index: &CertifiedScanFilterIndex,
-) -> Result<Option<Vec<(u32, StorageKey)>>, LixError> {
-    let mut input = CertifiedBatchReader::new(bytes)?;
-    if !input.external_pages {
-        return Ok(None);
-    }
-    let schema_count = input.u16()? as usize;
-    let mut schema_keys = Vec::with_capacity(schema_count);
-    for _ in 0..schema_count {
-        schema_keys.push(input.text()?);
-    }
-    let file_id = input.text()?;
-    if !filter_index.includes_any_schema(&schema_keys) {
-        return Ok(Some(Vec::new()));
-    }
-    if !filter_index.includes_file(file_id) {
-        return Ok(Some(Vec::new()));
-    }
-    let _commit_id = input.bytes(16)?;
-    let _timestamp = input.text()?;
-    let format = input.u16()?;
-    let _declared_rows = input.u64()?;
-    let creates = WasmCreateContext {
-        high: input.u64()?,
-        low: input.u32()?,
-    };
-    let selected_local_refs = ((format == 1
-        || format == 2
-        || format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
-        || format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT)
-        && !request.filter.entity_pks.is_empty())
-    .then(|| {
-        let high = creates.high.to_be_bytes();
-        let low = creates.low.to_be_bytes();
-        request
-            .filter
-            .entity_pks
-            .iter()
-            .map(|entity_pk| match entity_pk.components.as_slice() {
-                [crate::entity_pk::EntityPkComponent::Uuid(bytes)]
-                    if bytes[..8] == high && bytes[8..12] == low =>
-                {
-                    Ok(u32::from_be_bytes(
-                        bytes[12..]
-                            .try_into()
-                            .expect("UUID local-reference suffix is four bytes"),
-                    ))
-                }
-                _ => Err(()),
-            })
-            .collect::<Result<BTreeSet<_>, _>>()
-            .ok()
-    })
-    .flatten();
-    let page_count = input.u32()?;
-    let mut pages = Vec::with_capacity(page_count as usize);
-    for page_index in 0..page_count {
-        let first_local_ref = input.u32()?;
-        let last_local_ref = input.u32()?;
-        let _page_len = input.u32()?;
-        let selected = selected_local_refs.as_ref().is_none_or(|local_refs| {
-            local_refs
-                .range(first_local_ref..=last_local_ref)
-                .next()
-                .is_some()
-        });
-        if selected {
-            pages.push((
-                page_index,
-                certified_entity_batch_page_key(content_key, page_index),
-            ));
-        }
-    }
-    if input.offset != input.bytes.len() {
-        return Err(head_value_error(
-            "certified entity batch header has trailing bytes",
-        ));
-    }
-    Ok(Some(pages))
-}
-
-async fn scan_certified_entity_batch_rows(
-    store: &impl StorageAdapterRead,
-    branch_id: &str,
-    generation: CommitId,
-    request: &TrackedStateScanRequest,
-    limit: Option<usize>,
-    transaction_cache: Option<&HotStateTransactionCache>,
-) -> Result<MaterializedLiveStateBatch, LixError> {
-    if matches!(limit, Some(0)) {
-        return Ok(MaterializedLiveStateBatch::default());
-    }
-    let exact_file_ids = (!request.filter.file_ids.is_empty()
-        && !request
-            .filter
-            .file_ids
-            .iter()
-            .any(|file_id| matches!(file_id, NullableKeyFilter::Any)))
-    .then(|| {
-        request
-            .filter
-            .file_ids
-            .iter()
-            .filter_map(|file_id| match file_id {
-                NullableKeyFilter::Value(file_id) => Some(file_id.as_str()),
-                NullableKeyFilter::Any | NullableKeyFilter::Null => None,
-            })
-            .collect::<BTreeSet<_>>()
-    });
-    if exact_file_ids.is_none()
-        && let Some(cache) = transaction_cache
-        && cache.certified_generation_absent(generation)?
-    {
-        return Ok(MaterializedLiveStateBatch::default());
-    }
-    let mut manifest_entries = Vec::new();
-    if let Some(file_ids) = exact_file_ids.as_ref() {
-        for file_id in file_ids {
-            let mut prefix = generation.as_uuid().as_bytes().to_vec();
-            append_batch_text(&mut prefix, file_id)?;
-            let manifests = ScanPlan::prefix(
-                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-                StoragePrefix {
-                    bytes: Bytes::from(prefix),
-                },
-            )
-            .collect(store, StorageScanOptions::default())
-            .await?;
-            manifest_entries.extend(manifests.value.entries);
-        }
-    } else {
-        let manifests = ScanPlan::prefix(
-            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-            StoragePrefix {
-                bytes: Bytes::copy_from_slice(generation.as_uuid().as_bytes()),
-            },
-        )
-        .collect(store, StorageScanOptions::default())
-        .await?;
-        manifest_entries = manifests.value.entries;
-    }
-    if exact_file_ids.is_none() && manifest_entries.is_empty() {
-        if let Some(cache) = transaction_cache {
-            cache.remember_certified_generation_absent(generation)?;
-        }
-        return Ok(MaterializedLiveStateBatch::default());
-    }
-    let content_keys = manifest_entries
-        .into_iter()
-        .map(|entry| full_value_bytes(entry.value).map(StorageKey))
-        .collect::<Result<Vec<_>, _>>()?;
-    let contents = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_SPACE, &content_keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?
-        .value;
-    let content_count = contents.iter().flatten().count();
-    let decode_limit = (content_count <= 1).then_some(limit).flatten();
-    let needs_snapshot = request.read_columns.columns.is_empty()
-        || request
-            .read_columns
-            .columns
-            .iter()
-            .any(|column| column == "snapshot_content");
-    let filter_index = CertifiedScanFilterIndex::new(request);
-    let mut decode_inputs = Vec::with_capacity(content_keys.len());
-    let mut page_routes = Vec::new();
-    let mut page_keys = Vec::new();
-    for (content_key, value) in content_keys.into_iter().zip(contents) {
-        let Some(value) = value else {
-            continue;
-        };
-        let value = full_value_bytes(value)?;
-        let external_plan =
-            certified_external_page_plan(&value, content_key.0.as_ref(), request, &filter_index)?;
-        let input_index = decode_inputs.len();
-        let external_pages = external_plan
-            .as_ref()
-            .map(|plan| Vec::with_capacity(plan.len()));
-        if let Some(plan) = external_plan {
-            for (page_index, key) in plan {
-                page_routes.push((input_index, page_index));
-                page_keys.push(key);
-            }
-        }
-        decode_inputs.push((value, external_pages));
-    }
-    if !page_keys.is_empty() {
-        let page_values = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_PAGE_SPACE, &page_keys)
-            .materialize(store, StorageGetOptions::default())
-            .await?
-            .value;
-        for ((input_index, page_index), value) in page_routes.into_iter().zip(page_values) {
-            let value =
-                value.ok_or_else(|| head_value_error("certified entity batch page is missing"))?;
-            decode_inputs[input_index]
-                .1
-                .as_mut()
-                .expect("external page route belongs to an external batch")
-                .push((page_index, full_value_bytes(value)?));
-        }
-    }
-    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(
-        limit.unwrap_or_else(|| decode_inputs.len().saturating_mul(1024)),
-    );
-    for (value, external_pages) in decode_inputs {
-        decode_certified_entity_batch_rows(
-            &value,
-            external_pages.as_deref(),
-            branch_id,
-            request,
-            &filter_index,
-            needs_snapshot,
-            decode_limit,
-            &mut builder,
-        )?;
-        if decode_limit.is_some_and(|limit| builder.len() >= limit) {
-            break;
-        }
-    }
-    let batch = builder.finish();
-    if content_count <= 1 {
-        return Ok(batch);
-    }
-    let mut winners = BTreeMap::new();
-    for row in batch.into_rows() {
-        let key = (
-            row.schema_key.clone(),
-            row.entity_pk.clone(),
-            row.file_id.clone(),
-        );
-        match winners.entry(key) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(row);
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry)
-                if entry.get().updated_at <= row.updated_at =>
-            {
-                entry.insert(row);
-            }
-            std::collections::btree_map::Entry::Occupied(_) => {}
-        }
-    }
-    let mut rows = MaterializedLiveStateBatch::from_rows(winners.into_values().collect());
-    if let Some(limit) = limit {
-        rows = rows.filter(|_| true, Some(limit));
-    }
-    Ok(rows)
-}
-
-pub(crate) async fn scan_certified_history_rows(
-    store: &(impl StorageAdapterRead + ?Sized),
-    commit_ids: &BTreeSet<CommitId>,
-    request: &TrackedStateScanRequest,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-    if commit_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let needs_snapshot = request
-        .read_columns
-        .columns
-        .iter()
-        .any(|column| column == "snapshot_content");
-    let filter_index = CertifiedScanFilterIndex::new(request);
-    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(commit_ids.len() * 1024);
-    for commit_id in commit_ids {
-        let plan = ScanPlan::prefix(
-            CERTIFIED_ENTITY_BATCH_SPACE,
-            StoragePrefix {
-                bytes: Bytes::copy_from_slice(commit_id.as_uuid().as_bytes()),
-            },
-        );
-        let mut resume_after = None;
-        loop {
-            let page = plan
-                .collect(
-                    store,
-                    StorageScanOptions {
-                        resume_after,
-                        ..StorageScanOptions::default()
-                    },
-                )
-                .await?;
-            let has_more = page.value.has_more;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-            for entry in page.value.entries {
-                let value = full_value_bytes(entry.value)?;
-                if certified_batch_commit_id(&value)? != *commit_id {
-                    continue;
-                }
-                let external_plan = certified_external_page_plan(
-                    &value,
-                    entry.key.0.as_ref(),
-                    request,
-                    &filter_index,
-                )?;
-                let external_pages = if let Some(plan) = &external_plan {
-                    let keys = plan.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
-                    let values = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_PAGE_SPACE, &keys)
-                        .materialize(store, StorageGetOptions::default())
-                        .await?
-                        .value;
-                    Some(
-                        plan.iter()
-                            .zip(values)
-                            .map(|((page_index, _), value)| {
-                                let value = value.ok_or_else(|| {
-                                    head_value_error("certified history batch page is missing")
-                                })?;
-                                Ok((*page_index, full_value_bytes(value)?))
-                            })
-                            .collect::<Result<Vec<_>, LixError>>()?,
-                    )
-                } else {
-                    None
-                };
-                decode_certified_entity_batch_rows(
-                    &value,
-                    external_pages.as_deref(),
-                    "",
-                    request,
-                    &filter_index,
-                    needs_snapshot,
-                    None,
-                    &mut builder,
-                )?;
-            }
-            if !has_more {
-                break;
-            }
-            if resume_after.is_none() {
-                return Err(head_value_error(
-                    "certified history scan reported more rows without a resume key",
-                ));
-            }
-        }
-    }
-    Ok(builder.finish().into_rows())
 }
 
 /// Expands the authoritative rows needed to publish a host-produced packet.
@@ -1293,19 +197,6 @@ pub(crate) fn materialize_certified_root_rows(
         &mut builder,
     )?;
     Ok(builder.finish())
-}
-
-fn certified_batch_commit_id(bytes: &[u8]) -> Result<CommitId, LixError> {
-    let mut input = CertifiedBatchReader::new(bytes)?;
-    let schema_count = input.u16()? as usize;
-    for _ in 0..schema_count {
-        let _ = input.text()?;
-    }
-    let _ = input.text()?;
-    Ok(CommitId::new(
-        uuid::Uuid::from_slice(input.bytes(16)?)
-            .map_err(|error| head_value_error(format!("invalid certified commit id: {error}")))?,
-    ))
 }
 
 struct CertifiedScanFilterIndex {
@@ -1445,32 +336,26 @@ fn decode_certified_entity_batch_rows(
         return Ok(());
     }
 
-    let complete_pages = !input.external_pages
-        || external_pages.is_some_and(|pages| pages.len() == page_count as usize);
+    let complete_pages = external_pages.is_some_and(|pages| pages.len() == page_count as usize);
     let mut decoded_rows = 0_u64;
     for page_index in 0..page_count {
-        let page = if input.external_pages {
-            let _first_local_ref = input.u32()?;
-            let _last_local_ref = input.u32()?;
-            let page_len = input.u32()? as usize;
-            let Some((_, page)) = external_pages.and_then(|pages| {
-                pages
-                    .binary_search_by_key(&page_index, |(page_index, _)| *page_index)
-                    .ok()
-                    .map(|index| &pages[index])
-            }) else {
-                continue;
-            };
-            if page.len() != page_len {
-                return Err(head_value_error(
-                    "certified entity batch page length does not match its header",
-                ));
-            }
-            page.as_ref()
-        } else {
-            let page_len = input.u32()? as usize;
-            input.bytes(page_len)?
+        let _first_local_ref = input.u32()?;
+        let _last_local_ref = input.u32()?;
+        let page_len = input.u32()? as usize;
+        let Some((_, page)) = external_pages.and_then(|pages| {
+            pages
+                .binary_search_by_key(&page_index, |(page_index, _)| *page_index)
+                .ok()
+                .map(|index| &pages[index])
+        }) else {
+            continue;
         };
+        if page.len() != page_len {
+            return Err(head_value_error(
+                "certified entity batch page length does not match its header",
+            ));
+        }
+        let page = page.as_ref();
         let decoded_page;
         let page = if format == crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT {
             decoded_page = decode_certified_zstd_packet_page(page)?;
@@ -1758,23 +643,16 @@ fn certified_keyed_change_id(
 struct CertifiedBatchReader<'a> {
     bytes: &'a [u8],
     offset: usize,
-    external_pages: bool,
 }
 
 impl<'a> CertifiedBatchReader<'a> {
     fn new(bytes: &'a [u8]) -> Result<Self, LixError> {
-        let external_pages = if bytes.starts_with(CERTIFIED_ENTITY_BATCH_MAGIC_V1) {
-            false
-        } else if bytes.starts_with(CERTIFIED_ENTITY_BATCH_MAGIC_V2) {
-            true
-        } else {
-            return Err(head_value_error("invalid certified entity batch magic"));
-        };
-        Ok(Self {
-            bytes,
-            offset: 4,
-            external_pages,
-        })
+        if !bytes.starts_with(CERTIFIED_ENTITY_BATCH_MAGIC_V2) {
+            return Err(head_value_error(
+                "unsupported certified entity batch format; recreate the repository",
+            ));
+        }
+        Ok(Self { bytes, offset: 4 })
     }
 
     fn bytes(&mut self, length: usize) -> Result<&'a [u8], LixError> {
@@ -1867,7 +745,6 @@ struct HotCollectionControl {
 const DEFERRED_ROOT_LIVE_COUNT: u64 = crate::collection_generation::DEFERRED_LIVE_COUNT;
 
 const TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES: usize = 64;
-const TRANSACTION_PACKED_POINT_CACHE_MIN_OBSERVATIONS: u8 = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct HotCollectionCacheKey {
@@ -1881,62 +758,9 @@ struct HotCollectionCacheKey {
 #[derive(Default)]
 pub(crate) struct HotStateTransactionCache {
     collection_controls: StdMutex<BTreeMap<HotCollectionCacheKey, HotCollectionControl>>,
-    certified_absent_generations: StdMutex<BTreeSet<CommitId>>,
-    packed_point_generation_observations: StdMutex<SmallVec<[(CommitId, u8); 4]>>,
-    packed_current_base_refs: StdMutex<BTreeMap<(String, CommitId), Vec<PackedCurrentBaseRef>>>,
-    commit_delta_points: crate::tracked_state::CommitDeltaPointReadCache,
 }
 
 impl HotStateTransactionCache {
-    fn should_reuse_packed_points(&self, generation: CommitId) -> Result<bool, LixError> {
-        let mut generations = self
-            .packed_point_generation_observations
-            .lock()
-            .map_err(|_| hot_state_cache_lock_error())?;
-        if let Some((_, observations)) = generations
-            .iter_mut()
-            .find(|(candidate, _)| *candidate == generation)
-        {
-            *observations = observations.saturating_add(1);
-            return Ok(*observations >= TRANSACTION_PACKED_POINT_CACHE_MIN_OBSERVATIONS);
-        }
-        if generations.len() < TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES {
-            generations.push((generation, 1));
-        }
-        Ok(false)
-    }
-
-    fn packed_current_base_refs(
-        &self,
-        branch_id: &str,
-        generation: CommitId,
-    ) -> Result<Option<Vec<PackedCurrentBaseRef>>, LixError> {
-        Ok(self
-            .packed_current_base_refs
-            .lock()
-            .map_err(|_| hot_state_cache_lock_error())?
-            .get(&(branch_id.to_owned(), generation))
-            .cloned())
-    }
-
-    fn remember_packed_current_base_refs(
-        &self,
-        branch_id: &str,
-        generation: CommitId,
-        refs: &[PackedCurrentBaseRef],
-    ) -> Result<(), LixError> {
-        let mut entries = self
-            .packed_current_base_refs
-            .lock()
-            .map_err(|_| hot_state_cache_lock_error())?;
-        if entries.len() < TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES {
-            entries
-                .entry((branch_id.to_owned(), generation))
-                .or_insert_with(|| refs.to_vec());
-        }
-        Ok(())
-    }
-
     fn collection_control(
         &self,
         key: &HotCollectionCacheKey,
@@ -1963,61 +787,6 @@ impl HotStateTransactionCache {
         }
         Ok(())
     }
-
-    fn certified_generation_absent(&self, generation: CommitId) -> Result<bool, LixError> {
-        Ok(self
-            .certified_absent_generations
-            .lock()
-            .map_err(|_| hot_state_cache_lock_error())?
-            .contains(&generation))
-    }
-
-    fn remember_certified_generation_absent(&self, generation: CommitId) -> Result<(), LixError> {
-        let mut entries = self
-            .certified_absent_generations
-            .lock()
-            .map_err(|_| hot_state_cache_lock_error())?;
-        if entries.len() < TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES {
-            entries.insert(generation);
-        }
-        Ok(())
-    }
-}
-
-pub(crate) struct PackedIdentityMembership {
-    cache: Arc<HotStateTransactionCache>,
-    cursor: crate::tracked_state::CommitDeltaLiveMembershipCursor,
-    schema_key: String,
-    live_count: u64,
-    ordered_identity_digest: [u8; 32],
-    encoded_key: Vec<u8>,
-}
-
-impl PackedIdentityMembership {
-    pub(crate) async fn contains_single_string(
-        &mut self,
-        store: &(impl StorageAdapterRead + ?Sized),
-        entity_pk: &str,
-    ) -> Result<Option<bool>, LixError> {
-        self.encoded_key.clear();
-        let encoded = crate::tracked_state::encode_single_string_key_ref_into(
-            &mut self.encoded_key,
-            &self.schema_key,
-            None,
-            entity_pk,
-        );
-        self.cursor
-            .live_member(
-                store,
-                &self.cache.commit_delta_points,
-                &self.encoded_key[encoded],
-            )
-            .await
-    }
-
-    pub(crate) fn complete_generation(&self) -> (u64, [u8; 32]) {
-        (self.live_count, self.ordered_identity_digest)
-    }
 }
 
 fn hot_state_cache_lock_error() -> LixError {
@@ -2025,11 +794,6 @@ fn hot_state_cache_lock_error() -> LixError {
         LixError::CODE_INTERNAL_ERROR,
         "transaction hot-state metadata cache lock is poisoned",
     )
-}
-
-struct PackedCollectionIncrement {
-    live_count: u64,
-    ordered_identity_digest: Option<[u8; 32]>,
 }
 
 fn hot_collection_control_key(
@@ -2632,27 +1396,25 @@ fn stage_complete_collection_controls(
     Ok(())
 }
 
-#[derive(Clone)]
-struct PackedCurrentBaseRef {
-    commit_id: CommitId,
-    checkpoint_commit_id: Option<CommitId>,
-    coverage_key: Bytes,
-}
-
-struct PackedExclusiveSchemaBaseRef {
-    commit_id: CommitId,
-    index_key: Bytes,
-}
-
-/// One bounded authoritative HOT row layered over an immutable columnar
-/// base. The identity text is encoded exactly as the hidden sidecar column so
-/// execution can suppress stale base rows without parsing entity keys.
+/// One untracked HOT row overlaid on the authoritative Arrow root.
 #[derive(Clone, Debug)]
 pub(crate) struct EntityColumnarOverlayRow {
     pub(crate) entity_pk: EntityPk,
     pub(crate) snapshot_content: Option<Bytes>,
     pub(crate) deleted: bool,
     pub(crate) columnar_base_coordinate: Option<ColumnarBaseCoordinate>,
+}
+
+/// One physical group in a flattened current-state OLAP layout. A collection
+/// may span many content-addressed Arrow leaves; this route preserves the
+/// owning set and local group index while DataFusion sees one ordered group
+/// sequence.
+#[derive(Clone, Debug)]
+pub(crate) struct EntityColumnarGroupSource {
+    pub(crate) state_set_id: crate::columnar_row_group::ArrowStateSetId,
+    pub(crate) manifest: std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
+    pub(crate) manifest_digest: [u8; 32],
+    pub(crate) group_index: usize,
 }
 
 // Columnar planning temporarily overlaps encoded HOT input, its materialized
@@ -2681,301 +1443,10 @@ fn materialized_columnar_overlay_admission_bytes(
     })
 }
 
-fn packed_exclusive_schema_base_prefix(
-    branch_id: &str,
-    generation: CommitId,
-    schema_key: &str,
-) -> Vec<u8> {
-    let mut prefix = hot_scope_prefix(branch_id, generation);
-    write_key_string(&mut prefix, schema_key, KEY_PART_MORE);
-    prefix
-}
-
-fn packed_exclusive_schema_base_key(
-    branch_id: &str,
-    generation: CommitId,
-    schema_key: &str,
-    commit_id: CommitId,
-) -> Vec<u8> {
-    let mut key = packed_exclusive_schema_base_prefix(branch_id, generation, schema_key);
-    key.reserve(16);
-    key.extend_from_slice(commit_id.as_uuid().as_bytes());
-    key
-}
-
-async fn packed_exclusive_schema_base_refs(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    generation: CommitId,
-    schema_key: &str,
-) -> Result<Vec<PackedExclusiveSchemaBaseRef>, LixError> {
-    let prefix = packed_exclusive_schema_base_prefix(branch_id, generation, schema_key);
-    let plan = ScanPlan::prefix(
-        PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-        StoragePrefix {
-            bytes: Bytes::copy_from_slice(&prefix),
-        },
-    );
-    let mut refs = Vec::new();
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            let bytes = entry.key.0.as_ref();
-            if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
-                return Err(head_value_error(
-                    "packed exclusive-schema base index has an invalid key",
-                ));
-            }
-            refs.push(PackedExclusiveSchemaBaseRef {
-                commit_id: CommitId::new(
-                    uuid::Uuid::from_slice(&bytes[prefix.len()..])
-                        .map_err(|error| head_value_error(error.to_string()))?,
-                ),
-                index_key: entry.key.0,
-            });
-        }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
-    }
-    Ok(refs)
-}
-
-fn stage_packed_exclusive_schema_base_ref(
-    writes: &mut StorageWriteSet,
-    branch_id: &str,
-    generation: CommitId,
-    schema_key: &str,
-    commit_id: CommitId,
-) {
-    writes.put(
-        PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-        StorageKey(Bytes::from(packed_exclusive_schema_base_key(
-            branch_id, generation, schema_key, commit_id,
-        ))),
-        StorageValue {
-            bytes: Bytes::from_static(&[1]),
-        },
-    );
-}
-
-async fn packed_current_base_refs(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    generation: CommitId,
-) -> Result<Vec<PackedCurrentBaseRef>, LixError> {
-    let prefix = hot_scope_prefix(branch_id, generation);
-    let marker = PointReadPlan::new(
-        PACKED_CURRENT_BASE_CONTROL_SPACE,
-        &[StorageKey(Bytes::copy_from_slice(&prefix))],
-    )
-    .materialize(store, StorageGetOptions::default())
-    .await?
-    .value
-    .into_iter()
-    .next()
-    .flatten();
-    if marker.is_none() {
-        return Ok(Vec::new());
-    }
-    let plan = ScanPlan::prefix(
-        PACKED_CURRENT_BASE_SPACE,
-        StoragePrefix {
-            bytes: Bytes::copy_from_slice(&prefix),
-        },
-    );
-    let mut refs = Vec::new();
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            let bytes = entry.key.0.as_ref();
-            if bytes.len() != prefix.len() + 16 || bytes[..prefix.len()] != prefix {
-                return Err(head_value_error(
-                    "packed current-base manifest has an invalid key",
-                ));
-            }
-            let commit_id = CommitId::new(
-                uuid::Uuid::from_slice(&bytes[prefix.len()..])
-                    .map_err(|error| head_value_error(error.to_string()))?,
-            );
-            let checkpoint_bytes = full_value_bytes(entry.value)?;
-            if checkpoint_bytes.len() != 16 {
-                return Err(head_value_error(
-                    "packed current-base manifest has an invalid checkpoint owner",
-                ));
-            }
-            let checkpoint_uuid = uuid::Uuid::from_slice(&checkpoint_bytes)
-                .map_err(|error| head_value_error(error.to_string()))?;
-            refs.push(PackedCurrentBaseRef {
-                commit_id,
-                checkpoint_commit_id: (!checkpoint_uuid.is_nil())
-                    .then(|| CommitId::new(checkpoint_uuid)),
-                coverage_key: entry.key.0,
-            });
-        }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
-    }
-    Ok(refs)
-}
-
-async fn stage_retire_packed_current_bases(
-    store: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    branch_id: &str,
-    generation: CommitId,
-) -> Result<(), LixError> {
-    let control_key = StorageKey(Bytes::from(hot_scope_prefix(branch_id, generation)));
-    let control = PointReadPlan::new(
-        PACKED_CURRENT_BASE_CONTROL_SPACE,
-        std::slice::from_ref(&control_key),
-    )
-    .materialize(store, StorageGetOptions::default())
-    .await?
-    .value
-    .into_iter()
-    .next()
-    .flatten();
-    if control.is_none() {
-        return Ok(());
-    }
-    for base_ref in packed_current_base_refs(store, branch_id, generation).await? {
-        writes.delete(PACKED_CURRENT_BASE_SPACE, StorageKey(base_ref.coverage_key));
-    }
-    let index_plan = ScanPlan::prefix(
-        PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-        StoragePrefix {
-            bytes: Bytes::copy_from_slice(&control_key.0),
-        },
-    );
-    let mut resume_after = None;
-    loop {
-        let page = index_plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            writes.delete(PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, entry.key);
-        }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
-    }
-    writes.delete(PACKED_CURRENT_BASE_CONTROL_SPACE, control_key);
-    Ok(())
-}
-
-async fn packed_current_base_has_schema(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    generation: CommitId,
-    schema_key: &str,
-) -> Result<bool, LixError> {
-    for base_ref in packed_current_base_refs(store, branch_id, generation).await? {
-        if crate::tracked_state::commit_delta_contains_schema(store, base_ref.commit_id, schema_key)
-            .await?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn packed_member_matches_filter(
-    member: &crate::tracked_state::CommitDeltaMember,
-    filter: &TrackedStateFilter,
-) -> bool {
-    packed_identity_matches_filter(
-        &member.key.schema_key,
-        &member.key.entity_pk,
-        member.key.file_id.as_deref(),
-        filter,
-    )
-}
-
-fn packed_identity_matches_filter(
-    schema_key: &str,
-    entity_pk: &EntityPk,
-    file_id: Option<&str>,
-    filter: &TrackedStateFilter,
-) -> bool {
-    (filter.schema_keys.is_empty()
-        || filter
-            .schema_keys
-            .iter()
-            .any(|requested| requested == schema_key))
-        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(entity_pk))
-        && (filter.file_ids.is_empty()
-            || filter.file_ids.iter().any(|filter| match filter {
-                NullableKeyFilter::Any => true,
-                NullableKeyFilter::Null => file_id.is_none(),
-                NullableKeyFilter::Value(value) => file_id == Some(value.as_str()),
-            }))
-}
-
-fn packed_exact_keys_for_filter(filter: &TrackedStateFilter) -> Option<Vec<TrackedStateKey>> {
-    if filter.schema_keys.is_empty() || filter.entity_pks.is_empty() {
-        return None;
-    }
-    let includes_unfiled = filter.file_ids.is_empty()
-        || filter
-            .file_ids
-            .iter()
-            .any(|file_id| matches!(file_id, NullableKeyFilter::Any | NullableKeyFilter::Null));
-    if !includes_unfiled {
-        return Some(Vec::new());
-    }
-    let mut keys = filter
-        .schema_keys
-        .iter()
-        .flat_map(|schema_key| {
-            filter
-                .entity_pks
-                .iter()
-                .map(move |entity_pk| TrackedStateKey {
-                    schema_key: schema_key.clone(),
-                    file_id: None,
-                    entity_pk: entity_pk.clone(),
-                })
-        })
-        .collect::<Vec<_>>();
-    keys.sort_unstable();
-    keys.dedup();
-    Some(keys)
-}
-
 fn push_root_current_base_row(
     rows: &mut MaterializedLiveStateBatchBuilder,
     row: crate::tracked_state::MaterializedTrackedStateRowRef<'_>,
     branch_id: &str,
-    active_checkpoint_commit_id: Option<CommitId>,
 ) {
     let ordinal = rows.push_materialized_ref(
         row.entity_pk(),
@@ -2994,13 +1465,12 @@ fn push_root_current_base_row(
     );
     rows.set_durable_predecessor(
         ordinal,
-        CertifiedCurrentStatePredecessor::Packed(PackedHeadValue {
+        CertifiedCurrentStatePredecessor::ArrowRoot(ArrowRootHeadValue {
             change_id: row.change_id(),
             commit_id: row.commit_id(),
             deleted: row.deleted(),
             created_at: row.created_at(),
             updated_at: row.updated_at(),
-            checkpoint_commit_id: active_checkpoint_commit_id,
             columnar_base_coordinate: None,
         }),
     );
@@ -3010,7 +1480,6 @@ async fn scan_root_current_base_rows(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     generation: CommitId,
-    active_checkpoint_commit_id: Option<CommitId>,
     request: &TrackedStateScanRequest,
 ) -> Result<MaterializedLiveStateBatch, LixError> {
     let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation).await?
@@ -3060,7 +1529,7 @@ async fn scan_root_current_base_rows(
         if !root_tracked_row_is_active(row, generation, &active_generations, &stored_controls) {
             continue;
         }
-        push_root_current_base_row(&mut rows, row, branch_id, active_checkpoint_commit_id);
+        push_root_current_base_row(&mut rows, row, branch_id);
     }
     Ok(rows.finish())
 }
@@ -3069,7 +1538,6 @@ async fn scan_root_current_base_rows_for_merge(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     generation: CommitId,
-    active_checkpoint_commit_id: Option<CommitId>,
     request: &TrackedStateScanRequest,
     other_candidate_count: usize,
 ) -> Result<MaterializedLiveStateBatch, LixError> {
@@ -3186,21 +1654,13 @@ async fn scan_root_current_base_rows_for_merge(
         // without materializing history-sized state.
         *limit = limit.saturating_add(other_candidate_count);
     }
-    scan_root_current_base_rows(
-        store,
-        branch_id,
-        generation,
-        active_checkpoint_commit_id,
-        &root_request,
-    )
-    .await
+    scan_root_current_base_rows(store, branch_id, generation, &root_request).await
 }
 
 async fn load_root_current_base_exact(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     generation: CommitId,
-    active_checkpoint_commit_id: Option<CommitId>,
     keys: &[TrackedStateKeyRef<'_>],
     projection: ChangeRecordProjection,
 ) -> Result<MaterializedLiveStateExactBatch, LixError> {
@@ -3270,12 +1730,7 @@ async fn load_root_current_base_exact(
                 .map(|row| {
                     let ordinal = u32::try_from(rows.len())
                         .expect("root current-base exact result exceeds u32 rows");
-                    push_root_current_base_row(
-                        &mut rows,
-                        row,
-                        branch_id,
-                        active_checkpoint_commit_id,
-                    );
+                    push_root_current_base_row(&mut rows, row, branch_id);
                     ordinal
                 }),
         );
@@ -3337,7 +1792,6 @@ async fn load_root_active_collection_generations<'a>(
                     scope,
                     RootCollectionGeneration {
                         commit_id: row.commit_id(),
-                        created_at: row.created_at(),
                     },
                 )
             })
@@ -3348,7 +1802,6 @@ async fn load_root_active_collection_generations<'a>(
 #[derive(Clone, Copy)]
 struct RootCollectionGeneration {
     commit_id: CommitId,
-    created_at: LixTimestamp,
 }
 
 fn root_tracked_row_is_active(
@@ -3379,473 +1832,8 @@ fn root_tracked_row_is_active(
         }
         active_generations
             .get(&scope)
-            .is_none_or(|generation| row.created_at() >= generation.created_at)
+            .is_none_or(|generation| row.commit_id() > generation.commit_id)
     })
-}
-
-fn materialize_packed_slot(
-    include: bool,
-    slot: JsonSlot,
-    json_refs: &mut Vec<JsonRef>,
-    deferred: &mut Vec<DeferredJson>,
-    row_index: usize,
-    field: DeferredJsonField,
-) -> Option<SharedStr> {
-    if !include {
-        return None;
-    }
-    match slot {
-        JsonSlot::None => None,
-        JsonSlot::Inline(json) => Some(SharedStr::from(json)),
-        JsonSlot::Ref(json_ref) => {
-            json_refs.push(json_ref);
-            deferred.push(DeferredJson {
-                row_index,
-                field,
-                json_ref,
-            });
-            None
-        }
-    }
-}
-
-async fn scan_packed_current_base_rows(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    generation: CommitId,
-    request: &TrackedStateScanRequest,
-    limit: Option<usize>,
-) -> Result<MaterializedLiveStateBatch, LixError> {
-    if matches!(limit, Some(0)) {
-        return Ok(MaterializedLiveStateBatch::default());
-    }
-    let base_refs = packed_current_base_refs(store, branch_id, generation).await?;
-    if base_refs.is_empty() {
-        return Ok(MaterializedLiveStateBatch::default());
-    }
-    let single_base = base_refs.len() == 1;
-    let mut winners = BTreeMap::new();
-    let mut ordered_winners = None;
-    for base_ref in base_refs {
-        let scan_members_with_payloads = request.filter.schema_keys.len() == 1
-            && request.filter.entity_pks.is_empty()
-            && request.filter.file_ids.is_empty()
-            && request.limit.is_none()
-            && request.read_columns.columns.as_slice() == ["snapshot_content"];
-        if scan_members_with_payloads {
-            // Complete entity snapshot scans need every payload in the
-            // selected schema. Decode each packed segment once with its payload sidecar
-            // instead of first scanning the identity/value plane and then
-            // issuing a second manifest + segment pass for the same rows.
-            let members =
-                crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
-                    store,
-                    base_ref.commit_id,
-                    &request.filter.schema_keys,
-                    // This API materializes the complete requested public
-                    // result. Segment count is a physical-layout detail, not
-                    // a memory budget, so it must not select a different read
-                    // algorithm as collections are repartitioned.
-                    usize::MAX,
-                )
-                .await?;
-            if single_base {
-                if let Some(members) = members {
-                    let mut ordered = Vec::with_capacity(members.len());
-                    for member in members {
-                        if member.value.deleted
-                            || !packed_member_matches_filter(&member, &request.filter)
-                        {
-                            continue;
-                        }
-                        ordered.push((member.key, member.value, member.change));
-                    }
-                    if ordered.iter().any(|row| row.0.file_id.is_some()) {
-                        ordered.sort_unstable_by(|left, right| {
-                            (&left.0.schema_key, &left.0.entity_pk, &left.0.file_id).cmp(&(
-                                &right.0.schema_key,
-                                &right.0.entity_pk,
-                                &right.0.file_id,
-                            ))
-                        });
-                    }
-                    ordered_winners = Some(ordered);
-                    break;
-                }
-            } else if let Some(members) = members {
-                for member in members {
-                    if member.value.deleted
-                        || !packed_member_matches_filter(&member, &request.filter)
-                    {
-                        continue;
-                    }
-                    let key = member.key;
-                    let identity = (
-                        key.schema_key.clone(),
-                        key.entity_pk.clone(),
-                        key.file_id.clone(),
-                    );
-                    match winners.entry(identity) {
-                        std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert((key, member.value, member.change));
-                        }
-                        std::collections::btree_map::Entry::Occupied(mut entry)
-                            if entry.get().1.commit_id < member.value.commit_id =>
-                        {
-                            entry.insert((key, member.value, member.change));
-                        }
-                        std::collections::btree_map::Entry::Occupied(_) => {}
-                    }
-                }
-                continue;
-            }
-        }
-        let compact = crate::tracked_state::scan_commit_delta_values(
-            store,
-            base_ref.commit_id,
-            &request.filter.schema_keys,
-        )
-        .await?;
-        let mut keys = Vec::new();
-        for row in compact.iter() {
-            let key = row.key_ref();
-            if row.value().deleted
-                || !packed_identity_matches_filter(
-                    key.schema_key,
-                    key.entity_pk,
-                    key.file_id,
-                    &request.filter,
-                )
-            {
-                continue;
-            }
-            keys.push(TrackedStateKey {
-                schema_key: key.schema_key.to_owned(),
-                entity_pk: key.entity_pk.clone(),
-                file_id: key.file_id.map(str::to_owned),
-            });
-            if single_base && limit.is_some_and(|limit| keys.len() >= limit) {
-                break;
-            }
-        }
-        let requests = keys
-            .iter()
-            .cloned()
-            .map(|key| (base_ref.commit_id, key))
-            .collect::<Vec<_>>();
-        let loaded =
-            crate::tracked_state::load_owned_commit_delta_entries(store, &requests).await?;
-        for (key, loaded_entry) in keys.into_iter().zip(loaded) {
-            let Some(loaded_entry) = loaded_entry else {
-                return Err(head_value_error(
-                    "packed current-base manifest lost an indexed commit member",
-                ));
-            };
-            let identity = (
-                key.schema_key.clone(),
-                key.entity_pk.clone(),
-                key.file_id.clone(),
-            );
-            match winners.entry(identity) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert((key, loaded_entry.value, loaded_entry.change_record));
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry)
-                    if entry.get().1.commit_id < loaded_entry.value.commit_id =>
-                {
-                    entry.insert((key, loaded_entry.value, loaded_entry.change_record));
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
-        }
-    }
-    let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
-    let winner_rows = ordered_winners.unwrap_or_else(|| winners.into_values().collect::<Vec<_>>());
-    let row_capacity = limit.map_or(winner_rows.len(), |limit| limit.min(winner_rows.len()));
-    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(row_capacity);
-    let mut json_refs = Vec::new();
-    let mut deferred = Vec::new();
-    let global = branch_id == crate::GLOBAL_BRANCH_ID;
-    for (key, value, change) in winner_rows.into_iter().take(row_capacity) {
-        let row_index = rows.len();
-        let snapshot = materialize_packed_slot(
-            projection.snapshot_content,
-            change.snapshot,
-            &mut json_refs,
-            &mut deferred,
-            row_index,
-            DeferredJsonField::Snapshot,
-        );
-        let metadata = materialize_packed_slot(
-            projection.metadata,
-            change.metadata,
-            &mut json_refs,
-            &mut deferred,
-            row_index,
-            DeferredJsonField::Metadata,
-        );
-        rows.push_materialized(
-            key.entity_pk,
-            key.schema_key,
-            key.file_id,
-            snapshot,
-            metadata,
-            false,
-            value.created_at,
-            value.updated_at,
-            global,
-            Some(value.change_id),
-            Some(value.commit_id),
-            false,
-            branch_id,
-        );
-    }
-    if json_refs.is_empty() {
-        return Ok(rows.finish());
-    }
-    let mut json_values = JsonStoreContext::new()
-        .load_bytes_many(
-            store,
-            JsonLoadRequestRef {
-                refs: &json_refs,
-                scope: JsonReadScopeRef::OutOfBand,
-            },
-        )
-        .await?
-        .into_values();
-    for (index, deferred) in deferred.into_iter().enumerate() {
-        let bytes = json_values
-            .get_mut(index)
-            .and_then(Option::take)
-            .ok_or_else(|| head_value_error("packed current-base JSON payload is missing"))?;
-        let json = SharedStr::from_utf8(bytes)
-            .map_err(|error| head_value_error(format!("packed JSON is not UTF-8: {error}")))?;
-        match deferred.field {
-            DeferredJsonField::Snapshot => rows.set_snapshot_content(deferred.row_index, json),
-            DeferredJsonField::Metadata => rows.set_metadata(deferred.row_index, json),
-        }
-    }
-    Ok(rows.finish())
-}
-
-async fn load_packed_current_base_exact(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    generation: CommitId,
-    active_checkpoint_commit_id: Option<CommitId>,
-    keys: &[TrackedStateKeyRef<'_>],
-    projection: ChangeRecordProjection,
-    transaction_cache: Option<&HotStateTransactionCache>,
-) -> Result<MaterializedLiveStateExactBatch, LixError> {
-    if keys.is_empty() {
-        return MaterializedLiveStateExactBatch::new(
-            MaterializedLiveStateBatch::default(),
-            Vec::new(),
-        );
-    }
-    let winners = load_packed_current_base_exact_entries(
-        store,
-        branch_id,
-        generation,
-        keys,
-        transaction_cache,
-    )
-    .await?;
-
-    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
-    let mut slots = Vec::with_capacity(keys.len());
-    let mut json_refs = Vec::new();
-    let mut deferred = Vec::new();
-    let global = branch_id == crate::GLOBAL_BRANCH_ID;
-    for entry in winners {
-        let Some((value, change_record, base_coordinate)) = entry else {
-            slots.push(None);
-            continue;
-        };
-        if value.deleted {
-            slots.push(None);
-            continue;
-        }
-        let row_index = rows.len();
-        let columnar_base_coordinate = base_coordinate.map(|coordinate| ColumnarBaseCoordinate {
-            base_commit_id: coordinate.base_commit_id,
-            group_index: coordinate.group_index,
-            row_index: coordinate.row_index,
-        });
-        let durable_predecessor = CertifiedCurrentStatePredecessor::Packed(PackedHeadValue {
-            change_id: value.change_id,
-            commit_id: value.commit_id,
-            deleted: false,
-            created_at: value.created_at,
-            updated_at: value.updated_at,
-            checkpoint_commit_id: active_checkpoint_commit_id,
-            columnar_base_coordinate,
-        });
-        let snapshot = materialize_packed_slot(
-            projection.snapshot_content,
-            change_record.snapshot,
-            &mut json_refs,
-            &mut deferred,
-            row_index,
-            DeferredJsonField::Snapshot,
-        );
-        let metadata = materialize_packed_slot(
-            projection.metadata,
-            change_record.metadata,
-            &mut json_refs,
-            &mut deferred,
-            row_index,
-            DeferredJsonField::Metadata,
-        );
-        slots.push(Some(u32::try_from(row_index).map_err(|_| {
-            head_value_error("packed exact row count exceeds u32")
-        })?));
-        rows.push_materialized(
-            change_record.entity_pk,
-            change_record.schema_key,
-            change_record.file_id,
-            snapshot,
-            metadata,
-            false,
-            value.created_at,
-            value.updated_at,
-            global,
-            Some(value.change_id),
-            Some(value.commit_id),
-            false,
-            branch_id,
-        );
-        rows.set_durable_predecessor(row_index, durable_predecessor);
-        if let Some(coordinate) = columnar_base_coordinate {
-            rows.set_columnar_base_coordinate(row_index, coordinate);
-        }
-    }
-    if !json_refs.is_empty() {
-        let mut json_values = JsonStoreContext::new()
-            .load_bytes_many(
-                store,
-                JsonLoadRequestRef {
-                    refs: &json_refs,
-                    scope: JsonReadScopeRef::OutOfBand,
-                },
-            )
-            .await?
-            .into_values();
-        for (index, deferred) in deferred.into_iter().enumerate() {
-            let bytes = json_values
-                .get_mut(index)
-                .and_then(Option::take)
-                .ok_or_else(|| head_value_error("packed exact JSON payload is missing"))?;
-            let json = SharedStr::from_utf8(bytes)
-                .map_err(|error| head_value_error(format!("packed JSON is not UTF-8: {error}")))?;
-            match deferred.field {
-                DeferredJsonField::Snapshot => rows.set_snapshot_content(deferred.row_index, json),
-                DeferredJsonField::Metadata => rows.set_metadata(deferred.row_index, json),
-            }
-        }
-    }
-    MaterializedLiveStateExactBatch::new(rows.finish(), slots)
-}
-
-async fn load_packed_current_base_exact_entries(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    generation: CommitId,
-    keys: &[TrackedStateKeyRef<'_>],
-    transaction_cache: Option<&HotStateTransactionCache>,
-) -> Result<
-    Vec<
-        Option<(
-            crate::tracked_state::TrackedStateIndexValue,
-            crate::changelog::ChangeRecord,
-            Option<crate::tracked_state::TrackedStateBaseCoordinate>,
-        )>,
-    >,
-    LixError,
-> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let transaction_cache = match transaction_cache {
-        Some(cache) if cache.should_reuse_packed_points(generation)? => Some(cache),
-        Some(_) | None => None,
-    };
-    let base_refs = match transaction_cache
-        .map(|cache| cache.packed_current_base_refs(branch_id, generation))
-        .transpose()?
-        .flatten()
-    {
-        Some(refs) => refs,
-        None => {
-            let refs = packed_current_base_refs(store, branch_id, generation).await?;
-            if let Some(cache) = transaction_cache {
-                cache.remember_packed_current_base_refs(branch_id, generation, &refs)?;
-            }
-            refs
-        }
-    };
-    if base_refs.is_empty() {
-        return Ok((0..keys.len()).map(|_| None).collect());
-    }
-    if let [base_ref] = base_refs.as_slice() {
-        return Ok(
-            crate::tracked_state::load_owned_commit_delta_entries_one_ordered_ref(
-                store,
-                base_ref.commit_id,
-                keys,
-                transaction_cache.map(|cache| &cache.commit_delta_points),
-            )
-            .await?
-            .into_iter()
-            .map(|entry| {
-                entry.map(|entry| (entry.value, entry.change_record, entry.base_coordinate))
-            })
-            .collect(),
-        );
-    }
-    let owned_keys = keys
-        .iter()
-        .map(|key| TrackedStateKey {
-            schema_key: key.schema_key.to_owned(),
-            file_id: key.file_id.map(str::to_owned),
-            entity_pk: key.entity_pk.clone(),
-        })
-        .collect::<Vec<_>>();
-    let mut requests = Vec::with_capacity(base_refs.len().saturating_mul(keys.len()));
-    for base_ref in base_refs.iter() {
-        requests.extend(
-            owned_keys
-                .iter()
-                .cloned()
-                .map(|key| (base_ref.commit_id, key)),
-        );
-    }
-    let loaded = crate::tracked_state::load_owned_commit_delta_entries(store, &requests).await?;
-    let mut winners = (0..keys.len()).map(|_| None).collect::<Vec<
-        Option<(
-            crate::tracked_state::TrackedStateIndexValue,
-            crate::changelog::ChangeRecord,
-            Option<crate::tracked_state::TrackedStateBaseCoordinate>,
-        )>,
-    >>();
-    for entries in loaded.chunks(keys.len()) {
-        for (slot, entry) in winners.iter_mut().zip(entries) {
-            let Some(entry) = entry else {
-                continue;
-            };
-            if slot
-                .as_ref()
-                .is_none_or(|(previous, _, _)| previous.commit_id < entry.value.commit_id)
-            {
-                *slot = Some((
-                    entry.value.clone(),
-                    entry.change_record.clone(),
-                    entry.base_coordinate,
-                ));
-            }
-        }
-    }
-    Ok(winners)
 }
 
 #[cfg(test)]
@@ -3961,88 +1949,6 @@ impl<S> HotStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    pub(crate) async fn prepare_packed_identity_membership(
-        &self,
-        branch_id: &str,
-        generation: CommitId,
-        schema_key: &str,
-    ) -> Result<Option<PackedIdentityMembership>, LixError> {
-        let Some(cache) = self.transaction_cache.as_ref() else {
-            return Ok(None);
-        };
-        let base_refs =
-            packed_exclusive_schema_base_refs(&self.store, branch_id, generation, schema_key)
-                .await?;
-        let [base_ref] = base_refs.as_slice() else {
-            return Ok(None);
-        };
-        let collection = self
-            .collection_control(
-                branch_id,
-                generation,
-                crate::collection_generation::CollectionScopeRef {
-                    schema_key,
-                    file_id: None,
-                },
-            )
-            .await?;
-        let Some(ordered_identity_digest) = collection.ordered_identity_digest else {
-            return Ok(None);
-        };
-        if collection.active_generation != generation
-            || collection.live_count == DEFERRED_ROOT_LIVE_COUNT
-        {
-            return Ok(None);
-        }
-        let filter = TrackedStateFilter {
-            schema_keys: vec![schema_key.to_owned()],
-            file_ids: vec![NullableKeyFilter::Null],
-            ..TrackedStateFilter::default()
-        };
-        let Some(hot) =
-            hot_scan_entries(&self.store, branch_id, generation, &filter, Some(1), None).await?
-        else {
-            return Ok(None);
-        };
-        let has_hot_rows = match hot {
-            HotScanEntries::Decoded(rows) => !rows.is_empty(),
-            HotScanEntries::Finite(batches) => batches
-                .iter()
-                .flat_map(|batch| batch.values.iter())
-                .any(Option::is_some),
-        };
-        if has_hot_rows {
-            return Ok(None);
-        }
-        let certified = scan_certified_entity_batch_rows(
-            &self.store,
-            branch_id,
-            generation,
-            &TrackedStateScanRequest {
-                filter,
-                read_columns: Default::default(),
-                limit: Some(1),
-            },
-            Some(1),
-            Some(cache),
-        )
-        .await?;
-        if !certified.is_empty() {
-            return Ok(None);
-        }
-        let cursor = cache
-            .commit_delta_points
-            .live_membership_cursor(base_ref.commit_id);
-        Ok(Some(PackedIdentityMembership {
-            cache: Arc::clone(cache),
-            cursor,
-            schema_key: schema_key.to_owned(),
-            live_count: collection.live_count,
-            ordered_identity_digest,
-            encoded_key: Vec::new(),
-        }))
-    }
-
     async fn collection_control(
         &self,
         branch_id: &str,
@@ -4093,7 +1999,6 @@ where
         let rows = Box::pin(self.scan_live_batch_for_generation(
             branch_id,
             branch_generation,
-            None,
             &TrackedStateScanRequest {
                 filter: TrackedStateFilter {
                     schema_keys: vec![scope.schema_key.to_owned()],
@@ -4119,13 +2024,8 @@ where
         control: BranchHeadControl,
         request: &TrackedStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.scan_live_batch_for_generation(
-            branch_id,
-            control.generation,
-            control.working_diff_checkpoint_commit_id,
-            request,
-        )
-        .await
+        self.scan_live_batch_for_generation(branch_id, control.generation, request)
+            .await
     }
 
     pub(crate) async fn scan_live_rows(
@@ -4178,11 +2078,6 @@ where
         if !page.value.entries.is_empty() {
             return Ok(true);
         }
-        if packed_current_base_has_schema(&self.store, branch_id, control.generation, schema_key)
-            .await?
-        {
-            return Ok(true);
-        }
         let root = if load_root_current_base_commit(&self.store, branch_id, control.generation)
             .await?
             .is_some()
@@ -4191,7 +2086,6 @@ where
                 &self.store,
                 branch_id,
                 control.generation,
-                control.working_diff_checkpoint_commit_id,
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec![schema_key.to_owned()],
@@ -4213,30 +2107,7 @@ where
         if !root.is_empty() {
             return Ok(true);
         }
-        // Format plugins cannot publish engine-owned schemas. Avoid probing
-        // certified plugin segments when validation asks about a missing
-        // system schema. Engine-owned packed bases are checked above because
-        // they carry ordinary transaction-authored system rows.
-        if schema_key.starts_with("lix_") {
-            return Ok(false);
-        }
-        let certified = scan_certified_entity_batch_rows(
-            &self.store,
-            branch_id,
-            control.generation,
-            &TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    schema_keys: vec![schema_key.to_owned()],
-                    ..TrackedStateFilter::default()
-                },
-                read_columns: Default::default(),
-                limit: Some(1),
-            },
-            Some(1),
-            self.transaction_cache.as_deref(),
-        )
-        .await?;
-        Ok(!certified.is_empty())
+        Ok(false)
     }
 
     pub(crate) async fn scan_entity_snapshots(
@@ -4247,108 +2118,15 @@ where
         entity_pks: &[EntityPk],
         limit: Option<usize>,
     ) -> Result<Vec<Option<Bytes>>, LixError> {
-        if entity_pks.is_empty()
-            && limit.is_none()
-            && let Some(snapshots) = self
-                .scan_exclusive_entity_snapshots(branch_id, control, schema_key)
-                .await?
-        {
-            return Ok(snapshots);
-        }
         self.scan_entity_snapshots_for_generation(
             branch_id,
             control.generation,
-            control.working_diff_checkpoint_commit_id,
             schema_key,
             entity_pks,
             limit,
         )
         .await
     }
-
-    /// Reads one atomically published exclusive collection straight from its
-    /// packed commit payload column. The publication proof excludes HOT,
-    /// root, certified, and multi-base winners, so manufacturing a generic
-    /// live-state batch only to discard every column except the snapshot is
-    /// unnecessary read and allocation amplification.
-    async fn scan_exclusive_entity_snapshots(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-        schema_key: &str,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        let Some((commit_id, live_count)) = self
-            .exclusive_entity_base(branch_id, control, schema_key)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let Some(members) =
-            crate::tracked_state::load_commit_delta_members_with_payloads_for_schemas(
-                &self.store,
-                commit_id,
-                &[schema_key.to_owned()],
-                // The exclusive publication's live count already defines the
-                // exact materialized result below. Do not impose a second
-                // physical-segment cardinality policy on the same result.
-                usize::MAX,
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        let capacity = usize::try_from(live_count)
-            .map_err(|_| head_value_error("exclusive entity live count exceeds usize"))?;
-        let mut snapshots = Vec::with_capacity(capacity);
-        let mut deferred_refs = Vec::new();
-        let mut deferred_rows = Vec::new();
-        for member in members {
-            if member.value.deleted
-                || member.key.schema_key != schema_key
-                || member.key.file_id.is_some()
-            {
-                return Err(head_value_error(
-                    "exclusive entity base contains a non-live or file-scoped member",
-                ));
-            }
-            match member.change.snapshot {
-                JsonSlot::None => snapshots.push(None),
-                JsonSlot::Inline(json) => {
-                    snapshots.push(Some(Bytes::from(json.into_string())));
-                }
-                JsonSlot::Ref(json_ref) => {
-                    deferred_rows.push(snapshots.len());
-                    deferred_refs.push(json_ref);
-                    snapshots.push(None);
-                }
-            }
-        }
-        if snapshots.len() != capacity {
-            return Err(head_value_error(format!(
-                "exclusive entity base expected {live_count} live rows, decoded {}",
-                snapshots.len()
-            )));
-        }
-        if !deferred_refs.is_empty() {
-            let loaded = JsonStoreContext::new()
-                .load_bytes_many(
-                    &self.store,
-                    JsonLoadRequestRef {
-                        refs: &deferred_refs,
-                        scope: JsonReadScopeRef::OutOfBand,
-                    },
-                )
-                .await?
-                .into_values();
-            for (row_index, value) in deferred_rows.into_iter().zip(loaded) {
-                snapshots[row_index] = Some(value.ok_or_else(|| {
-                    head_value_error("exclusive entity snapshot payload is missing")
-                })?);
-            }
-        }
-        Ok(Some(snapshots))
-    }
-
     pub(crate) async fn scan_entity_primary_keys(
         &self,
         branch_id: &str,
@@ -4364,7 +2142,6 @@ where
             .scan_live_batch_for_generation(
                 branch_id,
                 control.generation,
-                control.working_diff_checkpoint_commit_id,
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec![schema_key.to_owned()],
@@ -4372,10 +2149,8 @@ where
                         include_tombstones: false,
                         ..TrackedStateFilter::default()
                     },
-                    // Retain the packed broad-scan route, which resolves the
-                    // same committed winners as snapshot scans. The provider
-                    // drops these bytes before Arrow conversion because only
-                    // the identity columns were requested.
+                    // The provider drops snapshot bytes before Arrow conversion
+                    // because only identity columns were requested.
                     read_columns: TrackedStateReadColumns {
                         columns: vec!["snapshot_content".to_owned()],
                     },
@@ -4386,9 +2161,8 @@ where
         Ok(rows.into_identity_ordered_primary_keys())
     }
 
-    /// Plans a typed columnar scan when one immutable packed base plus a
-    /// bounded HOT overlay is the complete current collection and its
-    /// atomically staged row-group sidecar agrees with publication control.
+    /// Plans a typed scan directly from the immutable Arrow root plus the
+    /// bounded untracked HOT overlay.
     pub(crate) async fn entity_columnar_layout(
         &self,
         branch_id: &str,
@@ -4396,201 +2170,185 @@ where
         schema_key: &str,
     ) -> Result<
         Option<(
-            crate::columnar_row_group::RowGroupSetId,
+            crate::columnar_row_group::ArrowStateSetId,
             crate::columnar_row_group::RowGroupManifest,
+            Vec<EntityColumnarGroupSource>,
             Vec<EntityColumnarOverlayRow>,
             u64,
         )>,
         LixError,
     > {
-        let Some((base_commit_id, live_count)) = self
-            .entity_columnar_base(branch_id, control, schema_key)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let id = crate::live_state::entity_row_group_set_id(base_commit_id, schema_key);
-        let Some(manifest) =
-            crate::columnar_row_group::load_row_group_manifest(&self.store, id).await?
-        else {
-            return Ok(None);
-        };
-        if manifest.namespace != schema_key {
-            return Err(head_value_error(
-                "entity columnar sidecar disagrees with its collection publication",
-            ));
-        }
-
-        // Read at most one bounded HOT generation. This is deliberately
-        // independent of the SQL predicate: an update or tombstone that no
-        // longer matches the predicate must still suppress its stale base row.
-        let filter = TrackedStateFilter {
-            schema_keys: vec![schema_key.to_owned()],
-            include_tombstones: true,
-            ..TrackedStateFilter::default()
-        };
-        let Some(entries) = hot_scan_entries(
-            &self.store,
-            branch_id,
-            control.generation,
-            &filter,
-            None,
-            Some(ENTITY_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES),
-        )
-        .await?
-        else {
-            return Ok(None);
-        };
-        let rows = materialize_hot_scan_entries(
-            &self.store,
-            entries,
-            ChangeRecordProjection::from_columns(&["snapshot_content".to_owned()]),
-            branch_id,
-            control.working_diff_checkpoint_commit_id,
-        )
-        .await?;
-        if materialized_columnar_overlay_admission_bytes(&rows)?
-            > ENTITY_COLUMNAR_OVERLAY_OUTPUT_ADMISSION_BYTES
+        if let Some(root_commit_id) =
+            load_root_current_base_commit(&self.store, branch_id, control.generation).await?
         {
-            return Ok(None);
-        }
-        let mut overlay = Vec::with_capacity(rows.len());
-        let mut overlay_bytes = 0_usize;
-        for row in rows.iter() {
-            // Packed columnar bases contain tracked, unfiled members only.
-            // Retain the established row path for a broader identity domain.
-            if row.file_id().is_some() || row.untracked() || row.global() {
-                return Ok(None);
-            }
-            let Some(row_commit_id) = row.commit_id() else {
-                return Ok(None);
-            };
-            // A complete packed replacement can be newer than stale HOT
-            // records in the same generation. Mirror the authoritative merge:
-            // equal/newer HOT wins; older HOT is ignored.
-            if row_commit_id < base_commit_id {
-                continue;
-            }
-            overlay_bytes = overlay_bytes
-                .checked_add(size_of::<EntityColumnarOverlayRow>())
-                .and_then(|bytes| bytes.checked_add(row.entity_pk().estimated_heap_bytes()))
-                .and_then(|bytes| {
-                    bytes.checked_add(row.snapshot_content().map_or(0, |snapshot| snapshot.len()))
-                })
-                .ok_or_else(|| head_value_error("entity columnar overlay byte size overflow"))?;
-            if overlay_bytes > ENTITY_COLUMNAR_OVERLAY_OUTPUT_ADMISSION_BYTES {
-                return Ok(None);
-            }
-            overlay.push(EntityColumnarOverlayRow {
-                entity_pk: row.entity_pk().clone(),
-                snapshot_content: row
-                    .snapshot_content()
-                    .map(|snapshot| Bytes::copy_from_slice(snapshot.as_bytes())),
-                deleted: row.deleted(),
-                columnar_base_coordinate: row.columnar_base_coordinate(),
-            });
-        }
-        Ok(Some((id, manifest, overlay, live_count)))
-    }
-
-    async fn entity_columnar_base(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-        schema_key: &str,
-    ) -> Result<Option<(CommitId, u64)>, LixError> {
-        let collection = load_hot_collection_control(
-            &self.store,
-            branch_id,
-            control.generation,
-            crate::collection_generation::CollectionScopeRef {
+            let collection_scope = crate::collection_generation::CollectionScopeRef {
                 schema_key,
                 file_id: None,
-            },
-        )
-        .await?;
-        if collection.active_generation != control.generation {
-            return Ok(None);
-        }
-        let base_refs = packed_exclusive_schema_base_refs(
-            &self.store,
-            branch_id,
-            control.generation,
-            schema_key,
-        )
-        .await?;
-        let [base_ref] = base_refs.as_slice() else {
-            return Ok(None);
-        };
-        let active_base_refs =
-            packed_current_base_refs(&self.store, branch_id, control.generation).await?;
-        if !active_base_refs
-            .iter()
-            .any(|active| active.commit_id == base_ref.commit_id)
-        {
-            return Err(head_value_error(
-                "exclusive schema index references an inactive packed current base",
-            ));
-        }
-        for active in active_base_refs
-            .iter()
-            .filter(|active| active.commit_id != base_ref.commit_id)
-        {
-            if crate::tracked_state::commit_delta_contains_schema(
+            };
+            if !load_root_active_collection_generations(
                 &self.store,
-                active.commit_id,
-                schema_key,
+                root_commit_id,
+                [collection_scope],
             )
             .await?
+            .is_empty()
             {
                 return Ok(None);
             }
-        }
-        Ok(Some((base_ref.commit_id, collection.live_count)))
-    }
+            let published = crate::tracked_state::load_published_commit_state_manifest(
+                &self.store,
+                root_commit_id,
+            )
+            .await?
+            .ok_or_else(|| head_value_error("root-backed columnar head is missing its manifest"))?;
+            let descriptors = crate::tracked_state::load_current_state_scope_descriptors(
+                &self.store,
+                &published,
+                &crate::tracked_state::CommitDeltaReplacementScope {
+                    schema_key: schema_key.to_owned(),
+                    file_id: None,
+                },
+            )
+            .await?;
+            if descriptors.is_empty() {
+                return Ok(None);
+            }
+            let mut group_sources = Vec::with_capacity(descriptors.len());
+            let mut layout_hasher =
+                blake3::Hasher::new_derive_key("lix current-state flattened Arrow collection v1");
+            for descriptor in descriptors {
+                let manifest = crate::columnar_row_group::load_row_group_manifest(
+                    &self.store,
+                    descriptor.state_set_id,
+                )
+                .await?
+                .ok_or_else(|| {
+                    head_value_error("Arrow state descriptor references a missing leaf")
+                })?;
+                if manifest.namespace != "lix.tracked_state.arrow_leaf.v1"
+                    || manifest.metadata.get("lix.layout").map(String::as_str)
+                        != Some(crate::sql2::ENTITY_ARROW_STATE_LAYOUT)
+                {
+                    return Err(head_value_error(
+                        "current-state descriptor does not reference the canonical Arrow leaf layout",
+                    ));
+                }
+                let local_group = descriptor.state_group_index as usize;
+                manifest.groups.get(local_group).ok_or_else(|| {
+                    head_value_error("Arrow state descriptor has an invalid group index")
+                })?;
+                let manifest_digest = manifest.content_digest()?;
+                layout_hasher.update(&descriptor.state_set_id.as_bytes());
+                layout_hasher.update(&descriptor.state_group_index.to_be_bytes());
+                group_sources.push(EntityColumnarGroupSource {
+                    state_set_id: descriptor.state_set_id,
+                    manifest: std::sync::Arc::new(manifest),
+                    manifest_digest,
+                    group_index: local_group,
+                });
+            }
+            let first_manifest = &group_sources
+                .first()
+                .expect("non-empty descriptors have a source")
+                .manifest;
+            let common_fields = first_manifest
+                .fields
+                .iter()
+                .filter(|field| {
+                    group_sources.iter().all(|source| {
+                        source
+                            .manifest
+                            .fields
+                            .iter()
+                            .find(|candidate| candidate.name == field.name)
+                            == Some(*field)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let common_field_names = common_fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect::<Vec<_>>();
+            let mut flattened_manifest = first_manifest.as_ref().clone();
+            flattened_manifest.fields = common_fields;
+            flattened_manifest.groups = group_sources
+                .iter()
+                .map(|source| {
+                    crate::columnar_row_group::remap_row_group_statistics(
+                        &source.manifest,
+                        source.group_index,
+                        &common_field_names,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let layout_id = crate::columnar_row_group::ArrowStateSetId::from_digest(
+                *layout_hasher.finalize().as_bytes(),
+            );
 
-    async fn exclusive_entity_base(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-        schema_key: &str,
-    ) -> Result<Option<(CommitId, u64)>, LixError> {
-        let collection = load_hot_collection_control(
-            &self.store,
-            branch_id,
-            control.generation,
-            crate::collection_generation::CollectionScopeRef {
-                schema_key,
-                file_id: None,
-            },
-        )
-        .await?;
-        if collection.active_generation != control.generation
-            || collection.ordered_identity_digest.is_none()
-        {
-            return Ok(None);
+            let filter = TrackedStateFilter {
+                schema_keys: vec![schema_key.to_owned()],
+                include_tombstones: true,
+                ..TrackedStateFilter::default()
+            };
+            let Some(entries) = hot_scan_entries(
+                &self.store,
+                branch_id,
+                control.generation,
+                &filter,
+                None,
+                Some(ENTITY_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES),
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            let rows = materialize_hot_scan_entries(
+                &self.store,
+                entries,
+                ChangeRecordProjection::from_columns(&["snapshot_content".to_owned()]),
+                branch_id,
+            )
+            .await?;
+            if materialized_columnar_overlay_admission_bytes(&rows)?
+                > ENTITY_COLUMNAR_OVERLAY_OUTPUT_ADMISSION_BYTES
+            {
+                return Ok(None);
+            }
+            let mut overlay = Vec::with_capacity(rows.len());
+            for row in rows.iter() {
+                if row.file_id().is_some() || row.global() || !row.untracked() {
+                    return Ok(None);
+                }
+                overlay.push(EntityColumnarOverlayRow {
+                    entity_pk: row.entity_pk().clone(),
+                    snapshot_content: row
+                        .snapshot_content()
+                        .map(|snapshot| Bytes::copy_from_slice(snapshot.as_bytes())),
+                    deleted: row.deleted(),
+                    columnar_base_coordinate: None,
+                });
+            }
+            let live_count = self
+                .exact_collection_live_count(
+                    branch_id,
+                    control.generation,
+                    crate::collection_generation::CollectionScopeRef {
+                        schema_key,
+                        file_id: None,
+                    },
+                )
+                .await?;
+            return Ok(Some((
+                layout_id,
+                flattened_manifest,
+                group_sources,
+                overlay,
+                live_count,
+            )));
         }
-        let base_refs = packed_exclusive_schema_base_refs(
-            &self.store,
-            branch_id,
-            control.generation,
-            schema_key,
-        )
-        .await?;
-        let [base_ref] = base_refs.as_slice() else {
-            return Ok(None);
-        };
-        let active_base_refs =
-            packed_current_base_refs(&self.store, branch_id, control.generation).await?;
-        if !active_base_refs
-            .iter()
-            .any(|active| active.commit_id == base_ref.commit_id)
-        {
-            return Err(head_value_error(
-                "exclusive schema index references an inactive packed current base",
-            ));
-        }
-        Ok(Some((base_ref.commit_id, collection.live_count)))
+
+        Ok(None)
     }
 
     #[cfg(test)]
@@ -4610,14 +2368,9 @@ where
             return Ok(None);
         };
         Ok(Some(
-            self.scan_live_batch_for_generation(
-                branch_id,
-                control.generation,
-                control.working_diff_checkpoint_commit_id,
-                request,
-            )
-            .await?
-            .into_rows(),
+            self.scan_live_batch_for_generation(branch_id, control.generation, request)
+                .await?
+                .into_rows(),
         ))
     }
 
@@ -4625,7 +2378,6 @@ where
         &self,
         branch_id: &str,
         generation: CommitId,
-        active_checkpoint_commit_id: Option<CommitId>,
         request: &TrackedStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let collection_control = match request.filter.schema_keys.as_slice() {
@@ -4649,9 +2401,6 @@ where
         };
         let replaced_generation =
             collection_control.filter(|control| control.active_generation != generation);
-        if replaced_generation.is_some_and(|control| control.live_count == 0) {
-            return Ok(MaterializedLiveStateBatch::default());
-        }
         // A storage prefix is ordered by identity, but tombstones are filtered
         // only after decoding the value. Applying SQL LIMIT to the raw scan
         // would therefore let one tombstone hide a later live row.
@@ -4669,14 +2418,8 @@ where
             filter_hot_scan_entries_by_collection_generation(&mut entries, control)?;
         }
         let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
-        let rows = materialize_hot_scan_entries(
-            &self.store,
-            entries,
-            projection,
-            branch_id,
-            active_checkpoint_commit_id,
-        )
-        .await?;
+        let rows =
+            materialize_hot_scan_entries(&self.store, entries, projection, branch_id).await?;
         let rows = rows.filter(
             |row| {
                 replaced_generation.is_none_or(|control| {
@@ -4686,183 +2429,17 @@ where
             },
             None,
         );
-        let overlay_commits = rows
-            .iter()
-            .map(|row| {
-                (
-                    (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    ),
-                    row.commit_id(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let packed_limit = if overlay_commits.is_empty() && replaced_generation.is_none() {
-            request.limit.map(|limit| limit.saturating_sub(rows.len()))
-        } else {
-            None
-        };
-        let packed_rows = if let Some(keys) = packed_exact_keys_for_filter(&request.filter) {
-            let key_refs = keys
-                .iter()
-                .map(|key| TrackedStateKeyRef {
-                    schema_key: &key.schema_key,
-                    file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
-                })
-                .collect::<Vec<_>>();
-            load_packed_current_base_exact(
-                &self.store,
-                branch_id,
-                generation,
-                active_checkpoint_commit_id,
-                &key_refs,
-                projection,
-                self.transaction_cache.as_deref(),
-            )
-            .await?
-            .into_present_batch()
-            .filter(|_| true, packed_limit)
-        } else {
-            scan_packed_current_base_rows(&self.store, branch_id, generation, request, packed_limit)
-                .await?
-        }
-        .filter(
-            |row| {
-                overlay_commits.is_empty() || {
-                    let identity = (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    );
-                    overlay_commits.get(&identity).is_none_or(|overlay_commit| {
-                        overlay_commit.is_some_and(|overlay_commit| {
-                            row.commit_id()
-                                .is_some_and(|packed_commit| packed_commit > overlay_commit)
-                        })
-                    })
-                }
-            },
-            None,
-        );
-        let packed_commits = if rows.is_empty() {
-            BTreeMap::new()
-        } else {
-            packed_rows
-                .iter()
-                .map(|row| {
-                    (
-                        (
-                            row.schema_key().to_owned(),
-                            row.entity_pk().clone(),
-                            row.file_id().map(str::to_owned),
-                        ),
-                        row.commit_id(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>()
-        };
-        let rows = rows.filter(
-            |row| {
-                packed_commits.is_empty() || {
-                    let identity = (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    );
-                    packed_commits.get(&identity).is_none_or(|packed_commit| {
-                        !packed_commit.is_some_and(|packed_commit| {
-                            row.commit_id()
-                                .is_some_and(|overlay_commit| packed_commit > overlay_commit)
-                        })
-                    })
-                }
-            },
-            None,
-        );
-        // Format plugins cannot publish engine-owned schemas. Do not even
-        // inspect certified semantic manifests for a scan that can only match
-        // engine rows such as file descriptors or blob materializations.
-        let certified_rows = if !request.filter.schema_keys.is_empty()
-            && request
-                .filter
-                .schema_keys
-                .iter()
-                .all(|schema_key| schema_key.starts_with("lix_"))
-        {
-            MaterializedLiveStateBatch::default()
-        } else {
-            scan_certified_entity_batch_rows(
-                &self.store,
-                branch_id,
-                generation,
-                request,
-                if overlay_commits.is_empty() {
-                    request.limit.map(|limit| limit.saturating_sub(rows.len()))
-                } else {
-                    None
-                },
-                self.transaction_cache.as_deref(),
-            )
-            .await?
-            .filter(
-                |row| {
-                    overlay_commits.is_empty() || {
-                        let identity = (
-                            row.schema_key().to_owned(),
-                            row.entity_pk().clone(),
-                            row.file_id().map(str::to_owned),
-                        );
-                        !overlay_commits.contains_key(&identity)
-                    }
-                },
-                None,
-            )
-        };
-        let certified_rows = if certified_rows.is_empty() || packed_rows.is_empty() {
-            certified_rows
-        } else {
-            let packed_identities = packed_rows
-                .iter()
-                .map(|row| {
-                    (
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    )
-                })
-                .collect::<BTreeSet<_>>();
-            certified_rows.filter(
-                |row| {
-                    !packed_identities.contains(&(
-                        row.schema_key().to_owned(),
-                        row.entity_pk().clone(),
-                        row.file_id().map(str::to_owned),
-                    ))
-                },
-                None,
-            )
-        };
-        // A pristine root-backed generation has no possible shadowing winner,
-        // so preserve bounded-read behavior by pushing LIMIT into the tracked
-        // tree. Once any collection control or overlay/base exists, select all
-        // winners first and apply the limit to the final merged batch.
+        // The root owns committed tracked rows; HOT contains only untracked
+        // rows. Resolve winners from those two sources and nowhere else.
         let root_rows = Box::pin(scan_root_current_base_rows_for_merge(
             &self.store,
             branch_id,
             generation,
-            active_checkpoint_commit_id,
             request,
-            rows.len()
-                .saturating_add(packed_rows.len())
-                .saturating_add(certified_rows.len()),
+            rows.len(),
         ))
         .await?;
-        let combined = merge_ordered_live_batches(rows, packed_rows);
-        let combined = merge_ordered_live_batches(combined, root_rows);
-        let rows = merge_ordered_live_batches(combined, certified_rows);
+        let rows = merge_ordered_live_batches(rows, root_rows);
         if request.filter.include_tombstones
             && request.limit.is_none()
             && replaced_generation.is_none()
@@ -4940,7 +2517,6 @@ where
         Box::pin(self.load_projected_live_batch_for_generation_refs(
             branch_id,
             control.generation,
-            control.working_diff_checkpoint_commit_id,
             keys,
             projection,
         ))
@@ -4951,7 +2527,6 @@ where
         &self,
         branch_id: &str,
         generation: CommitId,
-        active_checkpoint_commit_id: Option<CommitId>,
         keys: &[TrackedStateKeyRef<'_>],
         projection: &ChangeRecordProjection,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
@@ -5014,31 +2589,8 @@ where
                 ordinal
             }));
         }
-        let rows = materialize_live_entries(
-            &self.store,
-            entries,
-            *projection,
-            branch_id,
-            active_checkpoint_commit_id,
-        )
-        .await?;
+        let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
 
-        // Certified immutable segments deliberately do not manufacture one
-        // HOT_ROW entry per semantic row. Exact validation reads still need
-        // to observe those identities—for example, a sparse plugin successor
-        // proving that a keyed update or foreign-key target already exists.
-        // Decode the matching segment rows only when the ordinary point-read
-        // index misses, then preserve the original request alignment.
-        let packed = load_packed_current_base_exact(
-            &self.store,
-            branch_id,
-            generation,
-            active_checkpoint_commit_id,
-            keys,
-            *projection,
-            self.transaction_cache.as_deref(),
-        )
-        .await?;
         let root_backed = load_root_current_base_commit(&self.store, branch_id, generation)
             .await?
             .is_some();
@@ -5047,7 +2599,6 @@ where
                 &self.store,
                 branch_id,
                 generation,
-                active_checkpoint_commit_id,
                 keys,
                 *projection,
             ))
@@ -5061,7 +2612,7 @@ where
         let mut resolved = Vec::with_capacity(keys.len());
         for (index, slot) in slots.into_iter().enumerate() {
             let mut row = slot.and_then(|slot| rows.get(slot as usize));
-            for candidate in [packed.row(index), root.row(index)].into_iter().flatten() {
+            for candidate in [root.row(index)].into_iter().flatten() {
                 if row.is_none_or(
                     |current| match (current.commit_id(), candidate.commit_id()) {
                         (Some(current), Some(candidate)) => candidate > current,
@@ -5080,101 +2631,15 @@ where
                 })
             }));
         }
-        let certified_keys = keys
-            .iter()
-            .copied()
-            .zip(&resolved)
-            .filter_map(|(key, row)| {
-                (!key.schema_key.starts_with("lix_") && (root_backed || row.is_none()))
-                    .then_some(key)
-            })
-            .collect::<Vec<_>>();
-        let mut certified_groups = BTreeMap::<(String, Option<String>), Vec<EntityPk>>::new();
-        for key in certified_keys {
-            certified_groups
-                .entry((key.schema_key.to_owned(), key.file_id.map(str::to_owned)))
-                .or_default()
-                .push(key.entity_pk.clone());
-        }
-        let mut certified = MaterializedLiveStateBatch::default();
-        for ((schema_key, file_id), mut entity_pks) in certified_groups {
-            entity_pks.sort_unstable();
-            entity_pks.dedup();
-            let certified_request = TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    schema_keys: vec![schema_key],
-                    entity_pks,
-                    file_ids: vec![file_id.map_or(NullableKeyFilter::Null, |file_id| {
-                        NullableKeyFilter::Value(file_id)
-                    })],
-                    include_tombstones: true,
-                },
-                read_columns: TrackedStateReadColumns {
-                    columns: [
-                        projection.snapshot_content.then_some("snapshot_content"),
-                        projection.metadata.then_some("metadata"),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .map(str::to_owned)
-                    .collect(),
-                },
-                limit: None,
-            };
-            let group = scan_certified_entity_batch_rows(
-                &self.store,
-                branch_id,
-                generation,
-                &certified_request,
-                None,
-                self.transaction_cache.as_deref(),
-            )
-            .await?;
-            certified = merge_ordered_live_batches(certified, group);
-        }
-        let certified_by_identity = certified
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| {
-                (
-                    (
-                        candidate.schema_key().to_owned(),
-                        candidate.entity_pk().clone(),
-                        candidate.file_id().map(str::to_owned),
-                    ),
-                    index,
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
         let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
         let mut combined_slots = Vec::with_capacity(keys.len());
-        for (key, row) in keys.iter().zip(resolved) {
-            let certified_row = certified_by_identity
-                .get(&(
-                    key.schema_key.to_owned(),
-                    key.entity_pk.clone(),
-                    key.file_id.map(str::to_owned),
-                ))
-                .map(|index| certified.row(*index));
-            let row = match (row, certified_row) {
-                (Some(current), Some(candidate)) if candidate.commit_id() > current.commit_id() => {
-                    Some(candidate)
-                }
-                (Some(current), _) => Some(current),
-                (None, candidate) => candidate,
-            };
-            let row = row.filter(|row| {
-                replaced_generation.is_none_or(|control| {
-                    row.commit_id()
-                        .is_some_and(|commit_id| commit_id >= control.active_generation)
-                })
-            });
+        for row in resolved {
             combined_slots.push(
                 row.map(|row| {
                     u32::try_from(builder.push_ref(row, None)).map_err(|_| {
                         LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
-                            "certified exact live-state result exceeds u32 rows",
+                            "exact live-state result exceeds u32 rows",
                         )
                     })
                 })
@@ -5182,13 +2647,6 @@ where
             );
         }
         MaterializedLiveStateExactBatch::new(builder.finish(), combined_slots)
-    }
-
-    pub(crate) async fn working_diff_epoch(
-        &self,
-        branch_id: &str,
-    ) -> Result<Option<TrackedWorkingDiffEpoch>, LixError> {
-        load_tracked_working_diff_epoch(&self.store, branch_id).await
     }
 
     pub(crate) async fn untracked_json_refs(
@@ -5231,34 +2689,24 @@ where
 
     pub(crate) async fn working_diff_for_control(
         &self,
-        branch_id: &str,
+        _branch_id: &str,
         control: BranchHeadControl,
         request: &TrackedStateDiffRequest,
     ) -> Result<Option<TrackedWorkingDiff>, LixError> {
-        let Ok(Some(epoch)) = self.working_diff_epoch(branch_id).await else {
+        let Some(checkpoint_commit_id) = control.working_diff_checkpoint_commit_id else {
             return Ok(None);
         };
-        let generation = epoch.generation;
-        if generation != control.generation
-            || control.working_diff_checkpoint_commit_id != Some(epoch.checkpoint_commit_id)
-        {
-            return Ok(None);
-        }
-        let Some(entries) = hot_working_diff_entries(
-            &self.store,
-            branch_id,
-            epoch.checkpoint_commit_id,
-            generation,
-            epoch.coverage,
-            &request.filter,
-        )
-        .await?
-        else {
-            return Ok(None);
-        };
+        let mut tracked = crate::tracked_state::TrackedStateContext::new().reader(&self.store);
+        let diff = tracked
+            .diff_commits(
+                &checkpoint_commit_id.to_string(),
+                &control.head_commit_id.to_string(),
+                request,
+            )
+            .await?;
         Ok(Some(TrackedWorkingDiff {
-            checkpoint_commit_id: epoch.checkpoint_commit_id,
-            diff: TrackedStateDiff::from_entries(entries),
+            checkpoint_commit_id,
+            diff,
         }))
     }
 
@@ -5266,7 +2714,6 @@ where
         &self,
         branch_id: &str,
         generation: CommitId,
-        active_checkpoint_commit_id: Option<CommitId>,
         schema_key: &str,
         entity_pks: &[EntityPk],
         limit: Option<usize>,
@@ -5278,7 +2725,6 @@ where
             .scan_live_batch_for_generation(
                 branch_id,
                 generation,
-                active_checkpoint_commit_id,
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec![schema_key.to_owned()],
@@ -5314,6 +2760,7 @@ pub(crate) struct HotTrackedSnapshot {
 }
 
 impl HotTrackedSnapshot {
+    #[cfg(test)]
     pub(crate) fn from_materialized_rows(
         tracked_rows: Vec<MaterializedTrackedStateRow>,
     ) -> Result<Self, LixError> {
@@ -5346,7 +2793,6 @@ impl HotTrackedSnapshot {
                     .as_deref()
                     .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
                 columnar_base_coordinate: None,
-                working_diff_baseline: WorkingDiffBaseline::Disabled,
             };
             if rows
                 .insert(identity, Bytes::from(encode_head_value(&value)?))
@@ -5390,476 +2836,7 @@ where
         );
     }
 
-    /// Publishes a transaction-certified ordered insert batch as an immutable
-    /// current-state base without rebuilding row-shaped deltas or absence
-    /// guards.
-    ///
-    /// The commit-delta writer has already proven strict physical-key order
-    /// and assigned every row its direct address. Transaction validation has
-    /// proven that the same complete batch is absent under the branch-control
-    /// snapshot. Walking the prepared identity columns once for schema counts
-    /// is therefore sufficient to publish the existing commit as current
-    /// state.
-    pub(crate) async fn stage_ordered_insert_current_base<'a, I>(
-        &mut self,
-        branch_id: &str,
-        generation: CommitId,
-        new_head: CommitId,
-        rows: I,
-        entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<CommitId, LixError>
-    where
-        I: ExactSizeIterator<Item = (&'a str, &'a EntityPk)> + Clone,
-    {
-        if rows.len() == 0 {
-            return Err(head_value_error(
-                "ordered packed current base requires at least one inserted row",
-            ));
-        }
-        let mut previous = None::<(&str, &EntityPk)>;
-        let mut schema_rows = BTreeMap::<&str, Vec<&EntityPk>>::new();
-        for (schema_key, entity_pk) in rows {
-            if previous.is_some_and(|(previous_schema, previous_entity_pk)| {
-                previous_schema
-                    .cmp(schema_key)
-                    .then_with(|| previous_entity_pk.cmp(entity_pk))
-                    != Ordering::Less
-            }) {
-                return Err(head_value_error(
-                    "ordered packed current-base identities are not strictly increasing",
-                ));
-            }
-            previous = Some((schema_key, entity_pk));
-            schema_rows.entry(schema_key).or_default().push(entity_pk);
-        }
-        let schema_increments = schema_rows
-            .into_iter()
-            .map(|(schema_key, entity_pks)| {
-                let live_count = u64::try_from(entity_pks.len())
-                    .map_err(|_| head_value_error("packed current-base row count exceeds u64"))?;
-                Ok((
-                    schema_key,
-                    PackedCollectionIncrement {
-                        live_count,
-                        ordered_identity_digest:
-                            crate::collection_generation::ordered_single_string_identity_digest(
-                                entity_pks,
-                            ),
-                    },
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
-        for schema_key in schema_increments.keys() {
-            if let Some(encoded) =
-                entity_columnar_write_sets.get(&(new_head, (*schema_key).to_string()))
-            {
-                crate::columnar_row_group::stage_row_group_set(
-                    self.writes,
-                    crate::live_state::entity_row_group_set_id(new_head, schema_key),
-                    encoded,
-                )?;
-            }
-        }
-        self.stage_packed_insert_current_base_manifest(
-            branch_id,
-            generation,
-            new_head,
-            schema_increments,
-            working_diff_capture_checkpoint_commit_id,
-            coverage,
-        )
-        .await
-    }
-
-    /// Publishes an already authenticated lossless columnar mutation set as
-    /// the immutable current-state base. The mutation inventory has already
-    /// walked the strictly ordered identities and sealed their digest, so
-    /// repeating that O(rows) work here would create a second physical-layout
-    /// authority and a large transient pointer index.
-    pub(crate) async fn stage_certified_columnar_insert_current_base(
-        &mut self,
-        branch_id: &str,
-        generation: CommitId,
-        new_head: CommitId,
-        parts: &crate::tracked_state::ColumnarMutationPartSet,
-        lifecycle: &crate::tracked_state::CommitDeltaLifecycleSummary,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<CommitId, LixError> {
-        if parts.owner_commit_id != *new_head.as_uuid().as_bytes()
-            || parts.row_count == 0
-            || lifecycle.scope.schema_key != parts.schema_key
-            || lifecycle.scope.file_id.is_some()
-            || lifecycle.uniform_created_at != parts.uniform_created_at
-        {
-            return Err(head_value_error(
-                "certified columnar current base disagrees with mutation authority",
-            ));
-        }
-        let schema_increments = BTreeMap::from([(
-            parts.schema_key.as_str(),
-            PackedCollectionIncrement {
-                live_count: u64::from(parts.row_count),
-                ordered_identity_digest: Some(lifecycle.ordered_identity_digest),
-            },
-        )]);
-        self.stage_packed_insert_current_base_manifest(
-            branch_id,
-            generation,
-            new_head,
-            schema_increments,
-            working_diff_capture_checkpoint_commit_id,
-            coverage,
-        )
-        .await
-    }
-
-    /// Publishes a commit whose ordered deltas replace every live member of
-    /// one tracked, unfiled collection as a new packed base segment.
-    ///
-    /// Packed bases shared by other schemas remain available. Bases indexed
-    /// as exclusive to this schema are superseded completely and retired, so
-    /// repeated replacements retain the single-base read shape.
-    pub(crate) async fn stage_complete_collection_replacement_current_base(
-        &mut self,
-        branch_id: &str,
-        generation: CommitId,
-        new_head: CommitId,
-        schema_key: &str,
-        row_count: usize,
-        entity_columnar_write_sets: &crate::live_state::EntityColumnarWriteSets,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<(CommitId, bool), LixError> {
-        let row_count = u64::try_from(row_count)
-            .map_err(|_| head_value_error("packed replacement row count exceeds u64"))?;
-        if row_count == 0 {
-            return Err(head_value_error(
-                "packed collection replacement requires at least one row",
-            ));
-        }
-        let control = load_hot_collection_control(
-            self.store,
-            branch_id,
-            generation,
-            crate::collection_generation::CollectionScopeRef {
-                schema_key,
-                file_id: None,
-            },
-        )
-        .await?;
-        let live_count = if control.live_count == DEFERRED_ROOT_LIVE_COUNT {
-            let reader = HotStateStoreReader {
-                store: &*self.store,
-                transaction_cache: None,
-            };
-            reader
-                .exact_collection_live_count(
-                    branch_id,
-                    generation,
-                    crate::collection_generation::CollectionScopeRef {
-                        schema_key,
-                        file_id: None,
-                    },
-                )
-                .await?
-        } else {
-            control.live_count
-        };
-        if live_count != row_count {
-            return Err(head_value_error(format!(
-                "packed collection replacement expected {row_count} live rows in '{schema_key}', found {}",
-                live_count
-            )));
-        }
-
-        let replaced =
-            packed_exclusive_schema_base_refs(self.store, branch_id, generation, schema_key)
-                .await?;
-        if replaced
-            .iter()
-            .any(|base_ref| base_ref.commit_id == new_head)
-        {
-            return Err(head_value_error(
-                "packed collection replacement must publish a new commit",
-            ));
-        }
-        let mut manifest_key = hot_scope_prefix(branch_id, generation);
-        manifest_key.reserve(16);
-        manifest_key.extend_from_slice(new_head.as_uuid().as_bytes());
-        let expected_checkpoint = working_diff_capture_checkpoint_commit_id
-            .map_or([0; 16], |checkpoint| *checkpoint.as_uuid().as_bytes());
-        if replaced.is_empty() {
-            if working_diff_capture_checkpoint_commit_id.is_some() {
-                coverage
-                    .add_encoded_group_key(&manifest_key)
-                    .ok_or_else(|| {
-                        head_value_error("packed current-base diff count exceeds u64")
-                    })?;
-            }
-        } else {
-            let base_keys = replaced
-                .iter()
-                .map(|base_ref| {
-                    let mut key = hot_scope_prefix(branch_id, generation);
-                    key.reserve(16);
-                    key.extend_from_slice(base_ref.commit_id.as_uuid().as_bytes());
-                    StorageKey(Bytes::from(key))
-                })
-                .collect::<Vec<_>>();
-            let base_values = PointReadPlan::new(PACKED_CURRENT_BASE_SPACE, &base_keys)
-                .materialize(self.store, StorageGetOptions::default())
-                .await?
-                .value;
-            for ((base_ref, base_key), value) in replaced.iter().zip(&base_keys).zip(base_values) {
-                let value = value.ok_or_else(|| {
-                    head_value_error(
-                        "exclusive-schema index references an inactive packed current base",
-                    )
-                })?;
-                if full_value_bytes(value)?.as_ref() != expected_checkpoint {
-                    return Err(head_value_error(
-                        "packed collection replacement has a different working-diff owner",
-                    ));
-                }
-                if working_diff_capture_checkpoint_commit_id.is_some() {
-                    coverage
-                        .remove_encoded_group_key(&base_key.0)
-                        .ok_or_else(|| {
-                            head_value_error("packed current-base diff coverage underflow")
-                        })?;
-                }
-                self.writes
-                    .delete(PACKED_CURRENT_BASE_SPACE, base_key.clone());
-                self.writes.delete(
-                    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-                    StorageKey(base_ref.index_key.clone()),
-                );
-            }
-            if working_diff_capture_checkpoint_commit_id.is_some() {
-                coverage
-                    .add_encoded_group_key(&manifest_key)
-                    .ok_or_else(|| {
-                        head_value_error("packed current-base diff count exceeds u64")
-                    })?;
-            }
-        }
-        if let Some(encoded) = entity_columnar_write_sets.get(&(new_head, schema_key.to_string())) {
-            crate::columnar_row_group::stage_row_group_set(
-                self.writes,
-                crate::live_state::entity_row_group_set_id(new_head, schema_key),
-                encoded,
-            )?;
-        }
-        self.writes.put(
-            PACKED_CURRENT_BASE_SPACE,
-            StorageKey(Bytes::from(manifest_key)),
-            StorageValue {
-                bytes: Bytes::copy_from_slice(&expected_checkpoint),
-            },
-        );
-        stage_packed_exclusive_schema_base_ref(
-            self.writes,
-            branch_id,
-            generation,
-            schema_key,
-            new_head,
-        );
-        self.writes.put(
-            PACKED_CURRENT_BASE_CONTROL_SPACE,
-            StorageKey(Bytes::from(hot_scope_prefix(branch_id, generation))),
-            StorageValue {
-                bytes: Bytes::from_static(&[1]),
-            },
-        );
-        Ok((generation, !replaced.is_empty()))
-    }
-
-    /// Publishes validated, tracked, unfiled creates as an immutable base.
-    ///
-    /// The commit-delta plane already owns the sorted identities and payloads,
-    /// so manufacturing an equivalent HOT value and backend mutation for every
-    /// row is pure write amplification. This path retains only collection
-    /// counts plus one generation-to-commit reference. Ordinary mutations
-    /// continue to shadow the base through HOT rows.
-    pub(crate) async fn stage_packed_insert_current_base(
-        &mut self,
-        branch_id: &str,
-        generation: CommitId,
-        new_head: CommitId,
-        deltas: &[CurrentStateDeltaRef<'_>],
-        absence_guards: &[TrackedStateKeyRef<'_>],
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<CommitId, LixError> {
-        if deltas.is_empty() || deltas.len() != absence_guards.len() {
-            return Err(head_value_error(
-                "packed current base requires one absence proof per inserted row",
-            ));
-        }
-        let mut sorted = deltas.iter().collect::<Vec<_>>();
-        for delta in &sorted {
-            delta.validate()?;
-            if delta.untracked
-                || delta.deleted
-                || delta.file_id.is_some()
-                || delta.commit_id != Some(new_head)
-                || delta.change_id.is_none()
-            {
-                return Err(head_value_error(
-                    "packed current base accepts only live tracked unfiled creates",
-                ));
-            }
-        }
-        sorted.sort_unstable_by(|left, right| compare_hot_deltas(left, right));
-        if sorted
-            .windows(2)
-            .any(|pair| compare_hot_deltas(pair[0], pair[1]).is_eq())
-        {
-            return Err(current_state_duplicate_delta_error(sorted[1]));
-        }
-        let mut guarded = absence_guards
-            .iter()
-            .map(|guard| (guard.schema_key, guard.entity_pk, guard.file_id))
-            .collect::<Vec<_>>();
-        guarded.sort_unstable();
-        if sorted
-            .iter()
-            .map(|delta| (delta.schema_key, delta.entity_pk, delta.file_id))
-            .ne(guarded)
-        {
-            return Err(head_value_error(
-                "packed current base rows do not exactly match their validated absence proofs",
-            ));
-        }
-
-        let mut schema_rows = BTreeMap::<&str, Vec<&EntityPk>>::new();
-        for delta in &sorted {
-            schema_rows
-                .entry(delta.schema_key)
-                .or_default()
-                .push(delta.entity_pk);
-        }
-        let schema_increments = schema_rows
-            .into_iter()
-            .map(|(schema_key, entity_pks)| {
-                let live_count = u64::try_from(entity_pks.len())
-                    .map_err(|_| head_value_error("packed current-base row count exceeds u64"))?;
-                Ok((
-                    schema_key,
-                    PackedCollectionIncrement {
-                        live_count,
-                        ordered_identity_digest:
-                            crate::collection_generation::ordered_single_string_identity_digest(
-                                entity_pks,
-                            ),
-                    },
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
-        self.stage_packed_insert_current_base_manifest(
-            branch_id,
-            generation,
-            new_head,
-            schema_increments,
-            working_diff_capture_checkpoint_commit_id,
-            coverage,
-        )
-        .await
-    }
-
-    async fn stage_packed_insert_current_base_manifest(
-        &mut self,
-        branch_id: &str,
-        generation: CommitId,
-        new_head: CommitId,
-        schema_increments: BTreeMap<&str, PackedCollectionIncrement>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<CommitId, LixError> {
-        let exclusive_schema_key = (schema_increments.len() == 1).then(|| {
-            *schema_increments
-                .keys()
-                .next()
-                .expect("one schema increment")
-        });
-        let mut manifest_key = hot_scope_prefix(branch_id, generation);
-        manifest_key.reserve(16);
-        manifest_key.extend_from_slice(new_head.as_uuid().as_bytes());
-        if working_diff_capture_checkpoint_commit_id.is_some() {
-            coverage
-                .add_encoded_group_key(&manifest_key)
-                .ok_or_else(|| head_value_error("packed current-base diff count exceeds u64"))?;
-        }
-
-        let scopes = schema_increments
-            .keys()
-            .map(
-                |schema_key| crate::collection_generation::CollectionScopeRef {
-                    schema_key,
-                    file_id: None,
-                },
-            )
-            .collect::<Vec<_>>();
-        let controls =
-            load_hot_collection_controls(self.store, branch_id, generation, &scopes).await?;
-        for ((schema_key, increment), mut control) in schema_increments.into_iter().zip(controls) {
-            let was_empty = control.live_count == 0;
-            if control.live_count == DEFERRED_ROOT_LIVE_COUNT {
-                control.ordered_identity_digest = None;
-            } else {
-                control.live_count = control
-                    .live_count
-                    .checked_add(increment.live_count)
-                    .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
-                control.ordered_identity_digest = if was_empty {
-                    increment.ordered_identity_digest
-                } else {
-                    None
-                };
-            }
-            stage_hot_collection_control(
-                self.writes,
-                branch_id,
-                generation,
-                crate::collection_generation::CollectionScopeRef {
-                    schema_key,
-                    file_id: None,
-                },
-                control,
-            )?;
-        }
-        self.writes.put(
-            PACKED_CURRENT_BASE_SPACE,
-            StorageKey(Bytes::from(manifest_key)),
-            StorageValue {
-                bytes: working_diff_capture_checkpoint_commit_id.map_or_else(
-                    || Bytes::from_static(&[0; 16]),
-                    |checkpoint| Bytes::copy_from_slice(checkpoint.as_uuid().as_bytes()),
-                ),
-            },
-        );
-        if let Some(schema_key) = exclusive_schema_key {
-            stage_packed_exclusive_schema_base_ref(
-                self.writes,
-                branch_id,
-                generation,
-                schema_key,
-                new_head,
-            );
-        }
-        self.writes.put(
-            PACKED_CURRENT_BASE_CONTROL_SPACE,
-            StorageKey(Bytes::from(hot_scope_prefix(branch_id, generation))),
-            StorageValue {
-                bytes: Bytes::from_static(&[1]),
-            },
-        );
-        Ok(generation)
-    }
-
+    /// Publishes a transaction-certified ordered insert batch as immutable Arrow state.
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn stage_commit(
         &mut self,
@@ -5874,9 +2851,8 @@ where
             .iter()
             .map(TrackedHeadDeltaRef::as_current)
             .collect::<Vec<_>>();
-        let mut coverage = WorkingDiffIndexCoverage::default();
         let generation = self
-            .stage_current_state_with_working_diff(
+            .stage_current_state(
                 branch_id,
                 parent_generation,
                 new_head,
@@ -5884,8 +2860,6 @@ where
                 absence_guards,
                 parent_rows,
                 None,
-                None,
-                &mut coverage,
             )
             .await?;
         #[cfg(test)]
@@ -5893,38 +2867,8 @@ where
         Ok(generation)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn stage_commit_with_working_diff(
-        &mut self,
-        branch_id: &str,
-        parent_generation: Option<CommitId>,
-        new_head: CommitId,
-        deltas: &[TrackedHeadDeltaRef<'_>],
-        absence_guards: &BTreeSet<TrackedStateKey>,
-        parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<CommitId, LixError> {
-        let deltas = deltas
-            .iter()
-            .map(TrackedHeadDeltaRef::as_current)
-            .collect::<Vec<_>>();
-        self.stage_current_state_with_working_diff(
-            branch_id,
-            parent_generation,
-            new_head,
-            &deltas,
-            absence_guards,
-            parent_rows,
-            None,
-            working_diff_capture_checkpoint_commit_id,
-            coverage,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn stage_current_state_with_working_diff(
+    pub(crate) async fn stage_current_state(
         &mut self,
         branch_id: &str,
         parent_generation: Option<CommitId>,
@@ -5933,10 +2877,8 @@ where
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
         preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
-        self.stage_current_state_with_working_diff_inner(
+        self.stage_current_state_inner(
             branch_id,
             parent_generation,
             new_head,
@@ -5945,130 +2887,19 @@ where
             absence_guards,
             parent_rows,
             preserved_untracked_rows,
-            working_diff_capture_checkpoint_commit_id,
-            coverage,
             false,
             None,
             None,
-            false,
             &BTreeMap::new(),
         )
         .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn stage_current_state_with_certified_predecessors(
-        &mut self,
-        branch_id: &str,
-        parent_generation: Option<CommitId>,
-        new_head: CommitId,
-        deltas: &[CurrentStateDeltaRef<'_>],
-        durable_predecessors: &[CertifiedCurrentStatePredecessorRef<'_>],
-        absence_guards: &BTreeSet<TrackedStateKey>,
-        parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
-        preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<CommitId, LixError> {
-        self.stage_current_state_with_working_diff_inner(
-            branch_id,
-            parent_generation,
-            new_head,
-            deltas,
-            durable_predecessors,
-            absence_guards,
-            parent_rows,
-            preserved_untracked_rows,
-            working_diff_capture_checkpoint_commit_id,
-            coverage,
-            false,
-            None,
-            None,
-            false,
-            &BTreeMap::new(),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn stage_current_state_with_certified_counts(
-        &mut self,
-        branch_id: &str,
-        parent_generation: Option<CommitId>,
-        new_head: CommitId,
-        deltas: &[CurrentStateDeltaRef<'_>],
-        absence_guards: &BTreeSet<TrackedStateKey>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
-        certified_live_increments: &BTreeMap<(String, Option<String>), u64>,
-    ) -> Result<CommitId, LixError> {
-        self.stage_current_state_with_working_diff_inner(
-            branch_id,
-            parent_generation,
-            new_head,
-            deltas,
-            &[],
-            absence_guards,
-            None,
-            None,
-            working_diff_capture_checkpoint_commit_id,
-            coverage,
-            false,
-            None,
-            None,
-            false,
-            certified_live_increments,
-        )
-        .await
-    }
-
-    /// Publishes a checkpoint into the already-visible generation.
-    ///
-    /// The checkpoint selected refs are the complete dirty set for the
-    /// interval. Rewriting only those rows to `Clean` starts the next epoch
-    /// without copying every unchanged HOT row into a fresh generation.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn stage_checkpoint_current_state(
-        &mut self,
-        branch_id: &str,
-        generation: CommitId,
-        new_head: CommitId,
-        deltas: &[CurrentStateDeltaRef<'_>],
-        absence_guards: &BTreeSet<TrackedStateKey>,
-        checkpoint_commit_id: CommitId,
-        coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<CommitId, LixError> {
-        let generation = self
-            .stage_current_state_with_working_diff_inner(
-                branch_id,
-                Some(generation),
-                new_head,
-                deltas,
-                &[],
-                absence_guards,
-                None,
-                None,
-                Some(checkpoint_commit_id),
-                coverage,
-                false,
-                None,
-                None,
-                true,
-                &BTreeMap::new(),
-            )
-            .await?;
-        // The checkpoint has now materialized the complete dirty set as HOT
-        // rows. Keeping the immutable packed inputs active would make every
-        // later read revisit checkpointed history within the same generation.
-        stage_retire_packed_current_bases(self.store, self.writes, branch_id, generation).await?;
-        Ok(generation)
     }
 
     /// Stages deltas whose absence was already validated against the coherent
     /// transaction snapshot. The caller must publish the corresponding branch
     /// control with a compare-and-swap precondition from that same snapshot.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn stage_validated_insert_current_state_with_working_diff(
+    pub(crate) async fn stage_validated_insert_current_state(
         &mut self,
         branch_id: &str,
         parent_generation: Option<CommitId>,
@@ -6077,8 +2908,6 @@ where
         absence_guards: &[TrackedStateKeyRef<'_>],
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
         preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
         validated_absent_file_id: Option<&str>,
     ) -> Result<CommitId, LixError> {
         if parent_generation.is_none() {
@@ -6091,7 +2920,7 @@ where
                 })
                 .collect::<BTreeSet<_>>();
             return self
-                .stage_current_state_with_working_diff_inner(
+                .stage_current_state_inner(
                     branch_id,
                     parent_generation,
                     new_head,
@@ -6100,18 +2929,15 @@ where
                     &owned_guards,
                     parent_rows,
                     preserved_untracked_rows,
-                    working_diff_capture_checkpoint_commit_id,
-                    coverage,
                     true,
                     validated_absent_file_id,
                     None,
-                    false,
                     &BTreeMap::new(),
                 )
                 .await;
         }
         let no_owned_guards = BTreeSet::new();
-        self.stage_current_state_with_working_diff_inner(
+        self.stage_current_state_inner(
             branch_id,
             parent_generation,
             new_head,
@@ -6120,19 +2946,16 @@ where
             &no_owned_guards,
             parent_rows,
             preserved_untracked_rows,
-            working_diff_capture_checkpoint_commit_id,
-            coverage,
             true,
             validated_absent_file_id,
             Some(absence_guards),
-            false,
             &BTreeMap::new(),
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn stage_current_state_with_working_diff_inner(
+    async fn stage_current_state_inner(
         &mut self,
         branch_id: &str,
         parent_generation: Option<CommitId>,
@@ -6142,12 +2965,9 @@ where
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
         preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
         absence_guards_validated: bool,
         validated_absent_file_id: Option<&str>,
         borrowed_absence_guards: Option<&[TrackedStateKeyRef<'_>]>,
-        reset_working_diff_baselines: bool,
         certified_live_increments: &BTreeMap<(String, Option<String>), u64>,
     ) -> Result<CommitId, LixError> {
         let generation = parent_generation.unwrap_or(new_head);
@@ -6233,8 +3053,6 @@ where
                 preserved_untracked_rows.unwrap_or_default(),
                 &sorted,
                 absence_guards,
-                working_diff_capture_checkpoint_commit_id,
-                coverage,
             )?;
             return Ok(generation);
         }
@@ -6283,7 +3101,6 @@ where
                 }
             })
             .collect::<Vec<_>>();
-        let mut previous_from_packed = vec![false; previous_values.len()];
         debug_assert_eq!(loaded_previous_values.len(), 0);
         let packed_previous_indices = durable_previous_values
             .iter()
@@ -6301,53 +3118,6 @@ where
                 }
             })
             .collect::<Vec<_>>();
-        let packed_previous = Box::pin(load_packed_current_base_exact_entries(
-            self.store,
-            branch_id,
-            generation,
-            &packed_previous_keys,
-            None,
-        ))
-        .await?;
-        for (index, packed_previous) in packed_previous_indices.iter().copied().zip(packed_previous)
-        {
-            let previous = &mut previous_values[index];
-            let Some((packed_value, _, base_coordinate)) = &packed_previous else {
-                continue;
-            };
-            let packed_is_newer = match (
-                previous
-                    .as_ref()
-                    .map(CertifiedCurrentStatePredecessor::view)
-                    .transpose()?,
-                Some(packed_value.commit_id),
-            ) {
-                (None, Some(_)) => true,
-                (Some(previous), Some(packed)) => {
-                    previous.commit_id.is_some_and(|previous| packed > previous)
-                }
-                _ => false,
-            };
-            if !packed_is_newer {
-                continue;
-            }
-            previous_from_packed[index] = true;
-            *previous = Some(CertifiedCurrentStatePredecessor::Packed(PackedHeadValue {
-                change_id: packed_value.change_id,
-                commit_id: packed_value.commit_id,
-                deleted: packed_value.deleted,
-                created_at: packed_value.created_at,
-                updated_at: packed_value.updated_at,
-                checkpoint_commit_id: working_diff_capture_checkpoint_commit_id,
-                columnar_base_coordinate: base_coordinate.map(|coordinate| {
-                    ColumnarBaseCoordinate {
-                        base_commit_id: coordinate.base_commit_id,
-                        group_index: coordinate.group_index,
-                        row_index: coordinate.row_index,
-                    }
-                }),
-            }));
-        }
         let root_previous = if load_root_current_base_commit(self.store, branch_id, generation)
             .await?
             .is_some()
@@ -6356,7 +3126,6 @@ where
                 self.store,
                 branch_id,
                 generation,
-                working_diff_capture_checkpoint_commit_id,
                 &packed_previous_keys,
                 ChangeRecordProjection::identity_only(),
             ))
@@ -6387,7 +3156,6 @@ where
                     })
                 });
             if candidate_is_newer {
-                previous_from_packed[index] = true;
                 previous_values[index] = candidate.durable_predecessor().cloned();
             }
         }
@@ -6472,61 +3240,8 @@ where
                     &mut retired_untracked_json_refs,
                 );
             }
-            created_ats.push(if reset_working_diff_baselines && !delta.untracked {
-                // Checkpoint selection canonicalizes newly added rows to the
-                // changelog timestamp and preserves the original timestamp
-                // for modified/removed rows.
-                delta.created_at
-            } else {
-                existing.created_at
-            });
+            created_ats.push(existing.created_at);
         }
-        // A checkpoint often selects immutable change records whose HOT row
-        // is already the exact authoritative value. Re-publishing those rows
-        // only changes the row-local dirty marker and commit ownership, even
-        // though the checkpoint delta already records historical membership.
-        //
-        // Retain only a provably identical row whose baseline is already
-        // clean. A dirty identical row still needs one compacting rewrite to
-        // discard its stale before-image; a squashed selection has a new
-        // change ID and must likewise be written so canonical timestamps and
-        // payload ownership match historical rebuilds.
-        let (sorted, previous_values, created_ats) = if reset_working_diff_baselines {
-            let mut retained_deltas = Vec::with_capacity(sorted.len());
-            let mut retained_previous = Vec::with_capacity(previous_values.len());
-            let mut retained_created_ats = Vec::with_capacity(created_ats.len());
-            for (((delta, previous), created_at), previous_from_packed) in sorted
-                .into_iter()
-                .zip(previous_values)
-                .zip(created_ats)
-                .zip(previous_from_packed)
-            {
-                let identical_immutable_change = !previous_from_packed
-                    && !delta.untracked
-                    && delta.schema_key
-                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-                    && previous
-                        .as_ref()
-                        .map(CertifiedCurrentStatePredecessor::view)
-                        .transpose()?
-                        .is_some_and(|value| {
-                            value.change_id == delta.change_id
-                                && value.deleted == delta.deleted
-                                && value.created_at == delta.created_at
-                                && value.updated_at == delta.updated_at
-                                && value.working_diff_baseline == WorkingDiffBaseline::Clean
-                        });
-                if identical_immutable_change {
-                    continue;
-                }
-                retained_deltas.push(delta);
-                retained_previous.push(previous);
-                retained_created_ats.push(created_at);
-            }
-            (retained_deltas, retained_previous, retained_created_ats)
-        } else {
-            (sorted, previous_values, created_ats)
-        };
         let identities = encode_hot_mutation_identities(branch_id, generation, &sorted);
         let unmatched_guards = if absence_guards_validated || absence_guards.is_empty() {
             BTreeSet::new()
@@ -6547,30 +3262,6 @@ where
         };
         reject_hot_absence_guards(self.store, branch_id, generation, &unmatched_guards).await?;
 
-        // Build every fallible output before mutating the write set. The
-        // required primary-row batch above now supplies both mutation
-        // validation and the checkpoint first-before decision.  `HOT_DIFF`
-        // is an empty dirty-key index, so there is deliberately no second
-        // point-read batch against it here.
-        let mut next_coverage = *coverage;
-        let diff_scope = working_diff_capture_checkpoint_commit_id.map(|checkpoint_commit_id| {
-            encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation)
-        });
-        let diff_key_capacity = diff_scope.as_deref().map_or(0, |scope| {
-            sorted
-                .iter()
-                .try_fold(0_usize, |total, delta| {
-                    total.checked_add(encoded_hot_identity_key_len(
-                        scope.len(),
-                        delta.schema_key,
-                        delta.entity_pk,
-                        delta.file_id,
-                    )?)
-                })
-                .unwrap_or(0)
-        });
-        let mut diff_key_bytes = Vec::with_capacity(diff_key_capacity);
-        let mut diff_puts = Vec::with_capacity(diff_scope.as_ref().map_or(0, |_| sorted.len()));
         let next_value_capacity = sorted
             .iter()
             .zip(&previous_values)
@@ -6582,12 +3273,7 @@ where
                         .columnar_base_coordinate
                         .is_some()
                 });
-                checked_add_hot_next_value_capacity(
-                    total,
-                    delta,
-                    working_diff_capture_checkpoint_commit_id.is_some(),
-                    inherited_coordinate,
-                )
+                checked_add_hot_next_value_capacity(total, delta, inherited_coordinate)
             })
             // Preserve the encoder's fallible behavior for impossible input:
             // overflow must not turn into an attempted `usize::MAX`
@@ -6605,56 +3291,12 @@ where
             for (delta, (created_at, previous)) in
                 sorted.iter().zip(created_ats.iter().zip(&previous_values))
             {
-                // Ordinary commits have no active checkpoint, so their baseline
-                // is always disabled. Do not decode the row a second time merely
-                // to rediscover that fact; the first decode above already handled
-                // retention validation and `created_at` preservation.
-                let (working_diff_baseline, newly_dirty) = if reset_working_diff_baselines
-                    && !delta.untracked
-                {
-                    (WorkingDiffBaseline::Clean, false)
-                } else if working_diff_capture_checkpoint_commit_id.is_some() && !delta.untracked {
-                    let previous = previous
-                        .as_ref()
-                        .map(CertifiedCurrentStatePredecessor::view)
-                        .transpose()?;
-                    next_hot_working_diff_baseline(
-                        working_diff_capture_checkpoint_commit_id,
-                        delta,
-                        previous,
-                    )?
-                } else {
-                    (WorkingDiffBaseline::Disabled, false)
-                };
-                if newly_dirty {
-                    let key = append_hot_diff_key_parts(
-                        &mut diff_key_bytes,
-                        diff_scope
-                            .as_deref()
-                            .expect("a newly dirty hot row requires an active checkpoint"),
-                        delta.schema_key,
-                        delta.entity_pk,
-                        delta.file_id,
-                    );
-                    next_coverage
-                        .add_encoded_group_key(&diff_key_bytes[key.clone()])
-                        .ok_or_else(|| {
-                            head_value_error("hot working-diff index count exceeds u64")
-                        })?;
-                    diff_puts.push(EncodedPut {
-                        key: buffer_range(&key),
-                        value: BufferRange::default(),
-                    });
-                }
                 next_value_ranges.push(if delta.physically_deletes() {
                     None
                 } else {
-                    let mut value = delta.value_ref(*created_at, working_diff_baseline);
-                    value.columnar_base_coordinate = next_columnar_base_coordinate(
-                        reset_working_diff_baselines,
-                        delta,
-                        previous.as_ref(),
-                    )?;
+                    let mut value = delta.value_ref(*created_at);
+                    value.columnar_base_coordinate =
+                        next_columnar_base_coordinate(delta, previous.as_ref())?;
                     Some(append_head_value(&mut next_value_bytes, &value)?)
                 });
             }
@@ -6671,12 +3313,6 @@ where
         )?;
 
         async {
-            stage_hot_diff_batch(
-                self.writes,
-                diff_scope.as_deref().unwrap_or_default(),
-                diff_key_bytes,
-                diff_puts,
-            )?;
             stage_hot_mutation_batch(self.writes, identities, next_value_bytes, next_value_ranges);
             stage_incremental_file_delete_cascades(
                 self.store,
@@ -6684,9 +3320,6 @@ where
                 branch_id,
                 generation,
                 &sorted,
-                working_diff_capture_checkpoint_commit_id,
-                reset_working_diff_baselines,
-                &mut next_coverage,
                 &mut retired_untracked_json_refs,
             )
             .await
@@ -6702,7 +3335,6 @@ where
                 .into_iter()
                 .map(JsonRef::from_hash_bytes),
         );
-        *coverage = next_coverage;
         Ok(generation)
     }
 
@@ -6716,7 +3348,7 @@ where
     /// identity in the same atomic publication.  Every other retention
     /// collision fails before the new control can become visible.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn stage_complete_current_state_with_working_diff(
+    pub(crate) async fn stage_complete_current_state(
         &mut self,
         branch_id: &str,
         generation: CommitId,
@@ -6725,8 +3357,6 @@ where
         tracked_deltas: &[CurrentStateDeltaRef<'_>],
         untracked_deltas: &[CurrentStateDeltaRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<(HotTrackedSnapshot, BTreeSet<String>), LixError> {
         let mut rows = parent_tracked.rows;
         let mut untracked_rows = match preserved_untracked_generation {
@@ -6759,17 +3389,6 @@ where
             )?;
         }
 
-        // A replacement generation cannot inherit a checkpoint baseline from
-        // its source: that before image belongs to the retired generation.
-        // The one exception is publishing the checkpoint itself, where every
-        // final tracked row is the clean baseline by definition.
-        let tracked_baseline = if working_diff_capture_checkpoint_commit_id.is_some() {
-            WorkingDiffBaseline::Clean
-        } else {
-            WorkingDiffBaseline::Disabled
-        };
-        normalize_complete_hot_snapshot_baselines(&mut rows, tracked_baseline)?;
-
         let mut final_tracked = BTreeMap::new();
         let mut schema_keys = BTreeSet::new();
         for (identity, bytes) in &rows {
@@ -6787,7 +3406,6 @@ where
                 .into_iter()
                 .map(JsonRef::from_hash_bytes),
         );
-        *coverage = WorkingDiffIndexCoverage::default();
         Ok((
             HotTrackedSnapshot {
                 rows: final_tracked,
@@ -6797,16 +3415,12 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn stage_incremental_file_delete_cascades(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     branch_id: &str,
     generation: CommitId,
     deltas: &[&CurrentStateDeltaRef<'_>],
-    working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-    reset_working_diff_baselines: bool,
-    coverage: &mut WorkingDiffIndexCoverage,
     retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<(), LixError> {
     let mut cascades = BTreeMap::<String, &CurrentStateDeltaRef<'_>>::new();
@@ -6847,35 +3461,13 @@ async fn stage_incremental_file_delete_cascades(
             total.checked_add(key_len)
         })
         .unwrap_or(0);
-    let mut mutations = HotCascadeMutationBuffers::with_capacity(
-        identities.len(),
-        key_capacity,
-        working_diff_capture_checkpoint_commit_id.is_some(),
-    );
-    let diff_scope = working_diff_capture_checkpoint_commit_id.map(|checkpoint_commit_id| {
-        encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation)
-    });
-    let diff_key_capacity = diff_scope.as_deref().map_or(0, |scope| {
-        identities
-            .iter()
-            .try_fold(0_usize, |total, identity| {
-                total.checked_add(encoded_hot_identity_key_len(
-                    scope.len(),
-                    &identity.schema_key,
-                    &identity.entity_pk,
-                    identity.file_id.as_deref(),
-                )?)
-            })
-            .unwrap_or(0)
-    });
-    let mut diff_key_bytes = Vec::with_capacity(diff_key_capacity);
-    let mut diff_puts = Vec::with_capacity(diff_scope.as_ref().map_or(0, |_| identities.len()));
+    let mut mutations = HotCascadeMutationBuffers::with_capacity(identities.len(), key_capacity);
     for (identity, previous) in identities.into_iter().zip(values) {
         let row_identity = identity.clone().into_row_identity();
         if explicit.contains(&row_identity) {
             continue;
         }
-        let cascade = cascades
+        let _cascade = cascades
             .get(
                 identity
                     .file_id
@@ -6889,7 +3481,7 @@ async fn stage_incremental_file_delete_cascades(
             ));
         };
         let existing = decode_head_value(&previous)?;
-        if (cascade.untracked && !existing.untracked) || existing.deleted {
+        if !existing.untracked || existing.deleted {
             continue;
         }
         let row_start = mutations.key_bytes.len();
@@ -6902,61 +3494,9 @@ async fn stage_incremental_file_delete_cascades(
         write_file_id(&mut mutations.key_bytes, identity.file_id.as_deref());
         write_entity_pk(&mut mutations.key_bytes, &identity.entity_pk);
         let row_key = BufferRange::new(row_start, mutations.key_bytes.len() - row_start);
-        if existing.untracked {
-            collect_hot_untracked_refs(existing, retired_untracked_json_refs);
-            mutations.row_deletes.push(row_key);
-            continue;
-        }
-        let (baseline, newly_dirty) = if reset_working_diff_baselines {
-            (WorkingDiffBaseline::Clean, false)
-        } else {
-            next_cascade_working_diff_baseline(working_diff_capture_checkpoint_commit_id, existing)?
-        };
-        if newly_dirty {
-            let key = append_hot_diff_key_parts(
-                &mut diff_key_bytes,
-                diff_scope
-                    .as_deref()
-                    .expect("new cascade dirty row requires active checkpoint"),
-                &identity.schema_key,
-                &identity.entity_pk,
-                identity.file_id.as_deref(),
-            );
-            coverage
-                .add_encoded_group_key(&diff_key_bytes[key.clone()])
-                .ok_or_else(|| head_value_error("hot working-diff index count exceeds u64"))?;
-            diff_puts.push(EncodedPut {
-                key: buffer_range(&key),
-                value: BufferRange::default(),
-            });
-        }
-        let value = append_head_value(
-            &mut mutations.value_bytes,
-            &HeadValueRef {
-                change_id: cascade.change_id,
-                commit_id: cascade.commit_id,
-                untracked: false,
-                deleted: true,
-                created_at: existing.created_at,
-                updated_at: cascade.updated_at,
-                snapshot: JsonSlotRef::None,
-                metadata: JsonSlotRef::None,
-                columnar_base_coordinate: existing.columnar_base_coordinate,
-                working_diff_baseline: baseline,
-            },
-        )?;
-        let value = buffer_range(&value);
-        mutations.row_puts.push(EncodedPut {
-            key: row_key,
-            value,
-        });
+        collect_hot_untracked_refs(existing, retired_untracked_json_refs);
+        mutations.row_deletes.push(row_key);
     }
-    stage_hot_diff_batch(
-        writes,
-        diff_scope.as_deref().unwrap_or_default(),
-        diff_key_bytes,
-        diff_puts,
-    )?;
     if !mutations.row_puts.is_empty() || !mutations.row_deletes.is_empty() {
         stage_hot_encoded_mutation_ranges(
             writes,
@@ -6978,15 +3518,9 @@ struct HotCascadeMutationBuffers {
 }
 
 impl HotCascadeMutationBuffers {
-    fn with_capacity(row_capacity: usize, key_capacity: usize, active_checkpoint: bool) -> Self {
-        let checkpoint_bytes = if active_checkpoint {
-            WORKING_DIFF_CHECKPOINT_BYTES + WORKING_DIFF_VERSION_BYTES
-        } else {
-            0
-        };
-        let value_bytes_per_row = HEAD_VALUE_HEADER_BYTES
-            .checked_add(checkpoint_bytes)
-            .and_then(|bytes| bytes.checked_add(COLUMNAR_BASE_COORDINATE_BYTES));
+    fn with_capacity(row_capacity: usize, key_capacity: usize) -> Self {
+        let value_bytes_per_row =
+            HEAD_VALUE_HEADER_BYTES.checked_add(COLUMNAR_BASE_COORDINATE_BYTES);
         let value_capacity = value_bytes_per_row
             .and_then(|value_bytes| row_capacity.checked_mul(value_bytes))
             .unwrap_or(0);
@@ -7010,150 +3544,10 @@ fn incremental_cascade_explicit_index_builds() -> usize {
     INCREMENTAL_CASCADE_EXPLICIT_INDEX_BUILDS.with(std::cell::Cell::get)
 }
 
-fn next_cascade_working_diff_baseline(
-    active_checkpoint_commit_id: Option<CommitId>,
-    previous: HeadValueView<'_>,
-) -> Result<(WorkingDiffBaseline, bool), LixError> {
-    let Some(active_checkpoint_commit_id) = active_checkpoint_commit_id else {
-        return Ok((WorkingDiffBaseline::Disabled, false));
-    };
-    match previous.working_diff_baseline {
-        WorkingDiffBaseline::Clean => {
-            let before = previous
-                .working_diff_version()
-                .ok_or_else(|| head_value_error("tracked cascade member has no version"))?;
-            Ok((
-                WorkingDiffBaseline::BeforePresent {
-                    checkpoint_commit_id: active_checkpoint_commit_id,
-                    version: before,
-                },
-                true,
-            ))
-        }
-        WorkingDiffBaseline::BeforeAbsent {
-            checkpoint_commit_id,
-        } if checkpoint_commit_id == active_checkpoint_commit_id => Ok((
-            WorkingDiffBaseline::BeforeAbsent {
-                checkpoint_commit_id,
-            },
-            false,
-        )),
-        WorkingDiffBaseline::BeforePresent {
-            checkpoint_commit_id,
-            version,
-        } if checkpoint_commit_id == active_checkpoint_commit_id => Ok((
-            WorkingDiffBaseline::BeforePresent {
-                checkpoint_commit_id,
-                version,
-            },
-            false,
-        )),
-        WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. } => {
-            let mut before = previous
-                .working_diff_version()
-                .ok_or_else(|| head_value_error("tracked cascade member has no version"))?;
-            before.commit_id = active_checkpoint_commit_id;
-            Ok((
-                WorkingDiffBaseline::BeforePresent {
-                    checkpoint_commit_id: active_checkpoint_commit_id,
-                    version: before,
-                },
-                true,
-            ))
-        }
-        WorkingDiffBaseline::Disabled => Err(head_value_error(
-            "active checkpoint generation contains a cascade member without a baseline",
-        )),
-    }
-}
-
-/// Selects the baseline for one primary-row mutation and whether the sparse
-/// dirty-key index needs its first entry. The current primary row is already
-/// loaded for retention and insert validation, so this must remain purely
-/// in-memory: adding a `HOT_DIFF` lookup here would recreate the avoidable
-/// second read batch this layout removes.
-fn next_hot_working_diff_baseline(
-    active_checkpoint_commit_id: Option<CommitId>,
-    delta: &CurrentStateDeltaRef<'_>,
-    previous: Option<HeadValueView<'_>>,
-) -> Result<(WorkingDiffBaseline, bool), LixError> {
-    let Some(active_checkpoint_commit_id) = active_checkpoint_commit_id else {
-        return Ok((WorkingDiffBaseline::Disabled, false));
-    };
-    if delta.untracked {
-        return Ok((WorkingDiffBaseline::Disabled, false));
-    }
-    let Some(previous) = previous else {
-        return Ok((
-            WorkingDiffBaseline::BeforeAbsent {
-                checkpoint_commit_id: active_checkpoint_commit_id,
-            },
-            true,
-        ));
-    };
-    if previous.untracked {
-        return Err(head_value_error(
-            "tracked mutation has an untracked primary before image",
-        ));
-    }
-    match previous.working_diff_baseline {
-        WorkingDiffBaseline::Clean => {
-            let before = previous
-                .working_diff_version()
-                .ok_or_else(|| head_value_error("tracked mutation has no working-diff version"))?;
-            Ok((
-                WorkingDiffBaseline::BeforePresent {
-                    checkpoint_commit_id: active_checkpoint_commit_id,
-                    version: before,
-                },
-                true,
-            ))
-        }
-        WorkingDiffBaseline::BeforeAbsent {
-            checkpoint_commit_id,
-        } if checkpoint_commit_id == active_checkpoint_commit_id => Ok((
-            WorkingDiffBaseline::BeforeAbsent {
-                checkpoint_commit_id,
-            },
-            false,
-        )),
-        WorkingDiffBaseline::BeforePresent {
-            checkpoint_commit_id,
-            version,
-        } if checkpoint_commit_id == active_checkpoint_commit_id => Ok((
-            WorkingDiffBaseline::BeforePresent {
-                checkpoint_commit_id,
-                version,
-            },
-            false,
-        )),
-        WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. } => {
-            let mut before = previous
-                .working_diff_version()
-                .ok_or_else(|| head_value_error("tracked mutation has no working-diff version"))?;
-            before.commit_id = active_checkpoint_commit_id;
-            Ok((
-                WorkingDiffBaseline::BeforePresent {
-                    checkpoint_commit_id: active_checkpoint_commit_id,
-                    version: before,
-                },
-                true,
-            ))
-        }
-        WorkingDiffBaseline::Disabled => Err(head_value_error(
-            "active checkpoint generation contains a tracked row without a baseline",
-        )),
-    }
-}
-
 fn next_columnar_base_coordinate(
-    reset_working_diff_baselines: bool,
     delta: &CurrentStateDeltaRef<'_>,
     previous: Option<&CertifiedCurrentStatePredecessor>,
 ) -> Result<Option<ColumnarBaseCoordinate>, LixError> {
-    if reset_working_diff_baselines {
-        return Ok(None);
-    }
     Ok(delta.columnar_base_coordinate.or(previous
         .map(CertifiedCurrentStatePredecessor::view)
         .transpose()?
@@ -7309,7 +3703,7 @@ fn apply_complete_hot_snapshot_delta(
         rows.insert(
             identity,
             Bytes::from(encode_head_value(&{
-                let mut value = delta.value_ref(created_at, WorkingDiffBaseline::Disabled);
+                let mut value = delta.value_ref(created_at);
                 value.columnar_base_coordinate = None;
                 value
             })?),
@@ -7356,7 +3750,6 @@ fn apply_complete_file_delete_cascade(
                 snapshot: JsonSlotRef::None,
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: existing.columnar_base_coordinate,
-                working_diff_baseline: WorkingDiffBaseline::Disabled,
             })?),
         );
     }
@@ -7376,20 +3769,6 @@ fn file_delete_cascade_id(delta: &CurrentStateDeltaRef<'_>) -> Result<Option<Str
                 "file descriptor tombstone has invalid identity: {error}"
             ))
         })
-}
-
-fn normalize_complete_hot_snapshot_baselines(
-    rows: &mut HotRowMap,
-    tracked_baseline: WorkingDiffBaseline,
-) -> Result<(), LixError> {
-    for bytes in rows.values_mut() {
-        let value = decode_head_value(bytes.as_ref())?;
-        if value.untracked {
-            continue;
-        }
-        *bytes = Bytes::from(reencode_head_value_with_baseline(value, tracked_baseline)?);
-    }
-    Ok(())
 }
 
 fn compare_hot_deltas(
@@ -7603,16 +3982,12 @@ fn hot_delta_is_guarded_by_absent_file(
 
 /// Adds one encoded current-state value to the shared arena's capacity plan.
 ///
-/// Ordinary commits are exact. During an active checkpoint, a tracked row
-/// may carry a fixed-size first-before image, so the plan reserves that upper
-/// bound without decoding every predecessor a third time. Physical untracked
-/// deletes produce no value. Every operation is checked so an impossible
+/// Physical untracked deletes produce no value. Every operation is checked so an impossible
 /// batch can safely use a zero-capacity growth fallback and reach the normal
 /// fallible encoder instead of attempting an overflowing allocation.
 fn checked_add_hot_next_value_capacity(
     total: usize,
     delta: &CurrentStateDeltaRef<'_>,
-    active_checkpoint: bool,
     inherited_coordinate: bool,
 ) -> Option<usize> {
     if delta.physically_deletes() {
@@ -7622,22 +3997,16 @@ fn checked_add_hot_next_value_capacity(
         (0, 0)
     } else {
         (
-            encoded_hot_slot_len(delta.snapshot, active_checkpoint),
-            encoded_hot_slot_len(delta.metadata, active_checkpoint),
+            encoded_hot_slot_len(delta.snapshot),
+            encoded_hot_slot_len(delta.metadata),
         )
     };
     // Keep the plan bounded by the same on-disk u32 fields the encoder checks.
     u32::try_from(snapshot_len).ok()?;
     u32::try_from(metadata_len).ok()?;
-    let baseline_len = if active_checkpoint && !delta.untracked {
-        WORKING_DIFF_CHECKPOINT_BYTES + WORKING_DIFF_VERSION_BYTES
-    } else {
-        0
-    };
     let encoded_len = HEAD_VALUE_HEADER_BYTES
         .checked_add(snapshot_len)?
         .checked_add(metadata_len)?
-        .checked_add(baseline_len)?
         .checked_add(
             (delta.columnar_base_coordinate.is_some() || inherited_coordinate)
                 .then_some(COLUMNAR_BASE_COORDINATE_BYTES)
@@ -7646,13 +4015,10 @@ fn checked_add_hot_next_value_capacity(
     total.checked_add(encoded_len)
 }
 
-fn encoded_hot_slot_len(slot: JsonSlotRef<'_>, fingerprint_inline: bool) -> usize {
+fn encoded_hot_slot_len(slot: JsonSlotRef<'_>) -> usize {
     match slot {
         JsonSlotRef::None => 0,
         JsonSlotRef::Ref(_) => JSON_REF_BYTES,
-        JsonSlotRef::Inline(json) if fingerprint_inline => {
-            JSON_REF_BYTES.saturating_add(json.len())
-        }
         JsonSlotRef::Inline(json) => json.len(),
     }
 }
@@ -7748,115 +4114,6 @@ fn stage_hot_encoded_mutation_ranges(
                 .expect("hot file schema ranges originate in the supplied encoded buffers");
         writes.stage_encoded_batch(HOT_FILE_SPACE, file_batch);
     }
-}
-
-fn stage_hot_diff_batch(
-    writes: &mut StorageWriteSet,
-    scope: &[u8],
-    identity_key_bytes: Vec<u8>,
-    identity_puts: Vec<EncodedPut>,
-) -> Result<(), LixError> {
-    if identity_puts.is_empty() {
-        return Ok(());
-    }
-    if scope.is_empty() {
-        return Err(head_value_error(
-            "hot diff identities require a checkpoint scope",
-        ));
-    }
-    if identity_puts.len() < HOT_DIFF_PACK_MIN_IDENTITIES {
-        let batch = EncodedMutationBatch::try_new(
-            Bytes::from(identity_key_bytes),
-            Bytes::new(),
-            identity_puts,
-            Vec::new(),
-        )
-        .expect("direct hot diff ranges originate in the supplied encoded buffer");
-        writes.stage_encoded_batch(HOT_DIFF_SPACE, batch);
-        return Ok(());
-    }
-
-    // HOT_DIFF is a set of eagerly persisted identities. Store bounded
-    // segments instead of repeating the checkpoint scope in one LSM entry per
-    // identity. The content digest makes each segment key deterministic while
-    // the value retains every identity suffix in the same atomic write set.
-    let value_capacity = identity_key_bytes
-        .len()
-        .saturating_sub(scope.len().saturating_mul(identity_puts.len()))
-        .saturating_add(identity_puts.len().saturating_mul(4))
-        .saturating_add(
-            identity_puts
-                .len()
-                .div_ceil(HOT_DIFF_SEGMENT_MAX_IDENTITIES as usize)
-                .saturating_mul(HOT_DIFF_SEGMENT_HEADER_BYTES),
-        );
-    let mut value_bytes = Vec::with_capacity(value_capacity);
-    let mut value_ranges = Vec::<Range<usize>>::new();
-    let mut segment_start = value_bytes.len();
-    value_bytes.push(HOT_DIFF_SEGMENT_VERSION);
-    value_bytes.extend_from_slice(&0_u32.to_le_bytes());
-    let mut segment_count = 0_u32;
-
-    for put in identity_puts {
-        let key_start = put.key.offset();
-        let key_end = key_start
-            .checked_add(put.key.len())
-            .ok_or_else(|| head_value_error("hot diff key range overflow"))?;
-        let full_key = identity_key_bytes
-            .get(key_start..key_end)
-            .ok_or_else(|| head_value_error("hot diff key range escapes its arena"))?;
-        let suffix = full_key
-            .strip_prefix(scope)
-            .ok_or_else(|| head_value_error("hot diff identity key is outside its scope"))?;
-        let suffix_len = u32::try_from(suffix.len())
-            .map_err(|_| head_value_error("hot diff identity suffix exceeds u32"))?;
-        let encoded_len = 4_usize.saturating_add(suffix.len());
-        if HOT_DIFF_SEGMENT_HEADER_BYTES.saturating_add(encoded_len) > HOT_DIFF_SEGMENT_MAX_BYTES {
-            return Err(head_value_error(
-                "hot diff identity exceeds the segment size limit",
-            ));
-        }
-        let current_len = value_bytes.len() - segment_start;
-        if segment_count > 0
-            && (segment_count == HOT_DIFF_SEGMENT_MAX_IDENTITIES
-                || current_len.saturating_add(encoded_len) > HOT_DIFF_SEGMENT_MAX_BYTES)
-        {
-            value_bytes[segment_start + 1..segment_start + HOT_DIFF_SEGMENT_HEADER_BYTES]
-                .copy_from_slice(&segment_count.to_le_bytes());
-            value_ranges.push(segment_start..value_bytes.len());
-            segment_start = value_bytes.len();
-            value_bytes.push(HOT_DIFF_SEGMENT_VERSION);
-            value_bytes.extend_from_slice(&0_u32.to_le_bytes());
-            segment_count = 0;
-        }
-        value_bytes.extend_from_slice(&suffix_len.to_le_bytes());
-        value_bytes.extend_from_slice(suffix);
-        segment_count += 1;
-    }
-    value_bytes[segment_start + 1..segment_start + HOT_DIFF_SEGMENT_HEADER_BYTES]
-        .copy_from_slice(&segment_count.to_le_bytes());
-    value_ranges.push(segment_start..value_bytes.len());
-
-    let mut key_bytes = Vec::with_capacity(value_ranges.len().saturating_mul(scope.len() + 32));
-    let mut puts = Vec::with_capacity(value_ranges.len());
-    for value in value_ranges {
-        let key_start = key_bytes.len();
-        key_bytes.extend_from_slice(scope);
-        key_bytes.extend_from_slice(blake3::hash(&value_bytes[value.clone()]).as_bytes());
-        puts.push(EncodedPut {
-            key: BufferRange::new(key_start, key_bytes.len() - key_start),
-            value: buffer_range(&value),
-        });
-    }
-    let batch = EncodedMutationBatch::try_new(
-        Bytes::from(key_bytes),
-        Bytes::from(value_bytes),
-        puts,
-        Vec::new(),
-    )
-    .expect("hot diff segment ranges originate in the supplied encoded buffers");
-    writes.stage_encoded_batch(HOT_DIFF_SPACE, batch);
-    Ok(())
 }
 
 fn buffer_range(range: &Range<usize>) -> BufferRange {
@@ -7981,15 +4238,8 @@ fn stage_hot_bootstrap(
     preserved_untracked_rows: Vec<MaterializedLiveStateRow>,
     deltas: &[&CurrentStateDeltaRef<'_>],
     absence_guards: &BTreeSet<TrackedStateKey>,
-    working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-    coverage: &mut WorkingDiffIndexCoverage,
 ) -> Result<(), LixError> {
     let mut rows = HotRowMap::new();
-    let tracked_baseline = if working_diff_capture_checkpoint_commit_id.is_some() {
-        WorkingDiffBaseline::Clean
-    } else {
-        WorkingDiffBaseline::Disabled
-    };
     for row in parent_rows {
         let key = TrackedStateKey {
             schema_key: row.schema_key.clone(),
@@ -8020,7 +4270,6 @@ fn stage_hot_bootstrap(
                 .as_deref()
                 .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
             columnar_base_coordinate: None,
-            working_diff_baseline: tracked_baseline,
         };
         if rows
             .insert(identity, Bytes::from(encode_head_value(&value)?))
@@ -8067,7 +4316,6 @@ fn stage_hot_bootstrap(
                 .as_deref()
                 .map_or(JsonSlotRef::None, JsonSlotRef::Inline),
             columnar_base_coordinate: None,
-            working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
         if rows
             .insert(identity, Bytes::from(encode_head_value(&value)?))
@@ -8110,14 +4358,7 @@ fn stage_hot_bootstrap(
             rows.insert(
                 identity,
                 Bytes::from(encode_head_value(&{
-                    let mut value = delta.value_ref(
-                        created_at,
-                        if delta.untracked {
-                            WorkingDiffBaseline::Disabled
-                        } else {
-                            tracked_baseline
-                        },
-                    );
+                    let mut value = delta.value_ref(created_at);
                     value.columnar_base_coordinate = None;
                     value
                 })?),
@@ -8132,7 +4373,6 @@ fn stage_hot_bootstrap(
             .into_iter()
             .map(JsonRef::from_hash_bytes),
     );
-    *coverage = WorkingDiffIndexCoverage::default();
     Ok(())
 }
 
@@ -8640,18 +4880,10 @@ async fn materialize_hot_scan_entries(
     entries: HotScanEntries<'_>,
     projection: ChangeRecordProjection,
     branch_id: &str,
-    active_checkpoint_commit_id: Option<CommitId>,
 ) -> Result<MaterializedLiveStateBatch, LixError> {
     match entries {
         HotScanEntries::Decoded(entries) => {
-            materialize_live_entries(
-                store,
-                entries,
-                projection,
-                branch_id,
-                active_checkpoint_commit_id,
-            )
-            .await
+            materialize_live_entries(store, entries, projection, branch_id).await
         }
         HotScanEntries::Finite(batches) => {
             let row_count = batches
@@ -8668,14 +4900,7 @@ async fn materialize_hot_scan_entries(
                     entries.push((batch.identities.key_ref(index), value));
                 }
             }
-            materialize_live_entries(
-                store,
-                entries,
-                projection,
-                branch_id,
-                active_checkpoint_commit_id,
-            )
-            .await
+            materialize_live_entries(store, entries, projection, branch_id).await
         }
     }
 }
@@ -8784,431 +5009,6 @@ async fn hot_load_file_scope_identities(
         }
     }
     Ok(identities)
-}
-
-fn working_diff_baseline_before(
-    baseline: WorkingDiffBaseline,
-    checkpoint_commit_id: CommitId,
-) -> Option<Option<WorkingDiffVersion>> {
-    match baseline {
-        WorkingDiffBaseline::BeforeAbsent {
-            checkpoint_commit_id: owner,
-        } if owner == checkpoint_commit_id => Some(None),
-        WorkingDiffBaseline::BeforePresent {
-            checkpoint_commit_id: owner,
-            version,
-        } if owner == checkpoint_commit_id => Some(Some(version)),
-        WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. } => {
-            None
-        }
-        WorkingDiffBaseline::Disabled | WorkingDiffBaseline::Clean => None,
-    }
-}
-
-fn packed_working_diff_slot(slot: &JsonSlot) -> WorkingDiffSlotFingerprint {
-    match slot {
-        JsonSlot::None => WorkingDiffSlotFingerprint {
-            kind: WORKING_DIFF_SLOT_NONE,
-            hash: [0; JSON_REF_BYTES],
-        },
-        JsonSlot::Ref(json_ref) => WorkingDiffSlotFingerprint {
-            kind: WORKING_DIFF_SLOT_REF,
-            hash: *json_ref.as_hash_array(),
-        },
-        JsonSlot::Inline(json) => WorkingDiffSlotFingerprint {
-            kind: WORKING_DIFF_SLOT_INLINE,
-            hash: *JsonRef::for_content(json.as_bytes()).as_hash_array(),
-        },
-    }
-}
-
-fn packed_working_diff_version(
-    member: &crate::tracked_state::CommitDeltaMember,
-) -> WorkingDiffVersion {
-    WorkingDiffVersion {
-        change_id: member.value.change_id,
-        commit_id: member.value.commit_id,
-        deleted: member.value.deleted,
-        created_at: member.value.created_at,
-        updated_at: member.value.updated_at,
-        snapshot: packed_working_diff_slot(&member.change.snapshot),
-        metadata: packed_working_diff_slot(&member.change.metadata),
-    }
-}
-
-/// Resolves a checkpoint diff from row-local first-before images. Broad diffs
-/// enumerate the sparse dirty-key index; finite PK queries read only the
-/// primary rows that can answer the request.
-async fn hot_working_diff_entries(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    checkpoint_commit_id: CommitId,
-    generation: CommitId,
-    expected_coverage: WorkingDiffIndexCoverage,
-    filter: &TrackedStateFilter,
-) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
-    let packed_refs = packed_current_base_refs(store, branch_id, generation).await?;
-    let packed_refs = packed_refs
-        .into_iter()
-        .filter(|base| base.checkpoint_commit_id == Some(checkpoint_commit_id))
-        .collect::<Vec<_>>();
-    if packed_refs.is_empty() && !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
-        return hot_working_diff_entries_for_finite_filter(
-            store,
-            branch_id,
-            checkpoint_commit_id,
-            generation,
-            filter,
-        )
-        .await;
-    }
-
-    let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
-    let plan = ScanPlan::prefix(
-        HOT_DIFF_SPACE,
-        StoragePrefix {
-            bytes: Bytes::from(scope.clone()),
-        },
-    );
-    let mut actual_coverage = WorkingDiffIndexCoverage::default();
-    let mut selected = BTreeMap::<HeadIdentity, Option<WorkingDiffVersion>>::new();
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            let Ok(bytes) = full_value_bytes(entry.value) else {
-                return Ok(None);
-            };
-            if bytes.is_empty() {
-                if actual_coverage
-                    .add_encoded_group_key(entry.key.0.as_ref())
-                    .is_none()
-                {
-                    return Ok(None);
-                }
-                let Ok(identity) = decode_hot_diff_key_in_scope(entry.key.0.as_ref(), &scope)
-                else {
-                    return Ok(None);
-                };
-                if matches_filter(&identity, filter) {
-                    selected.insert(
-                        HeadIdentity {
-                            branch_id: branch_id.to_string(),
-                            generation,
-                            schema_key: identity.schema_key,
-                            entity_pk: identity.entity_pk,
-                            file_id: identity.file_id,
-                        },
-                        None,
-                    );
-                }
-                continue;
-            }
-            let Ok(segment_scope) = decode_hot_diff_segment_key(entry.key.0.as_ref()) else {
-                return Ok(None);
-            };
-            if segment_scope.digest != *blake3::hash(&bytes).as_bytes() {
-                return Ok(None);
-            }
-            let decoded =
-                visit_hot_diff_segment(&bytes, &scope, &mut actual_coverage, |identity| {
-                    if matches_filter(&identity, filter) {
-                        selected.insert(
-                            HeadIdentity {
-                                branch_id: branch_id.to_string(),
-                                generation,
-                                schema_key: identity.schema_key,
-                                entity_pk: identity.entity_pk,
-                                file_id: identity.file_id,
-                            },
-                            None,
-                        );
-                    }
-                });
-            if decoded.is_err() {
-                return Ok(None);
-            }
-        }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
-    }
-    for base_ref in packed_refs {
-        if actual_coverage
-            .add_encoded_group_key(&base_ref.coverage_key)
-            .is_none()
-        {
-            return Ok(None);
-        }
-        let Ok(members) = crate::tracked_state::load_commit_delta_members_with_payloads(
-            store,
-            base_ref.commit_id,
-        )
-        .await
-        else {
-            return Ok(None);
-        };
-        for member in members {
-            if !packed_member_matches_filter(&member, filter) {
-                continue;
-            }
-            let identity = HeadIdentity {
-                branch_id: branch_id.to_string(),
-                generation,
-                schema_key: member.key.schema_key.clone(),
-                entity_pk: member.key.entity_pk.clone(),
-                file_id: member.key.file_id.clone(),
-            };
-            let version = packed_working_diff_version(&member);
-            match selected.entry(identity) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(Some(version));
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry)
-                    if entry
-                        .get()
-                        .is_none_or(|previous| previous.commit_id < version.commit_id) =>
-                {
-                    entry.insert(Some(version));
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
-        }
-    }
-    if actual_coverage != expected_coverage {
-        return Ok(None);
-    }
-    let (selected, base_versions): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
-    let after_values = hot_load_primary_identity_bytes(store, &selected).await?;
-    let mut candidates = Vec::with_capacity(selected.len());
-    for ((identity, after), base_after) in selected.into_iter().zip(after_values).zip(base_versions)
-    {
-        let hot_after = if let Some(after) = after {
-            let Ok(after) = decode_head_value(&after) else {
-                return Ok(None);
-            };
-            if after.untracked {
-                return Ok(None);
-            }
-            let Some(before) =
-                working_diff_baseline_before(after.working_diff_baseline, checkpoint_commit_id)
-            else {
-                return Ok(None);
-            };
-            let Some(after) = after.working_diff_version() else {
-                return Ok(None);
-            };
-            Some((before, after))
-        } else {
-            None
-        };
-        let Some((before, after)) = choose_hot_or_packed_working_diff(hot_after, base_after) else {
-            return Ok(None);
-        };
-        let identity = identity.into_row_identity();
-        candidates.push((
-            TrackedStateKey {
-                schema_key: identity.schema_key,
-                entity_pk: identity.entity_pk,
-                file_id: identity.file_id,
-            },
-            before,
-            after,
-        ));
-    }
-    Ok(Some(classify_hot_working_diff_entries(candidates)?))
-}
-
-fn choose_hot_or_packed_working_diff(
-    hot: Option<(Option<WorkingDiffVersion>, WorkingDiffVersion)>,
-    packed: Option<WorkingDiffVersion>,
-) -> Option<(Option<WorkingDiffVersion>, WorkingDiffVersion)> {
-    match (hot, packed) {
-        (Some(hot), Some(packed)) if hot.1.commit_id < packed.commit_id => Some((hot.0, packed)),
-        (Some(hot), _) => Some(hot),
-        (None, Some(packed)) => Some((None, packed)),
-        (None, None) => None,
-    }
-}
-
-async fn hot_working_diff_entries_for_finite_filter(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    checkpoint_commit_id: CommitId,
-    generation: CommitId,
-    filter: &TrackedStateFilter,
-) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
-    let rows = hot_scan_entries(store, branch_id, generation, filter, None, None)
-        .await?
-        .expect("unbounded HOT scan cannot exhaust a byte budget");
-    match rows {
-        HotScanEntries::Decoded(rows) => {
-            let mut candidates = Vec::with_capacity(rows.len());
-            for (identity, bytes) in rows {
-                let Some(versions) = finite_working_diff_versions(&bytes, checkpoint_commit_id)
-                else {
-                    return Ok(None);
-                };
-                let Some((before, after)) = versions else {
-                    continue;
-                };
-                candidates.push((identity, before, after));
-            }
-            Ok(Some(classify_hot_working_diff_scan_entries(candidates)?))
-        }
-        HotScanEntries::Finite(batches) => {
-            let row_count = batches
-                .iter()
-                .map(|batch| batch.values.iter().flatten().count())
-                .sum();
-            let mut candidates = Vec::with_capacity(row_count);
-            for batch in batches {
-                for (index, bytes) in batch.values.into_iter().enumerate() {
-                    let Some(bytes) = bytes else {
-                        continue;
-                    };
-                    let Some(versions) = finite_working_diff_versions(&bytes, checkpoint_commit_id)
-                    else {
-                        return Ok(None);
-                    };
-                    let Some((before, after)) = versions else {
-                        continue;
-                    };
-                    candidates.push((batch.identities.key_ref(index), before, after));
-                }
-            }
-            Ok(Some(classify_hot_working_diff_entry_refs(candidates)?))
-        }
-    }
-}
-
-fn finite_working_diff_versions(
-    bytes: &Bytes,
-    checkpoint_commit_id: CommitId,
-) -> Option<Option<(Option<WorkingDiffVersion>, WorkingDiffVersion)>> {
-    let after = decode_head_value(bytes).ok()?;
-    if after.untracked || after.working_diff_baseline == WorkingDiffBaseline::Clean {
-        return Some(None);
-    }
-    if working_diff_checkpoint_owner(after.working_diff_baseline)
-        .is_some_and(|owner| owner != checkpoint_commit_id)
-    {
-        return Some(None);
-    }
-    let before = working_diff_baseline_before(after.working_diff_baseline, checkpoint_commit_id)?;
-    let after = after.working_diff_version()?;
-    Some(Some((before, after)))
-}
-
-fn classify_hot_working_diff_entries(
-    candidates: Vec<(
-        TrackedStateKey,
-        Option<WorkingDiffVersion>,
-        WorkingDiffVersion,
-    )>,
-) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
-    let row_count = candidates.len();
-    let mut keys = Vec::with_capacity(row_count);
-    let mut versions = Vec::with_capacity(row_count);
-    for (key, before, after) in candidates {
-        keys.push(key);
-        versions.push((before, after));
-    }
-    let identities = TrackedStateDiffIdentity::from_key_batch(keys)?;
-    let mut entries = Vec::with_capacity(row_count);
-    for (identity, (before, after)) in identities.into_iter().zip(versions) {
-        if let Some(entry) = classify_hot_working_diff_entry(identity, before, after) {
-            entries.push(entry);
-        }
-    }
-    Ok(entries)
-}
-
-fn classify_hot_working_diff_entry_refs(
-    candidates: Vec<(
-        TrackedStateKeyRef<'_>,
-        Option<WorkingDiffVersion>,
-        WorkingDiffVersion,
-    )>,
-) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
-    let row_count = candidates.len();
-    let identities =
-        TrackedStateDiffIdentity::from_key_refs(row_count, |index| candidates[index].0)?;
-    let mut entries = Vec::with_capacity(row_count);
-    for (identity, (_, before, after)) in identities.into_iter().zip(candidates) {
-        if let Some(entry) = classify_hot_working_diff_entry(identity, before, after) {
-            entries.push(entry);
-        }
-    }
-    Ok(entries)
-}
-
-fn classify_hot_working_diff_scan_entries(
-    candidates: Vec<(
-        HotScanIdentity,
-        Option<WorkingDiffVersion>,
-        WorkingDiffVersion,
-    )>,
-) -> Result<Vec<TrackedStateDiffEntry>, LixError> {
-    let row_count = candidates.len();
-    let identities = TrackedStateDiffIdentity::from_key_refs(row_count, |index| {
-        let identity = &candidates[index].0;
-        TrackedStateKeyRef {
-            schema_key: identity.schema_key(),
-            file_id: identity.file_id(),
-            entity_pk: &identity.entity_pk,
-        }
-    })?;
-    let mut entries = Vec::with_capacity(row_count);
-    for (identity, (_, before, after)) in identities.into_iter().zip(candidates) {
-        if let Some(entry) = classify_hot_working_diff_entry(identity, before, after) {
-            entries.push(entry);
-        }
-    }
-    Ok(entries)
-}
-
-fn classify_hot_working_diff_entry(
-    diff_identity: TrackedStateDiffIdentity,
-    before: Option<WorkingDiffVersion>,
-    after: WorkingDiffVersion,
-) -> Option<TrackedStateDiffEntry> {
-    let before_row = before.map(|version| version.into_diff_row(diff_identity.clone()));
-    let after_row = after.into_diff_row(diff_identity.clone());
-    match (
-        before_row.as_ref().filter(|row| !row.deleted),
-        (!after_row.deleted).then_some(&after_row),
-    ) {
-        (None, None) => None,
-        (None, Some(_)) => Some(TrackedStateDiffEntry {
-            identity: diff_identity,
-            kind: TrackedStateDiffKind::Added,
-            before: before_row,
-            after: Some(after_row),
-        }),
-        (Some(_), None) => Some(TrackedStateDiffEntry {
-            identity: diff_identity,
-            kind: TrackedStateDiffKind::Removed,
-            before: before_row,
-            after: Some(after_row),
-        }),
-        (Some(_), Some(_)) if before.is_some_and(|version| version.payload_eq(after)) => None,
-        (Some(_), Some(_)) => Some(TrackedStateDiffEntry {
-            identity: diff_identity,
-            kind: TrackedStateDiffKind::Modified,
-            before: before_row,
-            after: Some(after_row),
-        }),
-    }
 }
 
 async fn hot_scan_entries<'a>(
@@ -9602,50 +5402,6 @@ fn encode_hot_row_key_parts(
     key
 }
 
-#[cfg(test)]
-fn encode_hot_diff_key(checkpoint_commit_id: CommitId, identity: &HeadIdentity) -> Vec<u8> {
-    encode_hot_diff_key_parts(
-        &identity.branch_id,
-        checkpoint_commit_id,
-        identity.generation,
-        &identity.schema_key,
-        &identity.entity_pk,
-        identity.file_id.as_deref(),
-    )
-}
-
-#[cfg(test)]
-fn encode_hot_diff_key_parts(
-    branch_id: &str,
-    checkpoint_commit_id: CommitId,
-    generation: CommitId,
-    schema_key: &str,
-    entity_pk: &EntityPk,
-    file_id: Option<&str>,
-) -> Vec<u8> {
-    let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
-    let mut key = Vec::with_capacity(
-        encoded_hot_identity_key_len(scope.len(), schema_key, entity_pk, file_id).unwrap_or(0),
-    );
-    append_hot_diff_key_parts(&mut key, &scope, schema_key, entity_pk, file_id);
-    key
-}
-
-fn append_hot_diff_key_parts(
-    key_bytes: &mut Vec<u8>,
-    scope: &[u8],
-    schema_key: &str,
-    entity_pk: &EntityPk,
-    file_id: Option<&str>,
-) -> Range<usize> {
-    let start = key_bytes.len();
-    key_bytes.extend_from_slice(scope);
-    write_key_string(key_bytes, schema_key, KEY_PART_FINAL);
-    write_entity_pk(key_bytes, entity_pk);
-    write_file_id(key_bytes, file_id);
-    start..key_bytes.len()
-}
-
 fn encoded_hot_identity_key_len(
     scope_len: usize,
     schema_key: &str,
@@ -10004,154 +5760,6 @@ fn decode_hot_file_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
     Ok((branch_id, generation))
 }
 
-struct HotDiffSegmentScope {
-    branch_id: String,
-    checkpoint_commit_id: CommitId,
-    generation: CommitId,
-    digest: [u8; 32],
-}
-
-fn decode_hot_diff_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
-    if !bytes.starts_with(scope) {
-        return Err(key_codec_error(
-            "hot diff row does not begin with its scanned scope",
-        ));
-    }
-    let mut offset = scope.len();
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot diff row schema key has an invalid terminator",
-        ));
-    }
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
-    let file_id = read_file_id(bytes, &mut offset)?;
-    if offset != bytes.len() {
-        return Err(key_codec_error("hot diff row key has trailing bytes"));
-    }
-    Ok(HeadRowIdentity {
-        schema_key,
-        entity_pk,
-        file_id,
-    })
-}
-
-fn decode_hot_diff_segment_key(bytes: &[u8]) -> Result<HotDiffSegmentScope, LixError> {
-    let mut offset = 0;
-    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
-    if branch_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot diff branch id has an invalid terminator",
-        ));
-    }
-    let checkpoint_commit_id = read_generation(bytes, &mut offset)?;
-    let generation = read_generation(bytes, &mut offset)?;
-    let digest_bytes = bytes
-        .get(offset..)
-        .ok_or_else(|| key_codec_error("hot diff segment key is truncated before its digest"))?;
-    let digest = <[u8; 32]>::try_from(digest_bytes)
-        .map_err(|_| key_codec_error("hot diff segment key has an invalid digest length"))?;
-    Ok(HotDiffSegmentScope {
-        branch_id,
-        checkpoint_commit_id,
-        generation,
-        digest,
-    })
-}
-
-fn visit_hot_diff_segment(
-    bytes: &[u8],
-    scope: &[u8],
-    coverage: &mut WorkingDiffIndexCoverage,
-    mut visit: impl FnMut(HeadRowIdentity),
-) -> Result<(), LixError> {
-    if bytes.len() < HOT_DIFF_SEGMENT_HEADER_BYTES {
-        return Err(key_codec_error("hot diff segment is truncated"));
-    }
-    if bytes[0] != HOT_DIFF_SEGMENT_VERSION {
-        return Err(key_codec_error("hot diff segment has an unknown version"));
-    }
-    let count = u32::from_le_bytes(
-        bytes[1..HOT_DIFF_SEGMENT_HEADER_BYTES]
-            .try_into()
-            .expect("hot diff segment header has a fixed count width"),
-    );
-    if count == 0 || count > HOT_DIFF_SEGMENT_MAX_IDENTITIES {
-        return Err(key_codec_error(
-            "hot diff segment has an invalid identity count",
-        ));
-    }
-    let mut offset = HOT_DIFF_SEGMENT_HEADER_BYTES;
-    let mut full_key = Vec::with_capacity(scope.len() + 128);
-    full_key.extend_from_slice(scope);
-    for _ in 0..count {
-        let length_end = offset
-            .checked_add(4)
-            .ok_or_else(|| key_codec_error("hot diff segment length offset overflow"))?;
-        let encoded_length = bytes.get(offset..length_end).ok_or_else(|| {
-            key_codec_error("hot diff segment is truncated before identity length")
-        })?;
-        let suffix_len = u32::from_le_bytes(
-            encoded_length
-                .try_into()
-                .expect("hot diff identity length has a fixed width"),
-        ) as usize;
-        if suffix_len == 0 {
-            return Err(key_codec_error("hot diff segment has an empty identity"));
-        }
-        let suffix_end = length_end
-            .checked_add(suffix_len)
-            .ok_or_else(|| key_codec_error("hot diff segment identity offset overflow"))?;
-        let suffix = bytes
-            .get(length_end..suffix_end)
-            .ok_or_else(|| key_codec_error("hot diff segment is truncated in an identity"))?;
-        full_key.truncate(scope.len());
-        full_key.extend_from_slice(suffix);
-        coverage
-            .add_encoded_group_key(&full_key)
-            .ok_or_else(|| head_value_error("hot working-diff index count exceeds u64"))?;
-        visit(decode_hot_diff_key_in_scope(&full_key, scope)?);
-        offset = suffix_end;
-    }
-    if offset != bytes.len() {
-        return Err(key_codec_error("hot diff segment has trailing bytes"));
-    }
-    Ok(())
-}
-
-fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixError> {
-    let mut offset = 0;
-    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
-    if branch_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot diff branch id has an invalid terminator",
-        ));
-    }
-    let checkpoint_commit_id = read_generation(bytes, &mut offset)?;
-    let generation = read_generation(bytes, &mut offset)?;
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot diff schema key has an invalid terminator",
-        ));
-    }
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
-    let file_id = read_file_id(bytes, &mut offset)?;
-    if offset != bytes.len() {
-        return Err(key_codec_error("hot diff key has trailing bytes"));
-    }
-    Ok((
-        checkpoint_commit_id,
-        HeadIdentity {
-            branch_id,
-            generation,
-            schema_key,
-            entity_pk,
-            file_id,
-        },
-    ))
-}
-
 fn collect_hot_untracked_refs(value: HeadValueView<'_>, refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>) {
     if !value.untracked {
         return;
@@ -10193,15 +5801,6 @@ where
         &mut stale_untracked_refs,
     )
     .await?;
-    let stale_packed_bases = stage_collect_stale_hot_space(
-        store,
-        writes,
-        PACKED_CURRENT_BASE_SPACE,
-        decode_hot_collection_control_scope,
-        &active,
-        &mut stale_untracked_refs,
-    )
-    .await?;
     stage_collect_stale_hot_space(
         store,
         writes,
@@ -10211,26 +5810,6 @@ where
         &mut stale_untracked_refs,
     )
     .await?;
-    let stale_packed_controls = stage_collect_stale_hot_space(
-        store,
-        writes,
-        PACKED_CURRENT_BASE_CONTROL_SPACE,
-        decode_hot_collection_control_scope,
-        &active,
-        &mut stale_untracked_refs,
-    )
-    .await?;
-    if stale_packed_bases || stale_packed_controls {
-        stage_collect_stale_hot_space(
-            store,
-            writes,
-            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-            decode_hot_collection_control_scope,
-            &active,
-            &mut stale_untracked_refs,
-        )
-        .await?;
-    }
     stage_collect_stale_hot_collection_controls(store, writes, &active).await?;
     Ok(stale_untracked_refs
         .into_iter()
@@ -10335,120 +5914,6 @@ async fn stage_collect_stale_hot_space(
     Ok(deleted_any)
 }
 
-pub(crate) async fn stage_collect_stale_hot_diff_records<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    active: &BTreeMap<String, ActiveWorkingDiffScope>,
-) -> Result<(), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let plan = ScanPlan::prefix(
-        HOT_DIFF_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            let keep = match full_value_bytes(entry.value) {
-                Ok(bytes) if bytes.is_empty() => decode_hot_diff_key(entry.key.0.as_ref())
-                    .is_ok_and(|(checkpoint_commit_id, identity)| {
-                        active.get(&identity.branch_id).is_some_and(|scope| {
-                            scope.checkpoint_commit_id == checkpoint_commit_id
-                                && scope.generation == identity.generation
-                        })
-                    }),
-                Ok(bytes) => {
-                    decode_hot_diff_segment_key(entry.key.0.as_ref()).is_ok_and(|segment_scope| {
-                        if !active.get(&segment_scope.branch_id).is_some_and(|scope| {
-                            scope.checkpoint_commit_id == segment_scope.checkpoint_commit_id
-                                && scope.generation == segment_scope.generation
-                        }) {
-                            return false;
-                        }
-                        let scope = encode_working_diff_scope_prefix(
-                            &segment_scope.branch_id,
-                            segment_scope.checkpoint_commit_id,
-                            segment_scope.generation,
-                        );
-                        let mut coverage = WorkingDiffIndexCoverage::default();
-                        segment_scope.digest == *blake3::hash(&bytes).as_bytes()
-                            && visit_hot_diff_segment(&bytes, &scope, &mut coverage, |_| {}).is_ok()
-                    })
-                }
-                _ => false,
-            };
-            if !keep {
-                writes.delete(HOT_DIFF_SPACE, entry.key);
-            }
-        }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Reclaims one superseded working-diff epoch without scanning any other
-/// branch or checkpoint. A checkpoint already performs work linear in its
-/// selected dirty set; this prefix-local scan keeps reclamation on the same
-/// bound while preventing unreachable epochs from accumulating until GC.
-pub(super) async fn stage_delete_hot_diff_scope<S>(
-    store: &S,
-    writes: &mut StorageWriteSet,
-    branch_id: &str,
-    checkpoint_commit_id: CommitId,
-    generation: CommitId,
-) -> Result<(), LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let plan = ScanPlan::prefix(
-        HOT_DIFF_SPACE,
-        StoragePrefix {
-            bytes: Bytes::from(encode_working_diff_scope_prefix(
-                branch_id,
-                checkpoint_commit_id,
-                generation,
-            )),
-        },
-    );
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        writes.delete_batch(
-            HOT_DIFF_SPACE,
-            page.value.entries.into_iter().map(|entry| entry.key),
-        );
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -10457,47 +5922,10 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::branch::{BranchHeadControl, stage_branch_head_control};
     use crate::storage_adapter::{
         Memory, StorageAdapter, StorageGetManyRequest, StorageGetManyResult, StorageKeyRange,
         StorageReadOptions, StorageScanChunk, StorageScanOptions, StorageWriteOptions,
     };
-
-    #[tokio::test]
-    async fn certified_batches_reject_duplicate_content_owner() {
-        let storage = StorageAdapter::new(Memory::new());
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("duplicate certified read should open");
-        let batch = WasmCertifiedEntityBatch {
-            format: 2,
-            schema_keys: vec!["test_schema".to_owned()],
-            row_count: 1,
-            creates: WasmCreateContext { high: 0, low: 0 },
-            create_ranges: Vec::new(),
-            complete_file_state: true,
-            pages: Vec::new(),
-        };
-        let batches = [batch.clone(), batch];
-        let files = [CertifiedEntityBatchFileRef {
-            branch_id: "main",
-            file_id: "duplicate.lix",
-            batches: &batches,
-        }];
-        let error = stage_certified_entity_batches(
-            &read,
-            &mut StorageWriteSet::new(),
-            &files,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        )
-        .await
-        .expect_err("duplicate certified content owners must fail");
-        assert!(error.message.contains("duplicate branch"));
-    }
 
     #[test]
     fn keyed_certified_change_ids_include_full_identity() {
@@ -10545,77 +5973,6 @@ mod tests {
         assert_eq!(materialized("first.csv"), first);
         assert_eq!(materialized("first.csv"), materialized("first.csv"));
         assert_ne!(materialized("first.csv"), materialized("second.csv"));
-    }
-
-    #[test]
-    fn transaction_hot_state_cache_is_bounded_per_metadata_lane() {
-        let cache = HotStateTransactionCache::default();
-        for index in 0..=TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES {
-            let generation = CommitId::for_test_label(&format!("cache-generation-{index}"));
-            cache
-                .remember_collection_control(
-                    HotCollectionCacheKey {
-                        branch_id: "cache-branch".to_owned(),
-                        generation,
-                        schema_key: format!("schema-{index}"),
-                        file_id: None,
-                    },
-                    HotCollectionControl {
-                        active_generation: generation,
-                        live_count: index as u64,
-                        ordered_identity_digest: None,
-                    },
-                )
-                .expect("remember collection control");
-            cache
-                .remember_certified_generation_absent(generation)
-                .expect("remember absent certified generation");
-            cache
-                .remember_packed_current_base_refs(
-                    &format!("packed-branch-{index}"),
-                    generation,
-                    &[PackedCurrentBaseRef {
-                        commit_id: generation,
-                        checkpoint_commit_id: None,
-                        coverage_key: Bytes::new(),
-                    }],
-                )
-                .expect("remember packed current-base refs");
-            assert!(
-                !cache
-                    .should_reuse_packed_points(generation)
-                    .expect("observe first packed point scope")
-            );
-            for observation in 2..=TRANSACTION_PACKED_POINT_CACHE_MIN_OBSERVATIONS {
-                assert_eq!(
-                    cache
-                        .should_reuse_packed_points(generation)
-                        .expect("observe packed point scope"),
-                    index < TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES
-                        && observation == TRANSACTION_PACKED_POINT_CACHE_MIN_OBSERVATIONS,
-                );
-            }
-        }
-        assert_eq!(
-            cache.collection_controls.lock().unwrap().len(),
-            TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES
-        );
-        assert_eq!(
-            cache.certified_absent_generations.lock().unwrap().len(),
-            TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES
-        );
-        assert_eq!(
-            cache.packed_current_base_refs.lock().unwrap().len(),
-            TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES
-        );
-        assert_eq!(
-            cache
-                .packed_point_generation_observations
-                .lock()
-                .unwrap()
-                .len(),
-            TRANSACTION_HOT_STATE_CACHE_MAX_ENTRIES
-        );
     }
 
     #[tokio::test]
@@ -10679,48 +6036,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn transaction_cache_reuses_absent_certified_manifest_scan() {
-        const BRANCH_ID: &str = "absent-certified-cache-branch";
-        let storage = StorageAdapter::new(Memory::new());
-        let generation = CommitId::for_test_label("absent-certified-cache-generation");
-        let scan_calls = Arc::new(AtomicUsize::new(0));
-        let read = CountingRead {
-            inner: storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("open absent certified fixture read"),
-            get_many_calls: Arc::new(AtomicUsize::new(0)),
-            scan_calls: Some(Arc::clone(&scan_calls)),
-        };
-        let cache = HotStateTransactionCache::default();
-        let request = TrackedStateScanRequest {
-            filter: TrackedStateFilter {
-                schema_keys: vec!["plugin_row".to_owned()],
-                ..TrackedStateFilter::default()
-            },
-            ..TrackedStateScanRequest::default()
-        };
-        for _ in 0..2 {
-            let rows = scan_certified_entity_batch_rows(
-                &read,
-                BRANCH_ID,
-                generation,
-                &request,
-                None,
-                Some(&cache),
-            )
-            .await
-            .expect("scan absent certified generation");
-            assert!(rows.is_empty());
-        }
-        assert_eq!(
-            scan_calls.load(Ordering::Relaxed),
-            1,
-            "an immutable generation without manifests should be scanned once"
-        );
-    }
-
     struct CountingRead<R> {
         inner: R,
         get_many_calls: Arc<AtomicUsize>,
@@ -10749,39 +6064,6 @@ mod tests {
             if let Some(scan_calls) = &self.scan_calls {
                 scan_calls.fetch_add(1, Ordering::Relaxed);
             }
-            self.inner.scan(space, range, opts).await
-        }
-    }
-
-    struct JsonCountingRead<R> {
-        inner: R,
-        json_get_many_calls: Arc<AtomicUsize>,
-    }
-
-    impl<R: StorageAdapterRead> StorageAdapterRead for JsonCountingRead<R> {
-        fn snapshot_cache_key(&self) -> Option<u128> {
-            self.inner.snapshot_cache_key()
-        }
-
-        async fn get_many(
-            &self,
-            requests: &[StorageGetManyRequest<'_>],
-        ) -> Result<StorageGetManyResult, crate::storage_adapter::StorageError> {
-            if requests
-                .iter()
-                .any(|request| request.space == crate::json_store::store::JSON_SPACE)
-            {
-                self.json_get_many_calls.fetch_add(1, Ordering::Relaxed);
-            }
-            self.inner.get_many(requests).await
-        }
-
-        async fn scan(
-            &self,
-            space: StorageSpace,
-            range: StorageKeyRange,
-            opts: StorageScanOptions,
-        ) -> Result<StorageScanChunk, crate::storage_adapter::StorageError> {
             self.inner.scan(space, range, opts).await
         }
     }
@@ -10824,757 +6106,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn packed_mutation_lookup_retains_large_refs_and_finds_system_schemas() {
-        const COMMIT_LABEL: &str = "packed-system-schema-base";
-        let storage = StorageAdapter::new(Memory::new());
-        let generation = CommitId::for_test_label(COMMIT_LABEL);
-        let entity_pk = EntityPk::single("packed-system-row");
-        let snapshot = serde_json::json!({
-            "key": "packed-system-row",
-            "value": "x".repeat(crate::json_store::JSON_INLINE_MAX_BYTES + 1),
-        })
-        .to_string();
-        crate::test_support::seed_branch_head_with_rows(
-            storage.clone(),
-            crate::GLOBAL_BRANCH_ID,
-            COMMIT_LABEL,
-            &[MaterializedTrackedStateRow {
-                entity_pk: entity_pk.clone(),
-                schema_key: "lix_key_value".to_owned(),
-                file_id: None,
-                snapshot_content: Some(snapshot.into()),
-                metadata: None,
-                deleted: false,
-                created_at: timestamp().to_string(),
-                updated_at: timestamp().to_string(),
-                change_id: ChangeId::for_test_label("packed-system-change"),
-                commit_id: generation,
-            }],
-        )
-        .await;
-
-        let mut manifest_key = hot_scope_prefix(crate::GLOBAL_BRANCH_ID, generation);
-        manifest_key.extend_from_slice(generation.as_uuid().as_bytes());
-        let mut writes = StorageWriteSet::new();
-        writes.delete(
-            HOT_ROW_SPACE,
-            StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
-                branch_id: crate::GLOBAL_BRANCH_ID.to_owned(),
-                generation,
-                schema_key: "lix_key_value".to_owned(),
-                entity_pk: entity_pk.clone(),
-                file_id: None,
-            }))),
-        );
-        writes.put(
-            PACKED_CURRENT_BASE_SPACE,
-            StorageKey(Bytes::from(manifest_key)),
-            StorageValue {
-                bytes: Bytes::from_static(&[0; 16]),
-            },
-        );
-        writes.put(
-            PACKED_CURRENT_BASE_CONTROL_SPACE,
-            StorageKey(Bytes::from(hot_scope_prefix(
-                crate::GLOBAL_BRANCH_ID,
-                generation,
-            ))),
-            StorageValue {
-                bytes: Bytes::from_static(&[1]),
-            },
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("publish packed system-schema fixture");
-
-        let json_get_many_calls = Arc::new(AtomicUsize::new(0));
-        let get_many_calls = Arc::new(AtomicUsize::new(0));
-        let scan_calls = Arc::new(AtomicUsize::new(0));
-        let read = JsonCountingRead {
-            inner: CountingRead {
-                inner: storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("open packed fixture read"),
-                get_many_calls: Arc::clone(&get_many_calls),
-                scan_calls: Some(Arc::clone(&scan_calls)),
-            },
-            json_get_many_calls: Arc::clone(&json_get_many_calls),
-        };
-        let transaction_cache = Arc::new(HotStateTransactionCache::default());
-        let request_keys = [TrackedStateKeyRef {
-            schema_key: "lix_key_value",
-            entity_pk: &entity_pk,
-            file_id: None,
-        }];
-        let entries = load_packed_current_base_exact_entries(
-            &read,
-            crate::GLOBAL_BRANCH_ID,
-            generation,
-            &request_keys,
-            Some(transaction_cache.as_ref()),
-        )
-        .await
-        .expect("load packed mutation predecessor");
-        for _ in 2..=TRANSACTION_PACKED_POINT_CACHE_MIN_OBSERVATIONS {
-            let observed = load_packed_current_base_exact_entries(
-                &read,
-                crate::GLOBAL_BRANCH_ID,
-                generation,
-                &request_keys,
-                Some(transaction_cache.as_ref()),
-            )
-            .await
-            .expect("observe repeated packed mutation predecessor");
-            assert!(observed[0].is_some());
-        }
-        let admitted = load_packed_current_base_exact_entries(
-            &read,
-            crate::GLOBAL_BRANCH_ID,
-            generation,
-            &request_keys,
-            Some(transaction_cache.as_ref()),
-        )
-        .await
-        .expect("admit repeated packed mutation predecessor");
-        assert!(admitted[0].is_some());
-        let admitted_read_counts = (
-            get_many_calls.load(Ordering::Relaxed),
-            scan_calls.load(Ordering::Relaxed),
-        );
-        let reused = load_packed_current_base_exact_entries(
-            &read,
-            crate::GLOBAL_BRANCH_ID,
-            generation,
-            &request_keys,
-            Some(transaction_cache.as_ref()),
-        )
-        .await
-        .expect("reuse admitted packed mutation predecessor");
-        assert!(reused[0].is_some());
-        assert_eq!(
-            (
-                get_many_calls.load(Ordering::Relaxed),
-                scan_calls.load(Ordering::Relaxed),
-            ),
-            admitted_read_counts,
-            "a transaction snapshot must reuse an admitted packed segment by immutable address"
-        );
-        let (_, change, _) = entries[0].as_ref().expect("packed predecessor exists");
-        assert!(
-            matches!(change.snapshot, JsonSlot::Ref(_)),
-            "mutation lookup must retain the out-of-band slot instead of materializing its payload"
-        );
-        assert_eq!(
-            json_get_many_calls.load(Ordering::Relaxed),
-            0,
-            "mutation predecessor lookup must not read large JSON payloads"
-        );
-
-        let reader = HotStateStoreReader {
-            store: read,
-            transaction_cache: Some(transaction_cache),
-        };
-        let control = BranchHeadControl {
-            head_commit_id: generation,
-            generation,
-            current_state_revision: 0,
-            schema_presence_bloom: [u64::MAX; 4],
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp(),
-            updated_at: timestamp(),
-            ref_change_id: ChangeId::for_test_label("packed-system-ref"),
-        };
-        assert!(
-            reader
-                .has_schema_rows(crate::GLOBAL_BRANCH_ID, control, "lix_key_value",)
-                .await
-                .expect("probe packed system schema"),
-            "engine-owned schemas must probe packed bases before skipping plugin segments"
-        );
-        let exact = reader
-            .load_projected_live_batch_refs(
-                crate::GLOBAL_BRANCH_ID,
-                control,
-                &[TrackedStateKeyRef {
-                    schema_key: "lix_key_value",
-                    entity_pk: &entity_pk,
-                    file_id: None,
-                }],
-                &ChangeRecordProjection::full(),
-            )
-            .await
-            .expect("load packed system row through exact live-state API");
-        assert!(
-            exact.row(0).is_some(),
-            "engine-owned exact lookups must resolve packed bases before skipping plugin segments"
-        );
-    }
-
-    #[tokio::test]
-    async fn complete_replacement_retires_only_exclusive_schema_bases() {
-        const BRANCH_ID: &str = "exclusive-schema-replacement";
-        const SCHEMA_KEY: &str = "target_schema";
-        let storage = StorageAdapter::new(Memory::new());
-        let generation = CommitId::for_test_label("exclusive-generation");
-        let shared_head = CommitId::for_test_label("shared-base");
-        let exclusive_head = CommitId::for_test_label("exclusive-base");
-        let replacement_head = CommitId::for_test_label("replacement-base");
-        let mut fixture_writes = StorageWriteSet::new();
-        stage_hot_collection_control(
-            &mut fixture_writes,
-            BRANCH_ID,
-            generation,
-            crate::collection_generation::CollectionScopeRef {
-                schema_key: SCHEMA_KEY,
-                file_id: None,
-            },
-            HotCollectionControl {
-                active_generation: generation,
-                live_count: 1_024,
-                ordered_identity_digest: None,
-            },
-        )
-        .expect("stage replacement collection control");
-        for head in [shared_head, exclusive_head] {
-            let mut key = hot_scope_prefix(BRANCH_ID, generation);
-            key.extend_from_slice(head.as_uuid().as_bytes());
-            fixture_writes.put(
-                PACKED_CURRENT_BASE_SPACE,
-                StorageKey(Bytes::from(key)),
-                StorageValue {
-                    bytes: Bytes::from_static(&[0; 16]),
-                },
-            );
-        }
-        fixture_writes.put(
-            PACKED_CURRENT_BASE_CONTROL_SPACE,
-            StorageKey(Bytes::from(hot_scope_prefix(BRANCH_ID, generation))),
-            StorageValue {
-                bytes: Bytes::from_static(&[1]),
-            },
-        );
-        stage_packed_exclusive_schema_base_ref(
-            &mut fixture_writes,
-            BRANCH_ID,
-            generation,
-            SCHEMA_KEY,
-            exclusive_head,
-        );
-        storage
-            .commit_write_set(fixture_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit packed replacement fixture");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open packed replacement read");
-        let mut writes = StorageWriteSet::new();
-        let mut coverage = WorkingDiffIndexCoverage::default();
-        let (_, retired) = HotStateWriter {
-            store: &read,
-            writes: &mut writes,
-        }
-        .stage_complete_collection_replacement_current_base(
-            BRANCH_ID,
-            generation,
-            replacement_head,
-            SCHEMA_KEY,
-            1_024,
-            &crate::live_state::EntityColumnarWriteSets::new(),
-            None,
-            &mut coverage,
-        )
-        .await
-        .expect("stage complete packed replacement");
-        assert!(retired);
-        drop(read);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit complete packed replacement");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("verify complete packed replacement");
-        let base_keys = [shared_head, exclusive_head, replacement_head]
-            .into_iter()
-            .map(|head| {
-                let mut key = hot_scope_prefix(BRANCH_ID, generation);
-                key.extend_from_slice(head.as_uuid().as_bytes());
-                StorageKey(Bytes::from(key))
-            })
-            .collect::<Vec<_>>();
-        let bases = PointReadPlan::new(PACKED_CURRENT_BASE_SPACE, &base_keys)
-            .materialize(&read, StorageGetOptions::default())
-            .await
-            .expect("read replacement bases")
-            .value;
-        assert!(
-            bases[0].is_some(),
-            "a shared-schema base must remain visible"
-        );
-        assert!(bases[1].is_none(), "the exclusive predecessor must retire");
-        assert!(bases[2].is_some(), "the replacement base must publish");
-    }
-
-    #[tokio::test]
-    async fn current_state_gc_sweeps_stale_packed_generations() {
-        let storage = StorageAdapter::new(Memory::new());
-        let active_generation = CommitId::for_test_label("active-packed-generation");
-        let stale_generation = CommitId::for_test_label("stale-packed-generation");
-        let mut active_manifest = hot_scope_prefix("active-packed", active_generation);
-        active_manifest.extend_from_slice(active_generation.as_uuid().as_bytes());
-        let active_control = hot_scope_prefix("active-packed", active_generation);
-        let active_index = packed_exclusive_schema_base_key(
-            "active-packed",
-            active_generation,
-            "schema",
-            active_generation,
-        );
-        let mut stale_manifest = hot_scope_prefix("stale-packed", stale_generation);
-        stale_manifest.extend_from_slice(stale_generation.as_uuid().as_bytes());
-        let stale_control = hot_scope_prefix("stale-packed", stale_generation);
-        let active_root = hot_scope_prefix("active-packed", active_generation);
-        let stale_root = hot_scope_prefix("stale-packed", stale_generation);
-        let stale_index = packed_exclusive_schema_base_key(
-            "stale-packed",
-            stale_generation,
-            "schema",
-            stale_generation,
-        );
-        let mut writes = StorageWriteSet::new();
-        for (space, key, value) in [
-            (
-                PACKED_CURRENT_BASE_SPACE,
-                active_manifest.clone(),
-                Bytes::from_static(&[0; 16]),
-            ),
-            (
-                PACKED_CURRENT_BASE_CONTROL_SPACE,
-                active_control.clone(),
-                Bytes::from_static(&[1]),
-            ),
-            (
-                PACKED_CURRENT_BASE_SPACE,
-                stale_manifest.clone(),
-                Bytes::from_static(&[0; 16]),
-            ),
-            (
-                PACKED_CURRENT_BASE_CONTROL_SPACE,
-                stale_control.clone(),
-                Bytes::from_static(&[1]),
-            ),
-            (
-                ROOT_CURRENT_BASE_SPACE,
-                active_root.clone(),
-                Bytes::copy_from_slice(active_generation.as_uuid().as_bytes()),
-            ),
-            (
-                ROOT_CURRENT_BASE_SPACE,
-                stale_root.clone(),
-                Bytes::copy_from_slice(stale_generation.as_uuid().as_bytes()),
-            ),
-            (
-                PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-                active_index.clone(),
-                Bytes::from_static(&[1]),
-            ),
-            (
-                PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-                stale_index.clone(),
-                Bytes::from_static(&[1]),
-            ),
-        ] {
-            writes.put(
-                space,
-                StorageKey(Bytes::from(key)),
-                StorageValue { bytes: value },
-            );
-        }
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit packed GC fixture");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open packed GC read");
-        let active_branch_control = BranchHeadControl {
-            head_commit_id: active_generation,
-            generation: active_generation,
-            current_state_revision: 0,
-            schema_presence_bloom: [u64::MAX; 4],
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp(),
-            updated_at: timestamp(),
-            ref_change_id: ChangeId::for_test_label("active-packed-ref"),
-        };
-        let mut gc_writes = StorageWriteSet::new();
-        stage_collect_stale_hot_generations(
-            &read,
-            &mut gc_writes,
-            &[("active-packed".to_owned(), active_branch_control)],
-        )
-        .await
-        .expect("collect stale packed generations");
-        drop(read);
-        storage
-            .commit_write_set(gc_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit packed generation GC");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("verify packed generation GC");
-        let manifests = PointReadPlan::new(
-            PACKED_CURRENT_BASE_SPACE,
-            &[
-                StorageKey(Bytes::from(active_manifest)),
-                StorageKey(Bytes::from(stale_manifest)),
-            ],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read packed manifests")
-        .value;
-        let controls = PointReadPlan::new(
-            PACKED_CURRENT_BASE_CONTROL_SPACE,
-            &[
-                StorageKey(Bytes::from(active_control)),
-                StorageKey(Bytes::from(stale_control)),
-            ],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read packed controls")
-        .value;
-        assert!(manifests[0].is_some());
-        assert!(manifests[1].is_none());
-        assert!(controls[0].is_some());
-        assert!(controls[1].is_none());
-        let roots = PointReadPlan::new(
-            ROOT_CURRENT_BASE_SPACE,
-            &[
-                StorageKey(Bytes::from(active_root)),
-                StorageKey(Bytes::from(stale_root)),
-            ],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read tracked root references")
-        .value;
-        assert!(roots[0].is_some());
-        assert!(roots[1].is_none());
-        let indexes = PointReadPlan::new(
-            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-            &[
-                StorageKey(Bytes::from(active_index)),
-                StorageKey(Bytes::from(stale_index)),
-            ],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read packed exclusive-schema indexes")
-        .value;
-        assert!(indexes[0].is_some());
-        assert!(indexes[1].is_none());
-    }
-
-    #[tokio::test]
-    async fn checkpoint_retires_materialized_packed_bases_in_active_generation() {
-        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000c9";
-        const COMMIT_LABEL: &str = "checkpoint-packed-base";
-        const SCHEMA_KEY: &str = "checkpoint_schema";
-        let storage = StorageAdapter::new(Memory::new());
-        let generation = CommitId::for_test_label(COMMIT_LABEL);
-        let entity_pk = EntityPk::single("packed-row");
-        let created_at = timestamp();
-        crate::test_support::seed_branch_head_with_rows(
-            storage.clone(),
-            BRANCH_ID,
-            COMMIT_LABEL,
-            &[MaterializedTrackedStateRow {
-                entity_pk: entity_pk.clone(),
-                schema_key: SCHEMA_KEY.to_owned(),
-                file_id: None,
-                snapshot_content: Some(r#"{"key":"packed-row"}"#.into()),
-                metadata: None,
-                deleted: false,
-                created_at: created_at.to_string(),
-                updated_at: created_at.to_string(),
-                change_id: ChangeId::for_test_label("checkpoint-packed-base-change"),
-                commit_id: generation,
-            }],
-        )
-        .await;
-
-        let mut manifest_key = hot_scope_prefix(BRANCH_ID, generation);
-        manifest_key.extend_from_slice(generation.as_uuid().as_bytes());
-        let control_key = hot_scope_prefix(BRANCH_ID, generation);
-        let index_key =
-            packed_exclusive_schema_base_key(BRANCH_ID, generation, SCHEMA_KEY, generation);
-        let mut fixture_writes = StorageWriteSet::new();
-        fixture_writes.delete(
-            HOT_ROW_SPACE,
-            StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
-                branch_id: BRANCH_ID.to_owned(),
-                generation,
-                schema_key: SCHEMA_KEY.to_owned(),
-                entity_pk: entity_pk.clone(),
-                file_id: None,
-            }))),
-        );
-        fixture_writes.put(
-            PACKED_CURRENT_BASE_SPACE,
-            StorageKey(Bytes::from(manifest_key.clone())),
-            StorageValue {
-                bytes: Bytes::from_static(&[0; 16]),
-            },
-        );
-        fixture_writes.put(
-            PACKED_CURRENT_BASE_CONTROL_SPACE,
-            StorageKey(Bytes::from(control_key.clone())),
-            StorageValue {
-                bytes: Bytes::from_static(&[1]),
-            },
-        );
-        fixture_writes.put(
-            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-            StorageKey(Bytes::from(index_key.clone())),
-            StorageValue {
-                bytes: Bytes::from_static(&[1]),
-            },
-        );
-        storage
-            .commit_write_set(fixture_writes, StorageWriteOptions::default())
-            .await
-            .expect("publish packed checkpoint fixture");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open packed checkpoint read");
-        let checkpoint_head = CommitId::for_test_label("checkpoint-packed-head");
-        let checkpoint_change = ChangeId::for_test_label("checkpoint-packed-base-change");
-        let snapshot = r#"{"key":"packed-row"}"#;
-        let delta = CurrentStateDeltaRef {
-            schema_key: SCHEMA_KEY,
-            file_id: None,
-            entity_pk: &entity_pk,
-            change_id: Some(checkpoint_change),
-            commit_id: Some(generation),
-            untracked: false,
-            deleted: false,
-            created_at,
-            updated_at: created_at,
-            snapshot: JsonSlotRef::Inline(snapshot),
-            metadata: JsonSlotRef::None,
-            columnar_base_coordinate: None,
-        };
-        let mut checkpoint_writes = StorageWriteSet::new();
-        let mut coverage = WorkingDiffIndexCoverage::default();
-        HotStateWriter {
-            store: &read,
-            writes: &mut checkpoint_writes,
-        }
-        .stage_checkpoint_current_state(
-            BRANCH_ID,
-            generation,
-            checkpoint_head,
-            &[delta],
-            &BTreeSet::new(),
-            generation,
-            &mut coverage,
-        )
-        .await
-        .expect("stage checkpoint over packed base");
-        drop(read);
-        storage
-            .commit_write_set(checkpoint_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit checkpoint over packed base");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("verify packed checkpoint retirement");
-        let packed = PointReadPlan::new(
-            PACKED_CURRENT_BASE_SPACE,
-            &[StorageKey(Bytes::from(manifest_key))],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read retired packed manifest")
-        .value;
-        let control = PointReadPlan::new(
-            PACKED_CURRENT_BASE_CONTROL_SPACE,
-            &[StorageKey(Bytes::from(control_key))],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read retired packed control")
-        .value;
-        assert!(packed[0].is_none());
-        assert!(control[0].is_none());
-        let index = PointReadPlan::new(
-            PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-            &[StorageKey(Bytes::from(index_key))],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read retired packed exclusive-schema index")
-        .value;
-        assert!(index[0].is_none());
-        let hot = PointReadPlan::new(
-            HOT_ROW_SPACE,
-            &[StorageKey(Bytes::from(encode_hot_row_key(&HeadIdentity {
-                branch_id: BRANCH_ID.to_owned(),
-                generation,
-                schema_key: SCHEMA_KEY.to_owned(),
-                entity_pk,
-                file_id: None,
-            })))],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read materialized checkpoint row")
-        .value;
-        assert!(
-            hot[0].is_some(),
-            "checkpoint must materialize a packed-only row before retiring its base"
-        );
-    }
-
-    #[tokio::test]
-    async fn certified_history_scan_ignores_malformed_unrequested_commit() {
-        let storage = StorageAdapter::new(Memory::new());
-        let requested_commit = CommitId::for_test_label("requested-certified-history");
-        let unrelated_commit = CommitId::for_test_label("malformed-certified-history");
-        let mut writes = storage.new_write_set();
-        writes.put(
-            CERTIFIED_ENTITY_BATCH_SPACE,
-            StorageKey(Bytes::copy_from_slice(
-                unrelated_commit.as_uuid().as_bytes(),
-            )),
-            StorageValue {
-                bytes: Bytes::from_static(b"malformed"),
-            },
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("malformed unrelated certified batch should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("certified history read should open");
-        let rows = scan_certified_history_rows(
-            &read,
-            &BTreeSet::from([requested_commit]),
-            &TrackedStateScanRequest::default(),
-        )
-        .await
-        .expect("unrelated malformed batch must not affect the requested commit");
-
-        assert!(rows.is_empty());
-    }
-
-    #[tokio::test]
-    async fn certified_history_scan_paginates_past_1024_batches() {
-        fn empty_batch(commit_id: CommitId, file_id: &str) -> Vec<u8> {
-            let mut value = CERTIFIED_ENTITY_BATCH_MAGIC_V2.to_vec();
-            value.extend_from_slice(&1_u16.to_le_bytes());
-            append_batch_text(&mut value, "test_schema").unwrap();
-            append_batch_text(&mut value, file_id).unwrap();
-            value.extend_from_slice(commit_id.as_uuid().as_bytes());
-            append_batch_text(&mut value, "2026-01-01T00:00:00Z").unwrap();
-            value.extend_from_slice(&crate::wasm::HOST_CERTIFIED_PACKET_FORMAT.to_le_bytes());
-            value.extend_from_slice(&0_u64.to_le_bytes());
-            value.extend_from_slice(&0_u64.to_le_bytes());
-            value.extend_from_slice(&0_u32.to_le_bytes());
-            value.extend_from_slice(&0_u32.to_le_bytes());
-            value
-        }
-
-        let storage = StorageAdapter::new(Memory::new());
-        let commit_id = CommitId::for_test_label("paginated-certified-history");
-        let mut writes = storage.new_write_set();
-        for index in 0..crate::storage_adapter::MAX_SCAN_PAGE_ROWS {
-            let file_id = format!("file-{index:04}");
-            let mut key = commit_id.as_uuid().as_bytes().to_vec();
-            append_batch_text(&mut key, &file_id).unwrap();
-            writes.put(
-                CERTIFIED_ENTITY_BATCH_SPACE,
-                StorageKey(Bytes::from(key)),
-                StorageValue {
-                    bytes: Bytes::from(empty_batch(commit_id, &file_id)),
-                },
-            );
-        }
-        let mut malformed_key = commit_id.as_uuid().as_bytes().to_vec();
-        append_batch_text(&mut malformed_key, "zzzz-after-first-page").unwrap();
-        writes.put(
-            CERTIFIED_ENTITY_BATCH_SPACE,
-            StorageKey(Bytes::from(malformed_key)),
-            StorageValue {
-                bytes: Bytes::from_static(b"malformed"),
-            },
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("paginated certified fixture should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("certified history read should open");
-        assert!(
-            scan_certified_history_rows(
-                &read,
-                &BTreeSet::from([commit_id]),
-                &TrackedStateScanRequest::default(),
-            )
-            .await
-            .expect_err("the malformed batch after row 1024 must be visited")
-            .to_string()
-            .contains("certified"),
-        );
-    }
-
-    #[test]
-    fn create_only_packet_pages_expose_their_local_ref_range() {
-        fn create_record(local_ref: u64) -> Vec<u8> {
-            let mut record = vec![2];
-            record.extend_from_slice(&6_u32.to_le_bytes());
-            record.extend_from_slice(b"schema");
-            record.extend_from_slice(&local_ref.to_le_bytes());
-            let mut framed = Vec::new();
-            framed.extend_from_slice(&(record.len() as u32).to_le_bytes());
-            framed.extend_from_slice(&record);
-            framed
-        }
-
-        let mut page = create_record(7);
-        page.extend_from_slice(&create_record(11));
-        assert_eq!(
-            certified_packet_page_local_ref_range(&page).unwrap(),
-            Some((7, 11))
-        );
-
-        let mut keyed = create_record(7);
-        keyed[4] = 0;
-        assert_eq!(certified_packet_page_local_ref_range(&keyed).unwrap(), None);
-    }
-
     #[test]
     fn compressed_certified_page_rejects_invalid_bounds_and_corruption() {
         let mut inverted = Vec::new();
@@ -11599,369 +6130,6 @@ mod tests {
         assert!(decode_certified_zstd_packet_page(&corrupt).is_err());
     }
 
-    #[tokio::test]
-    async fn exact_file_certified_scan_does_not_read_unrelated_manifest() {
-        let storage = StorageAdapter::new(Memory::new());
-        let generation = CommitId::for_test_label("exact-certified-file-generation");
-        let malformed_content_key = StorageKey(Bytes::from_static(b"malformed-content"));
-        let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
-        append_batch_text(&mut manifest_key, "unrelated.md").unwrap();
-        manifest_key
-            .extend_from_slice(&crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
-        manifest_key.extend_from_slice(
-            CommitId::for_test_label("unrelated-certified-commit")
-                .as_uuid()
-                .as_bytes(),
-        );
-        let mut writes = storage.new_write_set();
-        writes.put(
-            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-            StorageKey(Bytes::from(manifest_key)),
-            StorageValue {
-                bytes: malformed_content_key.0.clone(),
-            },
-        );
-        writes.put(
-            CERTIFIED_ENTITY_BATCH_SPACE,
-            malformed_content_key,
-            StorageValue {
-                bytes: Bytes::from_static(b"malformed"),
-            },
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .unwrap();
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .unwrap();
-        let rows = scan_certified_entity_batch_rows(
-            &read,
-            "main",
-            generation,
-            &TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    file_ids: vec![NullableKeyFilter::Value("requested.md".to_owned())],
-                    ..TrackedStateFilter::default()
-                },
-                ..TrackedStateScanRequest::default()
-            },
-            None,
-            None,
-        )
-        .await
-        .expect("exact-file scan must not decode unrelated certified content");
-        assert!(rows.is_empty());
-    }
-
-    #[tokio::test]
-    async fn exact_hot_hit_skips_matching_certified_fallback() {
-        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000cf";
-        const COMMIT_LABEL: &str = "exact-hot-skips-certified";
-        const FILE_ID: &str = "requested.md";
-        const SCHEMA_KEY: &str = "plugin_row";
-        let storage = StorageAdapter::new(Memory::new());
-        let generation = CommitId::for_test_label(COMMIT_LABEL);
-        let entity_pk = EntityPk::single("hot-row");
-        crate::test_support::seed_branch_head_with_rows(
-            storage.clone(),
-            BRANCH_ID,
-            COMMIT_LABEL,
-            &[MaterializedTrackedStateRow {
-                entity_pk: entity_pk.clone(),
-                schema_key: SCHEMA_KEY.to_owned(),
-                file_id: Some(FILE_ID.to_owned()),
-                snapshot_content: Some(r#"{"id":"hot-row"}"#.into()),
-                metadata: None,
-                deleted: false,
-                created_at: timestamp().to_string(),
-                updated_at: timestamp().to_string(),
-                change_id: ChangeId::for_test_label("exact-hot-change"),
-                commit_id: generation,
-            }],
-        )
-        .await;
-
-        let malformed_content_key = StorageKey(Bytes::from_static(b"matching-malformed-content"));
-        let mut manifest_key = generation.as_uuid().as_bytes().to_vec();
-        append_batch_text(&mut manifest_key, FILE_ID).unwrap();
-        manifest_key
-            .extend_from_slice(&crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT.to_le_bytes());
-        manifest_key.extend_from_slice(
-            CommitId::for_test_label("matching-certified-commit")
-                .as_uuid()
-                .as_bytes(),
-        );
-        let mut writes = storage.new_write_set();
-        writes.put(
-            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-            StorageKey(Bytes::from(manifest_key)),
-            StorageValue {
-                bytes: malformed_content_key.0.clone(),
-            },
-        );
-        writes.put(
-            CERTIFIED_ENTITY_BATCH_SPACE,
-            malformed_content_key,
-            StorageValue {
-                bytes: Bytes::from_static(b"malformed"),
-            },
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("publish matching malformed certified fixture");
-
-        let reader = HotStateStoreReader {
-            store: storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("open exact HOT read"),
-            transaction_cache: None,
-        };
-        let result = reader
-            .load_projected_live_batch_for_generation_refs(
-                BRANCH_ID,
-                generation,
-                None,
-                &[TrackedStateKeyRef {
-                    schema_key: SCHEMA_KEY,
-                    file_id: Some(FILE_ID),
-                    entity_pk: &entity_pk,
-                }],
-                &ChangeRecordProjection::full(),
-            )
-            .await
-            .expect("authoritative HOT hit must not decode certified fallback");
-        let row = result.row(0).expect("HOT row remains visible");
-        assert_eq!(row.schema_key(), SCHEMA_KEY);
-        assert_eq!(row.file_id(), Some(FILE_ID));
-        assert_eq!(row.entity_pk(), &entity_pk);
-    }
-
-    #[tokio::test]
-    async fn branch_creation_inherits_certified_manifests_from_same_head() {
-        const EMPTY_BRANCH: &str = "a-empty";
-        const DONOR_BRANCH: &str = "donor";
-        const SECOND_DONOR_BRANCH: &str = "donor-two";
-        const CREATED_BRANCH: &str = "created";
-        const FILE_ID: &str = "inherited.csv";
-        const SECOND_FILE_ID: &str = "inherited-two.csv";
-        const SCHEMA_KEY: &str = "inherited_row";
-
-        let storage = StorageAdapter::new(Memory::new());
-        let head_commit_id = CommitId::for_test_label("certified-inherited-head");
-        let donor_generation = CommitId::for_test_label("certified-inherited-donor");
-        let created_generation = CommitId::for_test_label("certified-inherited-created");
-        let created_at = timestamp();
-        let donor_control = BranchHeadControl {
-            head_commit_id,
-            generation: donor_generation,
-            current_state_revision: 0,
-            schema_presence_bloom: [u64::MAX; 4],
-            working_diff_checkpoint_commit_id: None,
-            created_at,
-            updated_at: created_at,
-            ref_change_id: ChangeId::for_test_label("certified-inherited-donor-ref"),
-        };
-        let empty_control = BranchHeadControl {
-            generation: CommitId::for_test_label("certified-inherited-empty"),
-            ref_change_id: ChangeId::for_test_label("certified-inherited-empty-ref"),
-            ..donor_control
-        };
-        let second_donor_control = BranchHeadControl {
-            generation: CommitId::for_test_label("certified-inherited-donor-two"),
-            ref_change_id: ChangeId::for_test_label("certified-inherited-donor-two-ref"),
-            ..donor_control
-        };
-        let creates = WasmCreateContext {
-            high: 0x0192_0000_0000_7000,
-            low: 0x8000_0000,
-        };
-        let mut page = Vec::new();
-        page.extend_from_slice(&0_u32.to_le_bytes());
-        page.extend_from_slice(&1_u64.to_le_bytes());
-        page.push(0);
-        page.extend_from_slice(&0_u32.to_le_bytes());
-        page.extend_from_slice(&1_u16.to_le_bytes());
-        page.extend_from_slice(&5_u32.to_le_bytes());
-        page.extend_from_slice(b"value");
-        let page = lix_plugin_wire::encode_single_section(
-            lix_plugin_wire::Representation::SchemaRows,
-            lix_plugin_wire::Operation::Create,
-            SCHEMA_KEY,
-            br#"{"wire":["create_ref_u32","u64","u8","bytes_u32","list_utf8_u16"],"primary_key":[{"kind":"generated_id","slot":0}],"fields":[{"name":"cells","value":{"kind":"list_utf8","slot":4}},{"name":"id","value":{"kind":"generated_id","slot":0}},{"name":"layout","object":[{"name":"force_quote","value":{"kind":"base64_url","slot":3}},{"name":"terminator","value":{"kind":"enum","slot":2,"values":[null,"","\n","\r\n","\r"]}}]},{"name":"order_key","value":{"kind":"hex_u64","slot":1,"width":16}}]}"#,
-            1,
-            page,
-        )
-        .expect("test schema-row page");
-        let batch = WasmCertifiedEntityBatch {
-            format: 1,
-            schema_keys: vec![SCHEMA_KEY.to_owned()],
-            row_count: 1,
-            creates,
-            create_ranges: Vec::new(),
-            complete_file_state: true,
-            pages: vec![Bytes::from(page)],
-        };
-        let batches = [batch.clone()];
-        let second_batches = [WasmCertifiedEntityBatch {
-            creates: WasmCreateContext {
-                low: creates.low + 1,
-                ..creates
-            },
-            ..batch
-        }];
-        let files = [
-            CertifiedEntityBatchFileRef {
-                branch_id: DONOR_BRANCH,
-                file_id: FILE_ID,
-                batches: &batches,
-            },
-            CertifiedEntityBatchFileRef {
-                branch_id: DONOR_BRANCH,
-                file_id: SECOND_FILE_ID,
-                batches: &second_batches,
-            },
-        ];
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("donor certified read should open");
-        let mut writes = StorageWriteSet::new();
-        stage_branch_head_control(&mut writes, EMPTY_BRANCH, empty_control)
-            .expect("empty same-head control should stage");
-        stage_branch_head_control(&mut writes, DONOR_BRANCH, donor_control)
-            .expect("donor control should stage");
-        stage_certified_entity_batches(
-            &read,
-            &mut writes,
-            &files,
-            &BTreeMap::from([(DONOR_BRANCH.to_owned(), donor_control)]),
-            &BTreeMap::from([(
-                DONOR_BRANCH.to_owned(),
-                crate::branch::BranchHeadControlObservation {
-                    control: Some(donor_control),
-                    raw_token: None,
-                },
-            )]),
-            &BTreeMap::from([(head_commit_id, created_at)]),
-            &BTreeSet::new(),
-        )
-        .await
-        .expect("donor certified batch should stage");
-        drop(read);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("donor certified batch should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("second donor read should open");
-        let mut writes = StorageWriteSet::new();
-        stage_branch_head_control(&mut writes, SECOND_DONOR_BRANCH, second_donor_control)
-            .expect("second donor control should stage");
-        stage_certified_entity_batches(
-            &read,
-            &mut writes,
-            &[],
-            &BTreeMap::from([(SECOND_DONOR_BRANCH.to_owned(), second_donor_control)]),
-            &BTreeMap::from([(
-                SECOND_DONOR_BRANCH.to_owned(),
-                crate::branch::BranchHeadControlObservation {
-                    control: None,
-                    raw_token: None,
-                },
-            )]),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        )
-        .await
-        .expect("second donor should inherit certified manifests");
-        drop(read);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("second donor certified manifests should commit");
-
-        let created_control = BranchHeadControl {
-            generation: created_generation,
-            ref_change_id: ChangeId::for_test_label("certified-inherited-created-ref"),
-            ..donor_control
-        };
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("created branch read should open");
-        let mut writes = StorageWriteSet::new();
-        stage_certified_entity_batches(
-            &read,
-            &mut writes,
-            &[],
-            &BTreeMap::from([(CREATED_BRANCH.to_owned(), created_control)]),
-            &BTreeMap::from([(
-                CREATED_BRANCH.to_owned(),
-                crate::branch::BranchHeadControlObservation {
-                    control: None,
-                    raw_token: None,
-                },
-            )]),
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        )
-        .await
-        .expect("created branch should inherit certified manifests");
-        drop(read);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("created branch certified manifests should commit");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("created branch verification read should open");
-        let get_many_calls = Arc::new(AtomicUsize::new(0));
-        let read = CountingRead {
-            inner: read,
-            get_many_calls: Arc::clone(&get_many_calls),
-            scan_calls: None,
-        };
-        let rows = scan_certified_entity_batch_rows(
-            &read,
-            CREATED_BRANCH,
-            created_generation,
-            &TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    schema_keys: vec![SCHEMA_KEY.to_owned()],
-                    ..TrackedStateFilter::default()
-                },
-                read_columns: TrackedStateReadColumns {
-                    columns: vec!["snapshot_content".to_owned()],
-                },
-                limit: None,
-            },
-            None,
-            None,
-        )
-        .await
-        .expect("created branch certified rows should scan");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows.row(0).schema_key(), SCHEMA_KEY);
-        assert_eq!(rows.row(0).file_id(), Some(FILE_ID));
-        assert_eq!(rows.row(1).file_id(), Some(SECOND_FILE_ID));
-        assert_eq!(
-            get_many_calls.load(Ordering::Relaxed),
-            2,
-            "one content read and one page read must serve every certified batch"
-        );
-    }
-
     fn diff_identity(branch_id: &str, generation: CommitId, entity: &str) -> HeadIdentity {
         HeadIdentity {
             branch_id: branch_id.to_string(),
@@ -11969,181 +6137,6 @@ mod tests {
             schema_key: "schema".to_string(),
             entity_pk: EntityPk::single(entity),
             file_id: None,
-        }
-    }
-
-    fn working_diff_version(label: &str) -> WorkingDiffVersion {
-        WorkingDiffVersion {
-            change_id: ChangeId::for_test_label(&format!("{label}-change")),
-            commit_id: CommitId::for_test_label(&format!("{label}-commit")),
-            deleted: false,
-            created_at: timestamp(),
-            updated_at: timestamp(),
-            snapshot: WorkingDiffSlotFingerprint {
-                kind: WORKING_DIFF_SLOT_NONE,
-                hash: [0; JSON_REF_BYTES],
-            },
-            metadata: WorkingDiffSlotFingerprint {
-                kind: WORKING_DIFF_SLOT_NONE,
-                hash: [0; JSON_REF_BYTES],
-            },
-        }
-    }
-
-    #[test]
-    fn packed_recreate_wins_over_older_hot_working_diff_tombstone() {
-        let baseline = working_diff_version("checkpoint-baseline");
-        let mut hot = working_diff_version("hot-tombstone");
-        hot.commit_id = CommitId::new(uuid::Uuid::from_u128(1));
-        hot.deleted = true;
-        let mut packed = working_diff_version("packed-recreate");
-        packed.commit_id = CommitId::new(uuid::Uuid::from_u128(2));
-
-        let (before, after) =
-            choose_hot_or_packed_working_diff(Some((Some(baseline), hot)), Some(packed))
-                .expect("one current version must win");
-
-        assert_eq!(before, Some(baseline));
-        assert_eq!(after, packed);
-        assert!(!after.deleted);
-    }
-
-    #[test]
-    fn packed_exact_keys_are_ordered_and_deduplicated() {
-        let filter = TrackedStateFilter {
-            schema_keys: vec![
-                "schema-b".to_owned(),
-                "schema-a".to_owned(),
-                "schema-a".to_owned(),
-            ],
-            entity_pks: vec![
-                EntityPk::single("second"),
-                EntityPk::single("first"),
-                EntityPk::single("first"),
-            ],
-            ..TrackedStateFilter::default()
-        };
-
-        let keys = packed_exact_keys_for_filter(&filter).expect("filter is finite");
-        assert_eq!(
-            keys,
-            vec![
-                TrackedStateKey {
-                    schema_key: "schema-a".to_owned(),
-                    file_id: None,
-                    entity_pk: EntityPk::single("first"),
-                },
-                TrackedStateKey {
-                    schema_key: "schema-a".to_owned(),
-                    file_id: None,
-                    entity_pk: EntityPk::single("second"),
-                },
-                TrackedStateKey {
-                    schema_key: "schema-b".to_owned(),
-                    file_id: None,
-                    entity_pk: EntityPk::single("first"),
-                },
-                TrackedStateKey {
-                    schema_key: "schema-b".to_owned(),
-                    file_id: None,
-                    entity_pk: EntityPk::single("second"),
-                },
-            ]
-        );
-    }
-
-    fn single_hot_diff_segment(
-        checkpoint_commit_id: CommitId,
-        identity: &HeadIdentity,
-    ) -> (Vec<u8>, Vec<u8>) {
-        let scope = encode_working_diff_scope_prefix(
-            &identity.branch_id,
-            checkpoint_commit_id,
-            identity.generation,
-        );
-        let full_key = encode_hot_diff_key(checkpoint_commit_id, identity);
-        let suffix = full_key
-            .strip_prefix(scope.as_slice())
-            .expect("encoded hot diff identity starts with its scope");
-        let mut value = Vec::with_capacity(HOT_DIFF_SEGMENT_HEADER_BYTES + 4 + suffix.len());
-        value.push(HOT_DIFF_SEGMENT_VERSION);
-        value.extend_from_slice(&1_u32.to_le_bytes());
-        value.extend_from_slice(
-            &u32::try_from(suffix.len())
-                .expect("test identity suffix fits u32")
-                .to_le_bytes(),
-        );
-        value.extend_from_slice(suffix);
-        let mut key = scope;
-        key.extend_from_slice(blake3::hash(&value).as_bytes());
-        (key, value)
-    }
-
-    #[test]
-    fn hot_working_diff_entries_share_one_identity_batch() {
-        let candidates = ["first", "second"]
-            .into_iter()
-            .map(|entity| {
-                (
-                    TrackedStateKey {
-                        schema_key: "schema".to_owned(),
-                        entity_pk: EntityPk::single(entity),
-                        file_id: Some("file".to_owned()),
-                    },
-                    None,
-                    working_diff_version(entity),
-                )
-            })
-            .collect();
-
-        let entries =
-            classify_hot_working_diff_entries(candidates).expect("valid working diff batch");
-
-        assert_eq!(entries.len(), 2);
-        assert!(entries[0].identity.shares_batch_with(&entries[1].identity));
-        for entry in &entries {
-            assert!(
-                entry
-                    .identity
-                    .shares_key_with(&entry.after.as_ref().expect("after row").identity)
-            );
-        }
-    }
-
-    #[test]
-    fn finite_hot_working_diff_borrows_keys_into_one_identity_batch() {
-        let schema_key = String::from("schema");
-        let file_id = String::from("file");
-        let entity_pks = [EntityPk::single("first"), EntityPk::single("second")];
-        let candidates = entity_pks
-            .iter()
-            .enumerate()
-            .map(|(index, entity_pk)| {
-                (
-                    TrackedStateKeyRef {
-                        schema_key: &schema_key,
-                        entity_pk,
-                        file_id: Some(&file_id),
-                    },
-                    None,
-                    working_diff_version(if index == 0 { "first" } else { "second" }),
-                )
-            })
-            .collect();
-
-        let entries =
-            classify_hot_working_diff_entry_refs(candidates).expect("valid borrowed diff batch");
-
-        assert_eq!(entries.len(), 2);
-        assert!(entries[0].identity.shares_batch_with(&entries[1].identity));
-        assert_eq!(entries[0].identity.schema_key(), schema_key);
-        assert_eq!(entries[1].identity.file_id(), Some(file_id.as_str()));
-        for entry in &entries {
-            assert!(
-                entry
-                    .identity
-                    .shares_key_with(&entry.after.as_ref().expect("after row").identity)
-            );
         }
     }
 
@@ -12318,69 +6311,10 @@ mod tests {
     }
 
     #[test]
-    fn hot_diff_keys_append_into_one_exact_arena() {
-        let checkpoint = CommitId::for_test_label("shared-hot-diff-checkpoint");
-        let generation = CommitId::for_test_label("shared-hot-diff-generation");
-        let scope = encode_working_diff_scope_prefix("branch", checkpoint, generation);
-        let identities = [
-            HeadRowIdentity {
-                schema_key: "schema".to_string(),
-                entity_pk: EntityPk::single("first"),
-                file_id: None,
-            },
-            HeadRowIdentity {
-                schema_key: "schema\0escaped".to_string(),
-                entity_pk: EntityPk::single("second\0escaped"),
-                file_id: Some("file\0id".to_string()),
-            },
-        ];
-        let capacity = identities
-            .iter()
-            .try_fold(0_usize, |total, identity| {
-                total.checked_add(encoded_hot_identity_key_len(
-                    scope.len(),
-                    &identity.schema_key,
-                    &identity.entity_pk,
-                    identity.file_id.as_deref(),
-                )?)
-            })
-            .expect("test identities have a representable encoded size");
-        let mut key_bytes = Vec::with_capacity(capacity);
-        let allocation = key_bytes.as_ptr();
-        let ranges = identities
-            .iter()
-            .map(|identity| {
-                append_hot_diff_key_parts(
-                    &mut key_bytes,
-                    &scope,
-                    &identity.schema_key,
-                    &identity.entity_pk,
-                    identity.file_id.as_deref(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(key_bytes.len(), capacity);
-        assert_eq!(key_bytes.capacity(), capacity);
-        assert_eq!(key_bytes.as_ptr(), allocation);
-        assert_eq!(ranges[0].end, ranges[1].start);
-        for (range, expected) in ranges.into_iter().zip(identities) {
-            let (decoded_checkpoint, decoded_identity) =
-                decode_hot_diff_key(&key_bytes[range]).expect("decode appended hot-diff key");
-            assert_eq!(decoded_checkpoint, checkpoint);
-            assert_eq!(decoded_identity.branch_id, "branch");
-            assert_eq!(decoded_identity.generation, generation);
-            assert_eq!(decoded_identity.schema_key, expected.schema_key);
-            assert_eq!(decoded_identity.entity_pk, expected.entity_pk);
-            assert_eq!(decoded_identity.file_id, expected.file_id);
-        }
-    }
-
-    #[test]
     fn columnar_base_coordinate_survives_repeated_hot_updates_and_tombstones() {
         let entity_pk = EntityPk::single("coordinated-row");
         let coordinate = ColumnarBaseCoordinate {
-            base_commit_id: CommitId::for_test_label("coordinate-base"),
+            state_set_id: crate::columnar_row_group::ArrowStateSetId::from_digest([7; 32]),
             group_index: 7,
             row_index: 31,
         };
@@ -12394,7 +6328,6 @@ mod tests {
             snapshot: JsonSlotRef::Inline("{}"),
             metadata: JsonSlotRef::None,
             columnar_base_coordinate: Some(coordinate),
-            working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
         let mut predecessor = CertifiedCurrentStatePredecessor::Encoded(Bytes::from(
             encode_head_value(&previous).expect("encode coordinated predecessor"),
@@ -12422,15 +6355,10 @@ mod tests {
                 metadata: JsonSlotRef::None,
                 columnar_base_coordinate: None,
             };
-            let inherited = next_columnar_base_coordinate(false, &delta, Some(&predecessor))
+            let inherited = next_columnar_base_coordinate(&delta, Some(&predecessor))
                 .expect("inherit coordinate");
             assert_eq!(inherited, Some(coordinate));
-            assert_eq!(
-                next_columnar_base_coordinate(true, &delta, Some(&predecessor))
-                    .expect("clear coordinate for new base"),
-                None
-            );
-            let mut next = delta.value_ref(timestamp(), WorkingDiffBaseline::Disabled);
+            let mut next = delta.value_ref(timestamp());
             next.columnar_base_coordinate = inherited;
             predecessor = CertifiedCurrentStatePredecessor::Encoded(Bytes::from(
                 encode_head_value(&next).expect("encode repeated coordinated mutation"),
@@ -12444,76 +6372,6 @@ mod tests {
                 .columnar_base_coordinate,
             Some(coordinate)
         );
-    }
-
-    #[tokio::test]
-    async fn hot_diff_segments_preserve_identity_coverage_with_bounded_puts() {
-        const IDENTITY_COUNT: usize = 10_000;
-
-        let checkpoint = CommitId::for_test_label("segmented-hot-diff-checkpoint");
-        let generation = CommitId::for_test_label("segmented-hot-diff-generation");
-        let scope = encode_working_diff_scope_prefix("branch", checkpoint, generation);
-        let mut identity_key_bytes = Vec::new();
-        let mut identity_puts = Vec::with_capacity(IDENTITY_COUNT);
-        let mut expected_coverage = WorkingDiffIndexCoverage::default();
-        for index in 0..IDENTITY_COUNT {
-            let entity_pk = EntityPk::single(format!("entity-{index:05}"));
-            let key = append_hot_diff_key_parts(
-                &mut identity_key_bytes,
-                &scope,
-                "schema",
-                &entity_pk,
-                Some("file.md"),
-            );
-            expected_coverage
-                .add_encoded_group_key(&identity_key_bytes[key.clone()])
-                .expect("test coverage count fits u64");
-            identity_puts.push(EncodedPut {
-                key: buffer_range(&key),
-                value: BufferRange::default(),
-            });
-        }
-
-        let mut writes = StorageWriteSet::new();
-        stage_hot_diff_batch(&mut writes, &scope, identity_key_bytes, identity_puts)
-            .expect("stage segmented hot diff");
-        assert!(
-            writes.stats().staged_puts <= 3,
-            "ten thousand short identities should require at most three bounded segments"
-        );
-
-        let storage = StorageAdapter::new(Memory::new());
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit segmented hot diff");
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open segmented hot diff read");
-        let page = ScanPlan::prefix(
-            HOT_DIFF_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(scope.clone()),
-            },
-        )
-        .collect(&read, StorageScanOptions::default())
-        .await
-        .expect("scan segmented hot diff");
-        assert!(!page.value.has_more);
-
-        let mut actual_coverage = WorkingDiffIndexCoverage::default();
-        let mut decoded = 0_usize;
-        for entry in page.value.entries {
-            let bytes = full_value_bytes(entry.value).expect("full segment value");
-            let segment_scope =
-                decode_hot_diff_segment_key(entry.key.0.as_ref()).expect("segment key");
-            assert_eq!(segment_scope.digest, *blake3::hash(&bytes).as_bytes());
-            visit_hot_diff_segment(&bytes, &scope, &mut actual_coverage, |_| decoded += 1)
-                .expect("decode hot diff segment");
-        }
-        assert_eq!(decoded, IDENTITY_COUNT);
-        assert_eq!(actual_coverage, expected_coverage);
     }
 
     #[test]
@@ -12620,188 +6478,6 @@ mod tests {
     }
 
     #[test]
-    fn hot_next_values_append_into_one_planned_arena() {
-        let tracked_pk = EntityPk::single("tracked");
-        let tombstone_pk = EntityPk::single("tombstone");
-        let untracked_pk = EntityPk::single("untracked");
-        let removed_pk = EntityPk::single("removed");
-        let snapshot_ref = JsonRef::for_content(b"{\"large\":\"snapshot\"}");
-        let tracked = CurrentStateDeltaRef {
-            schema_key: "tracked_schema",
-            file_id: Some("tracked.json"),
-            entity_pk: &tracked_pk,
-            change_id: Some(ChangeId::for_test_label("planned-value-change")),
-            commit_id: Some(CommitId::for_test_label("planned-value-commit")),
-            untracked: false,
-            deleted: false,
-            created_at: timestamp(),
-            updated_at: timestamp(),
-            snapshot: JsonSlotRef::Inline("{\"tracked\":true}"),
-            metadata: JsonSlotRef::Inline("{\"source\":\"test\"}"),
-            columnar_base_coordinate: None,
-        };
-        let tombstone = CurrentStateDeltaRef {
-            schema_key: "tracked_schema",
-            file_id: None,
-            entity_pk: &tombstone_pk,
-            change_id: Some(ChangeId::for_test_label("planned-tombstone-change")),
-            commit_id: Some(CommitId::for_test_label("planned-tombstone-commit")),
-            untracked: false,
-            deleted: true,
-            created_at: timestamp(),
-            updated_at: timestamp(),
-            // Deleted values deliberately ignore both supplied slots.
-            snapshot: JsonSlotRef::Inline("{\"ignored\":true}"),
-            metadata: JsonSlotRef::Ref(&snapshot_ref),
-            columnar_base_coordinate: None,
-        };
-        let untracked = CurrentStateDeltaRef {
-            schema_key: "untracked_schema",
-            file_id: Some("untracked.json"),
-            entity_pk: &untracked_pk,
-            change_id: None,
-            commit_id: None,
-            untracked: true,
-            deleted: false,
-            created_at: timestamp(),
-            updated_at: timestamp(),
-            snapshot: JsonSlotRef::Ref(&snapshot_ref),
-            metadata: JsonSlotRef::None,
-            columnar_base_coordinate: None,
-        };
-        let removed = CurrentStateDeltaRef {
-            schema_key: "untracked_schema",
-            file_id: Some("removed.json"),
-            entity_pk: &removed_pk,
-            change_id: None,
-            commit_id: None,
-            untracked: true,
-            deleted: true,
-            created_at: timestamp(),
-            updated_at: timestamp(),
-            snapshot: JsonSlotRef::None,
-            metadata: JsonSlotRef::None,
-            columnar_base_coordinate: None,
-        };
-        let deltas = [&tracked, &tombstone, &untracked, &removed];
-
-        let ordinary_capacity = deltas
-            .iter()
-            .try_fold(0_usize, |total, delta| {
-                checked_add_hot_next_value_capacity(total, delta, false, false)
-            })
-            .expect("ordinary test values have a representable encoded size");
-        let mut ordinary = Vec::with_capacity(ordinary_capacity);
-        let ordinary_allocation = ordinary.as_ptr();
-        let mut ordinary_expected = Vec::new();
-        let mut ordinary_ranges = Vec::new();
-        for delta in deltas {
-            if delta.physically_deletes() {
-                continue;
-            }
-            let value = delta.value_ref(delta.created_at, WorkingDiffBaseline::Disabled);
-            ordinary_expected.extend_from_slice(
-                &encode_head_value(&value).expect("encode ordinary expected value"),
-            );
-            ordinary_ranges.push(
-                append_head_value(&mut ordinary, &value).expect("append ordinary planned value"),
-            );
-        }
-        assert_eq!(ordinary, ordinary_expected);
-        assert_eq!(ordinary.len(), ordinary_capacity);
-        assert_eq!(ordinary.capacity(), ordinary_capacity);
-        assert_eq!(ordinary.as_ptr(), ordinary_allocation);
-        for range in ordinary_ranges {
-            assert_eq!(
-                decode_head_value(&ordinary[range])
-                    .expect("decode ordinary planned value")
-                    .working_diff_baseline,
-                WorkingDiffBaseline::Disabled
-            );
-        }
-
-        let before = WorkingDiffVersion {
-            change_id: ChangeId::for_test_label("planned-before-change"),
-            commit_id: CommitId::for_test_label("planned-before-commit"),
-            deleted: false,
-            created_at: timestamp(),
-            updated_at: timestamp(),
-            snapshot: WorkingDiffSlotFingerprint {
-                kind: WORKING_DIFF_SLOT_NONE,
-                hash: [0; JSON_REF_BYTES],
-            },
-            metadata: WorkingDiffSlotFingerprint {
-                kind: WORKING_DIFF_SLOT_NONE,
-                hash: [0; JSON_REF_BYTES],
-            },
-        };
-        let checkpoint_capacity = [&tracked, &tombstone, &untracked, &removed]
-            .iter()
-            .try_fold(0_usize, |total, delta| {
-                checked_add_hot_next_value_capacity(total, delta, true, false)
-            })
-            .expect("checkpoint test values have a representable encoded size");
-        let checkpoint_baselines = [
-            WorkingDiffBaseline::BeforePresent {
-                checkpoint_commit_id: CommitId::for_test_label("checkpoint"),
-                version: before,
-            },
-            WorkingDiffBaseline::BeforePresent {
-                checkpoint_commit_id: CommitId::for_test_label("checkpoint"),
-                version: before,
-            },
-            WorkingDiffBaseline::Disabled,
-            WorkingDiffBaseline::Disabled,
-        ];
-        let mut checkpoint = Vec::with_capacity(checkpoint_capacity);
-        let checkpoint_allocation = checkpoint.as_ptr();
-        let mut checkpoint_expected = Vec::new();
-        for (delta, baseline) in [&tracked, &tombstone, &untracked, &removed]
-            .into_iter()
-            .zip(checkpoint_baselines)
-        {
-            if delta.physically_deletes() {
-                continue;
-            }
-            let value = delta.value_ref(delta.created_at, baseline);
-            checkpoint_expected.extend_from_slice(
-                &encode_head_value(&value).expect("encode checkpoint expected value"),
-            );
-            append_head_value(&mut checkpoint, &value).expect("append checkpoint planned value");
-        }
-        assert_eq!(checkpoint, checkpoint_expected);
-        assert_eq!(checkpoint.len(), checkpoint_capacity);
-        assert_eq!(checkpoint.capacity(), checkpoint_capacity);
-        assert_eq!(checkpoint.as_ptr(), checkpoint_allocation);
-
-        let before_absent = tracked.value_ref(
-            tracked.created_at,
-            WorkingDiffBaseline::BeforeAbsent {
-                checkpoint_commit_id: CommitId::for_test_label("checkpoint"),
-            },
-        );
-        let before_absent_bytes =
-            encode_head_value(&before_absent).expect("encode before-absent checkpoint value");
-        let tracked_checkpoint_capacity =
-            checked_add_hot_next_value_capacity(0, &tracked, true, false)
-                .expect("tracked checkpoint value has a representable size");
-        assert_eq!(
-            tracked_checkpoint_capacity,
-            before_absent_bytes.len() + WORKING_DIFF_VERSION_BYTES,
-            "new checkpoint rows use the same safe fixed-size upper bound"
-        );
-
-        assert!(
-            checked_add_hot_next_value_capacity(usize::MAX, &tracked, false, false).is_none(),
-            "overflow must select the caller's zero-capacity fallback"
-        );
-        assert_eq!(
-            checked_add_hot_next_value_capacity(usize::MAX, &tracked, false, false).unwrap_or(0),
-            0
-        );
-    }
-
-    #[test]
     fn hot_tracked_snapshot_clones_share_encoded_row_values() {
         let snapshot =
             HotTrackedSnapshot::from_materialized_rows(vec![MaterializedTrackedStateRow {
@@ -12849,62 +6525,6 @@ mod tests {
         assert_eq!(stats.value_shared_buffers, 2);
     }
 
-    #[test]
-    fn ten_thousand_file_cascade_mutations_reserve_shared_buffers_once() {
-        const ROW_COUNT: usize = 10_000;
-
-        let tombstone = HeadValueRef {
-            change_id: Some(ChangeId::for_test_label("cascade-reserve-change")),
-            commit_id: Some(CommitId::for_test_label("cascade-reserve-commit")),
-            untracked: false,
-            deleted: true,
-            created_at: timestamp(),
-            updated_at: timestamp(),
-            snapshot: JsonSlotRef::None,
-            metadata: JsonSlotRef::None,
-            columnar_base_coordinate: None,
-            working_diff_baseline: WorkingDiffBaseline::BeforePresent {
-                checkpoint_commit_id: CommitId::for_test_label("cascade-reserve-checkpoint"),
-                version: working_diff_version("cascade-reserve-before"),
-            },
-        };
-        let encoded_tombstone =
-            encode_head_value(&tombstone).expect("encode maximum cascade tombstone");
-        assert_eq!(
-            encoded_tombstone.len(),
-            HEAD_VALUE_HEADER_BYTES + WORKING_DIFF_CHECKPOINT_BYTES + WORKING_DIFF_VERSION_BYTES,
-            "the cascade value reservation must cover the largest checkpoint tombstone"
-        );
-
-        let mut buffers = HotCascadeMutationBuffers::with_capacity(ROW_COUNT, 0, true);
-        let value_allocation = buffers.value_bytes.as_ptr();
-        let row_put_allocation = buffers.row_puts.as_ptr();
-        let row_delete_allocation = buffers.row_deletes.as_ptr();
-        let descriptor = EncodedPut {
-            key: BufferRange::default(),
-            value: BufferRange::default(),
-        };
-        for _ in 0..ROW_COUNT {
-            append_head_value(&mut buffers.value_bytes, &tombstone)
-                .expect("append planned cascade tombstone");
-            buffers.row_puts.push(descriptor);
-            buffers.row_deletes.push(BufferRange::default());
-        }
-
-        assert_eq!(
-            buffers.value_bytes.len(),
-            ROW_COUNT
-                * (HEAD_VALUE_HEADER_BYTES
-                    + WORKING_DIFF_CHECKPOINT_BYTES
-                    + WORKING_DIFF_VERSION_BYTES)
-        );
-        assert_eq!(buffers.value_bytes.as_ptr(), value_allocation);
-        assert_eq!(buffers.row_puts.as_ptr(), row_put_allocation);
-        assert_eq!(buffers.row_deletes.as_ptr(), row_delete_allocation);
-        assert!(buffers.row_puts.capacity() >= ROW_COUNT);
-        assert!(buffers.row_deletes.capacity() >= ROW_COUNT);
-    }
-
     #[tokio::test]
     async fn ordinary_incremental_import_skips_file_cascade_identity_index() {
         const DELTAS: usize = 4096;
@@ -12935,7 +6555,6 @@ mod tests {
         let deltas = vec![&delta; DELTAS];
         let generation = CommitId::for_test_label("ordinary-import-generation");
         let mut writes = StorageWriteSet::new();
-        let mut coverage = WorkingDiffIndexCoverage::default();
         let mut retired_untracked_json_refs = BTreeSet::new();
         let explicit_index_builds = incremental_cascade_explicit_index_builds();
 
@@ -12945,9 +6564,6 @@ mod tests {
             "ordinary-import",
             generation,
             &deltas,
-            None,
-            false,
-            &mut coverage,
             &mut retired_untracked_json_refs,
         )
         .await
@@ -13154,179 +6770,5 @@ mod tests {
             .await
             .expect("point-read sparse identities after dense fallback");
         assert_eq!(point.iter().flatten().count(), requested.len());
-    }
-
-    #[tokio::test]
-    async fn working_diff_gc_keeps_only_control_bound_hot_records() {
-        let storage = StorageAdapter::new(Memory::new());
-        let active_generation = CommitId::for_test_label("active-generation");
-        let active_checkpoint = CommitId::for_test_label("active-checkpoint");
-        let stale_generation = CommitId::for_test_label("stale-generation");
-        let stale_checkpoint = CommitId::for_test_label("stale-checkpoint");
-        let orphan_generation = CommitId::for_test_label("orphan-generation");
-        let orphan_checkpoint = CommitId::for_test_label("orphan-checkpoint");
-
-        let active_identity = diff_identity("active", active_generation, "active-row");
-        let stale_identity = diff_identity("stale", stale_generation, "stale-row");
-        let orphan_identity = diff_identity("deleted", orphan_generation, "orphan-row");
-        let (active_key, active_value) =
-            single_hot_diff_segment(active_checkpoint, &active_identity);
-        let (stale_key, stale_value) = single_hot_diff_segment(stale_checkpoint, &stale_identity);
-        let (orphan_key, orphan_value) =
-            single_hot_diff_segment(orphan_checkpoint, &orphan_identity);
-
-        let mut writes = StorageWriteSet::new();
-        stage_tracked_working_diff_epoch(
-            &mut writes,
-            "active",
-            TrackedWorkingDiffEpoch {
-                checkpoint_commit_id: active_checkpoint,
-                generation: active_generation,
-                coverage: WorkingDiffIndexCoverage::default(),
-            },
-        )
-        .expect("stage active epoch");
-        stage_branch_head_control(
-            &mut writes,
-            "active",
-            BranchHeadControl {
-                head_commit_id: active_generation,
-                generation: active_generation,
-                current_state_revision: 0,
-                schema_presence_bloom: [u64::MAX; 4],
-                working_diff_checkpoint_commit_id: Some(active_checkpoint),
-                created_at: timestamp(),
-                updated_at: timestamp(),
-                ref_change_id: ChangeId::for_test_label("active-ref"),
-            },
-        )
-        .expect("stage active control");
-
-        stage_tracked_working_diff_epoch(
-            &mut writes,
-            "stale",
-            TrackedWorkingDiffEpoch {
-                checkpoint_commit_id: stale_checkpoint,
-                generation: stale_generation,
-                coverage: WorkingDiffIndexCoverage::default(),
-            },
-        )
-        .expect("stage stale epoch");
-        stage_branch_head_control(
-            &mut writes,
-            "stale",
-            BranchHeadControl {
-                head_commit_id: stale_generation,
-                generation: stale_generation,
-                current_state_revision: 0,
-                schema_presence_bloom: [u64::MAX; 4],
-                working_diff_checkpoint_commit_id: None,
-                created_at: timestamp(),
-                updated_at: timestamp(),
-                ref_change_id: ChangeId::for_test_label("stale-ref"),
-            },
-        )
-        .expect("stage stale control");
-
-        stage_tracked_working_diff_epoch(
-            &mut writes,
-            "deleted",
-            TrackedWorkingDiffEpoch {
-                checkpoint_commit_id: orphan_checkpoint,
-                generation: orphan_generation,
-                coverage: WorkingDiffIndexCoverage::default(),
-            },
-        )
-        .expect("stage orphan epoch");
-
-        for (key, value) in [
-            (&active_key, active_value),
-            (&stale_key, stale_value),
-            (&orphan_key, orphan_value),
-        ] {
-            writes.put(
-                HOT_DIFF_SPACE,
-                StorageKey(Bytes::copy_from_slice(key)),
-                StorageValue {
-                    bytes: Bytes::from(value),
-                },
-            );
-        }
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit hot working-diff GC fixture");
-
-        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("open hot working-diff GC read"),
-        );
-        let mut gc_writes = StorageWriteSet::new();
-        stage_collect_stale_working_diff_indexes(&read, &mut gc_writes)
-            .await
-            .expect("stage hot working-diff GC");
-        drop(read);
-        storage
-            .commit_write_set(gc_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit hot working-diff GC");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open hot working-diff GC verification read");
-        let active_epoch = PointReadPlan::new(
-            TRACKED_WORKING_DIFF_MARKER_SPACE,
-            &[StorageKey(Bytes::from(
-                working_diff_marker_key("active").expect("active working-diff marker key"),
-            ))],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read active epoch")
-        .value
-        .into_iter()
-        .next()
-        .flatten();
-        assert!(active_epoch.is_some(), "active epoch must survive GC");
-
-        for (branch_id, key) in [("stale", stale_key), ("deleted", orphan_key)] {
-            let epoch = PointReadPlan::new(
-                TRACKED_WORKING_DIFF_MARKER_SPACE,
-                &[StorageKey(Bytes::from(
-                    working_diff_marker_key(branch_id).expect("working-diff marker key"),
-                ))],
-            )
-            .materialize(&read, StorageGetOptions::default())
-            .await
-            .expect("read stale epoch")
-            .value
-            .into_iter()
-            .next()
-            .flatten();
-            assert!(epoch.is_none(), "inactive epoch must be reclaimed");
-            let record = PointReadPlan::new(HOT_DIFF_SPACE, &[StorageKey(Bytes::from(key))])
-                .materialize(&read, StorageGetOptions::default())
-                .await
-                .expect("read stale hot record")
-                .value
-                .into_iter()
-                .next()
-                .flatten();
-            assert!(record.is_none(), "inactive hot record must be reclaimed");
-        }
-
-        let active_record =
-            PointReadPlan::new(HOT_DIFF_SPACE, &[StorageKey(Bytes::from(active_key))])
-                .materialize(&read, StorageGetOptions::default())
-                .await
-                .expect("read active hot record")
-                .value
-                .into_iter()
-                .next()
-                .flatten();
-        assert!(active_record.is_some(), "active hot record must survive GC");
     }
 }

@@ -251,7 +251,6 @@ where
                     include_tombstones: true,
                     ..TrackedStateFilter::default()
                 },
-                retain_payloads: false,
             },
         )
         .await?;

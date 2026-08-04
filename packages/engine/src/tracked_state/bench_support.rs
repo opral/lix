@@ -5,14 +5,10 @@ use crate::json_store::{
 };
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageReadOptions,
-    StorageWriteOptions, StorageWriteSet, StorageWriteSetStats,
+    SharedStorageAdapterRead, StorageAdapter, StorageReadOptions, StorageWriteOptions,
+    StorageWriteSet,
 };
-use crate::tracked_state::{
-    CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
-    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey, TrackedStateReadColumns,
-    TrackedStateScanRequest,
-};
+use crate::tracked_state::{CommitStateManifest, TrackedStateCommitDeltaRef, TrackedStateDeltaRef};
 
 fn stage_bench_commit_deltas(
     writes: &mut StorageWriteSet,
@@ -24,58 +20,35 @@ fn stage_bench_commit_deltas(
         .map(|delta| delta.delta.commit_id)
         .unwrap_or_default();
     let mutations = staged.mutation_inventory().clone();
+    let current_state_catalog = Box::new(
+        super::current_state_part::empty_current_state_catalog_root(None, commit_id)?,
+    );
     super::storage::stage_commit_state_manifest(
         writes,
         &CommitStateManifest {
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
+            state_parent_commit_id: None,
             commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:bench-commit")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
-            replay_debt: CommitStateReplayDebt {
-                depth: 1,
-                rows: u64::from(mutations.member_count),
-                bytes: u64::from(mutations.member_count),
-            },
             mutations,
-            touched_scope_filter: Default::default(),
-            current_state_scoped_ranges: None,
-            snapshot_root: None,
+            current_state_catalog,
         },
     )?;
     Ok(staged.locators)
 }
 
-#[derive(Clone, Debug)]
-pub struct BenchTrackedRow {
-    pub schema_key: String,
-    pub file_id: Option<String>,
-    pub entity_pk: String,
-    pub value: Vec<u8>,
-    pub updated_value: Vec<u8>,
-}
-
-#[expect(missing_debug_implementations)]
-pub struct BenchTrackedFixture<StorageImpl: Storage> {
-    storage: StorageAdapter<StorageImpl>,
-    context: TrackedStateContext,
-    rows: Vec<BenchTrackedRow>,
-    current_commit_id: Option<String>,
-    next_commit_index: usize,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchCurrentStatePointMode {
-    ScopedRange,
-    FirstParentReplay,
+    PersistentCatalog,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchCurrentStateSparseShape {
     UnrelatedScopes,
     TouchedScope,
-    TouchedScopeDistinct,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,32 +60,24 @@ pub enum BenchCurrentStatePointTarget {
 #[expect(missing_debug_implementations)]
 pub struct BenchCurrentStatePointFixture<StorageImpl: Storage> {
     storage: StorageAdapter<StorageImpl>,
-    commits: Vec<CommitId>,
-    base_manifest: CommitStateManifest,
     current_manifest: CommitStateManifest,
     encoded_key: bytes::Bytes,
-    scope_count: usize,
-    scoped_manifest_bytes: u64,
-    replay_manifest_bytes: u64,
-    scoped_range_staged_puts: u64,
-    scoped_range_staged_bytes: u64,
-    sparse_scoped_range_staged_puts: u64,
-    sparse_scoped_range_staged_bytes: u64,
+    catalog_entry_count: usize,
+    catalog_manifest_bytes: u64,
+    catalog_staged_encoded_bytes: u64,
+    directory_staged_encoded_bytes: u64,
     sparse_staged_puts: u64,
     sparse_written_bytes: u64,
-    sparse_publication_p50_nanos: u64,
-    sparse_publication_p95_nanos: u64,
     first_sparse_elapsed_nanos: u64,
     first_sparse_staged_puts: u64,
     first_sparse_written_bytes: u64,
-    current_state_part_count: u64,
 }
 
 pub async fn seed_current_state_point_fixture<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
     replacement_rows: usize,
     unrelated_sparse_commits: usize,
-    scope_count: usize,
+    catalog_entry_count: usize,
     sparse_shape: BenchCurrentStateSparseShape,
     point_target: BenchCurrentStatePointTarget,
 ) -> BenchCurrentStatePointFixture<StorageImpl>
@@ -120,27 +85,15 @@ where
     StorageImpl: Storage,
 {
     assert!(replacement_rows > 0);
-    assert!(scope_count > 0);
+    assert!(catalog_entry_count > 0);
+    let _ = crate::storage_bench::take_crud_current_state_catalog_bytes();
+    let _ = crate::storage_bench::take_crud_current_state_directory_bytes();
     let created_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(11);
     let updated_at = crate::common::LixTimestamp::from_unix_millis_utc_lossy(22);
+    let parent_id = bench_addressable_commit_id("persistent-catalog-parent");
     let entity_pks = (0..replacement_rows)
         .map(|index| EntityPk::single(format!("entity-{index:09}")))
         .collect::<Vec<_>>();
-    let alpha_scope = super::types::CommitDeltaReplacementScope {
-        schema_key: "bench_current_state_alpha".to_string(),
-        file_id: None,
-    };
-    let alpha_generation = super::storage::CommitDeltaReplacementGeneration {
-        scope: alpha_scope.clone(),
-        fallback_commit_id: None,
-        lifecycle_summary: super::storage::CommitDeltaLifecycleSummary {
-            scope: alpha_scope,
-            ordered_identity_digest: [17; 32],
-            uniform_created_at: created_at,
-        },
-    };
-
-    let parent_id = bench_addressable_commit_id("scoped-range-parent");
     let parent_rows = entity_pks
         .iter()
         .enumerate()
@@ -149,7 +102,7 @@ where
                 schema_key: "bench_current_state_alpha",
                 file_id: None,
                 entity_pk,
-                change_id: ChangeId::for_test_label(&format!("scoped-parent-{index}")),
+                change_id: ChangeId::for_test_label(&format!("catalog-parent-{index}")),
                 commit_id: parent_id,
                 deleted: false,
                 created_at,
@@ -162,27 +115,57 @@ where
             authored: true,
         })
         .collect::<Vec<_>>();
+    let scope = super::types::CommitDeltaReplacementScope {
+        schema_key: "bench_current_state_alpha".to_string(),
+        file_id: None,
+    };
+    let generation = super::storage::CommitDeltaReplacementGeneration {
+        scope: scope.clone(),
+        lifecycle_summary: super::storage::CommitDeltaLifecycleSummary {
+            scope,
+            ordered_identity_digest: [17; 32],
+            uniform_created_at: created_at,
+        },
+    };
     let mut writes = storage.new_write_set();
-    let staged = super::storage::stage_ordered_addressable_replacement_parts(
+    let parent_stage = super::storage::stage_ordered_addressable_replacement_parts(
         &mut writes,
         parent_rows.iter().copied().map(Ok),
-        &alpha_generation,
+        &generation,
     )
     .expect("stage benchmark replacement parts");
-    let (mut current_manifest, mut scoped_range_staged_puts, mut scoped_range_staged_bytes, _, _) =
-        publish_bench_current_state_commit(
-            &storage,
-            writes,
-            None,
-            parent_id,
-            1,
-            staged.mutation_inventory().clone(),
-        )
-        .await;
-    let mut commits = vec![parent_id];
+    let mut parent_mutations = parent_stage.mutation_inventory().clone();
+    let parent_publication = super::storage::stage_current_state_catalog_from_published_parent(
+        &storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open benchmark root read"),
+        &mut writes,
+        None,
+        parent_id,
+        &parent_mutations,
+        &[],
+        None,
+    )
+    .await
+    .expect("certify benchmark parent catalog");
+    let parent_catalog = parent_publication.root();
+    parent_mutations.parts.clear();
+    let mut current_manifest =
+        bench_current_state_manifest(parent_id, None, parent_mutations, parent_catalog);
+    super::storage::stage_certified_commit_state_manifest(
+        &mut writes,
+        &current_manifest,
+        &parent_publication,
+    )
+    .expect("stage benchmark parent manifest");
+    storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .await
+        .expect("commit benchmark parent");
 
-    for index in 1..scope_count {
-        let commit_id = bench_addressable_commit_id(&format!("scoped-range-scope-{index}"));
+    for index in 1..catalog_entry_count {
+        let authority_commit_id = bench_addressable_commit_id(&format!("catalog-scope-{index}"));
         let schema_key = format!("bench_scope_{index:08}");
         let file_id = format!("file-{:05}", index % 10_000);
         let entity_pk = EntityPk::single("entity");
@@ -190,22 +173,13 @@ where
             schema_key: schema_key.clone(),
             file_id: Some(file_id.clone()),
         };
-        let generation = super::storage::CommitDeltaReplacementGeneration {
-            scope: scope.clone(),
-            fallback_commit_id: None,
-            lifecycle_summary: super::storage::CommitDeltaLifecycleSummary {
-                scope,
-                ordered_identity_digest: *blake3::hash(schema_key.as_bytes()).as_bytes(),
-                uniform_created_at: created_at,
-            },
-        };
         let row = TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key: &schema_key,
                 file_id: Some(&file_id),
                 entity_pk: &entity_pk,
-                change_id: ChangeId::for_test_label(&format!("scoped-scope-change-{index}")),
-                commit_id,
+                change_id: ChangeId::for_test_label(&format!("catalog-scope-change-{index}")),
+                commit_id: authority_commit_id,
                 deleted: false,
                 created_at,
                 updated_at,
@@ -216,63 +190,90 @@ where
             base_coordinate: None,
             authored: true,
         };
-        let mut writes = storage.new_write_set();
+        let generation = super::storage::CommitDeltaReplacementGeneration {
+            scope: scope.clone(),
+            lifecycle_summary: super::storage::CommitDeltaLifecycleSummary {
+                scope,
+                ordered_identity_digest: *blake3::hash(schema_key.as_bytes()).as_bytes(),
+                uniform_created_at: created_at,
+            },
+        };
+        let mut authority_writes = storage.new_write_set();
         let staged = super::storage::stage_ordered_addressable_replacement_parts(
-            &mut writes,
+            &mut authority_writes,
             std::iter::once(Ok(row)),
             &generation,
         )
-        .expect("stage benchmark scope replacement");
-        let (manifest, puts, bytes, _, _) = publish_bench_current_state_commit(
-            &storage,
-            writes,
-            Some(&current_manifest),
-            commit_id,
-            u16::try_from(index + 1)
-                .expect("benchmark scope depth fits u16")
-                .min(super::COMMIT_STATE_MAX_REPLAY_DEPTH),
-            staged.mutation_inventory().clone(),
+        .expect("stage valid benchmark scope replacement");
+        let mut mutations = staged.mutation_inventory().clone();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open benchmark scope parent read");
+        let published_parent =
+            super::storage::load_published_commit_state_manifest(&read, current_manifest.commit_id)
+                .await
+                .expect("load benchmark scope parent authority")
+                .expect("benchmark scope parent authority exists");
+        let publication = super::storage::stage_current_state_catalog_from_published_parent(
+            &read,
+            &mut authority_writes,
+            Some(&published_parent),
+            authority_commit_id,
+            &mutations,
+            &[],
+            None,
         )
-        .await;
-        current_manifest = manifest;
-        scoped_range_staged_puts = scoped_range_staged_puts.saturating_add(puts);
-        scoped_range_staged_bytes = scoped_range_staged_bytes.saturating_add(bytes);
-        commits.push(commit_id);
+        .await
+        .expect("certify benchmark scope catalog");
+        let catalog = publication.root();
+        mutations.parts.clear();
+        let authority_manifest = bench_current_state_manifest(
+            authority_commit_id,
+            Some(current_manifest.commit_id),
+            mutations,
+            catalog,
+        );
+        super::storage::stage_certified_commit_state_manifest(
+            &mut authority_writes,
+            &authority_manifest,
+            &publication,
+        )
+        .expect("stage benchmark scope authority");
+        drop(read);
+        storage
+            .commit_write_set(authority_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit benchmark scope authority");
+        current_manifest = authority_manifest;
     }
-    let base_manifest = current_manifest.clone();
 
-    let beta_pk = EntityPk::single("unrelated");
-    let mut scoped_manifest_bytes = 0u64;
-    let mut replay_manifest_bytes = 0u64;
-    let mut sparse_scoped_range_staged_puts = 0u64;
-    let mut sparse_scoped_range_staged_bytes = 0u64;
+    let mut catalog_manifest_bytes = 0u64;
     let mut sparse_staged_puts = 0u64;
     let mut sparse_written_bytes = 0u64;
-    let mut sparse_publication_nanos = Vec::with_capacity(unrelated_sparse_commits);
     let mut first_sparse_elapsed_nanos = 0u64;
     let mut first_sparse_staged_puts = 0u64;
     let mut first_sparse_written_bytes = 0u64;
+    let beta_pk = EntityPk::single("unrelated");
     for index in 0..unrelated_sparse_commits {
         let sparse_started = Instant::now();
-        let commit_id = bench_addressable_commit_id(&format!("scoped-range-child-{index}"));
-        let touches_alpha = matches!(
-            sparse_shape,
-            BenchCurrentStateSparseShape::TouchedScope
-                | BenchCurrentStateSparseShape::TouchedScopeDistinct
-        );
-        let present_scope = !touches_alpha && scope_count > 1 && index % 4 == 0;
+        let commit_id = bench_addressable_commit_id(&format!("catalog-child-{index}"));
+        let touches_alpha = sparse_shape == BenchCurrentStateSparseShape::TouchedScope;
+        let present_scope = !touches_alpha && catalog_entry_count > 1 && index % 4 == 0;
         let schema_key = if touches_alpha {
             "bench_current_state_alpha".to_string()
         } else if present_scope {
-            format!("bench_scope_{:08}", 1 + index % (scope_count - 1))
+            format!("bench_scope_{:08}", 1 + index % (catalog_entry_count - 1))
         } else {
             "bench_current_state_beta".to_string()
         };
-        let file_id =
-            present_scope.then(|| format!("file-{:05}", (1 + index % (scope_count - 1)) % 10_000));
-        let sparse_pk = if sparse_shape == BenchCurrentStateSparseShape::TouchedScopeDistinct {
-            &entity_pks[(replacement_rows / 4 + index) % replacement_rows]
-        } else if touches_alpha {
+        let file_id = present_scope.then(|| {
+            format!(
+                "file-{:05}",
+                (1 + index % (catalog_entry_count - 1)) % 10_000
+            )
+        });
+        let sparse_pk = if touches_alpha {
             &entity_pks[replacement_rows / 4]
         } else {
             &beta_pk
@@ -282,7 +283,7 @@ where
                 schema_key: &schema_key,
                 file_id: file_id.as_deref(),
                 entity_pk: sparse_pk,
-                change_id: ChangeId::for_test_label(&format!("scoped-child-change-{index}")),
+                change_id: ChangeId::for_test_label(&format!("catalog-child-change-{index}")),
                 commit_id,
                 deleted: false,
                 created_at,
@@ -295,7 +296,7 @@ where
             authored: true,
         };
         let mut writes = storage.new_write_set();
-        let staged = super::storage::stage_ordered_addressable_commit_deltas(
+        let stage = super::storage::stage_ordered_addressable_commit_deltas(
             &mut writes,
             std::iter::once(Ok(row)),
             true,
@@ -303,289 +304,147 @@ where
         )
         .expect("stage benchmark sparse mutation")
         .expect("benchmark sparse mutation is addressable");
-        let (manifest, range_puts, range_bytes, publication_nanos, stats) =
-            publish_bench_current_state_commit(
-                &storage,
-                writes,
-                Some(&current_manifest),
-                commit_id,
-                u16::try_from(commits.len() + 1)
-                    .expect("benchmark replay depth fits u16")
-                    .min(super::COMMIT_STATE_MAX_REPLAY_DEPTH),
-                staged.mutation_inventory().clone(),
+        let mut mutations = stage.mutation_inventory().clone();
+        let encoded_key = super::codec::encode_key_ref(super::types::TrackedStateKeyRef {
+            schema_key: &schema_key,
+            file_id: file_id.as_deref(),
+            entity_pk: sparse_pk,
+        });
+        let value = super::types::TrackedStateIndexValueRef {
+            change_id: row.delta.change_id,
+            commit_id,
+            deleted: false,
+            created_at,
+            updated_at,
+        };
+        let (encoded_state, _) =
+            super::current_state_data_part::encode_authoritative_arrow_state_rows(
+                &super::types::CommitDeltaReplacementScope {
+                    schema_key: schema_key.clone(),
+                    file_id: file_id.clone(),
+                },
+                &[super::current_state_data_part::ArrowStateInputRowRef {
+                    encoded_key: &encoded_key,
+                    value,
+                    snapshot: JsonSlotRef::Inline("{}"),
+                    metadata: JsonSlotRef::None,
+                }],
             )
-            .await;
-        let elapsed = u64::try_from(sparse_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        sparse_publication_nanos.push(publication_nanos);
-        sparse_scoped_range_staged_puts =
-            sparse_scoped_range_staged_puts.saturating_add(range_puts);
-        sparse_scoped_range_staged_bytes =
-            sparse_scoped_range_staged_bytes.saturating_add(range_bytes);
-        sparse_staged_puts = sparse_staged_puts.saturating_add(stats.staged_puts);
-        sparse_written_bytes = sparse_written_bytes.saturating_add(stats.written_bytes);
-        scoped_manifest_bytes = scoped_manifest_bytes.saturating_add(
-            u64::try_from(bench_manifest_encoded_len(&manifest))
-                .expect("benchmark manifest length fits u64"),
+            .expect("encode benchmark sparse Arrow mutation");
+        let mut arrow_mutations = crate::live_state::EntityColumnarWriteSets::new();
+        arrow_mutations.insert_scope(
+            commit_id,
+            super::types::CommitDeltaReplacementScope {
+                schema_key: schema_key.clone(),
+                file_id: file_id.clone(),
+            },
+            encoded_state,
         );
-        let mut replay_manifest = manifest.clone();
-        replay_manifest.current_state_scoped_ranges = None;
-        replay_manifest_bytes = replay_manifest_bytes.saturating_add(
-            u64::try_from(bench_manifest_encoded_len(&replay_manifest))
-                .expect("benchmark replay manifest length fits u64"),
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open benchmark parent read");
+        let published_parent =
+            super::storage::load_published_commit_state_manifest(&read, current_manifest.commit_id)
+                .await
+                .expect("load benchmark sparse parent authority")
+                .expect("benchmark sparse parent authority exists");
+        let planned_members = super::storage::staged_commit_delta_members_for_write(
+            &read, &writes, commit_id, &mutations,
+        )
+        .await
+        .expect("load benchmark sparse Arrow event members");
+        let publication = super::storage::stage_current_state_catalog_from_published_parent(
+            &read,
+            &mut writes,
+            Some(&published_parent),
+            commit_id,
+            &mut mutations,
+            &planned_members,
+            Some(&arrow_mutations),
+        )
+        .await
+        .expect("reuse benchmark persistent catalog");
+        let catalog = publication.root();
+        drop(read);
+        current_manifest = bench_current_state_manifest(
+            commit_id,
+            Some(current_manifest.commit_id),
+            mutations,
+            catalog,
         );
+        catalog_manifest_bytes += u64::try_from(bench_manifest_encoded_len(&current_manifest))
+            .expect("benchmark manifest length fits u64");
+        super::storage::stage_certified_commit_state_manifest(
+            &mut writes,
+            &current_manifest,
+            &publication,
+        )
+        .expect("stage benchmark sparse manifest");
+        let (_, stats) = storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit benchmark sparse child");
+        sparse_staged_puts += stats.staged_puts;
+        sparse_written_bytes += stats.written_bytes;
         if index == 0 {
-            first_sparse_elapsed_nanos = elapsed;
+            first_sparse_elapsed_nanos =
+                u64::try_from(sparse_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             first_sparse_staged_puts = stats.staged_puts;
             first_sparse_written_bytes = stats.written_bytes;
         }
-        current_manifest = manifest;
-        commits.push(commit_id);
     }
-    sparse_publication_nanos.sort_unstable();
-    let sparse_publication_p50_nanos = sparse_publication_nanos
-        .get(sparse_publication_nanos.len() / 2)
-        .copied()
-        .unwrap_or_default();
-    let sparse_publication_p95_nanos = sparse_publication_nanos
-        .get(
-            sparse_publication_nanos
-                .len()
-                .saturating_mul(95)
-                .div_ceil(100)
-                .saturating_sub(1),
-        )
-        .copied()
-        .unwrap_or_default();
 
-    let target_index = if sparse_shape == BenchCurrentStateSparseShape::TouchedScopeDistinct
-        && point_target == BenchCurrentStatePointTarget::HotMutated
-    {
-        (replacement_rows / 4 + unrelated_sparse_commits.saturating_sub(1)) % replacement_rows
-    } else if sparse_shape == BenchCurrentStateSparseShape::TouchedScope
+    let target_index = if sparse_shape == BenchCurrentStateSparseShape::TouchedScope
         && point_target == BenchCurrentStatePointTarget::HotMutated
     {
         replacement_rows / 4
     } else {
         replacement_rows / 2
     };
+    let target = &entity_pks[target_index];
     let encoded_key = bytes::Bytes::from(super::codec::encode_key_ref(
         super::types::TrackedStateKeyRef {
             schema_key: "bench_current_state_alpha",
             file_id: None,
-            entity_pk: &entity_pks[target_index],
+            entity_pk: target,
         },
     ));
-    let current_state_part_count = current_manifest
-        .current_state_scoped_ranges
-        .as_ref()
-        .map_or(0, |root| u64::from(root.tree.part_count));
     BenchCurrentStatePointFixture {
         storage,
-        commits,
-        base_manifest,
         current_manifest,
         encoded_key,
-        scope_count,
-        scoped_manifest_bytes,
-        replay_manifest_bytes,
-        scoped_range_staged_puts,
-        scoped_range_staged_bytes,
-        sparse_scoped_range_staged_puts,
-        sparse_scoped_range_staged_bytes,
+        catalog_entry_count,
+        catalog_manifest_bytes,
+        catalog_staged_encoded_bytes: crate::storage_bench::take_crud_current_state_catalog_bytes(),
+        directory_staged_encoded_bytes:
+            crate::storage_bench::take_crud_current_state_directory_bytes(),
         sparse_staged_puts,
         sparse_written_bytes,
-        sparse_publication_p50_nanos,
-        sparse_publication_p95_nanos,
         first_sparse_elapsed_nanos,
         first_sparse_staged_puts,
         first_sparse_written_bytes,
-        current_state_part_count,
     }
-}
-
-async fn publish_bench_current_state_commit<StorageImpl: Storage>(
-    storage: &StorageAdapter<StorageImpl>,
-    mut writes: StorageWriteSet,
-    parent: Option<&CommitStateManifest>,
-    commit_id: CommitId,
-    replay_depth: u16,
-    mut mutations: super::types::CommitStateMutationInventory,
-) -> (CommitStateManifest, u64, u64, u64, StorageWriteSetStats) {
-    let read = storage
-        .begin_read(StorageReadOptions::default())
-        .await
-        .expect("open benchmark scoped-range parent read");
-    let published_parent = match parent {
-        Some(parent) => Some(
-            super::storage::load_published_commit_state_manifest(&read, parent.commit_id)
-                .await
-                .expect("load benchmark scoped-range parent")
-                .expect("benchmark scoped-range parent exists"),
-        ),
-        None => None,
-    };
-    let before = writes.stats();
-    let publication_started = Instant::now();
-    let publication = super::storage::stage_current_state_scoped_ranges_from_published_parent(
-        &read,
-        &mut writes,
-        published_parent.as_ref(),
-        commit_id,
-        crate::ANONYMOUS_ACCOUNT_ID,
-        &mutations,
-    )
-    .await
-    .expect("stage benchmark production scoped-range publication");
-    let publication_nanos =
-        u64::try_from(publication_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let after = writes.stats();
-    let range_puts = after.staged_puts.saturating_sub(before.staged_puts);
-    let range_bytes = after.written_bytes.saturating_sub(before.written_bytes);
-    if mutations.replacement_generation.is_some() {
-        mutations.parts.clear();
-    }
-    let manifest = bench_current_state_manifest(
-        commit_id,
-        parent.map(|parent| parent.commit_id),
-        replay_depth,
-        mutations,
-        publication.touched_scope_filter().clone(),
-        publication.root(),
-    );
-    super::storage::stage_certified_commit_state_manifest(&mut writes, &manifest, &publication)
-        .expect("stage benchmark certified scoped-range manifest");
-    drop(read);
-    let (_, stats) = storage
-        .commit_write_set(writes, StorageWriteOptions::default())
-        .await
-        .expect("commit benchmark scoped-range authority");
-    (manifest, range_puts, range_bytes, publication_nanos, stats)
 }
 
 impl<StorageImpl> BenchCurrentStatePointFixture<StorageImpl>
 where
     StorageImpl: Storage,
 {
-    /// Appends one production-shaped empty graph merge whose first parent is
-    /// the fixture's current state. Before serving-base lineage this topology
-    /// edge discarded the physical root and forced replay; the v56 path
-    /// re-attests the unchanged tree against the merge authority.
-    pub async fn append_empty_merge(mut self) -> Self {
-        let other_id = bench_addressable_commit_id("scoped-range-merge-other");
-        let other = bench_current_state_manifest(
-            other_id,
-            None,
-            1,
-            super::types::CommitStateMutationInventory::default(),
-            Default::default(),
-            None,
-        );
-        let mut other_writes = self.storage.new_write_set();
-        super::storage::stage_commit_state_manifest(&mut other_writes, &other)
-            .expect("stage benchmark merge parent authority");
-        self.storage
-            .commit_write_set(other_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit benchmark merge parent authority");
-
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open benchmark merge publication read");
-        let current = super::storage::load_published_commit_state_manifest(
-            &read,
-            self.current_manifest.commit_id,
-        )
-        .await
-        .expect("load benchmark merge target")
-        .expect("benchmark merge target exists");
-        let other = super::storage::load_published_commit_state_manifest(&read, other_id)
-            .await
-            .expect("load benchmark second merge parent")
-            .expect("benchmark second merge parent exists");
-        let merge_id = bench_addressable_commit_id("scoped-range-empty-merge");
-        let mutations = super::types::CommitStateMutationInventory::default();
-        let mut writes = self.storage.new_write_set();
-        let publication = super::storage::stage_current_state_scoped_ranges_from_topology(
-            &read,
-            &mut writes,
-            &[
-                super::storage::CertifiedCommitStateTopologyParent::Published(&current),
-                super::storage::CertifiedCommitStateTopologyParent::Published(&other),
-            ],
-            None,
-            merge_id,
-            crate::ANONYMOUS_ACCOUNT_ID,
-            &mutations,
-        )
-        .await
-        .expect("stage benchmark merge serving root");
-        let merged = CommitStateManifest {
-            commit_id: merge_id,
-            generation: self.current_manifest.generation.saturating_add(1),
-            parent_commit_ids: vec![self.current_manifest.commit_id, other_id],
-            commit_change_id: ChangeId::for_test_label("scoped-range-empty-merge-change"),
-            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
-            created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(33),
-            replay_debt: CommitStateReplayDebt {
-                depth: self
-                    .current_manifest
-                    .replay_debt
-                    .depth
-                    .saturating_add(1)
-                    .min(super::COMMIT_STATE_MAX_REPLAY_DEPTH),
-                rows: self.current_manifest.replay_debt.rows,
-                bytes: self.current_manifest.replay_debt.bytes,
-            },
-            mutations,
-            touched_scope_filter: publication.touched_scope_filter().clone(),
-            current_state_scoped_ranges: publication.root(),
-            snapshot_root: None,
-        };
-        super::storage::stage_certified_commit_state_manifest(&mut writes, &merged, &publication)
-            .expect("stage certified benchmark merge manifest");
-        drop(read);
-        self.storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit benchmark merge serving root");
-        self.current_manifest = merged;
-        self.commits.push(merge_id);
-        self.current_state_part_count = self
-            .current_manifest
-            .current_state_scoped_ranges
-            .as_ref()
-            .map_or(0, |root| u64::from(root.tree.part_count));
-        self
+    pub fn catalog_entry_count(&self) -> usize {
+        self.catalog_entry_count
     }
 
-    pub fn scope_count(&self) -> usize {
-        self.scope_count
+    pub fn catalog_manifest_bytes(&self) -> u64 {
+        self.catalog_manifest_bytes
     }
 
-    pub fn scoped_manifest_bytes(&self) -> u64 {
-        self.scoped_manifest_bytes
+    pub fn catalog_staged_encoded_bytes(&self) -> u64 {
+        self.catalog_staged_encoded_bytes
     }
 
-    pub fn replay_manifest_bytes(&self) -> u64 {
-        self.replay_manifest_bytes
-    }
-
-    pub fn scoped_range_staged_puts(&self) -> u64 {
-        self.scoped_range_staged_puts
-    }
-
-    pub fn scoped_range_staged_bytes(&self) -> u64 {
-        self.scoped_range_staged_bytes
-    }
-
-    pub fn sparse_scoped_range_staged_puts(&self) -> u64 {
-        self.sparse_scoped_range_staged_puts
-    }
-
-    pub fn sparse_scoped_range_staged_bytes(&self) -> u64 {
-        self.sparse_scoped_range_staged_bytes
+    pub fn directory_staged_encoded_bytes(&self) -> u64 {
+        self.directory_staged_encoded_bytes
     }
 
     pub fn sparse_staged_puts(&self) -> u64 {
@@ -594,14 +453,6 @@ where
 
     pub fn sparse_written_bytes(&self) -> u64 {
         self.sparse_written_bytes
-    }
-
-    pub fn sparse_publication_p50_nanos(&self) -> u64 {
-        self.sparse_publication_p50_nanos
-    }
-
-    pub fn sparse_publication_p95_nanos(&self) -> u64 {
-        self.sparse_publication_p95_nanos
     }
 
     pub fn first_sparse_elapsed_nanos(&self) -> u64 {
@@ -616,10 +467,6 @@ where
         self.first_sparse_written_bytes
     }
 
-    pub fn current_state_part_count(&self) -> u64 {
-        self.current_state_part_count
-    }
-
     pub async fn read_point(&self, mode: BenchCurrentStatePointMode) -> usize {
         let read = self
             .storage
@@ -627,97 +474,25 @@ where
             .await
             .expect("begin benchmark current-state point read");
         match mode {
-            BenchCurrentStatePointMode::ScopedRange => {
+            BenchCurrentStatePointMode::PersistentCatalog => {
                 let state = super::storage::load_published_commit_state_manifest(
                     &read,
                     self.current_manifest.commit_id,
                 )
                 .await
-                .expect("load benchmark scoped-range manifest")
-                .expect("benchmark scoped-range manifest exists");
-                let values =
-                    super::storage::load_complete_current_state_values_from_published_manifest(
+                .expect("load benchmark current-state manifest")
+                .expect("benchmark current-state manifest exists");
+                let rows =
+                    super::storage::load_complete_current_state_rows_with_coordinates_encoded(
                         &read,
                         &state,
                         std::slice::from_ref(&self.encoded_key),
                     )
                     .await
-                    .expect("read benchmark production scoped-range tree")
-                    .expect("benchmark production scope is covered");
-                usize::from(values[0].is_some())
-            }
-            BenchCurrentStatePointMode::FirstParentReplay => self.read_point_by_replay(&read).await,
-        }
-    }
-
-    /// Hashes the production scope scan at both benchmark endpoints. This is
-    /// useful for profiling broad serving-index reads without retaining the
-    /// removed layout-specific diff mini-engine.
-    pub async fn scan_current_state_scope(&self) -> [u8; 32] {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("begin benchmark current-state scope scan");
-        let scope = super::types::CommitDeltaReplacementScope {
-            schema_key: "bench_current_state_alpha".to_string(),
-            file_id: None,
-        };
-        let prefix = super::current_state_envelope::current_state_scope_prefix(&scope)
-            .expect("encode benchmark scope prefix");
-        let mut digest =
-            blake3::Hasher::new_derive_key("lix benchmark current-state scoped-range scan v1");
-        for manifest in [&self.base_manifest, &self.current_manifest] {
-            let published =
-                super::storage::load_published_commit_state_manifest(&read, manifest.commit_id)
-                    .await
-                    .expect("load benchmark scope-scan manifest")
-                    .expect("benchmark scope-scan manifest exists");
-            let root = published
-                .current_state_scoped_ranges
-                .as_ref()
-                .expect("benchmark scope-scan root exists");
-            let scanned = super::scoped_range::scan_scoped_range_scope(&read, &root.tree, &prefix)
-                .await
-                .expect("scan benchmark production scope");
-            match scanned.coverage {
-                Some(marker) => {
-                    digest.update(&[1]);
-                    digest.update(&marker.row_count.to_be_bytes());
-                    digest.update(&marker.part_count.to_be_bytes());
-                }
-                None => {
-                    digest.update(&[0]);
-                }
-            }
-            digest.update(&(scanned.parts.len() as u64).to_be_bytes());
-            for part in scanned.parts {
-                for bytes in [&part.first_key, &part.last_key, &part.payload.bytes] {
-                    digest.update(&(bytes.len() as u64).to_be_bytes());
-                    digest.update(bytes);
-                }
-                digest.update(&part.row_count.to_be_bytes());
-                digest.update(&part.payload.version.to_be_bytes());
+                    .expect("read benchmark Arrow current-state row");
+                usize::from(rows[0].is_some())
             }
         }
-        *digest.finalize().as_bytes()
-    }
-
-    async fn read_point_by_replay(&self, read: &(impl StorageAdapterRead + ?Sized)) -> usize {
-        for commit_id in self.commits.iter().rev() {
-            let values = super::storage::load_commit_delta_values_encoded_with_cache(
-                read,
-                *commit_id,
-                std::slice::from_ref(&self.encoded_key),
-                None,
-            )
-            .await
-            .expect("replay benchmark commit point");
-            if values[0].is_some() {
-                return 1;
-            }
-        }
-        0
     }
 }
 
@@ -735,27 +510,19 @@ fn bench_addressable_commit_id(label: &str) -> CommitId {
 fn bench_current_state_manifest(
     commit_id: CommitId,
     parent_commit_id: Option<CommitId>,
-    replay_depth: u16,
     mutations: super::types::CommitStateMutationInventory,
-    touched_scope_filter: super::types::CommitStateTouchedScopeFilter,
-    current_state_scoped_ranges: Option<Box<super::types::CurrentStateScopedRangeRoot>>,
+    current_state_catalog: Box<super::types::CurrentStateCatalogRoot>,
 ) -> CommitStateManifest {
     CommitStateManifest {
         commit_id,
         generation: 0,
+        state_parent_commit_id: parent_commit_id,
         parent_commit_ids: parent_commit_id.into_iter().collect(),
         commit_change_id: ChangeId::for_test_label(&format!("{commit_id}:bench-state")),
         account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
-        replay_debt: CommitStateReplayDebt {
-            depth: replay_depth,
-            rows: u64::from(mutations.member_count),
-            bytes: u64::from(mutations.member_count),
-        },
         mutations,
-        touched_scope_filter,
-        current_state_scoped_ranges,
-        snapshot_root: None,
+        current_state_catalog,
     }
 }
 
@@ -1265,314 +1032,4 @@ mod packed_history_tests {
     }
 }
 
-struct BenchWriteOutcome {
-    logical_rows: usize,
-    stats: StorageWriteSetStats,
-}
-
-impl BenchWriteOutcome {
-    fn accounting(&self) -> BenchWriteAccounting {
-        BenchWriteAccounting {
-            logical_rows: self.logical_rows,
-            staged_puts: self.stats.staged_puts,
-            staged_deletes: self.stats.staged_deletes,
-            touched_spaces: self.stats.touched_spaces,
-            storage_calls: self.stats.storage_calls,
-            put_batches: self.stats.put_batches,
-            delete_batches: self.stats.delete_batches,
-            written_bytes: self.stats.written_bytes,
-        }
-    }
-}
-
-impl<StorageImpl> BenchTrackedFixture<StorageImpl>
-where
-    StorageImpl: Storage,
-{
-    pub fn new(storage: StorageAdapter<StorageImpl>, rows: Vec<BenchTrackedRow>) -> Self {
-        Self {
-            storage,
-            context: TrackedStateContext::new(),
-            rows,
-            current_commit_id: None,
-            next_commit_index: 0,
-        }
-    }
-
-    pub async fn seed(&mut self) -> usize {
-        self.insert_all().await
-    }
-
-    pub async fn insert_all(&mut self) -> usize {
-        self.insert_all_accounting().await.logical_rows
-    }
-
-    pub async fn insert_all_accounting(&mut self) -> BenchWriteAccounting {
-        let rows = self.rows.clone();
-        self.stage_rows(rows, None).await.accounting()
-    }
-
-    pub async fn update_all(&mut self) -> usize {
-        self.update_all_accounting().await.logical_rows
-    }
-
-    pub async fn update_all_accounting(&mut self) -> BenchWriteAccounting {
-        let rows = self
-            .rows
-            .iter()
-            .cloned()
-            .map(|mut row| {
-                row.value = row.updated_value.clone();
-                row
-            })
-            .collect::<Vec<_>>();
-        self.stage_rows(rows, self.current_commit_id.clone())
-            .await
-            .accounting()
-    }
-
-    pub async fn update_one_by_pk(&mut self) -> usize {
-        self.update_one_by_pk_accounting().await.logical_rows
-    }
-
-    pub async fn update_one_by_pk_accounting(&mut self) -> BenchWriteAccounting {
-        let mut row = self.rows[self.rows.len() / 2].clone();
-        row.value = row.updated_value.clone();
-        self.stage_rows(vec![row], self.current_commit_id.clone())
-            .await
-            .accounting()
-    }
-
-    pub async fn delete_all(&mut self) -> usize {
-        self.delete_all_accounting().await.logical_rows
-    }
-
-    pub async fn delete_all_accounting(&mut self) -> BenchWriteAccounting {
-        let rows = self
-            .rows
-            .iter()
-            .cloned()
-            .map(|mut row| {
-                row.value.clear();
-                row
-            })
-            .collect::<Vec<_>>();
-        self.stage_rows_as_deletes(rows, self.current_commit_id.clone())
-            .await
-            .accounting()
-    }
-
-    pub async fn delete_one_by_pk(&mut self) -> usize {
-        self.delete_one_by_pk_accounting().await.logical_rows
-    }
-
-    pub async fn delete_one_by_pk_accounting(&mut self) -> BenchWriteAccounting {
-        let mut row = self.rows[self.rows.len() / 2].clone();
-        row.value.clear();
-        self.stage_rows_as_deletes(vec![row], self.current_commit_id.clone())
-            .await
-            .accounting()
-    }
-
-    pub async fn read_all(&self) -> usize {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("begin tracked-state read"),
-        );
-        let mut reader = self.context.reader(read);
-        let rows = reader
-            .scan_batch_at_commit(
-                self.current_commit_id(),
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter::default(),
-                    read_columns: TrackedStateReadColumns::default(),
-                    limit: None,
-                },
-            )
-            .await
-            .expect("scan tracked-state rows")
-            .into_rows();
-        assert_eq!(rows.len(), self.rows.len());
-        rows.len()
-    }
-
-    pub async fn read_all_by_pk(&self) -> usize {
-        let keys = self.rows.iter().map(row_key).collect::<Vec<_>>();
-        self.read_by_pk(&keys).await
-    }
-
-    pub async fn read_one_by_pk(&self) -> usize {
-        let key = row_key(&self.rows[self.rows.len() / 2]);
-        self.read_by_pk(&[key]).await
-    }
-
-    async fn read_by_pk(&self, keys: &[TrackedStateKey]) -> usize {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("begin tracked-state read"),
-        );
-        let mut reader = self.context.reader(read);
-        let rows = reader
-            .load_batch_at_commit(self.current_commit_id(), keys)
-            .await
-            .expect("load tracked-state rows")
-            .into_rows();
-        assert!(rows.iter().all(Option::is_some));
-        rows.len()
-    }
-
-    async fn stage_rows(
-        &mut self,
-        rows: Vec<BenchTrackedRow>,
-        parent_commit_id: Option<String>,
-    ) -> BenchWriteOutcome {
-        self.stage_rows_inner(rows, parent_commit_id, false).await
-    }
-
-    async fn stage_rows_as_deletes(
-        &mut self,
-        rows: Vec<BenchTrackedRow>,
-        parent_commit_id: Option<String>,
-    ) -> BenchWriteOutcome {
-        self.stage_rows_inner(rows, parent_commit_id, true).await
-    }
-
-    async fn stage_rows_inner(
-        &mut self,
-        rows: Vec<BenchTrackedRow>,
-        parent_commit_id: Option<String>,
-        deleted: bool,
-    ) -> BenchWriteOutcome {
-        let commit_id = self.next_commit_id();
-        let mut writes = self.storage.new_write_set();
-        let owned = rows
-            .into_iter()
-            .enumerate()
-            .map(|(index, row)| OwnedDelta::new(row, &commit_id, index, deleted, &mut writes))
-            .collect::<Vec<_>>();
-        let deltas = owned.iter().map(OwnedDelta::as_ref).collect::<Vec<_>>();
-        {
-            let read = SharedStorageAdapterRead::new(
-                self.storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("begin tracked-state write read"),
-            );
-            let mut writer = self.context.writer(&read, &mut writes);
-            writer
-                .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
-                .await
-                .expect("stage tracked-state commit root");
-        }
-        let (_commit, stats) = self
-            .storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit tracked-state writes");
-        assert!(
-            stats.staged_puts > 0,
-            "tracked-state write should stage physical puts"
-        );
-        self.current_commit_id = Some(commit_id);
-        BenchWriteOutcome {
-            logical_rows: owned.len(),
-            stats,
-        }
-    }
-
-    pub async fn layout_accounting(&self) -> Vec<BenchLayoutAccounting> {
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("begin tracked-state layout accounting read"),
-        );
-        crate::storage_bench::layout_accounting(&read)
-            .await
-            .into_iter()
-            .map(|space| BenchLayoutAccounting {
-                space_id: space.space_id,
-                space: space.space,
-                rows: space.rows,
-                key_bytes: space.key_bytes,
-                value_bytes: space.value_bytes,
-            })
-            .collect()
-    }
-
-    fn next_commit_id(&mut self) -> String {
-        self.next_commit_index += 1;
-        format!("tracked-crud-commit-{}", self.next_commit_index)
-    }
-
-    fn current_commit_id(&self) -> &str {
-        self.current_commit_id
-            .as_deref()
-            .expect("tracked-state fixture should be seeded")
-    }
-}
-
-struct OwnedDelta {
-    change_id: ChangeId,
-    commit_id: CommitId,
-    entity_pk: EntityPk,
-    schema_key: String,
-    file_id: Option<String>,
-    deleted: bool,
-    created_at: crate::common::LixTimestamp,
-    updated_at: crate::common::LixTimestamp,
-}
-
-impl OwnedDelta {
-    fn new(
-        row: BenchTrackedRow,
-        commit_id: &str,
-        index: usize,
-        deleted: bool,
-        _writes: &mut StorageWriteSet,
-    ) -> Self {
-        let change_id = format!("tracked-crud-change-{commit_id}-{index}");
-        Self {
-            change_id: ChangeId::for_test_label(&change_id),
-            commit_id: CommitId::for_test_label(commit_id),
-            entity_pk: EntityPk::single(row.entity_pk),
-            schema_key: row.schema_key,
-            file_id: row.file_id,
-            deleted,
-            created_at: crate::common::LixTimestamp::expect_parse(
-                "created_at",
-                "2026-05-19T00:00:00.000Z",
-            ),
-            updated_at: crate::common::LixTimestamp::expect_parse(
-                "updated_at",
-                "2026-05-19T00:00:00.000Z",
-            ),
-        }
-    }
-
-    fn as_ref(&self) -> TrackedStateDeltaRef<'_> {
-        TrackedStateDeltaRef {
-            schema_key: &self.schema_key,
-            file_id: self.file_id.as_deref(),
-            entity_pk: &self.entity_pk,
-            change_id: self.change_id,
-            commit_id: self.commit_id,
-            deleted: self.deleted,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-        }
-    }
-}
-
-fn row_key(row: &BenchTrackedRow) -> TrackedStateKey {
-    TrackedStateKey {
-        schema_key: row.schema_key.clone(),
-        entity_pk: EntityPk::single(row.entity_pk.clone()),
-        file_id: row.file_id.clone(),
-    }
-}
 use std::time::Instant;

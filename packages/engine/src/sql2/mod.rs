@@ -40,20 +40,24 @@ pub(crate) use catalog::{
     EntityColumnType, EntitySurfaceSpec, PublicCatalog, derive_entity_surface_spec_from_schema,
     entity_visible_fields,
 };
-pub(crate) use change_materialization::MaterializedChange;
 pub(crate) use context::{
-    CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
-    DiffCommandOutcome, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
-    SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
-    WriteContextBranchRefReader, WriteContextLiveStateReader,
+    ChangelogQuerySource, DiffCommand, DiffCommandOutcome, HistoryQuerySource,
+    SqlChangelogQuerySource, SqlExecutionContext, SqlHistoryQuerySource, SqlWriteContext,
+    SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader,
+    WriteContextLiveStateReader,
 };
 pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader};
+#[cfg(test)]
+pub(crate) use entity_columnar_layout::encode_registered_entity_row_groups;
 pub(crate) use entity_columnar_layout::{
+    ENTITY_ARROW_STATE_COMMIT_ID_METADATA, ENTITY_ARROW_STATE_CREATED_AT_METADATA,
+    ENTITY_ARROW_STATE_LAYOUT, ENTITY_ARROW_STATE_NAMESPACE,
+    ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA, ENTITY_ARROW_STATE_UPDATED_AT_METADATA,
     ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ENTITY_COLUMNAR_ENTITY_PK_FIELD,
-    ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY,
-    ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, EncodedEntityRowGroups, EntityColumnarRowRef,
-    EntityRowGroupLocations, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
-    encode_registered_entity_row_groups, encode_unclustered_registered_entity_row_groups,
+    ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY, EncodedEntityRowGroups,
+    EntityColumnarAuthorityRef, EntityColumnarRowRef, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
+    encode_authoritative_registered_entity_row_groups,
+    encode_unclustered_registered_entity_row_groups,
 };
 pub(crate) use entity_projection::EntityProjectionDecoder;
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
@@ -61,8 +65,8 @@ pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{
     SqlLogicalPlan, append_path_value_replacement_snapshot,
-    append_path_value_replacement_snapshot_text, create_write_logical_plan_from_template,
-    create_write_plan_template_from_parsed, diff_command_query, execute_read_statement_from_parsed,
+    create_write_logical_plan_from_template, create_write_plan_template_from_parsed,
+    diff_command_query, execute_read_statement_from_parsed,
     execute_read_statement_in_session_from_parsed, execute_transaction_read_statement_from_parsed,
     execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,
     execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,

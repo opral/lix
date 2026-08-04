@@ -90,6 +90,7 @@ impl BranchHeadControl {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reset_schema_presence(&mut self) {
         self.schema_presence_bloom = [0; SCHEMA_PRESENCE_BLOOM_WORDS];
     }

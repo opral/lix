@@ -26,9 +26,12 @@ use crate::storage_adapter::StorageAdapterRead;
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // Consumed by the source-wide statistics cache in the provider layer.
 pub(crate) struct EntityColumnarScanLayout {
-    pub(crate) id: crate::columnar_row_group::RowGroupSetId,
+    /// Digest-derived identity of the ordered leaf sequence, used only for
+    /// caches. Physical reads route through `group_sources`.
+    pub(crate) id: crate::columnar_row_group::ArrowStateSetId,
     pub(crate) manifest: Arc<crate::columnar_row_group::RowGroupManifest>,
     pub(crate) manifest_digest: [u8; 32],
+    pub(crate) group_sources: Arc<Vec<crate::live_state::EntityColumnarGroupSource>>,
     pub(crate) overlay: Arc<Vec<crate::live_state::EntityColumnarOverlayRow>>,
     pub(crate) branch_id: Arc<str>,
     pub(crate) head_commit_id: crate::changelog::CommitId,
@@ -218,6 +221,7 @@ where
                     id,
                     manifest,
                     manifest_digest,
+                    group_sources,
                     overlay,
                     branch_id,
                     head_commit_id,
@@ -228,6 +232,7 @@ where
                         id,
                         manifest,
                         manifest_digest,
+                        group_sources,
                         overlay,
                         branch_id: Arc::from(branch_id),
                         head_commit_id,
@@ -246,10 +251,44 @@ where
     ) -> Result<RecordBatch, LixError> {
         let schema =
             crate::columnar_row_group::row_group_projected_schema(&layout.manifest, &projection)?;
-        let row_count = layout
+        let source = layout.group_sources.get(group_index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("row-group index {group_index} is outside the flattened layout"),
+            )
+        })?;
+        let source_projection = projection
+            .iter()
+            .map(|&column_index| {
+                let name = layout
+                    .manifest
+                    .fields
+                    .get(column_index)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "flattened entity projection is out of bounds".to_owned(),
+                        )
+                    })?
+                    .name
+                    .as_str();
+                source
+                    .manifest
+                    .fields
+                    .iter()
+                    .position(|field| field.name == name)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("Arrow leaf omitted shared entity field '{name}'"),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let row_count = source
             .manifest
             .groups
-            .get(group_index)
+            .get(source.group_index)
             .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -261,11 +300,11 @@ where
             .entity_decoded_columns
             .load_projection(
                 &self.store,
-                layout.id,
-                layout.manifest_digest,
-                &layout.manifest,
-                group_index,
-                &projection,
+                source.state_set_id,
+                source.manifest_digest,
+                &source.manifest,
+                source.group_index,
+                &source_projection,
             )
             .await?;
         if projection.is_empty() {
@@ -450,15 +489,15 @@ mod tests {
 
     fn cache_key_test_layout() -> EntityColumnarScanLayout {
         EntityColumnarScanLayout {
-            id: crate::columnar_row_group::RowGroupSetId::new([41; 16]),
+            id: crate::columnar_row_group::ArrowStateSetId::from_digest([41; 32]),
             manifest: Arc::new(crate::columnar_row_group::RowGroupManifest {
                 namespace: "cache-key-test".to_owned(),
                 metadata: std::collections::HashMap::new(),
                 fields: Vec::new(),
                 groups: Vec::new(),
-                encoded_digest: [0; 32],
             }),
             manifest_digest: [42; 32],
+            group_sources: Arc::new(Vec::new()),
             overlay: Arc::new(Vec::new()),
             branch_id: Arc::from("branch-a"),
             head_commit_id: crate::changelog::CommitId::for_test_label("cache-key-head"),

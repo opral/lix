@@ -19,7 +19,7 @@ use crate::changelog::{
 use crate::json_store::{
     JsonRef, JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
 };
-use crate::live_state::{TrackedHeadContext, stage_collect_stale_working_diff_indexes};
+use crate::live_state::TrackedHeadContext;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
     StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
@@ -282,6 +282,49 @@ async fn stage_sweep_unreachable_content_nodes(
     Ok(())
 }
 
+async fn stage_sweep_unreachable_arrow_state_sets(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    live: &BTreeSet<crate::columnar_row_group::ArrowStateSetId>,
+) -> Result<(), LixError> {
+    let plan = ScanPlan::prefix(
+        crate::columnar_row_group::ROW_GROUP_MANIFEST_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let digest: [u8; 32] = entry.key.0.as_ref().try_into().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "Arrow state manifest space contains a malformed key",
+                )
+            })?;
+            let id = crate::columnar_row_group::ArrowStateSetId::from_digest(digest);
+            if !live.contains(&id) {
+                crate::columnar_row_group::stage_delete_row_group_set(store, writes, id).await?;
+            }
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn load_recovery_ref(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -527,7 +570,6 @@ where
     // Checkpoint publication leaves prior dirty-index generations unreachable
     // in O(1). Reclaim those auxiliary records only in the asynchronous GC
     // pass so a foreground checkpoint never pays a history-sized delete cost.
-    stage_collect_stale_working_diff_indexes(&store, writes).await?;
     let tracked_root_stage_us = elapsed_micros(phase_started);
 
     Ok(RepositoryGcPlan {
@@ -608,16 +650,11 @@ where
             )
         })?;
         let topology = &authority.authority;
-        let manifest_rootless = topology.replay_debt.depth > 0;
         if topology.generation != commit.generation
             || topology.parent_commit_ids != commits.parent_commit_ids(commit)
             || topology.commit_change_id != commit.change_id
             || topology.account_id != commit.account_id
             || topology.created_at != commit.created_at
-            || manifest_rootless != commit.tracked_state_rootless
-            || topology.replay_debt.depth != commit.tracked_state_rootless_depth
-            || topology.replay_debt.rows != commit.tracked_state_rootless_rows
-            || topology.replay_debt.bytes != commit.tracked_state_rootless_bytes
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -671,22 +708,20 @@ where
         if !retained_authority_commits.insert(commit_id) {
             continue;
         }
-        let authority = packed.commits.get(&commit_id).ok_or_else(|| {
-            LixError::new(
+        if !packed.commits.contains_key(&commit_id) {
+            return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("canonical mutation authority '{commit_id}' is missing"),
-            )
-        })?;
-        if let Some(source_commit_id) = authority.selected_source_commit_id {
-            authority_roots.push(source_commit_id);
+            ));
         }
     }
-    let mut live_scoped_range_nodes = BTreeSet::<[u8; 32]>::new();
+    let mut live_catalog_nodes = BTreeSet::<[u8; 32]>::new();
+    let mut live_current_state_directory_nodes = BTreeSet::<[u8; 32]>::new();
     let mut live_current_state_data_parts = BTreeSet::<[u8; 32]>::new();
     let mut live_current_state_ref_summaries = BTreeMap::<[u8; 32], [u8; 32]>::new();
     let mut live_current_state_payload_hashes = BTreeSet::<[u8; 32]>::new();
-    let mut scoped_roots = BTreeMap::new();
-    let mut authority_manifests = BTreeMap::new();
+    let mut catalog_roots = BTreeMap::new();
+    let mut live_manifests = BTreeMap::new();
     let live_commit_ids = live_commits.iter().copied().collect::<Vec<_>>();
     let loaded_live_manifests =
         crate::tracked_state::load_commit_state_manifests(store, &live_commit_ids).await?;
@@ -697,153 +732,106 @@ where
                 format!("live commit '{commit_id}' has no commit-state authority"),
             )
         })?;
-        authority_manifests.insert(commit_id, manifest.clone());
-        let Some(root) = manifest.current_state_scoped_ranges.as_ref() else {
-            continue;
-        };
-        if let Some(previous) = scoped_roots.insert(root.tree.root_id, root.tree.clone()) {
-            if previous != root.tree {
+        live_manifests.insert(commit_id, manifest.clone());
+        let root = manifest.current_state_catalog.as_ref();
+        if let Some(previous) = catalog_roots.insert(root.root_id, root.clone()) {
+            if previous.entry_count != root.entry_count {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "live current-state scoped ranges disagree about root '{:?}'",
-                        root.tree.root_id
+                        "live current-state catalogs disagree about root '{:?}'",
+                        root.root_id
                     ),
                 ));
             }
         }
     }
-    let serving_base_ids = authority_manifests
+    let missing_state_parent_ids = live_manifests
         .values()
-        .filter_map(|manifest| {
-            manifest
-                .current_state_scoped_ranges
-                .as_ref()
-                .and_then(|root| root.serving_base_commit_id)
-        })
-        .filter(|base_id| !authority_manifests.contains_key(base_id))
+        .filter_map(|manifest| manifest.state_parent_commit_id)
+        .filter(|parent_id| !live_manifests.contains_key(parent_id))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    if let Some(base_id) = serving_base_ids
-        .iter()
-        .find(|base_id| !retained_authority_commits.contains(base_id))
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("current-state serving base '{base_id}' is not retained authority"),
-        ));
-    }
-    let loaded_serving_bases =
-        crate::tracked_state::load_commit_state_manifests(store, &serving_base_ids).await?;
-    for (base_id, manifest) in serving_base_ids.into_iter().zip(loaded_serving_bases) {
-        let manifest = manifest.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("current-state serving base '{base_id}' has no commit-state authority"),
-            )
-        })?;
-        authority_manifests.insert(base_id, manifest);
-    }
-    for commit_id in &live_commits {
-        let manifest = authority_manifests
-            .get(commit_id)
-            .expect("live commit authority was loaded");
-        let serving_base = manifest
-            .current_state_scoped_ranges
+    let loaded_state_parents =
+        crate::tracked_state::load_commit_state_manifests(store, &missing_state_parent_ids).await?;
+    let state_parent_manifests = missing_state_parent_ids
+        .into_iter()
+        .zip(loaded_state_parents)
+        .filter_map(|(commit_id, manifest)| manifest.map(|manifest| (commit_id, manifest)))
+        .collect::<BTreeMap<_, _>>();
+    for manifest in live_manifests.values() {
+        let parent = manifest
+            .state_parent_commit_id
             .as_ref()
-            .and_then(|root| root.serving_base_commit_id)
-            .and_then(|base_id| authority_manifests.get(&base_id));
-        crate::tracked_state::validate_current_state_scoped_range_serving_base_manifest(
-            manifest,
-            serving_base,
-        )?;
+            .and_then(|parent_id| {
+                live_manifests
+                    .get(parent_id)
+                    .or_else(|| state_parent_manifests.get(parent_id))
+            });
+        crate::tracked_state::validate_current_state_catalog_parent_manifest(manifest, parent)?;
+        crate::tracked_state::validate_current_state_catalog_transition_root(
+            store, manifest, parent,
+        )
+        .await?;
     }
 
-    let scoped_roots = scoped_roots.values().cloned().collect::<Vec<_>>();
-    let reachable = crate::tracked_state::validate_scoped_range_trees(store, &scoped_roots).await?;
-    live_scoped_range_nodes.extend(reachable.node_ids);
-    let mut live_columnar_sources = BTreeSet::<(CommitId, [u8; 16], [u8; 32])>::new();
-    for part in reachable.parts {
-        let descriptor =
-            crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
-        match descriptor.source_kind {
-            0 => {
-                let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
-                if !packed.commits.contains_key(&owner) {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "live scoped range references missing immutable-part owner '{owner}'"
-                        ),
-                    ));
-                }
-                retained_authority_commits.insert(owner);
-            }
-            1 => {
-                live_current_state_data_parts.insert(descriptor.content_digest);
-                if let Some(previous) = live_current_state_ref_summaries
-                    .insert(descriptor.content_digest, descriptor.payload_refs_digest)
-                    && previous != descriptor.payload_refs_digest
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "native scoped-range descriptors disagree about payload refs",
-                    ));
-                }
-            }
-            2 => {
-                let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
-                if !packed.commits.contains_key(&owner) {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("live scoped range references missing columnar owner '{owner}'"),
-                    ));
-                }
-                live_columnar_sources.insert((
-                    owner,
-                    descriptor.source_id,
-                    descriptor.content_digest,
-                ));
-                retained_authority_commits.insert(owner);
-            }
-            _ => {
+    // Catalog roots and immutable directory roots are content addressed and
+    // may be shared by many live commits. Validate each distinct authority and
+    // directory only once; otherwise a long unchanged branch interval turns
+    // GC into O(commits * scopes * directory parts) work.
+    let catalog_root_values = catalog_roots.values().cloned().collect::<Vec<_>>();
+    let (catalog_nodes, unique_entries) =
+        crate::tracked_state::load_current_state_catalog_reachability_many(
+            store,
+            &catalog_root_values,
+        )
+        .await?;
+    live_catalog_nodes.extend(catalog_nodes);
+    let mut catalog_entries = BTreeMap::new();
+    for set in unique_entries {
+        let identity = storage_codec::encode("GC current-state catalog entry", &set)?;
+        catalog_entries.entry(identity).or_insert(set);
+    }
+
+    let mut directory_roots = BTreeMap::new();
+    for set in catalog_entries.values() {
+        if let Some(previous) = directory_roots.insert(set.directory.root_id, set.directory.clone())
+        {
+            if previous != set.directory {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "live scoped range contains an unknown part source",
+                    format!(
+                        "live current-state catalogs disagree about directory root '{:?}'",
+                        set.directory.root_id
+                    ),
                 ));
             }
         }
     }
-    for (owner, source_id, content_digest) in live_columnar_sources {
-        let authority = match authority_manifests.get(&owner) {
-            Some(authority) => authority.clone(),
-            None => crate::tracked_state::load_commit_state_manifest(store, owner)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("live scoped range columnar owner '{owner}' has no authority"),
-                    )
-                })?,
-        };
-        let Some(parts) = authority.mutations.columnar_parts.as_ref() else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "live columnar scoped range owner has no columnar mutation authority",
-            ));
-        };
-        if parts.owner_commit_id != *owner.as_uuid().as_bytes()
-            || parts.row_group_set_id != source_id
-            || parts.manifest_digest != content_digest
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "live columnar scoped range descriptor disagrees with owner authority",
-            ));
+    let directories = directory_roots.values().cloned().collect::<Vec<_>>();
+    let (directory_nodes, descriptor_sets) =
+        crate::tracked_state::load_current_state_part_directory_reachability_many(
+            store,
+            &directories,
+        )
+        .await?;
+    live_current_state_directory_nodes.extend(directory_nodes);
+    for descriptors in descriptor_sets {
+        for descriptor in descriptors {
+            let state_set_digest = descriptor.state_set_id.as_bytes();
+            live_current_state_data_parts.insert(state_set_digest);
+            if let Some(previous) = live_current_state_ref_summaries
+                .insert(state_set_digest, descriptor.payload_refs_digest)
+                && previous != descriptor.payload_refs_digest
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "Arrow current-state descriptors disagree about payload refs",
+                ));
+            }
         }
     }
-
     let native_keys = live_current_state_ref_summaries
         .keys()
         .map(|digest| StorageKey(Bytes::copy_from_slice(digest)))
@@ -871,26 +859,19 @@ where
             crate::tracked_state::decode_current_state_data_part_refs(refs_digest, &bytes)?,
         );
     }
-    let native_part_presence = PointReadPlan::new(
-        crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-        &native_keys,
-    )
-    .materialize(
-        store,
-        StorageGetOptions {
-            projection: StorageCoreProjection::KeyOnly,
-        },
-    )
-    .await?;
-    if native_part_presence
-        .value
-        .into_iter()
-        .any(|value| !matches!(value, Some(StorageProjectedValue::KeyOnly)))
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "live current-state directory references a missing native data part",
-        ));
+    for digest in &live_current_state_data_parts {
+        if crate::columnar_row_group::load_row_group_manifest(
+            store,
+            crate::columnar_row_group::ArrowStateSetId::from_digest(*digest),
+        )
+        .await?
+        .is_none()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "live current-state directory references a missing Arrow state leaf",
+            ));
+        }
     }
     if let Some((commit_id, source_commit_id)) = live_commits.iter().find_map(|commit_id| {
         packed
@@ -1040,8 +1021,8 @@ where
     stage_sweep_unreachable_content_nodes(
         store,
         writes,
-        crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
-        &live_scoped_range_nodes,
+        crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
+        &live_catalog_nodes,
     )
     .await?;
     stage_sweep_unreachable_content_nodes(
@@ -1054,24 +1035,36 @@ where
     stage_sweep_unreachable_content_nodes(
         store,
         writes,
-        crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
-        &live_current_state_data_parts,
+        crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
+        &live_current_state_directory_nodes,
     )
     .await?;
+    let mut live_arrow_state_sets = live_current_state_data_parts
+        .iter()
+        .copied()
+        .map(crate::columnar_row_group::ArrowStateSetId::from_digest)
+        .collect::<BTreeSet<_>>();
+    live_arrow_state_sets.extend(
+        packed
+            .commits
+            .iter()
+            .filter(|(commit_id, _)| !sweep_authority_commits.contains(commit_id))
+            .flat_map(|(_, entry)| entry.members.iter())
+            .filter_map(|member| member.base_coordinate)
+            .map(|coordinate| coordinate.state_set_id),
+    );
+    stage_sweep_unreachable_arrow_state_sets(store, writes, &live_arrow_state_sets).await?;
     for commit_id in &sweep_authority_commits {
         if let Some(entry) = packed.commits.get(commit_id) {
-            let schema_keys = entry
+            let state_sets = entry
                 .members
                 .iter()
-                .map(|member| member.key.schema_key.as_str())
+                .filter_map(|member| member.base_coordinate)
+                .map(|coordinate| coordinate.state_set_id)
                 .collect::<BTreeSet<_>>();
-            for schema_key in schema_keys {
-                crate::columnar_row_group::stage_delete_row_group_set(
-                    store,
-                    writes,
-                    crate::live_state::entity_row_group_set_id(*commit_id, schema_key),
-                )
-                .await?;
+            for state_set_id in state_sets {
+                crate::columnar_row_group::stage_delete_row_group_set(store, writes, state_set_id)
+                    .await?;
             }
             crate::tracked_state::stage_delete_commit_delta_inventory_entry(
                 writes, *commit_id, entry,
@@ -1117,10 +1110,6 @@ where
 struct GcCommitInventoryEntry {
     commit_id: CommitId,
     generation: u64,
-    tracked_state_rootless: bool,
-    tracked_state_rootless_depth: u16,
-    tracked_state_rootless_rows: u64,
-    tracked_state_rootless_bytes: u64,
     change_id: ChangeId,
     account_id: String,
     created_at: crate::common::LixTimestamp,
@@ -1187,10 +1176,6 @@ where
             commits.entries.push(GcCommitInventoryEntry {
                 commit_id: commit.commit_id,
                 generation: commit.generation,
-                tracked_state_rootless: commit.tracked_state_rootless,
-                tracked_state_rootless_depth: commit.tracked_state_rootless_depth,
-                tracked_state_rootless_rows: commit.tracked_state_rootless_rows,
-                tracked_state_rootless_bytes: commit.tracked_state_rootless_bytes,
                 change_id: commit.change_id,
                 account_id: commit.account_id,
                 created_at: commit.created_at,
@@ -1269,13 +1254,13 @@ mod tests {
         JsonRef, JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJson,
         NormalizedJsonRef, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
     };
-    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
+    use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext};
     use crate::storage_adapter::{
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
         StorageKey, StorageReadOptions, StorageSpace, StorageValue, StorageWriteOptions,
     };
     use crate::tracked_state::{
-        CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
+        CommitStateManifest, CommitStateMutationInventory, MaterializedTrackedStateRow,
         TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef,
         load_change_record_by_id, scan_change_records_from_commit_deltas,
         scan_commit_delta_inventory, stage_addressable_commit_deltas_with_selected_source,
@@ -1370,8 +1355,8 @@ mod tests {
         let dead_id = [2u8; 32];
         let mut writes = storage.new_write_set();
         for space in [
-            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
-            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
+            crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
             for node_id in [live_id, dead_id] {
@@ -1395,8 +1380,8 @@ mod tests {
         let mut sweep = storage.new_write_set();
         let live = BTreeSet::from([live_id]);
         for space in [
-            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
-            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
+            crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
             super::stage_sweep_unreachable_content_nodes(&read, &mut sweep, space, &live)
@@ -1417,8 +1402,8 @@ mod tests {
             StorageKey(Bytes::copy_from_slice(&dead_id)),
         ];
         for space in [
-            crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
-            crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
+            crate::tracked_state::CURRENT_STATE_CATALOG_SPACE,
+            crate::tracked_state::CURRENT_STATE_PART_DIRECTORY_SPACE,
             crate::tracked_state::CURRENT_STATE_DATA_PART_REFS_SPACE,
         ] {
             let loaded = PointReadPlan::new(space, &keys)
@@ -1731,18 +1716,15 @@ mod tests {
             commit_id: live.commit_id,
             generation: live.generation,
             parent_commit_ids: live.parent_commit_ids.clone(),
+            state_parent_commit_id: live.parent_commit_ids.first().copied(),
             commit_change_id: live.change_id,
             account_id: live.account_id.clone(),
             created_at: live.created_at,
-            replay_debt: CommitStateReplayDebt {
-                depth: live.tracked_state_rootless_depth,
-                rows: live.tracked_state_rootless_rows,
-                bytes: live.tracked_state_rootless_bytes,
-            },
+            current_state_catalog: Box::new(
+                crate::tracked_state::empty_current_state_catalog_root(None, live.commit_id)
+                    .expect("empty Arrow state root should construct"),
+            ),
             mutations: CommitStateMutationInventory::default(),
-            touched_scope_filter: Default::default(),
-            current_state_scoped_ranges: None,
-            snapshot_root: None,
         };
         drifted.generation += 1;
         stage_commit_state_manifest(&mut writes, &drifted)
@@ -1803,10 +1785,6 @@ mod tests {
                 commit_id: source_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 1,
-                tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-source-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
@@ -1816,10 +1794,6 @@ mod tests {
                 commit_id: alias_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 1,
-                tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-live-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
@@ -1829,10 +1803,6 @@ mod tests {
                 commit_id: authority_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 1,
-                tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-authority-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
@@ -1842,10 +1812,6 @@ mod tests {
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![alias_commit, authority_commit],
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 2,
-                tracked_state_rootless_rows: 2,
-                tracked_state_rootless_bytes: 2,
                 change_id: ChangeId::for_test_label("gc-tombstone-alias-head-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
@@ -1866,7 +1832,7 @@ mod tests {
             .await
             .expect("tombstone alias headers should stage");
         let base_coordinate = crate::tracked_state::TrackedStateBaseCoordinate {
-            base_commit_id: source_commit,
+            state_set_id: crate::columnar_row_group::ArrowStateSetId::from_digest([19; 32]),
             group_index: 7,
             row_index: 11,
         };
@@ -1896,67 +1862,22 @@ mod tests {
             ),
             (alias_commit, alias_stage.mutation_inventory().clone()),
         ]);
-        let scope = crate::tracked_state::scoped_range::ScopedRangePrefix::try_from_components([
-            b"gc-selected-source-empty".as_slice(),
-        ])
-        .expect("GC selected-source scope should encode");
-        let tree = crate::tracked_state::scoped_range::stage_scoped_range_tree(
-            &mut writes,
-            [(
-                crate::tracked_state::scoped_range::ScopedRangeCoverageMarker {
-                    scope,
-                    row_count: 0,
-                    part_count: 0,
-                },
-                Vec::new(),
-            )],
-        )
-        .expect("GC selected-source empty serving tree should stage");
-        let source_inventory = inventories[&source_commit].clone();
-        let source_root = crate::tracked_state::attest_scoped_range_root(
-            source_commit,
-            None,
-            &source_inventory,
-            tree.clone(),
-        )
-        .expect("source serving root should attest");
-        let mut source_manifest = test_commit_state_manifest(&commits[0], source_inventory);
-        source_manifest.current_state_scoped_ranges = Some(Box::new(source_root.clone()));
-        crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
-            &mut writes,
-            &source_manifest,
-        )
-        .expect("source serving authority should stage");
-
-        let alias_inventory = inventories[&alias_commit].clone();
-        let alias_root = crate::tracked_state::attest_scoped_range_root(
-            alias_commit,
-            Some((source_commit, &source_root)),
-            &alias_inventory,
-            tree,
-        )
-        .expect("selected-source serving root should attest");
-        let mut alias_manifest = test_commit_state_manifest(&commits[1], alias_inventory);
-        alias_manifest.current_state_scoped_ranges = Some(Box::new(alias_root));
-        crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
-            &mut writes,
-            &alias_manifest,
-        )
-        .expect("selected-source serving authority should stage");
-
-        for record in &commits[2..] {
-            let manifest = test_commit_state_manifest(
+        let mut state_roots = BTreeMap::new();
+        for record in &commits {
+            let parent_root = record
+                .parent_commit_ids
+                .first()
+                .and_then(|parent| state_roots.get(parent));
+            let root = stage_test_commit_state_manifest(
+                &mut writes,
                 record,
                 inventories
                     .get(&record.commit_id)
                     .cloned()
                     .unwrap_or_default(),
+                parent_root,
             );
-            crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
-                &mut writes,
-                &manifest,
-            )
-            .expect("GC retained-authority fixture manifest should stage");
+            state_roots.insert(record.commit_id, root);
         }
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2062,10 +1983,6 @@ mod tests {
                 commit_id: live_parent,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 1,
-                tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("authority-gc-live-parent-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
@@ -2075,10 +1992,6 @@ mod tests {
                 commit_id: live_head,
                 generation: 1,
                 parent_commit_ids: vec![live_parent],
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 2,
-                tracked_state_rootless_rows: 2,
-                tracked_state_rootless_bytes: 2,
                 change_id: ChangeId::for_test_label("authority-gc-live-head-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
@@ -2088,10 +2001,6 @@ mod tests {
                 commit_id: dead_commit,
                 generation: 0,
                 parent_commit_ids: Vec::new(),
-                tracked_state_rootless: true,
-                tracked_state_rootless_depth: 1,
-                tracked_state_rootless_rows: 1,
-                tracked_state_rootless_bytes: 1,
                 change_id: ChangeId::for_test_label("authority-gc-dead-header"),
                 account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
                 created_at: timestamp,
@@ -2112,10 +2021,7 @@ mod tests {
             .await
             .expect("authority GC changelog fixture should stage");
         drop(writer);
-        let mut live_deltas = commit_delta_refs(live_parent, std::slice::from_ref(&live_member));
-        // The surviving copy is a merge/checkpoint selection. Once the
-        // original owner dies, GC promotes it through locator relocation.
-        live_deltas[0].authored = false;
+        let live_deltas = commit_delta_refs(live_parent, std::slice::from_ref(&live_member));
         let live_stage = stage_commit_deltas_for_commit_state(&mut writes, &live_deltas)
             .expect("live packed member should stage");
         let dead_members = vec![dead_shared_member.clone(), dead_only_member.clone()];
@@ -2128,14 +2034,61 @@ mod tests {
             (dead_commit, dead_stage.mutation_inventory().clone()),
         ]);
         for record in &commits {
-            stage_test_commit_state_manifest(
+            let rows = if record.commit_id == live_parent {
+                vec![MaterializedTrackedStateRow {
+                    entity_pk: live_member.entity_pk.clone(),
+                    schema_key: live_member.schema_key.clone(),
+                    file_id: live_member.file_id.clone(),
+                    snapshot_content: Some(r#"{"payload":"shared"}"#.into()),
+                    metadata: None,
+                    deleted: false,
+                    created_at: live_member.created_at.to_string(),
+                    updated_at: live_member.created_at.to_string(),
+                    change_id: live_member.change_id,
+                    commit_id: record.commit_id,
+                }]
+            } else if record.commit_id == dead_commit {
+                vec![
+                    MaterializedTrackedStateRow {
+                        entity_pk: dead_shared_member.entity_pk.clone(),
+                        schema_key: dead_shared_member.schema_key.clone(),
+                        file_id: dead_shared_member.file_id.clone(),
+                        snapshot_content: Some(r#"{"payload":"shared"}"#.into()),
+                        metadata: None,
+                        deleted: false,
+                        created_at: dead_shared_member.created_at.to_string(),
+                        updated_at: dead_shared_member.created_at.to_string(),
+                        change_id: dead_shared_member.change_id,
+                        commit_id: record.commit_id,
+                    },
+                    MaterializedTrackedStateRow {
+                        entity_pk: dead_only_member.entity_pk.clone(),
+                        schema_key: dead_only_member.schema_key.clone(),
+                        file_id: dead_only_member.file_id.clone(),
+                        snapshot_content: Some(r#"{"payload":"dead-only"}"#.into()),
+                        metadata: None,
+                        deleted: false,
+                        created_at: dead_only_member.created_at.to_string(),
+                        updated_at: dead_only_member.created_at.to_string(),
+                        change_id: dead_only_member.change_id,
+                        commit_id: record.commit_id,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            crate::test_support::stage_test_commit_state_manifest(
+                &read,
                 &mut writes,
                 record,
                 inventories
                     .get(&record.commit_id)
                     .cloned()
                     .unwrap_or_default(),
-            );
+                &rows,
+            )
+            .await
+            .expect("GC fixture Arrow authority should stage");
         }
         let sidecar_schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -2147,20 +2100,14 @@ mod tests {
             vec![Arc::new(StringArray::from(vec!["value"]))],
         )
         .expect("sidecar batch");
-        let sidecar = crate::columnar_row_group::encode_row_group_set(
+        let sidecar = crate::columnar_row_group::encode_row_group_set_preserving_batches(
             "authority_gc",
             sidecar_schema,
             &[sidecar_batch],
         )
         .expect("encode GC sidecar");
-        for commit_id in [live_parent, dead_commit] {
-            crate::columnar_row_group::stage_row_group_set(
-                &mut writes,
-                crate::live_state::entity_row_group_set_id(commit_id, "authority_gc"),
-                &sidecar,
-            )
+        let sidecar_id = crate::columnar_row_group::stage_row_group_set(&mut writes, &sidecar)
             .expect("stage GC sidecar");
-        }
         // Point the shared change at the owner about to be collected. GC must
         // relocate it to the surviving physical copy, not delete the index.
         stage_change_locators(&mut writes, &dead_locators);
@@ -2190,11 +2137,11 @@ mod tests {
         assert_eq!(plan.sweep.changes, vec![dead_standalone.change_id]);
         assert!(
             !plan.sweep.json_payloads.contains(&shared_ref),
-            "a payload shared with live packed history must stay live"
+            "a payload referenced by live Arrow authority must stay live"
         );
         assert!(
-            !plan.sweep.json_payloads.contains(&dead_only_ref),
-            "co-resident immutable part members and their payloads remain reachable"
+            plan.sweep.json_payloads.contains(&dead_only_ref),
+            "dead Arrow authority must release its referenced payload"
         );
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2265,29 +2212,16 @@ mod tests {
         assert!(inventory.commits.contains_key(&live_parent));
         assert!(inventory.commits.contains_key(&dead_commit));
         assert!(
-            crate::columnar_row_group::load_row_group_manifest(
-                &read,
-                crate::live_state::entity_row_group_set_id(live_parent, "authority_gc"),
-            )
-            .await
-            .expect("load live sidecar")
-            .is_some(),
-            "reachable commit sidecars must survive repository GC"
-        );
-        assert!(
-            crate::columnar_row_group::load_row_group_manifest(
-                &read,
-                crate::live_state::entity_row_group_set_id(dead_commit, "authority_gc"),
-            )
-            .await
-            .expect("load retained authority sidecar")
-            .is_some(),
-            "sidecars co-owned by retained immutable authority must survive"
+            crate::columnar_row_group::load_row_group_manifest(&read, sidecar_id,)
+                .await
+                .expect("load orphan Arrow set")
+                .is_none(),
+            "unreferenced Arrow sets must be swept even when a commit survives"
         );
         drop(read);
-        assert!(json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await);
+        assert!(json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref,).await);
         assert!(
-            json_ref_exists(
+            !json_ref_exists(
                 &storage,
                 crate::json_store::store::JSON_SPACE,
                 dead_only_ref,
@@ -2369,10 +2303,9 @@ mod tests {
         let timestamp =
             LixTimestamp::expect_parse("untracked GC owner timestamp", "2026-01-01T00:00:00Z");
         let mut writes = storage_adapter.new_write_set();
-        let mut coverage = WorkingDiffIndexCoverage::default();
         TrackedHeadContext::new()
             .writer(&read, &mut writes)
-            .stage_current_state_with_working_diff(
+            .stage_current_state(
                 GLOBAL_BRANCH_ID,
                 Some(control.generation),
                 control.head_commit_id,
@@ -2393,8 +2326,6 @@ mod tests {
                 &BTreeSet::new(),
                 None,
                 None,
-                None,
-                &mut coverage,
             )
             .await
             .expect("untracked current-state owner should stage");
@@ -2488,10 +2419,6 @@ mod tests {
             commit_id: CommitId::for_test_label(label),
             generation: 0,
             parent_commit_ids: Vec::new(),
-            tracked_state_rootless: true,
-            tracked_state_rootless_depth: 1,
-            tracked_state_rootless_rows: 0,
-            tracked_state_rootless_bytes: 0,
             change_id: ChangeId::for_test_label(&format!("{label}-header")),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: LixTimestamp::expect_parse(
@@ -2531,32 +2458,27 @@ mod tests {
         writes: &mut crate::storage_adapter::StorageWriteSet,
         record: &CommitRecord,
         mutations: CommitStateMutationInventory,
-    ) {
-        stage_commit_state_manifest(writes, &test_commit_state_manifest(record, mutations))
-            .expect("GC fixture commit-state manifest should stage");
-    }
-
-    fn test_commit_state_manifest(
-        record: &CommitRecord,
-        mutations: CommitStateMutationInventory,
-    ) -> CommitStateManifest {
-        CommitStateManifest {
-            commit_id: record.commit_id,
-            generation: record.generation,
-            parent_commit_ids: record.parent_commit_ids.clone(),
-            commit_change_id: record.change_id,
-            account_id: record.account_id.clone(),
-            created_at: record.created_at,
-            replay_debt: CommitStateReplayDebt {
-                depth: record.tracked_state_rootless_depth,
-                rows: record.tracked_state_rootless_rows,
-                bytes: record.tracked_state_rootless_bytes,
+        parent_root: Option<&crate::tracked_state::CurrentStateCatalogRoot>,
+    ) -> crate::tracked_state::CurrentStateCatalogRoot {
+        let current_state_catalog =
+            crate::tracked_state::empty_current_state_catalog_root(parent_root, record.commit_id)
+                .expect("GC fixture Arrow root should construct");
+        stage_commit_state_manifest(
+            writes,
+            &CommitStateManifest {
+                commit_id: record.commit_id,
+                generation: record.generation,
+                parent_commit_ids: record.parent_commit_ids.clone(),
+                state_parent_commit_id: record.parent_commit_ids.first().copied(),
+                commit_change_id: record.change_id,
+                account_id: record.account_id.clone(),
+                created_at: record.created_at,
+                current_state_catalog: Box::new(current_state_catalog.clone()),
+                mutations,
             },
-            mutations,
-            touched_scope_filter: Default::default(),
-            current_state_scoped_ranges: None,
-            snapshot_root: None,
-        }
+        )
+        .expect("GC fixture commit-state manifest should stage");
+        current_state_catalog
     }
 
     async fn json_ref_exists(storage: &Memory, space: StorageSpace, json_ref: JsonRef) -> bool {

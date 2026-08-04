@@ -20,26 +20,23 @@ fn stage_bench_commit_deltas(
         .map(|delta| delta.delta.commit_id)
         .unwrap_or_default();
     let mutations = staged.mutation_inventory().clone();
+    let current_state_catalog = Box::new(crate::tracked_state::empty_current_state_catalog_root(
+        None, commit_id,
+    )?);
     crate::tracked_state::stage_commit_state_manifest(
         writes,
         &crate::tracked_state::CommitStateManifest {
             commit_id,
             generation: 0,
             parent_commit_ids: Vec::new(),
+            state_parent_commit_id: None,
             commit_change_id: crate::changelog::ChangeId::for_test_label(&format!(
                 "{commit_id}:bench-commit"
             )),
             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
-            replay_debt: crate::tracked_state::CommitStateReplayDebt {
-                depth: 1,
-                rows: u64::from(mutations.member_count),
-                bytes: u64::from(mutations.member_count),
-            },
             mutations,
-            touched_scope_filter: Default::default(),
-            current_state_scoped_ranges: None,
-            snapshot_root: None,
+            current_state_catalog,
         },
     )?;
     Ok(staged.locators)
@@ -61,13 +58,9 @@ static CRUD_PHYSICAL_PUTS: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_DELETES: AtomicU64 = AtomicU64::new(0);
 static CRUD_PHYSICAL_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
 static CRUD_COMMIT_STATE_MANIFEST_BYTES: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_SCOPED_RANGE_HITS: AtomicU64 = AtomicU64::new(0);
-static CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static CRUD_CURRENT_STATE_DIRECTORY_BYTES: AtomicU64 = AtomicU64::new(0);
+static CRUD_CURRENT_STATE_CATALOG_BYTES: AtomicU64 = AtomicU64::new(0);
 static CRUD_SEALED_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
-static CRUD_REPLAY_MANIFEST_LOADS: AtomicU64 = AtomicU64::new(0);
-static CRUD_ORDERED_DELTA_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_MANIFEST_LEAF_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_SUMMARIZED_CHUNK_ROWS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_UPLOAD_CHUNK_PAYLOAD_HASH_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -196,57 +189,28 @@ pub fn take_crud_commit_state_manifest_bytes() -> u64 {
     CRUD_COMMIT_STATE_MANIFEST_BYTES.swap(0, Ordering::Relaxed)
 }
 
-pub(crate) fn record_crud_current_state_scoped_range_fallback() {
-    CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_crud_current_state_directory_bytes(bytes: usize) {
+    CRUD_CURRENT_STATE_DIRECTORY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
-pub fn take_crud_current_state_scoped_range_fallbacks() -> u64 {
-    CRUD_CURRENT_STATE_SCOPED_RANGE_FALLBACKS.swap(0, Ordering::Relaxed)
+pub fn take_crud_current_state_directory_bytes() -> u64 {
+    CRUD_CURRENT_STATE_DIRECTORY_BYTES.swap(0, Ordering::Relaxed)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CrudCurrentStateScopedRangeAccounting {
-    pub attempts: u64,
-    pub hits: u64,
-    pub errors: u64,
-    pub sealed_manifest_loads: u64,
-    pub replay_manifest_loads: u64,
-    pub ordered_delta_fallbacks: u64,
+pub(crate) fn record_crud_current_state_catalog_bytes(bytes: usize) {
+    CRUD_CURRENT_STATE_CATALOG_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
-pub(crate) fn record_crud_current_state_scoped_range_attempt() {
-    CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_crud_current_state_scoped_range_hit() {
-    CRUD_CURRENT_STATE_SCOPED_RANGE_HITS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_crud_current_state_scoped_range_error() {
-    CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS.fetch_add(1, Ordering::Relaxed);
+pub fn take_crud_current_state_catalog_bytes() -> u64 {
+    CRUD_CURRENT_STATE_CATALOG_BYTES.swap(0, Ordering::Relaxed)
 }
 
 pub(crate) fn record_crud_sealed_manifest_load() {
     CRUD_SEALED_MANIFEST_LOADS.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_crud_replay_manifest_load() {
-    CRUD_REPLAY_MANIFEST_LOADS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn record_crud_ordered_delta_fallback() {
-    CRUD_ORDERED_DELTA_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn take_crud_current_state_scoped_range_accounting() -> CrudCurrentStateScopedRangeAccounting {
-    CrudCurrentStateScopedRangeAccounting {
-        attempts: CRUD_CURRENT_STATE_SCOPED_RANGE_ATTEMPTS.swap(0, Ordering::Relaxed),
-        hits: CRUD_CURRENT_STATE_SCOPED_RANGE_HITS.swap(0, Ordering::Relaxed),
-        errors: CRUD_CURRENT_STATE_SCOPED_RANGE_ERRORS.swap(0, Ordering::Relaxed),
-        sealed_manifest_loads: CRUD_SEALED_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
-        replay_manifest_loads: CRUD_REPLAY_MANIFEST_LOADS.swap(0, Ordering::Relaxed),
-        ordered_delta_fallbacks: CRUD_ORDERED_DELTA_FALLBACKS.swap(0, Ordering::Relaxed),
-    }
+pub fn take_crud_sealed_manifest_loads() -> u64 {
+    CRUD_SEALED_MANIFEST_LOADS.swap(0, Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -259,16 +223,10 @@ pub struct BinaryCasWriteAccounting {
     pub transaction_duplicate_chunk_count: u64,
 }
 
-/// Result of one benchmark-only historical tracked-state diff.
-///
-/// The durable-root flags prove which physical diff path the benchmark used:
-/// the intended populated case is a checkpoint on the left and a rootless
-/// ordinary commit on the right.
+/// Result of one benchmark-only structural Arrow historical diff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrackedHistoricalDiffBenchResult {
     pub entries: usize,
-    pub left_has_durable_root: bool,
-    pub right_has_durable_root: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -567,8 +525,6 @@ where
 {
     let read = storage.begin_read(ReadOptions::default()).await?;
     let mut reader = crate::tracked_state::TrackedStateContext::new().reader(read);
-    let left_has_durable_root = reader.has_durable_commit_root(left_commit_id).await?;
-    let right_has_durable_root = reader.has_durable_commit_root(right_commit_id).await?;
     let entries = reader
         .diff_commits(
             left_commit_id,
@@ -578,11 +534,7 @@ where
         .await?
         .entries
         .len();
-    Ok(TrackedHistoricalDiffBenchResult {
-        entries,
-        left_has_durable_root,
-        right_has_durable_root,
-    })
+    Ok(TrackedHistoricalDiffBenchResult { entries })
 }
 
 pub fn reset_binary_cas_write_accounting() {
@@ -1463,19 +1415,10 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::branch::BRANCH_HEAD_CONTROL_SPACE,
         crate::live_state::HOT_ROW_SPACE,
         crate::live_state::HOT_FILE_SPACE,
-        crate::live_state::HOT_DIFF_SPACE,
-        crate::live_state::PACKED_CURRENT_BASE_CONTROL_SPACE,
-        crate::live_state::PACKED_CURRENT_BASE_SPACE,
-        crate::live_state::PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
         crate::live_state::ROOT_CURRENT_BASE_SPACE,
-        crate::live_state::TRACKED_WORKING_DIFF_MARKER_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-        crate::live_state::CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
         crate::transaction::plugin_checkpoint::PLUGIN_CHECKPOINT_SPACE,
         crate::json_store::store::JSON_SPACE,
         crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
         crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,

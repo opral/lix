@@ -127,7 +127,7 @@ struct EntityColumnarBatchKey {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct EntityColumnarShadowMaskKey {
-    pub(crate) row_groups: crate::columnar_row_group::RowGroupSetId,
+    pub(crate) row_groups: crate::columnar_row_group::ArrowStateSetId,
     pub(crate) branch_id: Arc<str>,
     pub(crate) head_commit_id: crate::changelog::CommitId,
     pub(crate) current_state_revision: u64,
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn statistics_projections_are_bounded_per_mask() {
         let key = EntityColumnarShadowMaskKey {
-            row_groups: crate::columnar_row_group::RowGroupSetId::new([7; 16]),
+            row_groups: crate::columnar_row_group::ArrowStateSetId::from_digest([7; 32]),
             branch_id: Arc::from("branch"),
             head_commit_id: crate::changelog::CommitId::for_test_label("scan-cache-head"),
             current_state_revision: 3,
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn reconciled_batches_are_entry_bounded() {
         let shadow = EntityColumnarShadowMaskKey {
-            row_groups: crate::columnar_row_group::RowGroupSetId::new([3; 16]),
+            row_groups: crate::columnar_row_group::ArrowStateSetId::from_digest([3; 32]),
             branch_id: Arc::from("branch"),
             head_commit_id: crate::changelog::CommitId::for_test_label("batch-cache-head"),
             current_state_revision: 1,
@@ -514,7 +514,7 @@ mod tests {
 
         let variants = [
             EntityColumnarShadowMaskKey {
-                row_groups: crate::columnar_row_group::RowGroupSetId::new([8; 16]),
+                row_groups: crate::columnar_row_group::ArrowStateSetId::from_digest([8; 32]),
                 ..base.clone()
             },
             EntityColumnarShadowMaskKey {
@@ -547,7 +547,7 @@ mod tests {
 
     fn batch_cache_key() -> EntityColumnarShadowMaskKey {
         EntityColumnarShadowMaskKey {
-            row_groups: crate::columnar_row_group::RowGroupSetId::new([3; 16]),
+            row_groups: crate::columnar_row_group::ArrowStateSetId::from_digest([3; 32]),
             branch_id: Arc::from("branch"),
             head_commit_id: crate::changelog::CommitId::for_test_label("batch-cache-head"),
             current_state_revision: 1,

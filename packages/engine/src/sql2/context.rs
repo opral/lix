@@ -23,14 +23,12 @@ use crate::live_state::{
 };
 use crate::plugin::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::TrackedStateScanRequest;
 use crate::transaction::types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch, RawWriteBatch,
     TransactionWrite, TransactionWriteMode, TransactionWriteOutcome, TypedMutationJournalBatch,
 };
 use crate::wasm::UnsupportedWasmRuntime;
 
-use super::change_materialization::MaterializedChange;
 use super::{PublicCatalog, SessionFileViews};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,25 +47,10 @@ pub(crate) struct DiffCommandOutcome {
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
 pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
 
-pub(crate) struct CertifiedHistoryChange {
-    pub(crate) commit_id: CommitId,
-    pub(crate) change: MaterializedChange,
-}
-
-#[async_trait]
-pub(crate) trait CertifiedHistoryReader: Send + Sync {
-    async fn scan(
-        &self,
-        commit_ids: &BTreeSet<CommitId>,
-        request: &TrackedStateScanRequest,
-    ) -> Result<Vec<CertifiedHistoryChange>, LixError>;
-}
-
 #[derive(Clone)]
 pub(crate) struct HistoryQuerySource<S> {
     pub(crate) store: S,
     pub(crate) json_reader: JsonStoreReader<S>,
-    pub(crate) certified_history_reader: Option<Arc<dyn CertifiedHistoryReader>>,
     /// Active-branch head pinned by the SQL session that owns this provider.
     ///
     /// History scans use this commit when the query does not provide an

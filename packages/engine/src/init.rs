@@ -15,10 +15,7 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
-use crate::live_state::{
-    CurrentStateDeltaRef, TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
-    stage_tracked_working_diff_epoch,
-};
+use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext};
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };
@@ -29,8 +26,10 @@ use crate::storage_adapter::{
     StorageSpaceId, StorageWriteSet,
 };
 use crate::tracked_state::{
-    CommitStateManifest, CommitStateReplayDebt, TrackedStateCommitDeltaRef, TrackedStateContext,
-    TrackedStateDeltaRef, stage_commit_deltas_for_commit_state,
+    ArrowStateInputRowRef, CommitDeltaReplacementScope, CommitStateManifest,
+    TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef,
+    TrackedStateIndexValueRef, TrackedStateKeyRef, encode_authoritative_arrow_state_rows,
+    encode_key_ref, stage_commit_deltas_for_commit_state,
 };
 use bytes::Bytes;
 use serde_json::json;
@@ -42,14 +41,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V56 separates semantic graph ancestry from physical current-state ancestry.
-/// A serving root authenticates the exact commit/root it structurally reuses,
-/// including merge targets and selected sources. Older repositories must fail
-/// closed rather than reinterpret a first-parent root as this stronger proof.
+/// V50 is the Arrow-native state-tree hard cut. Commits publish one
+/// content-addressed catalog of canonical Arrow leaves; compact event storage
+/// carries authored identity and coordinates only. Older repositories fail
+/// closed instead of invoking a legacy reader, replay, or migration path.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"authenticated-serving-base-lineage.v56";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"sparse-current-state-parts.v50";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -215,28 +214,12 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         checkpoint_marker_snapshot(&main_branch_id)?,
         timestamp,
     );
-    let system_account_change = canonical_change(
-        functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(crate::SYSTEM_ACCOUNT_ID)
-            .expect("system account ID is a canonical UUID"),
-        "lix_account",
-        account_snapshot(crate::SYSTEM_ACCOUNT_ID, "System", "system")?,
-        timestamp,
-    );
-    let anonymous_account_change = canonical_change(
-        functions.call_uuid_v7(),
-        EntityPk::uuid_from_canonical(crate::ANONYMOUS_ACCOUNT_ID)
-            .expect("anonymous account ID is a canonical UUID"),
-        "lix_account",
-        account_snapshot(crate::ANONYMOUS_ACCOUNT_ID, "Anonymous", "anonymous")?,
-        timestamp,
-    );
 
     let initial_commit = InitSeedCommit {
         id: initial_commit_id,
         change_id: ChangeId::from(functions.call_uuid_v7()),
         parent_ids: Vec::new(),
-        account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         created_at: timestamp,
     };
     // Keep one distinct public ref change id per initial branch, matching the
@@ -299,8 +282,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
                 main_branch_descriptor_change,
                 kv_lix_id_change,
                 initial_checkpoint_change,
-                system_account_change,
-                anonymous_account_change,
             ])
             .collect(),
         branch_controls: vec![global_branch_control, main_branch_control],
@@ -322,7 +303,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 /// plus untracked moving refs.
 pub(crate) async fn initialize<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
-    tracked_state: &TrackedStateContext,
+    _tracked_state: &TrackedStateContext,
 ) -> Result<InitReceipt, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -386,116 +367,151 @@ where
             .collect::<Vec<_>>();
         let staged_delta = stage_commit_deltas_for_commit_state(&mut writes, &commit_deltas)?;
         crate::tracked_state::stage_change_locators(&mut writes, &staged_delta.locators);
-        let mut tracked_writer = tracked_state.writer(&read, &mut writes);
-        tracked_writer
-            .stage_commit_root(&receipt.initial_commit_id, None, root_deltas)
-            .await?;
-        let snapshot_root = tracked_writer
-            .staged_commit_roots()
-            .find(|root| root.commit_id == plan.commit.id)
-            .cloned()
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "repository initialization did not stage its snapshot root",
-                )
-            })?;
-        let initial_mutations = staged_delta.mutation_inventory().clone();
-        let physical_publication =
-            crate::tracked_state::stage_current_state_scoped_ranges_from_published_parent(
+        let mut mutations = staged_delta.mutation_inventory().clone();
+        let mut planned_members = crate::tracked_state::staged_commit_delta_members_for_write(
+            &read,
+            &writes,
+            plan.commit.id,
+            &mutations,
+        )
+        .await?;
+        let mut arrow_mutations = crate::live_state::EntityColumnarWriteSets::new();
+        let mut changes_by_scope =
+            std::collections::BTreeMap::<CommitDeltaReplacementScope, Vec<&ChangeRecord>>::new();
+        for change in &authored_changes {
+            changes_by_scope
+                .entry(CommitDeltaReplacementScope {
+                    schema_key: change.schema_key.clone(),
+                    file_id: change.file_id.clone(),
+                })
+                .or_default()
+                .push(change);
+        }
+        for (scope, changes) in &mut changes_by_scope {
+            changes.sort_unstable_by(|left, right| left.entity_pk.cmp(&right.entity_pk));
+            let encoded_keys = changes
+                .iter()
+                .map(|change| {
+                    encode_key_ref(TrackedStateKeyRef {
+                        schema_key: &change.schema_key,
+                        file_id: change.file_id.as_deref(),
+                        entity_pk: &change.entity_pk,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let rows = changes
+                .iter()
+                .zip(&encoded_keys)
+                .map(|(change, encoded_key)| ArrowStateInputRowRef {
+                    encoded_key,
+                    value: TrackedStateIndexValueRef {
+                        change_id: change.change_id,
+                        commit_id: plan.commit.id,
+                        deleted: change.snapshot.is_none(),
+                        created_at: change.created_at,
+                        updated_at: change.created_at,
+                    },
+                    snapshot: change.snapshot.as_ref_slot(),
+                    metadata: change.metadata.as_ref_slot(),
+                })
+                .collect::<Vec<_>>();
+            let (row_group_set, _) = encode_authoritative_arrow_state_rows(scope, &rows)?;
+            arrow_mutations.insert_scope(plan.commit.id, scope.clone(), row_group_set);
+        }
+        let catalog_publication =
+            crate::tracked_state::stage_current_state_catalog_from_published_parent(
                 &read,
                 &mut writes,
                 None,
                 plan.commit.id,
-                &plan.commit.account_id,
-                &initial_mutations,
+                &mutations,
+                &planned_members,
+                Some(&arrow_mutations),
             )
             .await?;
-        crate::tracked_state::stage_certified_commit_state_manifest(
-            &mut writes,
-            &CommitStateManifest {
-                commit_id: plan.commit.id,
-                generation: 0,
-                parent_commit_ids: plan.commit.parent_ids.clone(),
-                commit_change_id: plan.commit.change_id,
-                account_id: plan.commit.account_id.clone(),
-                created_at: plan.commit.created_at,
-                replay_debt: CommitStateReplayDebt::default(),
-                mutations: initial_mutations,
-                touched_scope_filter: physical_publication.touched_scope_filter().clone(),
-                current_state_scoped_ranges: physical_publication.root(),
-                snapshot_root: Some(snapshot_root),
-            },
-            &physical_publication,
-        )?;
-
-        // Seed both visible branches with a complete hot current-state generation.
-        // The initial commit is shared, but the branch-scoped marker and
-        // groups are intentionally independent so normal reads never need a
-        // reconstruction path immediately after initialization.
-        let tracked_head_deltas = authored_changes
-            .iter()
-            .map(|change| CurrentStateDeltaRef {
-                schema_key: &change.schema_key,
-                file_id: change.file_id.as_deref(),
-                entity_pk: &change.entity_pk,
-                change_id: Some(change.change_id),
-                commit_id: Some(plan.commit.id),
-                untracked: false,
-                deleted: change.snapshot.is_none(),
-                created_at: change.created_at,
-                updated_at: change.created_at,
-                snapshot: change.snapshot.as_ref_slot(),
-                metadata: change.metadata.as_ref_slot(),
-                columnar_base_coordinate: None,
-            })
-            .collect::<Vec<_>>();
-        let tracked_head = TrackedHeadContext::new();
-        let absence_guards = std::collections::BTreeSet::default();
-        for branch in &plan.branch_controls {
-            let mut head_deltas = tracked_head_deltas.clone();
-            if branch.branch_id == GLOBAL_BRANCH_ID {
-                head_deltas.extend(plan.untracked_rows.iter().map(|row| CurrentStateDeltaRef {
-                    schema_key: &row.schema_key,
-                    file_id: None,
-                    entity_pk: &row.entity_pk,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: true,
-                    deleted: false,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                    snapshot: crate::json_store::JsonSlotRef::Inline(&row.snapshot_content),
-                    metadata: crate::json_store::JsonSlotRef::None,
-                    columnar_base_coordinate: None,
-                }));
+        for member in planned_members.iter_mut().filter(|member| member.authored) {
+            let encoded_key = encode_key_ref(TrackedStateKeyRef {
+                schema_key: &member.key.schema_key,
+                file_id: member.key.file_id.as_deref(),
+                entity_pk: &member.key.entity_pk,
+            });
+            if let Some(coordinate) = catalog_publication.coordinates().get(&encoded_key) {
+                member.base_coordinate = Some(*coordinate);
             }
-            let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
+            if !member.value.deleted && member.base_coordinate.is_none() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "repository initialization produced a live event without an Arrow coordinate",
+                ));
+            }
+        }
+        mutations = crate::tracked_state::finalize_commit_delta_event_coordinates(
+            &mut writes,
+            plan.commit.id,
+            &mutations,
+            &planned_members,
+        )?;
+        let manifest = CommitStateManifest {
+            commit_id: plan.commit.id,
+            generation: 0,
+            parent_commit_ids: plan.commit.parent_ids.clone(),
+            state_parent_commit_id: None,
+            commit_change_id: plan.commit.change_id,
+            account_id: plan.commit.account_id.clone(),
+            created_at: plan.commit.created_at,
+            mutations,
+            current_state_catalog: catalog_publication.root(),
+        };
+        crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
+            &mut writes,
+            &manifest,
+            &catalog_publication,
+        )?;
+        // Publish the shared immutable Arrow root for both visible branches.
+        // Only history-free global workspace rows enter mutable HOT storage.
+        let tracked_head = TrackedHeadContext::new();
+        for branch in &plan.branch_controls {
+            let untracked_deltas = if branch.branch_id == GLOBAL_BRANCH_ID {
+                plan.untracked_rows
+                    .iter()
+                    .map(|row| CurrentStateDeltaRef {
+                        schema_key: &row.schema_key,
+                        file_id: None,
+                        entity_pk: &row.entity_pk,
+                        change_id: None,
+                        commit_id: None,
+                        untracked: true,
+                        deleted: false,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                        snapshot: crate::json_store::JsonSlotRef::Inline(&row.snapshot_content),
+                        metadata: crate::json_store::JsonSlotRef::None,
+                        columnar_base_coordinate: None,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if !untracked_deltas.is_empty() {
+                tracked_head
+                    .writer(&read, &mut writes)
+                    .stage_complete_current_state(
+                        &branch.branch_id,
+                        plan.commit.id,
+                        crate::live_state::HotTrackedSnapshot::default(),
+                        None,
+                        &[],
+                        &untracked_deltas,
+                        &std::collections::BTreeSet::new(),
+                    )
+                    .await?;
+            }
             tracked_head
                 .writer(&read, &mut writes)
-                .stage_current_state_with_working_diff(
-                    &branch.branch_id,
-                    None,
-                    plan.commit.id,
-                    &head_deltas,
-                    &absence_guards,
-                    None,
-                    None,
-                    Some(plan.commit.id),
-                    &mut working_diff_coverage,
-                )
-                .await?;
-            stage_tracked_working_diff_epoch(
-                &mut writes,
-                &branch.branch_id,
-                TrackedWorkingDiffEpoch {
-                    checkpoint_commit_id: plan.commit.id,
-                    generation: plan.commit.id,
-                    coverage: working_diff_coverage,
-                },
-            )?;
+                .stage_root_current_base(&branch.branch_id, plan.commit.id, plan.commit.id);
             let mut control = branch.control;
-            control.note_schemas(head_deltas.iter().map(|delta| delta.schema_key));
+            control.schema_presence_bloom = [u64::MAX; 4];
+            control.note_schemas(untracked_deltas.iter().map(|delta| delta.schema_key));
             stage_branch_head_control(&mut writes, &branch.branch_id, control)?;
         }
     }
@@ -544,7 +560,7 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
     ChangeRecord {
         format_version: 1,
         change_id: change.id,
-        account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         entity_pk: change.entity_pk.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
@@ -559,7 +575,7 @@ fn seed_untracked_change_to_change_record(row: &InitSeedLiveRow) -> ChangeRecord
     ChangeRecord {
         format_version: 2,
         change_id: row.id,
-        account_id: crate::SYSTEM_ACCOUNT_ID.to_string(),
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: None,
@@ -610,10 +626,6 @@ async fn stage_init_changelog_commit(
         commit_id: plan.commit.id,
         generation: 0,
         parent_commit_ids: plan.commit.parent_ids.clone(),
-        tracked_state_rootless: false,
-        tracked_state_rootless_depth: 0,
-        tracked_state_rootless_rows: 0,
-        tracked_state_rootless_bytes: 0,
         change_id: plan.commit.change_id,
         account_id: plan.commit.account_id.clone(),
         created_at: plan.commit.created_at,
@@ -706,15 +718,6 @@ fn key_value_snapshot(key: &str, value: &str) -> Result<String, LixError> {
     }))
 }
 
-fn account_snapshot(id: &str, name: &str, kind: &str) -> Result<String, LixError> {
-    encode_snapshot(json!({
-        "id": id,
-        "name": name,
-        "kind": kind,
-        "status": "active",
-    }))
-}
-
 fn checkpoint_marker_snapshot(branch_id: &str) -> Result<String, LixError> {
     encode_snapshot(json!({
         "branch_id": branch_id,
@@ -751,7 +754,7 @@ mod tests {
     fn plan_init_seed_returns_tracked_changes_and_untracked_workspace_state() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
-        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 6);
+        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 4);
         assert_eq!(plan.untracked_rows.len(), 1);
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
@@ -766,10 +769,10 @@ mod tests {
         assert_eq!(plan.commit.id, plan.receipt.initial_commit_id);
         assert_eq!(
             plan.commit.change_id.to_string(),
-            test_uuid(seed_schema_definitions().len() + 10)
+            test_uuid(seed_schema_definitions().len() + 8)
         );
         assert!(plan.commit.parent_ids.is_empty());
-        assert_eq!(plan.commit.account_id, crate::SYSTEM_ACCOUNT_ID);
+        assert_eq!(plan.commit.account_id, crate::ANONYMOUS_ACCOUNT_ID);
         assert_eq!(
             plan.commit.created_at.to_string(),
             "2026-01-01T00:00:00.001Z"
@@ -780,7 +783,7 @@ mod tests {
             .iter()
             .map(|change| change.id.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 6);
+        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 4);
         let first_seed_change_id = test_uuid(4);
         assert!(change_ids.contains(&first_seed_change_id));
         assert!(!change_ids.contains(&plan.commit.change_id.to_string()));
@@ -913,7 +916,7 @@ mod tests {
             crate::tracked_state::load_commit_delta_change_ids(&membership_read, record.commit_id)
                 .await
                 .expect("initial commit membership should load");
-        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 6);
+        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 4);
         assert!(
             !change_refs.contains(&record.change_id),
             "initial commit row is derived from changelog.commit, not stored in its packed delta"
@@ -954,26 +957,6 @@ mod tests {
             .await
             .expect("derivable change lookup should load");
         assert!(missing_derivable.iter().all(|(_, value)| value.is_none()));
-        {
-            let read = storage
-                .begin_read(crate::storage_adapter::StorageReadOptions::default())
-                .await
-                .expect("read should open");
-            let mut writes = storage.new_write_set();
-            tracked_state
-                .root_rebuilder(&read, &mut writes)
-                .rebuild_commit_root_at(&receipt.initial_commit_id)
-                .await
-                .expect("initial commit root should rebuild from its packed delta");
-            drop(read);
-            storage
-                .commit_write_set(
-                    writes,
-                    crate::storage_adapter::StorageWriteOptions::default(),
-                )
-                .await
-                .expect("rebuilt initial commit root should commit");
-        }
         let mut tracked_reader = tracked_state.reader(
             storage
                 .begin_read(crate::storage_adapter::StorageReadOptions::default())
@@ -1001,7 +984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_protocol_rejects_pre_serving_base_lineage_marker() {
+    async fn repository_protocol_rejects_pre_columnar_policy_cut_marker() {
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = StorageWriteSet::new();
         writes.put(

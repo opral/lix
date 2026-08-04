@@ -1,17 +1,14 @@
 use bytes::Bytes;
 use std::borrow::Cow;
 use std::ops::Range;
-use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::tracked_state::types::{
-    TRACKED_STATE_HASH_BYTES, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
-    TrackedStateKeyRef, TrackedStateMutation, TrackedStateMutationBatch,
+    TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
+    TrackedStateMutation, TrackedStateMutationBatch,
 };
-
-const WEIBULL_K: i32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedLeafEntry {
@@ -32,97 +29,6 @@ impl EncodedLeafEntry {
             value: &self.value,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PendingChunk {
-    pub(crate) hash: [u8; TRACKED_STATE_HASH_BYTES],
-    pub(crate) data_start: usize,
-    pub(crate) data_len: usize,
-}
-
-/// Content-addressed tree chunks backed by one immutable encoded arena.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct PendingChunkBatch {
-    data: Bytes,
-    chunks: Vec<PendingChunk>,
-}
-
-impl PendingChunkBatch {
-    pub(crate) fn from_parts(data: Bytes, chunks: Vec<PendingChunk>) -> Self {
-        debug_assert!(chunks.iter().all(|chunk| {
-            chunk
-                .data_start
-                .checked_add(chunk.data_len)
-                .is_some_and(|end| end <= data.len())
-        }));
-        Self { data, chunks }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.chunks.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
-    }
-
-    pub(crate) fn data(&self) -> &Bytes {
-        &self.data
-    }
-
-    pub(crate) fn chunks(&self) -> &[PendingChunk] {
-        &self.chunks
-    }
-
-    #[cfg(test)]
-    pub(crate) fn chunk_bytes(&self, chunk: PendingChunk) -> &[u8] {
-        &self.data[chunk.data_start..chunk.data_start + chunk.data_len]
-    }
-
-    pub(crate) fn chunk_data(&self, chunk: PendingChunk) -> Bytes {
-        self.data
-            .slice(chunk.data_start..chunk.data_start + chunk.data_len)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ChildSummary {
-    pub(crate) first_key: Bytes,
-    pub(crate) last_key: Bytes,
-    pub(crate) child_hash: [u8; TRACKED_STATE_HASH_BYTES],
-    pub(crate) subtree_count: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ChildSummaryRef<'a> {
-    pub(crate) first_key: &'a [u8],
-    pub(crate) last_key: &'a [u8],
-    pub(crate) child_hash: [u8; TRACKED_STATE_HASH_BYTES],
-    pub(crate) subtree_count: u64,
-}
-
-impl ChildSummary {
-    pub(crate) fn as_ref(&self) -> ChildSummaryRef<'_> {
-        ChildSummaryRef {
-            first_key: &self.first_key,
-            last_key: &self.last_key,
-            child_hash: self.child_hash,
-            subtree_count: self.subtree_count,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum DecodedNode {
-    Leaf(DecodedLeafNodeRef),
-    Internal(DecodedInternalNode),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum DecodedNodeRef {
-    Leaf(DecodedLeafNodeRef),
-    Internal(DecodedInternalNode),
 }
 
 /// Decoded view of a leaf node.
@@ -150,10 +56,6 @@ impl DecodedLeafNodeRef {
         self.entries.len()
     }
 
-    pub(crate) fn resident_bytes(&self) -> usize {
-        size_of::<Self>() + self.arena.len() + self.entries.capacity() * size_of::<LeafEntrySpan>()
-    }
-
     pub(crate) fn first_key(&self) -> Option<&[u8]> {
         self.entries
             .first()
@@ -164,18 +66,6 @@ impl DecodedLeafNodeRef {
         self.entries
             .last()
             .map(|span| &self.arena[span.key_start..span.key_end])
-    }
-
-    pub(crate) fn first_key_owned(&self) -> Option<Bytes> {
-        self.entries
-            .first()
-            .map(|span| self.arena.slice(span.key_start..span.key_end))
-    }
-
-    pub(crate) fn last_key_owned(&self) -> Option<Bytes> {
-        self.entries
-            .last()
-            .map(|span| self.arena.slice(span.key_start..span.key_end))
     }
 
     #[expect(clippy::unnecessary_wraps)]
@@ -204,6 +94,7 @@ impl DecodedLeafNodeRef {
     /// Materializes per-entry buffers only for mutation paths that need to
     /// retain leaf entries after this decoded node is consumed. Read and diff
     /// paths keep using the arena-backed view above.
+    #[cfg(test)]
     pub(crate) fn into_entries(self) -> Vec<EncodedLeafEntry> {
         let arena = self.arena;
         self.entries
@@ -216,23 +107,7 @@ impl DecodedLeafNodeRef {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct DecodedInternalNode {
-    children: Vec<ChildSummary>,
-}
-
-impl DecodedInternalNode {
-    pub(crate) fn children(&self) -> &[ChildSummary] {
-        &self.children
-    }
-
-    pub(crate) fn into_children(self) -> Vec<ChildSummary> {
-        self.children
-    }
-}
-
 const NODE_KIND_LEAF_V3: u8 = 3;
-const NODE_KIND_INTERNAL_V3: u8 = 4;
 
 #[derive(Debug, Clone, Copy)]
 struct MutationSpan {
@@ -268,21 +143,8 @@ impl TrackedStateKeyBatchBuilder {
         }
     }
 
-    pub(crate) fn with_capacities(row_count: usize, encoded_bytes: usize) -> Self {
-        Self {
-            arena: Vec::with_capacity(encoded_bytes),
-            spans: Vec::with_capacity(row_count),
-        }
-    }
-
     pub(crate) fn push(&mut self, key: TrackedStateKeyRef<'_>) {
         self.spans.push(encode_key_ref_into(&mut self.arena, key));
-    }
-
-    pub(crate) fn push_encoded(&mut self, encoded_key: &[u8]) {
-        let start = self.arena.len();
-        self.arena.extend_from_slice(encoded_key);
-        self.spans.push(start..self.arena.len());
     }
 
     pub(crate) fn finish_batch(self) -> EncodedTrackedStateKeyBatch {
@@ -301,27 +163,6 @@ impl EncodedTrackedStateKeyBatch {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.spans.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.spans.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn encoded_bytes_len(&self) -> usize {
-        self.arena.len()
-    }
-
-    pub(crate) fn get(&self, ordinal: usize) -> Option<&[u8]> {
-        self.spans
-            .get(ordinal)
-            .map(|span| &self.arena[span.clone()])
-    }
-
-    pub(crate) fn get_owned(&self, ordinal: usize) -> Option<Bytes> {
-        self.spans
-            .get(ordinal)
-            .map(|span| self.arena.slice(span.clone()))
     }
 
     #[cfg(test)]
@@ -370,24 +211,6 @@ impl TrackedStateMutationBatchBuilder {
         self.push_inner(key, value);
     }
 
-    /// Appends one mutation and reports whether its encoded key is strictly
-    /// greater than the preceding key in this batch.
-    ///
-    /// Ordered root staging uses this check to preserve duplicate and ordering
-    /// semantics without materializing an owned `TrackedStateKey` per row.
-    pub(crate) fn push_strictly_ordered(
-        &mut self,
-        key: TrackedStateKeyRef<'_>,
-        value: TrackedStateIndexValueRef,
-    ) -> bool {
-        let previous = self.spans.last().copied();
-        let current = self.push_inner(key, value);
-        previous.is_none_or(|previous| {
-            self.key_arena[previous.key_start..previous.key_end]
-                < self.key_arena[current.key_start..current.key_end]
-        })
-    }
-
     fn push_inner(
         &mut self,
         key: TrackedStateKeyRef<'_>,
@@ -412,21 +235,6 @@ impl TrackedStateMutationBatchBuilder {
         };
         self.spans.push(span);
         span
-    }
-
-    pub(crate) fn push_encoded(&mut self, key: &[u8], value: &[u8]) {
-        let key_start = self.key_arena.len();
-        self.key_arena.extend_from_slice(key);
-        let key_end = self.key_arena.len();
-        let value_start = self.value_arena.len();
-        self.value_arena.extend_from_slice(value);
-        let value_end = self.value_arena.len();
-        self.spans.push(MutationSpan {
-            key_start,
-            key_end,
-            value_start,
-            value_end,
-        });
     }
 
     pub(crate) fn finish(self) -> TrackedStateMutationBatch {
@@ -472,10 +280,6 @@ impl TrackedStateMutationBatchBuilder {
     }
 }
 
-pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; TRACKED_STATE_HASH_BYTES] {
-    *blake3::hash(bytes).as_bytes()
-}
-
 pub(crate) fn encode_key(key: &TrackedStateKey) -> Vec<u8> {
     encode_key_parts(&key.schema_key, key.file_id.as_deref(), &key.entity_pk)
 }
@@ -514,6 +318,7 @@ pub(crate) fn encode_schema_key_prefix(schema_key: &str) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 pub(crate) fn encode_schema_file_prefix(schema_key: &str, file_id: Option<&str>) -> Vec<u8> {
     let mut out =
         Vec::with_capacity(schema_key.len() + file_id.map_or(1, |file_id| file_id.len() + 3) + 2);
@@ -600,33 +405,6 @@ pub(crate) fn decode_key_shared(bytes: Bytes) -> Result<DecodedTrackedStateKeySh
     Ok(DecodedTrackedStateKeyShared {
         schema_key,
         file_id,
-        entity_pk,
-    })
-}
-
-/// Decodes a key after the caller has already proven the schema/file prefix.
-///
-/// This is for scan paths that have matched an encoded prefix range and only
-/// need to materialize the entity suffix plus the selected columns.
-pub(crate) fn decode_key_with_trusted_prefix(
-    bytes: &[u8],
-    schema_key: &str,
-    file_id: Option<&str>,
-    prefix_len: usize,
-) -> Result<TrackedStateKey, LixError> {
-    if prefix_len > bytes.len() {
-        return Err(key_codec_error(
-            "trusted prefix is longer than the encoded key",
-        ));
-    }
-    let mut offset = prefix_len;
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
-    if offset != bytes.len() {
-        return Err(key_codec_error("has trailing bytes"));
-    }
-    Ok(TrackedStateKey {
-        schema_key: schema_key.to_string(),
-        file_id: file_id.map(str::to_string),
         entity_pk,
     })
 }
@@ -1202,17 +980,6 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateIndexValue, LixEr
     decode_value_view(bytes).map(tracked_value_from_storage)
 }
 
-pub(crate) fn decode_visible_value(
-    bytes: &[u8],
-    include_tombstones: bool,
-) -> Result<Option<TrackedStateIndexValue>, LixError> {
-    let view = decode_value_view(bytes)?;
-    if view.deleted && !include_tombstones {
-        return Ok(None);
-    }
-    Ok(Some(tracked_value_from_storage(view)))
-}
-
 fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef, LixError> {
     if !(VALUE_MIN_BYTES..=VALUE_MAX_BYTES).contains(&bytes.len()) {
         return Err(value_codec_error(format!(
@@ -1392,6 +1159,7 @@ fn tracked_value_from_storage(value: TrackedStateIndexValueRef) -> TrackedStateI
     }
 }
 
+#[cfg(test)]
 pub(crate) fn encode_leaf_node(entries: &[EncodedLeafEntry]) -> Vec<u8> {
     let entries = entries
         .iter()
@@ -1510,10 +1278,7 @@ pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<
 
 #[cfg(debug_assertions)]
 fn verify_leaf_round_trip(encoded: &[u8], entries: &[EncodedLeafEntryRef<'_>]) {
-    let decoded = match decode_node_ref(encoded) {
-        Ok(DecodedNodeRef::Leaf(leaf)) => leaf,
-        other => panic!("leaf round trip decoded unexpectedly: {other:?}"),
-    };
+    let decoded = decode_node_ref(encoded).expect("leaf round trip should decode");
     assert_eq!(decoded.len(), entries.len(), "leaf round trip entry count");
     for (index, entry) in entries.iter().enumerate() {
         let round_tripped = decoded
@@ -1774,245 +1539,23 @@ fn read_varint(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u64, L
     }
 }
 
-pub(crate) fn encode_internal_node(children: &[ChildSummary]) -> Vec<u8> {
-    let children = children
-        .iter()
-        .map(ChildSummary::as_ref)
-        .collect::<Vec<_>>();
-    encode_internal_node_refs(&children)
-}
-
-pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec<u8> {
-    assert!(
-        !children.is_empty(),
-        "tracked-state internal nodes must contain at least one child"
-    );
-    debug_assert!(
-        children
-            .iter()
-            .all(|child| { child.first_key <= child.last_key && child.subtree_count > 0 })
-    );
-    debug_assert!(
-        children
-            .windows(2)
-            .all(|pair| { pair[0].last_key < pair[1].first_key })
-    );
-
-    let mut out = Vec::with_capacity(2 + children.len() * 40);
-    out.push(NODE_KIND_INTERNAL_V3);
-    write_varint(&mut out, children.len() as u64);
-    let mut previous_last: &[u8] = &[];
-    for child in children {
-        write_front_coded(&mut out, previous_last, child.first_key);
-        write_front_coded(&mut out, child.first_key, child.last_key);
-        out.extend_from_slice(&child.child_hash);
-        write_varint(&mut out, child.subtree_count);
-        previous_last = child.last_key;
-    }
-    out
-}
-
-fn write_front_coded(out: &mut Vec<u8>, base: &[u8], value: &[u8]) {
-    let shared = shared_prefix_len(base, value);
-    write_varint(out, shared as u64);
-    write_varint(out, (value.len() - shared) as u64);
-    out.extend_from_slice(&value[shared..]);
-}
-
-fn decode_internal_v3(body: &[u8]) -> Result<DecodedInternalNode, LixError> {
-    fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
-        usize::try_from(value).map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("tracked-state internal node {what} does not fit in usize"),
-            )
-        })
-    }
-    fn slice<'a>(body: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8], LixError> {
-        let end = offset.checked_add(len).ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked-state internal node length overflow",
-            )
-        })?;
-        let bytes = body.get(*offset..end).ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked-state internal node is truncated",
-            )
-        })?;
-        *offset = end;
-        Ok(bytes)
-    }
-    fn front_coded_into(
-        body: &[u8],
-        offset: &mut usize,
-        base: Option<Range<usize>>,
-        arena: &mut Vec<u8>,
-    ) -> Result<Range<usize>, LixError> {
-        let shared = usize_from(
-            read_varint(body, offset, "tracked-state internal node")?,
-            "shared boundary length",
-        )?;
-        let base_len = base.as_ref().map_or(0, Range::len);
-        if shared > base_len {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked-state internal node shares more boundary bytes than its base holds",
-            ));
-        }
-        let suffix_len = usize_from(
-            read_varint(body, offset, "tracked-state internal node")?,
-            "boundary suffix length",
-        )?;
-        let suffix = slice(body, offset, suffix_len)?;
-        let start = arena.len();
-        if let Some(base) = base {
-            arena.extend_from_within(base.start..base.start + shared);
-        }
-        arena.extend_from_slice(suffix);
-        Ok(start..arena.len())
-    }
-
-    struct DecodedChildSpan {
-        first_key: Range<usize>,
-        last_key: Range<usize>,
-        child_hash: [u8; TRACKED_STATE_HASH_BYTES],
-        subtree_count: u64,
-    }
-
-    let mut offset = 0usize;
-    let child_count = usize_from(
-        read_varint(body, &mut offset, "tracked-state internal node")?,
-        "child count",
-    )?;
-    if child_count == 0 {
+pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
+    let (&kind, body) = bytes.split_first().ok_or_else(|| {
+        LixError::new("LIX_ERROR_UNKNOWN", "tracked-state event segment is empty")
+    })?;
+    if kind != NODE_KIND_LEAF_V3 {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "tracked-state internal node has no children",
+            format!("tracked-state event segment has unknown kind byte {kind}"),
         ));
     }
-    let mut boundary_arena = Vec::with_capacity(body.len());
-    let mut child_spans = Vec::with_capacity(child_count.min(body.len()));
-    let mut previous_last = None;
-    for _ in 0..child_count {
-        let first_key = front_coded_into(
-            body,
-            &mut offset,
-            previous_last.clone(),
-            &mut boundary_arena,
-        )?;
-        let last_key = front_coded_into(
-            body,
-            &mut offset,
-            Some(first_key.clone()),
-            &mut boundary_arena,
-        )?;
-        let child_hash = <[u8; TRACKED_STATE_HASH_BYTES]>::try_from(slice(
-            body,
-            &mut offset,
-            TRACKED_STATE_HASH_BYTES,
-        )?)
-        .expect("fixed-size tracked-state child hash slice should convert");
-        let subtree_count = read_varint(body, &mut offset, "tracked-state internal node")?;
-        if subtree_count == 0 {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked-state internal node child has an empty subtree",
-            ));
-        }
-        previous_last = Some(last_key.clone());
-        child_spans.push(DecodedChildSpan {
-            first_key,
-            last_key,
-            child_hash,
-            subtree_count,
-        });
-    }
-    if offset != body.len() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state internal node has trailing bytes",
-        ));
-    }
-    let boundary_arena = Bytes::from(boundary_arena);
-    Ok(DecodedInternalNode {
-        children: child_spans
-            .into_iter()
-            .map(|child| ChildSummary {
-                first_key: boundary_arena.slice(child.first_key),
-                last_key: boundary_arena.slice(child.last_key),
-                child_hash: child.child_hash,
-                subtree_count: child.subtree_count,
-            })
-            .collect(),
-    })
-}
-
-pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
-    match decode_node_ref(bytes)? {
-        DecodedNodeRef::Leaf(leaf) => Ok(DecodedNode::Leaf(leaf)),
-        DecodedNodeRef::Internal(internal) => Ok(DecodedNode::Internal(internal)),
-    }
-}
-
-pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef, LixError> {
-    let (&kind, body) = bytes
-        .split_first()
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree node is empty"))?;
-    match kind {
-        NODE_KIND_LEAF_V3 => Ok(DecodedNodeRef::Leaf(decode_leaf_v3(body)?)),
-        NODE_KIND_INTERNAL_V3 => Ok(DecodedNodeRef::Internal(decode_internal_v3(body)?)),
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree node has unknown kind byte {other}"),
-        )),
-    }
-}
-
-#[expect(clippy::cast_precision_loss)]
-pub(crate) fn boundary_trigger(
-    encoded_key: &[u8],
-    level: usize,
-    chunk_size: usize,
-    item_size: usize,
-    target_chunk_bytes: usize,
-) -> bool {
-    if item_size == 0 || target_chunk_bytes == 0 {
-        return false;
-    }
-
-    let start =
-        weibull_cdf(chunk_size.saturating_sub(item_size) as f64 / target_chunk_bytes as f64);
-    let end = weibull_cdf(chunk_size as f64 / target_chunk_bytes as f64);
-    let remaining = 1.0 - start;
-    if remaining <= 0.0 {
-        return true;
-    }
-
-    let split_probability = ((end - start) / remaining).clamp(0.0, 1.0);
-    let hash = xxh3_64_with_seed(encoded_key, level_salt(level));
-    (hash as f64) < split_probability * (u64::MAX as f64)
-}
-
-fn weibull_cdf(normalized_size: f64) -> f64 {
-    if normalized_size <= 0.0 {
-        return 0.0;
-    }
-    -f64::exp_m1(-normalized_size.powi(WEIBULL_K))
-}
-
-fn level_salt(level: usize) -> u64 {
-    let mut value = (level as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
+    decode_leaf_v3(body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodedNodeRef as NodeRefForLeafTests, decode_node_ref as decode_node_ref_for_leaf_tests,
+        decode_node_ref as decode_node_ref_for_leaf_tests,
         encode_leaf_node_refs as encode_leaf_refs_for_tests,
     };
 
@@ -2038,11 +1581,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let encoded = encode_leaf_refs_for_tests(&refs);
-        let NodeRefForLeafTests::Leaf(decoded) =
-            decode_node_ref_for_leaf_tests(&encoded).expect("leaf should decode")
-        else {
-            panic!("leaf encoded bytes decoded as non-leaf");
-        };
+        let decoded = decode_node_ref_for_leaf_tests(&encoded).expect("leaf should decode");
         assert_eq!(decoded.len(), entries.len());
         for (index, (key, value)) in entries.iter().enumerate() {
             let entry = decoded
@@ -2438,26 +1977,6 @@ mod tests {
                 _ => {}
             }
         }
-    }
-
-    #[test]
-    fn key_codec_decodes_entity_suffix_with_trusted_prefix() {
-        let key = TrackedStateKey {
-            schema_key: "schema".to_string(),
-            file_id: Some("file".to_string()),
-            entity_pk: EntityPk::from_parts_unchecked(vec![
-                "namespace".to_string(),
-                "id".to_string(),
-            ]),
-        };
-        let encoded = encode_key(&key);
-        let prefix = encode_schema_file_prefix("schema", Some("file"));
-
-        assert_eq!(
-            decode_key_with_trusted_prefix(&encoded, "schema", Some("file"), prefix.len())
-                .expect("key suffix should decode"),
-            key
-        );
     }
 
     #[test]
@@ -3045,9 +2564,7 @@ mod tests {
         ];
 
         let encoded = encode_leaf_node(&entries);
-        let DecodedNodeRef::Leaf(leaf) = decode_node_ref(&encoded).expect("leaf ref") else {
-            panic!("expected leaf node");
-        };
+        let leaf = decode_node_ref(&encoded).expect("leaf ref");
         assert_eq!(leaf.len(), 2);
         assert_eq!(leaf.key(1).expect("second key"), Some(b"bravo".as_ref()));
         let second = leaf
@@ -3057,9 +2574,7 @@ mod tests {
         assert_eq!(second.key, b"bravo");
         assert_eq!(second.value, raw_value(4, 5, 6));
 
-        let DecodedNode::Leaf(owned) = decode_node(&encoded).expect("owned leaf") else {
-            panic!("expected owned leaf node");
-        };
+        let owned = decode_node_ref(&encoded).expect("owned leaf");
         assert_eq!(owned.into_entries(), entries);
     }
 
@@ -3067,9 +2582,7 @@ mod tests {
     fn leaf_node_codec_roundtrips_empty_leaf() {
         let encoded = encode_leaf_node(&[]);
 
-        let DecodedNodeRef::Leaf(leaf) = decode_node_ref(&encoded).expect("leaf ref") else {
-            panic!("expected leaf node");
-        };
+        let leaf = decode_node_ref(&encoded).expect("leaf ref");
         assert_eq!(leaf.len(), 0);
         assert!(leaf.entry(0).expect("missing entry").is_none());
     }
@@ -3095,77 +2608,5 @@ mod tests {
             error.to_string().contains("tracked-state leaf node"),
             "unexpected error: {error}"
         );
-    }
-
-    #[test]
-    fn internal_v3_round_trips_and_pins_front_coded_boundaries() {
-        let children = vec![
-            ChildSummary {
-                first_key: Bytes::from_static(b"aa"),
-                last_key: Bytes::from_static(b"az"),
-                child_hash: [1; TRACKED_STATE_HASH_BYTES],
-                subtree_count: 3,
-            },
-            ChildSummary {
-                first_key: Bytes::from_static(b"ba"),
-                last_key: Bytes::from_static(b"bz"),
-                child_hash: [2; TRACKED_STATE_HASH_BYTES],
-                subtree_count: 4,
-            },
-        ];
-        let encoded = encode_internal_node(&children);
-        let mut expected = vec![
-            4, 2, // kind, child count
-            0, 2, b'a', b'a', // first "aa" relative to empty
-            1, 1, b'z', // last "az" relative to "aa"
-        ];
-        expected.extend_from_slice(&[1; TRACKED_STATE_HASH_BYTES]);
-        expected.extend_from_slice(&[
-            3, // subtree count
-            0, 2, b'b', b'a', // first "ba" relative to previous last "az"
-            1, 1, b'z', // last "bz" relative to "ba"
-        ]);
-        expected.extend_from_slice(&[2; TRACKED_STATE_HASH_BYTES]);
-        expected.push(4);
-        assert_eq!(encoded, expected, "internal v3 wire bytes must stay stable");
-
-        let DecodedNode::Internal(decoded) = decode_node(&encoded).expect("internal node") else {
-            panic!("expected internal node");
-        };
-        assert_eq!(decoded.children(), children);
-    }
-
-    #[test]
-    fn internal_v3_rejects_empty_truncated_and_invalid_boundaries() {
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V3, 0]).is_err());
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V3, 1]).is_err());
-        assert!(decode_node(&[NODE_KIND_INTERNAL_V3, 1, 1, 0]).is_err());
-
-        let child = ChildSummary {
-            first_key: Bytes::from_static(b"a"),
-            last_key: Bytes::from_static(b"z"),
-            child_hash: [9; TRACKED_STATE_HASH_BYTES],
-            subtree_count: 1,
-        };
-        let encoded = encode_internal_node(&[child]);
-        let mut zero_subtree = encoded.clone();
-        *zero_subtree.last_mut().expect("subtree count") = 0;
-        assert!(decode_node(&zero_subtree).is_err());
-
-        let mut trailing = encoded;
-        trailing.push(0);
-        assert!(decode_node(&trailing).is_err());
-    }
-
-    #[test]
-    fn content_hash_is_blake3() {
-        assert_eq!(hash_bytes(b"abc"), *blake3::hash(b"abc").as_bytes());
-    }
-
-    #[test]
-    fn boundary_decisions_are_xxh3_based_and_deterministic() {
-        let left = boundary_trigger(b"key", 0, 4096, 128, 4096);
-        let right = boundary_trigger(b"key", 0, 4096, 128, 4096);
-        assert_eq!(left, right);
     }
 }
