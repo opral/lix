@@ -2587,12 +2587,14 @@ where
                     .as_ref()
                     .and_then(|transaction| transaction.prepared_literal_mutation_shape())
             {
-                if let Some(decoded_values) =
-                    self.sql_planning_cache.decode_update_literals_for_shape(
+                if let Some(decoded_values) = self
+                    .sql_planning_cache
+                    .decode_update_literals_for_cached_shape(
                         sql,
                         normalized_shape,
                         parameter_count,
                         &mut self.prepared_literal_escape_scratch,
+                        &mut self.prepared_literal_shape,
                     )
                 {
                     let transaction = self
@@ -9192,18 +9194,18 @@ mod tests {
             .expect("transaction should begin");
         let first = transaction
             .execute(
-                "UPDATE lix_key_value SET value = 'first''s value' WHERE key = 'auto''one'",
+                "UPDATE lix_key_value SET value = 'second''s value' WHERE key = 'auto''two'",
                 &[],
             )
             .await
             .expect("first literal update should stage");
         let second = transaction
             .execute(
-                "UPDATE lix_key_value SET value = 'second''s value' WHERE key = 'auto''two'",
+                "UPDATE lix_key_value SET value = 'first''s value' WHERE key = 'auto''one'",
                 &[],
             )
             .await
-            .expect("second literal update should reuse the statement shape");
+            .expect("descending literal update should cross the order barrier");
         assert_eq!(first.rows_affected(), 1);
         assert_eq!(second.rows_affected(), 1);
         transaction
@@ -9229,6 +9231,59 @@ mod tests {
         assert_eq!(
             values.rows()[1].get::<serde_json::Value>("value").unwrap(),
             serde_json::json!("second's value")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_transaction_parameter_updates_reset_membership_on_descending_keys() {
+        let session = open_session().await;
+        for key in ["parameter-a", "parameter-z"] {
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+                    &[
+                        Value::Text(key.to_string()),
+                        Value::Text("seed".to_string()),
+                    ],
+                )
+                .await
+                .expect("seed row should commit");
+        }
+
+        let mut transaction = session.begin_transaction().await.unwrap();
+        let sql = "UPDATE lix_key_value SET value = $1 WHERE key = $2";
+        for (key, value) in [("parameter-z", "updated-z"), ("parameter-a", "updated-a")] {
+            assert_eq!(
+                transaction
+                    .execute(
+                        sql,
+                        &[Value::Text(value.to_string()), Value::Text(key.to_string()),],
+                    )
+                    .await
+                    .expect("descending parameter update should stage")
+                    .rows_affected(),
+                1
+            );
+        }
+        transaction.commit().await.unwrap();
+
+        let values = session
+            .execute(
+                "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2) ORDER BY key",
+                &[
+                    Value::Text("parameter-a".to_string()),
+                    Value::Text("parameter-z".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            values.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("updated-a")
+        );
+        assert_eq!(
+            values.rows()[1].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("updated-z")
         );
     }
 

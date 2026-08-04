@@ -6566,12 +6566,15 @@ where
         if let Some(error) = &self.mutation_journal_terminal_error {
             return Err(error.clone());
         }
-        let Some((_, program)) = self.prepared_mutation_program.as_ref() else {
-            return Ok(None);
+        let (primary_key, replacement_value) = {
+            let Some((_, program)) = self.prepared_mutation_program.as_ref() else {
+                return Ok(None);
+            };
+            (
+                program.primary_key_text(params)?,
+                program.replacement_value_text(params)?,
+            )
         };
-        let program = Arc::clone(program);
-        let primary_key = program.primary_key_text(params)?;
-        let replacement_value = program.replacement_value_text(params)?;
 
         let same_origin = self
             .mutation_journal
@@ -6592,6 +6595,7 @@ where
         }
         if !same_origin || !ordered_append {
             self.lower_provisional_mutations_to_prepared().await?;
+            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
             self.prepared_mutation_overlay_empty = false;
         }
 
@@ -6603,9 +6607,15 @@ where
         }
         if !self.prepared_mutation_overlay_empty {
             let entity_pk = EntityPk::single(primary_key.to_owned());
+            let schema_key = &self
+                .prepared_mutation_program
+                .as_ref()
+                .expect("packed literal mutation retains its prepared program")
+                .1
+                .schema_key;
             if self.staged_writes.staged_identity_may_affect(
                 &self.active_branch_id,
-                &program.schema_key,
+                schema_key,
                 None,
                 &entity_pk,
             )? {
@@ -6628,28 +6638,41 @@ where
         }
 
         let origin_key = next_origin_key.map(SharedStr::from);
-        let functions = self.functions.clone();
-        let (journal_slot, timestamp_slot) = (
-            &mut self.mutation_journal,
-            &mut self.prepared_mutation_timestamp,
-        );
-        let journal = journal_slot.get_or_insert_with(|| TransactionMutationJournal {
-            program: Arc::clone(&program),
-            origin_key: origin_key.clone(),
-            identity_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
-            identity_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
-            snapshot_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
-            snapshot_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
-            timestamp: None,
+        let journal_program = self.mutation_journal.is_none().then(|| {
+            Arc::clone(
+                &self
+                    .prepared_mutation_program
+                    .as_ref()
+                    .expect("packed literal mutation retains its prepared program")
+                    .1,
+            )
         });
-        debug_assert!(Arc::ptr_eq(&journal.program, &program));
+        let timestamp = match self.prepared_mutation_timestamp {
+            Some(timestamp) => timestamp,
+            None => {
+                let timestamp = self.functions.call_timestamp();
+                self.prepared_mutation_timestamp = Some(timestamp);
+                timestamp
+            }
+        };
+        let journal = self
+            .mutation_journal
+            .get_or_insert_with(|| TransactionMutationJournal {
+                program: journal_program
+                    .expect("new mutation journal retains its prepared program"),
+                origin_key: origin_key.clone(),
+                identity_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
+                identity_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
+                snapshot_arena: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ARENA_BYTES),
+                snapshot_offsets: Vec::with_capacity(INITIAL_MUTATION_JOURNAL_ROWS),
+                timestamp: None,
+            });
         debug_assert_eq!(journal.origin_key, origin_key);
         let snapshot_offset = crate::sql2::append_path_value_replacement_snapshot_text(
             primary_key,
             Some(replacement_value),
             &mut journal.snapshot_arena,
         )?;
-        let timestamp = *timestamp_slot.get_or_insert_with(|| functions.call_timestamp());
         journal.append_identity(primary_key);
         journal.snapshot_offsets.push(snapshot_offset);
         let journal_timestamp = journal.timestamp.get_or_insert(timestamp);
@@ -6828,6 +6851,7 @@ where
         }
         if !same_program || !same_origin || !ordered_append {
             self.lower_provisional_mutations_to_prepared().await?;
+            self.prepared_mutation_membership = PreparedMutationMembership::Unprepared;
             self.prepared_mutation_overlay_empty = false;
         }
         if !same_program {

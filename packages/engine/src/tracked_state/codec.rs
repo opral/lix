@@ -1660,6 +1660,14 @@ fn decode_leaf_v3(body: &[u8]) -> Result<DecodedLeafNodeRef, LixError> {
         let suffix = slice(body, &mut offset, suffix_len)?;
         arena.extend_from_slice(suffix);
         let key_end = arena.len();
+        if !entries.is_empty()
+            && arena[previous_key_start..previous_key_end] >= arena[key_start..key_end]
+        {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state leaf node keys are not strictly ordered",
+            ));
+        }
 
         let change_id = slice(body, &mut offset, VALUE_CHANGE_ID_END)?;
         let commit_ref = usize_from(
