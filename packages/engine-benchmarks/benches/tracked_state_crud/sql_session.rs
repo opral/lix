@@ -1008,6 +1008,10 @@ where
 
     #[expect(clippy::cast_possible_truncation)]
     async fn update_all(&self) -> usize {
+        let expected_rows = match &self.update_all_workload {
+            UpdateWorkload::Transaction(statements) => statements.len(),
+            UpdateWorkload::ExecuteBatch(_) => self.row_count,
+        };
         let affected = match &self.update_all_workload {
             UpdateWorkload::Transaction(statements) => {
                 Box::pin(execute_many_in_transaction(&self.session, statements)).await
@@ -1021,7 +1025,7 @@ where
                 .map(|result| result.rows_affected())
                 .sum(),
         };
-        assert_eq!(affected as usize, self.row_count);
+        assert_eq!(affected as usize, expected_rows);
         affected as usize
     }
 
@@ -1566,7 +1570,25 @@ fn update_workload(shape: FixtureShape, rows: &[WorkloadRow]) -> UpdateWorkload 
         Ok(other) => panic!(
             "unknown LIX_TRACKED_STATE_CRUD_PROFILE_UPDATE_API '{other}'; expected execute_batch or execute_batch_parameterized"
         ),
-        Err(_) => UpdateWorkload::Transaction(rows.iter().map(update_row_sql).collect()),
+        Err(_) => {
+            let scalar_rows = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT")
+                .ok()
+                .map(|value| {
+                    value.parse::<usize>().unwrap_or_else(|_| {
+                        panic!(
+                            "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be an integer between 1 and {}, got '{value}'",
+                            rows.len()
+                        )
+                    })
+                })
+                .unwrap_or(rows.len());
+            assert!(
+                (1..=rows.len()).contains(&scalar_rows),
+                "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be between 1 and {}, got {scalar_rows}",
+                rows.len()
+            );
+            UpdateWorkload::Transaction(rows[..scalar_rows].iter().map(update_row_sql).collect())
+        }
     }
 }
 

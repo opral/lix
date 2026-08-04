@@ -3971,13 +3971,61 @@ where
     I: ExactSizeIterator<Item = Result<R, LixError>>,
     R: ReplacementPartInputRef<'a>,
 {
+    stage_ordered_addressable_replacement_parts_inner(writes, deltas, generation, None)
+}
+
+pub(crate) fn stage_prefixed_ordered_addressable_replacement_parts<'a, I, R>(
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    uniform_updated_at: crate::common::LixTimestamp,
+    prefix_row_count: usize,
+    prefix_parts: Vec<crate::tracked_state::replacement_part::EncodedReplacementPart>,
+    deltas: I,
+    generation: &CommitDeltaReplacementGeneration,
+) -> Result<OrderedAddressableCommitDeltaStage, LixError>
+where
+    I: ExactSizeIterator<Item = Result<R, LixError>>,
+    R: ReplacementPartInputRef<'a>,
+{
+    stage_ordered_addressable_replacement_parts_inner(
+        writes,
+        deltas,
+        generation,
+        Some((
+            commit_id,
+            uniform_updated_at,
+            prefix_row_count,
+            prefix_parts,
+        )),
+    )
+}
+
+fn stage_ordered_addressable_replacement_parts_inner<'a, I, R>(
+    writes: &mut StorageWriteSet,
+    deltas: I,
+    generation: &CommitDeltaReplacementGeneration,
+    prefix: Option<(
+        CommitId,
+        crate::common::LixTimestamp,
+        usize,
+        Vec<crate::tracked_state::replacement_part::EncodedReplacementPart>,
+    )>,
+) -> Result<OrderedAddressableCommitDeltaStage, LixError>
+where
+    I: ExactSizeIterator<Item = Result<R, LixError>>,
+    R: ReplacementPartInputRef<'a>,
+{
     struct BorrowedRow<'a> {
         key: Vec<u8>,
         snapshot: crate::json_store::JsonSlotRef<'a>,
         metadata: crate::json_store::JsonSlotRef<'a>,
     }
 
-    let row_count = deltas.len();
+    let suffix_row_count = deltas.len();
+    let prefix_row_count = prefix.as_ref().map_or(0, |prefix| prefix.2);
+    let row_count = prefix_row_count
+        .checked_add(suffix_row_count)
+        .ok_or_else(|| LixError::unknown("tracked_state replacement row count overflowed"))?;
     if row_count == 0 {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -3990,11 +4038,15 @@ where
         row_count
     )
     .entered();
-    let mut commit_id = None;
-    let mut uniform_updated_at = None;
-    let mut previous_key = Vec::new();
+    let mut commit_id = prefix.as_ref().map(|prefix| prefix.0);
+    let mut uniform_updated_at = prefix.as_ref().map(|prefix| prefix.1);
+    let mut previous_key = prefix
+        .as_ref()
+        .and_then(|prefix| prefix.3.last())
+        .map_or_else(Vec::new, |part| part.last_key().to_vec());
     let mut pending = Vec::with_capacity(COMMIT_DELTA_SEGMENT_MAX_ROWS);
-    let mut parts = Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS));
+    let mut parts = prefix.map_or_else(Vec::new, |prefix| prefix.3);
+    parts.reserve(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS));
     let mut compressor = None;
     for delta in deltas {
         let delta = delta?.into_replacement_part_input()?;
@@ -4085,6 +4137,45 @@ where
         Ok(())
     }
 
+    stage_preencoded_ordered_addressable_replacement_parts(
+        writes,
+        commit_id,
+        uniform_updated_at,
+        row_count,
+        parts,
+        generation,
+    )
+}
+
+pub(crate) fn stage_preencoded_ordered_addressable_replacement_parts(
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    uniform_updated_at: crate::common::LixTimestamp,
+    row_count: usize,
+    parts: Vec<crate::tracked_state::replacement_part::EncodedReplacementPart>,
+    generation: &CommitDeltaReplacementGeneration,
+) -> Result<OrderedAddressableCommitDeltaStage, LixError> {
+    if row_count == 0 || parts.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state preencoded replacement generation cannot be empty",
+        ));
+    }
+    if parts
+        .iter()
+        .map(|part| usize::from(part.row_count()))
+        .sum::<usize>()
+        != row_count
+        || parts
+            .windows(2)
+            .any(|pair| pair[0].last_key() >= pair[1].first_key())
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state preencoded replacement parts are not a complete ordered row set",
+        ));
+    }
+    addressable_change_id(commit_id, 0, 0)?;
     let mut first_ordinal = 0u32;
     let directory_entries = parts
         .iter()
@@ -4145,7 +4236,9 @@ where
         writes.put(
             TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
             key(physical_key),
-            value(part.bytes().to_vec()),
+            StorageValue {
+                bytes: part.bytes().clone(),
+            },
         );
         first_address = u32::try_from(segment_index + 1)
             .expect("replacement segment count fits u32")

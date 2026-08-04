@@ -536,6 +536,12 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// same lifecycle boundary, so sealing must not preserve per-call clocks.
     prepared_mutation_timestamp: Option<LixTimestamp>,
     mutation_journal: Option<TransactionMutationJournal>,
+    mutation_journal_compressor: Option<crate::compression::ZstdLevel1Compressor>,
+    mutation_journal_sealed_rows: usize,
+    /// Eagerly sealed parts must remain one canonical prefix. Once a flush
+    /// leaves an unsealed tail or exceeds the bounded prefix, later chunks
+    /// must stay unsealed so commit can encode one contiguous suffix.
+    mutation_journal_seal_prefix_open: bool,
     /// Sealing consumes the journal's owned column buffers. If any fallible
     /// validation or staging step rejects those buffers, this transaction can
     /// no longer provide statement atomicity and must remain rollback-only.
@@ -587,6 +593,7 @@ struct TransactionMutationJournal {
 
 const INITIAL_MUTATION_JOURNAL_ROWS: usize = 16;
 const INITIAL_MUTATION_JOURNAL_ARENA_BYTES: usize = 1_024;
+const MUTATION_JOURNAL_EAGER_SEAL_MAX_ROWS: usize = 16 * 1_024;
 
 enum PreparedMutationMembership {
     Unprepared,
@@ -1454,6 +1461,9 @@ where
                 prepared_mutation_overlay_empty: false,
                 prepared_mutation_timestamp: None,
                 mutation_journal: None,
+                mutation_journal_compressor: None,
+                mutation_journal_sealed_rows: 0,
+                mutation_journal_seal_prefix_open: true,
                 mutation_journal_terminal_error: None,
                 staged_writes,
                 filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
@@ -6736,7 +6746,14 @@ where
                 complete_generation = None;
             }
         }
-        self.flush_mutation_journal().await?;
+        if complete_generation.is_some() {
+            self.flush_mutation_journal_final().await?;
+        } else {
+            // Without a certifiable base generation this journal cannot
+            // become complete-set authority. Leave its final tail unsealed
+            // for generic lowering.
+            self.flush_mutation_journal().await?;
+        }
         let replacement_certified =
             if let Some((schema_key, branch_id, (live_count, ordered_identity_digest))) =
                 complete_generation
@@ -6864,17 +6881,28 @@ where
     }
 
     async fn flush_mutation_journal(&mut self) -> Result<(), LixError> {
+        self.flush_mutation_journal_with_tail(false).await
+    }
+
+    async fn flush_mutation_journal_final(&mut self) -> Result<(), LixError> {
+        self.flush_mutation_journal_with_tail(true).await
+    }
+
+    async fn flush_mutation_journal_with_tail(
+        &mut self,
+        finalize_tail: bool,
+    ) -> Result<(), LixError> {
         if let Some(error) = &self.mutation_journal_terminal_error {
             return Err(error.clone());
         }
-        let result = self.flush_mutation_journal_inner().await;
+        let result = self.flush_mutation_journal_inner(finalize_tail).await;
         if let Err(error) = &result {
             self.mutation_journal_terminal_error = Some(error.clone());
         }
         result
     }
 
-    async fn flush_mutation_journal_inner(&mut self) -> Result<(), LixError> {
+    async fn flush_mutation_journal_inner(&mut self, finalize_tail: bool) -> Result<(), LixError> {
         let Some(journal) = self.mutation_journal.take() else {
             return Ok(());
         };
@@ -6894,7 +6922,7 @@ where
                 "non-empty transaction mutation journal has no lifecycle timestamp",
             )
         })?;
-        let chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+        let mut chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
             journal.program.schema_plan_id,
             journal.program.schema_key.as_str().into(),
             self.active_branch_id.clone().into(),
@@ -6906,6 +6934,35 @@ where
             None,
             timestamp,
         )?;
+        let eager_collection_is_bounded = match &self.prepared_mutation_membership {
+            PreparedMutationMembership::Packed(membership) => {
+                usize::try_from(membership.complete_generation().0)
+                    .is_ok_and(|rows| rows <= MUTATION_JOURNAL_EAGER_SEAL_MAX_ROWS)
+            }
+            PreparedMutationMembership::Unprepared | PreparedMutationMembership::Unavailable => {
+                false
+            }
+        };
+        if !eager_collection_is_bounded {
+            self.mutation_journal_seal_prefix_open = false;
+        }
+        if self.mutation_journal_seal_prefix_open {
+            let eager_row_count = self
+                .mutation_journal_sealed_rows
+                .checked_add(chunk.len())
+                .filter(|&rows| rows <= MUTATION_JOURNAL_EAGER_SEAL_MAX_ROWS);
+            if let Some(eager_row_count) = eager_row_count {
+                chunk
+                    .seal_replacement_parts(finalize_tail, &mut self.mutation_journal_compressor)?;
+                if chunk.sealed_replacement_parts().is_some() {
+                    self.mutation_journal_sealed_rows = eager_row_count;
+                } else {
+                    self.mutation_journal_seal_prefix_open = false;
+                }
+            } else {
+                self.mutation_journal_seal_prefix_open = false;
+            }
+        }
         match self.staged_writes.stage_immutable_mutation_chunk(chunk)? {
             ImmutableMutationChunkStage::Staged => {}
             ImmutableMutationChunkStage::RequiresGeneric(chunk) => {

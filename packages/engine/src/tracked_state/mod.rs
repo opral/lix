@@ -37,6 +37,10 @@ pub(crate) use merge::{
     TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan,
     merge_payload_fallback_ids, plan_merge,
 };
+pub(crate) use replacement_part::{
+    EncodedReplacementPart, REPLACEMENT_PART_MAX_ROWS, REPLACEMENT_PART_TARGET_BYTES,
+    ReplacementPartRowRef, encode_replacement_part_with_compressor,
+};
 pub(crate) use row_materialization::{
     MaterializedTrackedStateBatch, MaterializedTrackedStateExactBatch,
     MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
@@ -65,6 +69,8 @@ pub(crate) use storage::{
     stage_current_state_scoped_ranges_from_staged_parent, stage_delete_change_locators,
     stage_delete_commit_delta_inventory_entry, stage_ordered_addressable_commit_deltas,
     stage_ordered_addressable_replacement_parts, stage_ordered_columnar_mutations,
+    stage_preencoded_ordered_addressable_replacement_parts,
+    stage_prefixed_ordered_addressable_replacement_parts,
     validate_current_state_scoped_range_parent_manifest,
 };
 #[cfg(feature = "storage-benches")]
