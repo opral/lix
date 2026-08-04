@@ -890,133 +890,176 @@ async fn load_current_state_values_from_descriptors(
         .iter()
         .filter(|(_, (descriptor, _))| descriptor.source_kind == 2)
         .collect::<Vec<_>>();
-    for (_, (descriptor, output_indices)) in columnar {
-        use datafusion::arrow::array::{Array, StringArray};
-
+    let mut columnar_manifests = HashMap::new();
+    for (_, (descriptor, _)) in &columnar {
         let id = crate::columnar_row_group::RowGroupSetId::new(descriptor.source_id);
-        let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
-            .await?
-            .ok_or_else(|| {
-                replacement_payload_error("current-state columnar manifest is missing")
-            })?;
-        let first_key = decode_key(&descriptor.first_key)?;
-        if manifest.content_digest()? != descriptor.content_digest
-            || manifest.namespace != first_key.schema_key
-            || manifest
-                .metadata
-                .get(crate::sql2::ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY)
-                .map(String::as_str)
-                != Some("true")
-            || crate::live_state::entity_row_group_set_id(
-                CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id)),
-                &manifest.namespace,
-            )
-            .as_bytes()
-                != descriptor.source_id
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            columnar_manifests.entry(descriptor.source_id)
         {
-            return Err(replacement_payload_error(
-                "current-state columnar descriptor disagrees with its manifest",
-            ));
-        }
-        let identity_column_index = manifest
-            .fields
-            .len()
-            .checked_sub(1)
-            .ok_or_else(|| replacement_payload_error("columnar manifest has no identity"))?;
-        if manifest.fields[identity_column_index].name
-            != crate::sql2::ENTITY_COLUMNAR_ENTITY_PK_FIELD
-        {
-            return Err(replacement_payload_error(
-                "current-state columnar identity field drifted",
-            ));
-        }
-        let group_index = usize::try_from(descriptor.part_index)
-            .map_err(|_| replacement_payload_error("columnar group index exceeds usize"))?;
-        let page_index = usize::from(descriptor.source_page_index);
-        let batch = crate::columnar_row_group::load_row_group_page(
-            store,
-            id,
-            &manifest,
-            group_index,
-            page_index,
-            &[identity_column_index],
-        )
-        .await?;
-        let identities = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| replacement_payload_error("columnar identity page is not UTF-8"))?;
-        let slice_start = usize::from(descriptor.source_row_offset);
-        let slice_end = slice_start + usize::from(descriptor.row_count);
-        let identities = (slice_end <= identities.len())
-            .then(|| identities.slice(slice_start, usize::from(descriptor.row_count)))
-            .ok_or_else(|| replacement_payload_error("columnar page slice is out of bounds"))?;
-        let identities = identities
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("slicing preserves the string array type");
-        let encode_identity = |identity: &str| -> Result<Vec<u8>, LixError> {
-            let entity_pk = EntityPk::from_json_array_text(identity)
-                .map_err(|error| replacement_payload_error(&error.to_string()))?;
-            Ok(encode_key_ref(TrackedStateKeyRef {
-                schema_key: &manifest.namespace,
-                file_id: None,
-                entity_pk: &entity_pk,
-            }))
-        };
-        if identities.is_empty()
-            || encode_identity(identities.value(0))? != descriptor.first_key
-            || encode_identity(identities.value(identities.len() - 1))? != descriptor.last_key
-        {
-            return Err(replacement_payload_error(
-                "columnar page slice disagrees with current-state key fences",
-            ));
-        }
-        for &output_index in output_indices {
-            let key = decode_key(&encoded_keys[output_index])?;
-            if key.schema_key != manifest.namespace || key.file_id.is_some() {
-                continue;
-            }
-            let identity = key.entity_pk.as_json_array_text()?;
-            let ordered_identities = (0..identities.len())
-                .map(|row_index| identities.value(row_index))
-                .collect::<Vec<_>>();
-            let Ok(row_index) =
-                ordered_identities.binary_search_by(|candidate| candidate.cmp(&identity.as_str()))
-            else {
-                continue;
-            };
-            let group_base = manifest.groups[..group_index]
-                .iter()
-                .try_fold(0usize, |sum, group| {
-                    sum.checked_add(group.row_count as usize)
-                })
-                .ok_or_else(|| replacement_payload_error("columnar group base overflows"))?;
-            let ordinal = group_base
-                .checked_add(
-                    page_index
-                        .checked_mul(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS)
-                        .ok_or_else(|| replacement_payload_error("columnar page base overflows"))?,
-                )
-                .and_then(|base| base.checked_add(slice_start))
-                .and_then(|base| base.checked_add(row_index))
-                .ok_or_else(|| replacement_payload_error("columnar row ordinal overflows"))?;
-            let packed = u32::try_from(ordinal)
-                .map_err(|_| replacement_payload_error("columnar row ordinal exceeds u32"))?
-                .checked_add(1)
-                .ok_or_else(|| replacement_payload_error("columnar change address overflows"))?;
-            let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
-            values[output_index] = Some(TrackedStateIndexValue {
-                change_id: change_id_from_packed_address(owner, packed),
-                commit_id: owner,
-                deleted: false,
-                created_at: descriptor.uniform_created_at,
-                updated_at: descriptor.uniform_updated_at,
-            });
+            let manifest = crate::columnar_row_group::load_row_group_manifest(store, id)
+                .await?
+                .ok_or_else(|| {
+                    replacement_payload_error("current-state columnar manifest is missing")
+                })?;
+            entry.insert(manifest);
         }
     }
+    for (&source_id, manifest) in &columnar_manifests {
+        let identity_column_index = crate::live_state::entity_identity_column_index(manifest)
+            .ok_or_else(|| {
+                replacement_payload_error("current-state columnar identity contract drifted")
+            })?;
+        let mut page_routes = BTreeMap::new();
+        for (_, (descriptor, output_indices)) in &columnar {
+            if descriptor.source_id == source_id {
+                page_routes
+                    .entry((
+                        descriptor.part_index as usize,
+                        usize::from(descriptor.source_page_index),
+                    ))
+                    .or_insert_with(Vec::new)
+                    .push((descriptor, output_indices.as_slice()));
+            }
+        }
+        let coordinates = page_routes.keys().copied().collect::<Vec<_>>();
+        crate::columnar_row_group::visit_row_group_pages(
+            store,
+            crate::columnar_row_group::RowGroupSetId::new(source_id),
+            manifest,
+            &coordinates,
+            &[identity_column_index],
+            |coordinate, batch| {
+                for (descriptor, output_indices) in &page_routes[&coordinate] {
+                    apply_columnar_identity_page(
+                        manifest,
+                        descriptor,
+                        output_indices,
+                        &batch,
+                        encoded_keys,
+                        &mut values,
+                    )?;
+                }
+                Ok(())
+            },
+        )
+        .await?;
+    }
     Ok(values)
+}
+
+fn apply_columnar_identity_page(
+    manifest: &crate::columnar_row_group::RowGroupManifest,
+    descriptor: &CurrentStatePartDescriptor,
+    output_indices: &[usize],
+    batch: &datafusion::arrow::record_batch::RecordBatch,
+    encoded_keys: &[Bytes],
+    values: &mut [Option<TrackedStateIndexValue>],
+) -> Result<(), LixError> {
+    use datafusion::arrow::array::{Array, StringArray};
+
+    let first_key = decode_key(&descriptor.first_key)?;
+    if manifest.content_digest()? != descriptor.content_digest
+        || manifest.namespace != first_key.schema_key
+        || crate::live_state::entity_row_group_set_id(
+            CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id)),
+            &manifest.namespace,
+        )
+        .as_bytes()
+            != descriptor.source_id
+    {
+        return Err(replacement_payload_error(
+            "current-state columnar descriptor disagrees with its manifest",
+        ));
+    }
+    let group_index = usize::try_from(descriptor.part_index)
+        .map_err(|_| replacement_payload_error("columnar group index exceeds usize"))?;
+    let page_index = usize::from(descriptor.source_page_index);
+    let identities = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| replacement_payload_error("columnar identity page is not UTF-8"))?;
+    let slice_start = usize::from(descriptor.source_row_offset);
+    let slice_end = slice_start + usize::from(descriptor.row_count);
+    let identities = (slice_end <= identities.len())
+        .then(|| identities.slice(slice_start, usize::from(descriptor.row_count)))
+        .ok_or_else(|| replacement_payload_error("columnar page slice is out of bounds"))?;
+    let identities = identities
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("slicing preserves the string array type");
+    let encode_identity = |identity: &str| -> Result<Vec<u8>, LixError> {
+        let entity_pk = EntityPk::from_json_array_text(identity)
+            .map_err(|error| replacement_payload_error(&error.to_string()))?;
+        Ok(encode_key_ref(TrackedStateKeyRef {
+            schema_key: &manifest.namespace,
+            file_id: None,
+            entity_pk: &entity_pk,
+        }))
+    };
+    if identities.is_empty()
+        || encode_identity(identities.value(0))? != descriptor.first_key
+        || encode_identity(identities.value(identities.len() - 1))? != descriptor.last_key
+    {
+        return Err(replacement_payload_error(
+            "columnar page slice disagrees with current-state key fences",
+        ));
+    }
+    let identity_rows = (output_indices.len() > 4).then(|| columnar_identity_row_map(identities));
+    let group_base = manifest.groups[..group_index]
+        .iter()
+        .try_fold(0usize, |sum, group| {
+            sum.checked_add(group.row_count as usize)
+        })
+        .ok_or_else(|| replacement_payload_error("columnar group base overflows"))?;
+    let slice_ordinal_base = group_base
+        .checked_add(
+            page_index
+                .checked_mul(crate::columnar_row_group::ROW_GROUP_PAGE_ROWS)
+                .ok_or_else(|| replacement_payload_error("columnar page base overflows"))?,
+        )
+        .and_then(|base| base.checked_add(slice_start))
+        .ok_or_else(|| replacement_payload_error("columnar slice base overflows"))?;
+    for &output_index in output_indices {
+        let key = decode_key(&encoded_keys[output_index])?;
+        if key.schema_key != manifest.namespace || key.file_id.is_some() {
+            continue;
+        }
+        let identity = key.entity_pk.as_json_array_text()?;
+        let row_index = match &identity_rows {
+            Some(rows) => rows.get(identity.as_str()).copied(),
+            None => {
+                (0..identities.len()).find(|&row_index| identities.value(row_index) == identity)
+            }
+        };
+        let Some(row_index) = row_index else {
+            continue;
+        };
+        let ordinal = slice_ordinal_base
+            .checked_add(row_index)
+            .ok_or_else(|| replacement_payload_error("columnar row ordinal overflows"))?;
+        let packed = u32::try_from(ordinal)
+            .map_err(|_| replacement_payload_error("columnar row ordinal exceeds u32"))?
+            .checked_add(1)
+            .ok_or_else(|| replacement_payload_error("columnar change address overflows"))?;
+        let owner = CommitId::new(uuid::Uuid::from_bytes(descriptor.owner_commit_id));
+        values[output_index] = Some(TrackedStateIndexValue {
+            change_id: change_id_from_packed_address(owner, packed),
+            commit_id: owner,
+            deleted: false,
+            created_at: descriptor.uniform_created_at,
+            updated_at: descriptor.uniform_updated_at,
+        });
+    }
+    Ok(())
+}
+
+fn columnar_identity_row_map(
+    identities: &datafusion::arrow::array::StringArray,
+) -> HashMap<&str, usize> {
+    (0..datafusion::arrow::array::Array::len(identities))
+        .map(|row_index| (identities.value(row_index), row_index))
+        .collect()
 }
 
 pub(crate) async fn load_complete_current_state_values_from_scoped_root(
@@ -4898,28 +4941,29 @@ async fn load_change_records_at_locators(
                 .or_default()
                 .push((locator_index, row_in_page));
         }
-        for ((group_index, page_index), page_locators) in page_groups {
-            let batch = crate::columnar_row_group::load_row_group_page(
-                store,
-                id,
-                &row_group_manifest,
-                group_index,
-                page_index,
-                &projection,
-            )
-            .await?;
-            for (locator_index, row_in_page) in page_locators {
-                let locator = locators[locator_index];
-                loaded[locator_index] = Some(decode_columnar_change_record(
-                    &row_group_manifest,
-                    &batch,
-                    row_in_page,
-                    parts,
-                    locator.change_id,
-                    &manifests[&commit_id].account_id,
-                )?);
-            }
-        }
+        let page_coordinates = page_groups.keys().copied().collect::<Vec<_>>();
+        crate::columnar_row_group::visit_row_group_pages(
+            store,
+            id,
+            &row_group_manifest,
+            &page_coordinates,
+            &projection,
+            |coordinate, batch| {
+                for &(locator_index, row_in_page) in &page_groups[&coordinate] {
+                    let locator = locators[locator_index];
+                    loaded[locator_index] = Some(decode_columnar_change_record(
+                        &row_group_manifest,
+                        &batch,
+                        row_in_page,
+                        parts,
+                        locator.change_id,
+                        &manifests[&commit_id].account_id,
+                    )?);
+                }
+                Ok(())
+            },
+        )
+        .await?;
     }
 
     let routes = locators
@@ -5284,19 +5328,13 @@ pub(crate) fn validate_columnar_mutation_manifest(
         != parts.row_group_set_id
         || manifest.content_digest()? != parts.manifest_digest
         || manifest.namespace != parts.schema_key
-        || manifest
-            .metadata
-            .get(crate::sql2::ENTITY_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY)
-            .map(String::as_str)
-            != Some("true")
+        || crate::live_state::entity_identity_column_index(manifest).is_none()
         || manifest
             .groups
             .iter()
             .map(|group| group.row_count)
             .collect::<Vec<_>>()
             != parts.group_row_counts
-        || manifest.fields.last().map(|field| field.name.as_str())
-            != Some(crate::sql2::ENTITY_COLUMNAR_ENTITY_PK_FIELD)
     {
         return Err(replacement_payload_error(
             "columnar mutation manifest disagrees with commit authority",
@@ -10284,7 +10322,7 @@ mod tests {
         CommitDeltaManifest, CommitDeltaPayloadRef, DecodedCommitDeltaBatch,
         DecodedCommitDeltaCache, DecodedCommitDeltaSegment, GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS,
         TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay,
+        TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay, columnar_identity_row_map,
         decode_commit_delta_with_payloads, decode_commit_state_manifest,
         direct_change_locator_in_commit_state, encode_commit_delta_segment,
         encode_commit_delta_segment_with_payloads, encode_commit_delta_segment_with_raw_sidecar,
@@ -10297,6 +10335,19 @@ mod tests {
         stage_delete_commit_delta_inventory_entry,
         stage_fragmented_scoped_current_state_descriptor, value,
     };
+
+    #[test]
+    fn columnar_identity_lookup_does_not_assume_json_text_order() {
+        use datafusion::arrow::array::StringArray;
+
+        // Encoded EntityPk order is not JSON serialization order when a
+        // component requires escaping. Equality routing must therefore not
+        // binary-search the JSON text representation.
+        let identities = StringArray::from(vec![r#"["\n"]"#, r#"["!"]"#]);
+        let rows = columnar_identity_row_map(&identities);
+        assert_eq!(rows.get(r#"["\n"]"#), Some(&0));
+        assert_eq!(rows.get(r#"["!"]"#), Some(&1));
+    }
 
     #[test]
     fn fragmented_native_source_preserves_lifecycle_and_batches_adjacent_updates() {

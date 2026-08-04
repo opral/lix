@@ -679,7 +679,7 @@ fn profile_hot_sql_session_operations(
         }
         print_profile_samples(
             &format!(
-                "sql_session/{}/cold_after_{repeats}_updates",
+                "sql_session/{}/warm_after_{repeats}_updates",
                 profile.name()
             ),
             TransactionBenchOp::ReadManyByPk,

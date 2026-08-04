@@ -1785,7 +1785,17 @@ fn select_many_by_pk_sql(
                 .chain(std::iter::once(UNTRACKED_PROBE_PATH)),
         );
     }
-    select_by_pk_sql(&rows[..read_many_by_pk_count])
+    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_MANY_DISTRIBUTION").as_deref() {
+        Ok("spread") if read_many_by_pk_count > 1 => select_by_paths_sql(
+            (0..read_many_by_pk_count)
+                .map(|index| index * (rows.len() - 1) / (read_many_by_pk_count - 1))
+                .map(|index| rows[index].path.as_str()),
+        ),
+        Ok("spread") | Ok("prefix") | Err(_) => select_by_pk_sql(&rows[..read_many_by_pk_count]),
+        Ok(other) => panic!(
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_READ_MANY_DISTRIBUTION '{other}'; expected prefix or spread"
+        ),
+    }
 }
 
 fn select_by_paths_sql<'a>(paths: impl IntoIterator<Item = &'a str>) -> String {

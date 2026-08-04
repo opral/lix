@@ -7,7 +7,7 @@ use crate::changelog::CommitId;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::current_state_envelope::scoped_range_part_from_current_state_descriptor;
 use crate::tracked_state::scoped_range::{
-    ScopedRangeCoverageMarker, ScopedRangeRoot, scan_scoped_range_scope,
+    ScopedRangeCoverageMarker, ScopedRangeRoot, load_scoped_range_coverage,
     stage_replace_scoped_range, stage_scoped_range_tree,
 };
 use crate::tracked_state::types::{
@@ -114,7 +114,7 @@ async fn stage_disjoint_columnar_current_state_pages(
         file_id: None,
     };
     let prefix = crate::tracked_state::current_state_envelope::current_state_scope_prefix(&scope)?;
-    let mut scoped_parts = descriptors
+    let scoped_parts = descriptors
         .iter()
         .map(|descriptor| scoped_range_part_from_current_state_descriptor(&scope, descriptor))
         .collect::<Result<Vec<_>, LixError>>()?;
@@ -146,76 +146,32 @@ async fn stage_disjoint_columnar_current_state_pages(
             None => stage_scoped_range_tree(writes, [(marker, scoped_parts)])?,
         }
     } else {
+        // A mutation part set is not a complete post-image by itself. It may
+        // seed a scope only when absence is certified; an already covered
+        // scope waits for the bounded sparse range-rewrite path.
+        if let Some(parent) = parent
+            && load_scoped_range_coverage(store, &parent.tree, &prefix)
+                .await?
+                .is_some()
+        {
+            return Ok(None);
+        }
+        if !parent_scope_is_proven_empty(store, parent_manifest, &scope).await? {
+            return Ok(None);
+        }
+        let marker = ScopedRangeCoverageMarker {
+            scope: prefix.clone(),
+            row_count: global_ordinal,
+            part_count: u32::try_from(scoped_parts.len())
+                .map_err(|_| scoped_state_error("columnar part count exceeds u32"))?,
+        };
         match parent {
-            None => {
-                if !parent_scope_is_proven_empty(store, parent_manifest, &scope).await? {
-                    return Ok(None);
-                }
-                let marker = ScopedRangeCoverageMarker {
-                    scope: prefix,
-                    row_count: global_ordinal,
-                    part_count: u32::try_from(scoped_parts.len())
-                        .map_err(|_| scoped_state_error("columnar part count exceeds u32"))?,
-                };
-                stage_scoped_range_tree(writes, [(marker, scoped_parts)])?
-            }
             Some(parent) => {
-                let inherited = scan_scoped_range_scope(store, &parent.tree, &prefix).await?;
-                let coverage = match inherited.coverage {
-                    Some(coverage) => coverage,
-                    None => {
-                        if !parent_scope_is_proven_empty(store, parent_manifest, &scope).await? {
-                            return Ok(None);
-                        }
-                        let marker = ScopedRangeCoverageMarker {
-                            scope: prefix,
-                            row_count: global_ordinal,
-                            part_count: u32::try_from(scoped_parts.len()).map_err(|_| {
-                                scoped_state_error("columnar part count exceeds u32")
-                            })?,
-                        };
-                        let tree = stage_replace_scoped_range(
-                            store,
-                            writes,
-                            &parent.tree,
-                            marker,
-                            scoped_parts,
-                        )
-                        .await?
-                        .root;
-                        return Ok(Some(attest_scoped_range_root(
-                            commit_id,
-                            Some(parent),
-                            inventory,
-                            tree,
-                        )?));
-                    }
-                };
-                scoped_parts.extend(inherited.parts);
-                scoped_parts.sort_by(|left, right| left.first_key.cmp(&right.first_key));
-                if scoped_parts
-                    .windows(2)
-                    .any(|pair| pair[0].last_key >= pair[1].first_key)
-                {
-                    return Ok(None);
-                }
-                let marker = ScopedRangeCoverageMarker {
-                    scope: prefix,
-                    row_count: coverage
-                        .row_count
-                        .checked_add(global_ordinal)
-                        .ok_or_else(|| scoped_state_error("columnar scope row count overflows"))?,
-                    part_count: coverage
-                        .part_count
-                        .checked_add(u32::try_from(descriptors.len()).map_err(|_| {
-                            scoped_state_error("columnar scope part count exceeds u32")
-                        })?)
-                        .ok_or_else(|| scoped_state_error("columnar scope part count overflows"))?,
-                };
                 stage_replace_scoped_range(store, writes, &parent.tree, marker, scoped_parts)
                     .await?
                     .root
             }
+            None => stage_scoped_range_tree(writes, [(marker, scoped_parts)])?,
         }
     };
     Ok(Some(attest_scoped_range_root(
@@ -223,8 +179,10 @@ async fn stage_disjoint_columnar_current_state_pages(
     )?))
 }
 
-/// Proves that no commit in the first-parent state lineage could have authored
-/// the requested collection. Unknown/cascading scope information fails closed.
+/// Proves one collection has never been authored in the linear state lineage.
+/// This is a correctness fallback for first publication; existing covered
+/// scopes never use it. A cumulative scoped-authority summary will replace
+/// this one-time walk in the next manifest hard cut.
 async fn parent_scope_is_proven_empty(
     store: &(impl StorageAdapterRead + ?Sized),
     parent: Option<&CommitStateManifest>,
@@ -240,6 +198,11 @@ async fn parent_scope_is_proven_empty(
             return Err(scoped_state_error(
                 "parent scope emptiness proof encountered a commit cycle",
             ));
+        }
+        if manifest.parent_commit_ids.len() > 1
+            || manifest.mutations.selected_source_commit_id().is_some()
+        {
+            return Ok(false);
         }
         if manifest.mutations.member_count != 0 {
             if manifest
@@ -623,7 +586,7 @@ mod tests {
     };
 
     use super::{
-        attest_scoped_range_root, stage_current_state_scoped_ranges,
+        attest_scoped_range_root, parent_scope_is_proven_empty, stage_current_state_scoped_ranges,
         validate_scoped_range_attestation,
     };
 
@@ -1407,6 +1370,43 @@ mod tests {
         assert!(
             publication.root().is_none(),
             "cross-scope mutation must not inherit serving authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_scope_proof_rejects_merge_and_selected_source_ancestry() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let parent_id = CommitId::for_test_label("empty-proof-parent");
+        let requested = scope("not-authored-here");
+
+        let mut merge = manifest(
+            parent_id,
+            Some(CommitId::for_test_label("first-parent")),
+            CommitStateMutationInventory::default(),
+        );
+        merge
+            .parent_commit_ids
+            .push(CommitId::for_test_label("second-parent"));
+        assert!(
+            !parent_scope_is_proven_empty(&read, Some(&merge), &requested)
+                .await
+                .unwrap()
+        );
+
+        let mut selected = manifest(parent_id, None, CommitStateMutationInventory::default());
+        selected.mutations.selected_source_commit_id = Some(
+            *CommitId::for_test_label("selected-source")
+                .as_uuid()
+                .as_bytes(),
+        );
+        assert!(
+            !parent_scope_is_proven_empty(&read, Some(&selected), &requested)
+                .await
+                .unwrap()
         );
     }
 }

@@ -723,6 +723,7 @@ where
     let scoped_roots = scoped_roots.values().cloned().collect::<Vec<_>>();
     let reachable = crate::tracked_state::validate_scoped_range_trees(store, &scoped_roots).await?;
     live_scoped_range_nodes.extend(reachable.node_ids);
+    let mut live_columnar_sources = BTreeSet::<(CommitId, [u8; 16], [u8; 32])>::new();
     for part in reachable.parts {
         let descriptor =
             crate::tracked_state::current_state_descriptor_from_scoped_range_part(&part)?;
@@ -759,29 +760,11 @@ where
                         format!("live scoped range references missing columnar owner '{owner}'"),
                     ));
                 }
-                let authority = crate::tracked_state::load_commit_state_manifest(store, owner)
-                    .await?
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("live scoped range columnar owner '{owner}' has no authority"),
-                        )
-                    })?;
-                let Some(parts) = authority.mutations.columnar_parts.as_ref() else {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "live columnar scoped range owner has no columnar mutation authority",
-                    ));
-                };
-                if parts.owner_commit_id != descriptor.owner_commit_id
-                    || parts.row_group_set_id != descriptor.source_id
-                    || parts.manifest_digest != descriptor.content_digest
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "live columnar scoped range descriptor disagrees with owner authority",
-                    ));
-                }
+                live_columnar_sources.insert((
+                    owner,
+                    descriptor.source_id,
+                    descriptor.content_digest,
+                ));
                 retained_authority_commits.insert(owner);
             }
             _ => {
@@ -790,6 +773,34 @@ where
                     "live scoped range contains an unknown part source",
                 ));
             }
+        }
+    }
+    for (owner, source_id, content_digest) in live_columnar_sources {
+        let authority = match live_manifests.get(&owner) {
+            Some(authority) => authority.clone(),
+            None => crate::tracked_state::load_commit_state_manifest(store, owner)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("live scoped range columnar owner '{owner}' has no authority"),
+                    )
+                })?,
+        };
+        let Some(parts) = authority.mutations.columnar_parts.as_ref() else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "live columnar scoped range owner has no columnar mutation authority",
+            ));
+        };
+        if parts.owner_commit_id != *owner.as_uuid().as_bytes()
+            || parts.row_group_set_id != source_id
+            || parts.manifest_digest != content_digest
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "live columnar scoped range descriptor disagrees with owner authority",
+            ));
         }
     }
 
