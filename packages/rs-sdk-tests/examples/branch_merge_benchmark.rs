@@ -27,6 +27,7 @@ use lix_sdk::{
 };
 use lix_slatedb_storage::SlateDB;
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use tracing::Subscriber;
 use tracing::span::{Attributes, Id};
 use tracing::subscriber::Interest;
@@ -34,7 +35,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context as TracingContext, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
-const SCHEMA_VERSION: u64 = 1;
+const SCHEMA_VERSION: u64 = 2;
 const SOURCE_BRANCH_ID: &str = "01920000-0000-7000-8000-00000000b001";
 const INSERT_BATCH: usize = 250;
 
@@ -405,6 +406,7 @@ where
         "file benchmark requires the five primary affected files"
     );
     let cold_reopen = cfg.scenario == "all_plugins_cold_reopen";
+    let provenance = benchmark_provenance();
     let total_started = Instant::now();
     let root = benchmark_tempdir();
     let db_path = root.path().join(".lix");
@@ -598,6 +600,7 @@ where
 
     println!("{}", serde_json::to_string(&json!({
         "schema_version": SCHEMA_VERSION,
+        "provenance": provenance,
         "status": "ok",
         "storage_backend": StorageImpl::NAME,
         "layer": "files",
@@ -632,12 +635,13 @@ where
             "merge_retained": signed_delta(merge_measure.after.rss_bytes, merge_measure.before.rss_bytes),
         },
         "io_bytes": {
+            "measurement": io_measurement_metadata(),
             "preview_read": preview_measure.after.read_bytes.saturating_sub(preview_measure.before.read_bytes),
             "preview_write": preview_measure.after.write_bytes.saturating_sub(preview_measure.before.write_bytes),
             "merge_read": merge_measure.after.read_bytes.saturating_sub(merge_measure.before.read_bytes),
             "merge_write": merge_measure.after.write_bytes.saturating_sub(merge_measure.before.write_bytes),
-            "storage_before": storage_bytes_before, "storage_after": storage_bytes_after,
-            "storage_growth": signed_delta(storage_bytes_after, storage_bytes_before),
+            "storage_before": storage_bytes_before, "storage_after_merge": storage_bytes_after,
+            "storage_growth_after_merge": signed_delta(storage_bytes_after, storage_bytes_before),
         },
         "phase_ms": { "preview": preview_phases, "merge": merge_phases },
         "plugin_counters": {
@@ -669,6 +673,7 @@ async fn run_row_case<StorageImpl>(cfg: Config, collector: PerfSpanCollector)
 where
     StorageImpl: BenchmarkStorage,
 {
+    let provenance = benchmark_provenance();
     let total_started = Instant::now();
     let root = benchmark_tempdir();
     let db_path = root.path().join(".lix");
@@ -978,6 +983,7 @@ where
             "deleted branch remained visible"
         );
     }
+    let storage_bytes_after_branch_deletion = directory_bytes(&db_path);
     source.close().await.expect("close source session");
     lix.close().await.expect("close target session");
     drop(source);
@@ -1002,6 +1008,7 @@ where
 
     let result = json!({
         "schema_version": SCHEMA_VERSION,
+        "provenance": provenance,
         "status": "ok",
         "storage_backend": StorageImpl::NAME,
         "layer": cfg.layer,
@@ -1069,14 +1076,20 @@ where
             "diff_retained": signed_delta(diff_measure.after.rss_bytes, diff_measure.before.rss_bytes),
         },
         "io_bytes": {
+            "measurement": io_measurement_metadata(),
             "preview_read": preview_measure.after.read_bytes.saturating_sub(preview_measure.before.read_bytes),
             "preview_write": preview_measure.after.write_bytes.saturating_sub(preview_measure.before.write_bytes),
             "merge_read": merge_measure.after.read_bytes.saturating_sub(merge_measure.before.read_bytes),
             "merge_write": merge_measure.after.write_bytes.saturating_sub(merge_measure.before.write_bytes),
             "diff_read": diff_measure.after.read_bytes.saturating_sub(diff_measure.before.read_bytes),
             "diff_write": diff_measure.after.write_bytes.saturating_sub(diff_measure.before.write_bytes),
-            "storage_before": storage_bytes_before, "storage_after": storage_bytes_after,
-            "storage_growth": signed_delta(storage_bytes_after, storage_bytes_before),
+            "delete_branches_read": delete_branches_measure.after.read_bytes.saturating_sub(delete_branches_measure.before.read_bytes),
+            "delete_branches_write": delete_branches_measure.after.write_bytes.saturating_sub(delete_branches_measure.before.write_bytes),
+            "storage_before": storage_bytes_before,
+            "storage_after_merge": storage_bytes_after,
+            "storage_growth_after_merge": signed_delta(storage_bytes_after, storage_bytes_before),
+            "storage_after_branch_deletion": storage_bytes_after_branch_deletion,
+            "storage_growth_after_branch_deletion": signed_delta(storage_bytes_after_branch_deletion, storage_bytes_before),
         },
         "phase_ms": {
             "setup": setup_phases,
@@ -1166,6 +1179,27 @@ impl BenchmarkStorage for SlateDB {
 
 fn benchmark_storage_name() -> String {
     std::env::var("LIX_BRANCH_MERGE_BENCH_STORAGE").unwrap_or_else(|_| "rocksdb".to_owned())
+}
+
+fn benchmark_provenance() -> serde_json::Value {
+    let executable = std::env::current_exe().expect("resolve benchmark executable");
+    let executable_bytes = fs::read(&executable).expect("read benchmark executable for hashing");
+    json!({
+        "commit_sha": option_env!("LIX_BENCH_COMMIT_SHA").unwrap_or("unrecorded"),
+        "binary_sha256": format!("{:x}", Sha256::digest(&executable_bytes)),
+        "rustc_version": option_env!("LIX_BENCH_RUSTC_VERSION").unwrap_or("unrecorded"),
+        "cargo_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "target_arch": std::env::consts::ARCH,
+        "target_os": std::env::consts::OS,
+    })
+}
+
+fn io_measurement_metadata() -> serde_json::Value {
+    json!({
+        "source": if cfg!(target_os = "linux") { "/proc/self/io" } else { "unavailable" },
+        "os_page_cache_controlled": false,
+        "interpretation": "process physical I/O lower bound; zero does not prove zero logical reads",
+    })
 }
 
 async fn open_benchmark<StorageImpl>(path: &Path) -> Lix<StorageImpl>

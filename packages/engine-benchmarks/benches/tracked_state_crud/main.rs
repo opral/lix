@@ -153,9 +153,10 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
         profile_operation(&runtime, &rows);
         return;
     }
-    let rows = fixture_rows(REAL_WORKLOAD_ROWS);
+    let accounting_rows = accounting_row_count();
+    let rows = fixture_rows(REAL_WORKLOAD_ROWS.max(accounting_rows));
     io_stats::maybe_print_io_report();
-    accounting::maybe_print_accounting_report(&runtime, &rows[..SMOKE_ROWS]);
+    accounting::maybe_print_accounting_report(&runtime, &rows[..accounting_rows]);
 
     for (label, row_count) in [("smoke", SMOKE_ROWS), ("real_workload", REAL_WORKLOAD_ROWS)] {
         bench_raw_sqlite(c, &rows[..row_count], label);
@@ -167,6 +168,26 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
             bench_sql_session(c, &runtime, profile, &rows[..row_count], label);
         }
     }
+}
+
+fn accounting_row_count() -> usize {
+    if std::env::var_os("LIX_TRACKED_STATE_CRUD_ACCOUNTING").is_none() {
+        return SMOKE_ROWS;
+    }
+    let Some(value) = std::env::var_os("LIX_TRACKED_STATE_CRUD_ACCOUNTING_ROW_COUNT") else {
+        return SMOKE_ROWS;
+    };
+    let value = value.to_string_lossy();
+    let row_count = value.parse::<usize>().unwrap_or_else(|_| {
+        panic!(
+            "LIX_TRACKED_STATE_CRUD_ACCOUNTING_ROW_COUNT must be a positive integer, got '{value}'"
+        )
+    });
+    assert!(
+        row_count > 0,
+        "LIX_TRACKED_STATE_CRUD_ACCOUNTING_ROW_COUNT must be positive"
+    );
+    row_count
 }
 
 fn profile_sample_count() -> usize {
