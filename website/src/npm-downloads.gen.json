@@ -1,0 +1,219 @@
+{
+  "generatedAt": "2026-08-04T06:08:32.654Z",
+  "package": "@lix-js/sdk",
+  "latestWeeklyDownloads": 445000,
+  "weeks": [
+    {
+      "weekEnding": "2025-08-03",
+      "downloads": 33000
+    },
+    {
+      "weekEnding": "2025-08-10",
+      "downloads": 33000
+    },
+    {
+      "weekEnding": "2025-08-17",
+      "downloads": 36000
+    },
+    {
+      "weekEnding": "2025-08-24",
+      "downloads": 37000
+    },
+    {
+      "weekEnding": "2025-08-31",
+      "downloads": 39000
+    },
+    {
+      "weekEnding": "2025-09-07",
+      "downloads": 40000
+    },
+    {
+      "weekEnding": "2025-09-14",
+      "downloads": 48000
+    },
+    {
+      "weekEnding": "2025-09-21",
+      "downloads": 44000
+    },
+    {
+      "weekEnding": "2025-09-28",
+      "downloads": 52000
+    },
+    {
+      "weekEnding": "2025-10-05",
+      "downloads": 55000
+    },
+    {
+      "weekEnding": "2025-10-12",
+      "downloads": 51000
+    },
+    {
+      "weekEnding": "2025-10-19",
+      "downloads": 58000
+    },
+    {
+      "weekEnding": "2025-10-26",
+      "downloads": 63000
+    },
+    {
+      "weekEnding": "2025-11-02",
+      "downloads": 59000
+    },
+    {
+      "weekEnding": "2025-11-09",
+      "downloads": 62000
+    },
+    {
+      "weekEnding": "2025-11-16",
+      "downloads": 62000
+    },
+    {
+      "weekEnding": "2025-11-23",
+      "downloads": 66000
+    },
+    {
+      "weekEnding": "2025-11-30",
+      "downloads": 59000
+    },
+    {
+      "weekEnding": "2025-12-07",
+      "downloads": 70000
+    },
+    {
+      "weekEnding": "2025-12-14",
+      "downloads": 70000
+    },
+    {
+      "weekEnding": "2025-12-21",
+      "downloads": 69000
+    },
+    {
+      "weekEnding": "2025-12-28",
+      "downloads": 40000
+    },
+    {
+      "weekEnding": "2026-01-04",
+      "downloads": 40000
+    },
+    {
+      "weekEnding": "2026-01-11",
+      "downloads": 83000
+    },
+    {
+      "weekEnding": "2026-01-18",
+      "downloads": 91000
+    },
+    {
+      "weekEnding": "2026-01-25",
+      "downloads": 111000
+    },
+    {
+      "weekEnding": "2026-02-01",
+      "downloads": 113000
+    },
+    {
+      "weekEnding": "2026-02-08",
+      "downloads": 98000
+    },
+    {
+      "weekEnding": "2026-02-15",
+      "downloads": 110000
+    },
+    {
+      "weekEnding": "2026-02-22",
+      "downloads": 105000
+    },
+    {
+      "weekEnding": "2026-03-01",
+      "downloads": 139000
+    },
+    {
+      "weekEnding": "2026-03-08",
+      "downloads": 136000
+    },
+    {
+      "weekEnding": "2026-03-15",
+      "downloads": 150000
+    },
+    {
+      "weekEnding": "2026-03-22",
+      "downloads": 145000
+    },
+    {
+      "weekEnding": "2026-03-29",
+      "downloads": 174000
+    },
+    {
+      "weekEnding": "2026-04-05",
+      "downloads": 157000
+    },
+    {
+      "weekEnding": "2026-04-12",
+      "downloads": 158000
+    },
+    {
+      "weekEnding": "2026-04-19",
+      "downloads": 172000
+    },
+    {
+      "weekEnding": "2026-04-26",
+      "downloads": 192000
+    },
+    {
+      "weekEnding": "2026-05-03",
+      "downloads": 177000
+    },
+    {
+      "weekEnding": "2026-05-10",
+      "downloads": 216000
+    },
+    {
+      "weekEnding": "2026-05-17",
+      "downloads": 240000
+    },
+    {
+      "weekEnding": "2026-05-24",
+      "downloads": 254000
+    },
+    {
+      "weekEnding": "2026-05-31",
+      "downloads": 255000
+    },
+    {
+      "weekEnding": "2026-06-07",
+      "downloads": 251000
+    },
+    {
+      "weekEnding": "2026-06-14",
+      "downloads": 307000
+    },
+    {
+      "weekEnding": "2026-06-21",
+      "downloads": 318000
+    },
+    {
+      "weekEnding": "2026-06-28",
+      "downloads": 323000
+    },
+    {
+      "weekEnding": "2026-07-05",
+      "downloads": 333000
+    },
+    {
+      "weekEnding": "2026-07-12",
+      "downloads": 349000
+    },
+    {
+      "weekEnding": "2026-07-19",
+      "downloads": 410000
+    },
+    {
+      "weekEnding": "2026-07-26",
+      "downloads": 428000
+    },
+    {
+      "weekEnding": "2026-08-02",
+      "downloads": 445000
+    }
+  ]
+}

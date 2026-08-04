@@ -1,6 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Header } from "../components/header";
-import { LandingReadme } from "../components/landing-page";
+import LandingPage from "../components/landing-page";
 import markdownPageCss from "../components/markdown-page.style.css?url";
 import { loadReadmeContent } from "../lib/readme-content";
 import {
@@ -81,10 +80,5 @@ export const Route = createFileRoute("/")({
 function HomeRoute() {
   const { html } = Route.useLoaderData();
 
-  return (
-    <>
-      <Header />
-      <LandingReadme readmeHtml={html} />
-    </>
-  );
+  return <LandingPage readmeHtml={html} />;
 }

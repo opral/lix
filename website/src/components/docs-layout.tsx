@@ -19,7 +19,7 @@ export type PageTocItem = {
 };
 
 /**
- * VitePress-style documentation shell with header, left sidebar, and main content.
+ * Three-column documentation shell: sidebar, content, and "On this page" TOC.
  *
  * The sidebar is driven from the docs table of contents and highlights the
  * active entry based on the current doc relative path.
@@ -90,49 +90,47 @@ export function DocsLayout({
   const SidebarContent = () => (
     <nav
       aria-label="Documentation sidebar"
-      className="px-6 pt-6 pb-8 space-y-6"
+      className="flex flex-col gap-8 px-7 pb-16 pt-9"
     >
       {sidebarSections.map((section) => (
-        <section key={section.label} className="space-y-3">
-          <h2 className="text-sm font-semibold text-slate-900">
+        <section key={section.label} className="flex flex-col gap-2.5">
+          <span className="font-mono text-[11px] uppercase tracking-[0.09em] text-ink-faint">
             {section.label}
-          </h2>
-          <ul>
+          </span>
+          <div className="flex flex-col gap-[7px]">
             {section.items.map((item) => {
               const isActive = item.relativePath === activeRelativePath;
               return (
-                <li key={item.href}>
-                  <Link
-                    to={item.href}
-                    onClick={() => setIsMobileMenuOpen(false)}
-                    className={[
-                      "block py-1 text-sm leading-6 transition-colors",
-                      isActive
-                        ? "font-medium text-[#0891B2]"
-                        : "text-slate-600 hover:text-slate-900",
-                    ].join(" ")}
-                  >
-                    {item.label}
-                  </Link>
-                </li>
+                <Link
+                  key={item.href}
+                  to={item.href}
+                  onClick={() => setIsMobileMenuOpen(false)}
+                  className={
+                    isActive
+                      ? "text-[13.5px] font-semibold text-cyan-deep"
+                      : "text-[13.5px] text-ink-muted transition-colors hover:text-cyan-deep"
+                  }
+                >
+                  {item.label}
+                </Link>
               );
             })}
-          </ul>
+          </div>
         </section>
       ))}
     </nav>
   );
 
   return (
-    <div className="min-h-screen bg-white text-slate-900">
+    <div className="min-h-screen bg-paper text-ink">
       <div className="sticky top-0 z-50">
         <Header />
         {/* Mobile menu bar - below header, above content */}
-        <div className="border-b border-gray-200 bg-white lg:hidden">
-          <div className="mx-auto flex w-full max-w-[1440px] items-center px-6 py-2">
+        <div className="border-b border-line bg-paper lg:hidden">
+          <div className="mx-auto flex w-full max-w-[1376px] items-center px-8 py-2">
             <button
               onClick={() => setIsMobileMenuOpen(true)}
-              className="flex items-center gap-2 text-sm font-medium text-gray-700"
+              className="flex items-center gap-2 text-sm font-medium text-ink-secondary"
               aria-label="Open menu"
             >
               <MenuIcon className="h-5 w-5" />
@@ -145,15 +143,15 @@ export function DocsLayout({
       {isMobileMenuOpen && (
         <>
           <div
-            className="fixed inset-0 bg-black/50 z-40 lg:hidden"
+            className="fixed inset-0 z-40 bg-black/50 lg:hidden"
             onClick={() => setIsMobileMenuOpen(false)}
             aria-hidden="true"
           />
-          <aside className="fixed inset-y-0 left-0 w-full bg-slate-50 border-r border-slate-200 overflow-y-auto z-50 lg:hidden">
-            <div className="sticky top-0 bg-slate-50 px-6 py-3 flex justify-end items-center">
+          <aside className="fixed inset-y-0 left-0 z-50 w-full overflow-y-auto border-r border-line bg-paper lg:hidden">
+            <div className="sticky top-0 flex items-center justify-end bg-paper px-6 py-3">
               <button
                 onClick={() => setIsMobileMenuOpen(false)}
-                className="text-slate-600 hover:text-slate-900"
+                className="text-ink-muted hover:text-ink"
                 aria-label="Close menu"
               >
                 <svg
@@ -176,59 +174,48 @@ export function DocsLayout({
           </aside>
         </>
       )}
-      <div className="relative">
-        <div className="absolute left-0 top-14 hidden h-[calc(100vh-3.5rem)] w-64 bg-slate-50 -z-10 lg:block" />
-        <div className="mx-auto flex w-full max-w-[1440px]">
-          <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-64 shrink-0 overflow-y-auto border-r border-slate-200 lg:block">
+      <div className="grid grid-cols-1 items-stretch lg:grid-cols-[264px_minmax(0,1fr)] xl:grid-cols-[264px_minmax(0,1fr)_224px]">
+        <aside className="hidden border-r border-line lg:block">
+          <div className="sticky top-[50px] max-h-[calc(100vh-50px)] overflow-y-auto">
             <SidebarContent />
-          </aside>
+          </div>
+        </aside>
 
-          <main id="VPContent" className="min-w-0 flex-1">
-            <div className="px-6 py-8 lg:px-8">
-              <div className="mx-auto w-full max-w-3xl">{children}</div>
-            </div>
-          </main>
+        <main className="min-w-0 px-6 pb-[88px] pt-12 sm:px-16">
+          <div className="w-full max-w-[720px]">{children}</div>
+        </main>
 
-          {hasPageToc && (
-            <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-64 shrink-0 xl:block">
-              <nav
-                aria-label="On this page"
-                className="px-6 py-8 text-sm text-slate-600"
-              >
-                <div className="text-sm font-semibold text-slate-900">
+        {hasPageToc && (
+          <aside className="hidden xl:block">
+            <nav
+              aria-label="On this page"
+              className="sticky top-[50px] py-[52px] pl-2 pr-7"
+            >
+              <div className="flex flex-col gap-[9px] border-l border-line pl-4">
+                <span className="mb-[3px] font-mono text-[11px] uppercase tracking-[0.09em] text-ink-faint">
                   On this page
-                </div>
-                <ul className="mt-3 space-y-2 border-l border-slate-200 pl-4">
-                  {pageToc?.map((item) => {
-                    const isActive = item.id === activeTocId;
-                    return (
-                      <li key={item.id} className="relative">
-                        {isActive && (
-                          <span
-                            className="absolute -left-4 top-1/2 h-5 w-0.5 -translate-y-1/2 bg-[#0891B2]"
-                            aria-hidden="true"
-                          />
-                        )}
-                        <a
-                          href={`#${item.id}`}
-                          className={[
-                            "block transition-colors",
-                            item.level > 2 ? "pl-3" : "",
-                            isActive
-                              ? "font-medium text-[#0891B2]"
-                              : "text-slate-600 hover:text-slate-900",
-                          ].join(" ")}
-                        >
-                          {item.label}
-                        </a>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </nav>
-            </aside>
-          )}
-        </div>
+                </span>
+                {pageToc?.map((item) => {
+                  const isActive = item.id === activeTocId;
+                  return (
+                    <a
+                      key={item.id}
+                      href={`#${item.id}`}
+                      className={[
+                        item.level > 2 ? "pl-3" : "",
+                        isActive
+                          ? "text-[13px] font-semibold text-cyan-deep"
+                          : "text-[13px] text-ink-muted transition-colors hover:text-cyan-deep",
+                      ].join(" ")}
+                    >
+                      {item.label}
+                    </a>
+                  );
+                })}
+              </div>
+            </nav>
+          </aside>
+        )}
       </div>
       <Footer />
     </div>

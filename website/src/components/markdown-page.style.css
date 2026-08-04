@@ -3,20 +3,20 @@
  * Based on VitePress's vp-doc styling
  */
 
-/* CSS Custom Properties matching VitePress */
+/* CSS Custom Properties matching the Lix design tokens */
 :root {
-  --vp-c-brand-1: #3451b2;
-  --vp-c-brand-2: #3a5ccc;
-  --vp-c-brand-soft: rgba(100, 108, 255, 0.14);
-  --vp-c-text-1: rgba(60, 60, 67);
-  --vp-c-text-2: rgba(60, 60, 67, 0.78);
-  --vp-c-text-3: rgba(60, 60, 67, 0.56);
-  --vp-c-divider: rgba(60, 60, 67, 0.12);
+  --vp-c-brand-1: #0891ac;
+  --vp-c-brand-2: #07b6d5;
+  --vp-c-brand-soft: rgba(7, 182, 213, 0.14);
+  --vp-c-text-1: #3d4046;
+  --vp-c-text-2: #6b7076;
+  --vp-c-text-3: #8a8f96;
+  --vp-c-divider: #e6e4dd;
   --vp-c-bg: #ffffff;
-  --vp-c-bg-soft: #f6f6f7;
-  --vp-c-bg-alt: #f6f6f7;
-  --vp-c-border: rgba(60, 60, 67, 0.12);
-  --vp-c-gutter: rgba(60, 60, 67, 0.05);
+  --vp-c-bg-soft: #f7f6f1;
+  --vp-c-bg-alt: #f7f6f1;
+  --vp-c-border: #e0ded6;
+  --vp-c-gutter: #edebe4;
 
   /* Tip colors - Green */
   --vp-c-tip-1: #059669;
@@ -67,15 +67,15 @@
 .markdown-wc-body h5,
 .markdown-wc-body h6 {
   position: relative;
-  font-weight: 600;
+  font-weight: 700;
   outline: none;
-  color: var(--vp-c-text-1);
+  color: #15171b;
 }
 
 .markdown-wc-body h1 {
-  letter-spacing: -0.02em;
-  line-height: 40px;
-  font-size: 28px;
+  letter-spacing: -0.03em;
+  line-height: 1.2;
+  font-size: 36px;
   margin: 0 0 16px 0;
 }
 
@@ -186,7 +186,8 @@
   font-weight: 500;
   color: var(--vp-c-brand-1);
   text-decoration: underline;
-  text-underline-offset: 2px;
+  text-decoration-color: #b9e5ef;
+  text-underline-offset: 3px;
   transition:
     color 0.25s,
     opacity 0.25s;
@@ -288,9 +289,9 @@
 .markdown-wc-body :not(pre) > code {
   font-size: var(--vp-code-font-size);
   color: var(--vp-c-text-1);
-  background-color: var(--vp-c-bg-soft);
+  background-color: #f0eee7;
   border-radius: 4px;
-  padding: 2px 6px;
+  padding: 1px 5px;
   font-weight: 500;
   transition:
     color 0.25s,
@@ -382,8 +383,9 @@
 /* Code blocks */
 .markdown-wc-body pre {
   margin: 16px 0;
-  padding: 8px 12px;
+  padding: 14px 18px;
   background-color: var(--vp-c-bg-soft);
+  border: 1px solid #edebe4;
   border-radius: 8px;
   overflow-x: auto;
   position: relative;
@@ -628,25 +630,22 @@
 
 .markdown-wc-body tr {
   background-color: var(--vp-c-bg);
-  border-top: 1px solid var(--vp-c-divider);
+  border-top: 1px solid #edebe4;
   transition: background-color 0.5s;
-}
-
-.markdown-wc-body tr:nth-child(2n) {
-  background-color: var(--vp-c-bg-soft);
 }
 
 .markdown-wc-body th,
 .markdown-wc-body td {
-  border: 1px solid var(--vp-c-divider);
-  padding: 8px 16px;
+  border: 1px solid #edebe4;
+  padding: 11px 14px;
+  text-align: left;
 }
 
 .markdown-wc-body th {
   font-size: 14px;
   font-weight: 600;
-  color: var(--vp-c-text-1);
-  background-color: var(--vp-c-bg-soft);
+  color: #15171b;
+  background-color: #fdfcfa;
 }
 
 .markdown-wc-body td {

@@ -1,0 +1,37 @@
+name: Update download stats
+
+on:
+  schedule:
+    # Mondays 06:23 UTC, after npm has finalized the previous week's counts.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Fetch npm download stats
+        run: node website/scripts/update-npm-downloads.mjs
+
+      - name: Commit and push if changed
+        run: |
+          if git diff --quiet website/src/npm-downloads.gen.json; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add website/src/npm-downloads.gen.json
+          git commit -m "chore(website): update npm download stats"
+          git push

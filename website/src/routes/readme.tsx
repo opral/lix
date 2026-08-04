@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { Footer } from "../components/footer";
 import { Header } from "../components/header";
-import { LandingReadme } from "../components/landing-page";
 import markdownPageCss from "../components/markdown-page.style.css?url";
 import { loadReadmeContent } from "../lib/readme-content";
 import {
@@ -62,9 +62,32 @@ function ReadmeRoute() {
   const { html } = Route.useLoaderData();
 
   return (
-    <>
+    <div className="flex min-h-screen flex-col bg-paper text-ink">
       <Header />
-      <LandingReadme readmeHtml={html} />
-    </>
+      <main className="mx-auto w-full max-w-[880px] flex-1 px-8 pb-[104px] pt-[72px]">
+        <div className="overflow-hidden rounded-xl border border-line bg-white">
+          <div className="flex flex-wrap items-center justify-between gap-5 border-b border-line-soft bg-[#FDFCFA] px-7 py-3.5">
+            <span className="font-mono text-[12.5px] text-ink-faint">
+              README.md · opral/lix
+            </span>
+            <a
+              href="https://github.com/opral/lix"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-mono text-[12.5px] text-ink-muted transition-colors hover:text-cyan-deep"
+            >
+              view on GitHub →
+            </a>
+          </div>
+          <div className="max-w-[800px] px-6 pb-12 pt-10 sm:px-12">
+            <article
+              className="markdown-wc-body"
+              dangerouslySetInnerHTML={{ __html: html }}
+            />
+          </div>
+        </div>
+      </main>
+      <Footer />
+    </div>
   );
 }

@@ -41,63 +41,40 @@ export function PrevNextNav({
 
   return (
     <nav
-      className={`grid grid-cols-1 gap-4 border-t border-slate-200 pt-8 sm:grid-cols-2 ${className}`}
+      className={`flex justify-between gap-4 border-t border-line pt-5 ${className}`}
     >
-      <div className="min-w-0">
-        {prev && (
-          <Link
-            to={`${basePath}/$${paramName}` as string}
-            params={{ [paramName]: prev.slug } as Record<string, string>}
-            className="group block w-full rounded-xl border border-slate-200 p-4 transition-colors hover:border-slate-300"
-          >
-            <span className="flex items-center gap-1.5 text-sm text-slate-400">
-              <svg
-                className="h-3 w-3"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M19 12H5M12 19l-7-7 7-7" />
-              </svg>
-              {prevLabel}
-            </span>
-            <span className="mt-1 block font-medium text-[#3451b2] group-hover:text-[#3a5ccc]">
-              {prev.title}
-            </span>
-          </Link>
-        )}
-      </div>
-
-      <div className="min-w-0">
-        {next && (
-          <Link
-            to={`${basePath}/$${paramName}` as string}
-            params={{ [paramName]: next.slug } as Record<string, string>}
-            className="group block w-full rounded-xl border border-slate-200 p-4 transition-colors hover:border-slate-300"
-          >
-            <span className="flex items-center justify-end gap-1.5 text-sm text-slate-400">
-              {nextLabel}
-              <svg
-                className="h-3 w-3"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M5 12h14M12 5l7 7-7 7" />
-              </svg>
-            </span>
-            <span className="mt-1 block font-medium text-right text-[#3451b2] group-hover:text-[#3a5ccc]">
-              {next.title}
-            </span>
-          </Link>
-        )}
-      </div>
+      {prev ? (
+        <Link
+          to={`${basePath}/$${paramName}` as string}
+          params={{ [paramName]: prev.slug } as Record<string, string>}
+          className="flex min-w-0 flex-col gap-1"
+        >
+          <span className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-faint">
+            {prevLabel}
+          </span>
+          <span className="text-[15px] font-semibold text-cyan-deep">
+            ← {prev.title}
+          </span>
+        </Link>
+      ) : (
+        <span />
+      )}
+      {next ? (
+        <Link
+          to={`${basePath}/$${paramName}` as string}
+          params={{ [paramName]: next.slug } as Record<string, string>}
+          className="flex min-w-0 flex-col items-end gap-1 text-right"
+        >
+          <span className="font-mono text-[11px] uppercase tracking-[0.08em] text-ink-faint">
+            {nextLabel}
+          </span>
+          <span className="text-[15px] font-semibold text-cyan-deep">
+            {next.title} →
+          </span>
+        </Link>
+      ) : (
+        <span />
+      )}
     </nav>
   );
 }

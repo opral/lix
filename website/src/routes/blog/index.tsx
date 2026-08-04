@@ -11,13 +11,10 @@ type Author = {
   avatar?: string | null;
 };
 
-const blogMarkdownFiles = import.meta.glob<string>(
-  "../../../../blog/**/*.md",
-  {
-    query: "?raw",
-    import: "default",
-  },
-);
+const blogMarkdownFiles = import.meta.glob<string>("../../../../blog/**/*.md", {
+  query: "?raw",
+  import: "default",
+});
 const blogJsonFiles = import.meta.glob<string>("../../../../blog/*.json", {
   query: "?raw",
   import: "default",
@@ -153,107 +150,60 @@ function BlogIndexPage() {
   const { posts } = Route.useLoaderData();
 
   return (
-    <div className="flex min-h-screen flex-col bg-white text-slate-900">
+    <div className="flex min-h-screen flex-col bg-paper text-ink">
       <Header />
-      <main className="flex-1">
-        <div className="mx-auto max-w-4xl px-6 py-16">
-          <h1 className="mb-6 text-4xl font-bold tracking-tight text-slate-900">
-            Blog
-          </h1>
+      <main className="mx-auto w-full max-w-[880px] flex-1 px-8 pb-[104px] pt-[72px]">
+        <h1 className="text-[44px] font-bold tracking-[-0.032em]">Blog</h1>
+        <p className="mt-4 text-[17px] leading-[1.6] text-ink-muted">
+          Release notes and engineering updates from the Lix team.
+        </p>
 
-          <form
-            action="https://buttondown.com/api/emails/embed-subscribe/lix-blog"
-            method="post"
-            target="_blank"
-            className="embeddable-buttondown-form mb-12"
-          >
-            <p className="mb-3 text-sm text-slate-500">
-              Get notified about new blog posts
-            </p>
-            <div className="flex gap-2">
-              <label htmlFor="bd-email" className="sr-only">
-                Enter your email
-              </label>
-              <input
-                type="email"
-                name="email"
-                id="bd-email"
-                placeholder="your@email.com"
-                required
-                className="flex-1 rounded-md border border-slate-300 px-4 py-2 text-sm focus:border-transparent focus:outline-none focus:ring-2 focus:ring-slate-900"
-              />
-              <input
-                type="submit"
-                value="Subscribe"
-                className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-900 transition-colors hover:bg-slate-50"
-              />
-            </div>
-          </form>
-
-          <div className="flex flex-col gap-6">
-            {posts.map((post) => (
-              <Link
-                key={post.slug}
-                to="/blog/$slug"
-                params={{ slug: post.slug }}
-                className="group -mx-6 block rounded-xl p-6 transition-colors hover:bg-slate-50"
-              >
-                <article className="flex gap-6">
-                  {post.ogImage && (
-                    <div className="h-24 w-40 flex-shrink-0 overflow-hidden rounded-lg bg-slate-100">
-                      <img
-                        src={post.ogImage}
-                        alt={
-                          post.ogImageAlt ??
-                          `${post.title ?? post.slug} cover image`
-                        }
-                        className="h-full w-full object-cover"
-                      />
-                    </div>
-                  )}
-                  <div className="min-w-0 flex-1">
-                    <h2 className="text-xl font-semibold text-slate-900 transition-colors group-hover:text-slate-700">
-                      {post.title ?? post.slug}
-                    </h2>
-                    {post.description && (
-                      <p className="mt-2 line-clamp-2 text-sm text-slate-600">
-                        {post.description}
-                      </p>
-                    )}
-                    <div className="mt-3 flex items-center gap-2 text-sm text-slate-500">
-                      {post.authors && post.authors.length > 0 && (
-                        <>
-                          {post.authors.map((author, index) => (
-                            <div
-                              key={index}
-                              className="flex items-center gap-2"
-                            >
-                              {author.avatar ? (
-                                <img
-                                  src={author.avatar}
-                                  alt={author.name}
-                                  className="h-5 w-5 rounded-full object-cover"
-                                />
-                              ) : (
-                                <div className="flex h-5 w-5 items-center justify-center rounded-full bg-slate-300 text-xs font-medium text-slate-600">
-                                  {author.name.charAt(0)}
-                                </div>
-                              )}
-                              <span>{author.name}</span>
-                            </div>
-                          ))}
-                          {post.date && (
-                            <span className="text-slate-300">·</span>
-                          )}
-                        </>
-                      )}
-                      {post.date && <time>{formatDate(post.date)}</time>}
-                    </div>
-                  </div>
-                </article>
-              </Link>
-            ))}
-          </div>
+        <div className="mt-12 flex flex-col">
+          {posts.map((post, index) => (
+            <Link
+              key={post.slug}
+              to="/blog/$slug"
+              params={{ slug: post.slug }}
+              className={`group grid grid-cols-1 items-center gap-4 border-t border-line py-[30px] sm:grid-cols-[120px_236px_1fr] sm:gap-8 ${
+                index === posts.length - 1 ? "border-b" : ""
+              }`}
+            >
+              <span className="font-mono text-[12.5px] text-ink-faint">
+                {post.date ? formatDate(post.date) : ""}
+              </span>
+              {post.ogImage ? (
+                <img
+                  src={post.ogImage}
+                  alt={
+                    post.ogImageAlt ?? `${post.title ?? post.slug} cover image`
+                  }
+                  className="block aspect-[1.91/1] w-full max-w-[236px] rounded-lg border border-line bg-white object-cover"
+                />
+              ) : (
+                <span
+                  className="flex aspect-[1.91/1] w-full max-w-[236px] items-center justify-center rounded-lg border border-line"
+                  style={{
+                    backgroundImage:
+                      "repeating-linear-gradient(135deg, #F4F2EC 0px, #F4F2EC 8px, #FBFAF7 8px, #FBFAF7 16px)",
+                  }}
+                >
+                  <span className="rounded-[5px] border border-line bg-paper px-[9px] py-[5px] font-mono text-[11px] text-ink-faint">
+                    no og image
+                  </span>
+                </span>
+              )}
+              <span className="flex flex-col gap-2">
+                <span className="text-xl font-bold tracking-[-0.015em] text-ink transition-colors group-hover:text-cyan-deep">
+                  {post.title ?? post.slug}
+                </span>
+                {post.description && (
+                  <span className="text-[15px] leading-[1.6] text-ink-muted">
+                    {post.description}
+                  </span>
+                )}
+              </span>
+            </Link>
+          ))}
         </div>
       </main>
       <Footer />
@@ -266,8 +216,9 @@ function formatDate(dateString: string): string {
     const date = new Date(dateString);
     return date.toLocaleDateString("en-US", {
       year: "numeric",
-      month: "long",
+      month: "short",
       day: "numeric",
+      timeZone: "UTC",
     });
   } catch {
     return dateString;
