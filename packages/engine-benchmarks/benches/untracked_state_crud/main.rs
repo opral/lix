@@ -23,7 +23,7 @@ use lix_engine::storage_adapter::{
     StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
     StorageWriteOptions,
 };
-use lix_engine::{Engine, SessionContext, Storage};
+use lix_engine::{Engine, SessionContext, Storage, Value};
 use lix_rocksdb_storage::RocksDB;
 #[cfg(feature = "slatedb")]
 use lix_slatedb_storage::SlateDB;
@@ -1149,14 +1149,20 @@ async fn insert_untracked_json_pointer_rows<StorageImpl>(
         .begin_transaction()
         .await
         .expect("begin untracked insert transaction");
-    for chunk in rows.chunks(SESSION_INSERT_CHUNK_SIZE) {
-        let sql = insert_untracked_json_pointer_sql(chunk);
+    for row in rows {
         let affected = transaction
-            .execute(&sql, &[])
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ($1, lix_json($2), true)",
+                &[
+                    Value::Text(row.path.clone()),
+                    Value::Text(row.value_json.clone()),
+                ],
+            )
             .await
             .expect("insert untracked json_pointer rows")
             .rows_affected();
-        assert_eq!(affected as usize, chunk.len());
+        assert_eq!(affected, 1);
     }
     transaction
         .commit()
@@ -1258,14 +1264,20 @@ async fn update_untracked_json_pointer_rows<StorageImpl>(
         .begin_transaction()
         .await
         .expect("begin untracked update transaction");
-    for chunk in rows.chunks(SESSION_INSERT_CHUNK_SIZE) {
-        let sql = update_untracked_json_pointer_sql(chunk);
+    for row in rows {
         let affected = transaction
-            .execute(&sql, &[])
+            .execute(
+                "UPDATE json_pointer SET value = lix_json($1) \
+                 WHERE path = $2 AND lixcol_untracked = true",
+                &[
+                    Value::Text(row.updated_value_json.clone()),
+                    Value::Text(row.path.clone()),
+                ],
+            )
             .await
             .expect("update untracked json_pointer rows")
             .rows_affected();
-        assert_eq!(affected as usize, chunk.len());
+        assert_eq!(affected, 1);
     }
     transaction
         .commit()
@@ -1460,43 +1472,6 @@ fn raw_rows(rows: &[PointerRow]) -> Vec<RawUntrackedRow> {
             global: false,
         })
         .collect()
-}
-
-fn insert_untracked_json_pointer_sql(rows: &[PointerRow]) -> String {
-    let mut sql = String::from("INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ");
-    for (index, row) in rows.iter().enumerate() {
-        if index > 0 {
-            sql.push(',');
-        }
-        let _ = write!(
-            sql,
-            "('{}', lix_json('{}'), true)",
-            sql_string(row.path.as_str()),
-            sql_string(row.value_json.as_str())
-        );
-    }
-    sql
-}
-
-fn update_untracked_json_pointer_sql(rows: &[PointerRow]) -> String {
-    let mut sql = String::from("UPDATE json_pointer SET value = CASE path ");
-    for row in rows {
-        let _ = write!(
-            sql,
-            "WHEN '{}' THEN lix_json('{}') ",
-            sql_string(&row.path),
-            sql_string(&row.updated_value_json)
-        );
-    }
-    sql.push_str("ELSE value END WHERE lixcol_untracked = true AND path IN (");
-    for (index, row) in rows.iter().enumerate() {
-        if index > 0 {
-            sql.push(',');
-        }
-        let _ = write!(sql, "'{}'", sql_string(&row.path));
-    }
-    sql.push(')');
-    sql
 }
 
 fn entity_pk(row: &PointerRow) -> String {
