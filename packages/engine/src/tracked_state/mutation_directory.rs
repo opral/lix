@@ -219,7 +219,7 @@ pub(crate) fn build_mutation_directory(
     entries: &[MutationDirectoryEntry],
 ) -> Result<BuiltMutationDirectory, LixError> {
     validate_entries(layout, entries)?;
-    build_stored_mutation_directory(layout, entries.iter().map(stored_entry).collect())
+    build_stored_mutation_directory(layout, entries.iter().map(stored_entry))
 }
 
 pub(crate) fn build_bounded_mutation_directory(
@@ -236,6 +236,14 @@ pub(crate) fn build_bounded_mutation_directory(
     } else {
         LAYOUT_BOUNDED_INDIRECT
     };
+    if parts.iter().any(|part| !valid_part(part))
+        || parts
+            .windows(2)
+            .any(|pair| pair[0].last_key >= pair[1].first_key)
+        || direct_row_counts.is_some_and(|rows| rows.contains(&0))
+    {
+        return Err(directory_error("bounded entries overlap or are invalid"));
+    }
     let entries = parts
         .iter()
         .enumerate()
@@ -244,8 +252,7 @@ pub(crate) fn build_bounded_mutation_directory(
             last_key: part.last_key.clone(),
             replacement_part: part.replacement_part.clone(),
             direct_row_count: direct_row_counts.map_or(0, |rows| rows[index]),
-        })
-        .collect();
+        });
     build_stored_mutation_directory(layout, entries)
 }
 
@@ -258,6 +265,9 @@ pub(crate) fn build_compact_replacement_mutation_directory(
             "compact replacement counts do not match digest count",
         ));
     }
+    if content_digests.contains(&[0; 32]) || direct_row_counts.contains(&0) {
+        return Err(directory_error("compact replacement entry is invalid"));
+    }
     build_stored_mutation_directory(
         LAYOUT_COMPACT_REPLACEMENT,
         content_digests
@@ -269,30 +279,34 @@ pub(crate) fn build_compact_replacement_mutation_directory(
                     content_digest,
                     direct_row_count,
                 },
-            )
-            .collect(),
+            ),
     )
 }
 
 pub(crate) fn build_direct_rows_mutation_directory(
     direct_row_counts: &[u16],
 ) -> Result<BuiltMutationDirectory, LixError> {
+    if direct_row_counts.contains(&0) {
+        return Err(directory_error("direct-address entry is invalid"));
+    }
     build_stored_mutation_directory(
         LAYOUT_DIRECT_ROWS_ONLY,
         direct_row_counts
             .iter()
             .copied()
-            .map(|direct_row_count| StoredEntry::DirectAddress { direct_row_count })
-            .collect(),
+            .map(|direct_row_count| StoredEntry::DirectAddress { direct_row_count }),
     )
 }
 
-fn build_stored_mutation_directory(
+fn build_stored_mutation_directory<I>(
     layout: u8,
-    entries: Vec<StoredEntry>,
-) -> Result<BuiltMutationDirectory, LixError> {
-    validate_stored_entries(layout, &entries)?;
-    if entries.is_empty() {
+    entries: I,
+) -> Result<BuiltMutationDirectory, LixError>
+where
+    I: ExactSizeIterator<Item = StoredEntry>,
+{
+    validate_layout(layout)?;
+    if entries.len() == 0 {
         return Err(directory_error("cannot build an empty directory"));
     }
     let mut nodes = BTreeMap::new();
@@ -453,7 +467,6 @@ pub(crate) async fn route_mutation_directory_points(
     #[derive(Clone)]
     struct Pending {
         output_index: usize,
-        key: Vec<u8>,
         base_index: u32,
         expected: Option<NodeSummary>,
     }
@@ -462,9 +475,8 @@ pub(crate) async fn route_mutation_directory_points(
         root.root_id,
         keys.iter()
             .enumerate()
-            .map(|(output_index, key)| Pending {
+            .map(|(output_index, _)| Pending {
                 output_index,
-                key: key.to_vec(),
                 base_index: 0,
                 expected: None,
             })
@@ -477,6 +489,7 @@ pub(crate) async fn route_mutation_directory_points(
         let mut next = BTreeMap::<[u8; 32], Vec<Pending>>::new();
         for ((node_id, pending), (node, summary)) in frontier.into_iter().zip(loaded.into_iter()) {
             for request in pending {
+                let key = keys[request.output_index];
                 match request.expected.as_ref() {
                     Some(expected) if expected != &summary => {
                         return Err(directory_error("point route child summary mismatch"));
@@ -488,15 +501,15 @@ pub(crate) async fn route_mutation_directory_points(
                 }
                 match &node {
                     StoredNode::Leaf { entries, .. } => {
-                        let index = match entries.binary_search_by(|entry| {
-                            stored_entry_first_key(entry).cmp(request.key.as_slice())
-                        }) {
+                        let index = match entries
+                            .binary_search_by(|entry| stored_entry_first_key(entry).cmp(key))
+                        {
                             Ok(index) => index,
                             Err(0) => continue,
                             Err(index) => index - 1,
                         };
                         let entry = runtime_entry(entries[index].clone())?;
-                        if request.key.as_slice() <= entry.last_key() {
+                        if key <= entry.last_key() {
                             let MutationDirectoryEntry::Bounded {
                                 part,
                                 direct_row_count,
@@ -517,15 +530,15 @@ pub(crate) async fn route_mutation_directory_points(
                         }
                     }
                     StoredNode::Internal { children, .. } => {
-                        let index = match children.binary_search_by(|child| {
-                            child.first_key.as_slice().cmp(request.key.as_slice())
-                        }) {
+                        let index = match children
+                            .binary_search_by(|child| child.first_key.as_slice().cmp(key))
+                        {
                             Ok(index) => index,
                             Err(0) => continue,
                             Err(index) => index - 1,
                         };
                         let child = &children[index];
-                        if request.key.as_slice() > child.last_key.as_slice() {
+                        if key > child.last_key.as_slice() {
                             continue;
                         }
                         let preceding = children[..index].iter().try_fold(0u32, |sum, child| {
@@ -544,6 +557,98 @@ pub(crate) async fn route_mutation_directory_points(
                 }
             }
             let _ = node_id;
+        }
+        frontier = next;
+    }
+    Ok(output)
+}
+
+/// Loads only bounded-directory entries intersecting one of the requested
+/// half-open key ranges. An empty range list selects the complete directory.
+/// Every visited node is authenticated against its parent summary and the
+/// header-owned root; unrelated subtrees are never decoded.
+pub(crate) async fn load_bounded_mutation_directory_ranges(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &MutationDirectoryRoot,
+    ranges: &[(&[u8], Option<&[u8]>)],
+) -> Result<Vec<MutationDirectoryRoute>, LixError> {
+    validate_root(root)?;
+    if root.layout != LAYOUT_BOUNDED_DIRECT && root.layout != LAYOUT_BOUNDED_INDIRECT {
+        return Err(directory_error("range scan requires a bounded directory"));
+    }
+
+    fn overlaps(first: &[u8], last: &[u8], ranges: &[(&[u8], Option<&[u8]>)]) -> bool {
+        ranges.is_empty()
+            || ranges
+                .iter()
+                .any(|(start, end)| last >= *start && end.is_none_or(|end| first < end))
+    }
+
+    let mut frontier = vec![(root.root_id, 0u32, None::<NodeSummary>)];
+    let mut output = Vec::new();
+    while !frontier.is_empty() {
+        let node_ids = frontier
+            .iter()
+            .map(|(node_id, _, _)| *node_id)
+            .collect::<Vec<_>>();
+        let loaded = load_nodes(store, &node_ids).await?;
+        let mut next = Vec::new();
+        for ((_, base_index, expected), (node, summary)) in frontier.into_iter().zip(loaded) {
+            match expected {
+                Some(expected) if expected != summary => {
+                    return Err(directory_error("range scan child summary mismatch"));
+                }
+                None if !summary_matches_root(&summary, root) => {
+                    return Err(directory_error("range scan root summary mismatch"));
+                }
+                _ => {}
+            }
+            match node {
+                StoredNode::Leaf { entries, .. } => {
+                    for (index, entry) in entries.into_iter().enumerate() {
+                        if !overlaps(
+                            stored_entry_first_key(&entry),
+                            stored_entry_last_key(&entry),
+                            ranges,
+                        ) {
+                            continue;
+                        }
+                        let MutationDirectoryEntry::Bounded {
+                            part,
+                            direct_row_count,
+                        } = runtime_entry(entry)?
+                        else {
+                            return Err(directory_error("bounded leaf contains compact entry"));
+                        };
+                        output.push(MutationDirectoryRoute {
+                            entry_index: base_index
+                                .checked_add(
+                                    u32::try_from(index).map_err(|_| {
+                                        directory_error("leaf entry index overflows")
+                                    })?,
+                                )
+                                .ok_or_else(|| directory_error("entry index overflows"))?,
+                            part,
+                            direct_row_count,
+                        });
+                    }
+                }
+                StoredNode::Internal { children, .. } => {
+                    let mut preceding = 0u32;
+                    for child in children {
+                        let child_base = base_index
+                            .checked_add(preceding)
+                            .ok_or_else(|| directory_error("entry offset overflows"))?;
+                        preceding = preceding
+                            .checked_add(child.entry_count)
+                            .ok_or_else(|| directory_error("entry offset overflows"))?;
+                        if overlaps(&child.first_key, &child.last_key, ranges) {
+                            let summary = NodeSummary::from(&child);
+                            next.push((child.node_id, child_base, Some(summary)));
+                        }
+                    }
+                }
+            }
         }
         frontier = next;
     }

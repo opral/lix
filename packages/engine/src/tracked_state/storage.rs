@@ -7270,8 +7270,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
             let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
                 return Ok((0..keys.len()).map(|_| None).collect());
             };
-            if keys.len() <= DECODED_COMMIT_DELTA_CACHE_MAX_POINT_KEYS
-                && state.mutations.selected_source_commit_id.is_none()
+            if state.mutations.selected_source_commit_id.is_none()
                 && state.mutations.inline_part.is_empty()
                 && state.mutation_directory_root.as_ref().is_some_and(|root| {
                     root.layout == super::mutation_directory::LAYOUT_BOUNDED_DIRECT
@@ -7698,33 +7697,194 @@ pub(crate) async fn scan_commit_delta_values(
     commit_id: CommitId,
     schema_keys: &[String],
 ) -> Result<DecodedCommitDeltaBatch, LixError> {
-    scan_commit_delta_values_with_cache(store, commit_id, schema_keys, None).await
+    Box::pin(scan_commit_delta_values_with_cache(
+        store,
+        commit_id,
+        schema_keys,
+        None,
+    ))
+    .await
 }
 
 pub(crate) async fn scan_commit_delta_values_with_cache(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     schema_keys: &[String],
-    point_cache: Option<&CommitDeltaPointReadCache>,
+    _point_cache: Option<&CommitDeltaPointReadCache>,
 ) -> Result<DecodedCommitDeltaBatch, LixError> {
-    let Some(manifest) = load_commit_delta_manifest_cached(store, commit_id, point_cache).await?
-    else {
+    let Some(state) = load_point_replay_commit_state(store, commit_id).await? else {
         return Ok(DecodedCommitDeltaBatch::default());
     };
-    let Some(source_commit_id) = manifest.selected_source_commit_id() else {
-        return scan_local_commit_delta_values(store, commit_id, schema_keys, &manifest).await;
+    let Some(source_commit_id) = state.mutations.selected_source_commit_id() else {
+        return Box::pin(scan_authenticated_local_commit_delta_values(
+            store,
+            &state,
+            schema_keys,
+        ))
+        .await;
     };
-    let source = match load_commit_delta_manifest_cached(store, source_commit_id, point_cache)
-        .await?
-    {
-        Some(source_manifest) => {
-            scan_local_commit_delta_values(store, source_commit_id, schema_keys, &source_manifest)
-                .await?
+    let source = match load_point_replay_commit_state(store, source_commit_id).await? {
+        Some(source_state) => {
+            if source_state.mutations.selected_source_commit_id.is_some() {
+                return Err(replacement_payload_error(
+                    "selected-source mutation authority cannot alias another source",
+                ));
+            }
+            Box::pin(scan_authenticated_local_commit_delta_values(
+                store,
+                &source_state,
+                schema_keys,
+            ))
+            .await?
         }
         None => DecodedCommitDeltaBatch::default(),
     };
-    let local = scan_local_commit_delta_values(store, commit_id, schema_keys, &manifest).await?;
+    let local = Box::pin(scan_authenticated_local_commit_delta_values(
+        store,
+        &state,
+        schema_keys,
+    ))
+    .await?;
     merge_selected_source_batches(source, local, commit_id)
+}
+
+async fn scan_authenticated_local_commit_delta_values(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &AuthenticatedReplayCommitStateManifest,
+    schema_keys: &[String],
+) -> Result<DecodedCommitDeltaBatch, LixError> {
+    let Some(root) = state.mutation_directory_root.as_ref() else {
+        let manifest = commit_delta_manifest_from_commit_state(state);
+        return Box::pin(scan_local_commit_delta_values(
+            store,
+            state.commit_id,
+            schema_keys,
+            &manifest,
+        ))
+        .await;
+    };
+    if root.layout == super::mutation_directory::LAYOUT_BOUNDED_DIRECT
+        || root.layout == super::mutation_directory::LAYOUT_BOUNDED_INDIRECT
+    {
+        return Box::pin(scan_bounded_commit_delta_values(store, state, schema_keys)).await;
+    }
+    if root.layout == super::mutation_directory::LAYOUT_DIRECT_ROWS_ONLY {
+        let manifest = commit_delta_manifest_from_commit_state(state);
+        return Box::pin(scan_local_commit_delta_values(
+            store,
+            state.commit_id,
+            schema_keys,
+            &manifest,
+        ))
+        .await;
+    }
+    if root.layout != super::mutation_directory::LAYOUT_COMPACT_REPLACEMENT {
+        return Err(replacement_payload_error(
+            "mutation scan encountered an unsupported directory layout",
+        ));
+    }
+
+    // Compact replacement parts have ordinal identities rather than key
+    // bounds, so a schema scan must authenticate their complete digest list.
+    // This is a layout-specific traversal, not a general manifest expansion.
+    let entries = super::mutation_directory::load_mutation_directory(store, root).await?;
+    let mut expanded_state = state.manifest.clone();
+    for entry in entries {
+        let super::mutation_directory::MutationDirectoryEntry::CompactReplacement {
+            content_digest,
+            direct_row_count,
+        } = entry
+        else {
+            return Err(replacement_payload_error(
+                "compact replacement directory contains a bounded entry",
+            ));
+        };
+        expanded_state
+            .mutations
+            .replacement_part_digests
+            .push(content_digest);
+        expanded_state
+            .mutations
+            .direct_part_row_counts
+            .push(direct_row_count);
+    }
+    let manifest = expanded_commit_delta_manifest_from_commit_state(store, &expanded_state).await?;
+    validate_commit_delta_manifest(&manifest)?;
+    Box::pin(scan_local_commit_delta_values(
+        store,
+        state.commit_id,
+        schema_keys,
+        &manifest,
+    ))
+    .await
+}
+
+async fn scan_bounded_commit_delta_values(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &AuthenticatedReplayCommitStateManifest,
+    schema_keys: &[String],
+) -> Result<DecodedCommitDeltaBatch, LixError> {
+    let root = state.mutation_directory_root.as_ref().ok_or_else(|| {
+        replacement_payload_error("bounded mutation scan omitted its directory root")
+    })?;
+    let encoded_ranges = schema_keys
+        .iter()
+        .map(|schema_key| {
+            let start = encode_schema_key_prefix(schema_key);
+            let end = prefix_successor(&start);
+            (start, end)
+        })
+        .collect::<Vec<_>>();
+    let ranges = encoded_ranges
+        .iter()
+        .map(|(start, end)| (start.as_slice(), end.as_deref()))
+        .collect::<Vec<_>>();
+    let routes =
+        super::mutation_directory::load_bounded_mutation_directory_ranges(store, root, &ranges)
+            .await?;
+    if routes.is_empty() {
+        return Ok(DecodedCommitDeltaBatch::default());
+    }
+    let storage_keys = routes
+        .iter()
+        .map(|route| {
+            commit_delta_segment_key_for_bounds(
+                state.commit_id,
+                usize::try_from(route.entry_index)
+                    .map_err(|_| replacement_payload_error("part index exceeds usize"))?,
+                &CommitDeltaSegmentBounds {
+                    first_key: route.part.first_key.clone(),
+                    last_key: route.part.last_key.clone(),
+                    replacement_part: route.part.replacement_part.clone(),
+                },
+            )
+            .map(|key| StorageKey(Bytes::from(key)))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let segments = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    let requested_schemas = schema_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut batch = DecodedCommitDeltaBatchBuilder::with_capacity(
+        routes.len().saturating_mul(COMMIT_DELTA_SEGMENT_MAX_ROWS),
+        routes.len(),
+    );
+    for (route, value) in routes.into_iter().zip(segments.value) {
+        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+            replacement_payload_error("bounded mutation scan references a missing immutable part")
+        })?;
+        let bounds = CommitDeltaSegmentBounds {
+            first_key: route.part.first_key,
+            last_key: route.part.last_key,
+            replacement_part: route.part.replacement_part,
+        };
+        let leaf = decode_commit_delta_leaf(&bytes, Some(&bounds))?;
+        batch.push_leaf(leaf, state.commit_id, &requested_schemas)?;
+    }
+    Ok(batch.finish())
 }
 
 async fn scan_local_commit_delta_values(
@@ -12314,7 +12474,9 @@ mod tests {
             inventory_requests: std::sync::Arc::clone(&inventory_requests),
             directory_requests: std::sync::Arc::clone(&directory_requests),
         };
-        let routed_indices = [0usize, ROW_COUNT / 2, ROW_COUNT - 1];
+        let routed_indices = (0..33usize)
+            .map(|index| index * (ROW_COUNT - 1) / 32)
+            .collect::<Vec<_>>();
         let routed_keys = routed_indices
             .iter()
             .map(|&index| TrackedStateKeyRef {
