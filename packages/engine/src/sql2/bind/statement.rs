@@ -1369,10 +1369,10 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         | PublicSurfaceKind::CheckpointByBranch
         | PublicSurfaceKind::WorkingDiff
         | PublicSurfaceKind::WorkingDiffByBranch
-        | PublicSurfaceKind::FileWorkingChange
-        | PublicSurfaceKind::FileWorkingChangeByBranch
-        | PublicSurfaceKind::DirectoryWorkingChange
-        | PublicSurfaceKind::DirectoryWorkingChangeByBranch => {
+        | PublicSurfaceKind::FileWorkingDiff
+        | PublicSurfaceKind::FileWorkingDiffByBranch
+        | PublicSurfaceKind::DirectoryWorkingDiff
+        | PublicSurfaceKind::DirectoryWorkingDiffByBranch => {
             unreachable!("write capability checked before target binding")
         }
     }

@@ -41,9 +41,9 @@ pub(crate) enum PublicSurfaceKind {
     Revert,
     Apply,
     CreateCheckpoint,
-    FileWorkingChange,
-    FileWorkingChangeByBranch,
-    DirectoryWorkingChange,
-    DirectoryWorkingChangeByBranch,
+    FileWorkingDiff,
+    FileWorkingDiffByBranch,
+    DirectoryWorkingDiff,
+    DirectoryWorkingDiffByBranch,
     Change,
 }

@@ -16,7 +16,7 @@ history, not acceptance evidence.
 - Each measured interval changes 10 files across 5 atomic auto-commits.
 - 5,000 auto-commits and 10,000 file versions are compacted in total.
 - The run checks 10,000 live files and their deterministic payloads after
-  checkpointing, zero working changes, 1,002 visible checkpoints, and the same
+  checkpointing, zero working diffs, 1,002 visible checkpoints, and the same
   history after reopen.
 
 The harness detects checkpoint GC from the engine's post-collection tracing
@@ -155,7 +155,7 @@ from a 182.155 ms first-100 mean to a 418.514 ms last-100 mean.
 
 At depth 1,000, repeated optimized runs measured:
 
-- `lix_working_change`: 2.567-3.273 ms.
+- `lix_working_diff`: 2.567-3.273 ms.
 - Full `lix_checkpoint` history: 3.504-4.923 ms.
 - Reopen plus full checkpoint history: 3.887-4.182 ms.
 - Peak RSS in the median wall-time run: 290,700 KiB.

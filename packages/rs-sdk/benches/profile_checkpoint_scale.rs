@@ -315,7 +315,7 @@ where
         file_count
     );
     assert_eq!(
-        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_change").await,
+        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff").await,
         0
     );
     lix.close().await.expect("close checkpoint setup lix");
@@ -551,13 +551,13 @@ async fn run_workload<S>(
         expected_payloads,
         "checkpoint run must preserve the deterministic final file contents"
     );
-    let working_change_query_start = Instant::now();
-    let remaining_working_changes =
-        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_change").await;
-    let working_change_query_elapsed = working_change_query_start.elapsed();
+    let working_diff_query_start = Instant::now();
+    let remaining_working_diffs =
+        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff").await;
+    let working_diff_query_elapsed = working_diff_query_start.elapsed();
     assert_eq!(
-        remaining_working_changes, 0,
-        "checkpoint run must leave no working changes"
+        remaining_working_diffs, 0,
+        "checkpoint run must leave no working diffs"
     );
     let checkpoint_history_query_start = Instant::now();
     let visible_checkpoint_count =
@@ -627,9 +627,9 @@ async fn run_workload<S>(
         peak_sampled_storage_bytes,
     );
     println!(
-        "surface working_change_ms={:.3} checkpoint_history_ms={:.3} \
+        "surface working_diff_ms={:.3} checkpoint_history_ms={:.3} \
          reopen_and_checkpoint_history_ms={:.3}",
-        millis(working_change_query_elapsed),
+        millis(working_diff_query_elapsed),
         millis(checkpoint_history_query_elapsed),
         millis(reopen_and_history_elapsed),
     );
@@ -904,8 +904,7 @@ where
     let open_elapsed = open_start.elapsed();
 
     let working_start = Instant::now();
-    let working_count =
-        scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_change").await;
+    let working_count = scalar_count(&lix, "SELECT count(*) AS count FROM lix_working_diff").await;
     let working_elapsed = working_start.elapsed();
     let limited_sql = "SELECT commit_id FROM lix_checkpoint LIMIT 20";
     let medium_sql = "SELECT commit_id FROM lix_checkpoint LIMIT 128";
@@ -942,7 +941,7 @@ where
     drop(storage);
 
     println!(
-        "surface backend={} open_ms={:.3} working_change_ms={:.3} working_changes={} \
+        "surface backend={} open_ms={:.3} working_diff_ms={:.3} working_diffs={} \
          checkpoint_history_limit_20_ms={:.3} limited_checkpoints={} \
          checkpoint_history_limit_128_ms={:.3} medium_checkpoints={} \
          checkpoint_history_full_ms={:.3} checkpoint_history_count_ms={:.3} \

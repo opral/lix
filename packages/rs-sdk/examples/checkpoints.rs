@@ -4,7 +4,7 @@ use lix_sdk::{LixError, OpenLixOptions, Value, open_lix};
 async fn main() -> Result<(), LixError> {
     let lix = open_lix(OpenLixOptions::default()).await?;
 
-    // Writes to a tracked SQL surface create ordinary working changes.
+    // Writes to a tracked SQL surface create ordinary working diffs.
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
         &[
@@ -14,23 +14,23 @@ async fn main() -> Result<(), LixError> {
     )
     .await?;
 
-    let working_changes = lix
+    let working_diffs = lix
         .execute(
-            "SELECT entity_pk, schema_key, change_kind
-             FROM lix_working_change
+            "SELECT entity_pk, schema_key, diff_type
+             FROM lix_working_diff
              ORDER BY schema_key, entity_pk",
             &[],
         )
         .await?;
 
-    for row in working_changes.rows() {
+    for row in working_diffs.rows() {
         // Row::get<T> performs typed extraction from ExecuteResult.
         let entity_pk = row.get::<serde_json::Value>("entity_pk")?;
         let schema_key = row.get::<String>("schema_key")?;
-        let change_kind = row.get::<String>("change_kind")?;
-        println!("{change_kind} {schema_key} {entity_pk}");
+        let diff_type = row.get::<String>("diff_type")?;
+        println!("{diff_type} {schema_key} {entity_pk}");
     }
-    assert_eq!(working_changes.len(), 1);
+    assert_eq!(working_diffs.len(), 1);
 
     let checkpoint = lix.create_checkpoint().await?;
     println!("created checkpoint {}", checkpoint.commit_id);
@@ -56,11 +56,11 @@ async fn main() -> Result<(), LixError> {
     );
 
     let remaining = lix
-        .execute("SELECT COUNT(*) AS count FROM lix_working_change", &[])
+        .execute("SELECT COUNT(*) AS count FROM lix_working_diff", &[])
         .await?;
     let remaining_count = remaining.rows()[0].get::<i64>("count")?;
     assert_eq!(remaining_count, 0);
-    println!("working changes after checkpoint: {remaining_count}");
+    println!("working diffs after checkpoint: {remaining_count}");
 
     lix.close().await?;
     Ok(())

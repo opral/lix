@@ -28,7 +28,7 @@ use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters}
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 use crate::sql2::error::lix_error_to_datafusion_error;
 
-pub(super) async fn register_working_change_provider<S>(
+pub(super) async fn register_working_diff_provider<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
     active_branch_id: Option<String>,
@@ -42,7 +42,7 @@ where
     register_spec_table(
         session,
         surface_name,
-        Arc::new(WorkingChangeSpec {
+        Arc::new(WorkingDiffSpec {
             by_branch: active_branch_id.is_none(),
             active_branch_id,
             branch_ref,
@@ -53,7 +53,7 @@ where
     )
 }
 
-struct WorkingChangeSpec<S> {
+struct WorkingDiffSpec<S> {
     by_branch: bool,
     active_branch_id: Option<String>,
     branch_ref: Arc<dyn BranchRefReader>,
@@ -62,7 +62,7 @@ struct WorkingChangeSpec<S> {
 }
 
 #[async_trait]
-impl<S> TableSpec for WorkingChangeSpec<S>
+impl<S> TableSpec for WorkingDiffSpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -75,7 +75,7 @@ where
     }
 
     fn schema(&self) -> SchemaRef {
-        working_change_schema(self.by_branch)
+        working_diff_schema(self.by_branch)
     }
 
     fn table_type(&self) -> TableType {
@@ -103,7 +103,7 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema(), projection);
-        let route = WorkingChangeRoute::from_filters(filters)?;
+        let route = WorkingDiffRoute::from_filters(filters)?;
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -119,9 +119,9 @@ where
                 ),
                 move |(active_branch_id, branch_ref, commit_graph, store, schema, route)| async move {
                     if route.contradictory {
-                        return WORKING_CHANGE_COLS
+                        return WORKING_DIFF_COLS
                             .build(schema, &[])
-                            .map_err(working_change_batch_error);
+                            .map_err(working_diff_batch_error);
                     }
                     let heads = selected_heads(
                         branch_ref.as_ref(),
@@ -169,7 +169,7 @@ where
                             }
                             let graph = graph
                                 .as_mut()
-                                .expect("historical working-change graph should be initialized");
+                                .expect("historical working-diff graph should be initialized");
                             let tracked = tracked.get_or_insert_with(|| {
                                 TrackedStateContext::new().reader(store.clone())
                             });
@@ -203,7 +203,7 @@ where
                             {
                                 continue;
                             }
-                            rows.push(WorkingChangeSqlRow {
+                            rows.push(WorkingDiffSqlRow {
                                 diff_id: encode_diff_id(
                                     entry.before.as_ref().map(|row| row.change_id),
                                     entry.after.as_ref().map(|row| row.change_id),
@@ -225,9 +225,9 @@ where
                             }
                         }
                     }
-                    WORKING_CHANGE_COLS
+                    WORKING_DIFF_COLS
                         .build(schema, &rows)
-                        .map_err(working_change_batch_error)
+                        .map_err(working_diff_batch_error)
                 },
             ),
         })
@@ -235,13 +235,13 @@ where
 }
 
 #[derive(Clone, Debug)]
-struct WorkingChangeRoute {
+struct WorkingDiffRoute {
     branch_ids: FileIdConstraint,
     diff_request: TrackedStateDiffRequest,
     contradictory: bool,
 }
 
-impl WorkingChangeRoute {
+impl WorkingDiffRoute {
     fn from_filters(filters: &[Expr]) -> Result<Self> {
         let conjuncts = filter_conjuncts(filters);
         let branch_ids =
@@ -297,7 +297,7 @@ fn string_constraint_values(constraint: FileIdConstraint) -> Option<Vec<String>>
     }
 }
 
-pub(super) fn working_change_schema(by_branch: bool) -> SchemaRef {
+pub(super) fn working_diff_schema(by_branch: bool) -> SchemaRef {
     let mut fields = vec![
         Field::new("diff_id", DataType::Utf8, false),
         json_field("entity_pk", false),
@@ -313,7 +313,7 @@ pub(super) fn working_change_schema(by_branch: bool) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-struct WorkingChangeSqlRow {
+struct WorkingDiffSqlRow {
     diff_id: Result<String, LixError>,
     entity_pk: Result<String, LixError>,
     schema_key: String,
@@ -324,7 +324,7 @@ struct WorkingChangeSqlRow {
     branch_id: String,
 }
 
-static WORKING_CHANGE_COLS: ColumnTable<WorkingChangeSqlRow> = ColumnTable {
+static WORKING_DIFF_COLS: ColumnTable<WorkingDiffSqlRow> = ColumnTable {
     columns: &[
         (
             "diff_id",
@@ -349,10 +349,10 @@ static WORKING_CHANGE_COLS: ColumnTable<WorkingChangeSqlRow> = ColumnTable {
     ],
 };
 
-fn working_change_batch_error(error: ColumnTableError) -> DataFusionError {
+fn working_diff_batch_error(error: ColumnTableError) -> DataFusionError {
     match error {
         ColumnTableError::UnsupportedColumn(column) => {
-            DataFusionError::Execution(format!("unsupported working-change column '{column}'"))
+            DataFusionError::Execution(format!("unsupported working-diff column '{column}'"))
         }
         ColumnTableError::Arrow(error) | ColumnTableError::ArrowZeroColumn(error) => {
             DataFusionError::from(error)
@@ -367,17 +367,17 @@ mod tests {
 
     use crate::NullableKeyFilter;
 
-    use super::{FileIdConstraint, WorkingChangeRoute};
+    use super::{FileIdConstraint, WorkingDiffRoute};
 
     #[test]
     fn routes_exact_branch_and_tracked_identity_filters() {
-        let route = WorkingChangeRoute::from_filters(&[
+        let route = WorkingDiffRoute::from_filters(&[
             col("lixcol_branch_id").eq(lit("01920000-0000-7000-8000-0000000000a1")),
             col("schema_key").eq(lit("acme_task")),
             col("entity_pk").eq(lit("[\"task-a\"]")),
             col("file_id").eq(lit("01920000-0000-7000-8000-0000000000a2")),
         ])
-        .expect("exact working-change filters should route");
+        .expect("exact working-diff filters should route");
 
         assert_eq!(
             route.branch_ids,
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn contradictory_exact_filters_short_circuit() {
-        let route = WorkingChangeRoute::from_filters(&[
+        let route = WorkingDiffRoute::from_filters(&[
             col("schema_key").eq(lit("acme_task")),
             col("schema_key").eq(lit("acme_note")),
         ])

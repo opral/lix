@@ -423,9 +423,9 @@ async fn setup<StorageImpl>(
     }
     let writes_elapsed = writes_start.elapsed();
     let expected_changes = shape.expected_changes(row_count, commit_count, changes_per_commit);
-    let working_changes = working_change_count(&session).await;
+    let working_diffs = working_diff_count(&session).await;
     assert_eq!(
-        working_changes, expected_changes,
+        working_diffs, expected_changes,
         "populated working-diff fixture must expose every expected identity"
     );
     let branch_id = session
@@ -441,7 +441,7 @@ async fn setup<StorageImpl>(
     drop(engine);
     println!(
         "tracked_working_diff setup backend={} shape={} rows={row_count} commits={commit_count} \
-         changes_per_commit={changes_per_commit} working_changes={working_changes} \
+         changes_per_commit={changes_per_commit} working_diffs={working_diffs} \
          base_commit_id={} head_commit_id={} seed_ms={:.3} initial_checkpoint_ms={:.3} writes_ms={:.3}",
         backend.name(),
         shape_name(shape),
@@ -470,25 +470,25 @@ async fn measure<StorageImpl>(
         .await
         .expect("open tracked-working-diff session");
 
-    let expected_changes = working_change_count(&session).await;
+    let expected_changes = working_diff_count(&session).await;
     assert!(
         expected_changes > 0,
-        "fixture has no populated working changes"
+        "fixture has no populated working diffs"
     );
     // Warm SQL/provider construction and the RocksDB block cache outside the
     // reported samples. Repeated measurements remain read-only.
-    assert_eq!(working_change_count(&session).await, expected_changes);
+    assert_eq!(working_diff_count(&session).await, expected_changes);
     let mut latencies = Vec::with_capacity(repetitions);
     for _ in 0..repetitions {
         let start = Instant::now();
-        let count = profile_working_change_query(&session).await;
+        let count = profile_working_diff_query(&session).await;
         latencies.push(start.elapsed());
         assert_eq!(count, expected_changes);
     }
     let mut sorted = latencies.clone();
     sorted.sort_unstable();
     println!(
-        "tracked_working_diff measure backend={} working_changes={expected_changes} \
+        "tracked_working_diff measure backend={} working_diffs={expected_changes} \
          repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
         backend.name(),
         millis(sorted[sorted.len() / 2]),
@@ -521,10 +521,10 @@ async fn measure_history<StorageImpl>(
         .open_workspace_session()
         .await
         .expect("open tracked-working-diff session");
-    let expected_changes = working_change_count(&session).await;
+    let expected_changes = working_diff_count(&session).await;
     assert!(
         expected_changes > 0,
-        "fixture has no populated working changes"
+        "fixture has no populated working diffs"
     );
 
     let warm = diff_tracked_commits_for_bench(&adapter, base_commit_id, head_commit_id)
@@ -552,7 +552,7 @@ async fn measure_history<StorageImpl>(
     let mut sorted = latencies.clone();
     sorted.sort_unstable();
     println!(
-        "tracked_working_diff measure-history backend={} working_changes={expected_changes} \
+        "tracked_working_diff measure-history backend={} working_diffs={expected_changes} \
          repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
         backend.name(),
         millis(sorted[sorted.len() / 2]),
@@ -574,17 +574,17 @@ where
         .open_workspace_session()
         .await
         .expect("open tracked-working-diff session");
-    let before = working_change_count(&session).await;
-    assert!(before > 0, "fixture has no populated working changes");
+    let before = working_diff_count(&session).await;
+    assert!(before > 0, "fixture has no populated working diffs");
     let start = Instant::now();
     session
         .create_checkpoint()
         .await
         .expect("checkpoint populated working-diff fixture");
     let elapsed = start.elapsed();
-    assert_eq!(working_change_count(&session).await, 0);
+    assert_eq!(working_diff_count(&session).await, 0);
     println!(
-        "tracked_working_diff checkpoint backend={} working_changes_before={before} \
+        "tracked_working_diff checkpoint backend={} working_diffs_before={before} \
          checkpoint_ms={:.3}",
         backend.name(),
         millis(elapsed),
@@ -941,7 +941,7 @@ async fn update_commit_range<StorageImpl>(
 }
 
 #[inline(never)]
-async fn profile_working_change_query<StorageImpl>(
+async fn profile_working_diff_query<StorageImpl>(
     session: &lix_engine::SessionContext<StorageImpl>,
 ) -> usize
 where
@@ -954,13 +954,11 @@ where
         .len()
 }
 
-async fn working_change_count<StorageImpl>(
-    session: &lix_engine::SessionContext<StorageImpl>,
-) -> usize
+async fn working_diff_count<StorageImpl>(session: &lix_engine::SessionContext<StorageImpl>) -> usize
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    profile_working_change_query(session).await
+    profile_working_diff_query(session).await
 }
 
 fn row_id(row_index: usize) -> String {

@@ -6,7 +6,7 @@ description: Create restore points and query changes since the latest checkpoint
 
 Lix automatically commits tracked changes. A checkpoint marks one of those
 states as a user-meaningful restore point. The changes after the newest
-checkpoint are the branch's working changes.
+checkpoint are the branch's working diffs.
 
 Create a checkpoint with the Rust SDK:
 
@@ -15,15 +15,15 @@ let checkpoint = lix.create_checkpoint().await?;
 println!("created checkpoint {}", checkpoint.commit_id);
 ```
 
-`create_checkpoint()` checkpoints every working change on the active branch and
+`create_checkpoint()` checkpoints every working diff on the active branch and
 returns the new checkpoint commit ID. It does not take a name or comment.
 
 ## Complete example
 
 The runnable
 [`checkpoints.rs`](https://github.com/opral/lix/blob/main/packages/rs-sdk/examples/checkpoints.rs)
-example writes a tracked row, inspects its working change, creates a checkpoint,
-reads checkpoint history, and verifies that no working changes remain:
+example writes a tracked row, inspects its working diff, creates a checkpoint,
+reads checkpoint history, and verifies that no working diffs remain:
 
 ```rust
 use lix_sdk::{LixError, OpenLixOptions, Value, open_lix};
@@ -103,10 +103,10 @@ Checkpointing has eight read-only SQL surfaces:
 | :-- | :-- | :-- |
 | `lix_working_diff` | Active branch | `diff_id`, `entity_pk`, `schema_key`, `file_id`, `diff_type`, `before_change_id`, `after_change_id` |
 | `lix_working_diff_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
-| `lix_file_working_change` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
-| `lix_file_working_change_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
-| `lix_directory_working_change` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
-| `lix_directory_working_change_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
+| `lix_file_working_diff` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
+| `lix_file_working_diff_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
+| `lix_directory_working_diff` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
+| `lix_directory_working_diff_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
 | `lix_checkpoint` | Active branch | `commit_id`, `created_at`, `lixcol_depth` |
 | `lix_checkpoint_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
 
@@ -114,13 +114,13 @@ Use the unqualified surfaces for the common active-branch workflow. Use their
 `_by_branch` counterparts to inspect multiple branches in one query;
 `lixcol_branch_id` identifies the branch represented by each row.
 
-`diff_type` is `added`, `modified`, or `removed`. Working changes compare the
+`diff_type` is `added`, `modified`, or `removed`. Working diffs compare the
 current branch head with that branch's newest checkpoint. Creating a checkpoint
 makes the current head the new baseline, so `lix_working_diff` is empty until
 another tracked change is committed.
 
 `lix_working_diff` reports canonical source changes, like `lix_change`.
-Use `lix_file_working_change` and `lix_directory_working_change` for composed
+Use `lix_file_working_diff` and `lix_directory_working_diff` for composed
 filesystem revisions. They return one row per logical file or directory,
 preserve a deleted entry's old location in `previous_path`, and expand ancestor
 directory moves into descendants whose composed paths changed. This makes them

@@ -873,7 +873,7 @@ simulation_test!(
 
         assert_key_value(&main, "draft-merge-source", Some("\"draft\"")).await;
         assert_key_value(&main, "main-merge-target", Some("\"main\"")).await;
-        let working_changes = main
+        let working_diffs = main
             .execute(
                 "SELECT entity_pk, diff_type \
                  FROM lix_working_diff \
@@ -882,10 +882,10 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("post-merge working changes should load");
-        assert_eq!(working_changes.len(), 2);
+            .expect("post-merge working diffs should load");
+        assert_eq!(working_diffs.len(), 2);
         assert_eq!(
-            working_changes.rows()[0].values(),
+            working_diffs.rows()[0].values(),
             &[
                 Value::Json(JsonValue::Array(vec![JsonValue::String(
                     "draft-merge-source".to_string()
@@ -895,7 +895,7 @@ simulation_test!(
             "the selected source delta must remain visible against the target checkpoint"
         );
         assert_eq!(
-            working_changes.rows()[1].values(),
+            working_diffs.rows()[1].values(),
             &[
                 Value::Json(JsonValue::Array(vec![JsonValue::String(
                     "main-merge-target".to_string()

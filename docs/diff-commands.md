@@ -40,7 +40,7 @@ SELECT diff_id
 FROM lix_diff($1, $2)
 WHERE schema_key = 'acme_task';
 
--- Move only the selected working changes behind a new checkpoint.
+-- Move only the selected working diffs behind a new checkpoint.
 INSERT INTO lix_create_checkpoint (diff_id)
 SELECT diff_id
 FROM lix_working_diff
