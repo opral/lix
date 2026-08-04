@@ -150,8 +150,9 @@ fn complete_publication_coordinates(
                 crate::tracked_state::types::TrackedStateBaseCoordinate {
                     state_set_id: descriptor.state_set_id,
                     group_index: descriptor.state_group_index,
-                    row_index: u32::try_from(row_index)
-                        .expect("bounded Arrow leaf row count fits u32"),
+                    row_index: u32::from(descriptor.row_offset)
+                        + u32::try_from(row_index)
+                            .expect("bounded Arrow leaf row count fits u32"),
                 },
             );
         }
@@ -321,7 +322,28 @@ pub(super) async fn stage_current_state_catalog(
             replacement = Some(native);
         }
     }
-    let replacement_coordinates = if let Some(entry) = replacement.as_ref() {
+    let decoded_native_members;
+    let planned_members = if inventory.uses_native_arrow_history()
+        && replacement.is_none()
+        && planned_members.is_empty()
+    {
+        decoded_native_members =
+            crate::tracked_state::staged_commit_delta_members_for_write(
+                store, writes, commit_id, inventory,
+            )
+            .await?;
+        decoded_native_members.as_slice()
+    } else {
+        planned_members
+    };
+    let replacement_coordinates = if inventory.replacement_generation.is_some()
+        || inventory.uses_native_arrow_history()
+    {
+        // Complete replacement coordinates are the Arrow row-group ordinals
+        // themselves. Do not rebuild a 10K-entry key map merely to restate
+        // that physical ordering during the publishing commit.
+        std::collections::BTreeMap::new()
+    } else if let Some(entry) = replacement.as_ref() {
         let descriptors = if inventory.replacement_generation.is_some() {
             crate::tracked_state::storage::stage_complete_arrow_current_state_descriptors(
                 writes, commit_id, inventory,
@@ -2563,6 +2585,7 @@ mod tests {
                     *blake3::hash(&index.to_be_bytes()).as_bytes(),
                 ),
                 state_group_index: 0,
+                row_offset: 0,
                 payload_refs_digest: [1; 32],
                 row_count: 10,
             })

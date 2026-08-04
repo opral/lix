@@ -208,6 +208,14 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         Ok(None)
     }
 
+    async fn collection_is_proven_absent(
+        &mut self,
+        _branch_id: &str,
+        _scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<bool, LixError> {
+        Ok(false)
+    }
+
     async fn load_exact_collection_live_count(
         &mut self,
         _branch_id: &str,

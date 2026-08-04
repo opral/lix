@@ -17,7 +17,7 @@ use bytes::Bytes;
 
 use crate::LixError;
 
-pub(crate) const REPLACEMENT_PART_MAX_ROWS: usize = 512;
+pub(crate) const REPLACEMENT_PART_MAX_ROWS: usize = 16 * 1024;
 pub(crate) const REPLACEMENT_PART_TARGET_BYTES: usize = 64 * 1024;
 pub(crate) const REPLACEMENT_PART_MAX_BYTES: usize = 4 * 1024 * 1024;
 

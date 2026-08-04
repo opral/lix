@@ -6,7 +6,7 @@ use async_trait::async_trait;
 #[cfg(test)]
 use datafusion::arrow::array::Array;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
-use datafusion::arrow::compute::filter_record_batch;
+use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::{ColumnStatistics, Precision};
@@ -280,7 +280,15 @@ impl EntitySpec {
         limit: Option<usize>,
     ) -> Result<(SchemaRef, LiveStateScanRequest, Vec<EntityRowFilter>)> {
         let projected_schema = projected_schema(&self.schema, projection);
-        let row_filters = EntityRowFilterAnalyzer::new(&self.spec).analyze_filters(filters)?;
+        let primary_key_analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
+        let row_filter_analyzer = EntityRowFilterAnalyzer::new(&self.spec);
+        let row_filters = row_filter_analyzer.analyze_filters(
+            &filters
+                .iter()
+                .filter(|filter| !primary_key_analyzer.supports(filter))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )?;
         let mut request = entity_live_state_scan_request(
             &self.spec.schema_key,
             self.branch_binding.active_branch_id(),
@@ -931,18 +939,31 @@ async fn entity_columnar_scan_source(
         layout.manifest.groups[group_index].columns[deleted_column].max
             == Some(crate::columnar_row_group::RowGroupScalar::Boolean(true))
     };
-    let mut all_reconciled_statistics_cached =
-        !group_indices.iter().copied().any(group_has_tombstones);
-    let mut base_statistics_cached = Vec::with_capacity(group_indices.len());
-    let mut statistics = if layout.overlay.is_empty() {
+    let group_is_slice = |group_index: usize| {
+        let source = &layout.group_sources[group_index];
+        source.row_offset != 0
+            || source.row_count
+                != source.manifest.groups[source.group_index].row_count as usize
+    };
+    let mut all_reconciled_statistics_cached = !group_indices
+        .iter()
+        .copied()
+        .any(|group_index| group_has_tombstones(group_index) || group_is_slice(group_index));
+    let mut base_statistics_cached = vec![false; layout.manifest.groups.len()];
+    let base_statistics = if layout.overlay.is_empty() {
         group_indices
             .iter()
             .map(|&group_index| {
                 if group_has_tombstones(group_index) {
-                    base_statistics_cached.push(false);
-                    Statistics::new_unknown(schema.as_ref())
+                    Statistics::new_unknown(schema.as_ref()).with_num_rows(Precision::Inexact(
+                        layout.manifest.groups[group_index].row_count as usize,
+                    ))
+                } else if group_is_slice(group_index) {
+                    Statistics::new_unknown(schema.as_ref()).with_num_rows(Precision::Exact(
+                        layout.manifest.groups[group_index].row_count as usize,
+                    ))
                 } else {
-                    base_statistics_cached.push(true);
+                    base_statistics_cached[group_index] = true;
                     entity_columnar_group_statistics(
                         &layout.manifest.groups[group_index],
                         &projection,
@@ -954,11 +975,12 @@ async fn entity_columnar_scan_source(
     } else {
         let mut cached = Vec::with_capacity(group_indices.len());
         for &group_index in &group_indices {
-            if coordinate_shadow_masks
-                .as_ref()
-                .is_some_and(|masks| masks[group_index].is_none())
+            if !group_is_slice(group_index)
+                && coordinate_shadow_masks
+                    .as_ref()
+                    .is_some_and(|masks| masks[group_index].is_none())
             {
-                base_statistics_cached.push(true);
+                base_statistics_cached[group_index] = true;
                 cached.push(entity_columnar_group_statistics(
                     &layout.manifest.groups[group_index],
                     &projection,
@@ -977,18 +999,55 @@ async fn entity_columnar_scan_source(
                 .map_err(lix_error_to_datafusion_error)?
             {
                 Some(statistics) => {
-                    base_statistics_cached.push(true);
+                    base_statistics_cached[group_index] = true;
                     cached.push(statistics);
                 }
                 None => {
                     all_reconciled_statistics_cached = false;
-                    base_statistics_cached.push(false);
-                    cached.push(Statistics::new_unknown(schema.as_ref()));
+                    let row_count = layout.manifest.groups[group_index].row_count as usize;
+                    cached.push(
+                        Statistics::new_unknown(schema.as_ref()).with_num_rows(
+                            if group_has_tombstones(group_index) {
+                                Precision::Inexact(row_count)
+                            } else {
+                                Precision::Exact(row_count)
+                            },
+                        ),
+                    );
                 }
             }
         }
         cached
     };
+    // Slice-addressable physical leaves keep sparse writes proportional to the
+    // changed rows, but each slice must not become its own DataFusion task.
+    // Preserve every immutable batch and coalesce adjacent descriptors into
+    // roughly one canonical physical-leaf worth of work per scan partition.
+    const LOGICAL_SCAN_PARTITION_ROWS: usize = 16 * 1024;
+    let mut base_partition_ranges = Vec::new();
+    let mut partition_start = 0usize;
+    let mut partition_rows = 0usize;
+    for (position, &group_index) in group_indices.iter().enumerate() {
+        partition_rows = partition_rows.saturating_add(
+            layout.manifest.groups[group_index].row_count as usize,
+        );
+        if partition_rows >= LOGICAL_SCAN_PARTITION_ROWS {
+            base_partition_ranges.push(partition_start..position + 1);
+            partition_start = position + 1;
+            partition_rows = 0;
+        }
+    }
+    if partition_start < group_indices.len() {
+        base_partition_ranges.push(partition_start..group_indices.len());
+    }
+    let base_partitions = base_partition_ranges
+        .iter()
+        .map(|range| group_indices[range.clone()].to_vec())
+        .collect::<Vec<_>>();
+    let mut statistics = base_partition_ranges
+        .iter()
+        .map(|range| Statistics::try_merge_iter(base_statistics[range.clone()].iter(), schema.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
     for batch in overlay_batches.iter() {
         statistics.push(entity_columnar_record_batch_statistics(batch)?);
     }
@@ -1009,7 +1068,7 @@ async fn entity_columnar_scan_source(
         statistics.push(Statistics::new_unknown(schema.as_ref()));
     }
     let partition_count = statistics.len();
-    let base_partition_count = group_indices.len();
+    let base_partition_count = base_partitions.len();
     let stream_schema = Arc::clone(&schema);
     Ok(batch_stream_source_with_statistics_and_source(
         Arc::clone(&schema),
@@ -1033,110 +1092,129 @@ async fn entity_columnar_scan_source(
             let public_projection = projection.clone();
             let physical_projection = physical_projection.clone();
             let statistics_projection = projection.clone();
-            let statistics_cached = base_statistics_cached[partition];
             let shadow_identities = Arc::clone(&shadow_identities);
             let coordinate_shadow_masks = coordinate_shadow_masks.clone();
-            let group_index = group_indices[partition];
+            let partition_groups = base_partitions[partition].clone();
+            let base_statistics_cached = base_statistics_cached.clone();
             let schema = Arc::clone(&stream_schema);
             let batch_schema = Arc::clone(&schema);
             let loaded_public_schema = Arc::clone(&schema);
             let batches = stream::once(async move {
-                let coordinate_keep = coordinate_shadow_masks
-                    .as_ref()
-                    .and_then(|masks| masks[group_index].as_ref())
-                    .cloned();
-                let coordinates_prove_unshadowed =
-                    coordinate_shadow_masks.is_some() && coordinate_keep.is_none();
-                let batch = cached_or_load_entity_columnar_batch(
-                    &reader,
-                    &layout,
-                    group_index,
-                    shadow_identity_digest,
-                    public_projection.clone(),
-                    async {
-                        let (batch, overlay_keep) = if (shadow_identities.is_empty()
-                            && coordinate_shadow_masks.is_none())
-                            || coordinates_prove_unshadowed
-                        {
-                            (
-                                reader
+                let mut logical_batches = Vec::with_capacity(partition_groups.len());
+                for group_index in partition_groups {
+                    let reader = Arc::clone(&reader);
+                    let layout = Arc::clone(&layout);
+                    let public_projection = public_projection.clone();
+                    let physical_projection = physical_projection.clone();
+                    let statistics_projection = statistics_projection.clone();
+                    let shadow_identities = Arc::clone(&shadow_identities);
+                    let coordinate_shadow_masks = coordinate_shadow_masks.clone();
+                    let loaded_public_schema = Arc::clone(&loaded_public_schema);
+                    let statistics_cached = base_statistics_cached[group_index];
+                    let coordinate_keep = coordinate_shadow_masks
+                        .as_ref()
+                        .and_then(|masks| masks[group_index].as_ref())
+                        .cloned();
+                    let coordinates_prove_unshadowed =
+                        coordinate_shadow_masks.is_some() && coordinate_keep.is_none();
+                    let batch = cached_or_load_entity_columnar_batch(
+                        &reader,
+                        &layout,
+                        group_index,
+                        shadow_identity_digest,
+                        public_projection.clone(),
+                        async {
+                            let (batch, overlay_keep) = if (shadow_identities.is_empty()
+                                && coordinate_shadow_masks.is_none())
+                                || coordinates_prove_unshadowed
+                            {
+                                (
+                                    reader
+                                        .load_entity_columnar_group(
+                                            layout.clone(),
+                                            group_index,
+                                            physical_projection.clone(),
+                                        )
+                                        .await
+                                        .map_err(lix_error_to_datafusion_error)?,
+                                    None,
+                                )
+                            } else {
+                                let keep = if let Some(keep) = coordinate_keep {
+                                    keep
+                                } else {
+                                    reader
+                                        .entity_columnar_shadow_mask(
+                                            layout.clone(),
+                                            group_index,
+                                            identity_column,
+                                            Arc::clone(&shadow_identities),
+                                            shadow_identity_digest,
+                                        )
+                                        .await
+                                        .map_err(lix_error_to_datafusion_error)?
+                                };
+                                let batch = reader
                                     .load_entity_columnar_group(
                                         layout.clone(),
                                         group_index,
                                         physical_projection.clone(),
                                     )
                                     .await
-                                    .map_err(lix_error_to_datafusion_error)?,
-                                None,
-                            )
-                        } else {
-                            let keep = if let Some(keep) = coordinate_keep {
-                                keep
-                            } else {
-                                reader
-                                    .entity_columnar_shadow_mask(
-                                        layout.clone(),
-                                        group_index,
-                                        identity_column,
-                                        Arc::clone(&shadow_identities),
-                                        shadow_identity_digest,
-                                    )
-                                    .await
-                                    .map_err(lix_error_to_datafusion_error)?
+                                    .map_err(lix_error_to_datafusion_error)?;
+                                (batch, Some(keep))
                             };
-                            let batch = reader
-                                .load_entity_columnar_group(
-                                    layout.clone(),
-                                    group_index,
-                                    physical_projection.clone(),
-                                )
-                                .await
-                                .map_err(lix_error_to_datafusion_error)?;
-                            (batch, Some(keep))
-                        };
-                        let deleted = batch
-                            .column(public_column_count)
-                            .as_any()
-                            .downcast_ref::<BooleanArray>()
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(
-                                    "canonical entity Arrow tombstone column is not Boolean"
-                                        .to_owned(),
-                                )
-                            })?;
-                        let keep = BooleanArray::from(
-                            (0..batch.num_rows())
-                                .map(|row_index| {
-                                    !deleted.value(row_index)
-                                        && overlay_keep
-                                            .as_ref()
-                                            .is_none_or(|keep| keep.value(row_index))
-                                })
-                                .collect::<Vec<_>>(),
-                        );
-                        let batch = filter_record_batch(&batch, &keep)?;
-                        Ok(Arc::new(RecordBatch::try_new(
-                            loaded_public_schema,
-                            batch.columns()[..public_column_count].to_vec(),
-                        )?))
-                    },
-                )
-                .await?;
-                if !shadow_identities.is_empty() && !statistics_cached {
-                    let statistics = entity_columnar_record_batch_statistics(batch.as_ref())?;
-                    reader
-                        .cache_entity_columnar_statistics(
-                            &layout,
-                            group_index,
-                            shadow_identity_digest,
-                            statistics_projection,
-                            statistics,
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
+                            let deleted = batch
+                                .column(public_column_count)
+                                .as_any()
+                                .downcast_ref::<BooleanArray>()
+                                .ok_or_else(|| {
+                                    DataFusionError::Execution(
+                                        "canonical entity Arrow tombstone column is not Boolean"
+                                            .to_owned(),
+                                    )
+                                })?;
+                            let keep = BooleanArray::from(
+                                (0..batch.num_rows())
+                                    .map(|row_index| {
+                                        !deleted.value(row_index)
+                                            && overlay_keep
+                                                .as_ref()
+                                                .is_none_or(|keep| keep.value(row_index))
+                                    })
+                                    .collect::<Vec<_>>(),
+                            );
+                            let batch = filter_record_batch(&batch, &keep)?;
+                            Ok(Arc::new(RecordBatch::try_new(
+                                loaded_public_schema,
+                                batch.columns()[..public_column_count].to_vec(),
+                            )?))
+                        },
+                    )
+                    .await?;
+                    if !shadow_identities.is_empty() && !statistics_cached {
+                        let statistics = entity_columnar_record_batch_statistics(batch.as_ref())?;
+                        reader
+                            .cache_entity_columnar_statistics(
+                                &layout,
+                                group_index,
+                                shadow_identity_digest,
+                                statistics_projection,
+                                statistics,
+                            )
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?;
+                    }
+                    logical_batches.push(RecordBatch::try_new(
+                        Arc::clone(&batch_schema),
+                        batch.columns().to_vec(),
+                    )?);
                 }
-                RecordBatch::try_new(batch_schema, batch.columns().to_vec())
-                    .map_err(DataFusionError::from)
+                match logical_batches.as_slice() {
+                    [batch] => Ok(batch.clone()),
+                    batches => concat_batches(&batch_schema, batches.iter())
+                        .map_err(DataFusionError::from),
+                }
             });
             Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
         },
@@ -4929,6 +5007,8 @@ mod tests {
                                 .content_digest()
                                 .expect("manifest digest"),
                             group_index,
+                            row_offset: 0,
+                            row_count: encoded.manifest.groups[group_index].row_count as usize,
                         },
                     )
                     .collect(),

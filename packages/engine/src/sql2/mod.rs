@@ -50,10 +50,14 @@ pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader}
 #[cfg(test)]
 pub(crate) use entity_columnar_layout::encode_registered_entity_row_groups;
 pub(crate) use entity_columnar_layout::{
-    ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ENTITY_COLUMNAR_ENTITY_PK_FIELD,
+    ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ENTITY_COLUMNAR_COMPACT_PATH_VALUE_METADATA_KEY,
+    ENTITY_COLUMNAR_COMPACT_REPLACEMENT_METADATA_KEY, ENTITY_COLUMNAR_ENTITY_PK_FIELD,
     ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY, EncodedEntityRowGroups,
     EntityColumnarAuthorityRef, EntityColumnarRowRef, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
     encode_authoritative_registered_entity_row_groups,
+    encode_compact_path_value_journal_row_groups,
+    encode_compact_replacement_registered_entity_row_groups,
+    path_value_snapshot_value_json,
     encode_unclustered_registered_entity_row_groups,
 };
 pub(crate) use entity_projection::EntityProjectionDecoder;
@@ -62,8 +66,9 @@ pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{
     SqlLogicalPlan, append_path_value_replacement_snapshot,
-    create_write_logical_plan_from_template, create_write_plan_template_from_parsed,
-    diff_command_query, execute_read_statement_from_parsed,
+    append_path_value_replacement_snapshot_text, append_path_value_replacement_value,
+    append_path_value_replacement_value_text, create_write_logical_plan_from_template,
+    create_write_plan_template_from_parsed, diff_command_query, execute_read_statement_from_parsed,
     execute_read_statement_in_session_from_parsed, execute_transaction_read_statement_from_parsed,
     execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,
     execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
@@ -95,5 +100,6 @@ pub(crate) use providers::{
     execute_exact_lix_file_root_listing, execute_fast_lix_file_path_writes,
     execute_fast_lix_file_prepared_path_write,
 };
+pub(crate) use result_metadata::field_is_json;
 pub use script::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 mod aggregate_statistics;

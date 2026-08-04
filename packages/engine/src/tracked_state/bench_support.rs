@@ -350,7 +350,10 @@ where
                 .expect("load benchmark sparse parent authority")
                 .expect("benchmark sparse parent authority exists");
         let planned_members = super::storage::staged_commit_delta_members_for_write(
-            &read, &writes, commit_id, &mutations,
+            &read,
+            &mut writes,
+            commit_id,
+            &mutations,
         )
         .await
         .expect("load benchmark sparse Arrow event members");

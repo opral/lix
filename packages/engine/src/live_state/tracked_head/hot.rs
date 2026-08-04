@@ -1415,6 +1415,8 @@ pub(crate) struct EntityColumnarGroupSource {
     pub(crate) manifest: std::sync::Arc<crate::columnar_row_group::RowGroupManifest>,
     pub(crate) manifest_digest: [u8; 32],
     pub(crate) group_index: usize,
+    pub(crate) row_offset: usize,
+    pub(crate) row_count: usize,
 }
 
 // Columnar planning temporarily overlaps encoded HOT input, its materialized
@@ -1661,23 +1663,12 @@ async fn load_root_current_base_exact(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     generation: CommitId,
+    base_commit_id: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
     projection: ChangeRecordProjection,
+    decoded_columns: Option<&crate::live_state::EntityDecodedColumnCache>,
+    known_collection_control: Option<HotCollectionControl>,
 ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-    let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation).await?
-    else {
-        return MaterializedLiveStateExactBatch::new(
-            MaterializedLiveStateBatch::default(),
-            vec![None; keys.len()],
-        );
-    };
-    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
-    let tracked = Box::pin(reader.load_projected_batch_at_commit_refs(
-        &base_commit_id.to_string(),
-        keys,
-        &projection,
-    ))
-    .await?;
     let scopes = keys
         .iter()
         .filter(|key| {
@@ -1702,20 +1693,89 @@ async fn load_root_current_base_exact(
             },
         )
         .collect::<Vec<_>>();
-    let active_generations =
-        load_root_active_collection_generations(store, base_commit_id, scope_refs.iter().copied())
-            .await?;
-    let stored_control_values =
-        load_stored_hot_collection_controls(store, branch_id, generation, &scope_refs).await?;
-    let stored_controls = scopes
+    let marker_keys = scopes
+        .iter()
+        .map(|(schema_key, file_id)| TrackedStateKey {
+            schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY.to_owned(),
+            file_id: None,
+            entity_pk: EntityPk::single(crate::collection_generation::collection_scope_key(
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key,
+                    file_id: file_id.as_deref(),
+                },
+            )),
+        })
+        .collect::<Vec<_>>();
+    let marker_refs = marker_keys.iter().map(|key| TrackedStateKeyRef {
+        schema_key: &key.schema_key,
+        file_id: key.file_id.as_deref(),
+        entity_pk: &key.entity_pk,
+    });
+    let combined_keys = keys.iter().copied().chain(marker_refs).collect::<Vec<_>>();
+    let tracked_state = crate::tracked_state::TrackedStateContext::new();
+    let mut reader = match decoded_columns {
+        Some(decoded_columns) => {
+            tracked_state.reader_with_decoded_columns(store, decoded_columns.clone())
+        }
+        None => tracked_state.reader(store),
+    };
+    let tracked = Box::pin(reader.load_projected_batch_at_commit_refs(
+        &base_commit_id.to_string(),
+        &combined_keys,
+        &projection,
+    ))
+    .await?;
+    let active_generations = scopes
         .iter()
         .cloned()
+        .enumerate()
+        .filter_map(|(scope_index, scope)| {
+            tracked.row(keys.len() + scope_index).map(|row| {
+                (
+                    scope,
+                    RootCollectionGeneration {
+                        commit_id: row.commit_id(),
+                    },
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let known_scope = known_collection_control.and_then(|control| {
+        let first = keys.first()?;
+        keys.iter()
+            .all(|key| key.schema_key == first.schema_key && key.file_id.is_none())
+            .then(|| ((first.schema_key.to_owned(), None), control))
+    });
+    let missing_scopes = scope_refs
+        .iter()
+        .copied()
+        .filter(|scope| {
+            known_scope
+                .as_ref()
+                .is_none_or(|((schema_key, file_id), _)| {
+                    schema_key != scope.schema_key || file_id.as_deref() != scope.file_id
+                })
+        })
+        .collect::<Vec<_>>();
+    let stored_control_values =
+        load_stored_hot_collection_controls(store, branch_id, generation, &missing_scopes).await?;
+    let mut stored_controls = missing_scopes
+        .into_iter()
+        .map(|scope| {
+            (
+                scope.schema_key.to_owned(),
+                scope.file_id.map(str::to_owned),
+            )
+        })
         .zip(stored_control_values)
         .filter_map(|(scope, control)| control.map(|control| (scope, control)))
         .collect::<BTreeMap<_, _>>();
+    if let Some((scope, control)) = known_scope {
+        stored_controls.insert(scope, control);
+    }
     let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
     let mut slots = Vec::with_capacity(keys.len());
-    for index in 0..tracked.len() {
+    for index in 0..keys.len() {
         slots.push(
             tracked
                 .row(index)
@@ -1943,12 +2003,168 @@ fn merge_ordered_live_batches(
 pub(crate) struct HotStateStoreReader<S> {
     pub(super) store: S,
     pub(super) transaction_cache: Option<Arc<HotStateTransactionCache>>,
+    pub(super) decoded_columns: Option<crate::live_state::EntityDecodedColumnCache>,
+}
+
+pub(crate) struct ArrowIdentityMembership {
+    identities: Vec<String>,
+    live_count: u64,
+    ordered_identity_digest: [u8; 32],
+}
+
+impl ArrowIdentityMembership {
+    pub(crate) fn contains_single_string(&self, entity_pk: &str) -> bool {
+        self.identities
+            .binary_search_by(|candidate| candidate.as_str().cmp(entity_pk))
+            .is_ok()
+    }
+
+    pub(crate) fn complete_generation(&self) -> (u64, [u8; 32]) {
+        (self.live_count, self.ordered_identity_digest)
+    }
 }
 
 impl<S> HotStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    pub(crate) async fn prepare_arrow_identity_membership(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        schema_key: &str,
+    ) -> Result<Option<ArrowIdentityMembership>, LixError> {
+        if self.transaction_cache.is_none() {
+            return Ok(None);
+        }
+        let collection = self
+            .collection_control(
+                branch_id,
+                generation,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key,
+                    file_id: None,
+                },
+            )
+            .await?;
+        if collection.active_generation != generation {
+            return Ok(None);
+        }
+        let filter = TrackedStateFilter {
+            schema_keys: vec![schema_key.to_owned()],
+            file_ids: vec![NullableKeyFilter::Null],
+            ..TrackedStateFilter::default()
+        };
+        let hot = hot_scan_entries(&self.store, branch_id, generation, &filter, Some(1), None)
+            .await?
+            .expect("bounded row-count HOT scan cannot exhaust a byte budget");
+        let has_hot_rows = match hot {
+            HotScanEntries::Decoded(rows) => !rows.is_empty(),
+            HotScanEntries::Finite(batches) => batches
+                .iter()
+                .flat_map(|batch| batch.values.iter())
+                .any(Option::is_some),
+        };
+        if has_hot_rows {
+            return Ok(None);
+        }
+        let Some(base_commit_id) =
+            load_root_current_base_commit(&self.store, branch_id, generation).await?
+        else {
+            return Ok(None);
+        };
+        let published = crate::tracked_state::load_published_commit_state_manifest(
+            &self.store,
+            base_commit_id,
+        )
+        .await?
+        .ok_or_else(|| head_value_error("Arrow identity root is missing its manifest"))?;
+        let descriptors = crate::tracked_state::load_current_state_scope_descriptors(
+            &self.store,
+            &published,
+            &crate::tracked_state::CommitDeltaReplacementScope {
+                schema_key: schema_key.to_owned(),
+                file_id: None,
+            },
+        )
+        .await?;
+        if descriptors.is_empty() {
+            return Ok(None);
+        }
+        let row_count = descriptors.iter().try_fold(0usize, |total, descriptor| {
+            total
+                .checked_add(usize::from(descriptor.row_count))
+                .ok_or_else(|| head_value_error("Arrow identity membership row count overflow"))
+        })?;
+        let root_live_count = u64::try_from(row_count)
+            .map_err(|_| head_value_error("Arrow identity membership row count exceeds u64"))?;
+        if collection.live_count != DEFERRED_ROOT_LIVE_COUNT
+            && root_live_count != collection.live_count
+        {
+            return Ok(None);
+        }
+        let mut identities = Vec::with_capacity(row_count);
+        let mut identity_hasher = blake3::Hasher::new();
+        for descriptor in descriptors {
+            let manifest = crate::columnar_row_group::load_row_group_manifest(
+                &self.store,
+                descriptor.state_set_id,
+            )
+            .await?
+            .ok_or_else(|| head_value_error("Arrow identity leaf manifest is missing"))?;
+            let physical_key = manifest
+                .fields
+                .iter()
+                .position(|field| field.name == "physical_key")
+                .ok_or_else(|| head_value_error("Arrow identity leaf omitted physical_key"))?;
+            let mut columns = crate::columnar_row_group::load_row_group_columns(
+                &self.store,
+                descriptor.state_set_id,
+                &manifest,
+                descriptor.state_group_index as usize,
+                &[physical_key],
+            )
+            .await?;
+            let keys = columns
+                .pop()
+                .expect("one Arrow identity column was requested");
+            let keys = keys
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::BinaryArray>()
+                .ok_or_else(|| head_value_error("Arrow physical_key column is not Binary"))?;
+            let offset = usize::from(descriptor.row_offset);
+            let row_count = usize::from(descriptor.row_count);
+            if offset
+                .checked_add(row_count)
+                .is_none_or(|end| end > datafusion::arrow::array::Array::len(keys))
+            {
+                return Err(head_value_error(
+                    "Arrow identity descriptor slice exceeds its group",
+                ));
+            }
+            for encoded_key in keys.iter().skip(offset).take(row_count).flatten() {
+                let decoded = crate::tracked_state::decode_key_borrowed(encoded_key)?;
+                if decoded.schema_key.as_ref() != schema_key || decoded.file_id.is_some() {
+                    return Err(head_value_error("Arrow identity escaped its certified scope"));
+                }
+                let identity = decoded.entity_pk.as_single_string_owned()?;
+                identity_hasher.update(&(identity.len() as u64).to_le_bytes());
+                identity_hasher.update(identity.as_bytes());
+                identities.push(identity);
+            }
+        }
+        if !identities.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(head_value_error(
+                "Arrow identity membership is not strictly ordered",
+            ));
+        }
+        Ok(Some(ArrowIdentityMembership {
+            identities,
+            live_count: root_live_count,
+            ordered_identity_digest: *identity_hasher.finalize().as_bytes(),
+        }))
+    }
+
     async fn collection_control(
         &self,
         branch_id: &str,
@@ -2120,7 +2336,7 @@ where
     ) -> Result<Vec<Option<Bytes>>, LixError> {
         self.scan_entity_snapshots_for_generation(
             branch_id,
-            control.generation,
+            control,
             schema_key,
             entity_pks,
             limit,
@@ -2178,29 +2394,12 @@ where
         )>,
         LixError,
     > {
-        if let Some(root_commit_id) =
-            load_root_current_base_commit(&self.store, branch_id, control.generation).await?
-        {
-            let collection_scope = crate::collection_generation::CollectionScopeRef {
-                schema_key,
-                file_id: None,
-            };
-            if !load_root_active_collection_generations(
+        let published = crate::tracked_state::load_published_commit_state_manifest(
                 &self.store,
-                root_commit_id,
-                [collection_scope],
+                control.head_commit_id,
             )
             .await?
-            .is_empty()
-            {
-                return Ok(None);
-            }
-            let published = crate::tracked_state::load_published_commit_state_manifest(
-                &self.store,
-                root_commit_id,
-            )
-            .await?
-            .ok_or_else(|| head_value_error("root-backed columnar head is missing its manifest"))?;
+            .ok_or_else(|| head_value_error("columnar branch head is missing its manifest"))?;
             let descriptors = crate::tracked_state::load_current_state_scope_descriptors(
                 &self.store,
                 &published,
@@ -2214,37 +2413,62 @@ where
                 return Ok(None);
             }
             let mut group_sources = Vec::with_capacity(descriptors.len());
+            let mut loaded_manifests: BTreeMap<
+                crate::columnar_row_group::ArrowStateSetId,
+                (Arc<crate::columnar_row_group::RowGroupManifest>, [u8; 32]),
+            > = BTreeMap::new();
             let mut layout_hasher =
                 blake3::Hasher::new_derive_key("lix current-state flattened Arrow collection v1");
-            for descriptor in descriptors {
-                let manifest = crate::columnar_row_group::load_row_group_manifest(
-                    &self.store,
-                    descriptor.state_set_id,
-                )
-                .await?
-                .ok_or_else(|| {
-                    head_value_error("Arrow state descriptor references a missing leaf")
-                })?;
-                if manifest.namespace != "lix.tracked_state.arrow_leaf.v1"
-                    || manifest.metadata.get("lix.layout").map(String::as_str)
-                        != Some(crate::tracked_state::ENTITY_ARROW_STATE_LAYOUT)
+            for descriptor in descriptors.iter() {
+                let (manifest, manifest_digest) = if let Some(loaded) =
+                    loaded_manifests.get(&descriptor.state_set_id)
                 {
-                    return Err(head_value_error(
-                        "current-state descriptor does not reference the canonical Arrow leaf layout",
-                    ));
-                }
+                    loaded.clone()
+                } else {
+                    let manifest = crate::columnar_row_group::load_row_group_manifest(
+                        &self.store,
+                        descriptor.state_set_id,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        head_value_error("Arrow state descriptor references a missing leaf")
+                    })?;
+                    if manifest.namespace != "lix.tracked_state.arrow_leaf.v1"
+                        || manifest.metadata.get("lix.layout").map(String::as_str)
+                            != Some(crate::tracked_state::ENTITY_ARROW_STATE_LAYOUT)
+                    {
+                        return Err(head_value_error(
+                            "current-state descriptor does not reference the canonical Arrow leaf layout",
+                        ));
+                    }
+                    let manifest_digest = manifest.content_digest()?;
+                    let loaded = (std::sync::Arc::new(manifest), manifest_digest);
+                    loaded_manifests.insert(descriptor.state_set_id, loaded.clone());
+                    loaded
+                };
                 let local_group = descriptor.state_group_index as usize;
-                manifest.groups.get(local_group).ok_or_else(|| {
+                let group = manifest.groups.get(local_group).ok_or_else(|| {
                     head_value_error("Arrow state descriptor has an invalid group index")
                 })?;
-                let manifest_digest = manifest.content_digest()?;
+                let row_offset = usize::from(descriptor.row_offset);
+                let row_count = usize::from(descriptor.row_count);
+                if row_offset
+                    .checked_add(row_count)
+                    .is_none_or(|end| end > group.row_count as usize)
+                {
+                    return Err(head_value_error(
+                        "Arrow state descriptor slice exceeds its group",
+                    ));
+                }
                 layout_hasher.update(&descriptor.state_set_id.as_bytes());
                 layout_hasher.update(&descriptor.state_group_index.to_be_bytes());
                 group_sources.push(EntityColumnarGroupSource {
                     state_set_id: descriptor.state_set_id,
-                    manifest: std::sync::Arc::new(manifest),
+                    manifest,
                     manifest_digest,
                     group_index: local_group,
+                    row_offset,
+                    row_count,
                 });
             }
             let first_manifest = &group_sources
@@ -2279,6 +2503,8 @@ where
                         &source.manifest,
                         source.group_index,
                         &common_field_names,
+                        u32::try_from(source.row_count)
+                            .expect("descriptor row count fits u32"),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2286,30 +2512,34 @@ where
                 *layout_hasher.finalize().as_bytes(),
             );
 
-            let filter = TrackedStateFilter {
-                schema_keys: vec![schema_key.to_owned()],
-                include_tombstones: true,
-                ..TrackedStateFilter::default()
+            let rows = if control.may_have_untracked_schema(schema_key) {
+                let filter = TrackedStateFilter {
+                    schema_keys: vec![schema_key.to_owned()],
+                    include_tombstones: true,
+                    ..TrackedStateFilter::default()
+                };
+                let Some(entries) = hot_scan_entries(
+                    &self.store,
+                    branch_id,
+                    control.generation,
+                    &filter,
+                    None,
+                    Some(ENTITY_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES),
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                materialize_hot_scan_entries(
+                    &self.store,
+                    entries,
+                    ChangeRecordProjection::from_columns(&["snapshot_content".to_owned()]),
+                    branch_id,
+                )
+                .await?
+            } else {
+                MaterializedLiveStateBatch::default()
             };
-            let Some(entries) = hot_scan_entries(
-                &self.store,
-                branch_id,
-                control.generation,
-                &filter,
-                None,
-                Some(ENTITY_COLUMNAR_OVERLAY_INPUT_ADMISSION_BYTES),
-            )
-            .await?
-            else {
-                return Ok(None);
-            };
-            let rows = materialize_hot_scan_entries(
-                &self.store,
-                entries,
-                ChangeRecordProjection::from_columns(&["snapshot_content".to_owned()]),
-                branch_id,
-            )
-            .await?;
             if materialized_columnar_overlay_admission_bytes(&rows)?
                 > ENTITY_COLUMNAR_OVERLAY_OUTPUT_ADMISSION_BYTES
             {
@@ -2329,8 +2559,89 @@ where
                     columnar_base_coordinate: None,
                 });
             }
-            let live_count = self
-                .exact_collection_live_count(
+            let _deleted_column = flattened_manifest
+                .fields
+                .iter()
+                .position(|field| {
+                    field.name == "deleted"
+                        && field.data_type
+                            == crate::columnar_row_group::RowGroupDataType::Boolean
+                })
+                .ok_or_else(|| {
+                    head_value_error("canonical entity Arrow leaf is missing its tombstone column")
+                })?;
+            let live_count = if overlay.is_empty() {
+                let mut live_count = 0_u64;
+                for source in &group_sources {
+                    let source_deleted_column = source
+                        .manifest
+                        .fields
+                        .iter()
+                        .position(|field| field.name == "deleted")
+                        .ok_or_else(|| {
+                            head_value_error(
+                                "canonical entity Arrow source is missing its tombstone column",
+                            )
+                        })?;
+                    let group = &source.manifest.groups[source.group_index];
+                    let whole_group = source.row_offset == 0
+                        && source.row_count == group.row_count as usize;
+                    let deleted_count = if whole_group {
+                        group.columns[source_deleted_column]
+                            .true_count
+                            .ok_or_else(|| {
+                                head_value_error(
+                                    "canonical entity Arrow tombstone statistics omit true-count",
+                                )
+                            })? as usize
+                    } else if group.columns[source_deleted_column].max
+                        == Some(crate::columnar_row_group::RowGroupScalar::Boolean(false))
+                    {
+                        0
+                    } else {
+                        let arrays = if let Some(cache) = self.decoded_columns.as_ref() {
+                            cache
+                                .load_projection(
+                                    &self.store,
+                                    source.state_set_id,
+                                    source.manifest_digest,
+                                    &source.manifest,
+                                    source.group_index,
+                                    &[source_deleted_column],
+                                )
+                                .await?
+                        } else {
+                            crate::columnar_row_group::load_row_group_columns(
+                                &self.store,
+                                source.state_set_id,
+                                &source.manifest,
+                                source.group_index,
+                                &[source_deleted_column],
+                            )
+                            .await?
+                        };
+                        let deleted = arrays[0]
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+                            .ok_or_else(|| {
+                                head_value_error(
+                                    "canonical entity Arrow tombstone column is not Boolean",
+                                )
+                            })?;
+                        (source.row_offset..source.row_offset + source.row_count)
+                            .filter(|&row_index| deleted.value(row_index))
+                            .count()
+                    };
+                    live_count = live_count
+                        .checked_add(
+                            u64::try_from(source.row_count - deleted_count)
+                                .expect("descriptor row count fits u64"),
+                        )
+                        .ok_or_else(|| head_value_error("entity live count overflows u64"))?;
+                }
+                live_count
+            } else {
+                self.exact_collection_live_count(
                     branch_id,
                     control.generation,
                     crate::collection_generation::CollectionScopeRef {
@@ -2338,17 +2649,15 @@ where
                         file_id: None,
                     },
                 )
-                .await?;
-            return Ok(Some((
-                layout_id,
-                flattened_manifest,
-                group_sources,
-                overlay,
-                live_count,
-            )));
-        }
-
-        Ok(None)
+                .await?
+            };
+        Ok(Some((
+            layout_id,
+            flattened_manifest,
+            group_sources,
+            overlay,
+            live_count,
+        )))
     }
 
     #[cfg(test)]
@@ -2488,6 +2797,36 @@ where
             .map(MaterializedLiveStateExactBatch::into_rows)
     }
 
+    /// Checks only the history-free HOT plane. Tracked rows live in the Arrow
+    /// root and must not be hydrated when commit validation is merely guarding
+    /// against a tracked/untracked identity collision.
+    pub(crate) async fn load_untracked_identity_presence(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        keys: &[TrackedStateKey],
+    ) -> Result<Vec<bool>, LixError> {
+        let keys = keys
+            .iter()
+            .map(|key| TrackedStateKeyRef {
+                schema_key: key.schema_key.as_str(),
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            })
+            .collect::<Vec<_>>();
+        hot_load_identity_ref_bytes(&self.store, branch_id, generation, &keys)
+            .await?
+            .into_iter()
+            .map(|value| {
+                value
+                    .as_deref()
+                    .map(decode_head_value)
+                    .transpose()
+                    .map(|value| value.is_some_and(|value| value.untracked && !value.deleted))
+            })
+            .collect()
+    }
+
     pub(crate) async fn load_projected_live_batch(
         &self,
         branch_id: &str,
@@ -2533,7 +2872,7 @@ where
         if keys.is_empty() {
             return Ok(MaterializedLiveStateExactBatch::default());
         }
-        let replaced_generation = keys
+        let collection_control = keys
             .first()
             .filter(|first| keys.iter().all(|key| key.schema_key == first.schema_key))
             .filter(|first| {
@@ -2551,13 +2890,12 @@ where
                 )
                 .await
             });
-        let replaced_generation = match replaced_generation {
-            Some(control) => {
-                let control = control.await?;
-                (control.active_generation != generation).then_some(control)
-            }
+        let collection_control = match collection_control {
+            Some(control) => Some(control.await?),
             None => None,
         };
+        let replaced_generation =
+            collection_control.filter(|control| control.active_generation != generation);
         if replaced_generation.is_some_and(|control| control.live_count == 0) {
             return MaterializedLiveStateExactBatch::new(
                 MaterializedLiveStateBatch::default(),
@@ -2591,16 +2929,18 @@ where
         }
         let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
 
-        let root_backed = load_root_current_base_commit(&self.store, branch_id, generation)
-            .await?
-            .is_some();
-        let root = if root_backed {
+        let root_commit_id =
+            load_root_current_base_commit(&self.store, branch_id, generation).await?;
+        let root = if let Some(root_commit_id) = root_commit_id {
             Box::pin(load_root_current_base_exact(
                 &self.store,
                 branch_id,
                 generation,
+                root_commit_id,
                 keys,
                 *projection,
+                self.decoded_columns.as_ref(),
+                collection_control,
             ))
             .await?
         } else {
@@ -2713,7 +3053,7 @@ where
     async fn scan_entity_snapshots_for_generation(
         &self,
         branch_id: &str,
-        generation: CommitId,
+        control: BranchHeadControl,
         schema_key: &str,
         entity_pks: &[EntityPk],
         limit: Option<usize>,
@@ -2721,10 +3061,18 @@ where
         if matches!(limit, Some(0)) {
             return Ok(Vec::new());
         }
+        if let Some(snapshots) = self
+            .scan_arrow_entity_snapshots_for_generation(
+                branch_id, control, schema_key, entity_pks, limit,
+            )
+            .await?
+        {
+            return Ok(snapshots);
+        }
         let rows = self
             .scan_live_batch_for_generation(
                 branch_id,
-                generation,
+                control.generation,
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec![schema_key.to_owned()],
@@ -2740,6 +3088,94 @@ where
             )
             .await?;
         Ok(rows.into_identity_ordered_snapshots())
+    }
+
+    /// Reads exact committed identities from the Arrow current-state root.
+    ///
+    /// Point reads are common enough that routing them through the general
+    /// HOT-plus-root merge path is measurable even when HOT is empty. The
+    /// fast path is deliberately narrow: any HOT candidate, tombstone, or
+    /// non-inline payload falls back to the visibility path above.
+    async fn scan_arrow_entity_snapshots_for_generation(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+        entity_pks: &[EntityPk],
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        if entity_pks.is_empty() || limit.is_some_and(|limit| limit > entity_pks.len()) {
+            return Ok(None);
+        }
+        if control.may_have_untracked_schema(schema_key) {
+            let hot_filter = TrackedStateFilter {
+                schema_keys: vec![schema_key.to_owned()],
+                entity_pks: entity_pks.to_vec(),
+                include_tombstones: true,
+                ..TrackedStateFilter::default()
+            };
+            let hot = hot_scan_entries(
+                &self.store,
+                branch_id,
+                control.generation,
+                &hot_filter,
+                Some(1),
+                None,
+            )
+            .await?
+            .expect("bounded point HOT scan cannot exhaust its byte budget");
+            let has_hot_rows = match hot {
+                HotScanEntries::Decoded(rows) => !rows.is_empty(),
+                HotScanEntries::Finite(batches) => batches
+                    .iter()
+                    .flat_map(|batch| batch.values.iter())
+                    .any(Option::is_some),
+            };
+            if has_hot_rows {
+                return Ok(None);
+            }
+        }
+        let Some(state) =
+            crate::tracked_state::load_commit_state_manifest(&self.store, control.head_commit_id)
+                .await?
+        else {
+            return Ok(None);
+        };
+        let encoded_keys = entity_pks
+            .iter()
+            .map(|entity_pk| {
+                Bytes::from(crate::tracked_state::encode_key_ref(TrackedStateKeyRef {
+                    schema_key,
+                    file_id: None,
+                    entity_pk,
+                }))
+            })
+            .collect::<Vec<_>>();
+        let rows = crate::tracked_state::load_complete_current_state_rows_with_coordinates_encoded_cached(
+            &self.store,
+            &state,
+            &encoded_keys,
+            self.decoded_columns.as_ref(),
+        )
+        .await?;
+        let mut snapshots = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some((row, _)) = row else {
+                snapshots.push(None);
+                continue;
+            };
+            if row.value.deleted {
+                return Ok(None);
+            }
+            match row.snapshot {
+                crate::json_store::JsonSlot::None => snapshots.push(None),
+                crate::json_store::JsonSlot::Inline(value) => {
+                    snapshots.push(Some(Bytes::copy_from_slice(value.as_bytes())))
+                }
+                crate::json_store::JsonSlot::Ref(_) => return Ok(None),
+            }
+        }
+        Ok(Some(snapshots))
     }
 }
 
@@ -3118,16 +3554,18 @@ where
                 }
             })
             .collect::<Vec<_>>();
-        let root_previous = if load_root_current_base_commit(self.store, branch_id, generation)
-            .await?
-            .is_some()
-        {
+        let root_commit_id =
+            load_root_current_base_commit(self.store, branch_id, generation).await?;
+        let root_previous = if let Some(root_commit_id) = root_commit_id {
             Box::pin(load_root_current_base_exact(
                 self.store,
                 branch_id,
                 generation,
+                root_commit_id,
                 &packed_previous_keys,
                 ChangeRecordProjection::identity_only(),
+                None,
+                None,
             ))
             .await?
         } else {
@@ -6013,6 +6451,7 @@ mod tests {
                 scan_calls: None,
             },
             transaction_cache: Some(Arc::new(HotStateTransactionCache::default())),
+            decoded_columns: None,
         };
         for _ in 0..2 {
             let control = reader

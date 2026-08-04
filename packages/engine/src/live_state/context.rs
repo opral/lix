@@ -363,6 +363,7 @@ impl LiveStateContext {
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
             entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
             entity_columnar_layout_cache: std::sync::Arc::clone(&self.entity_columnar_layout_cache),
+            entity_decoded_column_cache: self.entity_decoded_column_cache.clone(),
             branch_head_control_cache: None,
         }
     }
@@ -384,6 +385,7 @@ impl LiveStateContext {
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
             entity_point_snapshot_cache: std::sync::Arc::clone(&self.entity_point_snapshot_cache),
             entity_columnar_layout_cache: std::sync::Arc::clone(&self.entity_columnar_layout_cache),
+            entity_decoded_column_cache: self.entity_decoded_column_cache.clone(),
             branch_head_control_cache: Some(branch_head_control_cache),
         }
     }
@@ -402,6 +404,7 @@ impl LiveStateContext {
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
             entity_point_snapshot_cache: std::sync::Arc::new(EntityPointSnapshotCache::default()),
             entity_columnar_layout_cache: std::sync::Arc::new(EntityColumnarLayoutCache::default()),
+            entity_decoded_column_cache: self.entity_decoded_column_cache.clone(),
             branch_head_control_cache: None,
         }
     }
@@ -425,6 +428,7 @@ pub(crate) struct LiveStateStoreReader<S> {
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
     entity_point_snapshot_cache: std::sync::Arc<EntityPointSnapshotCache>,
     entity_columnar_layout_cache: std::sync::Arc<EntityColumnarLayoutCache>,
+    entity_decoded_column_cache: crate::live_state::EntityDecodedColumnCache,
     branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
 }
 
@@ -432,6 +436,30 @@ impl<S> LiveStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    pub(crate) async fn prepare_arrow_identity_membership(
+        &self,
+        branch_id: &str,
+        schema_key: &str,
+    ) -> Result<Option<crate::live_state::ArrowIdentityMembership>, LixError> {
+        let Some(cache) = self.branch_head_control_cache.as_ref() else {
+            return Ok(None);
+        };
+        let controls =
+            load_branch_head_controls(&self.store, &[branch_id.to_owned()], Some(cache.as_ref()))
+                .await?;
+        let Some(control) = controls.get(branch_id).copied() else {
+            return Ok(None);
+        };
+        self.tracked_head
+            .cached_transaction_reader(
+                &self.store,
+                std::sync::Arc::clone(&cache.hot_state),
+                self.entity_decoded_column_cache.clone(),
+            )
+            .prepare_arrow_identity_membership(branch_id, control.generation, schema_key)
+            .await
+    }
+
     /// Returns raw current-state snapshot bytes for one current SQL entity scan.
     ///
     /// `None` means the normal materialized visibility path remains
@@ -470,7 +498,7 @@ where
         }
         let snapshots = self
             .tracked_head
-            .reader(&self.store)
+            .cached_reader(&self.store, self.entity_decoded_column_cache.clone())
             .scan_entity_snapshots(
                 &requested_branch_id,
                 requested_control,
@@ -499,7 +527,7 @@ where
             return Ok(None);
         };
         self.tracked_head
-            .reader(&self.store)
+            .cached_reader(&self.store, self.entity_decoded_column_cache.clone())
             .scan_entity_primary_keys(
                 &branch_id,
                 control,
@@ -564,7 +592,7 @@ where
         }
         let layout = self
             .tracked_head
-            .reader(&self.store)
+            .cached_reader(&self.store, self.entity_decoded_column_cache.clone())
             .entity_columnar_layout(&branch_id, control, &schema_key)
             .await?;
         let Some((id, manifest, group_sources, overlay, live_count)) = layout else {
@@ -609,7 +637,7 @@ where
         };
         Ok(self
             .tracked_head
-            .reader(&self.store)
+            .cached_reader(&self.store, self.entity_decoded_column_cache.clone())
             .entity_columnar_layout(branch_id, control, schema_key)
             .await?
             .map(|(_, _, _, overlay, _)| overlay.len()))
@@ -647,9 +675,12 @@ where
         let Some(requested_control) = scope.branch_heads.get(requested_branch_id).copied() else {
             return Ok(None);
         };
-        let tracked_head = self.tracked_head.reader(&self.store);
+        let tracked_head = self
+            .tracked_head
+            .cached_reader(&self.store, self.entity_decoded_column_cache.clone());
         if requested_branch_id != GLOBAL_BRANCH_ID
             && let Some(global_control) = scope.branch_heads.get(GLOBAL_BRANCH_ID).copied()
+            && global_control.may_have_schema(schema_key)
             && tracked_head
                 .has_schema_rows(GLOBAL_BRANCH_ID, global_control, schema_key)
                 .await?
@@ -808,10 +839,16 @@ where
         }
         let tracked_request = tracked_scan_request_from_live(request);
         let tracked_head = self.branch_head_control_cache.as_ref().map_or_else(
-            || self.tracked_head.reader(&self.store),
-            |cache| {
+            || {
                 self.tracked_head
-                    .transaction_reader(&self.store, std::sync::Arc::clone(&cache.hot_state))
+                    .cached_reader(&self.store, self.entity_decoded_column_cache.clone())
+            },
+            |cache| {
+                self.tracked_head.cached_transaction_reader(
+                    &self.store,
+                    std::sync::Arc::clone(&cache.hot_state),
+                    self.entity_decoded_column_cache.clone(),
+                )
             },
         );
         let rows_by_branch = tracked_head
@@ -978,7 +1015,7 @@ where
                         .collect::<Vec<_>>();
                     let rows = self
                         .tracked_head
-                        .reader(&self.store)
+                        .cached_reader(&self.store, self.entity_decoded_column_cache.clone())
                         .load_projected_live_batch_refs(branch_id, control, &keys, &projection)
                         .await?;
                     Ok::<_, LixError>((range, rows))
@@ -1221,10 +1258,48 @@ where
             return Ok(None);
         };
         self.tracked_head
-            .reader(&self.store)
+            .cached_reader(&self.store, self.entity_decoded_column_cache.clone())
             .collection_generation(branch_id, control.generation, scope)
             .await
             .map(Some)
+    }
+
+    async fn collection_is_proven_absent(
+        &self,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<bool, LixError> {
+        let controls = load_branch_head_controls(
+            &self.store,
+            &[branch_id.to_owned()],
+            self.branch_head_control_cache.as_deref(),
+        )
+        .await?;
+        let Some(control) = controls.get(branch_id).copied() else {
+            return Ok(false);
+        };
+        if !control.may_have_schema(scope.schema_key) {
+            return Ok(true);
+        }
+        let Some(manifest) = crate::tracked_state::load_commit_state_manifest(
+            &self.store,
+            control.head_commit_id,
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        let scope = crate::tracked_state::CommitDeltaReplacementScope {
+            schema_key: scope.schema_key.to_owned(),
+            file_id: scope.file_id.map(str::to_owned),
+        };
+        Ok(crate::tracked_state::load_current_state_catalog_entry(
+            &self.store,
+            &manifest.current_state_catalog,
+            &scope,
+        )
+        .await?
+        .is_none())
     }
 
     async fn scan_tracked_batch(
@@ -2627,6 +2702,7 @@ mod tests {
                 generation,
                 current_state_revision: 0,
                 schema_presence_bloom: [0; 4],
+                untracked_schema_presence_bloom: [0; 4],
                 working_diff_checkpoint_commit_id: None,
                 created_at,
                 updated_at,

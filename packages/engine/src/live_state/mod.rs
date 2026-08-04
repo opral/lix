@@ -23,10 +23,11 @@ pub(crate) use reader::load_exact_batch_via_scan_for_test;
 pub(crate) use tracked_head::TrackedHeadDeltaRef;
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
-    CertifiedCurrentStatePredecessor, CertifiedCurrentStatePredecessorRef, ColumnarBaseCoordinate,
-    CurrentStateDeltaRef, EntityColumnarGroupSource, EntityColumnarOverlayRow, HOT_FILE_SPACE,
-    HOT_ROW_SPACE, HotTrackedSnapshot, ROOT_CURRENT_BASE_SPACE, TrackedHeadContext,
-    TrackedWorkingDiff, materialize_certified_root_rows,
+    ArrowIdentityMembership, CertifiedCurrentStatePredecessor, CertifiedCurrentStatePredecessorRef,
+    ColumnarBaseCoordinate, CurrentStateDeltaRef, EntityColumnarGroupSource,
+    EntityColumnarOverlayRow, HOT_FILE_SPACE, HOT_ROW_SPACE, HotTrackedSnapshot,
+    ROOT_CURRENT_BASE_SPACE, TrackedHeadContext, TrackedWorkingDiff,
+    materialize_certified_root_rows,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

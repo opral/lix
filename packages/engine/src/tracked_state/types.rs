@@ -195,6 +195,8 @@ pub(crate) struct CurrentStatePartDescriptor {
     pub(crate) last_key: Vec<u8>,
     pub(crate) state_set_id: crate::columnar_row_group::ArrowStateSetId,
     pub(crate) state_group_index: u32,
+    /// First logical row owned inside `state_group_index`.
+    pub(crate) row_offset: u16,
     /// Digest of this Arrow leaf's compact JSON-reference summary.
     pub(crate) payload_refs_digest: [u8; 32],
     pub(crate) row_count: u16,
@@ -287,6 +289,13 @@ pub(crate) struct CommitStateMutationInventory {
 }
 
 impl CommitStateMutationInventory {
+    pub(crate) fn uses_native_arrow_history(&self) -> bool {
+        !self.sealed_state_parts.is_empty()
+            && self.inline_part.is_empty()
+            && self.parts.is_empty()
+            && self.replacement_part_digests.is_empty()
+    }
+
     pub(crate) fn selected_source_commit_id(&self) -> Option<CommitId> {
         self.selected_source_commit_id
             .map(|bytes| CommitId::new(uuid::Uuid::from_bytes(bytes)))
@@ -294,7 +303,9 @@ impl CommitStateMutationInventory {
 
     pub(crate) fn part_count(&self) -> usize {
         usize::from(!self.inline_part.is_empty())
-            + if self.replacement_part_digests.is_empty() {
+            + if self.uses_native_arrow_history() {
+                self.sealed_state_parts.len()
+            } else if self.replacement_part_digests.is_empty() {
                 self.parts.len()
             } else {
                 self.replacement_part_digests.len()

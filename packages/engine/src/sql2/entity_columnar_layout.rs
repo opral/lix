@@ -14,6 +14,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
@@ -30,6 +31,10 @@ pub(crate) const ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
     "lix.entity_columnar.layout_fingerprint.v1";
 pub(crate) const ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
     "lix.entity_columnar.base_coordinates.v1";
+pub(crate) const ENTITY_COLUMNAR_COMPACT_REPLACEMENT_METADATA_KEY: &str =
+    "lix.entity_columnar.compact_replacement.v1";
+pub(crate) const ENTITY_COLUMNAR_COMPACT_PATH_VALUE_METADATA_KEY: &str =
+    "lix.entity_columnar.compact_path_value.v1";
 pub(crate) const ENTITY_COLUMNAR_ENTITY_PK_FIELD: &str = "lixcol_entity_pk";
 pub(crate) use crate::tracked_state::{
     ENTITY_ARROW_STATE_COMMIT_ID_METADATA, ENTITY_ARROW_STATE_CREATED_AT_METADATA,
@@ -98,7 +103,7 @@ where
     // failures must retain the authoritative row layout rather than reject an
     // otherwise-valid transaction.
     Ok(optional_derived_row_group_set(
-        encode_registered_entity_row_groups_impl(spec, rows),
+        encode_registered_entity_row_groups_impl(spec, rows, false),
     ))
 }
 
@@ -117,7 +122,7 @@ where
             "authoritative Arrow state set cannot be empty",
         ));
     }
-    let encoded = encode_registered_entity_row_groups_impl(spec, rows)?;
+    let encoded = encode_registered_entity_row_groups_impl(spec, rows, false)?;
     if encoded
         .manifest
         .metadata
@@ -129,6 +134,146 @@ where
         ));
     }
     Ok(encoded)
+}
+
+pub(crate) fn encode_compact_replacement_registered_entity_row_groups<'a, I>(
+    spec: &EntitySurfaceSpec,
+    rows: I,
+) -> Result<EncodedEntityRowGroups, LixError>
+where
+    I: ExactSizeIterator<Item = EntityColumnarRowRef<'a>>,
+{
+    if rows.len() == 0 {
+        return Err(entity_columnar_error(
+            "compact Arrow replacement cannot be empty",
+        ));
+    }
+    encode_registered_entity_row_groups_impl(spec, rows, true)
+}
+
+/// Seals the one-chunk path/value journal without materializing entity DTOs or
+/// copying its canonical JSON value arena. The journal and Arrow leaf share the
+/// immutable value owner; only physical keys and Arrow offsets are constructed.
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn encode_compact_path_value_journal_row_groups(
+    spec: &EntitySurfaceSpec,
+    identity_arena: &bytes::Bytes,
+    identity_offsets: &[(u32, u32)],
+    value_arena: &bytes::Bytes,
+    value_offsets: &[(u32, u32)],
+    commit_id: crate::changelog::CommitId,
+    created_at: crate::common::LixTimestamp,
+    updated_at: crate::common::LixTimestamp,
+) -> Result<EncodedEntityRowGroups, LixError> {
+    if !spec.certifies_path_value_replacement
+        || identity_offsets.is_empty()
+        || identity_offsets.len() != value_offsets.len()
+    {
+        return Err(entity_columnar_error(
+            "direct compact journal is empty, misaligned, or has the wrong schema",
+        ));
+    }
+    let mut fields = vec![Field::new("physical_key", DataType::Binary, false)];
+    fields.push(entity_visible_fields(spec)[1].clone());
+    let metadata = HashMap::from([
+        (
+            ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_owned(),
+            spec.columnar_layout_fingerprint(),
+        ),
+        (
+            ENTITY_COLUMNAR_BASE_COORDINATES_METADATA_KEY.to_owned(),
+            "true".to_owned(),
+        ),
+        (
+            ENTITY_COLUMNAR_COMPACT_REPLACEMENT_METADATA_KEY.to_owned(),
+            "true".to_owned(),
+        ),
+        (
+            ENTITY_COLUMNAR_COMPACT_PATH_VALUE_METADATA_KEY.to_owned(),
+            "true".to_owned(),
+        ),
+        ("lix.layout".to_owned(), ENTITY_ARROW_STATE_LAYOUT.to_owned()),
+        ("lix.order".to_owned(), "physical_key-ascending".to_owned()),
+        (
+            ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA.to_owned(),
+            spec.schema_key.clone(),
+        ),
+        (
+            ENTITY_ARROW_STATE_COMMIT_ID_METADATA.to_owned(),
+            commit_id.to_string(),
+        ),
+        (
+            ENTITY_ARROW_STATE_CREATED_AT_METADATA.to_owned(),
+            created_at.packed().to_string(),
+        ),
+        (
+            ENTITY_ARROW_STATE_UPDATED_AT_METADATA.to_owned(),
+            updated_at.packed().to_string(),
+        ),
+    ]);
+    let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+    let mut batches = Vec::new();
+    let mut input_locations = Vec::with_capacity(identity_offsets.len());
+    for (group_index, range_start) in (0..identity_offsets.len()).step_by(16 * 1024).enumerate() {
+        let range_end = (range_start + 16 * 1024).min(identity_offsets.len());
+        let mut key_data = Vec::new();
+        let mut key_offsets = Vec::with_capacity(range_end - range_start + 1);
+        key_offsets.push(0_i32);
+        for &(start, end) in &identity_offsets[range_start..range_end] {
+            let identity = std::str::from_utf8(&identity_arena[start as usize..end as usize])
+                .map_err(|_| entity_columnar_error("journal identity is not UTF-8"))?;
+            crate::tracked_state::encode_single_string_key_ref_into(
+                &mut key_data,
+                &spec.schema_key,
+                None,
+                identity,
+            );
+            key_offsets.push(i32::try_from(key_data.len()).map_err(|_| {
+                entity_columnar_error("compact physical keys exceed Arrow i32 offsets")
+            })?);
+        }
+        let first_value = value_offsets[range_start].0 as usize;
+        let last_value = value_offsets[range_end - 1].1 as usize;
+        let mut arrow_value_offsets = Vec::with_capacity(range_end - range_start + 1);
+        arrow_value_offsets.push(0_i32);
+        for &(_, end) in &value_offsets[range_start..range_end] {
+            arrow_value_offsets.push(i32::try_from(end as usize - first_value).map_err(|_| {
+                entity_columnar_error("compact journal values exceed Arrow i32 offsets")
+            })?);
+        }
+        let values = value_arena.slice(first_value..last_value);
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(BinaryArray::new(
+                OffsetBuffer::new(ScalarBuffer::from(key_offsets)),
+                Buffer::from(key_data),
+                None,
+            )),
+            Arc::new(StringArray::new(
+                OffsetBuffer::new(ScalarBuffer::from(arrow_value_offsets)),
+                Buffer::from(values),
+                None,
+            )),
+        ];
+        batches.push(
+            RecordBatch::try_new(Arc::clone(&schema), columns)
+                .map_err(|error| entity_columnar_error(error.to_string()))?,
+        );
+        input_locations.extend((0..range_end - range_start).map(|row_index| {
+            RowGroupRowLocation {
+                group_index: u32::try_from(group_index).expect("bounded row-group index"),
+                row_index: u32::try_from(row_index).expect("bounded row-group row index"),
+            }
+        }));
+    }
+    let encoded = encode_row_group_set_preserving_batches(
+        ENTITY_ARROW_STATE_NAMESPACE,
+        schema,
+        &batches,
+    )?;
+    Ok(EncodedEntityRowGroups {
+        encoded,
+        input_locations,
+    })
 }
 
 /// Encodes frontend-owned typed columns when the established clustering rules
@@ -229,6 +374,7 @@ pub(crate) fn encode_unclustered_registered_entity_row_groups(
 fn encode_registered_entity_row_groups_impl<'a, I>(
     spec: &EntitySurfaceSpec,
     rows: I,
+    allow_compact_replacement: bool,
 ) -> Result<EncodedEntityRowGroups, LixError>
 where
     I: ExactSizeIterator<Item = EntityColumnarRowRef<'a>>,
@@ -273,17 +419,20 @@ where
             uniform_updated_at,
         )
     });
+    let compact_replacement = allow_compact_replacement;
     let mut fields = Vec::new();
     if authoritative {
-        fields.extend([
-            Field::new("physical_key", DataType::Binary, false),
-            Field::new("change_id", DataType::Binary, false),
-            Field::new("deleted", DataType::Boolean, false),
-            Field::new("snapshot_kind", DataType::Int64, false),
-            Field::new("snapshot_payload", DataType::Binary, true),
-            Field::new("metadata_kind", DataType::Int64, false),
-            Field::new("metadata_payload", DataType::Binary, true),
-        ]);
+        fields.push(Field::new("physical_key", DataType::Binary, false));
+        if !compact_replacement {
+            fields.extend([
+                Field::new("change_id", DataType::Binary, false),
+                Field::new("deleted", DataType::Boolean, false),
+                Field::new("snapshot_kind", DataType::Int64, false),
+                Field::new("snapshot_payload", DataType::Binary, true),
+                Field::new("metadata_kind", DataType::Int64, false),
+                Field::new("metadata_payload", DataType::Binary, true),
+            ]);
+        }
         let (_, uniform_commit_id, uniform_created_at, uniform_updated_at) =
             authoritative_lifecycle.expect("authoritative lifecycle was computed");
         if !uniform_commit_id {
@@ -296,12 +445,17 @@ where
             fields.push(Field::new("updated_at", DataType::UInt64, false));
         }
     }
-    fields.extend(entity_visible_fields(spec));
-    fields.push(Field::new(
-        ENTITY_COLUMNAR_ENTITY_PK_FIELD,
-        DataType::Utf8,
-        false,
-    ));
+    let compact_path_value = compact_replacement && spec.certifies_path_value_replacement;
+    if compact_path_value {
+        fields.push(entity_visible_fields(spec)[1].clone());
+    } else {
+        fields.extend(entity_visible_fields(spec));
+        fields.push(Field::new(
+            ENTITY_COLUMNAR_ENTITY_PK_FIELD,
+            DataType::Utf8,
+            false,
+        ));
+    }
     let mut metadata = HashMap::new();
     metadata.insert(
         ENTITY_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY.to_string(),
@@ -328,6 +482,18 @@ where
             "lix.layout".to_owned(),
             ENTITY_ARROW_STATE_LAYOUT.to_owned(),
         );
+        if compact_replacement {
+            metadata.insert(
+                ENTITY_COLUMNAR_COMPACT_REPLACEMENT_METADATA_KEY.to_owned(),
+                "true".to_owned(),
+            );
+        }
+        if compact_path_value {
+            metadata.insert(
+                ENTITY_COLUMNAR_COMPACT_PATH_VALUE_METADATA_KEY.to_owned(),
+                "true".to_owned(),
+            );
+        }
         metadata.insert("lix.order".to_owned(), "physical_key-ascending".to_owned());
         metadata.insert(
             ENTITY_ARROW_STATE_SCHEMA_KEY_METADATA.to_owned(),
@@ -452,7 +618,9 @@ where
     let mut input_locations = vec![None; input_count];
     let mut batches = Vec::new();
     for partition in partitions {
-        let group_max_rows = if authoritative {
+        let group_max_rows = if compact_replacement {
+            16 * 1024
+        } else if authoritative {
             512
         } else {
             ROW_GROUP_MAX_ROWS
@@ -467,7 +635,7 @@ where
                         .map_err(|_| entity_columnar_error("row index exceeds u32"))?,
                 });
             }
-            let mut columns = Vec::new();
+            let mut columns: Vec<ArrayRef> = Vec::new();
             if authoritative {
                 fn slot<'a>(value: crate::json_store::JsonSlotRef<'a>) -> (i64, Option<&'a [u8]>) {
                     match value {
@@ -478,43 +646,72 @@ where
                         }
                     }
                 }
+                if compact_path_value {
+                    let mut key_data = Vec::new();
+                    let mut key_offsets = Vec::with_capacity(rows.len() + 1);
+                    key_offsets.push(0_i32);
+                    for (_, row) in rows {
+                        let identity = row.entity_pk.as_single_string().map_err(|error| {
+                            entity_columnar_error(format!(
+                                "compact path/value identity is invalid: {error}"
+                            ))
+                        })?;
+                        crate::tracked_state::encode_single_string_key_ref_into(
+                            &mut key_data,
+                            &spec.schema_key,
+                            None,
+                            identity,
+                        );
+                        key_offsets.push(i32::try_from(key_data.len()).map_err(|_| {
+                            entity_columnar_error("compact physical keys exceed Arrow i32 offsets")
+                        })?);
+                    }
+                    columns.push(Arc::new(BinaryArray::new(
+                        OffsetBuffer::new(ScalarBuffer::from(key_offsets)),
+                        Buffer::from(key_data),
+                        None,
+                    )));
+                } else {
+                    let physical_keys = rows
+                        .iter()
+                        .map(|(_, row)| {
+                            crate::tracked_state::encode_key_ref(
+                                crate::tracked_state::TrackedStateKeyRef {
+                                    schema_key: &spec.schema_key,
+                                    file_id: None,
+                                    entity_pk: row.entity_pk,
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    columns.push(Arc::new(BinaryArray::from_iter_values(
+                        physical_keys.iter().map(Vec::as_slice),
+                    )));
+                }
                 let authority = rows
                     .iter()
                     .map(|(_, row)| row.authority.expect("authoritative set was validated"))
                     .collect::<Vec<_>>();
-                let (snapshot_tags, snapshot_payloads): (Vec<_>, Vec<_>) =
-                    authority.iter().map(|row| slot(row.snapshot)).unzip();
-                let (metadata_tags, metadata_payloads): (Vec<_>, Vec<_>) =
-                    authority.iter().map(|row| slot(row.metadata)).unzip();
-                let physical_keys = rows
-                    .iter()
-                    .map(|(_, row)| {
-                        crate::tracked_state::encode_key_ref(
-                            crate::tracked_state::TrackedStateKeyRef {
-                                schema_key: &spec.schema_key,
-                                file_id: None,
-                                entity_pk: row.entity_pk,
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                columns.extend::<[ArrayRef; 7]>([
-                    Arc::new(BinaryArray::from_iter_values(
-                        physical_keys.iter().map(Vec::as_slice),
-                    )),
-                    Arc::new(BinaryArray::from_iter_values(
-                        authority
-                            .iter()
-                            .map(|row| row.value.change_id.as_uuid().as_bytes().as_slice()),
-                    )),
-                    Arc::new(BooleanArray::from_iter(
-                        authority.iter().map(|row| Some(row.value.deleted)),
-                    )),
-                    Arc::new(Int64Array::from_iter_values(snapshot_tags)),
-                    Arc::new(BinaryArray::from_iter(snapshot_payloads)),
-                    Arc::new(Int64Array::from_iter_values(metadata_tags)),
-                    Arc::new(BinaryArray::from_iter(metadata_payloads)),
-                ]);
+                if !compact_replacement {
+                    let (snapshot_tags, snapshot_payloads): (Vec<_>, Vec<_>) =
+                        authority.iter().map(|row| slot(row.snapshot)).unzip();
+                    let (metadata_tags, metadata_payloads): (Vec<_>, Vec<_>) =
+                        authority.iter().map(|row| slot(row.metadata)).unzip();
+                    columns.extend::<[ArrayRef; 6]>([
+                        Arc::new(BinaryArray::from_iter_values(
+                            authority
+                                .iter()
+                                .map(|row| row.value.change_id.as_uuid().as_bytes().as_slice()),
+                        )),
+                        Arc::new(BooleanArray::from_iter(
+                            authority.iter().map(|row| Some(row.value.deleted)),
+                        )),
+                        Arc::new(Int64Array::from_iter_values(snapshot_tags)),
+                        Arc::new(BinaryArray::from_iter(snapshot_payloads)),
+                        Arc::new(Int64Array::from_iter_values(metadata_tags)),
+                        Arc::new(BinaryArray::from_iter(metadata_payloads)),
+                    ]);
+                }
                 let (_, uniform_commit_id, uniform_created_at, uniform_updated_at) =
                     authoritative_lifecycle.expect("authoritative lifecycle was computed");
                 if !uniform_commit_id {
@@ -535,16 +732,26 @@ where
                     )));
                 }
             }
-            columns.extend(
-                decoder
-                    .decode_arrow_columns(rows.iter().map(|(_, row)| Some(row.snapshot_bytes)))?,
-            );
-            let entity_pks = rows
-                .iter()
-                .map(|(_, row)| row.entity_pk.as_json_array_text())
-                .collect::<Result<Vec<_>, _>>()?;
-            let entity_pks: ArrayRef = Arc::new(StringArray::from(entity_pks));
-            columns.push(entity_pks);
+            if compact_replacement && spec.certifies_path_value_replacement {
+                columns.push(Arc::new(StringArray::from_iter_values(rows.iter().map(
+                    |(_, row)| std::str::from_utf8(row.snapshot_bytes)
+                        .expect("certified path/value replacement value is UTF-8 JSON"),
+                ))));
+            } else {
+                columns.extend(
+                    decoder.decode_arrow_columns(
+                        rows.iter().map(|(_, row)| Some(row.snapshot_bytes)),
+                    )?,
+                );
+            }
+            if !compact_path_value {
+                let entity_pks = rows
+                    .iter()
+                    .map(|(_, row)| row.entity_pk.as_json_array_text())
+                    .collect::<Result<Vec<_>, _>>()?;
+                let entity_pks: ArrayRef = Arc::new(StringArray::from(entity_pks));
+                columns.push(entity_pks);
+            }
             batches.push(
                 RecordBatch::try_new(Arc::clone(&schema), columns)
                     .map_err(|error| entity_columnar_error(error.to_string()))?,
@@ -564,6 +771,36 @@ where
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| entity_columnar_error("row-group permutation omitted an input row"))?,
     })
+}
+
+pub(crate) fn path_value_snapshot_value_json(snapshot: &[u8]) -> Option<&str> {
+    const PATH_PREFIX: &[u8] = b"{\"path\":";
+    const VALUE_SEPARATOR: &[u8] = b",\"value\":";
+    let mut cursor = PATH_PREFIX.len();
+    if !snapshot.starts_with(PATH_PREFIX) {
+        return None;
+    }
+    if snapshot.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    cursor += 1;
+    let mut escaped = false;
+    while let Some(&byte) = snapshot.get(cursor) {
+        cursor += 1;
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            break;
+        }
+    }
+    if !snapshot.get(cursor..)?.starts_with(VALUE_SEPARATOR) {
+        return None;
+    }
+    cursor += VALUE_SEPARATOR.len();
+    let value = snapshot.get(cursor..snapshot.len().checked_sub(1)?)?;
+    std::str::from_utf8(value).ok()
 }
 
 #[cfg(test)]

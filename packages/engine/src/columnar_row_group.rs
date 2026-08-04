@@ -43,6 +43,7 @@ pub(crate) const ROW_GROUP_COLUMN_SPACE: StorageSpace = StorageSpace::immutable(
 const MANIFEST_MAGIC: &[u8; 8] = b"LXRGM003";
 const COLUMN_MAGIC: &[u8; 8] = b"LXRGC001";
 const COMPRESSED_MAGIC: &[u8; 8] = b"LXRGZ001";
+const LZ4_COMPRESSED_MAGIC: &[u8; 8] = b"LXRGL001";
 const BLAKE3_DIGEST_LEN: usize = 32;
 const MAX_DECODED_COLUMN_BYTES: usize = 256 * 1024 * 1024;
 
@@ -176,6 +177,7 @@ pub(crate) struct RowGroupColumnStatistics {
     pub(crate) min: Option<RowGroupScalar>,
     pub(crate) max: Option<RowGroupScalar>,
     pub(crate) sum: Option<RowGroupScalar>,
+    pub(crate) true_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -318,6 +320,7 @@ pub(crate) fn remap_row_group_statistics(
     manifest: &RowGroupManifest,
     group_index: usize,
     field_names: &[String],
+    row_count: u32,
 ) -> Result<RowGroupStatistics, LixError> {
     let group = manifest
         .groups
@@ -334,7 +337,7 @@ pub(crate) fn remap_row_group_statistics(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(RowGroupStatistics {
-        row_count: group.row_count,
+        row_count,
         columns: indices
             .iter()
             .map(|&index| group.columns[index].clone())
@@ -464,7 +467,11 @@ fn encode_row_group_set_impl(
         let mut statistics = Vec::with_capacity(fields.len());
         let mut column_digests = Vec::with_capacity(fields.len());
         for (column_index, (array, field)) in batch.columns().iter().zip(&fields).enumerate() {
-            let stats = column_statistics(array, field.data_type)?;
+            let lexical_statistics = field
+                .metadata
+                .get("lix.value_type")
+                .is_none_or(|value| value != "json");
+            let stats = column_statistics(array, field.data_type, lexical_statistics)?;
             let encoded = encode_column(array, field.data_type)?;
             statistics.push(stats);
             column_digests.push(*blake3::hash(&encoded).as_bytes());
@@ -848,7 +855,10 @@ fn projected_schema(manifest: &RowGroupManifest, projection: &[usize]) -> Schema
     ))
 }
 
-fn encode_column(array: &ArrayRef, data_type: RowGroupDataType) -> Result<Vec<u8>, LixError> {
+fn encode_column(
+    array: &ArrayRef,
+    data_type: RowGroupDataType,
+) -> Result<Vec<u8>, LixError> {
     let row_count = u32::try_from(array.len())
         .map_err(|_| row_group_error("row-group column length exceeds u32"))?;
     let validity = encode_validity(array.as_ref());
@@ -868,52 +878,56 @@ fn encode_column(array: &ArrayRef, data_type: RowGroupDataType) -> Result<Vec<u8
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| row_group_error("row-group String column downcast failed"))?;
-            let mut data = Vec::new();
-            let mut offsets = Vec::with_capacity(values.len() + 1);
-            offsets.push(0_i32);
-            for index in 0..values.len() {
-                if values.is_valid(index) {
-                    data.extend_from_slice(values.value(index).as_bytes());
-                }
-                offsets.push(i32::try_from(data.len()).map_err(|_| {
-                    row_group_error("row-group String data exceeds Arrow i32 offsets")
-                })?);
-            }
+            let source_offsets = values.value_offsets();
+            let first = usize::try_from(source_offsets[0])
+                .map_err(|_| row_group_error("row-group String offset is negative"))?;
+            let last = usize::try_from(source_offsets[values.len()])
+                .map_err(|_| row_group_error("row-group String offset is negative"))?;
+            let data = values
+                .value_data()
+                .get(first..last)
+                .ok_or_else(|| row_group_error("row-group String offsets exceed data"))?;
+            raw.reserve(4 + source_offsets.len() * size_of::<i32>() + data.len());
             raw.extend_from_slice(
                 &u32::try_from(data.len())
                     .map_err(|_| row_group_error("row-group String data exceeds u32"))?
                     .to_le_bytes(),
             );
-            for offset in offsets {
-                raw.extend_from_slice(&offset.to_le_bytes());
+            for &offset in source_offsets {
+                let normalized = offset
+                    .checked_sub(source_offsets[0])
+                    .ok_or_else(|| row_group_error("row-group String offsets are unordered"))?;
+                raw.extend_from_slice(&normalized.to_le_bytes());
             }
-            raw.extend_from_slice(&data);
+            raw.extend_from_slice(data);
         }
         RowGroupDataType::Binary => {
             let values = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| row_group_error("row-group Binary column downcast failed"))?;
-            let mut data = Vec::new();
-            let mut offsets = Vec::with_capacity(values.len() + 1);
-            offsets.push(0_i32);
-            for index in 0..values.len() {
-                if values.is_valid(index) {
-                    data.extend_from_slice(values.value(index));
-                }
-                offsets.push(i32::try_from(data.len()).map_err(|_| {
-                    row_group_error("row-group Binary data exceeds Arrow i32 offsets")
-                })?);
-            }
+            let source_offsets = values.value_offsets();
+            let first = usize::try_from(source_offsets[0])
+                .map_err(|_| row_group_error("row-group Binary offset is negative"))?;
+            let last = usize::try_from(source_offsets[values.len()])
+                .map_err(|_| row_group_error("row-group Binary offset is negative"))?;
+            let data = values
+                .value_data()
+                .get(first..last)
+                .ok_or_else(|| row_group_error("row-group Binary offsets exceed data"))?;
+            raw.reserve(4 + source_offsets.len() * size_of::<i32>() + data.len());
             raw.extend_from_slice(
                 &u32::try_from(data.len())
                     .map_err(|_| row_group_error("row-group Binary data exceeds u32"))?
                     .to_le_bytes(),
             );
-            for offset in offsets {
-                raw.extend_from_slice(&offset.to_le_bytes());
+            for &offset in source_offsets {
+                let normalized = offset
+                    .checked_sub(source_offsets[0])
+                    .ok_or_else(|| row_group_error("row-group Binary offsets are unordered"))?;
+                raw.extend_from_slice(&normalized.to_le_bytes());
             }
-            raw.extend_from_slice(&data);
+            raw.extend_from_slice(data);
         }
         RowGroupDataType::Int64 => {
             let values = array
@@ -1131,11 +1145,22 @@ fn clear_unused_bits_are_zero(bits: &[u8], len: usize, label: &str) -> Result<()
 fn column_statistics(
     array: &ArrayRef,
     data_type: RowGroupDataType,
+    lexical_statistics: bool,
 ) -> Result<RowGroupColumnStatistics, LixError> {
     let null_count = u32::try_from(array.null_count())
         .map_err(|_| row_group_error("row-group null count exceeds u32"))?;
+    let mut true_count = None;
     let (min, max, sum) = match data_type {
         RowGroupDataType::String => {
+            if !lexical_statistics {
+                return Ok(RowGroupColumnStatistics {
+                    null_count,
+                    min: None,
+                    max: None,
+                    sum: None,
+                    true_count: None,
+                });
+            }
             let values = array
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -1147,6 +1172,7 @@ fn column_statistics(
                     min: None,
                     max: None,
                     sum: None,
+                    true_count: None,
                 });
             };
             let (mut min, mut max) = (first, first);
@@ -1176,6 +1202,7 @@ fn column_statistics(
                     min: None,
                     max: None,
                     sum: None,
+                    true_count: None,
                 });
             };
             let (mut min, mut max) = (first, first);
@@ -1205,6 +1232,7 @@ fn column_statistics(
                     min: None,
                     max: None,
                     sum: None,
+                    true_count: None,
                 });
             };
             let (mut min, mut max, mut sum) = (first, first, Some(first));
@@ -1231,6 +1259,7 @@ fn column_statistics(
                     min: None,
                     max: None,
                     sum: None,
+                    true_count: None,
                 });
             };
             let (mut min, mut max, mut sum) = (first, first, Some(first));
@@ -1257,6 +1286,7 @@ fn column_statistics(
                     min: None,
                     max: None,
                     sum: None,
+                    true_count: None,
                 });
             };
             let (mut min, mut max, mut sum) = (first, first, first);
@@ -1287,13 +1317,17 @@ fn column_statistics(
                     min: None,
                     max: None,
                     sum: None,
+                    true_count: Some(0),
                 });
             };
             let (mut min, mut max) = (first, first);
+            let mut count = u32::from(first);
             for value in observed {
                 min &= value;
                 max |= value;
+                count += u32::from(value);
             }
+            true_count = Some(count);
             (
                 Some(RowGroupScalar::Boolean(min)),
                 Some(RowGroupScalar::Boolean(max)),
@@ -1306,6 +1340,7 @@ fn column_statistics(
         min,
         max,
         sum,
+        true_count,
     })
 }
 
@@ -1326,7 +1361,11 @@ pub(crate) fn exact_record_batch_statistics(
         .zip(batch.schema().fields())
         .map(|(array, field)| {
             let data_type = RowGroupDataType::from_arrow(field.data_type())?;
-            column_statistics(array, data_type)
+            let lexical_statistics = field
+                .metadata()
+                .get("lix.value_type")
+                .is_none_or(|value| value != "json");
+            column_statistics(array, data_type, lexical_statistics)
         })
         .collect::<Result<Vec<_>, LixError>>()?;
     Ok(RowGroupStatistics {
@@ -1336,16 +1375,17 @@ pub(crate) fn exact_record_batch_statistics(
     })
 }
 
-fn compress_column(raw: &[u8]) -> Result<Vec<u8>, LixError> {
+fn compress_column(
+    raw: &[u8],
+) -> Result<Vec<u8>, LixError> {
     if raw.len() > MAX_DECODED_COLUMN_BYTES {
         return Err(row_group_error(
             "row-group decoded column exceeds the safety limit",
         ));
     }
-    let compressed = crate::compression::compress_zstd_level_1(raw)
-        .map_err(|error| row_group_error(format!("row-group compression failed: {error}")))?;
+    let compressed = lz4_flex::block::compress(raw);
     let mut output = Vec::with_capacity(12 + compressed.len());
-    output.extend_from_slice(COMPRESSED_MAGIC);
+    output.extend_from_slice(LZ4_COMPRESSED_MAGIC);
     output.extend_from_slice(
         &u32::try_from(raw.len())
             .map_err(|_| row_group_error("row-group decoded column exceeds u32"))?
@@ -1357,15 +1397,24 @@ fn compress_column(raw: &[u8]) -> Result<Vec<u8>, LixError> {
 
 fn decompress_column(encoded: &[u8]) -> Result<Vec<u8>, LixError> {
     let mut cursor = Cursor::new(encoded);
-    cursor.expect_magic(COMPRESSED_MAGIC, "compressed row-group column")?;
+    let lz4 = encoded.starts_with(LZ4_COMPRESSED_MAGIC);
+    cursor.expect_magic(
+        if lz4 { LZ4_COMPRESSED_MAGIC } else { COMPRESSED_MAGIC },
+        "compressed row-group column",
+    )?;
     let decoded_len = cursor.u32_le()? as usize;
     if decoded_len > MAX_DECODED_COLUMN_BYTES {
         return Err(row_group_error(
             "row-group decoded column exceeds the safety limit",
         ));
     }
-    crate::compression::decompress_zstd(cursor.remaining(), decoded_len)
-        .map_err(|error| row_group_error(format!("row-group decompression failed: {error}")))
+    if lz4 {
+        lz4_flex::block::decompress(cursor.remaining(), decoded_len)
+            .map_err(|error| row_group_error(format!("row-group decompression failed: {error}")))
+    } else {
+        crate::compression::decompress_zstd(cursor.remaining(), decoded_len)
+            .map_err(|error| row_group_error(format!("row-group decompression failed: {error}")))
+    }
 }
 
 fn encode_manifest(manifest: &RowGroupManifest) -> Result<Vec<u8>, LixError> {
@@ -1407,6 +1456,13 @@ fn encode_manifest(manifest: &RowGroupManifest) -> Result<Vec<u8>, LixError> {
             put_optional_scalar(&mut output, stats.min.as_ref(), field.data_type)?;
             put_optional_scalar(&mut output, stats.max.as_ref(), field.data_type)?;
             put_optional_scalar(&mut output, stats.sum.as_ref(), field.data_type)?;
+            match stats.true_count {
+                Some(true_count) => {
+                    output.push(1);
+                    output.extend_from_slice(&true_count.to_le_bytes());
+                }
+                None => output.push(0),
+            }
         }
     }
     let checksum = blake3::hash(&output);
@@ -1467,7 +1523,25 @@ fn decode_manifest(encoded: &[u8]) -> Result<RowGroupManifest, LixError> {
             let min = cursor.optional_scalar(field.data_type)?;
             let max = cursor.optional_scalar(field.data_type)?;
             let sum = cursor.optional_scalar(field.data_type)?;
-            if (min.is_none() || max.is_none()) != (null_count == row_count) {
+            let true_count = match cursor.u8()? {
+                0 => None,
+                1 => Some(cursor.u32_le()?),
+                _ => {
+                    return Err(row_group_error(
+                        "row-group Boolean true-count presence flag is invalid",
+                    ));
+                }
+            };
+            let omits_lexical_statistics = field
+                .metadata
+                .get("lix.value_type")
+                .is_some_and(|value| value == "json");
+            if min.is_none() != max.is_none()
+                || (min.is_some() && null_count == row_count)
+                || (min.is_none() && null_count != row_count && !omits_lexical_statistics)
+                || (field.data_type == RowGroupDataType::Boolean) != true_count.is_some()
+                || true_count.is_some_and(|count| count > row_count - null_count)
+            {
                 return Err(row_group_error(
                     "row-group min/max presence contradicts null count",
                 ));
@@ -1477,6 +1551,7 @@ fn decode_manifest(encoded: &[u8]) -> Result<RowGroupManifest, LixError> {
                 min,
                 max,
                 sum,
+                true_count,
             });
             column_digests.push(digest);
         }
@@ -1768,7 +1843,15 @@ mod tests {
             let decoded = decode_column(&column.bytes, field.data_type, group.row_count as usize)
                 .expect("decode column");
             assert_eq!(
-                column_statistics(&decoded, field.data_type).expect("decoded stats"),
+                column_statistics(
+                    &decoded,
+                    field.data_type,
+                    field
+                        .metadata
+                        .get("lix.value_type")
+                        .is_none_or(|value| value != "json"),
+                )
+                .expect("decoded stats"),
                 group.columns[column.column_index]
             );
         }

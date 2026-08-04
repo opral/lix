@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int64Array, UInt64Array, new_null_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array,
+    new_null_array,
 };
 use datafusion::arrow::compute::concat;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -18,7 +19,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use crate::LixError;
 use crate::columnar_row_group::{
     ArrowStateSetId, EncodedRowGroupSet, LoadedRowGroupSet, RowGroupRowLocation,
-    encode_row_group_set_preserving_batches, stage_row_group_set,
+    decode_encoded_row_group_set, encode_row_group_set_preserving_batches, stage_row_group_set,
 };
 use crate::json_store::{JsonRef, JsonSlot, JsonSlotRef};
 use crate::storage_adapter::{
@@ -31,8 +32,8 @@ pub(crate) const CURRENT_STATE_DATA_PART_REFS_SPACE: StorageSpace = StorageSpace
     "tracked_state.arrow_state_leaf_refs.v1",
 );
 
-pub(crate) const CURRENT_STATE_DATA_PART_MAX_ROWS: usize = 512;
-pub(crate) const CURRENT_STATE_DATA_PART_TARGET_BYTES: usize = 64 * 1024;
+pub(crate) const CURRENT_STATE_DATA_PART_MAX_ROWS: usize = 16 * 1024;
+const CURRENT_STATE_CANONICAL_LEAF_ROWS: usize = 512;
 const CURRENT_STATE_DATA_PART_MAX_BYTES: usize = 4 * 1024 * 1024;
 const REFS_DIGEST_CONTEXT: &str = "lix arrow state leaf refs v1";
 const LEAF_NAMESPACE: &str = "lix.tracked_state.arrow_leaf.v1";
@@ -55,6 +56,37 @@ pub(crate) fn current_state_data_projection(
         return Err(part_error(
             "unsupported Arrow state leaf layout; recreate the repository",
         ));
+    }
+    if compact_replacement(manifest) {
+        // Certified path/value replacements have only one visible payload
+        // column. Keep the point-read projection to the identity plus that
+        // payload; lifecycle columns are uniform and authenticated by
+        // manifest metadata. Bulk scans still request the full schema at the
+        // entity-columnar layer.
+        let compact_path_value = manifest
+            .metadata
+            .get(crate::sql2::ENTITY_COLUMNAR_COMPACT_PATH_VALUE_METADATA_KEY)
+            .is_some_and(|value| value == "true");
+        if compact_path_value {
+            return ["physical_key"]
+                .into_iter()
+                .chain(manifest.fields.iter().filter_map(|field| {
+                    (!matches!(
+                        field.name.as_str(),
+                        "physical_key" | "commit_id" | "created_at" | "updated_at"
+                    ))
+                    .then_some(field.name.as_str())
+                }))
+                .map(|name| {
+                    manifest
+                        .fields
+                        .iter()
+                        .position(|field| field.name == name)
+                        .ok_or_else(|| part_error(format!("Arrow state leaf omitted '{name}'")))
+                })
+                .collect();
+        }
+        return Ok((0..manifest.fields.len()).collect());
     }
     let mut names = vec![
         "physical_key",
@@ -84,6 +116,146 @@ pub(crate) fn current_state_data_projection(
                 .ok_or_else(|| part_error(format!("Arrow state leaf omitted '{name}'")))
         })
         .collect()
+}
+
+fn compact_replacement(manifest: &crate::columnar_row_group::RowGroupManifest) -> bool {
+    manifest
+        .metadata
+        .get(crate::sql2::ENTITY_COLUMNAR_COMPACT_REPLACEMENT_METADATA_KEY)
+        .is_some_and(|value| value == "true")
+}
+
+fn compact_snapshot(batch: &RecordBatch, row_index: usize) -> Result<JsonSlot, LixError> {
+    let mut object = serde_json::Map::new();
+    if batch
+        .schema()
+        .metadata()
+        .get(crate::sql2::ENTITY_COLUMNAR_COMPACT_PATH_VALUE_METADATA_KEY)
+        .is_some_and(|value| value == "true")
+    {
+        let key_index = batch
+            .schema()
+            .index_of("physical_key")
+            .map_err(|_| part_error("compact path/value leaf omitted physical_key"))?;
+        let encoded_key = binary_column(batch, key_index)?.value(row_index);
+        let decoded =
+            crate::tracked_state::codec::decode_key_shared(Bytes::copy_from_slice(encoded_key))?;
+        let path = decoded
+            .entity_pk
+            .as_single_string()
+            .map_err(|error| part_error(format!("compact path identity is invalid: {error}")))?;
+        object.insert(
+            "path".to_owned(),
+            serde_json::Value::String(path.to_owned()),
+        );
+    }
+    for (column_index, field) in batch.schema().fields().iter().enumerate() {
+        if field.name() == "physical_key"
+            || field.name() == crate::sql2::ENTITY_COLUMNAR_ENTITY_PK_FIELD
+        {
+            continue;
+        }
+        let array = batch.column(column_index);
+        let value = if array.is_null(row_index) {
+            serde_json::Value::Null
+        } else {
+            match field.data_type() {
+                DataType::Utf8 => {
+                    let value = array
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| part_error("compact String column has the wrong type"))?
+                        .value(row_index);
+                    if crate::sql2::field_is_json(field) {
+                        serde_json::from_str(value).map_err(|error| {
+                            part_error(format!("compact JSON column is invalid: {error}"))
+                        })?
+                    } else {
+                        serde_json::Value::String(value.to_owned())
+                    }
+                }
+                DataType::Int64 => serde_json::Value::Number(
+                    array
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| part_error("compact Int64 column has the wrong type"))?
+                        .value(row_index)
+                        .into(),
+                ),
+                DataType::Float64 => {
+                    let value = array
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or_else(|| part_error("compact Float64 column has the wrong type"))?
+                        .value(row_index);
+                    serde_json::Number::from_f64(value)
+                        .map(serde_json::Value::Number)
+                        .ok_or_else(|| part_error("compact Float64 column is not finite"))?
+                }
+                DataType::Boolean => serde_json::Value::Bool(
+                    array
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| part_error("compact Boolean column has the wrong type"))?
+                        .value(row_index),
+                ),
+                data_type => {
+                    return Err(part_error(format!(
+                        "compact replacement has unsupported Arrow type {data_type}"
+                    )));
+                }
+            }
+        };
+        object.insert(field.name().to_owned(), value);
+    }
+    serde_json::to_string(&serde_json::Value::Object(object))
+        .map(|json| JsonSlot::Inline(json.into()))
+        .map_err(|error| part_error(format!("compact snapshot encoding failed: {error}")))
+}
+
+fn compact_uniform_value(
+    manifest: &crate::columnar_row_group::RowGroupManifest,
+    batch: &RecordBatch,
+    group_index: u32,
+    row_index: usize,
+) -> Result<TrackedStateIndexValue, LixError> {
+    let commit_id = manifest
+        .metadata
+        .get(ENTITY_ARROW_STATE_COMMIT_ID_METADATA)
+        .ok_or_else(|| part_error("compact replacement omitted commit id"))?
+        .parse::<crate::changelog::CommitId>()
+        .map_err(|error| part_error(format!("compact commit id is invalid: {error}")))?;
+    let timestamp =
+        |key: &str, label: &str| {
+            let packed =
+                if let Some(value) = manifest.metadata.get(key) {
+                    value.parse::<u64>().map_err(|error| {
+                        part_error(format!("compact {label} is invalid: {error}"))
+                    })?
+                } else {
+                    batch
+                        .column(batch.schema().index_of(label).map_err(|_| {
+                            part_error(format!("compact replacement omitted {label}"))
+                        })?)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| part_error(format!("compact {label} has the wrong type")))?
+                        .value(row_index)
+                };
+            crate::common::LixTimestamp::from_packed(packed)
+                .map_err(|error| part_error(format!("compact {label} is invalid: {error}")))
+        };
+    Ok(TrackedStateIndexValue {
+        change_id: crate::tracked_state::addressable_change_id(
+            commit_id,
+            group_index as usize,
+            row_index,
+        )?,
+        commit_id,
+        deleted: false,
+        created_at: timestamp(ENTITY_ARROW_STATE_CREATED_AT_METADATA, "created_at")?,
+        updated_at: timestamp(ENTITY_ARROW_STATE_UPDATED_AT_METADATA, "updated_at")?,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,6 +438,7 @@ pub(crate) struct EncodedCurrentStateDataPart {
     pub(crate) row_count: u16,
     pub(crate) refs_digest: [u8; 32],
     pub(crate) refs_bytes: Bytes,
+    refs: Vec<[u8; 32]>,
 }
 
 impl EncodedCurrentStateDataPart {
@@ -308,11 +481,11 @@ pub(crate) fn encode_bounded_selected_current_state_data_parts(
     let mut encoded = Vec::new();
     let mut offset = 0usize;
     while offset < rows.len() {
-        let mut count = (rows.len() - offset).min(CURRENT_STATE_DATA_PART_MAX_ROWS);
+        let mut count = (rows.len() - offset).min(CURRENT_STATE_CANONICAL_LEAF_ROWS);
         let part = loop {
             let part =
-                encode_selected_current_state_data_part(sources, &rows[offset..offset + count])?;
-            if part.physical_bytes() <= CURRENT_STATE_DATA_PART_TARGET_BYTES || count == 1 {
+                encode_selected_current_state_data_part(sources, &rows[offset..offset + count], false)?;
+            if part.physical_bytes() <= CURRENT_STATE_DATA_PART_MAX_BYTES || count == 1 {
                 break part;
             }
             count = count.div_ceil(2);
@@ -323,20 +496,100 @@ pub(crate) fn encode_bounded_selected_current_state_data_parts(
     Ok(encoded)
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CanonicalCurrentStateGroup {
+    pub(crate) first_key: Vec<u8>,
+    pub(crate) last_key: Vec<u8>,
+    pub(crate) row_count: u16,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EncodedCanonicalCurrentStateSet {
+    encoded: EncodedRowGroupSet,
+    pub(crate) groups: Vec<CanonicalCurrentStateGroup>,
+    refs: Vec<[u8; 32]>,
+}
+
+impl EncodedCanonicalCurrentStateSet {
+    pub(crate) fn stage(
+        &self,
+        writes: &mut StorageWriteSet,
+    ) -> Result<(ArrowStateSetId, [u8; 32]), LixError> {
+        let state_set_id = stage_row_group_set(writes, &self.encoded)?;
+        let mut refs = self.refs.clone();
+        let refs_digest = stage_current_state_ref_summary(writes, state_set_id, &mut refs)?;
+        Ok((state_set_id, refs_digest))
+    }
+}
+
+/// Canonicalizes a complete logical scope into one content-addressed Arrow
+/// set with one batch per 512-row serving group. Lifecycle columns are made
+/// explicit across every group so all batches share one physical schema.
+pub(crate) fn encode_canonical_selected_current_state_set(
+    sources: &[LoadedRowGroupSet],
+    rows: &[ArrowStateRowSelection],
+) -> Result<EncodedCanonicalCurrentStateSet, LixError> {
+    if rows.is_empty() {
+        return Err(part_error("canonical Arrow state set is empty"));
+    }
+    validate_selected_rows(sources, rows)?;
+    let mut batches = Vec::with_capacity(rows.len().div_ceil(CURRENT_STATE_CANONICAL_LEAF_ROWS));
+    let mut groups = Vec::with_capacity(batches.capacity());
+    let mut refs = Vec::new();
+    let mut schema = None;
+    for chunk in rows.chunks(CURRENT_STATE_CANONICAL_LEAF_ROWS) {
+        let part = encode_selected_current_state_data_part(sources, chunk, true)?;
+        let projection = (0..part.encoded.manifest.fields.len()).collect::<Vec<_>>();
+        let loaded = decode_encoded_row_group_set(&part.encoded, &projection)?;
+        let batch = loaded
+            .batches
+            .into_iter()
+            .next()
+            .expect("one selected part encodes one batch");
+        if let Some(expected) = schema.as_ref() {
+            if expected != &batch.schema() {
+                return Err(part_error(
+                    "canonical Arrow state groups disagree on physical schema",
+                ));
+            }
+        } else {
+            schema = Some(batch.schema());
+        }
+        groups.push(CanonicalCurrentStateGroup {
+            first_key: chunk.first().expect("non-empty chunk").encoded_key.clone(),
+            last_key: chunk.last().expect("non-empty chunk").encoded_key.clone(),
+            row_count: u16::try_from(chunk.len()).expect("canonical group is bounded"),
+        });
+        refs.extend(part.refs);
+        batches.push(batch);
+    }
+    let schema = schema.expect("non-empty rows produce a schema");
+    let encoded = encode_row_group_set_preserving_batches(LEAF_NAMESPACE, schema, &batches)?;
+    Ok(EncodedCanonicalCurrentStateSet {
+        encoded,
+        groups,
+        refs,
+    })
+}
+
 fn encode_selected_current_state_data_part(
     sources: &[LoadedRowGroupSet],
     rows: &[ArrowStateRowSelection],
+    force_explicit_lifecycle: bool,
 ) -> Result<EncodedCurrentStateDataPart, LixError> {
     let first = &rows[0].value;
-    let uniform_commit_id = rows
-        .iter()
-        .all(|row| row.value.commit_id == first.commit_id);
-    let uniform_created_at = rows
-        .iter()
-        .all(|row| row.value.created_at == first.created_at);
-    let uniform_updated_at = rows
-        .iter()
-        .all(|row| row.value.updated_at == first.updated_at);
+    let uniform_commit_id = !force_explicit_lifecycle
+        && rows
+            .iter()
+            .all(|row| row.value.commit_id == first.commit_id);
+    let uniform_created_at = !force_explicit_lifecycle
+        && rows
+            .iter()
+            .all(|row| row.value.created_at == first.created_at);
+    let uniform_updated_at = !force_explicit_lifecycle
+        && rows
+            .iter()
+            .all(|row| row.value.updated_at == first.updated_at);
     let lifecycle_names = ["commit_id", "created_at", "updated_at"];
     let mut payload_fields = Vec::<Field>::new();
     for source in sources {
@@ -406,6 +659,8 @@ fn encode_selected_current_state_data_part(
     for source in sources {
         for (key, value) in &source.manifest.metadata {
             if matches!(key.as_str(), "lix.layout" | "lix.order")
+                || key == crate::sql2::ENTITY_COLUMNAR_COMPACT_REPLACEMENT_METADATA_KEY
+                || key == crate::sql2::ENTITY_COLUMNAR_COMPACT_PATH_VALUE_METADATA_KEY
                 || matches!(
                     key.as_str(),
                     ENTITY_ARROW_STATE_COMMIT_ID_METADATA
@@ -483,6 +738,9 @@ fn encode_selected_current_state_data_part(
         let Some((source_index, batch_index, row_index)) = row.source else {
             continue;
         };
+        if compact_replacement(&sources[source_index].manifest) {
+            continue;
+        }
         let batch = &sources[source_index].batches[batch_index];
         for (kind_name, payload_name) in [
             ("snapshot_kind", "snapshot_payload"),
@@ -526,6 +784,7 @@ fn encode_selected_current_state_data_part(
         row_count: u16::try_from(rows.len()).expect("Arrow leaf row count is bounded"),
         refs_digest,
         refs_bytes: Bytes::from(refs_bytes),
+        refs,
     })
 }
 
@@ -543,23 +802,55 @@ fn selected_column(
         } else {
             row.retain_payload
         };
-        let slice = row
+        let compact_slice = row
             .source
             .filter(|_| retain)
             .and_then(|(source_index, batch_index, row_index)| {
-                let batch = sources.get(source_index)?.batches.get(batch_index)?;
-                let column_index = batch.schema().index_of(name).ok()?;
-                let column = batch.column(column_index);
-                (column.data_type() == data_type).then(|| column.slice(row_index, 1))
+                let source = sources.get(source_index)?;
+                compact_replacement(&source.manifest).then(|| -> Result<ArrayRef, LixError> {
+                    let batch = &source.batches[batch_index];
+                    match name {
+                        "snapshot_kind" => {
+                            let array: ArrayRef = Arc::new(Int64Array::from_iter_values([1]));
+                            Ok(array)
+                        }
+                        "snapshot_payload" => {
+                            let JsonSlot::Inline(snapshot) = compact_snapshot(batch, row_index)?
+                            else {
+                                unreachable!("compact snapshots are inline")
+                            };
+                            let array: ArrayRef =
+                                Arc::new(BinaryArray::from_iter([Some(snapshot.as_bytes())]));
+                            Ok(array)
+                        }
+                        "metadata_kind" => {
+                            let array: ArrayRef = Arc::new(Int64Array::from_iter_values([0]));
+                            Ok(array)
+                        }
+                        "metadata_payload" => Ok(new_null_array(&DataType::Binary, 1)),
+                        _ => Ok(new_null_array(data_type, 1)),
+                    }
+                })
             })
-            .unwrap_or_else(|| {
-                if !typed_payload && matches!(name, "snapshot_kind" | "metadata_kind") {
-                    let kind: ArrayRef = Arc::new(Int64Array::from_iter_values([0]));
-                    kind
-                } else {
-                    new_null_array(data_type, 1)
-                }
-            });
+            .transpose()?;
+        let slice = compact_slice.unwrap_or_else(|| {
+            row.source
+                .filter(|_| retain)
+                .and_then(|(source_index, batch_index, row_index)| {
+                    let batch = sources.get(source_index)?.batches.get(batch_index)?;
+                    let column_index = batch.schema().index_of(name).ok()?;
+                    let column = batch.column(column_index);
+                    (column.data_type() == data_type).then(|| column.slice(row_index, 1))
+                })
+                .unwrap_or_else(|| {
+                    if !typed_payload && matches!(name, "snapshot_kind" | "metadata_kind") {
+                        let kind: ArrayRef = Arc::new(Int64Array::from_iter_values([0]));
+                        kind
+                    } else {
+                        new_null_array(data_type, 1)
+                    }
+                })
+        });
         slices.push(slice);
     }
     concat(
@@ -627,7 +918,7 @@ pub(crate) fn decode_current_state_data_part_refs(
 
 pub(crate) fn decode_current_state_data_part(
     loaded: &LoadedRowGroupSet,
-    _group_index: u32,
+    group_index: u32,
 ) -> Result<Vec<CurrentStateDataRow>, LixError> {
     if loaded.manifest.namespace != LEAF_NAMESPACE
         || !loaded
@@ -639,6 +930,28 @@ pub(crate) fn decode_current_state_data_part(
         return Err(part_error(
             "unsupported Arrow state leaf layout; recreate the repository",
         ));
+    }
+    if compact_replacement(&loaded.manifest) {
+        let mut rows = Vec::with_capacity(loaded.batches.iter().map(RecordBatch::num_rows).sum());
+        for batch in &loaded.batches {
+            let key = binary_column(
+                batch,
+                batch
+                    .schema()
+                    .index_of("physical_key")
+                    .map_err(|_| part_error("compact replacement omitted physical_key"))?,
+            )?;
+            for row_index in 0..batch.num_rows() {
+                rows.push(CurrentStateDataRow {
+                    encoded_key: key.value(row_index).to_vec(),
+                    value: compact_uniform_value(&loaded.manifest, batch, group_index, row_index)?,
+                    snapshot: compact_snapshot(batch, row_index)?,
+                    metadata: JsonSlot::None,
+                });
+            }
+        }
+        validate_rows(&rows)?;
+        return Ok(rows);
     }
     let metadata = &loaded.manifest.metadata;
     let uniform_commit_id = metadata
@@ -794,6 +1107,27 @@ pub(crate) fn decode_current_state_authority_rows(
             "unsupported Arrow state leaf layout; recreate the repository",
         ));
     }
+    if compact_replacement(&loaded.manifest) {
+        let mut rows = Vec::with_capacity(loaded.batches.iter().map(RecordBatch::num_rows).sum());
+        for (batch_index, batch) in loaded.batches.iter().enumerate() {
+            let key = binary_column(
+                batch,
+                batch
+                    .schema()
+                    .index_of("physical_key")
+                    .map_err(|_| part_error("compact replacement omitted physical_key"))?,
+            )?;
+            for row_index in 0..batch.num_rows() {
+                rows.push((
+                    key.value(row_index).to_vec(),
+                    compact_uniform_value(&loaded.manifest, batch, batch_index as u32, row_index)?,
+                    batch_index,
+                    row_index,
+                ));
+            }
+        }
+        return Ok(rows);
+    }
     let metadata = &loaded.manifest.metadata;
     let uniform_commit_id = metadata
         .get(ENTITY_ARROW_STATE_COMMIT_ID_METADATA)
@@ -924,11 +1258,113 @@ pub(crate) struct HydratedArrowStatePayload {
     pub(crate) metadata: JsonSlot,
 }
 
+/// Returns the physical identity summary without materializing any logical
+/// rows. Exact readers use this to authenticate a directory descriptor before
+/// hydrating only the requested ordinals.
+pub(crate) fn current_state_data_group_summary(
+    loaded: &LoadedRowGroupSet,
+) -> Result<(usize, Vec<u8>, Vec<u8>), LixError> {
+    if loaded.batches.len() != 1 {
+        return Err(part_error(
+            "current-state group summary requires exactly one Arrow row group",
+        ));
+    }
+    let batch = &loaded.batches[0];
+    let key = binary_column(
+        batch,
+        batch
+            .schema()
+            .index_of("physical_key")
+            .map_err(|_| part_error("Arrow state leaf omitted physical_key"))?,
+    )?;
+    if key.is_empty() {
+        return Err(part_error("Arrow state leaf group is empty"));
+    }
+    Ok((
+        key.len(),
+        key.value(0).to_vec(),
+        key.value(key.len() - 1).to_vec(),
+    ))
+}
+
+/// Binary-searches the physical Arrow identity column and hydrates only exact
+/// matches. The input order and misses are preserved.
+pub(crate) fn hydrate_current_state_data_rows_at_keys(
+    loaded: &LoadedRowGroupSet,
+    group_index: u32,
+    encoded_keys: &[&[u8]],
+) -> Result<Vec<Option<(CurrentStateDataRow, u32)>>, LixError> {
+    if loaded.batches.len() != 1 {
+        return Err(part_error(
+            "exact current-state hydration requires exactly one Arrow row group",
+        ));
+    }
+    let batch = &loaded.batches[0];
+    let key = binary_column(
+        batch,
+        batch
+            .schema()
+            .index_of("physical_key")
+            .map_err(|_| part_error("Arrow state leaf omitted physical_key"))?,
+    )?;
+    let mut row_indices = Vec::with_capacity(encoded_keys.len());
+    for &encoded_key in encoded_keys {
+        let mut low = 0usize;
+        let mut high = key.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if key.value(middle) < encoded_key {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        row_indices.push(
+            (low < key.len() && key.value(low) == encoded_key)
+                .then(|| u32::try_from(low).expect("Arrow row count fits u32")),
+        );
+    }
+    let present_indices = row_indices.iter().flatten().copied().collect::<Vec<_>>();
+    let mut hydrated =
+        hydrate_current_state_payload_rows(loaded, group_index, &present_indices)?.into_iter();
+    row_indices
+        .into_iter()
+        .map(|row_index| {
+            row_index
+                .map(|row_index| {
+                    let row = hydrated.next().ok_or_else(|| {
+                        part_error("exact current-state hydration lost a requested row")
+                    })?;
+                    Ok((
+                        CurrentStateDataRow {
+                            encoded_key: row.encoded_key,
+                            value: row.value,
+                            snapshot: row.snapshot,
+                            metadata: row.metadata,
+                        },
+                        row_index,
+                    ))
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|rows| {
+            if hydrated.next().is_some() {
+                Err(part_error(
+                    "exact current-state hydration returned an extra row",
+                ))
+            } else {
+                Ok(rows)
+            }
+        })
+}
+
 /// Hydrates only explicitly requested history coordinates. This is a terminal
 /// JSON boundary for changelog results, not an intermediate state
 /// representation used to rebuild another leaf.
 pub(crate) fn hydrate_current_state_payload_rows(
     loaded: &LoadedRowGroupSet,
+    group_index: u32,
     row_indices: &[u32],
 ) -> Result<Vec<HydratedArrowStatePayload>, LixError> {
     if loaded.batches.len() != 1 {
@@ -936,7 +1372,31 @@ pub(crate) fn hydrate_current_state_payload_rows(
             "coordinate hydration requires exactly one Arrow row group",
         ));
     }
-    let authority = decode_current_state_authority_rows(loaded)?;
+    if compact_replacement(&loaded.manifest) {
+        let batch = &loaded.batches[0];
+        let key = binary_column(
+            batch,
+            batch
+                .schema()
+                .index_of("physical_key")
+                .map_err(|_| part_error("compact replacement omitted physical_key"))?,
+        )?;
+        return row_indices
+            .iter()
+            .map(|&row_index| {
+                let row_index = usize::try_from(row_index).expect("u32 fits usize");
+                if row_index >= batch.num_rows() {
+                    return Err(part_error("authored Arrow event row is outside its leaf"));
+                }
+                Ok(HydratedArrowStatePayload {
+                    encoded_key: key.value(row_index).to_vec(),
+                    value: compact_uniform_value(&loaded.manifest, batch, group_index, row_index)?,
+                    snapshot: compact_snapshot(batch, row_index)?,
+                    metadata: JsonSlot::None,
+                })
+            })
+            .collect();
+    }
     let batch = &loaded.batches[0];
     let column_index = |name: &str| {
         batch
@@ -960,12 +1420,17 @@ pub(crate) fn hydrate_current_state_payload_rows(
         .iter()
         .map(|&row_index| {
             let row_index = usize::try_from(row_index).expect("u32 fits usize");
-            let (encoded_key, value, _, _) = authority
-                .get(row_index)
-                .ok_or_else(|| part_error("authored Arrow event row is outside its leaf"))?;
+            if row_index >= batch.num_rows() {
+                return Err(part_error("authored Arrow event row is outside its leaf"));
+            }
+            let (encoded_key, value) = decode_current_state_authority_row(
+                &loaded.manifest,
+                batch,
+                row_index,
+            )?;
             Ok(HydratedArrowStatePayload {
-                encoded_key: encoded_key.clone(),
-                value: value.clone(),
+                encoded_key,
+                value,
                 snapshot: decode_slot(
                     snapshot_kind.value(row_index),
                     snapshot_payload,
@@ -981,6 +1446,72 @@ pub(crate) fn hydrate_current_state_payload_rows(
             })
         })
         .collect()
+}
+
+fn decode_current_state_authority_row(
+    manifest: &crate::columnar_row_group::RowGroupManifest,
+    batch: &RecordBatch,
+    row_index: usize,
+) -> Result<(Vec<u8>, TrackedStateIndexValue), LixError> {
+    let column_index = |name: &str| {
+        batch
+            .schema()
+            .index_of(name)
+            .map_err(|_| part_error(format!("Arrow state leaf omitted '{name}'")))
+    };
+    let key = binary_column(batch, column_index("physical_key")?)?;
+    let change_id = binary_column(batch, column_index("change_id")?)?;
+    let deleted = batch
+        .column(column_index("deleted")?)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| part_error("deleted column has the wrong Arrow type"))?;
+    let commit_id = match manifest.metadata.get(ENTITY_ARROW_STATE_COMMIT_ID_METADATA) {
+        Some(value) => value
+            .parse::<crate::changelog::CommitId>()
+            .map_err(|error| part_error(format!("leaf commit id is invalid: {error}")))?,
+        None => crate::changelog::CommitId::new(uuid_from_column(
+            binary_column(batch, column_index("commit_id")?)?,
+            row_index,
+            "commit_id",
+        )?),
+    };
+    let timestamp = |metadata_key: &str, column_name: &str| {
+        match manifest.metadata.get(metadata_key) {
+            Some(value) => value
+                .parse::<u64>()
+                .map_err(|error| part_error(format!("leaf {column_name} is invalid: {error}")))
+                .and_then(|packed| {
+                    crate::common::LixTimestamp::from_packed(packed).map_err(|error| {
+                        part_error(format!("leaf {column_name} is invalid: {error}"))
+                    })
+                }),
+            None => {
+                let values = batch
+                    .column(column_index(column_name)?)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| part_error(format!("{column_name} has the wrong Arrow type")))?;
+                crate::common::LixTimestamp::from_packed(values.value(row_index)).map_err(|error| {
+                    part_error(format!("{column_name} is invalid: {error}"))
+                })
+            }
+        }
+    };
+    Ok((
+        key.value(row_index).to_vec(),
+        TrackedStateIndexValue {
+            change_id: crate::changelog::ChangeId::new(uuid_from_column(
+                change_id,
+                row_index,
+                "change_id",
+            )?),
+            commit_id,
+            deleted: deleted.value(row_index),
+            created_at: timestamp(ENTITY_ARROW_STATE_CREATED_AT_METADATA, "created_at")?,
+            updated_at: timestamp(ENTITY_ARROW_STATE_UPDATED_AT_METADATA, "updated_at")?,
+        },
+    ))
 }
 
 fn binary_column(batch: &RecordBatch, index: usize) -> Result<&BinaryArray, LixError> {

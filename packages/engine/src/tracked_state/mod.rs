@@ -14,7 +14,7 @@ mod types;
 
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use codec::encode_key;
-pub(crate) use codec::encode_key_ref;
+pub(crate) use codec::{decode_key_borrowed, encode_key_ref, encode_single_string_key_ref_into};
 pub(crate) use context::{
     TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
 };
@@ -30,6 +30,7 @@ pub(crate) use current_state_data_part::{
 pub(crate) use current_state_part::empty_current_state_catalog_root;
 pub(crate) use current_state_part::{
     CURRENT_STATE_CATALOG_SPACE, CURRENT_STATE_PART_DIRECTORY_SPACE,
+    load_current_state_catalog_entry,
     load_current_state_catalog_reachability_many,
     load_current_state_part_directory_reachability_many,
     validate_current_state_catalog_transition_root,
@@ -56,12 +57,15 @@ pub(crate) use storage::{
     load_change_record_by_id, load_commit_delta_members_with_payloads_for_history,
     load_commit_delta_selection_certificate, load_commit_state_manifest,
     load_commit_state_manifests, load_complete_current_state_coordinates_encoded,
+    load_complete_current_state_rows_with_coordinates_encoded,
+    load_complete_current_state_rows_with_coordinates_encoded_cached,
     load_current_state_payloads_at_coordinates, load_current_state_scope_descriptors,
     load_published_commit_state_manifest, scan_change_records_from_commit_deltas,
     scan_commit_delta_inventory, selected_change_selection_fingerprint,
     stage_addressable_commit_deltas, stage_addressable_commit_deltas_with_selected_source,
-    stage_certified_commit_state_manifest_with_handle, stage_change_locators,
-    stage_commit_deltas_for_commit_state, stage_current_state_catalog_from_published_parent,
+    stage_arrow_native_replacement_manifest, stage_certified_commit_state_manifest_with_handle,
+    stage_change_locators, stage_commit_deltas_for_commit_state,
+    stage_current_state_catalog_from_published_parent,
     stage_current_state_catalog_from_staged_parent, stage_delete_change_locators,
     stage_delete_commit_delta_inventory_entry, stage_ordered_addressable_commit_deltas,
     stage_ordered_addressable_replacement_parts, stage_ordered_arrow_native_commit_deltas,

@@ -3387,6 +3387,7 @@ dependencies = [
  "lix_plugin_layout",
  "lix_plugin_wire",
  "lru",
+ "lz4_flex",
  "memchr",
  "musli",
  "paste",

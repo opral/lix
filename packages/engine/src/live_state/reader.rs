@@ -77,6 +77,14 @@ pub(crate) trait LiveStateReader: Send + Sync {
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
         Ok(None)
     }
+
+    async fn collection_is_proven_absent(
+        &self,
+        _branch_id: &str,
+        _scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<bool, LixError> {
+        Ok(false)
+    }
 }
 
 #[cfg(test)]

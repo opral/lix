@@ -307,17 +307,19 @@ where
                 &source_projection,
             )
             .await?;
-        if projection.is_empty() {
-            return RecordBatch::try_new_with_options(
+        let batch = if projection.is_empty() {
+            RecordBatch::try_new_with_options(
                 schema,
                 arrays,
                 &datafusion::arrow::record_batch::RecordBatchOptions::new()
                     .with_row_count(Some(row_count)),
             )
-            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()));
-        }
-        RecordBatch::try_new(schema, arrays)
-            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))
+            .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?
+        } else {
+            RecordBatch::try_new(schema, arrays)
+                .map_err(|error| LixError::new(LixError::CODE_INTERNAL_ERROR, error.to_string()))?
+        };
+        Ok(batch.slice(source.row_offset, source.row_count))
     }
 
     async fn entity_columnar_shadow_mask(

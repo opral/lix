@@ -435,6 +435,9 @@ async fn collection_is_certifiably_empty(
     if ctx.has_staged_collection_rows(&branch_id, scope)? {
         return Ok(false);
     }
+    if ctx.collection_is_proven_absent(&branch_id, scope).await? {
+        return Ok(true);
+    }
     Ok(ctx
         .load_collection_generation(&branch_id, scope)
         .await?
@@ -2912,6 +2915,8 @@ pub(crate) struct PreparedPathValueReplacementProgram {
 pub(crate) struct PreparedPathValueReplacementRow {
     pub(crate) entity_pk: EntityPk,
     pub(crate) snapshot: TransactionJson,
+    pub(crate) durable_predecessor:
+        Option<crate::live_state::CertifiedCurrentStatePredecessor>,
 }
 
 impl PreparedPathValueReplacementProgram {
@@ -2929,6 +2934,36 @@ impl PreparedPathValueReplacementProgram {
             ));
         };
         Ok(primary_key)
+    }
+
+    pub(crate) fn primary_key_text<'a>(
+        &self,
+        params: &'a [impl AsRef<str>],
+    ) -> Result<&'a str, LixError> {
+        params
+            .get(self.primary_key_param_index)
+            .map(AsRef::as_ref)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "prepared path replacement primary key text is missing",
+                )
+            })
+    }
+
+    pub(crate) fn replacement_value_text<'a>(
+        &self,
+        params: &'a [impl AsRef<str>],
+    ) -> Result<&'a str, LixError> {
+        params
+            .get(self.value_param_index)
+            .map(AsRef::as_ref)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "prepared path replacement value text is missing",
+                )
+            })
     }
 }
 
@@ -3065,7 +3100,9 @@ pub(crate) async fn prepare_path_value_replacement_row(
         ));
     }
 
-    prepare_path_value_replacement_row_known_live(program, params).map(Some)
+    let mut row = prepare_path_value_replacement_row_known_live(program, params)?;
+    row.durable_predecessor = candidate.durable_predecessor().cloned();
+    Ok(Some(row))
 }
 
 pub(crate) fn prepare_path_value_replacement_row_known_live(
@@ -3084,6 +3121,7 @@ pub(crate) fn prepare_path_value_replacement_row_known_live(
     Ok(PreparedPathValueReplacementRow {
         entity_pk,
         snapshot,
+        durable_predecessor: None,
     })
 }
 
@@ -3104,6 +3142,41 @@ pub(crate) fn append_path_value_replacement_snapshot(
         }
     };
     append_path_value_replacement_snapshot_text(primary_key, replacement_value, normalized)
+}
+
+pub(crate) fn append_path_value_replacement_value(
+    program: &PreparedPathValueReplacementProgram,
+    params: &[Value],
+    normalized: &mut Vec<u8>,
+) -> Result<(usize, usize), LixError> {
+    let replacement_value = match params.get(program.value_param_index) {
+        Some(Value::Text(value)) => Some(value.as_str()),
+        Some(Value::Null) => None,
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "prepared path replacement value must be text or null",
+            ));
+        }
+    };
+    append_path_value_replacement_value_text(replacement_value, normalized)
+}
+
+pub(crate) fn append_path_value_replacement_value_text(
+    replacement_value: Option<&str>,
+    normalized: &mut Vec<u8>,
+) -> Result<(usize, usize), LixError> {
+    let start = normalized.len();
+    match replacement_value {
+        None => normalized.extend_from_slice(b"null"),
+        Some(raw) => {
+            if let Err(error) = append_canonical_json_parameter(normalized, raw) {
+                normalized.truncate(start);
+                return Err(error);
+            }
+        }
+    }
+    Ok((start, normalized.len()))
 }
 
 pub(crate) fn append_path_value_replacement_snapshot_text(

@@ -10,8 +10,8 @@
 mod hot;
 
 pub(crate) use hot::{
-    EntityColumnarGroupSource, EntityColumnarOverlayRow, HOT_FILE_SPACE, HOT_ROW_SPACE,
-    HotStateTransactionCache, HotTrackedSnapshot, ROOT_CURRENT_BASE_SPACE,
+    ArrowIdentityMembership, EntityColumnarGroupSource, EntityColumnarOverlayRow, HOT_FILE_SPACE,
+    HOT_ROW_SPACE, HotStateTransactionCache, HotTrackedSnapshot, ROOT_CURRENT_BASE_SPACE,
     materialize_certified_root_rows,
 };
 
@@ -296,6 +296,23 @@ impl TrackedHeadContext {
         hot::HotStateStoreReader {
             store,
             transaction_cache: None,
+            decoded_columns: None,
+        }
+    }
+
+    #[expect(clippy::unused_self)]
+    pub(crate) fn cached_reader<S>(
+        &self,
+        store: S,
+        decoded_columns: crate::live_state::EntityDecodedColumnCache,
+    ) -> hot::HotStateStoreReader<S>
+    where
+        S: StorageAdapterRead,
+    {
+        hot::HotStateStoreReader {
+            store,
+            transaction_cache: None,
+            decoded_columns: Some(decoded_columns),
         }
     }
 
@@ -311,6 +328,24 @@ impl TrackedHeadContext {
         hot::HotStateStoreReader {
             store,
             transaction_cache: Some(cache),
+            decoded_columns: None,
+        }
+    }
+
+    #[expect(clippy::unused_self)]
+    pub(crate) fn cached_transaction_reader<S>(
+        &self,
+        store: S,
+        cache: Arc<HotStateTransactionCache>,
+        decoded_columns: crate::live_state::EntityDecodedColumnCache,
+    ) -> hot::HotStateStoreReader<S>
+    where
+        S: StorageAdapterRead,
+    {
+        hot::HotStateStoreReader {
+            store,
+            transaction_cache: Some(cache),
+            decoded_columns: Some(decoded_columns),
         }
     }
 
@@ -525,6 +560,7 @@ fn stage_test_current_control(
             generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id,
             created_at: timestamp,
             updated_at: timestamp,
@@ -1588,6 +1624,7 @@ mod tests {
             generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
@@ -1655,6 +1692,7 @@ mod tests {
             generation: head,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
@@ -2735,6 +2773,7 @@ mod tests {
             generation: active_generation,
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
             updated_at: timestamp,

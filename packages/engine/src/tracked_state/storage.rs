@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Bound, Deref, Range};
 use std::sync::{Arc, Mutex};
 
+use datafusion::arrow::array::Array as _;
+
 use crate::changelog::CommitId;
 use crate::common::SharedStr;
 use crate::storage_adapter::{
@@ -68,7 +70,7 @@ pub(crate) const TRACKED_STATE_COMMIT_STATE_SEAL_SPACE: StorageSpace = StorageSp
     TRACKED_STATE_COMMIT_STATE_SEAL_NAMESPACE,
 );
 
-const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 512;
+const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 16 * 1024;
 const GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const GENERIC_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
 const ORDERED_COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 64 * 1024;
@@ -460,6 +462,10 @@ struct CommitDeltaManifest {
     replacement_generation: Option<StoredCommitDeltaReplacementGeneration>,
     #[musli(with = storage_codec::option)]
     replacement_parts: Option<StoredReplacementPartsAuthority>,
+    /// Authoritative Arrow post-image leaves used directly as the authored
+    /// history for a certified fresh generation. No duplicate event leaf is
+    /// stored for this shape.
+    sealed_state_parts: Vec<CurrentStatePartDescriptor>,
     /// A complete leaf payload for a commit that fits in one segment. Keeping
     /// it in the directory preserves the one-record shape of tiny commits;
     /// larger commits use the indexed segment list below.
@@ -514,7 +520,7 @@ fn commit_state_inventory_from_delta_manifest(
         lifecycle_summary: manifest.lifecycle_summary.clone(),
         replacement_generation: manifest.replacement_generation.clone(),
         replacement_parts: manifest.replacement_parts.clone(),
-        sealed_state_parts: Vec::new(),
+        sealed_state_parts: manifest.sealed_state_parts.clone(),
         inline_part: manifest.inline_segment.clone(),
         parts: manifest
             .segments
@@ -541,6 +547,17 @@ pub(crate) fn commit_delta_members_touched_scopes(
     inventory: &CommitStateMutationInventory,
     members: &[CommitDeltaMember],
 ) -> Result<(Vec<CommitDeltaReplacementScope>, BTreeSet<String>), LixError> {
+    if let Some(scope) = inventory.single_partition.clone()
+        && inventory.replacement_generation.is_some()
+    {
+        return Ok((vec![scope], BTreeSet::new()));
+    }
+    if let Some(scope) = inventory.single_partition.clone()
+        && inventory.uses_native_arrow_history()
+        && members.is_empty()
+    {
+        return Ok((vec![scope], BTreeSet::new()));
+    }
     let local_member_count = if inventory.selected_source_commit_id.is_some() {
         members.iter().filter(|member| member.authored).count()
     } else {
@@ -555,7 +572,7 @@ pub(crate) fn commit_delta_members_touched_scopes(
         return Ok((Vec::new(), BTreeSet::new()));
     }
     if let Some(scope) = inventory.single_partition.clone()
-        && (inventory.replacement_generation.is_some() || !inventory.sealed_state_parts.is_empty())
+        && !inventory.sealed_state_parts.is_empty()
     {
         return Ok((vec![scope], BTreeSet::new()));
     }
@@ -589,10 +606,56 @@ async fn expanded_commit_delta_manifest_from_commit_state(
 /// Resolves exact identities directly to their authoritative Arrow rows,
 /// including leaf-owned payload slots. Missing identities retain positional
 /// `None` entries and no mutation sidecar is consulted.
+fn slice_loaded_current_state_group(
+    mut loaded: crate::columnar_row_group::LoadedRowGroupSet,
+    descriptor: &CurrentStatePartDescriptor,
+) -> Result<crate::columnar_row_group::LoadedRowGroupSet, LixError> {
+    let [batch] = loaded.batches.as_mut_slice() else {
+        return Err(replacement_payload_error(
+            "current-state descriptor requires one Arrow group",
+        ));
+    };
+    let offset = usize::from(descriptor.row_offset);
+    let row_count = usize::from(descriptor.row_count);
+    if offset
+        .checked_add(row_count)
+        .is_none_or(|end| end > batch.num_rows())
+    {
+        return Err(replacement_payload_error(
+            "current-state descriptor slice exceeds its Arrow group",
+        ));
+    }
+    *batch = batch.slice(offset, row_count);
+    Ok(loaded)
+}
+
 pub(crate) async fn load_complete_current_state_rows_with_coordinates_encoded(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &CommitStateManifest,
     encoded_keys: &[Bytes],
+) -> Result<
+    Vec<
+        Option<(
+            crate::tracked_state::CurrentStateDataRow,
+            TrackedStateBaseCoordinate,
+        )>,
+    >,
+    LixError,
+> {
+    load_complete_current_state_rows_with_coordinates_encoded_cached(
+        store,
+        state,
+        encoded_keys,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn load_complete_current_state_rows_with_coordinates_encoded_cached(
+    store: &(impl StorageAdapterRead + ?Sized),
+    state: &CommitStateManifest,
+    encoded_keys: &[Bytes],
+    decoded_columns: Option<&crate::live_state::EntityDecodedColumnCache>,
 ) -> Result<
     Vec<
         Option<(
@@ -650,7 +713,7 @@ pub(crate) async fn load_complete_current_state_rows_with_coordinates_encoded(
         super::current_state_part::route_current_state_part_sets(store, &directory_requests)
             .await?;
     let mut routed = BTreeMap::<
-        (crate::columnar_row_group::ArrowStateSetId, u32),
+        (crate::columnar_row_group::ArrowStateSetId, u32, u16, u16),
         (CurrentStatePartDescriptor, Vec<usize>),
     >::new();
     for ((_, key_indices), descriptors) in sets.into_iter().zip(routes) {
@@ -659,7 +722,12 @@ pub(crate) async fn load_complete_current_state_rows_with_coordinates_encoded(
                 continue;
             };
             routed
-                .entry((descriptor.state_set_id, descriptor.state_group_index))
+                .entry((
+                    descriptor.state_set_id,
+                    descriptor.state_group_index,
+                    descriptor.row_offset,
+                    descriptor.row_count,
+                ))
                 .or_insert_with(|| (descriptor, Vec::new()))
                 .1
                 .push(output_index);
@@ -667,20 +735,81 @@ pub(crate) async fn load_complete_current_state_rows_with_coordinates_encoded(
     }
     let mut output = vec![None; encoded_keys.len()];
     for (_, (descriptor, output_indices)) in routed {
-        let rows = load_current_state_descriptor_rows(store, &descriptor).await?;
-        for output_index in output_indices {
-            if let Ok(row_index) = rows.binary_search_by(|row| {
-                row.encoded_key
-                    .as_slice()
-                    .cmp(encoded_keys[output_index].as_ref())
-            }) {
+        let manifest =
+            crate::columnar_row_group::load_row_group_manifest(store, descriptor.state_set_id)
+                .await?
+                .ok_or_else(|| {
+                    replacement_payload_error(
+                        "current-state directory references a missing Arrow leaf",
+                    )
+                })?;
+        let projection =
+            crate::tracked_state::current_state_data_part::current_state_data_projection(
+                &manifest,
+            )?;
+        let batch = if let Some(decoded_columns) = decoded_columns {
+            let manifest_digest = manifest.content_digest()?;
+            let arrays = decoded_columns
+                .load_projection(
+                    store,
+                    descriptor.state_set_id,
+                    manifest_digest,
+                    &manifest,
+                    descriptor.state_group_index as usize,
+                    &projection,
+                )
+                .await?;
+            let schema =
+                crate::columnar_row_group::row_group_projected_schema(&manifest, &projection)?;
+            datafusion::arrow::record_batch::RecordBatch::try_new(schema, arrays)
+                .map_err(|error| replacement_payload_error(error.to_string()))?
+        } else {
+            crate::columnar_row_group::load_row_group_batch(
+                store,
+                descriptor.state_set_id,
+                &manifest,
+                descriptor.state_group_index as usize,
+                &projection,
+            )
+            .await?
+        };
+        let loaded = slice_loaded_current_state_group(
+            crate::columnar_row_group::LoadedRowGroupSet {
+            manifest,
+            batches: vec![batch],
+            },
+            &descriptor,
+        )?;
+        let (row_count, first_key, last_key) =
+            crate::tracked_state::current_state_data_part::current_state_data_group_summary(
+                &loaded,
+            )?;
+        if row_count != usize::from(descriptor.row_count)
+            || first_key != descriptor.first_key
+            || last_key != descriptor.last_key
+        {
+            return Err(replacement_payload_error(
+                "Arrow current-state leaf disagrees with its directory descriptor",
+            ));
+        }
+        let requested_keys = output_indices
+            .iter()
+            .map(|&output_index| encoded_keys[output_index].as_ref())
+            .collect::<Vec<_>>();
+        let rows =
+            crate::tracked_state::current_state_data_part::hydrate_current_state_data_rows_at_keys(
+                &loaded,
+                descriptor.state_group_index,
+                &requested_keys,
+            )?;
+        for (output_index, row) in output_indices.into_iter().zip(rows) {
+            if let Some((row, row_index)) = row {
                 output[output_index] = Some((
-                    rows[row_index].clone(),
+                    row,
                     TrackedStateBaseCoordinate {
                         state_set_id: descriptor.state_set_id,
                         group_index: descriptor.state_group_index,
-                        row_index: u32::try_from(row_index)
-                            .expect("bounded Arrow leaf row count fits u32"),
+                        row_index: u32::from(descriptor.row_offset) + row_index,
                     },
                 ));
             }
@@ -745,7 +874,7 @@ pub(crate) async fn load_complete_current_state_coordinates_encoded(
         super::current_state_part::route_current_state_part_sets(store, &directory_requests)
             .await?;
     let mut routed = BTreeMap::<
-        (crate::columnar_row_group::ArrowStateSetId, u32),
+        (crate::columnar_row_group::ArrowStateSetId, u32, u16, u16),
         (CurrentStatePartDescriptor, Vec<usize>),
     >::new();
     for ((_, key_indices), descriptors) in sets.into_iter().zip(routes) {
@@ -754,7 +883,12 @@ pub(crate) async fn load_complete_current_state_coordinates_encoded(
                 continue;
             };
             routed
-                .entry((descriptor.state_set_id, descriptor.state_group_index))
+                .entry((
+                    descriptor.state_set_id,
+                    descriptor.state_group_index,
+                    descriptor.row_offset,
+                    descriptor.row_count,
+                ))
                 .or_insert_with(|| (descriptor, Vec::new()))
                 .1
                 .push(output_index);
@@ -762,18 +896,64 @@ pub(crate) async fn load_complete_current_state_coordinates_encoded(
     }
     let mut output = vec![None; encoded_keys.len()];
     for (_, (descriptor, output_indices)) in routed {
-        let rows = load_current_state_descriptor_rows(store, &descriptor).await?;
+        let manifest = crate::columnar_row_group::load_row_group_manifest(
+            store,
+            descriptor.state_set_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            replacement_payload_error("current-state directory references a missing Arrow leaf")
+        })?;
+        let key_index = manifest
+            .fields
+            .iter()
+            .position(|field| field.name == "physical_key")
+            .ok_or_else(|| replacement_payload_error("Arrow state leaf omitted physical_key"))?;
+        let mut columns = crate::columnar_row_group::load_row_group_columns(
+            store,
+            descriptor.state_set_id,
+            &manifest,
+            descriptor.state_group_index as usize,
+            &[key_index],
+        )
+        .await?;
+        let keys = columns
+            .pop()
+            .expect("one Arrow identity column was requested");
+        let keys = keys.slice(
+            usize::from(descriptor.row_offset),
+            usize::from(descriptor.row_count),
+        );
+        let keys = keys
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::BinaryArray>()
+            .ok_or_else(|| replacement_payload_error("physical_key has the wrong Arrow type"))?;
+        if keys.len() != usize::from(descriptor.row_count)
+            || keys.value(0) != descriptor.first_key.as_slice()
+            || keys.value(keys.len() - 1) != descriptor.last_key.as_slice()
+        {
+            return Err(replacement_payload_error(
+                "Arrow current-state identities disagree with their directory descriptor",
+            ));
+        }
         for output_index in output_indices {
-            if let Ok(row_index) = rows.binary_search_by(|row| {
-                row.encoded_key
-                    .as_slice()
-                    .cmp(encoded_keys[output_index].as_ref())
-            }) {
+            let sought = encoded_keys[output_index].as_ref();
+            let mut low = 0usize;
+            let mut high = keys.len();
+            while low < high {
+                let middle = low + (high - low) / 2;
+                if keys.value(middle) < sought {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            if low < keys.len() && keys.value(low) == sought {
                 output[output_index] = Some(TrackedStateBaseCoordinate {
                     state_set_id: descriptor.state_set_id,
                     group_index: descriptor.state_group_index,
-                    row_index: u32::try_from(row_index)
-                        .expect("bounded Arrow leaf row count fits u32"),
+                    row_index: u32::from(descriptor.row_offset)
+                        + u32::try_from(low).expect("bounded Arrow leaf row count fits u32"),
                 });
             }
         }
@@ -830,6 +1010,7 @@ pub(crate) async fn load_current_state_payloads_at_coordinates(
         let rows =
             crate::tracked_state::current_state_data_part::hydrate_current_state_payload_rows(
                 &loaded,
+                group_index,
                 &row_indices,
             )?;
         for ((output_index, _), row) in requests.into_iter().zip(rows) {
@@ -852,54 +1033,75 @@ pub(crate) async fn scan_complete_current_state_rows(
     state: &CommitStateManifest,
     request: &TrackedStatePhysicalScanRequest,
 ) -> Result<Vec<crate::tracked_state::CurrentStateDataRow>, LixError> {
-    let exact_key_count = request
-        .schema_keys
-        .len()
-        .checked_mul(request.entity_pks.len())
-        .and_then(|count| count.checked_mul(request.file_ids.len()));
     if !request.schema_keys.is_empty()
         && !request.entity_pks.is_empty()
-        && !request.file_ids.is_empty()
-        && request
-            .file_ids
-            .iter()
-            .all(|file_id| !matches!(file_id, crate::NullableKeyFilter::Any))
-        && exact_key_count.is_some_and(|count| count <= 4096)
+        && (request.file_ids.is_empty()
+            || request
+                .file_ids
+                .iter()
+                .all(|file_id| !matches!(file_id, crate::NullableKeyFilter::Any)))
     {
-        let mut encoded_keys = Vec::with_capacity(exact_key_count.unwrap_or_default());
-        for schema_key in &request.schema_keys {
-            for file_id in &request.file_ids {
-                let file_id = match file_id {
-                    crate::NullableKeyFilter::Null => None,
-                    crate::NullableKeyFilter::Value(file_id) => Some(file_id.as_str()),
-                    crate::NullableKeyFilter::Any => unreachable!("exact route rejected Any"),
-                };
+        let mut scopes = Vec::<CommitDeltaReplacementScope>::new();
+        if request.file_ids.is_empty() {
+            scopes.extend(
+                super::current_state_part::load_current_state_catalog_entries(
+                    store,
+                    &state.current_state_catalog,
+                )
+                .await?
+                .into_iter()
+                .filter(|entry| request.schema_keys.contains(&entry.scope.schema_key))
+                .map(|entry| entry.scope),
+            );
+        } else {
+            for schema_key in &request.schema_keys {
+                for file_id in &request.file_ids {
+                    scopes.push(CommitDeltaReplacementScope {
+                        schema_key: schema_key.clone(),
+                        file_id: match file_id {
+                            crate::NullableKeyFilter::Null => None,
+                            crate::NullableKeyFilter::Value(file_id) => Some(file_id.clone()),
+                            crate::NullableKeyFilter::Any => {
+                                unreachable!("exact route rejected Any")
+                            }
+                        },
+                    });
+                }
+            }
+        }
+        let exact_key_count = scopes.len().checked_mul(request.entity_pks.len());
+        if exact_key_count.is_some_and(|count| count <= 4096) {
+            let mut encoded_keys = Vec::with_capacity(exact_key_count.unwrap_or_default());
+            for scope in scopes {
                 for entity_pk in &request.entity_pks {
                     encoded_keys.push(Bytes::from(encode_key_ref(TrackedStateKeyRef {
-                        schema_key,
-                        file_id,
+                        schema_key: &scope.schema_key,
+                        file_id: scope.file_id.as_deref(),
                         entity_pk,
                     })));
                 }
             }
-        }
-        encoded_keys.sort_unstable();
-        encoded_keys.dedup();
-        let exact_rows =
-            load_complete_current_state_rows_with_coordinates_encoded(store, state, &encoded_keys)
-                .await?;
-        let mut rows = Vec::with_capacity(exact_rows.len());
-        for (row, _) in exact_rows.into_iter().flatten() {
-            let key = decode_key_shared(Bytes::copy_from_slice(&row.encoded_key))?;
-            if request.matches_ref(key.as_ref(), &row.value) {
-                rows.push(row);
+            encoded_keys.sort_unstable();
+            encoded_keys.dedup();
+            let exact_rows = load_complete_current_state_rows_with_coordinates_encoded(
+                store,
+                state,
+                &encoded_keys,
+            )
+            .await?;
+            let mut rows = Vec::with_capacity(exact_rows.len());
+            for (row, _) in exact_rows.into_iter().flatten() {
+                let key = decode_key_shared(Bytes::copy_from_slice(&row.encoded_key))?;
+                if request.matches_ref(key.as_ref(), &row.value) {
+                    rows.push(row);
+                }
             }
+            rows.sort_unstable_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+            if let Some(limit) = request.limit {
+                rows.truncate(limit);
+            }
+            return Ok(rows);
         }
-        rows.sort_unstable_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
-        if let Some(limit) = request.limit {
-            rows.truncate(limit);
-        }
-        return Ok(rows);
     }
     let catalog = super::current_state_part::load_current_state_catalog_entries(
         store,
@@ -983,10 +1185,13 @@ async fn load_current_state_descriptor_rows(
         &projection,
     )
     .await?;
-    let loaded = crate::columnar_row_group::LoadedRowGroupSet {
+    let loaded = slice_loaded_current_state_group(
+        crate::columnar_row_group::LoadedRowGroupSet {
         manifest,
         batches: vec![batch],
-    };
+        },
+        descriptor,
+    )?;
     let decoded = crate::tracked_state::decode_current_state_data_part(
         &loaded,
         descriptor.state_group_index,
@@ -1160,6 +1365,7 @@ fn commit_delta_manifest_from_inventory(
         lifecycle_summary: inventory.lifecycle_summary.clone(),
         replacement_generation: inventory.replacement_generation.clone(),
         replacement_parts: inventory.replacement_parts.clone(),
+        sealed_state_parts: inventory.sealed_state_parts.clone(),
         inline_segment: inventory.inline_part.clone(),
         segments: inventory
             .parts
@@ -1685,6 +1891,7 @@ pub(super) fn stage_complete_arrow_current_state_descriptors(
                 last_key: part.last_key.clone(),
                 state_set_id: sealed.state_set_id,
                 state_group_index: sealed.state_group_index,
+                row_offset: 0,
                 payload_refs_digest: sealed.payload_refs_digest,
                 row_count,
             })
@@ -1732,6 +1939,7 @@ fn stage_selected_arrow_current_state_rows(
                 last_key: part.last_key,
                 state_set_id,
                 state_group_index: 0,
+                row_offset: 0,
                 payload_refs_digest: part.refs_digest,
                 row_count: part.row_count,
             })
@@ -1979,6 +2187,100 @@ async fn stage_sparse_typed_arrow_current_state_part_set(
         )
         .await?
         .ok_or_else(|| replacement_payload_error("Arrow current-state leaf is missing"))?;
+        if cascade.is_none() {
+            let key_index = manifest
+                .fields
+                .iter()
+                .position(|field| field.name == "physical_key")
+                .ok_or_else(|| replacement_payload_error("Arrow state leaf omitted physical_key"))?;
+            let key_source = crate::columnar_row_group::load_row_group_batch_with_staged(
+                store,
+                writes,
+                descriptor.state_set_id,
+                descriptor.state_group_index as usize,
+                &[key_index],
+            )
+            .await?
+            .ok_or_else(|| replacement_payload_error("Arrow current-state key column is missing"))?;
+            let key_source = slice_loaded_current_state_group(key_source, &descriptor)?;
+            let keys = key_source.batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::BinaryArray>()
+                .ok_or_else(|| replacement_payload_error("physical_key has the wrong Arrow type"))?;
+            if keys.len() != usize::from(descriptor.row_count)
+                || keys.value(0) != descriptor.first_key.as_slice()
+                || keys.value(keys.len() - 1) != descriptor.last_key.as_slice()
+            {
+                return Err(replacement_payload_error(
+                    "Arrow current-state key slice disagrees with its directory bounds",
+                ));
+            }
+            let mut descriptor_mutations = Vec::new();
+            while pending
+                .peek()
+                .is_some_and(|(key, _)| key.as_slice() <= descriptor.last_key.as_slice())
+            {
+                descriptor_mutations.push(pending.next().expect("peeked sparse mutation"));
+            }
+            let push_parent_slice = |
+                output: &mut Vec<CurrentStatePartDescriptor>,
+                start: usize,
+                end: usize,
+            | -> Result<(), LixError> {
+                if start == end {
+                    return Ok(());
+                }
+                let row_offset = usize::from(descriptor.row_offset)
+                    .checked_add(start)
+                    .ok_or_else(|| replacement_payload_error("Arrow slice offset overflowed"))?;
+                output.push(CurrentStatePartDescriptor {
+                    first_key: keys.value(start).to_vec(),
+                    last_key: keys.value(end - 1).to_vec(),
+                    state_set_id: descriptor.state_set_id,
+                    state_group_index: descriptor.state_group_index,
+                    row_offset: u16::try_from(row_offset).map_err(|_| {
+                        replacement_payload_error("Arrow slice offset exceeds u16")
+                    })?,
+                    payload_refs_digest: descriptor.payload_refs_digest,
+                    row_count: u16::try_from(end - start).map_err(|_| {
+                        replacement_payload_error("Arrow slice row count exceeds u16")
+                    })?,
+                });
+                Ok(())
+            };
+            let mut base_cursor = 0usize;
+            for (encoded_key, (value, source)) in descriptor_mutations {
+                let mut low = base_cursor;
+                let mut high = keys.len();
+                while low < high {
+                    let middle = low + (high - low) / 2;
+                    if keys.value(middle) < encoded_key.as_slice() {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+                push_parent_slice(&mut output, base_cursor, low)?;
+                let replaces_parent = low < keys.len() && keys.value(low) == encoded_key;
+                let changed = ArrowStateRowSelection {
+                    encoded_key,
+                    retain_payload: !value.deleted,
+                    value,
+                    source,
+                };
+                output.extend(stage_selected_arrow_current_state_rows(
+                    writes,
+                    &sources,
+                    std::slice::from_ref(&changed),
+                    &coordinate_keys,
+                    &mut coordinates,
+                )?);
+                base_cursor = low + usize::from(replaces_parent);
+            }
+            push_parent_slice(&mut output, base_cursor, keys.len())?;
+            continue;
+        }
         let projection = (0..manifest.fields.len()).collect::<Vec<_>>();
         let parent_source = crate::columnar_row_group::load_row_group_batch_with_staged(
             store,
@@ -1989,6 +2291,7 @@ async fn stage_sparse_typed_arrow_current_state_part_set(
         )
         .await?
         .ok_or_else(|| replacement_payload_error("Arrow current-state leaf is missing"))?;
+        let parent_source = slice_loaded_current_state_group(parent_source, &descriptor)?;
         let source_index = sources.len();
         let parent_authority = decode_current_state_authority_rows(&parent_source)?;
         if parent_authority.len() != usize::from(descriptor.row_count)
@@ -2016,8 +2319,10 @@ async fn stage_sparse_typed_arrow_current_state_part_set(
             })
             .collect::<BTreeMap<_, _>>();
         sources.push(parent_source);
+        let mut changed_keys = BTreeSet::new();
         if let Some(cascade) = cascade.as_ref() {
             for row in rows.values_mut() {
+                changed_keys.insert(row.encoded_key.clone());
                 row.value.change_id = cascade.change_id;
                 row.value.commit_id = cascade.commit_id;
                 row.value.deleted = true;
@@ -2031,6 +2336,7 @@ async fn stage_sparse_typed_arrow_current_state_part_set(
         {
             let (encoded_key, (mut value, mutation_source)) =
                 pending.next().expect("peeked sparse mutation");
+            changed_keys.insert(encoded_key.clone());
             let previous = rows.get(&encoded_key);
             if let Some(previous) = previous {
                 value.created_at = previous.value.created_at;
@@ -2050,13 +2356,60 @@ async fn stage_sparse_typed_arrow_current_state_part_set(
                 },
             );
         }
-        output.extend(stage_selected_arrow_current_state_rows(
-            writes,
-            &sources,
-            &rows.into_values().collect::<Vec<_>>(),
-            &coordinate_keys,
-            &mut coordinates,
-        )?);
+        let rows = rows.into_values().collect::<Vec<_>>();
+        let unchanged_parent_row = |row: &ArrowStateRowSelection| {
+            (!changed_keys.contains(&row.encoded_key))
+                .then_some(row.source)
+                .flatten()
+                .and_then(|(candidate_source, batch_index, row_index)| {
+                    (candidate_source == source_index && batch_index == 0).then_some(row_index)
+                })
+        };
+        let mut cursor = 0usize;
+        while cursor < rows.len() {
+            if let Some(first_parent_row) = unchanged_parent_row(&rows[cursor]) {
+                let start = cursor;
+                let mut last_parent_row = first_parent_row;
+                cursor += 1;
+                while cursor < rows.len()
+                    && unchanged_parent_row(&rows[cursor])
+                        == last_parent_row.checked_add(1)
+                {
+                    last_parent_row += 1;
+                    cursor += 1;
+                }
+                let row_count = cursor - start;
+                let row_offset = usize::from(descriptor.row_offset)
+                    .checked_add(first_parent_row)
+                    .ok_or_else(|| replacement_payload_error("Arrow slice offset overflowed"))?;
+                output.push(CurrentStatePartDescriptor {
+                    first_key: rows[start].encoded_key.clone(),
+                    last_key: rows[cursor - 1].encoded_key.clone(),
+                    state_set_id: descriptor.state_set_id,
+                    state_group_index: descriptor.state_group_index,
+                    row_offset: u16::try_from(row_offset).map_err(|_| {
+                        replacement_payload_error("Arrow slice offset exceeds u16")
+                    })?,
+                    payload_refs_digest: descriptor.payload_refs_digest,
+                    row_count: u16::try_from(row_count).map_err(|_| {
+                        replacement_payload_error("Arrow slice row count exceeds u16")
+                    })?,
+                });
+            } else {
+                let start = cursor;
+                cursor += 1;
+                while cursor < rows.len() && unchanged_parent_row(&rows[cursor]).is_none() {
+                    cursor += 1;
+                }
+                output.extend(stage_selected_arrow_current_state_rows(
+                    writes,
+                    &sources,
+                    &rows[start..cursor],
+                    &coordinate_keys,
+                    &mut coordinates,
+                )?);
+            }
+        }
     }
     let tail = pending
         .map(|(encoded_key, (value, source))| ArrowStateRowSelection {
@@ -2073,6 +2426,108 @@ async fn stage_sparse_typed_arrow_current_state_part_set(
         &coordinate_keys,
         &mut coordinates,
     )?);
+    // Sparse slices are the write-efficient representation, not permission
+    // for an ever-growing flat scan surface. Once fragmentation materially
+    // exceeds the canonical 512-row leaf count, repack this one scope into
+    // canonical Arrow leaves. The grace keeps ordinary point mutations on
+    // the zero-copy slice path while bounding planning, diff, and GC edges.
+    const CANONICAL_CURRENT_STATE_LEAF_ROWS: u64 = 512;
+    let canonical_part_count = parent
+        .map(|parent| {
+            parent
+                .directory
+                .row_count
+                .div_ceil(CANONICAL_CURRENT_STATE_LEAF_ROWS)
+                .max(1) as usize
+        })
+        .unwrap_or(1);
+    let fragmentation_grace = (canonical_part_count / 10).max(2);
+    if output.len() > canonical_part_count.saturating_add(fragmentation_grace) {
+        let mut repack_sources = Vec::with_capacity(output.len());
+        let mut repack_rows = Vec::with_capacity(
+            output
+                .iter()
+                .map(|descriptor| usize::from(descriptor.row_count))
+                .sum(),
+        );
+        for descriptor in &output {
+            let manifest = crate::columnar_row_group::load_row_group_manifest_with_staged(
+                store,
+                writes,
+                descriptor.state_set_id,
+            )
+            .await?
+            .ok_or_else(|| replacement_payload_error("fragmented Arrow state leaf is missing"))?;
+            let projection = (0..manifest.fields.len()).collect::<Vec<_>>();
+            let source = crate::columnar_row_group::load_row_group_batch_with_staged(
+                store,
+                writes,
+                descriptor.state_set_id,
+                descriptor.state_group_index as usize,
+                &projection,
+            )
+            .await?
+            .ok_or_else(|| replacement_payload_error("fragmented Arrow state batch is missing"))?;
+            let source = slice_loaded_current_state_group(source, descriptor)?;
+            let source_index = repack_sources.len();
+            repack_rows.extend(
+                decode_current_state_authority_rows(&source)?
+                    .into_iter()
+                    .map(|(encoded_key, value, batch_index, row_index)| ArrowStateRowSelection {
+                        encoded_key,
+                        retain_payload: !value.deleted,
+                        value,
+                        source: Some((source_index, batch_index, row_index)),
+                    }),
+            );
+            repack_sources.push(source);
+        }
+        coordinates.clear();
+        let canonical = crate::tracked_state::current_state_data_part::encode_canonical_selected_current_state_set(
+            &repack_sources,
+            &repack_rows,
+        )?;
+        let (state_set_id, payload_refs_digest) = canonical.stage(writes)?;
+        let mut row_offset = 0usize;
+        output = canonical
+            .groups
+            .into_iter()
+            .enumerate()
+            .map(|(group_index, group)| {
+                let group_row_count = usize::from(group.row_count);
+                for (row_index, row) in repack_rows
+                    [row_offset..row_offset + group_row_count]
+                    .iter()
+                    .enumerate()
+                {
+                    if coordinate_keys.contains(&row.encoded_key) {
+                        coordinates.insert(
+                            row.encoded_key.clone(),
+                            TrackedStateBaseCoordinate {
+                                state_set_id,
+                                group_index: u32::try_from(group_index)
+                                    .expect("canonical group index fits u32"),
+                                row_index: u32::try_from(row_index)
+                                    .expect("canonical group row fits u32"),
+                            },
+                        );
+                    }
+                }
+                row_offset += group_row_count;
+                Ok(CurrentStatePartDescriptor {
+                    first_key: group.first_key,
+                    last_key: group.last_key,
+                    state_set_id,
+                    state_group_index: u32::try_from(group_index)
+                        .expect("canonical group index fits u32"),
+                    row_offset: 0,
+                    payload_refs_digest,
+                    row_count: group.row_count,
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        debug_assert_eq!(row_offset, repack_rows.len());
+    }
     if output.is_empty() {
         return Ok((None, coordinates));
     }
@@ -2144,12 +2599,52 @@ fn staged_commit_delta_segment_bytes(
 
 async fn staged_commit_delta_members(
     store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
     commit_id: CommitId,
     inventory: &CommitStateMutationInventory,
     staged_segments: Vec<Option<Bytes>>,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     let manifest = commit_delta_manifest_from_inventory(inventory);
     let mut members = Vec::with_capacity(inventory.member_count as usize);
+    if manifest.uses_native_arrow_history() {
+        let mut global_row_index = 0usize;
+        for descriptor in &manifest.sealed_state_parts {
+            let arrow_manifest = crate::columnar_row_group::load_row_group_manifest_with_staged(
+                store,
+                writes,
+                descriptor.state_set_id,
+            )
+            .await?
+            .ok_or_else(|| replacement_payload_error("native Arrow history manifest is missing"))?;
+            let projection =
+                crate::tracked_state::current_state_data_part::current_state_data_projection(
+                    &arrow_manifest,
+                )?;
+            let loaded = crate::columnar_row_group::load_row_group_batch_with_staged(
+                store,
+                writes,
+                descriptor.state_set_id,
+                descriptor.state_group_index as usize,
+                &projection,
+            )
+            .await?
+            .ok_or_else(|| replacement_payload_error("native Arrow history group is missing"))?;
+            let rows = crate::tracked_state::decode_current_state_data_part(
+                &loaded,
+                descriptor.state_group_index,
+            )?;
+            append_native_arrow_history_members(
+                commit_id,
+                &manifest.account_id,
+                descriptor,
+                rows,
+                &mut global_row_index,
+                &mut members,
+            )?;
+        }
+        validate_commit_delta_member_order_and_ids(commit_id, &members)?;
+        return Ok(members);
+    }
     if let Some(inline) = manifest.inline_segment() {
         collect_strict_commit_delta_members(
             inline,
@@ -2163,6 +2658,73 @@ async fn staged_commit_delta_members(
         for ((segment_index, bounds), staged) in
             manifest.segments.iter().enumerate().zip(staged_segments)
         {
+            if staged.is_none()
+                && let Some(part) = bounds.replacement_part.as_ref()
+                && part.content_digest == part.state_set_id.as_bytes()
+            {
+                let arrow_manifest =
+                    crate::columnar_row_group::load_row_group_manifest_with_staged(
+                        store,
+                        writes,
+                        part.state_set_id,
+                    )
+                    .await?
+                    .ok_or_else(|| replacement_payload_error("Arrow event manifest is missing"))?;
+                let projection =
+                    crate::tracked_state::current_state_data_part::current_state_data_projection(
+                        &arrow_manifest,
+                    )?;
+                let loaded = crate::columnar_row_group::load_row_group_batch_with_staged(
+                    store,
+                    writes,
+                    part.state_set_id,
+                    part.state_group_index as usize,
+                    &projection,
+                )
+                .await?
+                .ok_or_else(|| replacement_payload_error("Arrow event group is missing"))?;
+                for (ordinal, row) in crate::tracked_state::decode_current_state_data_part(
+                    &loaded,
+                    part.state_group_index,
+                )?
+                .into_iter()
+                .enumerate()
+                {
+                    let decoded = decode_key_shared(Bytes::from(row.encoded_key))?;
+                    let key = TrackedStateKey {
+                        schema_key: decoded.schema_key.to_string(),
+                        file_id: decoded.file_id.as_deref().map(str::to_owned),
+                        entity_pk: decoded.entity_pk,
+                    };
+                    let change = crate::changelog::ChangeRecord {
+                        format_version: 2,
+                        change_id: row.value.change_id,
+                        account_id: manifest.account_id.clone(),
+                        schema_key: key.schema_key.clone(),
+                        entity_pk: key.entity_pk.clone(),
+                        file_id: key.file_id.clone(),
+                        snapshot: row.snapshot,
+                        metadata: row.metadata,
+                        created_at: row.value.updated_at,
+                        origin_key: None,
+                    };
+                    members.push(CommitDeltaMember {
+                        key,
+                        value: row.value,
+                        change,
+                        segment_index: segment_index as u32,
+                        ordinal: ordinal as u32,
+                        authored: true,
+                        base_coordinate: Some(TrackedStateBaseCoordinate {
+                            state_set_id: part.state_set_id,
+                            group_index: part.state_group_index,
+                            row_index: ordinal as u32,
+                        }),
+                        selected_tombstone: false,
+                    });
+                }
+                continue;
+            }
             let physical_key =
                 commit_delta_segment_key_for_bounds(commit_id, segment_index, bounds)?;
             let bytes = if let Some(bytes) = staged {
@@ -2194,13 +2756,13 @@ async fn staged_commit_delta_members(
 
 pub(crate) async fn staged_commit_delta_members_for_write(
     store: &(impl StorageAdapterRead + ?Sized),
-    writes: &StorageWriteSet,
+    writes: &mut StorageWriteSet,
     commit_id: CommitId,
     inventory: &CommitStateMutationInventory,
 ) -> Result<Vec<CommitDeltaMember>, LixError> {
     let staged_segments = staged_commit_delta_segment_bytes(writes, commit_id, inventory)?;
     let mut local =
-        staged_commit_delta_members(store, commit_id, inventory, staged_segments).await?;
+        staged_commit_delta_members(store, writes, commit_id, inventory, staged_segments).await?;
     let manifest = commit_delta_manifest_from_inventory(inventory);
     let Some(source_commit_id) = manifest.selected_source_commit_id() else {
         return Ok(local);
@@ -2244,10 +2806,19 @@ pub(crate) fn finalize_commit_delta_event_coordinates(
     inventory: &CommitStateMutationInventory,
     members: &[CommitDeltaMember],
 ) -> Result<CommitStateMutationInventory, LixError> {
+    if inventory.replacement_generation.is_some() && members.is_empty() {
+        return Ok(inventory.clone());
+    }
+    if inventory.uses_native_arrow_history() && members.is_empty() {
+        return Ok(inventory.clone());
+    }
     if usize::try_from(inventory.member_count).ok() != Some(members.len()) {
         return Err(replacement_payload_error(
             "event finalization disagrees with its mutation plan",
         ));
+    }
+    if inventory.uses_native_arrow_history() {
+        return Ok(inventory.clone());
     }
     let mut finalized = inventory.clone();
     if !finalized.inline_part.is_empty() {
@@ -2711,20 +3282,99 @@ where
 }
 
 pub(crate) fn stage_ordered_arrow_native_commit_deltas<'a, I>(
-    writes: &mut StorageWriteSet,
+    _writes: &mut StorageWriteSet,
     deltas: I,
     order_certified: bool,
     publish_lifecycle_summary: bool,
+    sealed_state_parts: Vec<CurrentStatePartDescriptor>,
 ) -> Result<Option<OrderedAddressableCommitDeltaStage>, LixError>
 where
     I: ExactSizeIterator<Item = Result<TrackedStateCommitDeltaRef<'a>, LixError>> + Clone,
 {
-    stage_ordered_addressable_commit_deltas_inner(
-        writes,
-        deltas,
-        order_certified,
-        publish_lifecycle_summary,
-    )
+    let row_count = deltas.len();
+    let mut probe = deltas.clone();
+    let Some(first) = probe.next().transpose()? else {
+        return Ok(Some(OrderedAddressableCommitDeltaStage {
+            commit_id: CommitId::default(),
+            change_addresses: OrderedChangeAddresses::Dense,
+            row_count: 0,
+            mutation_inventory: CommitStateMutationInventory::default(),
+        }));
+    };
+    let commit_id = first.delta.commit_id;
+    let mut previous_key = TrackedStateKeyRef {
+        schema_key: first.delta.schema_key,
+        file_id: first.delta.file_id,
+        entity_pk: first.delta.entity_pk,
+    };
+    if !order_certified {
+        for delta in probe {
+            let delta = delta?;
+            if delta.delta.commit_id != commit_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state cannot publish native deltas from different commits",
+                ));
+            }
+            let key = TrackedStateKeyRef {
+                schema_key: delta.delta.schema_key,
+                file_id: delta.delta.file_id,
+                entity_pk: delta.delta.entity_pk,
+            };
+            if compare_tracked_state_key_refs(previous_key, key) != std::cmp::Ordering::Less {
+                return Ok(None);
+            }
+            previous_key = key;
+        }
+    }
+    if sealed_state_parts.is_empty()
+        || sealed_state_parts
+            .iter()
+            .map(|part| usize::from(part.row_count))
+            .sum::<usize>()
+            != row_count
+    {
+        return Err(replacement_payload_error(
+            "native Arrow history does not cover its certified rows",
+        ));
+    }
+    let lifecycle_summary = if publish_lifecycle_summary {
+        lifecycle_summary_for_ordered_deltas(deltas)?
+    } else {
+        None
+    };
+    let single_partition = Some(CommitDeltaReplacementScope {
+        schema_key: first.delta.schema_key.to_owned(),
+        file_id: first.delta.file_id.map(str::to_owned),
+    });
+    let direct_part_row_counts = (0..row_count)
+        .step_by(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+        .map(|offset| {
+            u16::try_from((row_count - offset).min(COMMIT_DELTA_SEGMENT_MAX_ROWS))
+                .expect("direct address part row count fits u16")
+        })
+        .collect();
+    Ok(Some(OrderedAddressableCommitDeltaStage {
+        commit_id,
+        change_addresses: OrderedChangeAddresses::Dense,
+        row_count,
+        mutation_inventory: CommitStateMutationInventory {
+            selected_source_commit_id: None,
+            member_count: u32::try_from(row_count).map_err(|_| {
+                replacement_payload_error("native Arrow history row count exceeds u32")
+            })?,
+            selection_fingerprint: [0; 32],
+            direct_part_row_counts,
+            replacement_part_digests: Vec::new(),
+            single_partition,
+            lifecycle_summary,
+            replacement_generation: None,
+            replacement_parts: None,
+            sealed_state_parts,
+            inline_part: Vec::new(),
+            parts: Vec::new(),
+        },
+    }))
 }
 
 fn stage_ordered_addressable_commit_deltas_inner<'a, I>(
@@ -2799,6 +3449,7 @@ where
         lifecycle_summary,
         replacement_generation: None,
         replacement_parts: None,
+        sealed_state_parts: Vec::new(),
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(row_count.div_ceil(COMMIT_DELTA_SEGMENT_MAX_ROWS)),
     };
@@ -3145,9 +3796,11 @@ where
                                 || coordinate.row_index
                                     != u32::try_from(ordinal).expect("bounded replacement row")
                             {
-                                return Err(replacement_payload_error(
-                                    "replacement row coordinate disagrees with physical ordering",
-                                ));
+                                return Err(replacement_payload_error(format!(
+                                    "replacement row coordinate disagrees with physical ordering: observed={:?}/{} expected={group_index}/{ordinal}",
+                                    coordinate.group_index,
+                                    coordinate.row_index,
+                                )));
                             }
                             Ok(coordinate.state_set_id)
                         })
@@ -3208,6 +3861,7 @@ where
             commit_id, generation, &authority,
         )),
         replacement_parts: Some(authority),
+        sealed_state_parts: Vec::new(),
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(parts.len()),
     };
@@ -3267,6 +3921,116 @@ where
         commit_id,
         change_addresses,
         row_count,
+        mutation_inventory: commit_state_inventory_from_delta_manifest(&manifest),
+    })
+}
+
+pub(crate) fn stage_arrow_native_replacement_manifest(
+    writes: &mut StorageWriteSet,
+    encoded: &crate::columnar_row_group::EncodedRowGroupSet,
+    commit_id: CommitId,
+    generation: &CommitDeltaReplacementGeneration,
+    uniform_updated_at: crate::common::LixTimestamp,
+) -> Result<OrderedAddressableCommitDeltaStage, LixError> {
+    let physical_key_index = encoded
+        .manifest
+        .fields
+        .iter()
+        .position(|field| field.name == "physical_key")
+        .ok_or_else(|| replacement_payload_error("Arrow replacement omitted physical_key"))?;
+    let state_set_id = encoded.id();
+    let content_digest = state_set_id.as_bytes();
+    let mut first_ordinal = 0u32;
+    let mut entries = Vec::with_capacity(encoded.manifest.groups.len());
+    let mut segments = Vec::with_capacity(encoded.manifest.groups.len());
+    let mut row_counts = Vec::with_capacity(encoded.manifest.groups.len());
+    let mut payload_refs = Vec::new();
+    let payload_refs_digest =
+        crate::tracked_state::current_state_data_part::stage_current_state_ref_summary(
+            writes,
+            state_set_id,
+            &mut payload_refs,
+        )?;
+    for (group_index, group) in encoded.manifest.groups.iter().enumerate() {
+        let statistics = &group.columns[physical_key_index];
+        let first_key = match statistics.min.as_ref() {
+            Some(crate::columnar_row_group::RowGroupScalar::Binary(value)) => value.clone(),
+            _ => {
+                return Err(replacement_payload_error(
+                    "Arrow replacement omitted key minimum",
+                ));
+            }
+        };
+        let last_key = match statistics.max.as_ref() {
+            Some(crate::columnar_row_group::RowGroupScalar::Binary(value)) => value.clone(),
+            _ => {
+                return Err(replacement_payload_error(
+                    "Arrow replacement omitted key maximum",
+                ));
+            }
+        };
+        let row_count = u16::try_from(group.row_count)
+            .map_err(|_| replacement_payload_error("Arrow replacement group exceeds u16"))?;
+        entries.push(
+            crate::tracked_state::replacement_part::ReplacementPartDirectoryEntry::new(
+                content_digest,
+                &first_key,
+                &last_key,
+                first_ordinal,
+                row_count,
+            ),
+        );
+        segments.push(CommitDeltaSegmentBounds {
+            first_key,
+            last_key,
+            replacement_part: Some(StoredReplacementPart {
+                content_digest,
+                state_set_id,
+                state_group_index: u32::try_from(group_index)
+                    .map_err(|_| replacement_payload_error("Arrow group index exceeds u32"))?,
+                payload_refs_digest,
+                owner_commit_id: *commit_id.as_uuid().as_bytes(),
+                first_address: first_ordinal,
+                uniform_created_at: generation.lifecycle_summary.uniform_created_at,
+                uniform_updated_at,
+            }),
+        });
+        row_counts.push(row_count);
+        first_ordinal = first_ordinal
+            .checked_add(u32::from(row_count))
+            .ok_or_else(|| replacement_payload_error("Arrow replacement row count overflows"))?;
+    }
+    if first_ordinal == 0 {
+        return Err(replacement_payload_error("Arrow replacement is empty"));
+    }
+    let directory = crate::tracked_state::replacement_part::ReplacementPartDirectory::try_new(
+        entries,
+        first_ordinal,
+    )?;
+    let authority = StoredReplacementPartsAuthority {
+        directory_digest: directory.digest()?,
+        uniform_updated_at,
+    };
+    let manifest = CommitDeltaManifest {
+        account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
+        selected_source_commit_id: None,
+        member_count: first_ordinal,
+        selection_fingerprint: [0; 32],
+        direct_segment_row_counts: row_counts,
+        single_partition: Some(generation.scope.clone()),
+        lifecycle_summary: Some(generation.lifecycle_summary.clone()),
+        replacement_generation: Some(stored_replacement_generation(
+            commit_id, generation, &authority,
+        )),
+        replacement_parts: Some(authority),
+        sealed_state_parts: Vec::new(),
+        inline_segment: Vec::new(),
+        segments,
+    };
+    Ok(OrderedAddressableCommitDeltaStage {
+        commit_id,
+        change_addresses: OrderedChangeAddresses::Dense,
+        row_count: first_ordinal as usize,
         mutation_inventory: commit_state_inventory_from_delta_manifest(&manifest),
     })
 }
@@ -3638,6 +4402,7 @@ fn stage_commit_deltas_inner(
             lifecycle_summary: None,
             replacement_generation: None,
             replacement_parts: None,
+            sealed_state_parts: Vec::new(),
             inline_segment,
             segments: Vec::new(),
         };
@@ -3664,6 +4429,7 @@ fn stage_commit_deltas_inner(
         lifecycle_summary: None,
         replacement_generation: None,
         replacement_parts: None,
+        sealed_state_parts: Vec::new(),
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(segment_count),
     };
@@ -3944,7 +4710,7 @@ async fn load_change_entries_at_locators(
         .iter()
         .filter_map(|locator| {
             let manifest = &manifests[&locator.commit_id];
-            manifest.inline_segment().is_none().then_some((
+            (manifest.inline_segment().is_none() && !manifest.uses_native_arrow_history()).then_some((
                 locator.commit_id,
                 usize::try_from(locator.segment_index).expect("u32 fits usize"),
             ))
@@ -4007,6 +4773,24 @@ async fn load_change_entries_at_locators(
     let mut loaded = (0..locators.len()).map(|_| None).collect::<Vec<_>>();
     for ((commit_id, segment_index), locator_indices) in locator_groups {
         let manifest = &manifests[&commit_id];
+        if manifest.uses_native_arrow_history() {
+            for locator_index in locator_indices {
+                let locator = locators[locator_index];
+                let change_record = load_native_arrow_change_at_locator(store, locator, manifest)
+                    .await?
+                .ok_or_else(|| {
+                    replacement_payload_error(
+                        "native Arrow history locator points to the wrong row",
+                    )
+                })?;
+                loaded[locator_index] = Some(LoadedCommitDeltaEntry {
+                    change_record,
+                    base_coordinate: None,
+                    commit_id,
+                });
+            }
+            continue;
+        }
         let (bytes, bounds) = if let Some(inline) = manifest.inline_segment() {
             if segment_index != 0 {
                 return Err(LixError::new(
@@ -4204,6 +4988,7 @@ async fn hydrate_change_entry_at_arrow_coordinate(
     let mut rows =
         crate::tracked_state::current_state_data_part::hydrate_current_state_payload_rows(
             &loaded,
+            coordinate.group_index,
             &[coordinate.row_index],
         )?;
     let row = rows
@@ -4268,6 +5053,9 @@ async fn try_load_change_record_at_locator_in_manifest(
     manifest: &CommitDeltaManifest,
 ) -> Result<Option<crate::changelog::ChangeRecord>, LixError> {
     let change_id = locator.change_id;
+    if manifest.uses_native_arrow_history() {
+        return load_native_arrow_change_at_locator(store, locator, manifest).await;
+    }
     let (segment, bounds) = if let Some(inline) = manifest.inline_segment() {
         if locator.segment_index != 0 {
             return Err(LixError::new(
@@ -4321,6 +5109,40 @@ async fn try_load_change_record_at_locator_in_manifest(
     hydrate_change_entry_at_arrow_coordinate(store, entry)
         .await
         .map(Some)
+}
+
+async fn load_native_arrow_change_at_locator(
+    store: &(impl StorageAdapterRead + ?Sized),
+    locator: CommitDeltaChangeLocator,
+    manifest: &CommitDeltaManifest,
+) -> Result<Option<crate::changelog::ChangeRecord>, LixError> {
+    let logical_row = usize::try_from(locator.segment_index)
+        .expect("u32 fits usize")
+        .checked_mul(COMMIT_DELTA_SEGMENT_MAX_ROWS)
+        .and_then(|offset| offset.checked_add(usize::from(locator.ordinal)))
+        .ok_or_else(|| replacement_payload_error("native history locator overflows usize"))?;
+    let mut descriptor_start = 0usize;
+    for descriptor in &manifest.sealed_state_parts {
+        let descriptor_end = descriptor_start + usize::from(descriptor.row_count);
+        if logical_row < descriptor_end {
+            let rows = load_current_state_descriptor_rows(store, descriptor).await?;
+            let mut members = Vec::with_capacity(rows.len());
+            let mut global_row_index = descriptor_start;
+            append_native_arrow_history_members(
+                locator.commit_id,
+                &manifest.account_id,
+                descriptor,
+                rows,
+                &mut global_row_index,
+                &mut members,
+            )?;
+            let member = &members[logical_row - descriptor_start];
+            return Ok((member.change.change_id == locator.change_id)
+                .then(|| member.change.clone()));
+        }
+        descriptor_start = descriptor_end;
+    }
+    Ok(None)
 }
 
 pub(crate) fn decode_change_locator(
@@ -4643,7 +5465,32 @@ async fn load_commit_delta_members_from_manifest_filtered(
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     let mut members = Vec::new();
-    if let Some(inline_segment) = manifest.inline_segment() {
+    if manifest.uses_native_arrow_history() {
+        let mut global_row_index = 0usize;
+        for descriptor in &manifest.sealed_state_parts {
+            let include = requested_schemas.is_empty()
+                || requested_schemas.iter().copied().any(|schema_key| {
+                    encoded_bounds_overlap_schema(
+                        &descriptor.first_key,
+                        &descriptor.last_key,
+                        schema_key,
+                    )
+                });
+            if include {
+                let rows = load_current_state_descriptor_rows(store, descriptor).await?;
+                append_native_arrow_history_members(
+                    commit_id,
+                    &manifest.account_id,
+                    descriptor,
+                    rows,
+                    &mut global_row_index,
+                    &mut members,
+                )?;
+            } else {
+                global_row_index += usize::from(descriptor.row_count);
+            }
+        }
+    } else if let Some(inline_segment) = manifest.inline_segment() {
         collect_strict_commit_delta_members(
             inline_segment,
             None,
@@ -4707,6 +5554,67 @@ async fn load_commit_delta_members_from_manifest_filtered(
     Ok(members)
 }
 
+fn append_native_arrow_history_members(
+    commit_id: CommitId,
+    account_id: &str,
+    descriptor: &CurrentStatePartDescriptor,
+    rows: Vec<crate::tracked_state::CurrentStateDataRow>,
+    global_row_index: &mut usize,
+    members: &mut Vec<CommitDeltaMember>,
+) -> Result<(), LixError> {
+    if rows.len() != usize::from(descriptor.row_count) {
+        return Err(replacement_payload_error(
+            "native Arrow history group disagrees with its descriptor",
+        ));
+    }
+    for (physical_ordinal, row) in rows.into_iter().enumerate() {
+        if row.value.commit_id != commit_id {
+            return Err(replacement_payload_error(
+                "native Arrow history row belongs to the wrong commit",
+            ));
+        }
+        let decoded = decode_key_shared(Bytes::from(row.encoded_key))?;
+        let key = TrackedStateKey {
+            schema_key: decoded.schema_key.to_string(),
+            file_id: decoded.file_id.as_deref().map(str::to_owned),
+            entity_pk: decoded.entity_pk,
+        };
+        let logical_segment = *global_row_index / COMMIT_DELTA_SEGMENT_MAX_ROWS;
+        let logical_ordinal = *global_row_index % COMMIT_DELTA_SEGMENT_MAX_ROWS;
+        let change = crate::changelog::ChangeRecord {
+            format_version: 2,
+            change_id: row.value.change_id,
+            account_id: account_id.to_owned(),
+            schema_key: key.schema_key.clone(),
+            entity_pk: key.entity_pk.clone(),
+            file_id: key.file_id.clone(),
+            snapshot: row.snapshot,
+            metadata: row.metadata,
+            created_at: row.value.created_at,
+            origin_key: None,
+        };
+        members.push(CommitDeltaMember {
+            key,
+            value: row.value,
+            change,
+            segment_index: u32::try_from(logical_segment)
+                .map_err(|_| replacement_payload_error("native history segment exceeds u32"))?,
+            ordinal: u32::try_from(logical_ordinal)
+                .expect("native history logical ordinal fits u32"),
+            authored: true,
+            base_coordinate: Some(TrackedStateBaseCoordinate {
+                state_set_id: descriptor.state_set_id,
+                group_index: descriptor.state_group_index,
+                row_index: u32::try_from(physical_ordinal)
+                    .expect("native Arrow row ordinal fits u32"),
+            }),
+            selected_tombstone: false,
+        });
+        *global_row_index += 1;
+    }
+    Ok(())
+}
+
 async fn hydrate_selected_members(
     store: &(impl StorageAdapterRead + ?Sized),
     members: &mut [CommitDeltaMember],
@@ -4752,6 +5660,7 @@ async fn hydrate_selected_members(
         let rows =
             crate::tracked_state::current_state_data_part::hydrate_current_state_payload_rows(
                 &loaded,
+                group_index,
                 &row_indices,
             )?;
         for ((member_index, _), row) in requests.into_iter().zip(rows) {
@@ -5272,9 +6181,28 @@ pub(crate) async fn scan_commit_delta_inventory(
     for (&commit_id, manifest) in &manifests {
         let physical_segments = segments.remove(&commit_id).unwrap_or_default();
         let physical_segment_keys = segment_keys.remove(&commit_id).unwrap_or_default();
-        let segment_count = manifest.segments.len();
+        let segment_count = if manifest.uses_native_arrow_history() {
+            manifest.sealed_state_parts.len()
+        } else {
+            manifest.segments.len()
+        };
         let mut members = Vec::new();
-        if let Some(inline_segment) = manifest.inline_segment() {
+        if manifest.uses_native_arrow_history() {
+            if !physical_segments.is_empty() {
+                return Err(replacement_payload_error(
+                    "native Arrow history has duplicate physical event segments",
+                ));
+            }
+            members = load_commit_delta_members_from_manifest_filtered(
+                store,
+                commit_id,
+                manifest,
+                &[],
+                &[],
+                &[],
+            )
+            .await?;
+        } else if let Some(inline_segment) = manifest.inline_segment() {
             if !physical_segments.is_empty() {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -5876,6 +6804,62 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
             "tracked_state commit_delta manifest has an invalid single-partition certificate",
         ));
     }
+    if manifest.uses_native_arrow_history() {
+        if manifest.selected_source_commit_id.is_some()
+            || manifest.replacement_generation.is_some()
+            || manifest.replacement_parts.is_some()
+            || !manifest.inline_segment.is_empty()
+            || !manifest.segments.is_empty()
+            || manifest.direct_segment_row_counts.is_empty()
+            || manifest
+                .sealed_state_parts
+                .iter()
+                .map(|part| u64::from(part.row_count))
+                .sum::<u64>()
+                != u64::from(manifest.member_count)
+            || manifest
+                .sealed_state_parts
+                .windows(2)
+                .any(|pair| pair[0].last_key >= pair[1].first_key)
+        {
+            return Err(replacement_payload_error(format!(
+                "tracked_state native Arrow history has an invalid manifest shape: selected={} replacement_generation={} replacement_parts={} inline={} segments={} direct={} rows={}/{} ordered={}",
+                manifest.selected_source_commit_id.is_some(),
+                manifest.replacement_generation.is_some(),
+                manifest.replacement_parts.is_some(),
+                !manifest.inline_segment.is_empty(),
+                manifest.segments.len(),
+                manifest.direct_segment_row_counts.len(),
+                manifest
+                    .sealed_state_parts
+                    .iter()
+                    .map(|part| u64::from(part.row_count))
+                    .sum::<u64>(),
+                manifest.member_count,
+                !manifest
+                    .sealed_state_parts
+                    .windows(2)
+                    .any(|pair| pair[0].last_key >= pair[1].first_key),
+            )));
+        }
+        let actual_scope = single_partition_from_bounds(
+            &manifest
+                .sealed_state_parts
+                .first()
+                .expect("nonempty native state parts")
+                .first_key,
+            &manifest
+                .sealed_state_parts
+                .last()
+                .expect("nonempty native state parts")
+                .last_key,
+        )?;
+        if manifest.single_partition != actual_scope {
+            return Err(replacement_payload_error(
+                "tracked_state native Arrow history partition certificate is invalid",
+            ));
+        }
+    }
     if let Some(summary) = manifest.lifecycle_summary.as_ref()
         && (summary.scope.schema_key.is_empty()
             || manifest.single_partition.as_ref() != Some(&summary.scope)
@@ -6003,7 +6987,9 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
                 "tracked_state commit_delta manifest has an invalid dense address inventory",
             ));
         }
-        let expected_segment_count = if manifest.inline_segment.is_empty() {
+        let expected_segment_count = if manifest.uses_native_arrow_history() {
+            manifest.direct_segment_row_counts.len()
+        } else if manifest.inline_segment.is_empty() {
             manifest.segments.len()
         } else {
             1
@@ -6037,6 +7023,9 @@ fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), 
         return Ok(());
     }
     if manifest.segments.is_empty() {
+        if manifest.uses_native_arrow_history() {
+            return Ok(());
+        }
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "tracked_state commit_delta manifest has no segments",
@@ -6125,6 +7114,12 @@ fn replacement_directory_from_manifest(
 }
 
 impl CommitDeltaManifest {
+    fn uses_native_arrow_history(&self) -> bool {
+        !self.sealed_state_parts.is_empty()
+            && self.inline_segment.is_empty()
+            && self.segments.is_empty()
+    }
+
     fn selected_source_commit_id(&self) -> Option<CommitId> {
         self.selected_source_commit_id
             .map(|bytes| CommitId::new(uuid::Uuid::from_bytes(bytes)))
@@ -6161,6 +7156,23 @@ fn commit_delta_segment_count_for_schemas_up_to(
     schema_keys: &BTreeSet<&str>,
     limit: usize,
 ) -> usize {
+    if manifest.uses_native_arrow_history() {
+        return manifest
+            .sealed_state_parts
+            .iter()
+            .filter(|part| {
+                schema_keys.is_empty()
+                    || schema_keys.iter().copied().any(|schema_key| {
+                        encoded_bounds_overlap_schema(
+                            &part.first_key,
+                            &part.last_key,
+                            schema_key,
+                        )
+                    })
+            })
+            .take(limit.saturating_add(1))
+            .count();
+    }
     if schema_keys.is_empty() {
         return manifest.segments.len().min(limit.saturating_add(1));
     }
@@ -6181,12 +7193,15 @@ fn commit_delta_segment_overlaps_schema(
     bounds: &CommitDeltaSegmentBounds,
     schema_key: &str,
 ) -> bool {
+    encoded_bounds_overlap_schema(&bounds.first_key, &bounds.last_key, schema_key)
+}
+
+fn encoded_bounds_overlap_schema(first_key: &[u8], last_key: &[u8], schema_key: &str) -> bool {
     let schema_prefix = encode_schema_key_prefix(schema_key);
     let Some(schema_end) = prefix_successor(&schema_prefix) else {
         return true;
     };
-    bounds.last_key.as_slice() >= schema_prefix.as_slice()
-        && bounds.first_key.as_slice() < schema_end.as_slice()
+    last_key >= schema_prefix.as_slice() && first_key < schema_end.as_slice()
 }
 
 fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -6933,7 +7948,8 @@ fn validate_commit_state_mutation_inventory(
     }
     if !inventory.direct_part_row_counts.is_empty() {
         let direct_rows = &inventory.direct_part_row_counts;
-        if direct_rows.len() != inventory.part_count()
+        if (!inventory.uses_native_arrow_history()
+            && direct_rows.len() != inventory.part_count())
             || direct_rows
                 .iter()
                 .any(|&rows| rows == 0 || usize::from(rows) > COMMIT_DELTA_SEGMENT_MAX_ROWS)
@@ -8993,6 +10009,7 @@ mod tests {
             lifecycle_summary: None,
             replacement_generation: None,
             replacement_parts: None,
+            sealed_state_parts: Vec::new(),
             inline_segment: segment,
             segments: Vec::new(),
         };
@@ -9710,6 +10727,7 @@ mod tests {
             lifecycle_summary: None,
             replacement_generation: None,
             replacement_parts: None,
+            sealed_state_parts: Vec::new(),
             inline_segment: encode_commit_delta_segment(&entries),
             segments: Vec::new(),
         };

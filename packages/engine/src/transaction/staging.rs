@@ -95,6 +95,7 @@ pub(crate) struct ImmutableMutationJournalChunk {
     identity_offsets: Arc<[(u32, u32)]>,
     snapshot_arena: Bytes,
     snapshot_offsets: Arc<[(u32, u32)]>,
+    compact_path_values: bool,
     large_snapshot_refs: Arc<[(u32, crate::json_store::JsonRef)]>,
     durable_predecessors: Option<Arc<[CertifiedCurrentStatePredecessor]>>,
     timestamp: LixTimestamp,
@@ -110,6 +111,7 @@ impl PartialEq for ImmutableMutationJournalChunk {
             && self.identity_offsets == other.identity_offsets
             && self.snapshot_arena == other.snapshot_arena
             && self.snapshot_offsets == other.snapshot_offsets
+            && self.compact_path_values == other.compact_path_values
             && self.large_snapshot_refs == other.large_snapshot_refs
             && self.timestamp == other.timestamp
             && self.durable_predecessors.as_ref().map(|values| {
@@ -141,6 +143,7 @@ impl ImmutableMutationJournalChunk {
         identity_offsets: Vec<(usize, usize)>,
         snapshot_arena: Vec<u8>,
         snapshot_offsets: Vec<(usize, usize)>,
+        compact_path_values: bool,
         durable_predecessors: Option<Vec<CertifiedCurrentStatePredecessor>>,
         timestamp: LixTimestamp,
     ) -> Result<Self, LixError> {
@@ -205,6 +208,7 @@ impl ImmutableMutationJournalChunk {
             offsets.into(),
             snapshot_arena,
             snapshot_offsets,
+            compact_path_values,
             durable_predecessors,
             timestamp,
         )
@@ -220,6 +224,7 @@ impl ImmutableMutationJournalChunk {
         identity_offsets: Arc<[(u32, u32)]>,
         snapshot_arena: Vec<u8>,
         snapshot_offsets: Vec<(usize, usize)>,
+        compact_path_values: bool,
         durable_predecessors: Option<Vec<CertifiedCurrentStatePredecessor>>,
         timestamp: LixTimestamp,
     ) -> Result<Self, LixError> {
@@ -306,6 +311,7 @@ impl ImmutableMutationJournalChunk {
             identity_offsets,
             snapshot_arena: Bytes::from(snapshot_arena),
             snapshot_offsets: offsets.into(),
+            compact_path_values,
             large_snapshot_refs: large_snapshot_refs.into(),
             durable_predecessors: durable_predecessors.map(Into::into),
             timestamp,
@@ -390,17 +396,40 @@ impl ImmutableMutationJournalChunk {
         allow_missing_predecessors: bool,
     ) -> Result<PreparedStateBatch, LixError> {
         let entity_pks = self.materialized_entity_pks();
-        let offsets = self
-            .snapshot_offsets
-            .iter()
-            .map(|&(start, end)| (start as usize, end as usize))
-            .collect();
+        let (snapshot_arena, offsets) = if self.compact_path_values {
+            let mut arena = Vec::with_capacity(
+                self.snapshot_arena
+                    .len()
+                    .saturating_add(self.identity_arena.len())
+                    .saturating_add(self.len() * 20),
+            );
+            let mut offsets = Vec::with_capacity(self.len());
+            for row_index in 0..self.len() {
+                let start = arena.len();
+                arena.extend_from_slice(b"{\"path\":");
+                arena.extend_from_slice(
+                    serde_json::to_string(self.identity(row_index))
+                        .expect("validated identity is JSON encodable")
+                        .as_bytes(),
+                );
+                arena.extend_from_slice(b",\"value\":");
+                arena.extend_from_slice(self.snapshot(row_index).as_bytes());
+                arena.push(b'}');
+                offsets.push((start, arena.len()));
+            }
+            (arena, offsets)
+        } else {
+            (
+                self.snapshot_arena.to_vec(),
+                self.snapshot_offsets
+                    .iter()
+                    .map(|&(start, end)| (start as usize, end as usize))
+                    .collect(),
+            )
+        };
         let mut rows = CertifiedParameterReplacementBatch::new(
             entity_pks.iter().cloned().collect(),
-            TransactionJson::from_certified_row_content_arena(
-                self.snapshot_arena.to_vec(),
-                offsets,
-            )?,
+            TransactionJson::from_certified_row_content_arena(snapshot_arena, offsets)?,
             self.schema_key,
             self.branch_id,
             CertifiedRawWriteBatchPreparation {
@@ -456,6 +485,12 @@ impl<'a> OrderedMutationJournalRowRef<'a> {
 
     pub(crate) fn snapshot(&self) -> &'a str {
         self.chunk.snapshot(self.row_index)
+    }
+
+    pub(crate) fn compact_path_value(&self) -> Option<&'a str> {
+        self.chunk
+            .compact_path_values
+            .then(|| self.chunk.snapshot(self.row_index))
     }
 
     pub(crate) fn snapshot_slot(&self) -> crate::json_store::JsonSlotRef<'a> {
@@ -533,6 +568,20 @@ impl<'a> Iterator for OrderedMutationJournalRows<'a> {
 impl ExactSizeIterator for OrderedMutationJournalRows<'_> {}
 
 impl OrderedMutationJournal {
+    pub(crate) fn single_compact_path_value_chunk(
+        &self,
+    ) -> Option<(&Bytes, &[(u32, u32)], &Bytes, &[(u32, u32)])> {
+        let [chunk] = self.chunks.as_slice() else {
+            return None;
+        };
+        chunk.compact_path_values.then_some((
+            &chunk.identity_arena,
+            &chunk.identity_offsets,
+            &chunk.snapshot_arena,
+            &chunk.snapshot_offsets,
+        ))
+    }
+
     pub(crate) fn iter(&self) -> OrderedMutationJournalRows<'_> {
         OrderedMutationJournalRows {
             journal: self,
@@ -3686,14 +3735,23 @@ fn push_ordered_mutation_materialized(
     chunk: &ImmutableMutationJournalChunk,
     row_index: usize,
 ) -> Result<usize, LixError> {
-    let snapshot = chunk.snapshot(row_index);
-    let snapshot =
-        SharedStr::from_utf8_slice(chunk.snapshot_arena.clone(), snapshot).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "immutable mutation snapshot escaped its shared arena",
-            )
-        })?;
+    let snapshot_value = chunk.snapshot(row_index);
+    let snapshot = if chunk.compact_path_values {
+        SharedStr::from(format!(
+            "{{\"path\":{},\"value\":{snapshot_value}}}",
+            serde_json::to_string(chunk.identity(row_index))
+                .expect("validated identity is JSON encodable")
+        ))
+    } else {
+        SharedStr::from_utf8_slice(chunk.snapshot_arena.clone(), snapshot_value).ok_or_else(
+            || {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "immutable mutation snapshot escaped its shared arena",
+                )
+            },
+        )?
+    };
     let created_at = if let Some(created_at) = journal.overlay_uniform_created_at {
         created_at
     } else {
@@ -4359,6 +4417,7 @@ mod tests {
                     first_snapshot.len() + second_snapshot.len(),
                 ),
             ],
+            false,
             None,
             LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
         )
@@ -4402,6 +4461,7 @@ mod tests {
             identity_offsets,
             snapshots,
             snapshot_offsets,
+            false,
             None,
             LixTimestamp::expect_parse("timestamp", "2026-01-01T00:00:00Z"),
         )

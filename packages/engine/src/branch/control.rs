@@ -56,6 +56,9 @@ pub(crate) struct BranchHeadControl {
     /// therefore skip an otherwise-empty schema range scan; a collision only
     /// falls back to the normal scan.
     pub(crate) schema_presence_bloom: [u64; SCHEMA_PRESENCE_BLOOM_WORDS],
+    /// Conservative summary of schemas present in the history-free HOT plane.
+    /// Tracked Arrow-root schemas are deliberately excluded.
+    pub(crate) untracked_schema_presence_bloom: [u64; SCHEMA_PRESENCE_BLOOM_WORDS],
 }
 
 impl BranchHeadControl {
@@ -84,6 +87,23 @@ impl BranchHeadControl {
         }
     }
 
+    pub(crate) fn note_untracked_schema(&mut self, schema_key: &str) {
+        note_schema_bloom(&mut self.untracked_schema_presence_bloom, schema_key);
+    }
+
+    pub(crate) fn note_untracked_schemas<'a>(
+        &mut self,
+        schema_keys: impl IntoIterator<Item = &'a str>,
+    ) {
+        for schema_key in schema_keys {
+            self.note_untracked_schema(schema_key);
+        }
+    }
+
+    pub(crate) fn may_have_untracked_schema(&self, schema_key: &str) -> bool {
+        schema_bloom_may_contain(&self.untracked_schema_presence_bloom, schema_key)
+    }
+
     pub(crate) fn note_schemas<'a>(&mut self, schema_keys: impl IntoIterator<Item = &'a str>) {
         for schema_key in schema_keys {
             self.note_schema(schema_key);
@@ -105,6 +125,27 @@ impl BranchHeadControl {
                 != 0
         })
     }
+}
+
+fn note_schema_bloom(bloom: &mut [u64; SCHEMA_PRESENCE_BLOOM_WORDS], schema_key: &str) {
+    let hash = xxh3_64(schema_key.as_bytes()).to_be_bytes();
+    for pair in hash.chunks_exact(2) {
+        let bit = usize::from(u16::from_be_bytes([pair[0], pair[1]]))
+            % (SCHEMA_PRESENCE_BLOOM_WORDS * u64::BITS as usize);
+        bloom[bit / u64::BITS as usize] |= 1_u64 << (bit % u64::BITS as usize);
+    }
+}
+
+fn schema_bloom_may_contain(
+    bloom: &[u64; SCHEMA_PRESENCE_BLOOM_WORDS],
+    schema_key: &str,
+) -> bool {
+    let hash = xxh3_64(schema_key.as_bytes()).to_be_bytes();
+    hash.chunks_exact(2).all(|pair| {
+        let bit = usize::from(u16::from_be_bytes([pair[0], pair[1]]))
+            % (SCHEMA_PRESENCE_BLOOM_WORDS * u64::BITS as usize);
+        bloom[bit / u64::BITS as usize] & (1_u64 << (bit % u64::BITS as usize)) != 0
+    })
 }
 
 /// One coherent point-read observation used for both generation selection and
@@ -333,6 +374,7 @@ mod tests {
             generation: CommitId::for_test_label("first-generation"),
             current_state_revision: 0,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
             created_at: LixTimestamp::expect_parse("first created_at", "2026-01-01T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("first updated_at", "2026-01-01T00:00:00Z"),
@@ -343,6 +385,7 @@ mod tests {
             generation: CommitId::for_test_label("first-generation"),
             current_state_revision: 1,
             schema_presence_bloom: [u64::MAX; 4],
+            untracked_schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
             created_at: first.created_at,
             updated_at: LixTimestamp::expect_parse("second updated_at", "2026-01-02T00:00:00Z"),

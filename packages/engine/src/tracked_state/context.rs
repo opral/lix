@@ -52,6 +52,22 @@ impl TrackedStateContext {
         TrackedStateStoreReader {
             store,
             commit_delta_point_cache: storage::CommitDeltaPointReadCache::default(),
+            decoded_columns: None,
+        }
+    }
+
+    pub(crate) fn reader_with_decoded_columns<S>(
+        &self,
+        store: S,
+        decoded_columns: crate::live_state::EntityDecodedColumnCache,
+    ) -> TrackedStateStoreReader<S>
+    where
+        S: StorageAdapterRead,
+    {
+        TrackedStateStoreReader {
+            store,
+            commit_delta_point_cache: storage::CommitDeltaPointReadCache::default(),
+            decoded_columns: Some(decoded_columns),
         }
     }
 }
@@ -61,6 +77,7 @@ pub(crate) struct TrackedStateStoreReader<S> {
     store: S,
     /// Shares immutable event manifests across repeated history validation.
     commit_delta_point_cache: storage::CommitDeltaPointReadCache,
+    decoded_columns: Option<crate::live_state::EntityDecodedColumnCache>,
 }
 
 impl<S> TrackedStateStoreReader<S>
@@ -174,10 +191,11 @@ where
                     format!("tracked_state commit authority is missing for commit '{commit_id}'"),
                 )
             })?;
-        let arrow_rows = storage::load_complete_current_state_rows_with_coordinates_encoded(
+        let arrow_rows = storage::load_complete_current_state_rows_with_coordinates_encoded_cached(
             &self.store,
             &manifest,
             &encoded_keys,
+            self.decoded_columns.as_ref(),
         )
         .await?;
         if arrow_rows.len() != unique_keys.len() {

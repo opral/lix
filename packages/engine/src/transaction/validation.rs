@@ -1398,6 +1398,12 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
             file_id: None,
         };
         if live_state
+            .collection_is_proven_absent(branch_id, scope)
+            .await?
+        {
+            return Ok(());
+        }
+        if live_state
             .collection_generation(branch_id, scope)
             .await?
             .is_some_and(|generation| generation.live_count == 0)
@@ -1419,6 +1425,12 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
             schema_key: first.row.schema_key,
             file_id: first.row.file_id.map(crate::common::SharedStr::as_str),
         };
+        if live_state
+            .collection_is_proven_absent(first.row.branch_id, scope)
+            .await?
+        {
+            return Ok(());
+        }
         if live_state
             .collection_generation(first.row.branch_id, scope)
             .await?

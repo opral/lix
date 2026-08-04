@@ -48,6 +48,7 @@ impl ZstdLevel1Compressor {
         Ok(Self)
     }
 
+
     pub(crate) fn compress(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
         compress_zstd_level_1(data)
     }
